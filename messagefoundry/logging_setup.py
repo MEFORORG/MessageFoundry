@@ -75,9 +75,10 @@ from messagefoundry.logging_guard import (
 from messagefoundry.redaction import _REDACTED as PHI_PLACEHOLDER
 from messagefoundry.redaction import (
     ExcInfo,
+    clamp_untrusted,
     prepare_log_record,
+    redact,
     redact_binary_carriage,
-    redact_untrusted,
     safe_traceback,
 )
 from messagefoundry.secretscrub import (
@@ -85,8 +86,12 @@ from messagefoundry.secretscrub import (
     _KV_TAILS,
     CREDENTIAL_PLACEHOLDER,
     _braced_tail,
-    mask_private_key_blocks,
+    _mask_only,
+    _without_tails,
+    could_take_a_tail,
+    mask_private_key_blocks_then,
     scrub_credentials,
+    scrub_credentials_without_tails,
 )
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
@@ -411,17 +416,33 @@ def _scrub_credential_query(text: str) -> str:
     ``CREDENTIAL_PLACEHOLDER`` rather than a second literal ``<redacted>``: one log line must not be
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
-    return _CREDENTIAL_QUERY_RE.sub(
-        lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}{_braced_tail(m)}", text
-    )
+    tailed = _CREDENTIAL_QUERY_RE.sub(_query_repl, text)
+    if tailed is text or not could_take_a_tail(text):
+        return tailed
+    # A bytes tail masks text the credential pass after this filter reads (BACKLOG #5547), and this
+    # filter has no union behind it. So the tailed value is kept only where what that pass then
+    # prints is what it printed before the tails, with characters written as "x"; the comment on
+    # secretscrub's _NO_LABEL_BEFORE states this control.
+    before = _without_tails(_CREDENTIAL_QUERY_RE).sub(_query_repl, text)
+    if tailed == before or _mask_only(
+        scrub_credentials_without_tails(before), scrub_credentials(tailed)
+    ):
+        return tailed
+    return before
+
+
+def _query_repl(m: re.Match[str]) -> str:
+    return f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}{_braced_tail(m)}"
 
 
 def _redact_masking_key_blocks(text: str) -> str:
-    """:func:`~messagefoundry.redaction.redact_untrusted` after the PRIVATE KEY block mask (BACKLOG
-    #5550). The mask runs first because the PHI pass reads a block's markers as a name run and
-    rewrites them, so no pass after it could find the block. It runs on the field before the clamp,
-    but only on text holding ``-----``, and it keeps the length, so the clamp cuts where it did."""
-    return redact_untrusted(mask_private_key_blocks(text))
+    """:func:`~messagefoundry.redaction.redact_untrusted` with the PRIVATE KEY block mask between
+    its clamp and its scan (BACKLOG #5550). The mask runs before the PHI pass because that pass reads
+    a block's markers as a name run and rewrites them, so no pass after it could find the block;
+    after the clamp, so it scans no more than the PHI pass does (BACKLOG #1576).
+    :func:`~messagefoundry.secretscrub.mask_private_key_blocks_then` keeps the PHI pass's reading of
+    the unmasked text wherever the masked one differs from it at anything but an "x"."""
+    return mask_private_key_blocks_then(clamp_untrusted(text), redact)
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:
@@ -746,7 +767,7 @@ class JsonFormatter(_SafeExcFormatter):
             # lists what still passes.
             # Bounded for the same reason and on the same terms as the filter's own call (#1576): a
             # filter-less handler is exactly the one with nothing upstream to have clamped it already.
-            payload["exception"] = redact_untrusted(self.formatException(record.exc_info))
+            payload["exception"] = _redact_masking_key_blocks(self.formatException(record.exc_info))
         if record.stack_info:
             payload["stack"] = record.stack_info
         return json.dumps(payload, ensure_ascii=False)

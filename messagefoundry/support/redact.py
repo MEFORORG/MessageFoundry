@@ -50,6 +50,7 @@ underscore so it cannot be reached by that sweep.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
@@ -62,7 +63,12 @@ from messagefoundry.secretscrub import (
     _dsn_password_repl,
     _keep_key_marker,
     _mask_member,
+    _mask_only,
+    _same,
+    _without_tails,
+    could_take_a_tail,
     scrub_credentials,
+    scrub_credentials_without_tails,
 )
 from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_NARROW_DSN_PASSWORD
 from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY_BLOCK
@@ -619,7 +625,10 @@ _LEADING_TS = re.compile(
 #
 # * The shared pass runs AFTER the PHI pass. The PHI pass judges a line by its shape. Handed the
 #   shared pass's output, it changed its verdict and printed a value on 12 lines of that corpus. After
-#   it, the PHI pass sees exactly the text it always saw.
+#   it, the PHI pass sees the text this copy left. Since BACKLOG #5546 to #5550 that text can hold
+#   a masked tail, and a review found the PHI pass then printing a name the line before the tails
+#   hid; :func:`redact_log_line` compares the two readings on such a line and keeps the one without
+#   the tails where they differ at anything but an "x".
 # * The shared pass runs on the text BETWEEN this module's placeholders, one piece at a time. A second
 #   pass reads a placeholder as a value and runs on into the next label:
 #   ``pwd=[REDACTED]:password=[REDACTED]`` came out as ``pwd=[REDACTED]``. The value stays hidden, but
@@ -670,43 +679,57 @@ def redact_log_line(line: str) -> str:
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
     ts = _LEADING_TS.match(line)
-    prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
-    logged_placeholder = REDACTION_PLACEHOLDER in body
-    # First, before the PHI pass rewrites a PRIVATE KEY block's markers (BACKLOG #5550). Spelled
-    # out rather than through ``mask_private_key_blocks`` so this function applies the pattern by
-    # its name here, which the family table and its mutation test read.
-    if "-----" in body:
-        body = _PRIVATE_KEY_BLOCK.sub(_keep_key_marker, body)
-    body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
-    body = _MEFOR_SECRET.sub(_keep_label, body)
-    body = _BEARER.sub(_keep_label, body)
-    body = _AUTH_SCHEME.sub(_keep_scheme, body)
-    body = _CREDENTIAL_KV.sub(_keep_label, body)
-    body = _KEY_MATERIAL.sub(_keep_label, body)
-    body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
-    body = _redact_phi(
-        body
-    )  # shared engine PHI pass: generic HL7 segments/field runs + DOB + names
-    # The second credential layer; see the comment above this function.
-    pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
-    body = REDACTION_PLACEHOLDER.join(
-        scrub_credentials(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
-    )
-    # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
-    # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second layer and
-    # before only the widened DSN pass and the long-base64 sweep below, so it reads what they left,
-    # and over the whole joined body, since this module's placeholder can sit inside the value
-    # (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks words only, so the PHI pass and the labels of a later redaction of
-    # this line read the same separators; secretscrub's comment on the pattern says why that matters.
-    if ";" in body:
-        body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
-    # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a password-only
-    # DSN, and a password holding an "@" that the narrow copy above cut at its first one; the comment
-    # on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not reach
-    # past a label a pass reads, a query key the write-time filter hides included, whether or not a
-    # pass above hid its value; the comment on _DSN_PASSWORD says which labels.
-    if "@" in body and "://" in body:
-        body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
+    prefix, original = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
+    logged_placeholder = REDACTION_PLACEHOLDER in original
+
+    def layers(
+        body: str, read: Callable[[re.Pattern[str]], re.Pattern[str]], scrub: Callable[..., str]
+    ) -> str:
+        # First, before the PHI pass rewrites a PRIVATE KEY block's markers (BACKLOG #5550).
+        if "-----" in body:
+            body = read(_PRIVATE_KEY_BLOCK).sub(_keep_key_marker, body)
+        body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
+        body = read(_MEFOR_SECRET).sub(_keep_label, body)
+        body = read(_BEARER).sub(_keep_label, body)
+        body = _AUTH_SCHEME.sub(_keep_scheme, body)
+        body = read(_CREDENTIAL_KV).sub(_keep_label, body)
+        body = read(_KEY_MATERIAL).sub(_keep_label, body)
+        body = _DSN_PASSWORD.sub(_keep_dsn_user, body)
+        body = _redact_phi(body)  # shared engine PHI pass: HL7 segments/field runs + DOB + names
+        # The second credential layer; see the comment above this function.
+        pieces = [body] if logged_placeholder else body.split(REDACTION_PLACEHOLDER)
+        body = REDACTION_PLACEHOLDER.join(
+            scrub(piece, placeholder=REDACTION_PLACEHOLDER) for piece in pieces
+        )
+        # A connection-string member, its value's words masked to the next ";" (BACKLOG #5030).
+        # secretscrub's own pattern and mask, not a copy, run after the PHI pass and the second
+        # layer and before only the widened DSN pass and the long-base64 sweep below, so it reads
+        # what they left, and over the whole joined body, since this module's placeholder can sit
+        # inside the value (``;PWD=[REDACTED] kx,Pw&mv;``), where the split above cut it. It masks
+        # words only, so the PHI pass and the labels of a later redaction of this line read the
+        # same separators; secretscrub's comment on the pattern says why that matters.
+        if ";" in body:
+            body = _CONNECTION_STRING_MEMBER.sub(_mask_member, body)
+        # The widened DSN reading, last and over the whole line (BACKLOG #5386): at least a
+        # password-only DSN, and a password holding an "@" that the narrow copy above cut at its
+        # first one; the comment on secretscrub's _WIDE_DSN_PASSWORD says what else. It does not
+        # reach past a label a pass reads, a query key the write-time filter hides included,
+        # whether or not a pass above hid its value; the comment on _DSN_PASSWORD says which.
+        if "@" in body and "://" in body:
+            body = _WIDE_DSN_PASSWORD.sub(_keep_dsn_user, body)
+        return body
+
+    body = layers(original, _same, scrub_credentials)
+    # THE MASKED TAILS' CONTROL (BACKLOG #5546 to #5550), stated on ``_NO_LABEL_BEFORE`` in
+    # secretscrub. The first layer's tails mask text before the PHI pass reads it, and a masked
+    # token can end a name run or an HL7 segment that pass would have hidden. So on a line a tail
+    # could fire on, the line is read again without them, and the tailed reading is kept only where
+    # it is that reading with characters written as "x". Compared before the long-base64 sweep,
+    # which reads an "x" run as base64 and only ever hides more.
+    if could_take_a_tail(original):
+        before = layers(original, _without_tails, scrub_credentials_without_tails)
+        if not _mask_only(before, body):
+            body = before
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
 

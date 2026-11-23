@@ -1074,25 +1074,38 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # except whitespace, the quotes and the HL7 delimiters ``|^~\&``. So the line keeps its length and
 # its delimiters, and a pass after this one reads the same separators it read before.
 #
-# THE CONTRACT EVERY TAIL HOLDS, each item a reason one of those designs regressed:
+# WHAT THE TAIL GRAMMAR AIMS AT, each item a reason one of those designs regressed. These are aims
+# of the grammar, and a review found shapes each missed; the control is the next paragraph.
 #
 # * No "{", no line break, no "://" and no quote other than the tail's own inside a tail.
 # * No label head inside a tail unless the label's whole value is inside too. A bytes literal or a
 #   token68 body holds no ":" or "=", except token68's trailing padding, and that padding is refused
 #   when a label word ends right before it (:data:`_NO_LABEL_BEFORE`): ``Basic abc.password==``
-#   would otherwise mask a label ``_CREDENTIAL_KV`` reads.
-# * A tail ends right before whitespace, a quote or the end of the text (:data:`_TAIL_END`).
+#   would otherwise mask a label ``_CREDENTIAL_KV`` reads. A Digest parameter whose name ends in a
+#   label word is refused the same way.
+# * A tail ends right before whitespace not followed by ":" or "=", before a quote not followed by
+#   them, or at the end of the text (:data:`_TAIL_END`). A closer followed by them is a later
+#   label's quote, as in ``token=b'x+pwd'='v'``, and a spaced ``abc.password = 'v'`` is a label.
 # * A shape the tail grammar refuses matches exactly as it did before: the tail group is optional
 #   and possessive, after the whole old match, so a refused tail leaves the old match whole.
-#   :func:`_pre_camel` strips every tail fragment by exact replace, so on a line where a tail could
-#   fire (:func:`_reads_camel`), :func:`_union` hides whatever either reading hid. That is what
-#   covers a cascade the second rule misses, on this function's own output; the bundle's copy in
-#   ``support/redact.py`` and ``logging_setup``'s query filter have no union.
+#
+# THE CONTROL IS A COMPARISON, NOT THE GRAMMAR. Each surface computes the line twice where a tail
+# could fire, with the tails and without them (:func:`_without_tails`, which is the reading before
+# them), and keeps the tailed output only where it has the other's length and differs from it only
+# at an "x" (:func:`_mask_only`); otherwise it keeps the output without the tails, which is what the
+# code before them printed. :func:`scrub_credentials` does it on its own output,
+# ``support.redact.redact_log_line`` on its output before the long-base64 sweep, the query filter in
+# ``logging_setup`` on the credential pass's reading of its output, and the key-block mask on the PHI
+# pass's (:func:`mask_private_key_blocks_then`). So a shape the grammar gets wrong costs coverage,
+# never a value the code before it hid. At least two places are not covered: a record that two
+# handlers filter, where the second pass reads the first's output, and the line across filters on
+# the installed chain, where only the query filter's step is compared.
 #
 # RESIDUALS, at least: a bytes literal whose value holds ":" or "=" prints as before, and so does a
 # quoted scheme token whose padding follows a label word, a token68 followed by anything but
-# whitespace, a quote or the end, and a Digest header whose last parameter is followed by anything
-# else, such as ``;``. A quoted scheme token after an EARLIER label's plain value, as in
+# whitespace, a quote or the end, a Digest header in a dict repr or JSON, with an unquoted first
+# parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
+# A quoted scheme token after an EARLIER label's plain value, as in
 # ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
 # no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3).
 
@@ -1100,10 +1113,14 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
 _NO_LABEL_BEFORE = "".join(
     rf"(?<!(?i:{re.escape(word)}))"
-    for word in sorted(set(_CAMEL_WORDS + _CREDENTIAL_QUERY_KEYS), key=len, reverse=True)
+    for word in sorted(set(_CAMEL_WORDS + _CREDENTIAL_QUERY_KEYS), key=lambda w: (-len(w), w))
 )
-#: Where every tail ends: right before whitespace, a quote, or the end of the text.
-_TAIL_END = r"(?=[\s'\"]|\Z)"
+#: Where every tail ends: right before whitespace or a quote that no ":" or "=" follows, or at the
+#: end of the text.
+_TAIL_END = r"(?=\s++(?![:=])|['\"](?!\s*+[:=])|\Z)"
+#: A bytes literal's closers, each one no ":" or "=" follows, so it is not a later label's quote.
+_SQ_CLOSER = r"(?='(?!\s*+[:=]))"
+_DQ_CLOSER = r"(?=\"(?!\s*+[:=]))"
 #: A token68 credential (RFC 9110 section 11.2) and its padding.
 _TOKEN68 = r"[A-Za-z0-9._~+/-]++(?:" + _NO_LABEL_BEFORE + r"=++)?+" + _TAIL_END
 
@@ -1124,16 +1141,24 @@ _BYTES_PROBE = r"(?:(?=(?P<bytes_open>)b['\"]))?"
 _BYTES_TAIL = (
     r"(?(bytes_open)|(?!))(?<=b)(?P<bytes_tail>'"
     + _BYTES_CHARS
-    + r"*+(?=')|\""
+    + r"*+"
+    + _SQ_CLOSER
+    + r"|\""
     + _BYTES_CHARS
-    + r"*+(?=\"))"
+    + r"*+"
+    + _DQ_CLOSER
+    + r")"
 )
 _MEFOR_BYTES_TAIL = (
     r"(?(bytes_open)|(?!))(?P<bytes_tail>(?<=b')"
     + _BYTES_CHARS
-    + r"*+(?=')|(?<=b\")"
+    + r"*+"
+    + _SQ_CLOSER
+    + r"|(?<=b\")"
     + _BYTES_CHARS
-    + r"*+(?=\"))"
+    + r"*+"
+    + _DQ_CLOSER
+    + r")"
 )
 
 #: BACKLOG #5548. ``_BEARER``'s scheme words as they shipped, and the same with a marker on
@@ -1147,7 +1172,9 @@ _DIGEST_QUOTED = r"\"(?:[^\"'{:\r\n]|:(?!//))*+\""
 _DIGEST_TAIL = (
     r"(?(digest)|(?!))(?P<digest_tail>(?:(?<=[:=])"
     + _DIGEST_QUOTED
-    + r")?+(?:[^\S\r\n]*+,[^\S\r\n]*+[A-Za-z]++=(?:"
+    + r")?+(?:[^\S\r\n]*+,[^\S\r\n]*+[A-Za-z]++"
+    + _NO_LABEL_BEFORE
+    + r"=(?:"
     + _DIGEST_QUOTED
     + r"|[A-Za-z0-9._~+/-]++))*+)"
     + _TAIL_END
@@ -1183,7 +1210,8 @@ def _strip_tails(source: str) -> str:
 #
 # Group 1 is the BEGIN marker, kept. ``key_body`` is every whole line after it that is a base64 run
 # (its padding refused after a label word, as a token68's is), a ``Proc-Type:`` or ``DEK-Info:``
-# header or an empty line, each line separated by a real or an escaped line break. A line is taken
+# header or an empty line, each line separated by a real or an escaped line break, with spaces or
+# tabs allowed at its end. A line is taken
 # only where it ends where a line ends, so a block cut off mid-line by a driver or a clamp is masked
 # only to its last line boundary, and a block with its END marker is masked to that marker. The line
 # breaks are kept, escaped ones too (:func:`_mask_key_body`), so the masked block keeps its layout.
@@ -1198,15 +1226,16 @@ _KEY_LINE = (
     + r"={1,2})?+|Proc-Type:[ ]*+[0-9]++,[A-Z]++|DEK-Info:[ ]*+[A-Za-z0-9-]++,[0-9A-Fa-f]++|)"
 )
 _PRIVATE_KEY_BLOCK = re.compile(
-    r"(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:"
+    r"(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \t]*+"
     + _KEY_SEPARATOR
     + _KEY_LINE
-    + r"(?="
+    + r"[ \t]*+(?="
     + _KEY_SEPARATOR
     + r"|\Z))++)"
 )
-#: The fold of the BEGIN marker's head, for the admission gate.
-_KEY_BLOCK_HINT = ("-----begin",)
+#: The fold of the BEGIN marker's tail, for the admission gate. Not ``-----begin``, which a
+#: certificate holds too.
+_KEY_BLOCK_HINT = ("private key-----",)
 
 # A bearer/authorization token or an opaque session token in a header-ish or "token=" shape.
 #
@@ -2090,7 +2119,7 @@ _TAIL_MASKED = re.compile(r"[^\s'\"|^~\\&]")
 #: ``DEK-Info:`` header line as it was. A header names a cipher and an IV, not key material, and
 #: masking one changed what the PHI pass after it reads: on the line before the tails it rewrote
 #: ``ENCRYPTED`` and the next line's ``DEK`` as a name run, and the masked line kept its length.
-_KEY_BODY_MASKED = re.compile(r"(\\[rn]|(?i:Proc-Type|DEK-Info):[^\r\n\\]*+)|[^\s'\"|^~\\&]")
+_KEY_BODY_MASKED = re.compile(r"(\\[rn]|(?i:Proc-Type|DEK-Info):[^\r\n\\]*+)|[^\s'\"|^~\\&]++")
 
 
 def _mask_tail(text: str) -> str:
@@ -2100,7 +2129,7 @@ def _mask_tail(text: str) -> str:
 
 def _mask_key_body(text: str) -> str:
     """:func:`_mask_tail` over a key body, keeping each escaped ``\\n`` and ``\\r``."""
-    return _KEY_BODY_MASKED.sub(lambda m: m.group(1) or "x", text)
+    return _KEY_BODY_MASKED.sub(lambda m: m.group(1) or "x" * (m.end() - m.start()), text)
 
 
 #: Every tail group a pattern may hold, and how each is written back.
@@ -2132,6 +2161,32 @@ def mask_private_key_blocks(text: str) -> str:
     if "-----" not in text:
         return text
     return _PRIVATE_KEY_BLOCK.sub(_keep_key_marker, text)
+
+
+def _mask_only(before: str, after: str) -> bool:
+    """Whether ``after`` is ``before`` with some characters written as "x": the same length, and
+    every character that differs is an "x". The comparison the comment above
+    :data:`_NO_LABEL_BEFORE` calls the control."""
+    return len(before) == len(after) and all(
+        a == b or a == "x" for b, a in zip(before, after, strict=True)
+    )
+
+
+def mask_private_key_blocks_then(text: str, then: Callable[[str], str]) -> str:
+    """``then`` over ``text`` with its PRIVATE KEY block bodies masked, where that output is
+    ``then(text)`` with characters written as "x"; ``then(text)`` otherwise (BACKLOG #5550).
+
+    For a caller that runs the PHI pass, which reads a block's markers as a name run and rewrites
+    them, so the mask must run before it. The PHI pass may read the masked body differently from
+    the body, as it read the ``ENCRYPTED`` header against the next line's ``DEK``, and the comparison
+    keeps that from printing anything ``then(text)`` hid. A caller clamps ``text`` first, so the mask
+    scans no more than the PHI pass does."""
+    masked = mask_private_key_blocks(text)
+    plain = then(text)
+    if masked is text or masked == text:
+        return plain
+    tailed = then(masked)
+    return tailed if _mask_only(plain, tailed) else plain
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------
@@ -2298,9 +2353,47 @@ def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -
     folded = _gate_fold(text)
     if not _admits(folded, _ANY_HINT):
         return text
+    return _scrub_credentials(text, placeholder, folded)
+
+
+def scrub_credentials_without_tails(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
+    """:func:`scrub_credentials` as it read before the masked tails and the key-block pass, for a
+    caller that compares the two readings itself (``support/redact.py``)."""
+    folded = _gate_fold(text)
+    if not _admits(folded, _ANY_HINT):
+        return text
+    return _scrub_credentials(text, placeholder, folded, tails=False)
+
+
+def _scrub_credentials(
+    text: str, placeholder: str, folded: str | None, *, tails: bool = True
+) -> str:
+    """:func:`scrub_credentials` after its gate. With ``tails`` False, the reading without the masked
+    tails and the key-block pass (BACKLOG #5546 to #5550), which is what the code before them
+    printed. With it True, that reading's output wherever the tailed one is not that output with
+    characters written as "x" (:func:`_mask_only`), and the tailed one otherwise; a line no tail
+    could fire on takes one reading, which the two share there."""
+    if not tails:
+        return _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+    tailed = _one_reading(text, placeholder, folded, _same, None)
+    if not _could_take_a_tail(folded):
+        return tailed
+    before = _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
+    return tailed if _mask_only(before, tailed) else before
+
+
+def _one_reading(
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    read: Callable[[re.Pattern[str]], re.Pattern[str]],
+    sub: _Sub | None,
+) -> str:
+    """One reading of ``text``: each pattern through ``read``, applied by ``sub``, and through
+    :func:`_union` on a line the camelCase reading could change."""
     if _reads_camel(text, folded, placeholder):
-        return _union(text, placeholder, folded)
-    return _run(text, placeholder, folded)
+        return _union(text, placeholder, folded, read, sub)
+    return _run(text, placeholder, folded, sub)
 
 
 #: Query-parameter NAMES that carry a credential in a URL and in nothing else here. Each is too
@@ -2741,8 +2834,9 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
     # reads the tail on, the union still hides it, since it hides what either reading hid.
     source = source.replace(_DSN_TAIL, "")
     # Nor are the masked tails (BACKLOG #5546, #5547, #5548), and nor is the key-block pass (#5550),
-    # which the reading before does not run: so on a line where one could fire, :func:`_union`
-    # hides what either reading hid. A shipped pattern that should hold a tail and does not raises,
+    # which the reading before does not run, so that reading stays the code before them; the
+    # control on the tails is :func:`_scrub_credentials`' comparison, not the union. A shipped
+    # pattern that should hold a tail and does not raises,
     # as :func:`_narrowed_value` does, so a strip cannot silently change nothing.
     if pattern is _PRIVATE_KEY_BLOCK:
         source = r"(?!x)x"
@@ -2759,6 +2853,37 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
 
 def _plain_sub(pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None) -> str:
     return pattern.sub(repl, text)
+
+
+def _same(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    return pattern
+
+
+#: :func:`_without_tails`' compiled readings, keyed as :data:`_PRE_CAMEL` is.
+_WITHOUT_TAILS: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
+
+
+def _without_tails(pattern: re.Pattern[str]) -> re.Pattern[str]:
+    """``pattern`` without the masked tails, and the key-block pass as a pattern that never
+    matches: the reading the code before BACKLOG #5546 to #5550 ran. Compiled once per pattern."""
+    found = _WITHOUT_TAILS.get(id(pattern))
+    if found is not None and found[0] is pattern:
+        return found[1]
+    for fragment in _SHIPPED_TAILS.get(id(pattern), ()):
+        if fragment not in pattern.pattern:
+            raise ValueError(f"no {fragment[:40]} to strip")
+    source = r"(?!x)x" if pattern is _PRIVATE_KEY_BLOCK else _strip_tails(pattern.pattern)
+    if len(_WITHOUT_TAILS) >= 64:  # only patched test patterns get here
+        _WITHOUT_TAILS.clear()
+    compiled = re.compile(source, pattern.flags)
+    _WITHOUT_TAILS[id(pattern)] = (pattern, compiled)
+    return compiled
+
+
+def _without_tails_sub(
+    pattern: re.Pattern[str], repl: _Repl, text: str, _tail: str | int | None
+) -> str:
+    return _without_tails(pattern).sub(repl, text)
 
 
 def _pre_camel_sub(
@@ -2856,7 +2981,7 @@ class _Trace:
 
 
 #: What a line must hold for a masked tail or the key-block pass to fire, folded: each tail's
-#: lookbehind or marker, and the BEGIN marker's head.
+#: lookbehind or marker, and the BEGIN marker's tail.
 _TAIL_TRIGGERS = (*_KEY_BLOCK_HINT, "digest", "'basic", '"basic', "'bearer", '"bearer')
 #: Where :data:`_BYTES_PROBE` can fire: a ``b`` and a quote at a value's start, which follows a
 #: ":", an "=" or white space. Searched for rather than a bare ``b'`` substring, which ``'job'``
@@ -2869,23 +2994,36 @@ def _reads_camel(text: str, folded: str | None, placeholder: str) -> bool:
     these tests are enough."""
     if placeholder[-1:].isalnum() or _CAMEL_PROBE.search(text) is not None:
         return True
-    # A line a masked tail or the key-block pass could fire on (BACKLOG #5546 to #5550): the
-    # reading before leaves both out, so the union covers a cascade the tail contract misses.
+    # Every compound key word ends in "key", so one substring test rejects most lines.
+    return folded is None or ("key" in folded and _admits(folded, _COMPOUND_HINT))
+
+
+def could_take_a_tail(text: str) -> bool:
+    """Whether a masked tail or the key-block pass could fire on ``text`` (BACKLOG #5546 to
+    #5550), so a caller must compare the readings with and without them."""
+    return _could_take_a_tail(_gate_fold(text))
+
+
+def _could_take_a_tail(folded: str | None) -> bool:
     if folded is None or any(trigger in folded for trigger in _TAIL_TRIGGERS):
         return True
-    if _BYTES_TRIGGER.search(folded) is not None:
-        return True
-    # Every compound key word ends in "key", so one substring test rejects most lines.
-    return "key" in folded and _admits(folded, _COMPOUND_HINT)
+    return _BYTES_TRIGGER.search(folded) is not None
 
 
-def _union(text: str, placeholder: str, folded: str | None) -> str:
+def _union(
+    text: str,
+    placeholder: str,
+    folded: str | None,
+    read: Callable[[re.Pattern[str]], re.Pattern[str]] | None = None,
+    sub: _Sub | None = None,
+) -> str:
     """``text`` scrubbed with the shipped patterns, keeping a character of the line only where
     :func:`_pre_camel` of them printed it too: where that reading masked it, its mask, and where it
     hid it, one ``placeholder`` for the run. That reading's own output instead where the shipped one
-    would hide a ";" it printed."""
+    would hide a ";" it printed. ``read`` and ``sub`` give the shipped reading, the patterns as
+    they are by default; :func:`_scrub_credentials` passes the reading without the tails."""
     before = _Trace(len(text), _pre_camel)
-    shipped = _Trace(len(text), lambda pattern: pattern)
+    shipped = _Trace(len(text), _same if read is None else read)
     try:
         # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as it was
         # before BACKLOG #5386 widened that reading. Decided on the widened one, a line where that
@@ -2900,7 +3038,7 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
         except _Changed:
             pass
         else:
-            return _run(text, placeholder, folded)
+            return _run(text, placeholder, folded, sub)
         old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:

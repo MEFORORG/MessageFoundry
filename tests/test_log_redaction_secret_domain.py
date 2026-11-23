@@ -4667,19 +4667,80 @@ def _before_the_tails(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> dic
         return _tail_outputs(corpus)
 
 
-def _mask_only_breaches(
-    monkeypatch: pytest.MonkeyPatch, shipped_swaps: tuple[tuple[str, str], ...] = ()
-) -> list[str]:
-    """Every corpus line and surface where the shipped output, with ``shipped_swaps`` applied, is not
-    the output without the tails with some of its characters written as "x"."""
-    corpus = [
+#: Shapes a review of the first tail build found breaking the invariant on some surface, kept so
+#: none comes back. Each is a later label's quote taken as a closer, a spaced label after a token,
+#: a PHI run a masked token cut short, a PEM marker after a scheme word, or a Digest label.
+_TAIL_REVIEW_SHAPES = (
+    "token=b'x+pwd'='vq1 vq2'",
+    "code=b'pwd'=vq3PID|vq4",
+    "state=b'secret'=vq5",
+    '{"Authorization": "Basic abc.password = \'vq1 vq2\'"}',
+    "Authorization: Bearer b'x(secret'={vq1 vq2}",
+    " MEFOR_X=b'pwd'=DOE JANE vq1",
+    '{"Authorization": "Basic SMITH JOHN Q',
+    "password=b'PID|x': vq1",
+    'api_key: "Basic ' + pem_block("RSA PRIVATE KEY", "\\n", "AAAA"),
+    'Authorization: Digest username="u", password="vq1 vq2" tail',
+    'Authorization: "Basic u="vq0"; password="vq1 vq2"',
+    pem_marker("BEGIN", "RSA PRIVATE KEY")
+    + " \nvq1vq2 \nvq3\n"
+    + pem_marker("END", "RSA PRIVATE KEY"),
+)
+
+#: The pieces the tail-aware corpus joins: every tail's trigger and closers, label heads, PHI
+#: shapes and the separators between them. The two seeded corpora above hold none of the triggers,
+#: so over them alone a tail never fires (found by code review).
+_TAIL_FUZZ_PIECES = (
+    *('"Basic ', "'Bearer ", '"bearer ', "b'", 'b"', "Digest ", 'username="', ', nonce="'),
+    *(pem_marker("BEGIN", "RSA PRIVATE KEY"), pem_marker("END", "RSA PRIVATE KEY")),
+    *("\n", "\\n", "==", "=", ":", " = ", "'", '"', "'", '"', " ", " ", ",", ";", "{", "}"),
+    *("password", "pwd", "token", "private_key", "MEFOR_X", "Authorization: ", "code"),
+    *("SMITH JOHN ", "DOE JANE", "PID|", "|", "^", "2024-01-01", ".", "+", "/", "-", "AAAA"),
+)
+
+
+def _tail_fuzz_lines(count: int) -> list[str]:
+    """``count`` lines from :data:`_TAIL_FUZZ_PIECES` and ``vq`` atoms, seeded."""
+    rng = random.Random(5546)
+    return [
+        "".join(
+            f"vq{j}" if rng.random() < 0.25 else rng.choice(_TAIL_FUZZ_PIECES)
+            for j in range(rng.randint(3, 16))
+        )
+        for _ in range(count)
+    ]
+
+
+def _tail_corpus() -> list[str]:
+    return [
         *_REVIEW_SHAPES,
         *_TAKEN_TAIL_SHAPES,
         _QUERY_TAIL_SHAPE,
         *_REFUSED_TAIL_SHAPES,
-        *_fuzz_lines(4000),
-        *_structured_lines(4000),
+        *_TAIL_REVIEW_SHAPES,
+        *_tail_fuzz_lines(3000),
+        *_fuzz_lines(2000),
+        *_structured_lines(2000),
     ]
+
+
+def _without_the_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take out the comparison that keeps the output without the tails wherever the tailed one is
+    not mask-only, on every surface, so a control sees what the tail grammar alone does."""
+    for module in (scrub_mod, redact_mod, logging_mod):
+        monkeypatch.setattr(module, "_mask_only", lambda _before, _after: True)
+
+
+def _mask_only_breaches(
+    monkeypatch: pytest.MonkeyPatch,
+    shipped_swaps: tuple[tuple[str, str], ...] = (),
+    *,
+    compare: bool = True,
+) -> list[str]:
+    """Every corpus line and surface where the shipped output, with ``shipped_swaps`` applied and the
+    comparison taken out unless ``compare``, is not the output without the tails with some of its
+    characters written as "x"."""
+    corpus = _tail_corpus()
     key_block = _swapped(scrub_mod._PRIVATE_KEY_BLOCK.pattern, shipped_swaps)
     fragments = tuple((_swapped(f, shipped_swaps), b) for f, b in scrub_mod._TAIL_FRAGMENTS)
     with monkeypatch.context() as patch:
@@ -4688,8 +4749,10 @@ def _mask_only_breaches(
             shipped_swaps,
             key_block=re.compile(key_block, scrub_mod._PRIVATE_KEY_BLOCK.flags),
         )
-        # So ``_pre_camel`` strips the loosened tails, as it strips the shipped ones.
+        # So ``_pre_camel`` and ``_without_tails`` strip the loosened tails, as the shipped ones.
         patch.setattr(scrub_mod, "_TAIL_FRAGMENTS", fragments)
+        if not compare:
+            _without_the_comparison(patch)
         new = _tail_outputs(corpus)
     old = _before_the_tails(monkeypatch, corpus)
     breaches = []
@@ -4745,13 +4808,26 @@ def test_a_refused_tail_shape_prints_byte_for_byte_as_before(
 def test_the_invariant_sees_each_tail_guard_removed(
     guard: str, loosened: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """THE POSITIVE CONTROLS. Each guard of the tail contract, loosened in every stopped pattern of
-    both copies and in the query filter, must make the invariant find a breach: the bytes literal
-    that may hold ":" or "=", the padding refused after a label word, and the end rule."""
+    """THE POSITIVE CONTROLS FOR THE GRAMMAR. The comparison would hide a loosened guard, so it is
+    taken out on both sides here: each guard of the tail grammar, loosened in every stopped pattern
+    of both copies and in the query filter, must then make the invariant find more breaches than
+    the grammar alone leaves. The bytes literal that may hold ":" or "=", the padding refused after
+    a label word, and the end rule."""
     fragment: str = getattr(scrub_mod, guard)
     assert any(fragment in getattr(scrub_mod, name).pattern for name in _STOPPED_PATTERNS)
-    breaches = _mask_only_breaches(monkeypatch, ((fragment, loosened),))
-    assert breaches, f"with {guard} loosened the invariant found nothing, so it cannot see it"
+    grammar_alone = len(_mask_only_breaches(monkeypatch, compare=False))
+    loosened_count = len(_mask_only_breaches(monkeypatch, ((fragment, loosened),), compare=False))
+    assert loosened_count > grammar_alone, (
+        f"with {guard} loosened the invariant found {loosened_count} breaches, against "
+        f"{grammar_alone} with it in place, so it cannot see that guard"
+    )
+
+
+def test_the_comparison_is_what_keeps_the_tails_mask_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL FOR THE COMPARISON. Over the same corpus, with the comparison taken out,
+    the tail grammar alone breaks the invariant somewhere, so the green invariant above is the
+    comparison's work, and the invariant can see the comparison removed."""
+    assert _mask_only_breaches(monkeypatch, compare=False), "the grammar alone breaks nothing"
 
 
 def test_a_scheme_token_after_an_earlier_plain_value_still_prints() -> None:
