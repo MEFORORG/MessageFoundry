@@ -267,9 +267,8 @@ source = "measured 2026-11-02 UTC (Windows engine step-margin re-measure, 2026-1
 #     were skipped.
 #
 # THE 2026-10-17 ROWS ABOVE WERE THEMSELVES A RE-MEASURE, the web console step-margin gate re-measure
-# of that date, after the gate reddened windows-2022 with every test passing on at least engine PRs
-# 2347, 2349, 2360 and 2371 and on merge-group runs 39012965647 and 39012997644, which the queue
-# ejected. They replaced the 2026-10-07 rows.
+# of that date. ci.yml's "THE FIFTH RE-DERIVATION" note names the runs it was cut for. They replaced
+# the 2026-10-07 rows.
 #
 # THE 2026-10-07 ROWS. ci.yml's "THE FOURTH RE-DERIVATION" note cites this pool, so each row is kept
 # here whole:

@@ -1787,8 +1787,8 @@ jobs:
       # 16 -> 19 and 24 -> 27.
       #
       # THE SIXTH RE-DERIVATION PULLED IT ON TWO, the same way: ubuntu's kill 12 -> 13 and job cap
-      # 23 -> 24, windows-2022's 15 -> 17 and 24 -> 26. windows-2025's did not move. So every leg
-      # keeps the slack the table above gives it.
+      # 23 -> 24, windows-2022's 15 -> 17 and 24 -> 26. So every leg keeps the slack the table above
+      # gives it.
       # tests/test_ci_step_margin.py parses this table and re-adds every row.
       #
       # THE RULER AND THE WALL: THE MARGIN CAP AND THE KILL ARE NOW TWO NUMBERS, DELIBERATELY.
@@ -2127,16 +2127,15 @@ jobs:
       # progress lines are more than 0:34 apart, so none holds a stall of a minute. This step passes
       # no `--durations`, so a hosted log cannot rank single tests. One local run at this step's
       # flags, on main d2ed8a8bd, put the largest single test at 0.58 percent of summed test time
-      # and the 9 test files added since the pool opened at 7.2 percent. That run is on a different
-      # machine, so it is a pointer and not a hosted measurement. Passed tests in the logs read rose
-      # 1325 -> 1472 over the pool, across 21 commits, the largest holding 20 percent of the added
-      # test lines.
+      # and the 9 test files added since the pool opened at 7.2 percent. It is a pointer, not a
+      # hosted measurement. Passed tests in the hosted logs rose 1325 -> 1472 over the pool, across
+      # 21 commits, the largest holding 20 percent of the added test lines.
       #
       # THE RUNNER IMAGE MOVED IN THE SAME WEEK, AND NO SHARE OF THE RISE IS ATTRIBUTED TO IT.
       # ubuntu's image went from 20261103.629 to 20261111.635 during the pool. Among the 55 ubuntu
-      # rows of 2026-11-20, all over 1395 to 1421 tests, 36 on the older image took a median 6:00
-      # and 19 on the newer 6:21. That is one day, not controlled for load, so it says the image may
-      # matter and not how much.
+      # rows of 2026-11-20, each running 1395 to 1421 tests, 36 on the older image took a median
+      # 6:00 and 19 on the newer 6:21. That is one day, not controlled for load, so it says the
+      # image may matter and not how much.
       #
       # windows-2022's 13 RESTS ON ONE RUN, AND THAT RUN IS RUNNER TIME. Run 44592652313 took 9:27
       # on this leg in attempt 1 and 7:20 in attempt 2, on the same tree; attempt 1's ubuntu and
@@ -2144,13 +2143,8 @@ jobs:
       # It is kept for the reason the fourth and fifth re-derivations kept theirs: excluding a run
       # is a change to the sizing rule, which this re-measure did not make.
       #
-      # THIS POOL IS NARROWER THAN THE FIFTH'S. It opens 2026-11-16 rather than where the fifth
-      # closed, to hold the shared API budget, so the jobs of the 3171 runs listed between the two
-      # were not read. A slower run among them would not be in these rows.
-      #
-      # AT THESE CAPS the gate reds at 7:42 or longer on ubuntu, 10:01 or longer on windows-2022 and
-      # 10:47 or longer on windows-2025 -- 6.7, 6.0 and 5.9 percent over each leg's worst pooled
-      # run.
+      # AT THESE CAPS the gate reds from 7:42 on ubuntu, 10:01 on windows-2022 and 10:47 on
+      # windows-2025 -- 6.7, 6.0 and 5.9 percent over each leg's worst pooled run.
       #
       # THE CONSOLE SUITE HAS ITS OWN TIMING-SENSITIVE TESTS, and contention is the cost this change
       # pays rather than one it avoids. `test_webui_account.py`'s TOTP helper,
