@@ -126,7 +126,8 @@ if (NODE_SIDE) {
   // extension's own is dropped, not a named list, so none that configEditors pulls in transitively
   // stays cached bound to this stub and to the fake CLI below.
   const outDir = path.resolve(__dirname, "..", "..");
-  const ours = (f: string): boolean => f.startsWith(outDir) && !f.includes(`${path.sep}test${path.sep}`);
+  const testDir = path.join(outDir, "test") + path.sep;
+  const ours = (f: string): boolean => f.startsWith(outDir + path.sep) && !f.startsWith(testDir);
   const saved = new Map(Object.entries(require.cache).filter(([f]) => ours(f)));
   for (const f of saved.keys()) {
     delete require.cache[f];
@@ -192,8 +193,14 @@ providerSuite("connections custom editor answers the form's fields request (BACK
     );
     assert.ok(handler, "the provider registered no message handler");
     await settle(() => /const MF_CHANNEL = "/.test(webview.html));
+    return pageToken();
+  }
+
+  function pageToken(): string {
     const token = /const MF_CHANNEL = "([^"]+)"/.exec(webview.html)?.[1];
     assert.ok(token, "the rendered form carries no page token");
+    // The fake CLI throws on any call it does not know; the provider turns that into an error post.
+    assert.ok(!posts.some((p) => p.command === "error"), `the render posted an error: ${JSON.stringify(posts)}`);
     return token;
   }
 
@@ -212,12 +219,16 @@ providerSuite("connections custom editor answers the form's fields request (BACK
   });
 
   test("a request from a page that is no longer showing gets no reply", async () => {
-    const token = await open();
-    await ask("stale");
-    assert.ok(!posts.some((p) => p.command === "fields"), "a stale page's request was answered");
+    const first = await open();
+    // The picker's "New connection" re-renders the panel, so the first page is gone.
+    await handler!({ command: "select", name: null });
+    const second = pageToken();
+    assert.notStrictEqual(second, first, "the select did not re-render the page");
+    await ask(first);
+    assert.ok(!posts.some((p) => p.command === "fields"), "a replaced page's request was answered");
     // Control: the same request from the page that is showing IS answered, so the silence above is
     // the stale-page drop and not a rebuild that failed.
-    await ask(token);
+    await ask(second);
     assert.ok(posts.some((p) => p.command === "fields"), "the live page's request was not answered");
   });
 });
