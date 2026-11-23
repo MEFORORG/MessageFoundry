@@ -1681,13 +1681,15 @@ async def test_a_window_of_zero_removes_the_whole_step_up_return_audit_budget() 
     """BACKLOG #3965: a window of 0 removes the whole budget. This first planted a negative
     global, which refused every row there; the load now refuses that (BACKLOG #5318), and a window
     of 0 prunes every hit before it counts, so this pins the behaviour rather than the
-    ``backstop_on`` window term, which no loadable value can still need."""
+    ``backstop_on`` window term; the backstop is asserted unbuilt to pin that term."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(
             store,
             AuthSettings(login_rate_limit_window_seconds=0.0, login_rate_limit_global=1),
         )
+        assert service._step_up_return_audit_backstop is None
+        assert service._step_up_return_audit_floor is None
         pages: list[str] = []
         service._step_up_return_audit_alert = pages.append
         assert all(

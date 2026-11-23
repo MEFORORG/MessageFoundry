@@ -74,17 +74,16 @@ def test_auth_loads_its_floor(field: str, value: Any) -> None:
 
 
 def test_the_oidc_allow_list_comment_claims_no_runtime_recheck() -> None:
-    """S09-58: no OIDC runtime module reads ``oidc_allowed_endpoints``; only the load does. The
-    comment once said jwks and flow re-check it before each outbound call."""
+    """S09-58: the comment once said jwks and flow re-check the allow-list before each outbound
+    call, and no OIDC runtime module reads it. This pins the comment only: a runtime re-check added
+    later is welcome, and should change the comment with it."""
     import inspect
 
-    from messagefoundry.auth import oidc_http
-    from messagefoundry.auth.oidc import client_auth, flow, jwks
     from messagefoundry.config import settings
 
-    for module in (client_auth, flow, jwks, oidc_http):
-        assert "oidc_allowed_endpoints" not in inspect.getsource(module)
-    assert "re-check before each outbound call" not in inspect.getsource(settings)
+    source = inspect.getsource(settings)
+    assert "re-check before each outbound call" not in source
+    assert "Only the\n    # model-validator reads it, at load" in source
 
 
 # --- [store], [api] and every float in every section (BACKLOG #5769) ----------------------------

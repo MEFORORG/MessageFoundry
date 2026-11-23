@@ -7791,10 +7791,14 @@ class DrSettings(_Section):
     @field_validator("seed_archive", "restore_token")
     @classmethod
     def _path_not_blank(cls, value: str, info: ValidationInfo) -> str:
-        # "" switches each off. A present-but-whitespace value is truthy, so activation would try to
-        # open it and abort every time, during the disaster (BACKLOG #5965 item 1).
+        # "" switches each off. A blank or space-padded value is a path activation would try to open
+        # as written and abort on every time, during the disaster (BACKLOG #5965 item 1).
         if value and not value.strip():
             raise ValueError(f"[dr].{info.field_name} must be a non-blank path (or omit it)")
+        if value != value.strip():
+            raise ValueError(
+                f"[dr].{info.field_name} must not begin or end with whitespace; remove the padding"
+            )
         return value
 
     @field_validator("takeover_timeout_seconds")

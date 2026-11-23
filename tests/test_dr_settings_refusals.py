@@ -68,6 +68,13 @@ def test_a_blank_path_is_refused(field: str, blank: str) -> None:
         DrSettings.model_validate({field: blank})
 
 
+@pytest.mark.parametrize("field", ["seed_archive", "restore_token"])
+def test_a_padded_path_is_refused(field: str) -> None:
+    """Activation would open the padded path as written and abort."""
+    with pytest.raises(ValidationError, match=rf"\[dr\]\.{field} must not begin or end"):
+        DrSettings.model_validate({field: " C:/dr/seed.mfbak "})
+
+
 def _toml(tmp_path: Path, store: str, dr: str) -> Path:
     cfg = tmp_path / "messagefoundry.toml"
     cfg.write_text(f"[store]\n{store}\n[dr]\n{dr}\n", encoding="utf-8")

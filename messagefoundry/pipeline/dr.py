@@ -283,8 +283,9 @@ class DrCoordinator:
         # written: (detail, actor, now). Set before the write and cleared after it, so a write that a
         # cancellation or a store error cut short is written by the next activate or release call
         # rather than that call answering success with no row (vault BACKLOG #2751). Held in memory
-        # only, so a restart loses it; the refusal and its log line are what record that. A box active
-        # from [dr].activate at boot never set it: that activation is the configuration's.
+        # only, so a restart loses it; the refusal and its log line are what record that. Only a
+        # settings object built in code can start a box active, since the load refuses
+        # [dr].activate = true (BACKLOG #5965); such a box never set it.
         self._unrecorded_activation: tuple[dict[str, object], str, float] | None = None
         # The same for a completed hand-back whose dr.release row is not yet known to be written
         # (vault BACKLOG #2752). The next activate or release call writes it first.
