@@ -14,7 +14,7 @@ the current primary mid-load**, and measures what a failover actually costs:
   lease TTL`` (relative, so it stays valid whatever timings a profile sets);
 * **no loss (acknowledged)** — every message the engine accept-ACKed reached the sink (``acked ⊆
   delivered``, via :class:`~harness.load.failover_track.FailoverTracker`), with nothing stranded
-  (``in_pipeline == 0``) and the outbound dead count unchanged from the run's opening read;
+  (``in_pipeline == 0``) and no dead-letters;
 * **bounded duplicates** — at-least-once re-deliveries (``sink_received − engine done``) under a rate cap;
 * **per-lane FIFO** — first arrivals per engine outbound DESTINATION (the lane, recovered from MSH-6 —
   the MLLP connector opens a fresh connection per delivery, so the lane is the destination, not the
@@ -736,7 +736,7 @@ async def run_failover_load(
                 tracker,
                 outcome,
                 final,
-                opening,
+                opening.done,
                 fo,
                 notes,
             )
@@ -863,34 +863,17 @@ def _build_report(
     tracker: FailoverTracker,
     outcome: _KillOutcome,
     final: NodeStats,
-    opening: NodeStats,
+    done_at_start: int,
     fo: Failover,
     notes: list[str],
 ) -> FailoverReport:
     c = counters.snapshot()
-    engine_delivered = max(0, final.done - opening.done)
+    engine_delivered = max(0, final.done - done_at_start)
     duplicates = max(0, c.sink_received - engine_delivered)
     dup_rate = duplicates / engine_delivered if engine_delivered else 0.0
     acked_not_delivered = tracker.acked_not_delivered()
     intake_gap = max(0, c.sent - c.acked)
-    # Nonzero either way fails. A fall means dead rows left the count during the run (a replay or a
-    # store reset; a retention purge keeps them), so it can no longer show whether a row also went
-    # dead, and a plain "> 0" would pass that. Rows leaving in exactly the number that newly went
-    # dead still read as zero: these two counters cannot show it (BACKLOG #5572).
-    dead_new = final.dead - opening.dead
-    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and dead_new == 0
-    if dead_new > 0:
-        notes.append(f"{dead_new} row(s) went dead this run ({opening.dead} -> {final.dead})")
-    elif dead_new < 0:
-        notes.append(
-            f"the dead count fell during the run ({opening.dead} -> {final.dead}), so new dead "
-            "rows cannot be ruled out; failing the no-loss check"
-        )
-    elif opening.dead:
-        notes.append(
-            f"{opening.dead} dead row(s) carried over from before this run; the count did not "
-            "change (as many rows replayed out as newly went dead would not show)"
-        )
+    no_loss_ok = acked_not_delivered == 0 and final.in_pipeline == 0 and final.dead == 0
     recovery_bound = fo.recovery_ttl_multiple * fo.leader_lease_ttl_seconds
 
     slos = [

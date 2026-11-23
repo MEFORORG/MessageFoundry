@@ -338,7 +338,7 @@ def _stats(*, done: int = 0, dead: int = 0, in_pipeline: int = 0) -> NodeStats:
     return NodeStats(done=done, dead=dead, pending=in_pipeline, inflight=0, in_pipeline=in_pipeline)
 
 
-def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None, opening=None):
+def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None, done_at_start=0):
     fo = _profile().failover
     assert fo is not None
     return _build_report(
@@ -348,7 +348,7 @@ def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None
         tracker,
         outcome or _outcome(),
         final or _stats(done=294),
-        opening=opening or _stats(),
+        done_at_start=done_at_start,
         fo=fo,
         notes=[],
     )
@@ -456,49 +456,12 @@ def test_build_report_single_leader_passes_with_samples() -> None:
     assert any(s.name == "single_leader" and s.ok for s in rep.slos)
 
 
-def _no_loss_ok(rep: failover.FailoverReport) -> bool:
-    return next(s.ok for s in rep.slos if s.name == "no_acknowledged_loss")
-
-
-def test_dead_rows_carried_over_from_a_reused_store_do_not_fail_a_clean_run() -> None:
-    rep = _report(
-        tracker=_full_tracker(),
-        opening=_stats(done=5000, dead=3),
-        final=_stats(done=5294, dead=3),
-    )
-    assert rep.result_ok is True
-    assert rep.dead_final == 3  # still the absolute count, so the carried-over rows stay visible
-    assert any("carried over" in n for n in rep.notes)
-
-
-@pytest.mark.parametrize(
-    ("final_dead", "note"),
-    [
-        (4, "went dead"),  # a new dead row on a reused store
-        (1, "fell"),  # three replayed out and one new: a plain delta reads -2 and would pass
-        (0, "fell"),
-    ],
-)
-def test_a_dead_count_that_moves_fails_the_run(final_dead: int, note: str) -> None:
-    rep = _report(
-        tracker=_full_tracker(),
-        opening=_stats(done=5000, dead=3),
-        final=_stats(done=5294, dead=final_dead),
-    )
+def test_any_dead_row_at_the_end_fails_the_run() -> None:
+    # The counters cannot separate carried-over dead rows from new ones, so the check stays absolute.
+    rep = _report(tracker=_full_tracker(), done_at_start=5000, final=_stats(done=5294, dead=3))
+    assert rep.dead_final == 3
     assert rep.result_ok is False
-    assert _no_loss_ok(rep) is False
-    assert rep.dead_final == final_dead
-    assert any(note in n for n in rep.notes)
-
-
-def test_in_pipeline_stays_absolute_on_a_reused_store() -> None:
-    rep = _report(
-        tracker=_full_tracker(),
-        opening=_stats(done=5000, dead=3, in_pipeline=2),
-        final=_stats(done=5294, dead=3, in_pipeline=2),
-    )
-    assert rep.result_ok is False
-    assert _no_loss_ok(rep) is False
+    assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
 
 
 def test_duplicates_are_measured_against_the_opening_done_count() -> None:
@@ -506,7 +469,7 @@ def test_duplicates_are_measured_against_the_opening_done_count() -> None:
     rep = _report(
         tracker=_full_tracker(),
         counters=_counters(sink_received=1200),
-        opening=_stats(done=5000),
+        done_at_start=5000,
         final=_stats(done=6000),
     )
     assert rep.engine_delivered == 1000
