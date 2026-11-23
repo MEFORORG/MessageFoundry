@@ -46,6 +46,7 @@ refill a spent allowance.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -79,6 +80,8 @@ __all__ = [
     "RefusedBodyPolicy",
     "head_only_resubmit_refusal",
 ]
+
+log = logging.getLogger(__name__)
 
 #: The engine-internal metadata key. ``store.metadata.user_metadata`` exposes only the ``user`` bag,
 #: so this never reaches the API's user-metadata field.
@@ -256,17 +259,26 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
     parse, so resubmitting it could route a message with its tail missing as if it were whole.
 
     A whole-stored refusal, any other row, and metadata that is absent (a retention purge nulls it
-    with the body) or unreadable all answer ``None``, as before this check existed. The text names
-    lengths and ``message_id`` only, never a byte of the body or another message's id."""
+    with the body) or not JSON answer ``None``, as before this check existed. Metadata nested too
+    deep to decode is refused: whether it records a head cannot be read, so it is not let through
+    (BACKLOG #5758). The text names lengths and ``message_id`` only, never a byte of the body or
+    another message's id; the deep-nesting refusal names ``message_id`` alone."""
     if not metadata:
         return None
     try:
         parsed = json.loads(metadata)
-    except (TypeError, ValueError, RecursionError):
-        # Deep nesting overflows the decoder with a RecursionError, which is not a ValueError. The
-        # store's edit paths decode the same cell again and refuse it as a 409 when it overflows
-        # there too (BACKLOG #5758); nothing here pins that both overflow at the same depth.
+    except (TypeError, ValueError):
         return None
+    except RecursionError:
+        # Deep nesting overflows the decoder with a RecursionError, which is not a ValueError.
+        # Whether the cell records a head is then unknown, so refuse rather than let it through.
+        log.warning(
+            "message %s metadata is nested too deeply to read; the edit was refused", message_id
+        )
+        return (
+            f"message {message_id} metadata is nested too deeply to read, so it cannot be edited"
+            " and resubmitted from this copy"
+        )
     record = parsed.get(METADATA_KEY) if isinstance(parsed, dict) else None
     if not isinstance(record, dict) or record.get("stored") != "head":
         return None

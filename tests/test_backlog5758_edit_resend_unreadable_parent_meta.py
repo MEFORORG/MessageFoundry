@@ -23,7 +23,6 @@ import pytest
 
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.refused_body import head_only_resubmit_refusal
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.base import ResendError, ResendOriginMetadataUnreadable
 from messagefoundry.store.postgres import PostgresStore
@@ -115,8 +114,18 @@ async def _engine(tmp_path: Path) -> Engine:
     return engine
 
 
+#: The store's refusal, and the route's head-only check's refusal of a cell too deep to decode.
+_STORE_REFUSAL = "does not hold readable correlation metadata"
+_TOO_DEEP_REFUSAL = "nested too deeply to read"
+
+
 async def _assert_refused_and_untouched(
-    engine: Engine, mid: str, to: str | None, caplog: pytest.LogCaptureFixture
+    engine: Engine,
+    mid: str,
+    to: str | None,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    refusals: tuple[str, ...] = (_STORE_REFUSAL,),
 ) -> None:
     store = engine.store
     assert isinstance(store, MessageStore)
@@ -129,7 +138,7 @@ async def _assert_refused_and_untouched(
     assert any(
         "edit was refused" in rec.getMessage() and mid in rec.getMessage() for rec in caplog.records
     )
-    assert "does not hold readable correlation metadata" in r.json()["detail"]
+    assert any(refusal in r.json()["detail"] for refusal in refusals), r.text
     assert mid in r.json()["detail"]
     assert _SENTINEL not in r.text and _SENTINEL not in caplog.text
     # Nothing was written: no child, the dead-lettered row as it was, and the key still free.
@@ -149,7 +158,14 @@ async def test_edit_resend_of_a_dead_lettered_cell_is_a_409(
     try:
         mid = await _dead_lettered(engine, cell)
         await engine.start()
-        await _assert_refused_and_untouched(engine, mid, to, caplog)
+        # A cell too deep to decode is refused by whichever decoder overflows first: the route's
+        # head-only check, which runs before the store, or the store's own.
+        refusals = (
+            (_STORE_REFUSAL, _TOO_DEEP_REFUSAL)
+            if cell == BAD_CELLS["deep-nesting"]
+            else (_STORE_REFUSAL,)
+        )
+        await _assert_refused_and_untouched(engine, mid, to, caplog, refusals=refusals)
     finally:
         await engine.stop()
 
@@ -236,9 +252,3 @@ def test_every_store_builds_the_edit_child_with_the_helper(store_cls: type, meth
     source = inspect.getsource(getattr(store_cls, method))
     assert "edit_child_metadata(" in source
     assert 'int(parent_meta.get("correlation_depth"' not in source
-
-
-def test_head_only_check_reads_a_too_deep_cell_as_no_refusal() -> None:
-    """The route's head-only check runs before the store; a cell too deep to decode is not a
-    head-only refusal, so the store's own 409 answers it rather than a RecursionError."""
-    assert head_only_resubmit_refusal("origin-1", BAD_CELLS["deep-nesting"]) is None
