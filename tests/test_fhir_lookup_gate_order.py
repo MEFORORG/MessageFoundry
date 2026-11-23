@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #8299 items 2, 3, 4, 6, 8 and 9: the order of the FhirLookupExecutor's checks and gates.
 
-A check that needs no I/O and logs nothing runs for every lookup before any lookup reaches a hop
-gate, so a lookup it refuses leaves no crossing record, from itself or from a lookup built before
+The checks ``_planned`` runs come for every lookup before any lookup reaches a hop gate, so a
+lookup one of them refuses leaves no crossing record, from itself or from a lookup built before
 it. Synthetic values only.
 """
 
@@ -151,13 +151,22 @@ def test_the_static_credential_check_runs_before_the_token_provider_is_built(
     [
         ({"headers": ["X-Site", "1"]}, "'headers' must be a table"),
         ({"basic_user": "u"}, "basic_user and basic_password must be set together"),
+        ({"headers": []}, "'headers' must be a table"),
         ({"basic_password": "p"}, "basic_user and basic_password must be set together"),
+        ({"basic_user": "a:b", "basic_password": "p"}, "basic_user must not contain ':'"),
         (
             {"basic_user": "u", "basic_password": "p", "bearer_token": "t"},
             "both bearer_token and basic_user",
         ),
     ],
-    ids=["headers-list", "user-only", "password-only", "bearer-and-basic"],
+    ids=[
+        "headers-list",
+        "user-only",
+        "headers-empty-list",
+        "password-only",
+        "colon",
+        "bearer-and-basic",
+    ],
 )
 def test_a_static_credential_the_lookup_would_drop_is_refused(
     over: dict[str, Any], match: str
@@ -196,12 +205,13 @@ def _destination(**over: Any) -> object:
         ({"headers": ["X-Site", "1"]}, "'headers' must be a table"),
         ({"basic_user": "u"}, "basic_user and basic_password must be set together"),
         ({"basic_password": "p"}, "basic_user and basic_password must be set together"),
+        ({"basic_user": "a:b", "basic_password": "p"}, "basic_user must not contain ':'"),
         (
             {"basic_user": "u", "basic_password": "p", "bearer_token": "t"},
             "both bearer_token and basic_user",
         ),
     ],
-    ids=["headers-list", "user-only", "password-only", "bearer-and-basic"],
+    ids=["headers-list", "user-only", "password-only", "colon", "bearer-and-basic"],
 )
 def test_the_fhir_destination_refuses_the_same_dropped_credentials(
     over: dict[str, Any], match: str
@@ -209,7 +219,7 @@ def test_the_fhir_destination_refuses_the_same_dropped_credentials(
     """Item 8, on the destination's own copy of ``_build_headers``."""
     with pytest.raises(ValueError, match=match) as ei:
         _destination(**over)
-    assert "FHIR destination" in str(ei.value)
+    assert str(ei.value).startswith("connection 'OB_FHIR'; FHIR destination")
 
 
 def test_the_control_the_fhir_destination_still_builds_a_whole_credential() -> None:
