@@ -15,8 +15,9 @@ On Windows those modes do not restrict the file, so the candidate is given a pro
 granting the editing account, and the live file's owner when that is another account, before its
 first byte is written. An own-account replaced file is then given the editing account's list
 alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor``
-says why that is one whole-list write and not ``store._secure_file``, which is only the fallback
-when the write fails. The caller's ``validate`` runs against that candidate. Only a candidate that
+writes that one whole list. ``store._secure_file``, which can grant only the editing account, is
+the fallback when that write fails, and on Windows only for a file no other account owns. The
+caller's ``validate`` runs against that candidate. Only a candidate that
 validates replaces the live file, so a refused edit never touches the live file at all: its bytes
 and its permission bits stay exactly as they were, and there is no rollback write to get wrong.
 
@@ -440,6 +441,11 @@ def replace_validated(
     # owner at full control, the editor at read only. A refused ownership hand-back whose list was
     # written never gets here.
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
+        return
+    if sys.platform == "win32" and live.windows_owner is not None:
+        # store._secure_file writes a list granting the editing account alone, which would take the
+        # owning account's entry the candidate gave the file (vault BACKLOG #5619). The file keeps
+        # the candidate's list, and _restrict_to_editor has logged its failure.
         return
     _secure_file(path)
 

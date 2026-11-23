@@ -1856,7 +1856,7 @@ _CODE_PROBE_DELETIONS: tuple[tuple[str, str, str, Callable[[str], bool]], ...] =
     ),
     (
         "store/store.py",
-        "        _secure_file(path)\n",
+        "        _secure_file(path, keep_trio_entries=True)\n",
         "        pass\n",
         lambda src: source_calls(src, "_secure_file"),
     ),

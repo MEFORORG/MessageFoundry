@@ -242,6 +242,40 @@ def test_secure_file_drops_another_principals_explicit_entry(tmp_path, others: s
     assert_owner_only(path, sid)
 
 
+#: A per-service virtual account's shape (NT SERVICE\<name>); no service here holds it.
+_SERVICE_SID = "S-1-5-80-1000000001-1000000002-1000000003-1000000004-1000000005"
+
+
+@_windows_only
+def test_the_store_trio_fallback_keeps_its_trio_entries_and_drops_the_rest(tmp_path) -> None:
+    # A store file the installer's rule already restricted (SYSTEM, Administrators, the service at
+    # Modify) whose directory is later refused, so the open takes the owner-only fallback. The
+    # fallback keeps those three, as the icacls rewrite did (ADR 0163), or it would shut the service
+    # out. Broad or stray explicit entries are dropped. RED before the fix: icacls kept every
+    # explicit entry, so Everyone and OWNER RIGHTS stayed.
+    import messagefoundry.store.store as store_mod
+    from tests._win_acl import folder_granting, protected_entries
+
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "messagefoundry.db"
+    path.write_bytes(b"x")
+    trio = f"(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{_SERVICE_SID})"
+    stray = "(A;;FR;;;WD)(A;;FA;;;OW)(A;;0x1301bf;;;S-1-5-32-545)"
+    seeded = store_mod._set_security_from_sddl(path, f"D:P{trio}{stray}", protected=True)
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
+    store_mod._secure_store_file(path, dir_grants=None)
+    sddl, _, entries = protected_entries(path)
+    assert sorted(entries) == sorted(
+        [
+            ("A", "", "FA", sid),
+            ("A", "", "FA", "S-1-5-18"),
+            ("A", "", "FA", "S-1-5-32-544"),
+            ("A", "", "0X1301BF", _SERVICE_SID),
+        ]
+    ), sddl
+
+
 @_windows_only
 def test_grant_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     # _grant_read is the store's remaining icacls call, and it WRITES an access list, so it must
@@ -296,7 +330,7 @@ def _record_secure_file_threads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
     idents: list[int] = []
 
-    def _record(path: object) -> None:
+    def _record(path: object, **_kw: object) -> None:
         idents.append(threading.get_ident())
 
     monkeypatch.setattr(store_mod, "_secure_file", _record)

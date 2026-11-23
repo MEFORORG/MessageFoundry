@@ -1290,7 +1290,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     if os.name == "nt":
         try:
             # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
-            # a single argv token, never a shell word (matches _secure_file's low-27/STORE-5 note).
+            # a single argv token, never a shell word (low-27/STORE-5).
             # No modifying flags. The pin is what makes "fixed system tool" true: CreateProcess
             # resolves an unqualified name through a search path that reaches the caller's working
             # directory, and this call's OUTPUT is what decides the verdict below, so a planted

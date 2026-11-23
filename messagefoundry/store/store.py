@@ -9140,19 +9140,23 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path) -> None:
+def _secure_file(path: Path, *, keep_trio_entries: bool = False) -> None:
     """Restrict a store file to its owner — it holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
     POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
     writes one protected DACL whole instead, granting full control to the account read from this
-    process's token and naming nobody else. Written whole, the list replaces every entry the file
-    carried, explicit ones included (an explicit grant on a moved-in file, or the entries a temp
-    directory hands a file), which the ``icacls /inheritance:r /grant:r`` rewrite this replaced
-    left in place. The owner is not changed, and an owner keeps the access Windows gives it beyond
-    the list. A skipped or failed restriction is **logged** (STORE-2), and leaves the file's access
-    list as it was.
+    process's token. Written whole, the list replaces every entry the file carried, explicit ones
+    included (an explicit grant on a moved-in file, or the entries a temp directory hands a file),
+    which the ``icacls /inheritance:r /grant:r`` rewrite this replaced left in place. The owner is
+    not changed, and an owner keeps the access Windows gives it beyond the list. A skipped or failed
+    restriction is **logged** (STORE-2), and leaves the file's access list as it was.
+
+    ``keep_trio_entries`` is for the store trio's owner-only fallback (:func:`_secure_store_file`):
+    the list also keeps the file's own explicit entries in the hardened directory's shape
+    (:func:`_kept_trio_entries`), as the icacls rewrite did, so a fallback open does not shut the
+    service account out of a store file the installer's rule already named it on (ADR 0163).
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9175,7 +9179,8 @@ def _secure_file(path: Path) -> None:
             # lookup chooses who is granted (vault BACKLOG #5612). One SetNamedSecurityInfoW call,
             # as _write_trio_dacl makes, rather than icacls: icacls cannot drop an unnamed
             # principal's explicit entry while granting, and an API call has no program to plant.
-            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid})", protected=True)
+            kept = _kept_trio_entries(path, sid) if keep_trio_entries else ""
+            result = _set_security_from_sddl(path, f"D:P(A;;FA;;;{sid}){kept}", protected=True)
             if result.failure is not None or result.dacl_status != 0:
                 log.warning(
                     "could not restrict %s to this account: %s",
@@ -9186,6 +9191,31 @@ def _secure_file(path: Path) -> None:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+def _kept_trio_entries(path: Path, sid: str) -> str:
+    """The SDDL entries of ``path``'s own explicit allows that have the store trio's shape, for
+    :func:`_secure_file` to keep: SYSTEM or Administrators at full control, and an account at the
+    run-as Modify right whose SID has the shape of a per-service virtual account or of one user
+    account (:func:`_account_shape_refusal`, which makes no lookup). ``sid``, the token's own
+    account, is left out because the caller grants it full control. Any other entry is dropped, so
+    a broad grant such as Everyone does not survive. An access list this cannot read or parse keeps
+    nothing, so the file is left to the token's account alone."""
+    current = _read_dacl_sddl(path)
+    parsed = _parse_sddl_dacl(current) if current is not None else None
+    if parsed is None:
+        return ""
+    kept: dict[str, str] = {}
+    for kind, flags, rights, ace_sid in parsed.aces:
+        if kind != "A" or flags or ace_sid == sid or rights != _trio_right(ace_sid):
+            continue
+        if (
+            ace_sid in _TRIO_RIGHTS
+            or _SERVICE_SID.fullmatch(ace_sid)
+            or _account_shape_refusal(ace_sid) is None
+        ):
+            kept[ace_sid] = _TRIO_RIGHTS.get(ace_sid, _RUN_AS_RIGHTS)
+    return "".join(f"(A;;{rights};;;{ace_sid})" for ace_sid, rights in kept.items())
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9831,7 +9861,8 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    outside a hardened directory -- is :func:`_secure_file`, owner-only, keeping the file's own
+    entries in the trio's shape (``keep_trio_entries``). Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9840,7 +9871,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path)
+        _secure_file(path, keep_trio_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
@@ -12385,7 +12416,7 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each a blocking ACL write on Windows. Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)
@@ -23248,7 +23279,7 @@ class MessageStore:
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
-        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        # loop, so a synchronous ACL write here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
 
     async def _copy_snapshot(self, dest: Path, method: str) -> None:
