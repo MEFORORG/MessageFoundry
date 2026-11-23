@@ -25,7 +25,9 @@ from tests._serviceenv_remedy import (
     CREATE,
     KEEP,
     REMOVE,
+    REMOVE_SPARING,
     RUNS_ON,
+    RUNS_ON_SPARING,
     SET_NO,
     WIDER,
 )
@@ -198,7 +200,10 @@ def test_a_joined_directory_string_is_removed_with_the_value(entries: list[str])
     assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal
+    # Beside the keep-one step, both spare the directory line it keeps.
+    spares = KEEP in refusal
+    assert (REMOVE_SPARING if spares else REMOVE) in refusal
+    assert (RUNS_ON_SPARING if spares else RUNS_ON) in refusal
 
 
 def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directory() -> None:
@@ -235,7 +240,7 @@ def test_a_path_alone_joined_into_an_empty_key_is_kept() -> None:
     assert posture.listed_keys == (_KEY,) and posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.endswith(f"{REMOVE_SPARING}. {RUNS_ON_SPARING}. {KEEP}{_END}")
     # The key's only value is that path, so there is no key to protect (the fifth hold, H2).
     assert "protect-key" not in refusal
 
@@ -286,7 +291,8 @@ def test_only_a_plain_absolute_path_is_kept(value: str, kept: bool) -> None:
     assert (KEEP in refusal) is kept
     # A blank value holds no key either, so nothing says to protect one.
     assert ("protect-key" in refusal) is not (kept or not value.strip())
-    assert REMOVE in refusal and RUNS_ON in refusal
+    assert (REMOVE_SPARING if kept else REMOVE) in refusal
+    assert (RUNS_ON_SPARING if kept else RUNS_ON) in refusal
 
 
 def test_one_joined_value_that_is_no_plain_path_keeps_nothing() -> None:
@@ -332,10 +338,10 @@ def test_a_path_alone_joined_into_an_empty_key_beside_a_secret_is_kept() -> None
     )
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.endswith(f"{REMOVE_SPARING}. {RUNS_ON_SPARING}. {KEEP}{_END}")
     assert refusal.index(CREATE) < refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD")
     assert refusal.index("Put MEFOR_AUTH_AD_BIND_PASSWORD in the secrets directory") < (
-        refusal.index(REMOVE)
+        refusal.index(REMOVE_SPARING)
     )
 
 
@@ -365,7 +371,7 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
 @pytest.mark.parametrize(
     ("entry", "creates"),
     [
-        pytest.param("MEFOR_VALUE_A=", True, id="empty-value"),
+        pytest.param("MEFOR_VALUE_A=", False, id="empty-value"),
         pytest.param("MEFOR_VALUE_=synthetic", True, id="bare-prefix"),
         pytest.param("MEFOR_VALUE_A=1", True, id="value"),
         pytest.param("MEFOR_AUTH_AD_BIND_PASSWORD=synthetic", True, id="secret"),
@@ -373,9 +379,11 @@ def test_protect_key_and_the_secrets_directory_come_before_the_removal_step() ->
     ],
 )
 def test_the_create_guidance_comes_with_the_put_step(entry: str, creates: bool) -> None:
-    """A MEFOR_VALUE_* name, empty or the bare prefix among them, gets the Put step and how a
-    directory is created (the Lander's decision d20261122T181059560-3bac03 on PR 3142). A
-    store key alone goes to a key file, so it gets neither."""
+    """A MEFOR_VALUE_* name, the bare prefix among them, gets the Put step and how a directory
+    is created (the Lander's decision d20261122T181059560-3bac03 on PR 3142). An empty one has
+    nothing to move, since the remedy says to delete it, so it gets neither (the Lander's hold
+    on PR 3142, comment 7100710066, item 10). A store key alone goes to a key file, so it gets
+    neither."""
     refusal = service_env_refusal(_read([entry]))
     assert refusal is not None
     assert (CREATE in refusal) is creates and ("Put " in refusal) is creates
@@ -411,7 +419,7 @@ def test_a_secret_whose_only_value_is_a_joined_path_moves_nothing() -> None:
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert CREATE not in refusal and "Put " not in refusal and "protect-key" not in refusal
-    assert refusal.endswith(f"{REMOVE}. {RUNS_ON}. {KEEP}{_END}")
+    assert refusal.endswith(f"{REMOVE_SPARING}. {RUNS_ON_SPARING}. {KEEP}{_END}")
 
 
 def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
@@ -485,3 +493,107 @@ def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
         [_KEY, line],
     ):
         assert _read(entries).listed_keys == (), (entries, _read(entries).listed)
+
+
+_RETIRED = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(f"{_KEY_B64},", id="trailing-comma"),
+        pytest.param(f"{_KEY_B64},,{_KEY_B64}", id="doubled-comma"),
+        pytest.param(f",{_KEY_B64}", id="leading-comma"),
+        pytest.param(f"'{_KEY_B64}, '", id="quoted-trailing-blank"),
+    ],
+)
+def test_a_retired_key_list_with_a_blank_entry_below_an_empty_secret_refuses(value: str) -> None:
+    """The Lander's hold on PR 3142, comment 7100710066, item 3: the engine's retired-keys reader
+    skips a blank entry, so a key list with a trailing or doubled comma is key material, and a
+    Windows name set to it does not end the empty secret above it."""
+    posture = _read([f"{_RETIRED}=", f"Path={value}"])
+    assert posture.listed_keys == (_RETIRED,), posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and _KEY_B64 not in refusal
+
+
+@pytest.mark.parametrize("value", [",", " , ", "C:\\Windows,"])
+def test_a_list_of_blanks_or_a_path_still_ends_the_empty_secret(value: str) -> None:
+    """Control for the test above: with no key in it, the Windows name still ends the empty
+    value, so nothing refuses."""
+    assert _read([f"{_RETIRED}=", f"Path={value}"]).listed_keys == ()
+
+
+def test_a_store_key_in_this_process_keeps_the_protect_key_step() -> None:
+    """The Lander's hold on PR 3142, comment 7100710066, item 4: the listed key's only value is a
+    joined directory path, but the key reaches this process anyway, so the remedy still says to
+    keep it in a protected key file. The control, with no key in the process, prints no such
+    step."""
+    entries = [(_EXTRA, f"{_KEY}="), (_EXTRA, "mefor_secrets_directory=C:\\s")]
+    reached = read_service_env_posture(probe=_Probe(entries), environ={_KEY: _KEY_B64})
+    assert reached.keys_in_environment == (_KEY,) and reached.listed_keys == (_KEY,)
+    refusal = service_env_refusal(reached)
+    assert refusal is not None and "messagefoundry protect-key" in refusal
+    assert _KEY_B64 not in refusal
+    control = service_env_refusal(read_service_env_posture(probe=_Probe(entries), environ={}))
+    assert control is not None and "protect-key" not in control
+
+
+_PLAIN = "Parameters\\AppEnvironment"
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+                (_EXTRA, f"{_KEY}="),
+                (_EXTRA, "mefor_secrets_directory=C:\\other"),
+            ],
+            id="joined-path-beside-a-listed-one",
+        ),
+        pytest.param(
+            [
+                (_EXTRA, "MEFOR_VALUE_A=synthetic"),
+                (_EXTRA, f"{_KEY}="),
+                (_EXTRA, "mefor_secrets_directory=C:\\d"),
+            ],
+            id="joined-lower-case-path",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+                (_EXTRA, "MEFOR_VALUE_A="),
+                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+            ],
+            id="joined-equals-beside-a-listed-one",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_VALUE_A=synthetic"),
+                (_PLAIN, "MEFOR_VALUE_A="),
+                (_PLAIN, " MEFOR_SECRETS_DIRECTORY=="),
+                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+            ],
+            id="joined-padded-beside-the-scm-one",
+        ),
+    ],
+)
+def test_a_joined_directory_entry_keeps_one_entry_and_spares_it_from_removal(
+    entries: list[tuple[str, str]],
+) -> None:
+    """The Lander's hold on PR 3142, comment 7100710066, items 5 and 8. A joined directory entry
+    the engine may read, beside another or alone, would win over the path the service should
+    name, so the remedy keeps exactly one entry, in AppEnvironmentExtra, written as the path, and
+    takes every other directory line out. The removal and run-on steps spare the directory lines,
+    so no step removes an entry a later one keeps."""
+    posture = read_service_env_posture(probe=_Probe(entries), environ={})
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.endswith(f"{KEEP}{_END}"), refusal
+    assert REMOVE_SPARING in refusal and RUNS_ON_SPARING in refusal
+    assert REMOVE not in refusal and RUNS_ON not in refusal
+    assert "Keep any of them that sets" not in refusal
+    assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
+    assert "synthetic" not in refusal and "C:\\other" not in refusal

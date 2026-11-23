@@ -21,12 +21,28 @@ RUNS_ON = (
     "runs on into with it, or the value stays in the registry key"
 )
 
-#: Printed last, only where every refused variable that runs on takes only directory entries
-#: that are blank or plainly a path, and one sets the directory to a path: that entry stays.
+#: Printed last, where a directory entry is joined to a refused value and no add-back step
+#: follows: one entry stays, in AppEnvironmentExtra, rewritten to the path, and every other
+#: directory line goes (the Lander's hold on PR 3142, comment 7100710066, items 5 and 8).
 KEEP = (
-    "Keep any of them that sets MEFOR_SECRETS_DIRECTORY to a path and nothing else, as its own "
-    "entry"
+    "Leave exactly one entry that sets MEFOR_SECRETS_DIRECTORY in the service's lists: one in "
+    "AppEnvironmentExtra, which NSSM applies last, written as MEFOR_SECRETS_DIRECTORY=<path> "
+    "naming the secrets directory by its path, so it is the one the engine reads. Take each "
+    "other line that sets MEFOR_SECRETS_DIRECTORY out of every list, keeping each other line no "
+    "step above says to remove, before any re-run of the installer, which refuses an existing "
+    "directory the service does not name. `nssm set` replaces a whole list, so read it first "
+    "with `nssm get`, running the service's own nssm.exe by its full path, and pass back every "
+    "entry but those refused above and the strings and lines this step and any step above say "
+    'to remove: see docs/SERVICE.md, "Start / stop / status"'
 )
+
+#: The clause the removal and run-on steps carry wherever KEEP is printed, so neither removes a
+#: directory line KEEP then keeps (the Lander's hold on PR 3142, comment 7100710066, item 8).
+SPARE = ", but for each line that sets MEFOR_SECRETS_DIRECTORY, which a step below covers"
+
+#: REMOVE and RUNS_ON as printed beside KEEP.
+REMOVE_SPARING = REMOVE.replace(" environment. See", f" environment{SPARE}. See", 1)
+RUNS_ON_SPARING = RUNS_ON.replace(" with it, or", f" with it{SPARE}, or", 1)
 
 #: The add-back step as origin/main prints it, where a refused name outside the key class
 #: is listed, no value runs on, and no line of any string in the lists sets

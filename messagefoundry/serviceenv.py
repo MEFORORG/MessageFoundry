@@ -174,10 +174,11 @@ class ServiceEnvPosture:
     #: Whether a refused name's value, empty in its own string, runs on into the next strings of
     #: its registry value, so the refusal can say to remove those entries too.
     value_runs_on: bool = False
-    #: The refused names whose only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are
-    #: blank or plainly a path (:func:`_directory_entry_value`). The remedy alone reads this,
-    #: never the refusal itself.
-    directory_only_names: tuple[str, ...] = field(default=(), repr=False)
+    #: The refused names with nothing to move (:func:`_nothing_to_move`): each entry that sets one
+    #: is empty, or its only value is joined ``MEFOR_SECRETS_DIRECTORY`` entries that are blank or
+    #: plainly a path (:func:`_directory_entry_value`). The remedy alone reads this, never the
+    #: refusal itself.
+    nothing_to_move_names: tuple[str, ...] = field(default=(), repr=False)
     #: Whether such an entry, run on into, sets the directory to a path, so the refusal says to
     #: keep it and not to add one back. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
@@ -520,13 +521,16 @@ def _holds_key_run(text: str) -> bool:
 
 def _is_key_value(text: str) -> bool:
     """Whether ``text``, stripped and with one pair of surrounding quotes taken off, is one secret
-    or a comma-separated list of them with no empty entry (:func:`_is_one_key_text`; vault
-    BACKLOG #5394 added items 6 and 12). A retired-keys list the engine would load with an empty
-    entry, from a trailing or doubled comma, is not read as one, a known gap."""
+    or a comma-separated list of them (:func:`_is_one_key_text`; vault BACKLOG #5394 added items
+    6 and 12). A blank entry, from a trailing or doubled comma, is skipped once another entry is
+    not blank, as the engine's retired-keys reader skips one, so such a list is still read as key
+    material (code review on PR 3142)."""
     value = text.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         value = value[1:-1]
-    return all(_is_one_key_text(part.strip()) for part in value.split(","))
+    parts = [part.strip() for part in value.split(",")]
+    entries = [part for part in parts if part]
+    return bool(entries) and all(_is_one_key_text(part) for part in entries)
 
 
 def _is_ordinary_line(line: str) -> bool:
@@ -1146,7 +1150,7 @@ def read_service_env_posture(
         empty_value_names=empty,
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
-        directory_only_names=_every_kept(variables, found, lambda v: v.directory_only),
+        nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
         # Fail closed: one run-on value that takes anything but a blank or plain-path directory
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
@@ -1168,6 +1172,16 @@ def read_service_env_posture(
             _sets_directory_beside_more(entry) for where, entry in entries if where == _EXTRA_LIST
         ),
     )
+
+
+def _nothing_to_move(variable: _Variable) -> bool:
+    """Whether ``variable`` holds nothing the remedy moves elsewhere: its only value is joined
+    directory entries that are blank or plainly a path, or it is a ``MEFOR_VALUE_*`` name whose
+    value is empty or blank, which the remedy says to delete, not to put in the secrets
+    directory, since that directory refuses an empty file (code review on PR 3142). Remedy only."""
+    if variable.directory_only:
+        return True
+    return variable.written.upper().startswith(_VALUE_PREFIX) and not variable.value.strip()
 
 
 def _every_kept(
@@ -1290,9 +1304,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         return None
     # A secret whose only value is a joined directory entry that is blank or plainly a path has
     # nothing to move (the Lander's fifth hold on PR 3142, H2; the sixth hold, H1), and nor
-    # has such a MEFOR_VALUE_* name (the Lander's hold in comment 7085002242).
-    only = posture.directory_only_names
-    moving_keys = [k for k in keys if k not in only]
+    # has such a MEFOR_VALUE_* name (the Lander's hold in comment 7085002242), or an empty one,
+    # which the steps below say to delete. A store key that still reaches this process, from
+    # anywhere, keeps the protect-key step (code review on PR 3142).
+    only = posture.nothing_to_move_names
+    moving_keys = [k for k in keys if k not in only or k in posture.keys_in_environment]
     moving_others = [o for o in others if o not in only]
     moving_values = [v for v in values if v not in only]
     steps: list[str] = []
@@ -1332,7 +1348,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "of the environment may go in its value file instead, environments/<env>.toml by "
                 "default, keyed by the name after MEFOR_VALUE_ in lower case. Each MEFOR_VALUE_* "
                 "name is counted once, without regard to case, under the first registry value "
-                "that sets it"
+                "that sets it, so remove it from every value that sets it"
             )
         if _VALUE_PREFIX in values:
             parts.append(
@@ -1366,27 +1382,42 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             cite += ' and "[environments]"'
         if parts:
             steps.append(". ".join([*parts, cite]))
+    add_back_due = (
+        bool(others or values or posture.directory_run_on)
+        and _DIRECTORY_VARIABLE not in posture.listed
+        and not posture.directory_path_joined
+    )
+    # Where a directory entry is joined to a refused value and no add-back step follows, one
+    # directory entry is kept, the one the engine reads, and every other removed, as
+    # origin/main's joined-directory step said; the removal steps then spare each directory line,
+    # so no step removes an entry a later one keeps (code review on PR 3142).
+    keep_one = (
+        posture.directory_joined
+        and bool(posture.value_runs_on or others or values)
+        and not add_back_due
+    )
+    spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
     # names no list, string or command (the Lander's third and fourth holds on PR 3142, H1).
     steps.append(
-        "Remove each refused variable, with its value, from the service's environment. See "
-        'docs/SERVICE.md, "Start / stop / status"'
+        "Remove each refused variable, with its value, from the service's environment"
+        + (spare if keep_one else "")
+        + '. See docs/SERVICE.md, "Start / stop / status"'
     )
     if posture.value_runs_on:
         # Removing the name alone would leave the value, which then refuses nothing.
         steps.append(
             "At least one refused variable's value runs on past its own entry, so remove the "
-            "entries it runs on into with it, or the value stays in the registry key"
+            "entries it runs on into with it"
+            + (spare if keep_one else "")
+            + ", or the value stays in the registry key"
         )
-    if (
-        (others or values or posture.directory_run_on)
-        and _DIRECTORY_VARIABLE not in posture.listed
-        and not posture.directory_path_joined
-    ):
+    if add_back_due:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
-        # the value it is joined to unless the step below keeps it, so only a kept one makes
-        # "add it back" false (the Lander's ruling on handback 7085947392, F1). A refused
+        # the value it is joined to unless it is plainly a path, which the keep-one step below
+        # keeps instead, so only that makes "add it back" false (the Lander's ruling on handback
+        # 7085947392, F1). A refused
         # name outside the key class may need the directory, and the run-on step may remove
         # a directory string even for a store key alone (the Lander's ruling on comment
         # 7087145957, F1 on H3's terms).
@@ -1441,13 +1472,22 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 "directory is created"
             )
         steps.append(add_back)
-    if posture.directory_path_joined:
-        # A path alone holds no secret, and the service may read it as its directory (fourth
-        # hold, H2), so only a joined entry that is plainly a path is spared, and only when
-        # every refused variable that runs on takes nothing else (sixth hold, H1).
+    if keep_one:
+        # One entry, rewritten to the path, so no joined entry's text stays, key material
+        # included (sixth hold, H1), and none other is left to override it: a kept decoy, "==" or
+        # lower-case entry in AppEnvironmentExtra wins over the path the service should read
+        # (code review on PR 3142). AppEnvironmentExtra, because NSSM applies it last.
         steps.append(
-            f"Keep any of them that sets {_DIRECTORY_VARIABLE} to a path and nothing else, as its "
-            "own entry"
+            f"Leave exactly one entry that sets {_DIRECTORY_VARIABLE} in the service's lists: "
+            f"one in AppEnvironmentExtra, which NSSM applies last, written as "
+            f"{_DIRECTORY_VARIABLE}=<path> naming the secrets directory by its path, so it is "
+            f"the one the engine reads. Take each other line that sets {_DIRECTORY_VARIABLE} out "
+            "of every list, keeping each other line no step above says to remove, before any "
+            "re-run of the installer, which refuses an existing directory the service does not "
+            "name. `nssm set` replaces a whole list, so read it first with `nssm get`, running "
+            "the service's own nssm.exe by its full path, and pass back every entry but those "
+            "refused above and the strings and lines this step and any step above say to "
+            'remove: see docs/SERVICE.md, "Start / stop / status"'
         )
     return (
         f"{found}. Any local user may be able to read that key, and with it each value refused "

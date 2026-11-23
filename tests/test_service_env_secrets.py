@@ -991,15 +991,19 @@ def test_an_env_value_in_the_nssm_list_refuses(entry: str) -> None:
     )
     assert name not in refusal and name.lower() not in refusal
     assert "'MessageFoundry'" in refusal
+    value = entry.split("=", 1)[1]
+    # An empty one has nothing to move, so it gets no Put step and no create guidance, only the
+    # step that says to delete it (the Lander's hold on PR 3142, comment 7100710066, item 10).
+    moves = bool(value.strip())
     assert (
         "Put each MEFOR_VALUE_* variable in the secrets directory MEFOR_SECRETS_DIRECTORY names"
         in refusal
-    )
-    assert "environments/<env>.toml" in refusal and '"[environments]"' in refusal
-    assert CREATE in refusal
+    ) is moves
+    assert ("environments/<env>.toml" in refusal) is moves
+    assert '"[environments]"' in refusal
+    assert (CREATE in refusal) is moves
     assert _ENFORCEMENT_NOTE in refusal
     assert "protect-key" not in refusal
-    value = entry.split("=", 1)[1]
     assert not value.strip() or value not in refusal, "the value must never reach the refusal"
     # An empty entry is also told to go, since the secrets directory refuses an empty file.
     told_to_delete = "An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal
@@ -1041,8 +1045,13 @@ def test_env_values_are_counted_per_registry_value() -> None:
     assert "rename that env() key" not in bare and "An empty or blank" not in bare
     assert "The bare name" not in refusal.split("3 MEFOR_VALUE_", 1)[0]
     assert "counted once, without regard to case, under the first registry value" in refusal
-    # The fifth hold on PR 3142, H3: the counted-once sentence ends there.
-    assert "remove it from every value that sets it" not in refusal
+    # The counted-once sentence says to remove the name from every value that sets it, so a
+    # duplicate does not refuse again on the next start (the Lander's hold on PR 3142, comment
+    # 7100710066, item 9, which restores the clause the fifth hold's H3 took out).
+    assert (
+        "under the first registry value that sets it, so remove it from every value that sets it"
+        in refusal
+    )
     # Names are printed nowhere, so the shared ending speaks of what was refused, not named.
     assert REMOVE in refusal
     assert "each value named" not in refusal and "Remove each name" not in refusal
