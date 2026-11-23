@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.serviceenv import (
+    _LINE_BREAK,
     KEY_CLASS_NAMES,
     _installer_reads,
     _may_name_directory,
@@ -35,7 +36,6 @@ from messagefoundry.serviceenv import (
 _DIR = "MEFOR_SECRETS_DIRECTORY"
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _APP = "Parameters\\AppEnvironment"
-_LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 _END = '. [security].enforcement = "warn" does not change this refusal'
 _KEY = KEY_CLASS_NAMES[0]
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-for-tests-01").decode()
@@ -106,17 +106,32 @@ def _doubt_step(steps: list[str]) -> str:
     return ". ".join(steps[start : end + 1])
 
 
+_RUN = re.compile(r"[A-Za-z0-9+/_-]{43}")
+
+
+def _ends_the_value(line: str, refused: frozenset[str]) -> bool:
+    """The step's own rule for the line that ends a directory line's value: it names a refused
+    variable, alone or set, or it sets another variable, a name before its first equals sign
+    with no run of 43 such characters in it and something after that sign besides equals signs
+    and blanks."""
+    if _names_refused(line, refused):
+        return True
+    name, equals, value = line.partition("=")
+    return bool(
+        equals and name.strip() and not _RUN.search(name) and value.replace("=", "").strip()
+    )
+
+
 def _take_out(string: str, refused: frozenset[str], *, with_value: bool) -> list[str]:
     """The lines of ``string`` left once each line that may set the directory is out, with, as
-    the step says where ``with_value``, each line below one up to the next that holds an equals
-    sign or is a refused variable's name alone."""
+    the step says where ``with_value``, each line below one that it reads as that value."""
     kept: list[str] = []
     dropping = False
     for line in _LINE_BREAK.split(string):
         if _may_name_directory(line):
             dropping = True
             continue
-        if dropping and with_value and "=" not in line and not _names_refused(line, refused):
+        if dropping and with_value and not _ends_the_value(line, refused):
             continue
         dropping = False
         kept.append(line)
@@ -127,7 +142,9 @@ def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -
     """Take each line that may set the directory out of every list, as the step says, and pass
     back what its pass-back clause says to pass back."""
     leave = "leave as it is each string that holds a refused variable or that a refused" in text
-    with_value = "up to the next that holds an equals sign" in text
+    with_value = (
+        "each line below it in its string that the engine reads as part of its value" in text
+    )
     if "pass back every entry, with only those lines taken out" in text:
         also_removed = False
     elif "the strings and lines this step and the steps above say to remove or take out" in text:
@@ -334,6 +351,21 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {_KEY: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
         False,
     ),
+    # Code review round 2 on this repair: a name written alone above a directory string, which
+    # the reader joins into the name's value, in a list the installer does not read and in one it
+    # does.
+    "value-name-alone-above-a-directory-string": (
+        [(_APP, "MEFOR_VALUE_A"), (_APP, f"mefor_secrets_directory={_KEY_B64}")],
+        frozenset({f"mefor_secrets_directory={_KEY_B64}"}),
+        {"MEFOR_VALUE_A": _KEY_B64},
+        False,
+    ),
+    "value-name-alone-above-an-installer-string": (
+        [(_EXTRA, "MEFOR_VALUE_A"), (_EXTRA, f"mefor_secrets_directory={_KEY_B64}")],
+        frozenset({f"mefor_secrets_directory={_KEY_B64}"}),
+        {"MEFOR_VALUE_A": _KEY_B64},
+        False,
+    ),
     # A value bound for the secrets directory runs on into such a string, so the clause has the
     # operator read it out before removing the string.
     "password-runs-on-into-an-installer-string": (
@@ -362,8 +394,33 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     # comment 7112155891).
     assert registry.installer_read == []
     # Only a value the clause had read out before its string went is not read at the Put step.
-    assert registry.read_out <= {"MEFOR_STORE_PASSWORD"}
-    assert (case == "password-runs-on-into-an-installer-string") is bool(registry.read_out)
+    assert registry.read_out == _READ_OUT.get(case, set())
+
+
+#: The values the create step's installer clause has the operator read out, by case.
+_READ_OUT = {
+    "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
+    "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
+}
+
+
+def test_the_doubt_step_takes_key_text_below_a_directory_line_out_with_it() -> None:
+    """Code review round 2 on this repair: the reader reads a padded store key below a directory
+    line as that line's value, though the key ends in an equals sign, so the doubt step's own
+    rule takes it out with the line, and no key text is left as a string of its own."""
+    assert _KEY_B64.endswith("=")
+    entries = [
+        (_EXTRA, f"MEFOR_SECRETS_DIRECTORY=C:\\d\n{_KEY_B64}"),
+        (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
+    ]
+    posture = read_service_env_posture(probe=_Probe(entries), environ={})
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    registry = _Registry(list(entries))
+    assert _walk(refusal, registry, {"MEFOR_VALUE_A": "SEKRITvalueA"}) == "ok"
+    assert not any(_KEY_B64 in string for _where, string in registry.entries)
+    # The reader agrees the key line was the directory's value, not a variable of its own.
+    assert not any(_KEY_B64 in v.written for v in _variables(entries))
 
 
 def test_the_installer_model_matches_install_service_ps1() -> None:

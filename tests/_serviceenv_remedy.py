@@ -92,8 +92,10 @@ DOUBT_STEP = (
     "to a path under that name, in ASCII with no blank around it, so first take each line that "
     "may set it out of every list, whatever its letter case, a blank around its name, or a letter "
     "outside ASCII that upper-cases to one of its letters, with each line below it in its string "
-    "up to the next that holds an equals sign or is a refused variable's name alone, which the "
-    "engine reads as part of its value. Take out those lines alone, and keep "
+    "that the engine reads as part of its value, up to the next that names a refused variable, "
+    "alone or set, or sets another variable: a name before its first equals sign with no run of "
+    "43 letters, digits, plus signs, slashes, hyphens or underscores in it, and after that sign "
+    "something besides equals signs and blanks. Take out those lines alone, and keep "
     "every refused variable and every other line where it is, for the steps below to move each "
     "value before its entry goes: where such a line shares a registry string with other lines, "
     "write that string back with its other lines as they were, in their order, and leave out "
@@ -117,7 +119,7 @@ DOUBT_LEAVE = (
 
 #: DOUBT_STEP as printed where DOUBT_LEAVE applies.
 DOUBT_STEP_LEAVING = DOUBT_STEP.replace(
-    "part of its value. Take out", f"part of its value{DOUBT_LEAVE}. Take out", 1
+    "and blanks. Take out", f"and blanks{DOUBT_LEAVE}. Take out", 1
 )
 
 #: The add-back step's pass-back exclusion where a directory entry is in doubt, so no line the
