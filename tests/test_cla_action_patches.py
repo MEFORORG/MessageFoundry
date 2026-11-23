@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -56,6 +57,7 @@ def _bundle_text() -> str:
     return (REPO_ROOT / provenance.BUNDLE_PATH).read_text(encoding="utf-8")
 
 
+@functools.cache
 def _module_factory(module_id: int) -> str:
     """The source of one webpack module's factory function, cut out of the bundle by its id.
 
@@ -69,6 +71,7 @@ def _module_factory(module_id: int) -> str:
     return text[start:end] + "\n}"
 
 
+@functools.cache
 def _lodash() -> str:
     """JavaScript that evaluates to the bundle's OWN lodash (module 250), not a stand-in.
 
@@ -278,17 +281,18 @@ def test_a_cursor_cycle_fails_instead_of_looping(tmp_path: Path) -> None:
 
 
 @_needs_node
-def test_a_read_shorter_than_total_count_fails(tmp_path: Path) -> None:
-    """A last page that leaves commits unread -- a capped connection, say -- raises.
+def test_a_capped_connection_is_read_to_its_end_and_not_failed(tmp_path: Path) -> None:
+    """``hasNextPage`` false ends the read even when ``totalCount`` is larger, deliberately.
 
-    Without this a pull request whose commit list stops short of ``totalCount`` would be checked
-    against the authors read so far, and an author past the stop would never be asked to sign.
+    GitHub's connection stops at 250 commits while ``totalCount`` reports the full number, so
+    failing on the difference would red every larger pull request with nothing that clears it. This
+    pins that the patch does not do that; the README states the cap as a limit.
     """
     result = _committers(
         tmp_path, {"": _page(["alice"], has_next=False, end_cursor="C1", total=300)}
     )
 
-    assert "read 1 of 300 pull request commits" in result.get("error", ""), result
+    assert result == {"names": ["alice"], "asked": [""]}
 
 
 # --- Static pins, which run without Node ------------------------------------------------------
@@ -316,3 +320,24 @@ def test_every_patch_carries_the_marker_comment(index: int) -> None:
 
     assert b"MessageFoundry patch" in patched
     assert b"MessageFoundry patch" not in upstream
+
+
+def test_the_record_pedigree_names_every_row_a_patch_cites() -> None:
+    """The CycloneDX pedigree is written by hand, so tie it to the patch list it summarizes.
+
+    A patch added for a new row with no pedigree entry would leave the part of the record a tool
+    reads under-reporting the local changes while ``--write`` regenerated it clean.
+    """
+    cited = {
+        match.decode("ascii")
+        for _, patched in provenance.BUNDLE_PATCHES
+        for match in re.findall(rb"MessageFoundry patch \(BACKLOG (#\d+)\)", patched)
+    }
+    record = json.loads((REPO_ROOT / provenance.RECORD_PATH).read_text(encoding="utf-8"))
+    named = {
+        re.match(r"BACKLOG (#\d+)", resolved["name"]).group(1)  # type: ignore[union-attr]
+        for patch in record["metadata"]["component"]["pedigree"]["patches"]
+        for resolved in patch["resolves"]
+    }
+
+    assert cited == named == {"#5644", "#5645"}

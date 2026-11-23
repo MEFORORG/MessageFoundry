@@ -36,7 +36,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "d8b3c70ee49fb590fff88f698bcd3c850ce20e01b26801d7ff2ef13a852990f9"
+          "content": "e908b17b82e369ef37d188b4a869c394b55c6be5490100716b487ceee32d13e2"
         }
       ],
       "pedigree": {
@@ -152,7 +152,7 @@
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/dist/index.js",
-          "value": "d8b3c70ee49fb590fff88f698bcd3c850ce20e01b26801d7ff2ef13a852990f9"
+          "value": "e908b17b82e369ef37d188b4a869c394b55c6be5490100716b487ceee32d13e2"
         },
         {
           "name": "messagefoundry:recorded-files:sha256:.github/actions/cla-assistant-lite/upstream-package-lock.json",

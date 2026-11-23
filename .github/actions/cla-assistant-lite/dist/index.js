@@ -81,8 +81,6 @@ function getCommitters() {
             // MessageFoundry patch (BACKLOG #5645): read every page of commits.
             let cursor = '';
             let hasNextPage = true;
-            let read = 0;
-            let total;
             const seenCursors = new Set(['']);
             while (hasNextPage) {
             let response = yield octokit_1.octokit.graphql(`
@@ -142,19 +140,14 @@ function getCommitters() {
                 }
             });
             // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a
-            // cursor already seen or a read shorter than totalCount.
+            // next page whose cursor is missing or already seen.
             const commits = response.repository.pullRequest.commits;
-            read += commits.edges.length;
-            total = commits.totalCount;
             hasNextPage = commits.pageInfo.hasNextPage === true;
             if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || seenCursors.has(commits.pageInfo.endCursor))) {
                 throw new Error('pagination reported a next page with no new cursor');
             }
             cursor = commits.pageInfo.endCursor;
             seenCursors.add(cursor);
-            }
-            if (typeof total === 'number' && read < total) {
-                throw new Error(`read ${read} of ${total} pull request commits`);
             }
             filteredCommitters = committers.filter((committer) => {
                 return committer.id !== 41898282;

@@ -248,9 +248,12 @@ VENDORING_HEADER = (
 #:    escaped by lodash's ``escapeRegExp``; the patch adds the ``^`` and ``$``.
 #: 2-4. BACKLOG #5645 item 2: ``getCommitters`` read ONE page of 100 commits with an empty cursor
 #:    and never followed ``pageInfo.hasNextPage``, so an author first seen past page one was not in
-#:    the list a sign comment is recorded against. The patch loops on ``endCursor``. It raises when
-#:    a further page is claimed with a cursor that is missing or already seen, or when the commits
-#:    read fall short of ``totalCount``; the action reports either as a failed step.
+#:    the list a sign comment is recorded against. The patch loops on ``endCursor``, and raises when
+#:    a further page is claimed with a cursor that is missing or already seen, which the action
+#:    reports as a failed step. It does NOT compare the commits read with ``totalCount``: this
+#:    change's review measured GitHub's connection stopping at 250 commits while ``totalCount``
+#:    reported the full number (2026-11-23), so that comparison would red every larger pull request
+#:    with no way to clear it.
 #:
 #: Every patched span carries a ``MessageFoundry patch`` comment, so a grep of the bundle finds all
 #: of them.
@@ -266,8 +269,6 @@ BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
         b"            // MessageFoundry patch (BACKLOG #5645): read every page of commits.\n"
         b"            let cursor = '';\n"
         b"            let hasNextPage = true;\n"
-        b"            let read = 0;\n"
-        b"            let total;\n"
         b"            const seenCursors = new Set(['']);\n"
         b"            while (hasNextPage) {\n"
         b"            let response = yield",
@@ -280,10 +281,8 @@ BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
         b"            });\n            filteredCommitters = committers.filter(",
         b"            });\n"
         b"            // MessageFoundry patch (BACKLOG #5645): stop after the last page, and fail on a\n"
-        b"            // cursor already seen or a read shorter than totalCount.\n"
+        b"            // next page whose cursor is missing or already seen.\n"
         b"            const commits = response.repository.pullRequest.commits;\n"
-        b"            read += commits.edges.length;\n"
-        b"            total = commits.totalCount;\n"
         b"            hasNextPage = commits.pageInfo.hasNextPage === true;\n"
         b"            if (hasNextPage && (typeof commits.pageInfo.endCursor !== 'string' || "
         b"seenCursors.has(commits.pageInfo.endCursor))) {\n"
@@ -291,9 +290,6 @@ BUNDLE_PATCHES: tuple[tuple[bytes, bytes], ...] = (
         b"            }\n"
         b"            cursor = commits.pageInfo.endCursor;\n"
         b"            seenCursors.add(cursor);\n"
-        b"            }\n"
-        b"            if (typeof total === 'number' && read < total) {\n"
-        b"                throw new Error(`read ${read} of ${total} pull request commits`);\n"
         b"            }\n"
         b"            filteredCommitters = committers.filter(",
     ),
