@@ -502,37 +502,6 @@ async def test_an_aborted_sweep_keeps_the_passes_result_and_logs_no_body(
     assert _ORPHAN_TEXT not in caplog.text
 
 
-async def test_a_stop_set_while_the_listing_is_read_removes_nothing_and_ends_the_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #2264 bound: the listing alone can be long on a large dir, so the stop is checked
-    before each entry of it, and a stop set partway ends the pass with nothing removed."""
-    store = _store(tmp_path)
-    orphan = _aged_orphan(store)
-    stop = threading.Event()
-    real = Path.iterdir
-    consumed: list[int] = []
-
-    def _listed(self: Path) -> Iterator[Path]:
-        if self != store._root:
-            return real(self)
-
-        def _entries() -> Iterator[Path]:
-            yield orphan
-            stop.set()
-            consumed.append(1)
-            yield orphan
-            consumed.append(2)
-            yield orphan
-
-        return _entries()
-
-    monkeypatch.setattr(Path, "iterdir", _listed)
-    assert store._sweep_orphans_sync(now=time.time(), abort=stop) == 0
-    assert orphan.exists()
-    assert consumed == [1], "the listing was read on after the stop was set"
-
-
 async def test_the_sweep_lists_the_root_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

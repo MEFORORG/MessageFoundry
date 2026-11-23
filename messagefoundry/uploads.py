@@ -4293,10 +4293,13 @@ class UploadStore:
         success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
         and not how long it can stall, so an hour is a margin against this and not a bar to it.
 
-        ``abort`` is :meth:`prune_expired`'s, checked before each entry, so a slow sweep over a large
-        dir does not hold a stop past its bound (BACKLOG #2264). The pass's audit rows are already
-        written when this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the
-        next one resumes."""
+        ``abort`` is :meth:`prune_expired`'s. It is checked before the listing and before each entry
+        once the listing has been read, so a slow sweep over a large dir does not hold a stop past
+        its bound while it removes files (BACKLOG #2264). It is not seen during the listing:
+        ``Path.iterdir`` reads the whole directory before it returns on this Python, so a stop set
+        meanwhile takes effect when that read ends. The pass's audit rows are already written when
+        this runs (BACKLOG #3184). An aborted sweep returns what it removed so far; the next one
+        resumes."""
         stop = abort if abort is not None else threading.Event()
         root = self._root
         if stop.is_set():
@@ -4306,11 +4309,7 @@ class UploadStore:
         # nothing. An error is_absent reads as no root ends the pass at 0, and any other raises;
         # prune_expired logs that and keeps its result (BACKLOG #6575).
         try:
-            entries: list[Path] = []
-            for listed in root.iterdir():
-                if stop.is_set():
-                    return 0  # nothing has gone yet; the next pass lists again
-                entries.append(listed)
+            entries = list(root.iterdir())
         except OSError as exc:
             if is_absent(exc):
                 return 0  # read as no root yet, as a lost drive or parent also is
