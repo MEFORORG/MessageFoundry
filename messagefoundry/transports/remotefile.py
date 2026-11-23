@@ -668,12 +668,17 @@ class _Listed(NamedTuple):
     ``other_form`` is set only by the FTP ``NLST`` fallback, on an entry the listing guard will
     refuse that :func:`_is_other_listing_form` reads as an unsupported listing form (BACKLOG #1130).
     Every other listing leaves it False, so a refused name from SFTP or ``MLSD`` always logs as
-    traversal."""
+    traversal.
+
+    ``size_known`` is False where the server gave no size for a file the poll can read, so a
+    ``size`` of 0 there is no evidence of an empty file (BACKLOG #5750). The retrieve-time size
+    check reads it. An entry the listing guard refuses is never retrieved, so it never matters."""
 
     name: str
     size: int
     mtime: str | None
     other_form: bool = False
+    size_known: bool = True
 
 
 class _StuckReject(NamedTuple):
@@ -683,6 +688,15 @@ class _StuckReject(NamedTuple):
     size: int
     mtime: str | None
     due: float
+
+
+class _HeldRead(NamedTuple):
+    """What the source remembers of a retrieve whose length was not the listed size (BACKLOG
+    #5750): the size and modification time it listed at, and the bytes that read returned."""
+
+    size: int
+    mtime: str | None
+    read: int
 
 
 def _same_listing(seen_size: int, seen_mtime: str | None, size: int, mtime: str | None) -> bool:
@@ -713,8 +727,12 @@ class _RemoteClient(abc.ABC):
         """:meth:`list_dir`, with each file's listed modification time where the server gives one
         (vault BACKLOG #2758). The poll reads this, so its leave-mode dedup key can tell a same-size
         replacement from the file already ingested. The SFTP and FTP clients override it; the
-        default, for a client whose listing has no modification time, lists none."""
-        return [_Listed(name, size, None) for name, size in self.list_dir(remote_dir)]
+        default, for a client whose listing has no modification time, lists none. :meth:`list_dir`
+        cannot say that a 0 is a real size, so here it counts as no size (``size_known``)."""
+        return [
+            _Listed(name, size, None, size_known=size > 0)
+            for name, size in self.list_dir(remote_dir)
+        ]
 
     def list_names(self, remote_dir: str) -> set[str]:
         """The name of EVERY entry directly in ``remote_dir``, whatever its type: a directory, a
@@ -1263,7 +1281,14 @@ class _FtpClient(_RemoteClient):
                 # RFC 3659 fact values are case-insensitive; _names lowercases them too.
                 if name in (".", "..") or facts.get("type", "").lower() != "file":
                     continue
-                out.append(_Listed(name, int(facts.get("size", 0)), facts.get("modify") or None))
+                out.append(
+                    _Listed(
+                        name,
+                        int(facts.get("size", 0)),
+                        facts.get("modify") or None,
+                        size_known="size" in facts,
+                    )
+                )
             return out
         except (ftplib.error_perm, ftplib.error_proto):
             pass
@@ -1286,7 +1311,7 @@ class _FtpClient(_RemoteClient):
                 continue
             # A directory or an un-sizable entry lists as 0 (the oversize check skips it).
             size = _ftp_size(ftp, posixpath.join(remote_dir, base))
-            out.append(_Listed(base, size or 0, None))
+            out.append(_Listed(base, size or 0, None, size_known=size is not None))
         return out
 
     def list_names(self, remote_dir: str) -> set[str]:
@@ -2134,11 +2159,13 @@ class _SftpClient(_RemoteClient):
                 if _stat.S_ISREG(mode):
                     # paramiko leaves st_mtime None when the server omits the times (BACKLOG #2758).
                     mtime = getattr(entry, "st_mtime", None)
+                    size = _sftp_size(entry)
                     out.append(
                         _Listed(
                             entry.filename,
-                            int(getattr(entry, "st_size", 0) or 0),
+                            size or 0,
                             None if mtime is None else str(int(mtime)),
+                            size_known=size is not None,
                         )
                     )
             return out
@@ -2836,6 +2863,9 @@ class RemoteFileSource(SourceConnector):
         # in a row have not listed it. In memory only and never logged. See _remember_stuck.
         self._stuck: dict[str, tuple[_StuckReject, int]] = {}
         self._stuck_full_logged = False  # the memory filled: logged once until it drains to half
+        # BACKLOG #5750: retrieves whose length was not the listed size, by name, each with how many
+        # polls in a row have not listed it. In memory only and never logged. See _held_for_size.
+        self._size_held: dict[str, tuple[_HeldRead, int]] = {}
         self._error_dir_asked = False  # this poll already asked for error_subdir (leave mode)
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
@@ -3073,9 +3103,8 @@ class RemoteFileSource(SourceConnector):
         remembered reject without a slot drops any settle sighting, which must come from
         consecutive polls.
 
-        A poll with a slot to run lists the directory once more, because the pass's hand-offs sit
-        between the first listing and these retries, so a file rewritten meanwhile is judged on
-        what it lists at now. A listing that fails runs no retry, and they stay due."""
+        Hand-offs sit between the poll's one listing and these retries. A file rewritten meanwhile
+        is caught by the retrieve-time size check (:meth:`_held_for_size`), as a fresh file is."""
         now = time.monotonic()
         for entry in unreached if self._stuck else ():
             stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
@@ -3085,27 +3114,11 @@ class RemoteFileSource(SourceConnector):
         slots = heapq.nsmallest(allowance, due.values(), key=itemgetter(0))
         for name in (self._stuck.keys() & self._settle_seen.keys()) - {e.name for _, e in slots}:
             del self._settle_seen[name]
-        if not slots:
-            return 0
-        try:
-            current = await asyncio.to_thread(self._client.list_entries, self._remote_dir)
-        except _RemoteError as exc:
-            logger.warning(
-                "REMOTEFILE %s: could not list the directory again before retrying rejected "
-                "files; they stay due: %s",
-                _where(self._host, self._remote_dir),
-                safe_exc(exc),
-            )
-            return 0
-        latest = {entry.name: entry for entry in current}
         recorded = 0
         for _, entry in slots:
             if self._stop.is_set():
                 break
-            now_listed = latest.get(entry.name)
-            if now_listed is None:
-                continue  # gone since the first listing: _prune_memories forgets it
-            step = await self._examine(now_listed, retry=True)
+            step = await self._examine(entry, retry=True)
             if step is _Step.STOP:
                 break
             recorded += step is _Step.RECORDED
@@ -3166,11 +3179,14 @@ class RemoteFileSource(SourceConnector):
         path = posixpath.join(self._remote_dir, name)
         # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
         # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
-        # server gives one, BACKLOG #2758) — never a cleartext filename.
-        forms = self._file_key_forms(name, size, mtime) if self._after_read == "leave" else None
+        # server gives one, BACKLOG #2758) — never a cleartext filename. A retry whose listing lost
+        # the time keys on the time remembered for it (#5750), or the listing that next carries the
+        # time would read as a new version of a file already ingested.
+        key_mtime = mtime if stuck is None else stuck.mtime
+        forms = self._file_key_forms(name, size, key_mtime) if self._after_read == "leave" else None
         file_key = None if forms is None else forms[0]
         if forms is not None and await self._leave_already_ingested(forms):
-            if mtime is None:
+            if key_mtime is None:
                 self._log_undetectable_skip(name, size, forms[0])
             # A retry the ledger holds is finished with, so it must stop taking a retry slot.
             self._stuck.pop(name, None)
@@ -3257,6 +3273,11 @@ class RemoteFileSource(SourceConnector):
                 safe_exc(exc, file_name=name),
             )
             return _Step.FREE
+        # Before the sniff, because a body cut off mid-write can fail it, and being written is not
+        # a reason to quarantine. On the raw bytes, before any decode or split.
+        held = self._held_for_size(entry, len(raw))
+        if held is not None:
+            return held
         # Content-vs-type magic-byte check (ASVS 5.2.2), the local File source's own helper: the raw
         # bytes, then for a text type on a non-ASCII encoding the head decoded with `encoding`, so a
         # UTF-16 or UTF-32 drop is not quarantined for its BOM (BACKLOG #5684). The dispatch is
@@ -3303,7 +3324,7 @@ class RemoteFileSource(SourceConnector):
             # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
             # rejection. Fail closed (ASVS 5.4.3): never emit unscanned content from a less-trusted
             # remote source. Unlike a ScanRejected we don't quarantine a possibly-healthy file on a
-            # scanner outage — leave it in place so the next poll re-runs the scan once the scanner
+            # scanner outage — leave it in place so a later poll re-runs the scan once the scanner
             # recovers (at-least-once, mirroring the transient-retrieve path). Logged, never a silent
             # pass-through, and scoped to THIS file so a hiccup can't abort the poll's remaining files.
             logger.warning(
@@ -3330,6 +3351,7 @@ class RemoteFileSource(SourceConnector):
                 self._delay_retry(name, STUCK_TRANSIENT_RETRY_SECONDS)
             return _Step.FREE
         self._stuck.pop(name, None)  # it passed every gate, so it is no longer a reject
+        self._size_held.pop(name, None)
         if stopped:
             # A stop arrived before the file's last message: the whole file stays, and the next
             # start hands it over again (at-least-once, as the File source does). The poll ends
@@ -3338,9 +3360,74 @@ class RemoteFileSource(SourceConnector):
         await self._after_processing(path, name, len(raw))
         # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
         # Only a durable write counts, so a broken ledger does not draw a prune.
-        if file_key is not None and await self._leave_record(file_key):
-            return _Step.RECORDED
-        return _Step.CHARGED
+        if file_key is None:
+            return _Step.CHARGED
+        wrote = await self._leave_record(file_key)
+        if key_mtime != mtime:
+            # A retry on a listing without the time (#5750): the time-less key too, so a listing
+            # that stays without it does not read this file as new either.
+            wrote = await self._leave_record(self._file_key(name, size, mtime)) or wrote
+        return _Step.RECORDED if wrote else _Step.CHARGED
+
+    def _held_for_size(self, entry: _Listed, read: int) -> _Step | None:
+        """The step to end on when a retrieve of ``read`` raw bytes must not be handed off this
+        poll because the listing gave another size, else None (BACKLOG #5750). The file may have
+        been written after the listing, and the transfer's own before-and-after check (#116) cannot
+        see a write that ended before the transfer began. So it stays in place, unrecorded, and
+        settles again from the length read.
+
+        **A steady disagreement is not held for good.** RFC 3659 calls the ``MLSD`` size approximate
+        and ``SIZE`` after ``NLST`` can answer for ASCII mode, so a server can list a size no read
+        ever matches. When a later read returns the same length while the listing has not changed,
+        the file is not moving, so it is logged and goes on. That costs such a server a second
+        download of each file. The record stays until the hand-off, so a later gate that leaves the
+        file in place does not cost another. A writer paused across both reads is not told apart,
+        as the settle gate cannot tell one either. A read length that keeps changing stays held,
+        and is logged on every read.
+
+        **The budget.** A file's first held read charges it, so a server that lists every file at a
+        wrong size does not pull its whole backlog in one poll. A repeat is free, so a file that
+        keeps moving cannot spend the budget on every poll. A file the full memory refused has no
+        record, so each of its reads counts as a first, as a reject the stuck memory refused does.
+
+        **What it cannot see.** A listing with no size (``size_known`` False: FTP ``NLST`` where
+        ``SIZE`` is refused, ``MLSD`` without a ``size`` fact, an SFTP server that omits it) keeps
+        the behaviour from before this check. So does a rewrite that leaves the length as listed.
+
+        The memory is bounded at ``SETTLE_SEEN_MAX``. A file it cannot hold is held again on its
+        next read, and takes a place once one frees, so it waits rather than displacing another
+        file's first read. Lines carry the safe name and byte counts, never content."""
+        name, size, mtime = entry.name, entry.size, entry.mtime
+        if not _differs(size if entry.size_known else None, read):
+            self._size_held.pop(name, None)
+            return None
+        held = self._size_held.get(name)
+        if (
+            held is not None
+            and held[0].read == read
+            and _same_listing(held[0].size, held[0].mtime, size, mtime)
+        ):
+            logger.warning(
+                "REMOTEFILE %s: %s is listed at %d bytes but read at %d on two reads with its "
+                "listing unchanged; the listed size looks unreliable, so handing it on",
+                _where(self._host, self._remote_dir),
+                safe_name(name),
+                size,
+                read,
+            )
+            return None
+        if held is not None or len(self._size_held) < SETTLE_SEEN_MAX:
+            self._size_held[name] = (_HeldRead(size, mtime, read), 0)
+        logger.warning(
+            "REMOTEFILE %s: %s is listed at %d bytes but %d were read, so it may still be being "
+            "written; not handed off, left in place for a later poll",
+            _where(self._host, self._remote_dir),
+            safe_name(name),
+            size,
+            read,
+        )
+        self._remember_size(name, read, mtime)  # still moving: it settles again from this length
+        return _Step.FREE if held is not None else _Step.CHARGED
 
     async def _hand_off(self, raw: bytes) -> bool:
         """Hand one retrieved file to the pipeline, one message at a time; return True when a stop
@@ -3381,9 +3468,10 @@ class RemoteFileSource(SourceConnector):
 
         **What charges the budget.** Only a file this poll FINISHED with: one handed to the pipeline, or
         one rejected (over the listed size, over the retrieved size, a content-vs-type mismatch, a
-        scanner rejection). The arms that leave a file **in place** for a later retry — a refused unsafe
-        listing name, a file not yet settled (#2071), a transient retrieve failure, a malfunctioning
-        scan hook, a handler failure — do
+        scanner rejection), plus a file's first read at a length other than its listed size
+        (:meth:`_held_for_size`, #5750). The arms that leave a file **in place** for a later retry — a
+        refused unsafe listing name, a file not yet settled (#2071), a transient retrieve failure, a
+        repeat of such a read, a malfunctioning scan hook, a handler failure — do
         NOT charge, because a stuck file that sorts early would otherwise eat the whole budget every
         poll and starve the healthy files behind it. This mirrors
         :meth:`~messagefoundry.transports.file.FileSource._at_ceiling`, which states the rule in full.
@@ -3459,14 +3547,15 @@ class RemoteFileSource(SourceConnector):
         return False
 
     def _prune_memories(self, listing: list[_Listed]) -> None:
-        """Forget a file in the settle or stuck-reject memory once ``SETTLE_MISS_LIMIT`` polls in a
-        row have not listed it (moved, deleted, renamed away), so each is bounded by the poll
-        directory. A file listed again has its count reset. A failed listing raises before this
+        """Forget a file in the settle, stuck-reject or size-hold memory once ``SETTLE_MISS_LIMIT``
+        polls in a row have not listed it (moved, deleted, renamed away), so each is bounded by the
+        poll directory. A file listed again has its count reset. A failed listing raises before this
         runs, so it never counts as a miss."""
-        if self._settle_seen or self._stuck:
+        if self._settle_seen or self._stuck or self._size_held:
             listed = {entry.name for entry in listing}
             _prune_unlisted(self._settle_seen, listed)
             _prune_unlisted(self._stuck, listed)
+            _prune_unlisted(self._size_held, listed)
         if self._stuck_full_logged and len(self._stuck) <= SETTLE_SEEN_MAX // 2:
             self._stuck_full_logged = False  # drained: a memory that fills again is logged again
 
@@ -3772,7 +3861,7 @@ class RemoteFileSource(SourceConnector):
         try:
             await asyncio.to_thread(self._client.rename, path, dst)
         except _RemoteError as exc:
-            # A stuck file (locked / dest unwritable) stays and is re-read; log it.
+            # A stuck file (locked / dest unwritable) stays, and _quarantine remembers it; log it.
             logger.warning(
                 "REMOTEFILE could not move %s to %s: %s",
                 safe_name(name),

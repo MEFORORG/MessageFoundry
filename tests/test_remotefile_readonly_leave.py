@@ -10,7 +10,11 @@ per-tick budget each time, which held back the valid files sorted after it.
 
 from __future__ import annotations
 
+import ftplib
+import logging
+import stat
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -23,7 +27,8 @@ from messagefoundry.transports.file import (
     STUCK_TRANSIENT_RETRY_SECONDS,
     _content_matches_declared,
 )
-from messagefoundry.transports.remotefile import _RemoteError, _SftpClient
+from messagefoundry.transports.remotefile import _FtpClient, _RemoteError, _SftpClient
+from tests.test_remotefile_leave_replacement import _LOGGER, _Ftp, _StampedClient
 from tests.test_remotefile_transport import (
     _FakeClient,
     _FakeLedger,
@@ -393,11 +398,11 @@ async def test_a_stopped_poll_drops_the_sighting_of_a_due_reject(
     assert _retrieved(client, "/in/a.hl7") == 1
 
 
-async def test_a_retry_is_judged_on_a_listing_taken_after_the_fresh_hand_offs(
+async def test_a_retry_rewritten_during_a_fresh_hand_off_is_not_taken(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A partner starts rewriting z while a's hand-off runs, so the poll's first listing no longer
-    describes it. The retry must see that, as the File source's re-stat does."""
+    """A partner starts rewriting z while a's hand-off runs, so the poll's one listing no longer
+    describes it. The retrieve-time size check sees that, and the next listing makes it a new file."""
     client = _read_only({"/in/z.hl7": _BAD})
     src = _leave(monkeypatch, client)
     await _settle(src)
@@ -406,44 +411,13 @@ async def test_a_retry_is_judged_on_a_listing_taken_after_the_fresh_hand_offs(
     _make_due(src, "z.hl7")
     await src._poll_once()  # a is first seen; z takes the slot and settles
     partial = b"MSH|^~\\&|PARTIAL"
-    handler = _RecordingHandler()
-
-    async def rewriting(raw: bytes) -> str | None:
-        client.files["/in/z.hl7"] = partial
-        return await handler(raw)
-
-    src._handler = rewriting
+    handler = _grows_during_hand_off(src, client, "/in/z.hl7", partial)
     await src._poll_once()
     assert handler.bodies == [_GOOD], "the partial must not be handed over"
-    assert _retrieved(client, "/in/z.hl7") == 1
+    assert _retrieved(client, "/in/z.hl7") == 2, "the retry read it and held it"
+    await src._poll_once()
     assert "z.hl7" not in src._stuck, "a changed listing is a new file"
-
-
-async def test_a_failed_second_listing_leaves_the_retry_due(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    client = _read_only({"/in/z.hl7": _BAD})
-    src = _leave(monkeypatch, client)
-    await _settle(src)
-    await src._poll_once()
-    _make_due(src, "z.hl7")
-    await src._poll_once()  # z takes the slot and settles
-    listed = client.list_dir
-    calls = 0
-
-    def second_fails(remote_dir: str) -> list[tuple[str, int]]:
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise _RemoteError("synthetic listing failure", permanent=False)
-        return listed(remote_dir)
-
-    monkeypatch.setattr(client, "list_dir", second_fails)
-    await src._poll_once()
-    assert calls == 2
-    assert _retrieved(client, "/in/z.hl7") == 1, "nothing is read on a listing that failed"
-    assert src._stuck["z.hl7"][0].due <= time.monotonic(), "it stays due"
-    assert "could not list" in caplog.text
+    assert handler.bodies == [_GOOD, partial], "which settled on the length read"
 
 
 async def test_a_due_retry_already_in_the_ledger_does_not_hold_a_slot(
@@ -644,3 +618,271 @@ async def test_the_encoded_sniff_is_what_the_poll_runs(monkeypatch: pytest.Monke
     await src._poll_once()
     assert src._handler.bodies == [good]
     assert client.files["/in/.error/bad.hl7"] == bad
+
+
+# === the retrieve-time size check =================================================================
+
+
+_GROWN = _GOOD + b"|the rest of the message"
+
+
+def _grows_during_hand_off(src: Any, client: _FakeClient, path: str, body: bytes) -> Any:
+    """Install a handler that rewrites ``path`` while the first hand-off runs, as a partner's writer
+    would between the poll's one listing and a later file's retrieve."""
+    handler = _RecordingHandler()
+
+    async def rewriting(raw: bytes) -> str | None:
+        if not handler.bodies:
+            client.files[path] = body
+        return await handler(raw)
+
+    src._handler = rewriting
+    return handler
+
+
+async def test_a_fresh_file_that_grew_after_the_listing_is_not_handed_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open item 2: a file written between the listing and its retrieve was taken as it stood."""
+    client = _FakeClient(files={"/in/a.hl7": _GOOD, "/in/b.hl7": _GOOD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    handler = _grows_during_hand_off(src, client, "/in/b.hl7", _GROWN)
+    await src._poll_once()
+    assert handler.bodies == [_GOOD], "b was retrieved at a length its listing did not give"
+    assert len(src.processed_ledger.keys) == 1, "a held file is not recorded as seen"
+    assert "/in/b.hl7" in client.files
+    assert src._stuck == {}, "a held file is not a reject"
+    await src._poll_once()  # its read length is the sighting this listing agrees with
+    assert handler.bodies == [_GOOD, _GROWN]
+    assert len(src.processed_ledger.keys) == 2
+
+
+async def test_a_later_retry_slot_is_not_taken_on_a_listing_older_than_an_earlier_hand_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open item 1: every slot read one listing, so y's hand-off could outdate z's."""
+    client = _read_only({"/in/y.hl7": _BAD, "/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client, poll_max_files=20)  # a retry allowance of two
+    await _settle(src)
+    await src._poll_once()  # both are rejected and remembered
+    client.files |= {"/in/y.hl7": _GOOD_AT_BAD_SIZE, "/in/z.hl7": _GOOD_AT_BAD_SIZE}
+    _make_due(src, "y.hl7", 1.0)
+    _make_due(src, "z.hl7", 2.0)
+    await _settle(src)  # both take a slot and settle
+    partial = b"MSH|^~\\&|PARTIAL"
+    handler = _grows_during_hand_off(src, client, "/in/z.hl7", partial)
+    await src._poll_once()
+    assert handler.bodies == [_GOOD_AT_BAD_SIZE], "z's partial must not be handed over"
+
+
+async def test_a_size_mismatch_is_never_quarantined_or_recorded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A partial body can fail the sniff, so the check runs first: being written is not a reject."""
+    secret = b"PARTIAL-BODY-MRN1234567"
+    client = _FakeClient(files={"/in/a.hl7": _GOOD, "/in/b.hl7": _GOOD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    _grows_during_hand_off(src, client, "/in/b.hl7", secret)
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    await src._poll_once()
+    assert "/in/.error/b.hl7" not in client.files
+    assert client.files["/in/b.hl7"] == secret
+    assert src._stuck == {}
+    assert len(src.processed_ledger.keys) == 1
+    assert "not handed off" in caplog.text, "a hold is logged"
+    assert "MRN1234567" not in caplog.text, "and without the content"
+    assert "b.hl7" not in caplog.text, "or the file name in the clear"
+
+
+async def test_a_listing_that_stays_wrong_does_not_hold_the_file_for_good(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RFC 3659 calls the MLSD size approximate, and SIZE after NLST can answer for ASCII mode, so a
+    server can list a steady wrong size. Two reads of one length show the file is not moving."""
+    client = _FakeClient(files={"/in/a.hl7": _GROWN}, sizes={"/in/a.hl7": 5})
+    src = _leave(monkeypatch, client)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    for _ in range(3):
+        await src._poll_once()
+    assert src._handler.bodies == [], "the first read is held"
+    assert _retrieved(client, "/in/a.hl7") == 1
+    await src._poll_once()
+    assert src._handler.bodies == [_GROWN], "the second read of that length is handed off"
+    assert _retrieved(client, "/in/a.hl7") == 2
+    assert "listed" in caplog.text and "handing" in caplog.text
+    assert src._size_held == {}
+    for _ in range(3):
+        await src._poll_once()
+    assert src._handler.bodies == [_GROWN], "and it is ingested once"
+
+
+async def test_a_file_whose_read_length_keeps_moving_stays_held_and_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control for the agreement above: two reads must give ONE length."""
+    client = _FakeClient(files={"/in/a.hl7": _GROWN}, sizes={"/in/a.hl7": 5})
+    src = _leave(monkeypatch, client)
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    bodies = [_GROWN + b"x" * n for n in range(1, 40)]
+    for body in bodies:
+        client.files["/in/a.hl7"] = body
+        await src._poll_once()
+    assert src._handler.bodies == []
+    assert _retrieved(client, "/in/a.hl7") > 2
+    assert "/in/a.hl7" in client.files
+    assert "not handed off" in caplog.text
+
+
+async def test_a_full_hold_memory_makes_a_file_wait_and_never_lose_its_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(remotefile, "SETTLE_SEEN_MAX", 1)
+    client = _FakeClient(
+        files={"/in/a.hl7": _GROWN, "/in/b.hl7": _GROWN},
+        sizes={"/in/a.hl7": 5, "/in/b.hl7": 5},
+    )
+    src = _leave(monkeypatch, client)
+    for _ in range(16):
+        await src._poll_once()
+    assert src._handler.bodies == [_GROWN, _GROWN]
+    assert src._size_held == {}
+
+
+async def test_first_held_reads_charge_the_ceiling_and_repeats_do_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server listing every file at a wrong size must not pull its whole backlog in one poll, and
+    a file that keeps moving must not spend the budget on every poll."""
+    paths = [f"/in/f{i}.hl7" for i in range(5)]
+    client = _FakeClient(files=dict.fromkeys(paths, _GROWN), sizes=dict.fromkeys(paths, 5))
+    src = _leave(monkeypatch, client, poll_max_files=2)
+    await _settle(src)
+    await src._poll_once()
+    assert sum(_retrieved(client, path) for path in paths) == 2
+    for _ in range(12):
+        await src._poll_once()
+    assert src._handler.bodies == [_GROWN] * 5, "every file still arrives"
+
+    moving = _FakeClient(files={"/in/a.hl7": _GROWN, "/in/b.hl7": _GOOD}, sizes={"/in/a.hl7": 5})
+    src = _leave(monkeypatch, moving, poll_max_files=1)
+    await _settle(src)
+    await src._poll_once()  # a's first held read spends the budget
+    assert src._handler.bodies == []
+    src._size_held["a.hl7"] = (src._size_held["a.hl7"][0]._replace(read=1), 0)  # a moved
+    src._settle_seen["a.hl7"] = ((5, None), 0)
+    await src._poll_once()  # a's repeat is free, so b behind it is reached
+    assert src._handler.bodies == [_GOOD]
+
+
+async def test_a_held_file_no_longer_listed_is_forgotten(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _FakeClient(files={"/in/a.hl7": _GROWN}, sizes={"/in/a.hl7": 5})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    assert "a.hl7" in src._size_held
+    del client.files["/in/a.hl7"]
+    for _ in range(SETTLE_MISS_LIMIT):
+        await src._poll_once()
+    assert src._size_held == {}
+
+
+async def test_a_listing_with_no_size_keeps_todays_behaviour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stated limit: 0 from a client that cannot say is no evidence, so nothing is held."""
+    client = _FakeClient(files={"/in/a.hl7": _GROWN}, sizes={"/in/a.hl7": 0})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    assert src._handler.bodies == [_GROWN]
+    assert _retrieved(client, "/in/a.hl7") == 1
+
+
+async def test_a_real_listed_zero_is_a_size_and_holds_a_file_since_filled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer that creates the file and fills it later lists a true 0, the likeliest partial."""
+    client = _StampedClient({"/in/a.hl7": b""}, {"/in/a.hl7": "20261123080000"})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    real = client.retrieve
+
+    def filled(path: str, *, max_bytes: int | None = None) -> bytes:
+        client.files[path] = _GROWN  # written between the listing and this read
+        return real(path, max_bytes=max_bytes)
+
+    monkeypatch.setattr(client, "retrieve", filled)
+    await src._poll_once()
+    assert src._handler.bodies == []
+
+
+def test_each_real_listing_says_whether_it_gave_a_size() -> None:
+    class _Nlst(_Ftp):
+        def nlst(self, path: str) -> list[str]:
+            return ["sized.hl7", "unsized.hl7"]
+
+        def size(self, path: str) -> int:
+            if path.endswith("unsized.hl7"):
+                raise ftplib.error_perm("550 SIZE not allowed")
+            return 0
+
+    mlsd = [("sized.hl7", {"type": "file", "size": "0"}), ("unsized.hl7", {"type": "file"})]
+    for fake in (_Ftp(mlsd), _Nlst(None)):
+        known = {e.name: e.size_known for e in _FtpClient._list(fake, "/in")}  # type: ignore[arg-type]
+        assert known == {"sized.hl7": True, "unsized.hl7": False}
+
+    class _Sftp:
+        def listdir_attr(self, path: str) -> list[Any]:
+            regular = stat.S_IFREG | 0o644
+            return [
+                SimpleNamespace(filename="sized.hl7", st_mode=regular, st_size=0, st_mtime=1),
+                SimpleNamespace(filename="unsized.hl7", st_mode=regular, st_size=None, st_mtime=1),
+            ]
+
+    sftp = _SftpClient.__new__(_SftpClient)
+    sftp._op = lambda fn, **_: fn(_Sftp())  # type: ignore[method-assign]
+    known = {e.name: e.size_known for e in sftp.list_entries("/in")}
+    assert known == {"sized.hl7": True, "unsized.hl7": False}
+
+
+async def test_a_poll_with_a_due_retry_lists_the_directory_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open items 3 and 5: the retrieve-time check replaced the second listing, so no poll pays for
+    one and no failed or partial second listing can leave a slot's sighting behind."""
+    client = _read_only({"/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    _make_due(src, "z.hl7")
+    client.list_calls = 0
+    await src._poll_once()
+    assert client.list_calls == 1
+
+
+@pytest.mark.parametrize("time_returns", [True, False])
+async def test_a_leave_retry_on_a_listing_that_lost_the_time_is_ingested_once(
+    monkeypatch: pytest.MonkeyPatch, time_returns: bool
+) -> None:
+    """Open item 4: the retry keyed on the time-less listing, so the next listing with the time
+    read as a new version. Recorded under both, it stays ingested whichever the server lists."""
+    stamp = "20261123080000"
+    client = _StampedClient({"/in/a.hl7": _BAD}, {"/in/a.hl7": stamp})
+    client._rename_exc = _REFUSED
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()  # rejected, and remembered with its time
+    assert src._stuck["a.hl7"][0].mtime == stamp
+    client.files["/in/a.hl7"] = _GOOD_AT_BAD_SIZE
+    client.mtimes.clear()  # an MLSD refusal that falls back to NLST
+    _make_due(src, "a.hl7")
+    await _settle(src)
+    await src._poll_once()
+    assert src._handler.bodies == [_GOOD_AT_BAD_SIZE]
+    if time_returns:
+        client.mtimes["/in/a.hl7"] = stamp
+    for _ in range(4):
+        await src._poll_once()
+    assert src._handler.bodies == [_GOOD_AT_BAD_SIZE], "one version is ingested once"
