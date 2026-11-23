@@ -350,8 +350,8 @@ def test_each_engine_shard_gets_its_store_path_as_one_argv_token(
 def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """[api].port is now the default base (BACKLOG #5817) and has no range check at load, so
-    supervise refuses a value no socket takes before the TLS renewal can write anything."""
+    """[api].port is now the default base (BACKLOG #5817), and the load refuses a value no socket
+    takes (BACKLOG #5769), so supervise stops before the TLS renewal can write anything."""
     from messagefoundry import __main__ as cli
 
     def _no_renewal(*args: object, **kwargs: object) -> Path:
@@ -366,7 +366,7 @@ def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
     )
     assert cli._supervise(args) == 2
     err = capsys.readouterr().err
-    assert "[api].port 70000 is not a port from 0 to 65535" in err, err
+    assert "api.port" in err and "65535" in err, err
 
 
 class _AtTheRenewal(Exception):
