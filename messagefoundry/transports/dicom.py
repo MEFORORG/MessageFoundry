@@ -71,12 +71,13 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import warnings
 import zlib
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, ClassVar, NamedTuple, assert_never, cast
+from typing import Any, ClassVar, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
 from messagefoundry.config.models import (
@@ -113,15 +114,14 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import (
-    _REDACTED,
-    prepare_log_record,
-    prints_a_codec_error,
-    safe_exc,
-    safe_text,
-    safe_traceback,
-)
+from messagefoundry.redaction import _REDACTED, prints_a_codec_error, safe_exc, safe_text
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
+from messagefoundry.transports._dicom_log_lines import (
+    ALWAYS_REDACTED_KINDS,
+    PEER_VALUE_KINDS,
+    VALUE_FREE_LINES,
+    compiled_templates,
+)
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
     REFUSAL_LOG_WINDOW_SECONDS,
@@ -495,181 +495,6 @@ def _drain_readable(sock: socket.socket) -> None:
 _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 
 
-class _Shape(NamedTuple):
-    """One kind of log line that names a peer's value. ``head`` is matched at the start of the line,
-    or found anywhere in it where ``anywhere`` is set; the value runs from there to ``tail``, the
-    fixed text the line ends with, found from its last ``anchor``. A line whose end is not ``tail``
-    loses everything after its head. ``whole`` is for a line with more than one value: it stays as
-    it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
-    after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
-    with the same value in it. ``anchor_required`` is for a head this general: it counts only in a
-    line that holds ``anchor``. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
-    it, so a long value costs one pass, on whatever thread logged it. A ``warning`` pattern can
-    backtrack over the value: ``.*`` gives text back one character at a time. Each is matched from
-    the start of the warning with at most one such run, so its cost stays linear in the text."""
-
-    head: re.Pattern[str]
-    anchor: str | None = None
-    tail: re.Pattern[str] | None = None
-    anywhere: bool = False
-    whole: re.Pattern[str] | None = None
-    warning: str | None = None
-    anchor_required: bool = False
-
-
-#: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
-#: (owner ruling 2026-11-03, vault BACKLOG #5081). Each keeps its head and tail and puts
-#: :data:`_REDACTED` where the value was. ``pynetdicom.utils`` writes ``set_uid`` and ``set_ae``:
-#: ``Non-conformant '<name>' value '<value>'`` at WARNING, and ``Invalid '<name>' value '<value>' -
-#: <reason>`` at ERROR, whose reasons are fixed strings in ``pynetdicom._validators``.
-#: ``pynetdicom.presentation`` and ``pynetdicom.pdu_primitives`` write ``The <name> '<value>' is
-#: non-conformant``, and ``pynetdicom.presentation`` names a proposed or accepted transfer syntax
-#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom._handlers`` writes
-#: ``<label> : <value>`` at DEBUG for each association request and DIMSE message it receives or
-#: sends; a head with a ``label`` group keeps a value that passes :func:`_kept`, since a real UID or
-#: AE title may be logged. :data:`_REFUSALS` holds the shapes an exception can carry. At least these
-#: shapes, read from pynetdicom 3.0.4 and pydicom 3.0.2; a line of another shape, or on another
-#: logger, passes whole.
-_NON_CONFORMANT_NAME = _Shape(
-    re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
-)
-_NOT_A_PRIVATE_CREATOR = "' is not a valid private creator"
-#: What ``set_uid``, ``set_ae``, ``decode_bytes`` and pydicom's ``validate_value`` say as they refuse
-#: a value, read wherever it appears in any record or traceback on a filtered logger, since a
-#: refusal is logged by whichever module caught it and pydicom's ``tag_in_exception`` wraps it in a
-#: longer message. Each tail is one line: text after it is not known to be fixed, so it goes too.
-_REFUSALS: tuple[_Shape, ...] = (
-    _Shape(
-        re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^'\n]*"), anywhere=True
-    ),
-    _Shape(
-        re.compile(r"Unable to decode '"),
-        "' using the ",
-        re.compile(r"' using the [^'\n]*"),
-        anywhere=True,
-    ),
-    # With a pointer to PS3.5 after it when a data element is read, and sometimes after pydicom's own
-    # length message in the same line.
-    _Shape(
-        re.compile(r"Invalid value for VR [A-Z]{2}: "),
-        ". Please see <",
-        re.compile(r"\. Please see <[^<>\n]*> for allowed values for each VR\."),
-        anywhere=True,
-        warning=r".*Invalid value for VR [A-Z]{2}: ",  # not first where a length message leads it
-    ),
-    # pydicom's Specific Character Set lines. The first names the value twice, its second copy
-    # patched from the first, so nothing after the head is fixed text.
-    _Shape(
-        re.compile(r"Incorrect value for Specific Character Set '"),
-        anywhere=True,
-        warning=r"Incorrect value for Specific Character Set '",
-    ),
-    _Shape(
-        re.compile(r"Unknown encoding '"),
-        "' - using default encoding instead",
-        re.compile(r"' - using default encoding instead"),
-        anywhere=True,
-        warning=r"Unknown encoding '",
-    ),
-    _Shape(
-        re.compile(
-            r"Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: "
-        ),
-        anywhere=True,
-        warning=r"Value '[^']*' for Specific Character Set does not allow code extensions, ",
-    ),
-    # A DS or IS value, with the note pydicom adds to it when it raises rather than warns. Its
-    # warning is matched from the start of the text: with a leading ``.*``, this pattern, the first
-    # filter every UserWarning meets, would be quadratic on a value of repeated ``Value "``.
-    _Shape(
-        re.compile(r'Value "'),
-        '" is not valid for elements with a VR of ',
-        re.compile(
-            r'" is not valid for elements with a VR of (?:DS|IS)'
-            r"(?:\nSet reading_validation_mode to WARN or IGNORE to bypass)?"
-        ),
-        anywhere=True,
-        warning=r'Value "(?s:.*)" is not valid for elements with a VR of ',
-    ),
-    # A numeric element whose length is no multiple of its VR's size: pydicom quotes its raw bytes.
-    _Shape(
-        re.compile(r"Instead received "),
-        " with length ",
-        re.compile(
-            r" with length \d+ and struct format '[^'\n]*' which corresponds to bytes per value of "
-            r"\d+\."
-        ),
-        anywhere=True,
-        warning=r"Expected total bytes to be an even multiple of bytes per value\. Instead received ",
-    ),
-    # Python's own refusal of a DS or IS that is no number, which quotes the text whole.
-    _Shape(re.compile(r"could not convert string to float: "), anywhere=True),
-    _Shape(re.compile(r"invalid literal for int\(\) with base \d+: "), anywhere=True),
-    # A private element's creator with more than one value, which pydicom prints whole, as a line
-    # and in the KeyError it raises, whose str() is the repr of the line: it ends in a quote, and
-    # escapes each single quote where the value holds a double one.
-    _Shape(
-        re.compile(r"\([0-9A-F]{4},[0-9A-F]{4}\) \\?'"),
-        _NOT_A_PRIVATE_CREATOR,
-        re.compile(_NOT_A_PRIVATE_CREATOR + "[\"']?"),
-        anywhere=True,
-        warning=r"\([0-9A-F]{4},[0-9A-F]{4}\) '(?s:.*)" + _NOT_A_PRIVATE_CREATOR,
-        anchor_required=True,
-    ),
-)
-_PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
-    # An object's SOP class and transfer syntax, as the SCU found no accepted context for them.
-    "pynetdicom.association": (
-        _Shape(
-            re.compile(r"No presentation context for '"),
-            whole=re.compile(
-                r"No presentation context for '([^']*)' has been accepted by the peer"
-                r"(?: with '([^']*)' transfer syntax)? for the (?:SCU|SCP) role"
-            ),
-        ),
-        # The SOP class of a request pynetdicom has no service for, which a peer's command names.
-        _Shape(
-            re.compile(r"No supported service class available for the SOP Class UID '"),
-            whole=re.compile(
-                r"No supported service class available for the SOP Class UID '([^']*)', please see "
-                r"the pynetdicom\.sop_class\.register_uid\(\) function if you need to add support "
-                r"for a private, retired or otherwise unknown SOP Class UID"
-            ),
-        ),
-    ),
-    "pynetdicom.utils": (
-        _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
-    ),
-    "pynetdicom.presentation": (
-        _NON_CONFORMANT_NAME,
-        _Shape(
-            re.compile(
-                r"A UID has been added to 'transfer_syntax' that is not a transfer syntax: '"
-            ),
-            "'",
-            re.compile("'"),
-        ),
-    ),
-    "pynetdicom.pdu_primitives": (_NON_CONFORMANT_NAME,),
-    "pynetdicom._handlers": (
-        _Shape(
-            re.compile(
-                r" *(?P<label>Affected SOP Class UID|Affected SOP Instance UID|Move Originator"
-                r"|Requested SOP Class UID|Requested SOP Instance UID"
-                r"|Their Implementation Class UID|Their Implementation Version Name"
-                r"|Calling Application Name|Called Application Name|Application Context Name"
-                r"|Abstract Syntax|Accepted Transfer Syntax|SOP Class|Service Class) *: *=?"
-            )
-        ),
-        _Shape(re.compile(r"(?P<label>) +=")),  # a transfer syntax, alone under its context
-        # A user identity's fields, in clear in the dump of an association request either way: never
-        # kept, whatever they spell, and the bracket pynetdicom opens goes with the value.
-        _Shape(re.compile(r" +(?:Username|Password): ")),
-        # pretty_bytes' hex of an extended negotiation item's application information.
-        _Shape(re.compile(r" +(?=[0-9a-f]{2}(?:  [0-9a-f]{2})*$)")),
-    ),
-}
-
 #: The ``pynetdicom._handlers`` labels whose value is an AE title, or a version name pynetdicom checks
 #: as one. :func:`_kept` applies ``set_ae``'s check to each, including the A-ASSOCIATE-AC's two
 #: titles, which pynetdicom reads from reserved fields with ``decode_bytes`` and no title check.
@@ -682,48 +507,43 @@ _TITLE_LABELS = frozenset(
     }
 )
 
+#: The :func:`_kept` label for each kind of template slot that holds a peer's value and may stay.
+_KIND_LABELS = {
+    "uid": "",
+    "quoted_uid": "",
+    "instance": "Affected SOP Instance UID",
+    "title": "Calling Application Name",
+    "version": "Their Implementation Version Name",
+    "move": "Move Originator",
+}
 
-def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
-    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value. The head
-    earliest in the text decides, since all after it is the value or a fixed tail, so a second value
-    further on goes with the first."""
-    found: tuple[_Shape, re.Match[str]] | None = None
-    for shape in shapes:
-        if shape.anchor_required and (shape.anchor or "") not in text:
-            continue
-        head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
-        if head is not None and (found is None or head.start() < found[1].start()):
-            found = (shape, head)
-            if head.start() == 0:  # no later shape can start ahead of it
-                break
-    if found is None:
-        return None
-    shape, head = found
-    if shape.whole is not None:
-        line = shape.whole.fullmatch(text)
-        if line is not None and all(_kept("", value) for value in line.groups() if value):
-            return None
-    rest = text[head.end() :]
-    label = head.groupdict().get("label")
-    if label is not None and _kept(label, rest):
-        return None
-    tail = ""
-    if shape.anchor is not None and shape.tail is not None:
-        cut = rest.rfind(shape.anchor)
-        if cut >= 0 and shape.tail.fullmatch(rest, cut):
-            tail = rest[cut:]
-    return f"{text[: head.end()]}{_REDACTED}{tail}"
+#: What a withheld line says, after its logger and level. Fixed text, so nothing of the line is in it.
+_LINE_WITHHELD = "line withheld: it matches no pinned template"
+#: What an exception's message reads in a traceback when it matches no pinned template.
+_MESSAGE_WITHHELD = "[message withheld]"
+#: Said of a traceback that had notes or group members, which are never written.
+_PARTS_WITHHELD = "[traceback withheld: its notes and group members are not written]"
+#: Set on a record once it has been screened, so the record factory and the filter do it once.
+_SCREENED = "_dicom_log_screened"
 
+#: The two libraries whose every logger is default-deny, wherever in their tree it sits.
+_LIBRARY_ROOTS = frozenset({"pynetdicom", "pydicom"})
 
-#: Every logger the filter is on. Those above; ``pydicom``, for :data:`_REFUSALS`; each pynetdicom
-#: module that logs an exception it caught, which can be a refusal or hold one in its chain; and
-#: three a pre-read of a command set writes to with no peer value in the line, so that the hold
-#: covers them: ``message_to_primitive``'s WARNING for an element with more than one value, the Move
-#: Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
+#: The loggers the filter sits on by name: each module logger in pynetdicom 3.0.4, and pydicom's.
+#: The hold in :func:`_logs_held` needs a filter, since a record factory cannot drop a record. A test
+#: pins this against the libraries' own ``getLogger`` calls. A logger outside this list is still
+#: screened, by :func:`_screening_record_factory`.
 _FILTERED_LOGGERS = (
-    *_PEER_VALUE_LINES,
     "pydicom",
+    "pydicom.pixels.decoders.base",
+    "pydicom.pixels.encoders.base",
+    "pydicom.pixels.utils",
+    "pynetdicom",
+    "pynetdicom._handlers",
+    "pynetdicom._validators",
     "pynetdicom.acse",
+    "pynetdicom.ae",
+    "pynetdicom.association",
     "pynetdicom.dimse",
     "pynetdicom.dimse_messages",
     "pynetdicom.dimse_primitives",
@@ -731,24 +551,30 @@ _FILTERED_LOGGERS = (
     "pynetdicom.dul",
     "pynetdicom.events",
     "pynetdicom.fsm",
+    "pynetdicom.pdu",
+    "pynetdicom.pdu_items",
+    "pynetdicom.pdu_primitives",
+    "pynetdicom.presentation",
     "pynetdicom.service_class",
+    "pynetdicom.service_class_n",
+    "pynetdicom.sop_class",
+    "pynetdicom.timer",
     "pynetdicom.transport",
+    "pynetdicom.utils",
 )
+_FILTERED_LOGGER_NAMES = frozenset(_FILTERED_LOGGERS)
 
-#: What the filter reads on each logger: its own lines, then the refusals every logger can carry.
-_SHAPES_BY_LOGGER: dict[str, tuple[_Shape, ...]] = {
-    name: (*_PEER_VALUE_LINES.get(name, ()), *_REFUSALS) for name in _FILTERED_LOGGERS
-}
+#: The modules whose warnings are ignored: pydicom's ``warn_and_log`` raises a ``UserWarning`` with
+#: the same text as its log line, value included, and unignored it goes to stderr, which the Windows
+#: service writes to a file. Scoped by module, so no other library's warning is silenced. It matches
+#: what ``warnings`` attributes the warning to, which ``warn_and_log``'s stack level sets: the
+#: pydicom module that called it, or for ``charset``'s three calls at stack level 2, the pydicom
+#: function that called that one. A test pins those call sites.
+_PYDICOM_WARNING_MODULES = (r"pydicom(?:\.|$)",)
 
-#: The start of each ``UserWarning`` pydicom's ``warn_and_log`` raises beside a log line above, with
-#: the same value in it. Each is ignored; the log line, redacted, still says what was wrong.
-#: Unignored, it goes to stderr, which the Windows service writes to a file.
-_PYDICOM_VALUE_WARNINGS = tuple(shape.warning for shape in _REFUSALS if shape.warning is not None)
-
-#: Those patterns as ``warnings.filterwarnings`` leaves them at the front of ``warnings.filters``.
+#: That pattern as ``warnings.filterwarnings`` leaves it at the front of ``warnings.filters``.
 _PYDICOM_WARNING_FILTERS = [
-    ("ignore", re.compile(message, re.IGNORECASE), UserWarning, None, 0)
-    for message in reversed(_PYDICOM_VALUE_WARNINGS)
+    ("ignore", None, Warning, re.compile(module), 0) for module in _PYDICOM_WARNING_MODULES
 ]
 
 #: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
@@ -757,9 +583,8 @@ _PRE_READ = threading.local()
 
 
 def _kept(label: str, value: str) -> bool:
-    """Whether a ``pynetdicom._handlers`` field value passes the check pynetdicom flags it on. A
-    check that raises redacts the value, since a filter that raised would raise on the pynetdicom
-    thread that logged the line.
+    """Whether a peer's value passes the check pynetdicom flags it on. A check that raises redacts
+    the value, since a filter that raised would raise on the pynetdicom thread that logged the line.
 
     No word is let through as a placeholder. The only one pynetdicom 3.0.4 prints on these labels
     is ``unknown``, where a peer sent no implementation class UID or version name. As a version
@@ -804,155 +629,194 @@ def _uid_names() -> frozenset[str]:
     return frozenset(entry[0] for entry in UID_dictionary.values())
 
 
+def _screened_line(text: str) -> str | None:
+    """``text`` as an operator may read it, or ``None`` where it must be withheld.
+
+    A line stays only if it is one of :data:`~._dicom_log_lines.VALUE_FREE_LINES` or fully matches
+    one of the pinned templates. In a template's line, a peer's value that fails :func:`_kept`, and
+    any value the library is refusing, reads :data:`_REDACTED`; the template's fixed text stays."""
+    if text in VALUE_FREE_LINES:
+        return text
+    for template in compiled_templates():
+        line = template.pattern.fullmatch(text)
+        if line is None:
+            continue
+        kept: list[str] = []
+        position = 0
+        for group, kind in enumerate(template.kinds, start=1):
+            if kind not in PEER_VALUE_KINDS:
+                continue
+            start, end = line.span(group)
+            if kind in ALWAYS_REDACTED_KINDS or not _kept(_KIND_LABELS[kind], text[start:end]):
+                kept += (text[position:start], _REDACTED)
+                position = end
+        kept.append(text[position:])
+        return "".join(kept)
+    return None
+
+
+def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) -> str | None:
+    """The traceback of ``info`` with each exception's message screened by :func:`_screened_line`,
+    or ``None`` where every message stays as it is and the stock formatter can write it.
+
+    Each message is replaced on the ``TracebackException`` node the formatter prints it from, so no
+    search of the rendered text can miss a copy. A class name and the frames stay, since those are
+    the library's and the engine's code. Notes and group members are never written. A syntax error
+    is refused, since the stdlib prints its source text from other fields. Any failure here raises,
+    and the caller withholds the traceback."""
+    root = traceback.TracebackException(*info, compact=True)
+    changed = False
+    pending = [root]
+    seen: set[int] = set()
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if getattr(node, "_is_syntax_error", False):
+            raise ValueError("a syntax error's text is not screened")
+        message: str = node._str  # type: ignore[attr-defined]
+        line = _screened_line(message)
+        screened = _MESSAGE_WITHHELD if line is None else line
+        if node.__notes__ or node.exceptions:
+            screened = f"{screened} {_PARTS_WITHHELD}"
+            node.__notes__ = None
+            node.exceptions = None
+        if screened != message:
+            node._str = screened  # type: ignore[attr-defined]
+            changed = True
+        pending += [link for link in (node.__cause__, node.__context__) if link is not None]
+    return "".join(root.format()).removesuffix("\n") if changed else None
+
+
+def _screen_record(record: logging.LogRecord) -> None:
+    """Make ``record`` safe to write, once, and never raise: this runs on whatever pynetdicom thread
+    logged the line, and a failure here withholds the line rather than crash or pass it."""
+    if record.__dict__.get(_SCREENED):
+        return
+    record.__dict__[_SCREENED] = True
+    info = record.exc_info
+    exc = info[1] if isinstance(info, tuple) else None
+    try:
+        line = _screened_line(record.getMessage())
+    except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
+        logger.debug("A DICOM library log line was withheld: %s", type(failed).__name__)
+        line = None
+    if line is None:
+        named = f" ({type(exc).__name__})" if exc is not None else ""
+        line = f"{record.name} {record.levelname} {_LINE_WITHHELD}{named}"
+    # Always rewritten: a handler's handleError prints a record's msg and args if a format fails.
+    record.msg, record.args = line, ()
+    if exc is None:
+        # Text a formatter wrote before this record got here has not been read.
+        if record.exc_text:
+            record.exc_text = f"(traceback withheld: {_LINE_WITHHELD})"
+        record.exc_info = None if not isinstance(info, tuple) else info
+        return
+    try:
+        rendered = _screened_traceback((type(exc), exc, exc.__traceback__))
+    except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
+        record.exc_info = None
+        record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
+        logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
+        return
+    if rendered is not None:
+        record.exc_info, record.exc_text = None, rendered
+
+
 class _PeerValueFilter(logging.Filter):
-    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` and
-    :data:`_REFUSALS` name, render a codec error without its byte, and hold every line inside
-    :func:`_logs_held`. The line itself is kept, so the warning, its element and its reason are still
-    in the log; only the value goes. A filter on a logger sees only what is logged on that logger
-    itself, so it is added to each by name."""
+    """Screen each record with :func:`_screen_record`, and hold every line inside
+    :func:`_logs_held`. A filter on a logger sees only what is logged on that logger itself, so it
+    is added to each by name."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         held: list[logging.LogRecord] | None = getattr(_PRE_READ, "held", None)
         if held is not None:
             held.append(record)
             return False
-        shapes = _SHAPES_BY_LOGGER.get(record.name, _REFUSALS)
-        # A codec error in the message or its args names a byte of what it failed on. The engine's
-        # log chain renders it safely, but a host's handler need not, so it is done here as well. The
-        # traceback is left out of this step and read below.
-        info, record.exc_info = record.exc_info, None
-        prepare_log_record(record)
-        record.exc_info = info
-        try:
-            text = record.getMessage()
-        except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
-            # Withheld with its args, as prepare_log_record does: a stock handler's handleError
-            # prints both, and either may hold the value. The engine's own chain withholds such a
-            # record too, but a host's handler need not. A filter that raised would raise on the
-            # pynetdicom thread that logged the line.
-            record.msg = f"[log message withheld: {type(failed).__name__} while formatting it]"
-            record.args = ()
-        else:
-            redacted = _redacted_line(shapes, text)
-            if redacted is not None:
-                record.msg, record.args = redacted, ()
-        if record.exc_info and record.exc_info[1] is not None:
-            exc = record.exc_info[1]
-            try:
-                _redact_traceback(record, shapes, exc)
-            except Exception as failed:  # noqa: BLE001 - rendering a third-party exception
-                # A filter that raised would raise on the pynetdicom thread that logged the line, and
-                # the traceback could still hold the value, so it is withheld.
-                record.exc_info = None
-                record.exc_text = f"{type(exc).__name__} (traceback withheld: it did not render)"
-                logger.debug("A DICOM traceback was withheld: %s", type(failed).__name__)
+        _screen_record(record)
         return True
-
-
-def _redact_traceback(
-    record: logging.LogRecord, shapes: tuple[_Shape, ...], exc: BaseException
-) -> None:
-    """Redact the message of ``exc``, and of each exception it was raised from or during, where it
-    is of a shape in ``shapes``. A formatter writes each one again on the traceback's last lines,
-    which redacting the record's own message does not reach. The traceback is rendered through
-    :func:`~messagefoundry.redaction.safe_traceback` into ``exc_text`` and ``exc_info`` cleared, as
-    ``prepare_log_record`` does, so a formatter writes the rendered copy and its codec-error lines
-    keep that function's protection. A traceback with no such message is left as it was, unless it
-    holds a codec error, whose line only that rendering rewrites.
-
-    The redaction is a replace of each message in the rendered text, so a message the rendering
-    does not hold verbatim withholds the whole traceback. ``safe_traceback`` rewrites a line, or
-    falls back to :func:`~messagefoundry.redaction.safe_exc`'s single line, at least for a codec
-    error and on a CPython without ``TracebackException._str``, and the value could survive there
-    in a form the replace does not find. A link with notes or group members withholds it too, since
-    the stdlib prints those and this walk does not read them. A codec error's own notes are
-    ``safe_traceback``'s to keep or drop."""
-    redactions: list[tuple[str, str]] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, BaseExceptionGroup) or (
-            getattr(current, "__notes__", None) and not isinstance(current, UnicodeError)
-        ):
-            record.exc_info = None
-            record.exc_text = (
-                f"{type(exc).__name__} (traceback withheld: it has notes or group members)"
-            )
-            return
-        message = str(current)
-        redacted = _redacted_line(shapes, message)
-        if redacted is not None:
-            redactions.append((message, redacted))
-        # The links the stdlib prints, so a suppressed context, which it leaves out, is not looked for.
-        if current.__cause__ is not None:
-            current = current.__cause__
-        else:
-            current = None if current.__suppress_context__ else current.__context__
-    info = (type(exc), exc, exc.__traceback__)
-    rendered = safe_traceback(info)
-    if not redactions:
-        # Where safe_traceback rewrote a codec error's line, a stock formatter would write it raw.
-        if rendered != logging.Formatter().formatException(info):
-            record.exc_info, record.exc_text = None, rendered
-        return
-    # All checked before any replace, since one link's message can repeat or hold another's.
-    if any(message not in rendered for message, _ in redactions):
-        record.exc_info = None
-        record.exc_text = f"{type(exc).__name__} (traceback withheld: its value was not redacted)"
-        return
-    # Longest first: a shorter message replaced first would break the match of one that holds it.
-    for message, redacted in sorted(redactions, key=lambda pair: len(pair[0]), reverse=True):
-        rendered = rendered.replace(message, redacted)
-    record.exc_info, record.exc_text = None, rendered
 
 
 _PEER_VALUE_FILTER = _PeerValueFilter()
 
 
+def _screening_record_factory(previous: Callable[..., logging.LogRecord]) -> Any:
+    """A log record factory that screens each record of a library logger as it is made and leaves
+    every other logger's alone. This is what covers a logger no filter is on, such as one created
+    after the install, one that does not propagate, and a host with its own handlers. A record a
+    hold will catch is left for the filter, which holds it and screens it when it is written."""
+
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        name = str(record.name)
+        if name.partition(".")[0] in _LIBRARY_ROOTS and not (
+            name in _FILTERED_LOGGER_NAMES and getattr(_PRE_READ, "held", None) is not None
+        ):
+            _screen_record(record)
+        return record
+
+    factory._screens_dicom_logs = True  # type: ignore[attr-defined]
+    return factory
+
+
+def _install_record_screen() -> None:
+    """Put the screening factory in force, over whatever factory is there now, unless it already is.
+    A host that replaces the factory later and does not call this one takes it out of force, until
+    the next association puts it back; the named loggers keep their filter through that gap."""
+    current = logging.getLogRecordFactory()
+    if not getattr(current, "_screens_dicom_logs", False):
+        logging.setLogRecordFactory(_screening_record_factory(current))
+
+
 def _redact_flagged_peer_values() -> None:
-    """Install the redaction on the loggers it covers, and ignore pydicom's copy as a warning.
+    """Install the screen on the libraries' loggers, and ignore pydicom's copy as a warning.
 
     Run at import, rather than in ``logging_setup``: a filter on a logger holds whatever handlers a
     host attaches, and ``serve``, the harness and the tests all import this transport, while only
     ``serve`` runs ``logging_setup``. The SCP runs it again at each start, since a
     ``warnings.catch_warnings`` block, such as pytest's around collection, puts the warnings filters
-    back as they were when it ends; that makes the warnings half best effort. Both halves are
+    back as they were when it ends; that makes the warnings half best effort. All of it is
     idempotent."""
     for name in _FILTERED_LOGGERS:
         logging.getLogger(name).addFilter(_PEER_VALUE_FILTER)
+    _install_record_screen()
     _ignore_pydicom_value_warnings()
 
 
 def _ignore_pydicom_value_warnings() -> None:
-    """Put the ignores for pydicom's warning copies first in ``warnings.filters``, unless they are.
+    """Put the ignore for pydicom's warning copies first in ``warnings.filters``, unless it is.
 
     The check keeps this cheap enough for the SCU to run per association, and it matters beyond the
     cost: each ``filterwarnings`` call resets every module's once-per-location record, so installing
-    them per send would repeat any other library's warning on stderr once per message. With
+    it per send would repeat any other library's warning on stderr once per message. With
     context-aware warnings, ``warnings.filters`` is not the list in force, so it decides nothing."""
     context_aware = getattr(sys.flags, "context_aware_warnings", 0)
     in_place = list(warnings.filters[: len(_PYDICOM_WARNING_FILTERS)]) == _PYDICOM_WARNING_FILTERS
     if in_place and not context_aware:
         return
-    for message in _PYDICOM_VALUE_WARNINGS:
-        warnings.filterwarnings("ignore", message=message, category=UserWarning)
+    for module in _PYDICOM_WARNING_MODULES:
+        warnings.filterwarnings("ignore", category=Warning, module=module)
 
 
 _redact_flagged_peer_values()
 
 
 def _safe_library_exc(exc: BaseException) -> str:
-    """:func:`~messagefoundry.redaction.safe_exc` of an exception pydicom or pynetdicom raised, with
-    a refusal's value redacted. ``redact()`` does not recognise a UID, so a refused one survives it,
-    and it rewrites some of the text a shape starts with, so the shapes read the message before it
-    does. A codec error's ``str()`` is never read here: it names a byte."""
+    """An exception pydicom or pynetdicom raised, for the engine's own log and error text: its class,
+    and its message only where :func:`_screened_line` keeps it. ``redact()`` does not recognise a
+    UID, so a refused one would survive it. A codec error's ``str()`` is never read here: it names
+    a byte."""
     if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
         return safe_exc(exc)
-    redacted = _redacted_line(_REFUSALS, str(exc))
-    if redacted is None:
-        return safe_exc(exc)
-    return f"{type(exc).__name__}: {safe_text(redacted)}"
+    try:
+        line = _screened_line(str(exc))
+    except Exception as failed:  # noqa: BLE001 - a third-party exception's str()
+        logger.debug("A DICOM exception's text was withheld: %s", type(failed).__name__)
+        line = None
+    if line is None:
+        return f"{type(exc).__name__}: {_MESSAGE_WITHHELD}"
+    return f"{type(exc).__name__}: {safe_text(line)}"
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
@@ -3109,6 +2973,7 @@ class DicomScuDestination(DestinationConnector):
     def _build_ae(self) -> Any:
         from pynetdicom import AE
 
+        _install_record_screen()  # a host may have replaced the record factory since the import
         _ignore_pydicom_value_warnings()  # the SCP's start does this too; this host may have none
         ae = AE(ae_title=self._calling_ae_title)
         ae.acse_timeout = self._timeout

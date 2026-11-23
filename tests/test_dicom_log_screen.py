@@ -1,0 +1,551 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""The fail-closed screen on pynetdicom's and pydicom's logs (vault BACKLOG #6637 item 10): a line is
+written only if it is pinned, and anything else is withheld with its logger, level and exception
+class. Every value here is synthetic. These tests assert on the formatted output, tracebacks
+included, since that is what reaches a log file.
+
+**These tests need the ``[dicom]`` extra and SKIP without it.**
+"""
+
+from __future__ import annotations
+
+import ast
+import collections
+import io
+import logging
+import re
+import subprocess
+import sys
+import textwrap
+import time
+from collections.abc import Callable, Iterator
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("pydicom", reason="DICOM log tests need the [dicom] extra")
+pytest.importorskip("pynetdicom", reason="DICOM log tests need the [dicom] extra")
+
+from messagefoundry.transports import _dicom_log_lines as lines  # noqa: E402
+from messagefoundry.transports import dicom as dicom_module  # noqa: E402
+from tests import _dicom_log_census as census  # noqa: E402
+
+_PLANTED = "DOE^JANE^PLANTED"
+_WITHHELD = "line withheld: it matches no pinned template"
+_FORMAT = "%(name)s|%(levelname)s|%(message)s"
+
+
+def _written(log: logging.Logger, emit: Callable[[logging.Logger], None]) -> str:
+    """What a stock handler on ``log`` writes, with no ``logging_setup`` in the process's path."""
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter(_FORMAT))
+    level, propagate = log.level, log.propagate
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    try:
+        emit(log)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(level)
+        log.propagate = propagate
+    return stream.getvalue()
+
+
+@pytest.mark.parametrize("level", [logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR])
+@pytest.mark.parametrize(
+    "name", ["pydicom", "pynetdicom.association", "pynetdicom.dul", "pynetdicom.pdu"]
+)
+def test_an_unpinned_line_is_withheld_at_every_level(name: str, level: int) -> None:
+    written = _written(
+        logging.getLogger(name), lambda log: log.log(level, "Patient name %s", _PLANTED)
+    )
+    assert _PLANTED not in written
+    assert written == f"{name}|{logging.getLevelName(level)}|{name} " + (
+        f"{logging.getLevelName(level)} {_WITHHELD}\n"
+    )
+
+
+def test_an_info_dump_of_a_dataset_is_withheld() -> None:
+    # pynetdicom logs a C-FIND identifier line by line at INFO, so INFO carries values too.
+    written = _written(
+        logging.getLogger("pynetdicom.service_class"),
+        lambda log: log.info(f"(0010,0010) PN [{_PLANTED}]"),
+    )
+    assert _PLANTED not in written and _WITHHELD in written
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Association Accepted",
+        "Association Released",
+        "Association Aborted",
+        "Association Aborted (A-P-ABORT)",
+        "Association Rejected",
+        "Requesting Association",
+        "Accepting Association",
+        "Releasing Association",
+        "Aborting Association",
+        "Network timeout reached",
+        "Connection closed before the entire PDU was received",
+        "Sending Store Request: MsgID 7, (CT)",
+        "Received Store Response (Status: 0x0000 - Success)",
+        "Received Echo Request (MsgID 3)",
+        "Result: Rejected Permanent, Source: Service User",
+        "Reason: Called AE title not recognised",
+    ],
+)
+def test_the_lines_an_operator_works_from_are_kept_whole(message: str) -> None:
+    written = _written(logging.getLogger("pynetdicom.association"), lambda log: log.info(message))
+    assert written == f"pynetdicom.association|INFO|{message}\n"
+
+
+@pytest.mark.parametrize("field", ["Reason", "Result", "Status"])
+def test_a_fixed_vocabulary_slot_refuses_a_word_outside_it(field: str) -> None:
+    line = {
+        "Reason": f"Reason: {_PLANTED}",
+        "Result": f"Result: {_PLANTED}, Source: Service User",
+        "Status": f"Received Store Response (Status: 0x0000 - {_PLANTED})",
+    }[field]
+    assert dicom_module._screened_line(line) is None
+
+
+# --- Loggers a filter is not on ------------------------------------------------------------------
+
+
+def test_a_logger_created_after_the_install_is_screened() -> None:
+    name = "pynetdicom.created_after_install"
+    assert name not in logging.root.manager.loggerDict  # CONTROL: it did not exist before this
+    written = _written(logging.getLogger(name), lambda log: log.error("value %s", _PLANTED))
+    assert _PLANTED not in written and _WITHHELD in written
+
+
+def test_a_child_that_does_not_propagate_is_screened() -> None:
+    log = logging.getLogger("pydicom.a.child")
+    log.propagate = False
+    written = _written(log, lambda child: child.warning("value %s", _PLANTED))
+    assert _PLANTED not in written and _WITHHELD in written
+
+
+def test_another_librarys_logger_is_left_alone() -> None:
+    for name in ("pynetdicomish", "pydicomish.child", "messagefoundry.anything"):
+        written = _written(logging.getLogger(name), lambda log: log.warning("kept %s", _PLANTED))
+        assert written == f"{name}|WARNING|kept {_PLANTED}\n"
+
+
+def test_a_host_record_factory_is_chained_and_put_back_under() -> None:
+    original = logging.getLogRecordFactory()
+    seen: list[str] = []
+
+    def hosts(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+        seen.append(record.name)
+        return record
+
+    logging.setLogRecordFactory(hosts)
+    try:
+        dicom_module._install_record_screen()
+        assert logging.getLogRecordFactory() is not hosts
+        written = _written(
+            logging.getLogger("pynetdicom.new_under_a_host"),
+            lambda log: log.error("value %s", _PLANTED),
+        )
+        assert "pynetdicom.new_under_a_host" in seen  # the host's factory still ran
+        assert _PLANTED not in written and _WITHHELD in written
+        installed = logging.getLogRecordFactory()
+        dicom_module._install_record_screen()
+        assert logging.getLogRecordFactory() is installed  # CONTROL: installing is idempotent
+    finally:
+        logging.setLogRecordFactory(original)
+
+
+def test_every_logger_the_libraries_create_has_the_filter() -> None:
+    # The hold in _logs_held works through the filter, so it must be on each by name.
+    created: set[str] = set()
+    for module, logger, source in census.library_sources():
+        if "getLogger(__name__)" in source:
+            created.add(module)
+        if 'getLogger("pydicom")' in source:
+            created.add(logger)
+    assert "pynetdicom.dul" in created and "pydicom" in created  # CONTROL
+    assert created <= set(dicom_module._FILTERED_LOGGERS)
+    for name in dicom_module._FILTERED_LOGGERS:
+        assert dicom_module._PEER_VALUE_FILTER in logging.getLogger(name).filters, name
+
+
+# --- Tracebacks --------------------------------------------------------------------------------
+
+
+def _chained() -> BaseException:
+    try:
+        try:
+            raise ValueError(f"inner {_PLANTED}")
+        except ValueError as inner:
+            raise RuntimeError(f"outer {_PLANTED}") from inner
+    except RuntimeError as exc:
+        return exc
+
+
+def _during() -> BaseException:
+    try:
+        try:
+            raise KeyError(_PLANTED)
+        except KeyError:
+            raise OSError(f"failed on {_PLANTED}")  # noqa: B904 - the implicit context is the case
+    except OSError as exc:
+        return exc
+
+
+def _noted() -> BaseException:
+    exc = RuntimeError("Unable to decode the received PDU data")
+    exc.add_note(f"while reading {_PLANTED}")
+    return exc
+
+
+def _group() -> BaseException:
+    return ExceptionGroup("failed", [ValueError(_PLANTED), TypeError(_PLANTED)])
+
+
+def _codec() -> BaseException:
+    try:
+        f"{_PLANTED}\xe9".encode("ascii")
+    except UnicodeEncodeError as exc:
+        return exc
+    raise AssertionError("no error")
+
+
+@pytest.mark.parametrize(
+    ("build", "class_name"),
+    [
+        (_chained, "RuntimeError"),
+        (_during, "OSError"),
+        (_noted, "RuntimeError"),
+        (_group, "ExceptionGroup"),
+        (_codec, "UnicodeEncodeError"),
+    ],
+    ids=["cause", "context", "note", "group", "codec"],
+)
+def test_nothing_of_an_exception_reaches_the_output_but_its_class(
+    build: Callable[[], BaseException], class_name: str
+) -> None:
+    exc = build()
+    written = _written(
+        logging.getLogger("pynetdicom.events"), lambda log: log.exception(exc, exc_info=exc)
+    )
+    assert _PLANTED not in written, written
+    assert class_name in written
+
+
+def test_a_withheld_line_names_its_exception_class() -> None:
+    exc = _chained()
+    written = _written(
+        logging.getLogger("pynetdicom.dul"), lambda log: log.exception(exc, exc_info=exc)
+    )
+    assert f"pynetdicom.dul ERROR {_WITHHELD} (RuntimeError)" in written
+
+
+def test_a_chain_keeps_a_pinned_message_and_loses_the_rest() -> None:
+    try:
+        try:
+            raise ValueError("Unable to decode the received PDU data")
+        except ValueError as inner:
+            raise RuntimeError(f"outer {_PLANTED}") from inner
+    except RuntimeError as exc:
+        caught = exc
+    written = _written(
+        logging.getLogger("pynetdicom.dul"), lambda log: log.exception(caught, exc_info=caught)
+    )
+    assert "ValueError: Unable to decode the received PDU data" in written
+    assert "RuntimeError: [message withheld]" in written
+    assert _PLANTED not in written
+
+
+# --- A failure inside the screen -----------------------------------------------------------------
+
+
+def test_a_failure_in_the_screen_withholds_the_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(text: str) -> str | None:
+        raise RuntimeError(f"failed on {text}")
+
+    monkeypatch.setattr(dicom_module, "_screened_line", broken)
+    exc = _chained()
+    written = _written(
+        logging.getLogger("pynetdicom.dul"), lambda log: log.exception(exc, exc_info=exc)
+    )
+    assert _PLANTED not in written
+    assert _WITHHELD in written and "traceback withheld" in written
+
+
+def test_a_value_check_that_raises_redacts_the_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken() -> frozenset[str]:
+        raise RuntimeError("no dictionary")
+
+    monkeypatch.setattr(dicom_module, "_uid_names", broken)
+    assert (
+        dicom_module._screened_line("Affected SOP Class UID        : Verification SOP Class")
+        == "Affected SOP Class UID        : [redacted]"
+    )
+
+
+def test_a_message_whose_str_raises_is_withheld() -> None:
+    class Unprintable:
+        def __str__(self) -> str:
+            raise RuntimeError(_PLANTED)
+
+    written = _written(logging.getLogger("pynetdicom.dul"), lambda log: log.error(Unprintable()))
+    assert _PLANTED not in written and _WITHHELD in written
+
+
+def test_a_line_break_in_a_value_cannot_forge_a_second_line() -> None:
+    # `.` stops at a line break, so the value slot does not span it and no template matches.
+    forged = f"Calling Application Name:    A\nAssociation Accepted {_PLANTED}"
+    assert dicom_module._screened_line(forged) is None
+
+
+# --- Cost on a peer's text -----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "a" * 200_000,
+        "'" * 200_000,
+        "' - " * 50_000,
+        ". Please see <" * 15_000,
+        'Value "' * 30_000,
+    ],
+    ids=["plain", "quotes", "tail", "see", "head"],
+)
+@pytest.mark.parametrize(
+    "head",
+    [
+        "",
+        "Invalid 'X' value '",
+        "Invalid value for VR UI: ",
+        "No presentation context for '",
+        'Value "',
+    ],
+)
+def test_matching_stays_linear_on_a_long_peer_value(head: str, value: str) -> None:
+    started = time.monotonic()
+    dicom_module._screened_line(head + value)
+    assert time.monotonic() - started < 1.0
+
+
+def test_no_template_has_two_unbounded_runs() -> None:
+    def unbounded(template: str) -> int:
+        return sum(
+            1
+            for kind in re.findall(r"\{([a-z_]+)\}", template)
+            if lines._SLOT_PATTERNS[kind] == r".*"
+        )
+
+    assert unbounded("A {value} B {uid}") == 2  # CONTROL
+    assert not [t for t in lines.TEMPLATES if unbounded(t) > 1]
+
+
+# --- The guard: a library upgrade that changes a line fails here ---------------------------------
+
+
+def test_the_census_is_the_installed_libraries() -> None:
+    pinned = census.read_pinned()
+    assert len(pinned) > 400  # CONTROL: the file holds a census, not an empty list
+    found = census.census()
+    added = sorted(set(found) - set(pinned))
+    removed = sorted(set(pinned) - set(found))
+    assert (added, removed) == ([], []), (
+        "A library's log calls changed. Read each, pin it in messagefoundry/transports/"
+        "_dicom_log_lines.py if an operator needs it, then run "
+        "python -P tests/_dicom_log_census.py --write"
+    )
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        'LOGGER.error(f"Patient {name} refused")',
+        'LOGGER.info("Patient %s refused", name)',
+        'LOGGER.warning(msg + " refused")',
+        'warn_and_log(f"Patient {name} refused")',
+        'logger.exception(f"Patient {name} refused")',
+    ],
+)
+def test_the_guard_sees_a_planted_library_line(planted: str) -> None:
+    source = next(s for m, _l, s in census.library_sources() if m == "pynetdicom.dul")
+    before = census.rows_in("pynetdicom.dul", "pynetdicom.dul", source)
+    assert before <= set(census.read_pinned())  # CONTROL: the unplanted module is in the census
+    after = census.rows_in(
+        "pynetdicom.dul", "pynetdicom.dul", f"{source}\n\ndef planted():\n    {planted}\n"
+    )
+    assert after - set(census.read_pinned())
+
+
+def test_the_value_free_lines_are_the_census_literals() -> None:
+    literals = {"Association Aborted (A-P-ABORT)"}  # built by += in association.py
+    for row in census.read_pinned():
+        text = row.split(" ", 2)[2] if row.count(" ") >= 2 else ""
+        if "{}" in text or text.startswith("<") or "<''" in text:
+            continue
+        if re.search(r"%[sdxrXi]", text):
+            continue
+        literals.add(text.replace("\\n", "\n").replace("\\r", "\r").replace("\\\\", "\\"))
+    assert literals == lines.VALUE_FREE_LINES
+
+
+def test_each_template_still_has_its_text_in_a_library() -> None:
+    # By its longest run of words: a library builds some of these lines from more than one literal.
+    # CPython's own two number refusals are the exception, since no library holds their text.
+    corpus = "\0".join(census.string_fragments())
+    stale = []
+    for template in lines.TEMPLATES:
+        if template.startswith(("could not convert string", "invalid literal for int")):
+            continue
+        words = re.findall(r"[A-Za-z][A-Za-z ]{5,}", re.sub(r"\{[a-z_]+\}", "\0", template))
+        if words and max(words, key=len).strip()[:16] not in corpus:
+            stale.append(template)
+    assert "Association Accepted" in corpus  # CONTROL
+    assert "A wording no library has" not in corpus  # CONTROL
+    assert stale == []
+
+
+def test_each_slot_kind_is_defined_and_used() -> None:
+    used = {kind for t in lines.TEMPLATES for kind in re.findall(r"\{([a-z_]+)\}", t)}
+    assert used == set(lines._SLOT_PATTERNS)
+    assert set(dicom_module._KIND_LABELS) == lines.PEER_VALUE_KINDS - lines.ALWAYS_REDACTED_KINDS
+
+
+def test_the_census_counts_by_library_and_level() -> None:
+    """The figures in docs/DICOM.md's account come from here; a change moves both."""
+    counts = collections.Counter(
+        (row.split(" ", 1)[0].split(".")[0], row.split(" ", 2)[1]) for row in census.read_pinned()
+    )
+    assert counts[("pynetdicom", "INFO")] > 0 and counts[("pydicom", "WARNING")] > 0
+
+
+# --- Warnings ------------------------------------------------------------------------------------
+
+
+def test_only_charset_warns_with_a_raised_stack_level() -> None:
+    # The ignore is by module, and a raised stack level attributes a warning to a caller: if one of
+    # these reached code outside pydicom, its warning would no longer be ignored.
+    sites: list[tuple[str, str]] = []
+    for module, _logger, source in census.library_sources():
+        if not module.startswith("pydicom"):
+            continue
+        tree = ast.parse(source)
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "warn_and_log"
+                    and any(k.arg == "stacklevel" for k in node.keywords)
+                ):
+                    sites.append((module, function.name))
+    assert sorted(set(sites)) == [
+        ("pydicom.charset", "_handle_illegal_standalone_encodings"),
+        ("pydicom.charset", "_warn_about_invalid_encoding"),
+    ]
+    charset = next(s for m, _l, s in census.library_sources() if m == "pydicom.charset")
+    for name in ("_handle_illegal_standalone_encodings", "_warn_about_invalid_encoding"):
+        for module, _logger, source in census.library_sources():
+            if module != "pydicom.charset":
+                assert f"{name}(" not in source, (module, name)
+        assert f"{name}(" in charset
+
+
+_WARNINGS_PROBE = textwrap.dedent(
+    """
+    import sys, threading, warnings
+    warnings.simplefilter("default")
+    from messagefoundry.transports import dicom
+    dicom._redact_flagged_peer_values()
+    from pydicom import charset
+
+    def run():
+        charset.convert_encodings(["ISO_IR 192", "PLANTED-WARNING-VALUE"])
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join()
+    run()
+    warnings.warn_explicit("ANOTHER-LIBRARY-WARNING", UserWarning, "other.py", 1, module="other")
+    """
+)
+
+
+@pytest.mark.parametrize("context_aware", ["0", "1"])
+def test_the_ignore_is_scoped_to_pydicom_under_either_warnings_mode(context_aware: str) -> None:
+    done = subprocess.run(  # noqa: S603 - this interpreter, on a fixed script
+        [sys.executable, "-X", f"context_aware_warnings={context_aware}", "-c", _WARNINGS_PROBE],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "PLANTED-WARNING-VALUE" not in done.stderr, done.stderr
+    assert "ANOTHER-LIBRARY-WARNING" in done.stderr, done.stderr  # another library's still shows
+
+
+def test_the_probe_warns_with_the_value_when_the_ignore_is_off() -> None:
+    # The CONTROL for the two above: the same call, with no ignore, puts the value on stderr.
+    probe = _WARNINGS_PROBE.replace(
+        "dicom._redact_flagged_peer_values()", "warnings.resetwarnings()"
+    )
+    done = subprocess.run(  # noqa: S603 - this interpreter, on a fixed script
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert "PLANTED-WARNING-VALUE" in done.stderr
+
+
+def _iter_templates() -> Iterator[str]:
+    yield from lines.TEMPLATES
+
+
+def test_every_template_compiles_and_matches_its_own_shape() -> None:
+    samples = {
+        "int": "1",
+        "number": "1",
+        "hex": "00FF",
+        "vr": "UI",
+        "tag": "0009,0010",
+        "name": "Some Name",
+        "keyword": "Keyword",
+        "message_type": "C-STORE",
+        "role": "SCU",
+        "roles": "SCU",
+        "codecs": "ascii",
+        "struct_format": "H",
+        "see_url": "https://dicom.nema.org/x",
+        "indent": "  ",
+        "hex_dump": "00  ff",
+        "status_word": "Success",
+        "presence": "Present",
+        "yes_none": "Yes",
+        "priority": "Low",
+        "standalone_charset": "GBK",
+        "refusal_reason": "must be str",
+        "assoc_result": "Accepted",
+        "assoc_source": "Service User",
+        "assoc_reason": "Reserved",
+        "context_result": "Accepted",
+        "identity_type": "SAML",
+    }
+    for text in _iter_templates():
+        filled = re.sub(
+            r"\{([a-z_]+)\}", lambda m: samples.get(m.group(1), "1.2.826.0.1.3680043.2.1"), text
+        )
+        assert dicom_module._screened_line(filled) is not None, text

@@ -393,6 +393,9 @@ _INVALID_MESSAGES = {
 }
 
 
+#: A line pynetdicom pins and this flow never writes, so the log screen keeps it: the capture control.
+_CAPTURE_CONTROL_LINE = "maximum_associations set to 1"
+
 #: The pynetdicom loggers that write a traceback, or one of the lines the quiet-end test looks for.
 _PYNETDICOM_LOGGERS = (
     "pynetdicom",
@@ -421,7 +424,7 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
                 # look for, so they are known to read a capture those records reach. It names none
                 # of the strings they look for.
                 for name in _PYNETDICOM_LOGGERS:
-                    logging.getLogger(name).warning("planted capture control")
+                    logging.getLogger(name).warning(_CAPTURE_CONTROL_LINE)
                 sock.sendall(sends)
                 answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_INVALID))
                 assert answer == _ABORT_INVALID, answer
@@ -431,7 +434,7 @@ async def test_a_message_pynetdicom_would_fail_on_ends_the_association_quietly(
     # The bare assert stays although the next lines imply it: it is the guard
     # tests/test_vacuous_absence_assert_lint.py reads for the two absence asserts below.
     assert caplog.records
-    planted = sorted(r.name for r in caplog.records if r.getMessage() == "planted capture control")
+    planted = sorted(r.name for r in caplog.records if r.getMessage() == _CAPTURE_CONTROL_LINE)
     assert planted == sorted(_PYNETDICOM_LOGGERS), caplog.text
     # The SCP's own end of this association, so the abort the peer read came from that path and not
     # from pynetdicom's own AA-8, which sends the same bytes.
