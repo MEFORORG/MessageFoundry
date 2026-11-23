@@ -132,18 +132,26 @@ def _acl(path: Path) -> _Acl:
     return _Acl(lines[0] == "protected=1", tuple(entries), out)
 
 
+# Replaces the whole access list with the SDDL given, writing only the access section. ``icacls
+# /inheritance:r /grant:r`` is not enough: it drops only entries marked inherited, and on the hosted
+# runners the SYSTEM, Administrators and OWNER RIGHTS entries from pytest's mode-0700 temp folder
+# arrive on a child folder as explicit entries and survive it (CI run 45151393786).
+_SET_ACL = (
+    "$ErrorActionPreference = 'Stop';"
+    "$a = Get-Acl -LiteralPath $env:MF_ACL_PATH;"
+    "$a.SetSecurityDescriptorSddlForm($env:MF_ACL_SDDL,"
+    " [System.Security.AccessControl.AccessControlSections]::Access);"
+    "Set-Acl -LiteralPath $env:MF_ACL_PATH -AclObject $a"
+)
+
+
 def _folder_granting_only(path: Path, sid: str) -> Path:
     """Make ``path`` a folder whose protected list grants ``sid`` alone, inherited by what is made
     in it, and check that it took."""
     path.mkdir()
     _run(
-        [
-            str(_SYSTEM32 / "icacls.exe"),
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            f"*{sid}:(OI)(CI)F",
-        ]
+        [str(_POWERSHELL), "-NoProfile", "-NonInteractive", "-Command", _SET_ACL],
+        extra_env={"MF_ACL_PATH": str(path), "MF_ACL_SDDL": f"D:PAI(A;OICI;FA;;;{sid})"},
     )
     acl = _acl(path)
     assert acl.protected and {e.sid for e in acl.entries} == {sid}, acl.raw
