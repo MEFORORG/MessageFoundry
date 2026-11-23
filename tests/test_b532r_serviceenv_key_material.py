@@ -26,6 +26,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_DOUBT,
     CREATE,
     DOUBT_PASS_BACK,
+    DOUBT_STEP,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
@@ -449,9 +450,9 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     remedy = refusal.split("each value refused here. ", 1)[1]
     # The password moves to the secrets directory, so the step carries its create clause.
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
-    # The third hold's H1: no step before the add-back step, which reads and passes back a
-    # list, names a string.
-    assert "string" not in remedy.split(ADD_BACK_ANY, 1)[0]
+    # The third hold's H1: no step before the doubt step names a string. That step and the
+    # add-back step read and pass back a list, so they name the strings they leave out.
+    assert "string" not in remedy.split(DOUBT_STEP, 1)[0]
 
 
 def test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step() -> None:
@@ -654,8 +655,8 @@ def test_a_joined_directory_entry_that_is_not_plainly_a_path_is_removed_and_name
     scenario, under the Lander's ruling B on the repair handback, comment 7106776128. A joined
     directory entry whose value is not plainly a path is in doubt, so no step spares or keeps
     it, and the removal and run-on steps take it out with the value. That changes the entry the
-    engine reads, so the add-back step then says to take every other directory line out and
-    name the path again, never a silent change of directory. The parametrized control
+    engine reads, so a step of its own says to take every directory line out and the add-back
+    step names the path again, never a silent change of directory. The parametrized control
     ``joined-path-beside-a-listed-one`` above, the same lists with a joined path, still keeps one
     entry."""
     posture = read_service_env_posture(probe=_Probe(entries), environ={})
@@ -706,7 +707,8 @@ def test_a_directory_line_in_doubt_beside_a_joined_path_keeps_no_entry(string: s
     findings 1, 2 and 4: a joined plain path would be kept, but another registry string holds a
     directory line that is not, alone, plainly a path. The rule reads every string as written,
     whatever the line reading made of it, so that line is in doubt: no step spares or keeps a
-    directory line, and the add-back step says to take every other one out and name the path."""
+    directory line, a step of its own says to take every one out, and the add-back step names
+    the path."""
     refusal = _remedy(
         [
             (_EXTRA, f"{_KEY}="),

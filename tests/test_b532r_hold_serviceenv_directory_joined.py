@@ -533,14 +533,18 @@ def test_a_directory_entry_in_doubt_outside_the_extra_list_is_taken_out_too(
     plain: str, where: str
 ) -> None:
     """The Lander's ruling B on PR 3142's repair handback, comment 7106776128: a directory
-    entry in doubt is taken out whatever list holds it, so the clause names every list and the
-    step says `nssm set` replaces a whole list, not only AppEnvironmentExtra (the Lander's hold
-    on PR 3142, comment 7090314503, item 3, read under that ruling). The lists still set the
-    directory, so the step never says they set none."""
+    entry in doubt is taken out whatever list holds it, so the doubt step names every list, says
+    `nssm set` replaces a whole list and to read AppEnvironment and AppEnvironmentExtra first
+    with `nssm get`, and says the service's own Environment value is edited in its registry key
+    (the Lander's hold on PR 3142, comment 7090314503, item 3, read under that ruling; code
+    review round 2 on the repair). The lists still set the directory, so the step never says
+    they set none."""
     refusal = service_env_refusal(_read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (where, plain)]))
     assert refusal is not None
     assert SET_NO not in refusal
     assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
+    assert "read AppEnvironment and AppEnvironmentExtra first with `nssm get`" in DOUBT_STEP
+    assert "Environment value is no NSSM list and is edited in the registry key" in DOUBT_STEP
 
 
 @pytest.mark.parametrize(
@@ -555,9 +559,10 @@ def test_a_non_ascii_name_does_not_set_the_directory_but_is_in_doubt(name: str) 
     """The Lander's hold on PR 3142, comment 7090314503, item 4: ``str.upper`` maps U+017F
     onto S and U+0131 onto I, and ``str.strip`` removes a U+00A0 blank, so ``_sets_directory``
     holds a name to ASCII. Python's ``os.environ`` on Windows upper-cases names, so the engine
-    may read such a name as the directory (the Lander's hold on PR 3142, comment 7104660861):
-    under ruling B (comment 7106776128) the entry is in doubt, and the step says to take it out
-    and add the directory back, as for the blank ASCII control."""
+    may read a U+017F or U+0131 name as the directory (the Lander's hold on PR 3142, comment
+    7104660861); it does not strip a U+00A0 blank, but the reader's whole-string reading does.
+    Under ruling B (comment 7106776128) each entry is in doubt, and the remedy says to take it
+    out and add the directory back, as for the blank ASCII control."""
     assert not _sets_directory(f"{name}=") and _sets_directory("MEFOR_SECRETS_DIRECTORY=")
     for spelled in (name, "MEFOR_SECRETS_DIRECTORY"):
         refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{spelled}="]))
@@ -568,8 +573,8 @@ def test_a_non_ascii_name_does_not_set_the_directory_but_is_in_doubt(name: str) 
 def test_a_blank_directory_item_is_not_passed_back() -> None:
     """The Lander's hold on PR 3142, comment 7089064404, A: the blank
     ``MEFOR_SECRETS_DIRECTORY=`` is no refused variable, and no value runs on into it. It is not
-    plainly a path, so it is in doubt, the clause says to remove it, and the wider exclusion
-    leaves out what this step says to remove (finding C)."""
+    plainly a path, so it is in doubt, the doubt step says to take it out, and the add-back
+    step passes back none of what the steps above remove or take out (finding C)."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
     assert refusal is not None
     assert SET_NO not in refusal and RUNS_ON not in refusal

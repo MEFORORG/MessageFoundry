@@ -179,8 +179,8 @@ class ServiceEnvPosture:
     #: True the remedy prints no keep-one step and no clause sparing directory lines from its
     #: removal steps. It prints a step that says to take every line that may name the directory
     #: (:func:`_may_name_directory`) out of every list, and then the add-back step, which says
-    #: to add one entry naming the path, even where a directory entry is listed. Where it is
-    #: False, every directory entry is plainly a path on its own, so the keep-one step prints
+    #: to add one entry naming the path wherever the directory exists, even where a directory
+    #: entry is listed. Where it is False, every directory entry is plainly a path on its own, so the keep-one step prints
     #: where a refused value runs on into one (``directory_run_on``), and no step removes one
     #: otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
     #: PR 3142's repair handback, comment 7106776128).
@@ -1381,12 +1381,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     # PR 3142). directory_run_on needs a refused value that runs on, so the run-on step prints
     # too. Where any entry is in doubt, nothing is spared or kept: a step of its own, with no
     # condition, says to take every line that may name the directory out of every list, and the
-    # add-back step then names the path again, so no step changes the directory the engine reads
-    # without naming it (code review round 1 on this repair).
+    # add-back step then names the path again wherever the directory exists, so no step changes
+    # the directory the engine reads without naming it (code review rounds 1 and 2 on this
+    # repair).
     doubt = posture.directory_in_doubt
     keep_one = posture.directory_run_on and not doubt
     add_back_due = doubt or (
-        not keep_one and bool(others or values) and _DIRECTORY_VARIABLE not in posture.listed
+        not posture.directory_run_on
+        and bool(others or values)
+        and _DIRECTORY_VARIABLE not in posture.listed
     )
     spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
@@ -1412,26 +1415,37 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
         # directory and nothing else, or beside other lines, is now either plainly a path, and
         # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
-        # comment 7106776128).
+        # comment 7106776128). It names every list it acts in, with how each is edited, since
+        # `nssm set` replaces a whole list and the service's own Environment value is no NSSM
+        # list (code review round 2 on this repair).
         steps.append(
-            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not plainly a path on its "
-            "own, so take each line that may set it out of every list, whatever its letter case, "
-            "a blank around its name, or a letter outside ASCII that upper-cases to one of its "
-            "letters, removing an entry that holds nothing else and keeping each other line no "
-            'step above says to remove. See docs/SERVICE.md, "Start / stop / status"'
+            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
+            "plainly to a path under that name, in ASCII with no blank around it, so take each "
+            "line that may set it out of every list, whatever its letter case, a blank around "
+            "its name, or a letter outside ASCII that upper-cases to one of its letters, "
+            "removing an entry that holds nothing else and keeping each other line no step "
+            "above says to remove. `nssm set` replaces a whole list, so read AppEnvironment and "
+            "AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by "
+            "its full path, and pass back every entry but the strings and lines this step and "
+            "the steps above say to remove or take out. "
+            "The service's own Environment value is no NSSM list and is edited in the registry "
+            'key named above: see docs/SERVICE.md, "Start / stop / status"'
         )
     if add_back_due:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
         # the value it is joined to unless no directory entry is in doubt, when the keep-one
-        # step below keeps one instead, so only that makes "add it back" false (the Lander's
-        # ruling on handback 7085947392, F1). A refused
+        # step below keeps one instead (the Lander's ruling on handback 7085947392, F1). With
+        # no entry in doubt, a listed directory also leaves this step out. A refused
         # name outside the key class may need the directory, and the run-on step may remove
         # a directory string even for a store key alone (the Lander's ruling on comment
         # 7087145957, F1 on H3's terms).
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
+        # Where an entry is in doubt, the step above may have taken out a working entry, so the
+        # step says to add one back wherever the directory exists, however it was made (code
+        # review round 2 on this repair).
         # The step says the lists set no directory only where no line of any string in them
         # sets one (directory_in_lists) and no directory entry is in doubt. Where one is in
         # doubt, the entries it says to pass back leave out the strings and lines the steps
@@ -1440,9 +1454,13 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # above say to remove, which may hold the refused value or set the directory (the
         # Lander's holds on PR 3142, comments 7088102723 and 7088663896).
         none_set = (others or values) and not posture.directory_in_lists and not doubt
+        made = (
+            "the secrets directory already exists, however it was made"
+            if doubt
+            else "install-service.ps1 already made the secrets directory"
+        )
         add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
-            f"Where install-service.ps1 already made the secrets directory, add "
-            f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
+            f"Where {made}, add {_DIRECTORY_VARIABLE} naming that existing path back to the service's "
             "AppEnvironmentExtra, beside its other entries, before any re-run of the installer, "
             "which refuses an existing directory the service does not name. `nssm set` replaces "
             "that whole list, so read it first with `nssm get`, running the service's own "

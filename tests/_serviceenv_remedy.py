@@ -86,11 +86,16 @@ WIDER = "and the strings this step and any step above say to remove"
 #: Lander's holds on PR 3142, comments 7089064404, 7089400537 and 7090314503 (the Lander's
 #: ruling B on PR 3142's repair handback, comment 7106776128).
 DOUBT_STEP = (
-    "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not plainly a path on its own, so "
-    "take each line that may set it out of every list, whatever its letter case, a blank around "
-    "its name, or a letter outside ASCII that upper-cases to one of its letters, removing an "
-    "entry that holds nothing else and keeping each other line no step above says to remove. "
-    'See docs/SERVICE.md, "Start / stop / status"'
+    "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not one line setting it plainly "
+    "to a path under that name, in ASCII with no blank around it, so take each line that may set "
+    "it out of every list, whatever its letter case, a blank around its name, or a letter outside "
+    "ASCII that upper-cases to one of its letters, removing an entry that holds nothing else and "
+    "keeping each other line no step above says to remove. `nssm set` replaces a whole list, so "
+    "read AppEnvironment and AppEnvironmentExtra first with `nssm get`, running the service's own "
+    "nssm.exe by its full path, and pass back every entry but the strings and lines this step and "
+    "the steps above say to remove or take out. The service's own Environment value is no NSSM "
+    'list and is edited in the registry key named above: see docs/SERVICE.md, "Start / stop / '
+    'status"'
 )
 
 #: The add-back step's pass-back exclusion where a directory entry is in doubt, so no line the
@@ -98,10 +103,14 @@ DOUBT_STEP = (
 DOUBT_PASS_BACK = "and the strings and lines the steps above say to remove or take out"
 
 #: DOUBT_STEP and the add-back step after it, as printed wherever a directory entry is in doubt:
-#: no opener, and the doubt pass-back exclusion.
+#: no opener, a condition on the directory existing however it was made, since DOUBT_STEP may
+#: take out a working entry (code review round 2 on the repair of PR 3142), and the doubt
+#: pass-back exclusion.
 ADD_BACK_DOUBT = f"{DOUBT_STEP}. " + ADD_BACK_BARE.replace(
-    "refused above: see", f"refused above {DOUBT_PASS_BACK}: see", 1
-)
+    "Where install-service.ps1 already made the secrets directory,",
+    "Where the secrets directory already exists, however it was made,",
+    1,
+).replace("refused above: see", f"refused above {DOUBT_PASS_BACK}: see", 1)
 
 #: The step where a value runs on and no line of any string sets the directory: the opener,
 #: and the wider exclusion, since the strings the run-on step removes may hold the refused
@@ -118,7 +127,7 @@ ADD_BACK_RUN_ON = (
 )
 
 #: Text every form of the step carries, so a negative arm sees any.
-ADD_BACK_ANY = "Where install-service.ps1 already made the secrets directory, add"
+ADD_BACK_ANY = "naming that existing path back to the service's AppEnvironmentExtra"
 
 #: Its create clause, added only where a setting moves to the secrets directory (the Lander's
 #: ruling on handback 7087574833, R1).

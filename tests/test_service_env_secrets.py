@@ -642,7 +642,7 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             id="directory-listed",
         ),
         # A joined directory string in doubt goes with the run-on (the Lander's ruling on
-        # handback 7085947392, F1), in either spelling, and the step says to take every other
+        # handback 7085947392, F1), in either spelling, and a step of its own says to take every
         # directory line out (the Lander's ruling B on PR 3142's repair handback, comment
         # 7106776128). A joined plain path beside a run-on into other text is in no doubt, so
         # the keep-one step names it instead.
@@ -680,9 +680,9 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
     """The add-back step, printed once after the Put step and the removal where no listed variable
     is MEFOR_SECRETS_DIRECTORY and the remedy keeps no joined path entry: as origin/main prints it
     where main prints it (the Lander's hold on PR 3142, comment 7085002242), and where a joined
-    directory string is in doubt with no opener, the clause taking every other directory line
-    out, and main's wider pass-back exclusion (comment 7088102723; the Lander's ruling B on the
-    repair handback, comment 7106776128). Where a value runs on, the step keeps the opener but
+    directory string is in doubt after the step that takes every directory line out, with no
+    opener and a pass-back exclusion of what the steps above remove or take out (comment
+    7088102723; the Lander's ruling B on the repair handback, comment 7106776128). Where a value runs on, the step keeps the opener but
     leaves out the strings the steps above say to remove (comment 7088663896). A store key alone
     with no run-on and no directory entry in doubt goes to a key file and gets none; beside an
     entry in doubt it gets the step, as
