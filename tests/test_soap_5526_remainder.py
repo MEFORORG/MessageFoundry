@@ -78,8 +78,9 @@ def test_control_soap_builds_on_either_credential_alone(auth: dict[str, str]) ->
 
 
 def test_the_census_lists_only_the_basic_pair_where_both_are_set() -> None:
-    """Item 2: a connector that builds with both sends Basic (FHIR assigns it last), so the census
-    lists HTTP Basic alone. Control: each alone is listed."""
+    """Item 2: with both set the census lists HTTP Basic alone. The FHIR destination and
+    FhirLookup now refuse to build on both (BACKLOG #8299 item 8), so this pins the census reading,
+    not a credential on the wire. Control: each alone is listed."""
     both = {"bearer_token": _TOKEN, "basic_user": "svc", "basic_password": _PW}
     assert http_hop_credentials(ConnectorType.FHIR, both) == ["HTTP Basic"]
     assert http_hop_credentials(ConnectorType.FHIR, {"bearer_token": _TOKEN}) == [

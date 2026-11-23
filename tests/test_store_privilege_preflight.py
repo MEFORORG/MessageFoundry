@@ -1177,6 +1177,8 @@ def test_probed_grant_lives_in_the_leaf_and_the_login_probe_calls_it(
 ) -> None:
     """BACKLOG #6015 items 7 and 8: one rule, in the leaf both packages may import, so the store
     probe and the partner-login probe cannot drift apart."""
+    # This form, not `from messagefoundry import sqlserver_roles`: the server-DB path gate in
+    # test_serverdb_ci_coverage.py maps that form to the package root and fails.
     import messagefoundry.sqlserver_roles as sqlserver_roles
     from messagefoundry.transports import database
 

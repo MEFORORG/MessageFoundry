@@ -227,8 +227,10 @@ def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
     """The static credential the connector writes into its own ``Authorization`` header. With both
     a ``bearer_token`` and a Basic pair set, only Basic is listed (BACKLOG #5526 item 2). REST,
     SOAP, DICOMweb, the FHIR destination and ``FhirLookup`` (BACKLOG #8299 item 8) refuse to build
-    on both, so this listing describes a hop that does not build: this reader does not take the
-    connector type."""
+    on both when the pair is set, so this listing then describes a hop that does not build: this
+    reader does not take the connector type. It also reads the unresolved settings, so an ``env()``
+    Basic half counts as set here even where it resolves empty; that hop builds and sends the
+    bearer, and this listing still names Basic."""
     if settings.get("basic_user") and settings.get("basic_password"):
         return ["HTTP Basic"]
     if settings.get("bearer_token"):
