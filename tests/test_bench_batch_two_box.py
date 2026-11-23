@@ -30,7 +30,6 @@ from harness.load.connscale.runner import ConnScaleError, _excusal
 from harness.load.coord import BATCH_CELL_DONE, BATCH_CELL_READY, FileDropCoord
 from harness.load.failover import FailoverError
 from harness.load.metrics import Counters
-from messagefoundry.terminal_text import escape_for_terminal
 
 _MINIMAL_BATCH = """
 [connscale]
@@ -697,92 +696,30 @@ def _assert_logged_by_type_only(report: Any, caplog: pytest.LogCaptureFixture) -
 
 
 @pytest.mark.usefixtures("no_auth_env")
-async def test_a_failed_store_reset_fails_the_cell_without_its_secret_bug_5857(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_a_failed_store_reset_is_noted_by_type_and_the_cell_still_runs_bug_5857(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    stored_value = "Zztestname"
     eng_rec = _install_engine_fakes(monkeypatch)
-    monkeypatch.setattr(bb, "_reset_server_store", _raiser(RuntimeError(_SECRET_TEXT)))
-
-    report, readies = await _engine_report()
-
-    assert eng_rec.started == []  # no cell measures on top of the previous cell's rows
-    assert not report.ok
-    assert all("store reset failed: RuntimeError" in (c.error or "") for c in report.cells)
-    assert all("store reset failed: RuntimeError" in r["error"] for r in readies)
-    assert _SECRET_VALUE not in repr(report.to_json_dict())
-    assert _SECRET_VALUE not in repr(readies)
-
-
-@pytest.mark.usefixtures("no_auth_env")
-async def test_a_failed_store_reset_keeps_the_remedy_and_drops_the_secret_bug_5857(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Before this path failed the cell, the store's refusal reached the operator through the engine's
-    # log tail. Failing earlier must not lose its remedy, and must not print the driver's secret.
-    remedy = (
-        "a DBA must run once: alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on"
-        " with rollback immediate"
-    )
-    _install_engine_fakes(monkeypatch)
-    # The store puts the driver's diagnostics BEFORE the remedy, so a long one must not cut it off.
-    diagnostics = "driver diagnostic; " * 80
     monkeypatch.setattr(
         bb,
         "_reset_server_store",
-        _raiser(RuntimeError(f"{diagnostics}{remedy}\nnote: forged\n{_SECRET_TEXT}")),
+        _raiser(RuntimeError(f"{_SECRET_TEXT}; bad value: {stored_value!r}")),
     )
+    with caplog.at_level("WARNING", logger=bb.__name__):
+        report, readies = await _engine_report()
 
-    report, readies = await _engine_report()
-
-    for text in [c.error or "" for c in report.cells] + [r["error"] for r in readies]:
-        assert "store reset failed: RuntimeError" in text
-        assert remedy in text
-        assert "not-a-real-one" not in text
-        assert "\n" not in text  # driver text cannot print a line that reads as a real note
-    assert "not-a-real-one" not in repr(report.to_json_dict())
-
-
-_REMEDY = "a DBA must run once: alter database [mefor_test] SET READ_COMMITTED_SNAPSHOT on"
-
-
-@pytest.mark.parametrize("diagnostic_chars", [3900, 5000])
-def test_a_long_diagnostic_cannot_cut_the_remedy_after_it_bug_5857(diagnostic_chars: int) -> None:
-    # Words, because the redactor masks one unbroken run whole and nothing would need cutting.
-    diagnostic = ("driver diagnostic; " * 300)[:diagnostic_chars]
-    text = bb._store_reset_failure(RuntimeError(f"{diagnostic}{_REMEDY}"))
-    assert _REMEDY in text
-    assert bb._RESET_CUT_MARK in text
-    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
-
-
-def test_text_within_the_cap_carries_no_cut_marker_bug_5857() -> None:
-    text = bb._store_reset_failure(RuntimeError(_REMEDY))
-    assert _REMEDY in text
-    assert bb._RESET_CUT_MARK not in text
-
-
-def test_the_cap_holds_on_5000_emoji_bug_5857() -> None:
-    text = bb._store_reset_failure(RuntimeError("\U0001f600" * 5000))
-    assert bb._RESET_CUT_MARK in text
-    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
-
-
-def test_the_cap_holds_after_escaping_and_never_splits_an_escape_bug_5857() -> None:
-    control = "\x1b"  # escaped under every option, so the input grows when escaped
-    one = escape_for_terminal(control, single_line=True, keep_printable_unicode=True)
-    assert len(one) > 1  # or this proves nothing
-
-    text = bb._store_reset_failure(RuntimeError(control * 5000))
-
-    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
-    tail = text.split(bb._RESET_CUT_MARK, 1)[1]
-    assert tail and len(tail) % len(one) == 0
-    assert tail == one * (len(tail) // len(one))
-
-
-def test_a_remedy_naming_a_non_ascii_database_stays_pasteable_bug_5857() -> None:
-    remedy = _REMEDY.replace("mefor_test", "Prüfung")
-    assert remedy in bb._store_reset_failure(RuntimeError(remedy))
+    assert len(eng_rec.started) == len(report.cells) == len(readies)  # it continues, as on main
+    assert report.ok
+    assert all(c.error is None for c in report.cells)
+    assert all("error" not in r for r in readies)
+    reset_notes = [n for n in report.notes if "store reset failed (RuntimeError)" in n]
+    assert len(reset_notes) == len(report.cells)
+    assert all("prior cell's rows" in n for n in reset_notes)
+    _assert_logged_by_type_only(report, caplog)
+    everywhere = repr(report.to_json_dict()) + repr(readies) + caplog.text
+    assert _SECRET_VALUE not in everywhere
+    assert stored_value not in everywhere
 
 
 @pytest.mark.usefixtures("no_auth_env")
