@@ -147,3 +147,14 @@ CREATE = (
     'Where no secrets directory exists yet, the bullet "The other secrets: a secrets directory" '
     'under docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created'
 )
+
+#: CREATE as printed wherever a directory entry is in doubt: the installer drops whole each entry
+#: that starts with the directory's name and may print the value it reads, so it runs only once
+#: the doubt step has taken those lines out (code review round 1 on the repair of PR 3142's
+#: round-3 open finding 1).
+CREATE_DOUBT = (
+    f"{CREATE}, but run the installer only once the steps below have taken out each line that "
+    "may set MEFOR_SECRETS_DIRECTORY, since it drops whole each entry that starts with "
+    "MEFOR_SECRETS_DIRECTORY= in any letter case, every line in it included, and may print the "
+    "value it reads"
+)
