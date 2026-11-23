@@ -300,8 +300,10 @@ async def test_require_step_up_action_records_its_throttle_too(engine: Engine) -
     assert reasons == [(_REFUSED, "step_up"), (_REFUSED, "throttled")]
 
 
-#: The calls in a derived gate that can refuse a request or spend something on it. Each must run
-#: inside the gate's ``_recorded_decision`` block, or the grant row is written before it decides.
+#: At least the calls in a derived gate that can refuse a request or spend something on it. Each
+#: must run inside the gate's ``_recorded_decision`` block, or the grant row is written before it
+#: decides. ``_charge_monitoring_read`` is left out on purpose: it runs outside the block on
+#: ``require_monitoring_read``'s deferred-``reveal`` branch (see the test below).
 _GATE_CHECKS = frozenset(
     {
         "_enforce_admin_write_pacing",

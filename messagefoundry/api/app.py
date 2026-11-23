@@ -5724,7 +5724,7 @@ def create_app(
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
         # behind a 429. For that reason the gate holds a monitoring-read 429 on a valid reveal, and
         # it is raised here, after this check and the reveal's permission check, so both refusals
-        # are recorded as on main (vault BACKLOG #1191). A scoped caller's dashboard carries no
+        # are answered and recorded as before pacing (vault BACKLOG #1191). A scoped caller's dashboard carries no
         # outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))

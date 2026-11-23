@@ -270,7 +270,7 @@ async def test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spen
 async def test_a_reveal_without_view_summary_is_denied_with_the_budget_spent(
     engine: Engine,
 ) -> None:
-    """As on main, a reveal by a caller without ``messages:view_summary`` gets the 403 and its
+    """As before pacing, a reveal by a caller without ``messages:view_summary`` gets the 403 and its
     ``auth.permission_denied`` row, not a monitoring 429, even with the budget spent."""
     service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
@@ -288,8 +288,8 @@ async def test_a_reveal_without_view_summary_is_denied_with_the_budget_spent(
 
 async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: Engine) -> None:
     """A reveal value that will fail validation is not deferred: over the budget it is refused 429
-    at the gate with its ``auth.gate_refused`` row, so the request leaves a decision row, as main's
-    grant row did."""
+    at the gate with its ``auth.gate_refused`` row, so the request leaves a decision row, as the
+    pre-pacing grant row did."""
     service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
         h = await _bearer(c, "vw")
@@ -306,8 +306,7 @@ async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: E
 
 async def test_an_out_of_scope_reveal_under_the_budget_spends_a_read(engine: Engine) -> None:
     """While the budget has room, a reveal the scope check denies spends a read like any other.
-    Once it is spent, the limiter records no refused attempt, so such a reveal is answered by the
-    scope check's 403 with no further charge."""
+    The over-budget case is the out-of-scope test above."""
     service = await _scoped_service(engine, monitoring_read_rate_limit_per_actor=1)
     async with _client(engine, service) as c:
         h = await _bearer(c, "vw")
