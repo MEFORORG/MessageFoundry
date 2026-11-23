@@ -543,10 +543,18 @@ async def test_a_command_set_past_its_bound_ends_the_association() -> None:
 def test_a_request_with_every_field_it_needs_gets_past_the_tally() -> None:
     # The CONTROL for the stream of requests that lack a field: the same command set with its
     # instance UID is a request pynetdicom would serve, and the tally lets it through.
-    whole = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    whole = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     command = _c_store_command(data_set_type=0x0101)
     assert whole.take(_p_data(0x03, command)[6:]) is None
-    lacking = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    lacking = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     command = _c_store_command(data_set_type=0x0101, instance_uid=None)
     assert lacking.take(_p_data(0x03, command)[6:]) == (
         dicom_module._ABORT_INVALID_MESSAGE,
@@ -559,7 +567,11 @@ def test_the_tally_splits_items_as_pynetdicom_does() -> None:
     bytes: every fragment but its control byte, in every item of the PDU."""
     from pynetdicom.pdu import P_DATA_TF
 
-    tally = dicom_module._ReceiptTally(max_data_set_bytes=1000, timeout_seconds=30.0)
+    tally = dicom_module._ReceiptTally(
+        max_data_set_bytes=1000,
+        timeout_seconds=30.0,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+    )
     assert tally.take(_p_data(0x03, _c_store_command())[6:]) is None  # a data set follows
     body = (
         struct.pack(">IBB", 12, 1, 0x00)

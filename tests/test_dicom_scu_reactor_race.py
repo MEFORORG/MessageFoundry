@@ -44,22 +44,15 @@ class _StalledCheckpoint(threading.Event):
         return passed
 
 
-class _DroppedResponses(logging.Handler):
-    """Collects pynetdicom's line for a response its reactor took and could not serve."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.lines: list[str] = []
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if "Received unexpected" in record.getMessage():
-            self.lines.append(record.getMessage())
+def _dropped(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """pynetdicom's line for each response its reactor took and could not serve."""
+    return [r.getMessage() for r in caplog.records if "Received unexpected" in r.getMessage()]
 
 
 @pytest.fixture
-def dropped(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+def stalled(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> Iterator[None]:
     """Delays that put the reactor in the window as the send starts and the caller behind it when
-    the response lands. Yields the lines for each response the reactor dropped."""
+    the response lands, with pynetdicom's WARNING lines captured."""
     from pynetdicom.association import Association
     from pynetdicom.dimse import DIMSEServiceProvider
 
@@ -86,38 +79,39 @@ def dropped(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     monkeypatch.setattr(Association, "__init__", stalled_build)
     monkeypatch.setattr(Association, "send_c_store", late_store)
     monkeypatch.setattr(DIMSEServiceProvider, "get_msg", late_read)
-    handler = _DroppedResponses()
-    association_log = logging.getLogger("pynetdicom.association")
-    association_log.addHandler(handler)
-    try:
-        yield handler.lines
-    finally:
-        association_log.removeHandler(handler)
+    with caplog.at_level(logging.WARNING, logger="pynetdicom.association"):
+        yield
 
 
-async def test_the_reactor_never_takes_the_response_to_the_one_store(dropped: list[str]) -> None:
+@pytest.mark.usefixtures("stalled")
+async def test_the_reactor_never_takes_the_response_to_the_one_store(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     data = _carry(make_sr_part10())
     with _storage_scp() as port:
         scu = _scu(port, timeout_seconds=2.0)
         for _ in range(3):
             await scu.send(data)  # a dropped response would raise DeliveryError here
-    assert dropped == []
+    assert _dropped(caplog) == []
 
 
+@pytest.mark.usefixtures("stalled")
 async def test_the_same_stalls_lose_a_response_without_the_hold(
-    dropped: list[str], monkeypatch: pytest.MonkeyPatch
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The CONTROL for the test above: without the hold, these delays do reproduce the race.
     monkeypatch.setattr(dicom_module, "_hold_the_reactor", lambda event: None)
     data = _carry(make_sr_part10())
     with _storage_scp() as port:
-        scu = _scu(port, timeout_seconds=2.0)
+        scu = _scu(port, timeout_seconds=1.0)
         for _ in range(8):
             with contextlib.suppress(DeliveryError):
                 await scu.send(data)
-            if dropped:
+            if _dropped(caplog):
                 break
-    assert dropped, "the stalls never reproduced the race, so the test above proves nothing"
+    assert _dropped(caplog), (
+        "the stalls never reproduced the race, so the test above proves nothing"
+    )
 
 
 def test_the_reactor_seams_the_hold_uses_are_still_pynetdicoms() -> None:

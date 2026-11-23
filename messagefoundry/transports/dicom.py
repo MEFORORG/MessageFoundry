@@ -389,7 +389,7 @@ _ANSWER_SEND_SECONDS = 1.0
 #: from it, and docs/DICOM.md section 3 states the bound it gives. The default of the SCP's
 #: ``min_message_bytes_per_second``, chosen far under most links: 64 KiB a second is a quarter of a
 #: 2 Mbit/s line. A slower link needs the setting (vault BACKLOG #6637).
-_MIN_MESSAGE_BYTES_PER_SECOND = 64 * 1024
+_DEFAULT_MESSAGE_BYTES_PER_SECOND = 64 * 1024
 
 #: The least ``min_message_bytes_per_second`` the SCP takes. The deadline is the slow-sender defence,
 #: so no value may switch it off or make it unbounded. At this rate the longest message the SCP
@@ -499,8 +499,8 @@ class _Shape(NamedTuple):
     loses everything after its head. ``whole`` is for a line with more than one value: it stays as
     it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
     after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
-    with the same value in it. ``needs`` is fixed text a line must hold for a head this general to
-    count at all. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
+    with the same value in it. ``anchor_required`` is for a head this general: it counts only in a
+    line that holds ``anchor``. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
     it, so a long value costs one pass, on whatever thread logged it. A ``warning`` pattern can
     backtrack over the value: ``.*`` gives text back one character at a time. Each is matched from
     the start of the warning with at most one such run, so its cost stays linear in the text."""
@@ -511,7 +511,7 @@ class _Shape(NamedTuple):
     anywhere: bool = False
     whole: re.Pattern[str] | None = None
     warning: str | None = None
-    needs: str | None = None
+    anchor_required: bool = False
 
 
 #: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
@@ -606,7 +606,7 @@ _REFUSALS: tuple[_Shape, ...] = (
         re.compile(_NOT_A_PRIVATE_CREATOR + "[\"']?"),
         anywhere=True,
         warning=r"\([0-9A-F]{4},[0-9A-F]{4}\) '(?s:.*)" + _NOT_A_PRIVATE_CREATOR,
-        needs=_NOT_A_PRIVATE_CREATOR,
+        anchor_required=True,
     ),
 )
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
@@ -681,7 +681,7 @@ def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
     further on goes with the first."""
     found: tuple[_Shape, re.Match[str]] | None = None
     for shape in shapes:
-        if shape.needs is not None and shape.needs not in text:
+        if shape.anchor_required and (shape.anchor or "") not in text:
             continue
         head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
         if head is not None and (found is None or head.start() < found[1].start()):
@@ -1074,7 +1074,7 @@ class _ReceiptTally:
         *,
         max_data_set_bytes: int,
         timeout_seconds: float,
-        min_bytes_per_second: int = _MIN_MESSAGE_BYTES_PER_SECOND,
+        min_bytes_per_second: int,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
@@ -2035,17 +2035,13 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     return ctx
 
 
-#: The end of the SCP's refusal for a ``max_object_bytes`` that is not above zero (BACKLOG #2103). The
-#: shared default tells the operator to "use None or 0 to disable it", which is false on the SCP:
-#: either value resolves to the ingress ceiling. Following that advice would leave the SCP at 16 MiB
-#: while the operator believed it uncapped.
 def _message_rate_setting(s: Mapping[str, Any]) -> int:
     """The SCP's ``min_message_bytes_per_second``. Unset is the shipped rate; a value that is set
     has to be a whole number at or over :data:`_LEAST_MESSAGE_BYTES_PER_SECOND`, so ``None``, zero
     and every other spelling of "off" are refused rather than read as no deadline. The refusal
     withholds the value, by the rule in :func:`~messagefoundry.transports.base.count_setting`."""
     if "min_message_bytes_per_second" not in s:
-        return _MIN_MESSAGE_BYTES_PER_SECOND
+        return _DEFAULT_MESSAGE_BYTES_PER_SECOND
     rate = count_setting(
         s["min_message_bytes_per_second"],
         knob="min_message_bytes_per_second",
@@ -2060,6 +2056,10 @@ def _message_rate_setting(s: Mapping[str, Any]) -> int:
     return rate
 
 
+#: The end of the SCP's refusal for a ``max_object_bytes`` that is not above zero (BACKLOG #2103). The
+#: shared default tells the operator to "use None or 0 to disable it", which is false on the SCP:
+#: either value resolves to the ingress ceiling. Following that advice would leave the SCP at 16 MiB
+#: while the operator believed it uncapped.
 _SCP_OBJECT_CAP_OFF_HINT = (
     "None or 0 does not disable the SCP's object cap: either one resolves to the engine's binary "
     f"ingress ceiling of {_ENGINE_INGRESS_CEILING_BYTES} bytes, and no setting raises the cap above it"

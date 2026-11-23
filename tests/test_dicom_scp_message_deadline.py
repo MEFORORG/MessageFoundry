@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The DICOM C-STORE SCP's deadline per DIMSE message (vault BACKLOG #5080): a peer that keeps one
 message incomplete with slow fragments, each PDU inside the per-read deadline, is ended at
-``timeout_seconds`` plus its data set bytes at ``_MIN_MESSAGE_BYTES_PER_SECOND``, and gives its
+``timeout_seconds`` plus its data set bytes at ``_DEFAULT_MESSAGE_BYTES_PER_SECOND``, and gives its
 ``max_associations`` slot back.
 
 Every listener here binds ``127.0.0.1`` on an ephemeral port. Every object is a synthetic SR from
@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import io
 import logging
 import socket
 import threading
@@ -41,6 +40,7 @@ from messagefoundry.transports.base import DeliveryError  # noqa: E402
 from tests._dicom_sample import make_sr_part10  # noqa: E402
 from tests.test_dicom_scp import _SCP_AE, _build_scp, _scu_cstore  # noqa: E402
 from tests.test_dicom_scp_admission import _LOG, _running_scp, _send_slowly, _until  # noqa: E402
+from tests.test_dicom_scp_disposition import _big_sr  # noqa: E402
 from tests.test_dicom_scp_pre_association import _a_held_association  # noqa: E402
 from tests.test_dicom_scp_receipt_bounds import _c_store_command, _p_data  # noqa: E402
 from tests.test_dicom_scu import _carry, _scu  # noqa: E402
@@ -62,7 +62,10 @@ class _Clock:
 
 def _tally(clock: _Clock, *, timeout: float = 30.0) -> dicom_module._ReceiptTally:
     return dicom_module._ReceiptTally(
-        max_data_set_bytes=10 * 1024 * 1024, timeout_seconds=timeout, clock=clock
+        max_data_set_bytes=10 * 1024 * 1024,
+        timeout_seconds=timeout,
+        min_bytes_per_second=dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND,
+        clock=clock,
     )
 
 
@@ -75,7 +78,7 @@ _DEADLINE_REASON = "a message did not arrive within timeout_seconds plus its dat
 def test_a_message_has_timeout_seconds_plus_its_data_set_at_the_floor() -> None:
     clock = _Clock()
     tally = _tally(clock)
-    floor = dicom_module._MIN_MESSAGE_BYTES_PER_SECOND
+    floor = dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND
     assert tally.take(_p_data(0x03, _c_store_command())[6:]) is None  # the clock starts here
     fragment = b"\x00" * 4096
     assert tally.take(_p_data(0x00, fragment)[6:]) is None
@@ -132,7 +135,7 @@ async def test_slow_fragments_of_one_object_end_the_association_and_free_its_slo
     # and never finishes the message, held its max_associations slot for as long as it sent. Here
     # each PDU takes about 0.6 s to dribble in, a byte every 0.03 s, against a 2 s read deadline,
     # and pynetdicom's idle timer restarts on each one.
-    monkeypatch.setattr(dicom_module, "_MIN_MESSAGE_BYTES_PER_SECOND", _TEST_FLOOR)
+    monkeypatch.setattr(dicom_module, "_DEFAULT_MESSAGE_BYTES_PER_SECOND", _TEST_FLOOR)
     timeout = 2.0
     fragment_pdu = _p_data(0x00, b"\x00" * 8)
     pending = fragment_pdu * 200  # far more than the bound lets through
@@ -173,7 +176,7 @@ async def test_an_object_sent_at_normal_speed_completes_under_the_same_floor(
 ) -> None:
     # The CONTROL for the test above: the same patched floor and timeout, and an object sent at
     # loopback speed, which completes long before its deadline and is stored.
-    monkeypatch.setattr(dicom_module, "_MIN_MESSAGE_BYTES_PER_SECOND", _TEST_FLOOR)
+    monkeypatch.setattr(dicom_module, "_DEFAULT_MESSAGE_BYTES_PER_SECOND", _TEST_FLOOR)
     captured: list[bytes] = []
     async with _running_scp(
         {"timeout_seconds": 2.0, "max_associations": 1}, captured=captured
@@ -191,16 +194,6 @@ _LINK_BYTES_PER_SECOND = 32 * 1024
 #: Inside the band at the two-second timeout below: over ``T * r * f / (f - r)``, about 128 KiB, by
 #: enough that the cut lands well before the last fragment; 6.25 s on the link.
 _BAND_OBJECT_BYTES = 200 * 1024
-
-
-def _object_of(size: int) -> bytes:
-    from pydicom import dcmread
-
-    dataset = dcmread(io.BytesIO(make_sr_part10()))
-    dataset.add_new(0x00091010, "OB", b"\x00" * size)
-    buffer = io.BytesIO()
-    dataset.save_as(buffer, enforce_file_format=True)
-    return buffer.getvalue()
 
 
 def _relay(source: socket.socket, sink: socket.socket, rate: int | None) -> None:
@@ -236,6 +229,8 @@ def _throttled_link(target_port: int, rate: int) -> Iterator[int]:
     try:
         yield listener.getsockname()[1]
     finally:
+        with contextlib.suppress(OSError):
+            listener.shutdown(socket.SHUT_RDWR)  # close alone leaves accept() blocked on Linux
         listener.close()
         for end in opened:
             end.close()
@@ -261,7 +256,7 @@ async def _send_over_the_link(settings: dict[str, object], data: bytes) -> tuple
 async def test_an_object_in_the_band_is_delivered_once_the_floor_is_set_under_the_link(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    data = _object_of(_BAND_OBJECT_BYTES)
+    data = _big_sr(_BAND_OBJECT_BYTES)
     with caplog.at_level(logging.WARNING, logger=_LOG):
         stored, ended = await _send_over_the_link({}, data)  # CONTROL: the shipped floor cuts it
     assert (stored, ended) == ([], 1)
@@ -298,7 +293,7 @@ def test_the_floor_setting_moves_the_deadline() -> None:
 
 
 def test_the_shipped_floor_is_unchanged_and_unset_means_it() -> None:
-    assert dicom_module._MIN_MESSAGE_BYTES_PER_SECOND == 64 * 1024
+    assert dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND == 64 * 1024
     assert _build_scp([])._min_message_bytes_per_second == 64 * 1024
 
 
@@ -342,7 +337,7 @@ def test_pynetdicoms_idle_timer_restarts_on_each_pdu() -> None:
 
 def test_the_doc_states_the_message_deadline() -> None:
     doc = (Path(__file__).resolve().parents[1] / "docs" / "DICOM.md").read_text(encoding="utf-8")
-    floor_kib = dicom_module._MIN_MESSAGE_BYTES_PER_SECOND // 1024
+    floor_kib = dicom_module._DEFAULT_MESSAGE_BYTES_PER_SECOND // 1024
     assert f"{floor_kib} KiB a second" in doc
     assert "per message, not per association" in doc
     assert "C-ECHO every few seconds" in doc

@@ -1800,14 +1800,16 @@ async def test_a_peers_class_with_no_service_never_reaches_the_scp_log(
     assert not [line for line in filtered if _PLANTED in line], filtered
 
 
-def _read_a_bad_private_creator() -> None:
-    """pydicom's own lookup of a private element whose creator has more than one value."""
+def _read_a_bad_private_creator() -> KeyError:
+    """pydicom's own lookup of a private element whose creator has more than one value, and the
+    error it raises."""
     from pydicom.datadict import get_private_entry
     from pydicom.multival import MultiValue
     from pydicom.tag import Tag
 
-    with pytest.raises(KeyError):
+    with pytest.raises(KeyError) as raised:
         get_private_entry(Tag(0x0009, 0x1001), MultiValue(str, ["A", _PLANTED]))  # type: ignore[arg-type]
+    return raised.value
 
 
 def test_a_bad_private_creator_never_reaches_the_log(caplog: pytest.LogCaptureFixture) -> None:
@@ -1841,20 +1843,12 @@ def test_a_bad_private_creators_warning_copy_is_ignored() -> None:
 def test_a_bad_private_creator_in_a_raised_error_is_redacted(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    from pydicom.datadict import get_private_entry
-    from pydicom.multival import MultiValue
-    from pydicom.tag import Tag
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        with pytest.raises(KeyError) as raised:
-            get_private_entry(
-                Tag(0x0009, 0x1001),
-                MultiValue(str, ["A", _PLANTED]),  # type: ignore[arg-type]
-            )
-    assert _PLANTED in str(raised.value)  # CONTROL
-    assert _PLANTED not in dicom_module._safe_library_exc(raised.value)
-    lines = _logged("pynetdicom.events", raised.value, caplog)
+        error = _read_a_bad_private_creator()
+    assert _PLANTED in str(error)  # CONTROL
+    assert _PLANTED not in dicom_module._safe_library_exc(error)
+    lines = _logged("pynetdicom.events", error, caplog)
     assert lines
     assert not [line for line in lines if _PLANTED in line], lines
 
