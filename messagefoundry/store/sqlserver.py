@@ -7901,12 +7901,15 @@ class SqlServerStore:
                 # so conditionally OMIT the batch member. The messages.status UPDATE above is unaffected
                 # (count-and-log is separate).
                 if should_record_event(event, self._message_events):
+                    # Built here so the lambda holds the string, not the handlers. A lambda, not the
+                    # bound method: the PHI logging inventory reads each _event_stmt call site.
+                    routed_detail = f"{len(handlers)} handler(s)"
                     acc.add(
                         *(
                             await cipher_call(
                                 self._cipher,
                                 lambda: self._event_stmt(
-                                    message_id, event, None, f"{len(handlers)} handler(s)", now
+                                    message_id, event, None, routed_detail, now
                                 ),
                             )
                         )
@@ -8208,16 +8211,15 @@ class SqlServerStore:
                 # event detail to the unbatched path (which adds len(pt_deliveries)==0). #63 verbosity
                 # gate: conditionally omit the batch member (can't no-op inside _event_stmt).
                 if should_record_event("transformed", self._message_events):
+                    # Built here so the lambda holds the string, not the deliveries. A lambda, not the
+                    # bound method: the PHI logging inventory reads each _event_stmt call site.
+                    transformed_detail = f"{len(deliveries)} destination(s)"
                     acc.add(
                         *(
                             await cipher_call(
                                 self._cipher,
                                 lambda: self._event_stmt(
-                                    message_id,
-                                    "transformed",
-                                    None,
-                                    f"{len(deliveries)} destination(s)",
-                                    now,
+                                    message_id, "transformed", None, transformed_detail, now
                                 ),
                             )
                         )
