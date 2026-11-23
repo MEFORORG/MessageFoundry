@@ -1308,8 +1308,13 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if others or values:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, and before the step that moves a setting there (the third
-        # hold's H2, the fourth hold's H1).
-        if _DIRECTORY_VARIABLE not in posture.listed and (moving_others or moving_values):
+        # hold's H2, the fourth hold's H1). Where a directory entry is in doubt, the doubt step
+        # below takes out every line that may name the directory, so a listed name settles
+        # nothing and the step prints before the Put step all the same (round-3 open finding 1
+        # on PR 3142's repair handback, comment 7110577570).
+        if (_DIRECTORY_VARIABLE not in posture.listed or posture.directory_in_doubt) and (
+            moving_others or moving_values
+        ):
             steps.append(
                 'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '

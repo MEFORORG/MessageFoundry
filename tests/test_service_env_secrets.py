@@ -59,6 +59,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
+    DOUBT_STEP,
     KEEP,
     REMOVE,
     RUNS_ON,
@@ -443,14 +444,43 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
-    """The whole-string reading strips the name, so a blank first line moves the first name down.
-    The secrets directory below one is set, and the refusal must not tell the operator to add
-    it."""
+    """The whole-string reading strips the name, so a blank first line moves the first name down,
+    and the secrets directory below one is listed. The string is two lines, so its entry is in
+    doubt, the doubt step takes it out, and the create step prints before the Put step (round-3
+    open finding 1 on PR 3142's repair handback, comment 7110577570)."""
     posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
-    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and posture.directory_in_doubt
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert CREATE not in refusal
+    assert CREATE in refusal
+    assert refusal.index(CREATE) < refusal.index("Put each MEFOR_VALUE_* variable")
+
+
+def test_a_directory_listed_only_in_doubt_gets_the_create_step_before_the_put_step() -> None:
+    """Round-3 open finding 1 on PR 3142's repair handback, comment 7110577570: where the only
+    entry naming the secrets directory is in doubt, the doubt step takes it out, so the create
+    step must print up front, before the Put step moves a setting into the directory. A blank
+    before the name puts this one-line entry in doubt."""
+    posture = _service([" MEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    put = remedy.index("Put each MEFOR_VALUE_* variable in the secrets directory")
+    assert remedy.startswith(f"{CREATE}. ")
+    assert remedy.index(CREATE) < put < remedy.index(DOUBT_STEP)
+
+
+def test_a_directory_listed_plainly_gets_no_create_step() -> None:
+    """The control for the test above: one plain directory entry, not in doubt, keeps the order
+    and text it had, with no create step and no add-back step, the Put step first."""
+    posture = _service(["MEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and not posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith("Put each MEFOR_VALUE_* variable in the secrets directory")
+    assert CREATE not in refusal and ADD_BACK_ANY not in refusal and DOUBT_STEP not in refusal
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)

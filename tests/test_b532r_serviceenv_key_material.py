@@ -440,14 +440,17 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     to remove that variable and names no string to remove (the third hold, H1). The directory
     line shares its string with other lines, so it is in doubt, and removing the variable may
     change the directory the engine reads, so the add-back step names it again (the Lander's
-    ruling B on PR 3142's repair handback, comment 7106776128)."""
+    ruling B on PR 3142's repair handback, comment 7106776128). The directory is listed only by
+    that entry, so the create step prints before the Put step (round-3 open finding 1 on that
+    handback, comment 7110577570)."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
     assert posture.value_runs_on and posture.directory_in_doubt
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
+    assert REMOVE in refusal and RUNS_ON in refusal
     remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{CREATE}. Put MEFOR_STORE_PASSWORD in the secrets directory")
     # The password moves to the secrets directory, so the step carries its create clause.
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
     # The third hold's H1: no step before the doubt step names a string. That step and the
