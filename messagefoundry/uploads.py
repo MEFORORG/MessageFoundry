@@ -4285,8 +4285,9 @@ class UploadStore:
         re-check, are what stand between this pass and a write stalled past it. On Windows an open
         handle can also block the unlink. The first form covers a ``save``'s temp and a stalled
         ``rotate-key`` re-seal's temp, which share the temp shape. Stalled before a temp's ``os.replace``, it can have that temp removed underneath
-        it: the ``os.replace`` then raises and its ``save`` fails, nothing is published
-        half-written, and the operator retries. Stalled after its body landed and before its
+        it: the ``os.replace`` then raises. A ``save`` fails and the operator retries; a re-seal is not a
+        save, it fails in ``_replace_if_unchanged`` and is handled as a skipped half. Nothing is
+        published half-written either way. Stalled after its body landed and before its
         sidecar did, it can LOSE THE BODY: this pass sees a body past the floor with no sidecar and
         unlinks it, with no audit row, and the ``save`` then publishes the sidecar and reports
         success for an upload with no body. ``max_bytes``, 25 MiB by default, bounds a write's size
