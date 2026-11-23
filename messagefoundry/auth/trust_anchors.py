@@ -249,10 +249,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
-    device at the path refused as not a regular file among them (on Windows ``os.stat`` of a
-    device the account cannot open can raise ``PermissionError`` instead, which sets none), or an
-    ACL or path that could not be read, since whoever
-    swapped the file can make its ACL unreadable. Some file read faults set nothing
+    device at the path refused as not a regular file among them (on Windows ``os.stat`` of a pipe
+    or device can fail first, with a fault that sets none; :func:`_transient_read_fault` says
+    which), or an ACL or path that could not be read, since whoever swapped the file can make its
+    ACL unreadable. Some file read faults set nothing
     (:func:`_transient_read_fault`, which lists at least which and names the known residuals,
     and says which of them reach a read at ``enforce``). Any other ``OSError`` sets the hold.
     What the hold refuses: at least the new connects the
@@ -2976,14 +2976,14 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     **A pin whose path verdict at the store open is indeterminate or insecure does not reach this
     read at** ``enforce``. The SQL Server store open refuses both verdicts
     (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
-    open whatever the network does. A share can read as either: on POSIX at least CIFS or NFS with
-    a foreign uid, or with a group or other write bit and without the sticky bit, reads as
-    insecure, and otherwise as indeterminate. On POSIX at least a local disk of a type outside
+    open whatever the network does. A share can read as either, depending on the owners and mode
+    bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`), and on
+    POSIX so can at least a local disk of a type outside
     :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
-    host without ``/proc/self/mountinfo`` read as indeterminate. So at ``enforce`` this exemption
+    host without ``/proc/self/mountinfo``. So at ``enforce`` this exemption
     takes effect only for a pin whose path passed at the store open, such as on a trusted local
-    file system or on block-level network storage formatted with one, or a pin location that
-    becomes networked or insecure after the open; at ``warn`` no refusal sets the hold at all.
+    file system or on block-level network storage formatted with one; at ``warn`` no refusal sets
+    the hold at all.
 
     **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
     among them, since on Windows that is what a scanner holding the file arrives as and the read
@@ -2996,7 +2996,7 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     that becomes networked after the open, and for a read that fails with ``EIO``, as on a
     failing disk or, on POSIX, a device swapped in between the stat and the open. On POSIX a
     device already at the path when the stat runs is refused as not a regular file and sets
-    the hold. On Windows ``os.stat`` of a device the account cannot open can raise
+    the hold. On Windows ``os.stat`` of a device or named pipe the account cannot open can raise
     ``PermissionError``, which sets no hold. Windows also reports at
     least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
     such check still refuses the reload. The path verdict does not gate this read at a later
