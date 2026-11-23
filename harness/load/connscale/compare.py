@@ -968,8 +968,9 @@ class FuseModeComparison:
     @property
     def ok(self) -> bool:
         """The correctness fold for the run's exit code: every present B1 arm held zero-loss, none
-        is missing, and no cell went unrun in both arms. The GO/NO-GO throughput decision is reported separately and does NOT fail the run
-        (a null/negative fusion result banks nothing but is not an error, ADR 0071 §6.4b)."""
+        is missing, and no cell went unrun in both arms. The GO/NO-GO throughput decision is
+        reported separately and does NOT fail the run (a null/negative fusion result banks nothing
+        but is not an error, ADR 0071 §6.4b)."""
         return (
             bool(self.rows)
             and all(row.ok for row in self.rows)

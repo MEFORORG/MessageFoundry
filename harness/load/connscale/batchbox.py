@@ -1070,8 +1070,8 @@ async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineRep
             f"CELL {cell_id}: engine stop raised {kind} and its root process still reads as "
             "RUNNING; check that it exited"
             if node.alive
-            else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running, "
-            "so this is not a cell fault (child processes were not checked)"
+            else f"CELL {cell_id}: cleanup stop raised {kind}; its root process is not running "
+            "(it may never have started; child processes were not checked)"
         )
 
 
