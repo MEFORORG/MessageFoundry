@@ -22,7 +22,11 @@
   before the open connects, it says the open may or may not have reached them and names those
   changes only as possible. The same holds for `provision-admin`'s OS-user and authenticator-enrolment refusals
   over an existing store, `admin-reset-totp`'s OS-user, enrolment and code-mismatch refusals, and
-  `admin-unlock`'s refused row seal. Other refusals after an open still say nothing was written,
+  `admin-unlock`'s refused row seal. A keyless-chain, keyless-provision or unauditable-write
+  refusal is raised only after a full open, so it says the open may already have changed the
+  database; after a keyed open an unauditable-write refusal also names the genesis record, and
+  the salt record where the cipher binds one. In `admin-reset-totp` a refusal at the replacement's own open names the earlier
+  open, the one that checked the account before the key was shown. Other refusals after an open still say nothing was written,
   at least a store pin refusal under the host key provider, a refusal about the account itself
   such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
 - **`provision-admin` would now keep its result when the store fails to close after the grant

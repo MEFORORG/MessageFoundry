@@ -7777,7 +7777,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
     # quotes a byte of what it decoded (BACKLOG #2532).
     except could_not_start as exc:
         # A short server schema says what the open may have changed before it (BACKLOG #5067).
-        left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+        left = (
+            _open_refusal_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+            or "Nothing was written"
+        )
         _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.", as_json=args.json)
         return 2
     except RowSealError as exc:
@@ -9958,7 +9961,9 @@ _PROVISION_AUTH_REFUSALS = {
 _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
-def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str | None:
+def _open_refusal_left_behind(
+    exc: BaseException, store: StoreSettings, *, keyed: bool
+) -> str | None:
     """What a refused store open left behind, when that is more than "nothing was written"
     (BACKLOG #5067), or ``None`` when nothing was.
 
@@ -9975,14 +9980,18 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
     options may already have changed: sentences, the last with no full stop, so a caller can end
     it.
 
-    A key or cipher refusal (``StoreKeylessError``, ``CipherError``) or a keyless-chain refusal
-    (``KeylessAuditChainRefused``), raised itself or as such a cause, can come after the open has
-    run its own writing steps, or from a read after a full open. For those it says the change this
-    command makes did not land and names, at least, what the open may already have changed
-    (:func:`_open_steps_left_behind`). So does the check that this command's audit row could
-    not be written (``_UnauditableWrite``, raised before any write of the command's own) or a
-    keyless open the settings refuse (``_KeylessProvisionRefused``), each raised after a full
-    open.
+    A key or cipher refusal (``StoreKeylessError``, ``CipherError``), raised itself or as such a
+    cause, can come before the open reached its own writing steps or after them. For those it says
+    the change this command makes did not land and names, at least, what the open may have
+    changed, only as a possibility (:func:`_open_steps_left_behind`).
+
+    Three refusals are raised only after a full open, so for them it says the open may already
+    have changed the database and names, at least, what (BACKLOG #5067): a keyless-chain refusal
+    (``KeylessAuditChainRefused``) and a keyless open the settings refuse
+    (``_KeylessProvisionRefused``), each after a keyless open, which binds no salt and writes no
+    genesis record; and the check that this command's audit row could not be written
+    (``_UnauditableWrite``, raised before any write of the command's own), after an open that is
+    keyed as ``keyed`` says, so a keyed one names the salt and genesis records too.
 
     Not every refusal it returns ``None`` for comes before the database is touched: at least a
     store pin refusal under the host key provider can come after the schema step, and this does
@@ -9993,14 +10002,18 @@ def _open_refusal_left_behind(exc: BaseException, store: StoreSettings) -> str |
 
     raised = (exc, exc.__cause__)
     if not any(isinstance(e, ServerSchemaMismatchError) for e in raised):
+        # Raised only after a full open, so the open's own steps have run: the certain wording.
+        after_a_keyless_open = (KeylessAuditChainRefused, _KeylessProvisionRefused)
+        if any(isinstance(e, after_a_keyless_open) for e in raised):
+            # Keyless: the open binds no salt and writes no genesis record.
+            return _open_steps_left_behind(store, keyed=False, returned=True)
+        if any(isinstance(e, _UnauditableWrite) for e in raised):
+            # A keyed open may have bound a salt and written a genesis record before the check.
+            return _open_steps_left_behind(store, keyed=keyed, returned=True)
         if any(isinstance(e, CipherError) for e in raised):
             return _open_steps_left_behind(store, keyed=True)
-        keyless = (StoreKeylessError, KeylessAuditChainRefused, _KeylessProvisionRefused)
-        if any(isinstance(e, keyless) for e in raised):
+        if any(isinstance(e, StoreKeylessError) for e in raised):
             # Keyless: the open binds no salt and writes no genesis record.
-            return _open_steps_left_behind(store, keyed=False)
-        if any(isinstance(e, _UnauditableWrite) for e in raised):
-            # Keyed or not, which this does not know, so it names only what either may do.
             return _open_steps_left_behind(store, keyed=False)
         return None
     left = (
@@ -10112,9 +10125,27 @@ def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool
     """What a refusal raised after an open returned left behind (BACKLOG #5067): what
     :func:`_open_refusal_left_behind` says for ``exc``, else :func:`_open_steps_left_behind`, so
     it never says nothing was written. ``keyed`` is whether a store key is configured."""
-    return _open_refusal_left_behind(exc, store) or _open_steps_left_behind(
+    return _open_refusal_left_behind(exc, store, keyed=keyed) or _open_steps_left_behind(
         store, keyed=keyed, returned=True
     )
+
+
+#: ``admin-reset-totp``'s name for its first open, in ``check()``, for a refusal at the swap's.
+_RESET_TOTP_CHECK_OPEN = (
+    "This command's earlier open, which checked the account before the key was shown,"
+)
+
+
+def _earlier_open_left_behind(store: StoreSettings, *, keyed: bool, which: str) -> str:
+    """What an earlier open of this command, which returned, may have changed, for a refusal
+    raised at a later open or after it (BACKLOG #5067): one sentence with no full stop, naming
+    the earlier open as ``which`` says, so a reader does not take it for the open just refused.
+    ``keyed`` is as for :func:`_open_steps_left_behind`. It says "at least": the later open's own
+    steps may have changed the database too."""
+    listed = _open_changes(store, salt=keyed and _binds_salt(store), genesis=keyed)
+    if not listed:
+        return f"{which} may already have written to the database"
+    return f"{which} may already have changed the database: at least {listed}"
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -10238,7 +10269,7 @@ def _provision_open_refusal(
     configured, since a keyless open binds no salt."""
     from messagefoundry.redaction import codec_safe_str
 
-    left = _open_refusal_left_behind(exc, store)
+    left = _open_refusal_left_behind(exc, store, keyed=keyed)
     if left is None and opened:
         left = _open_steps_left_behind(store, keyed=keyed, returned=True)
     if kept is not None:
@@ -11186,7 +11217,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
         # Each is raised before the write, so the shown key's entry has no seed (#5067). Each
         # follows a full open, which may have changed the database, so the text says so (#5067).
-        keyless_left = _opened_left_behind(exc, settings.store, keyed=False)
+        # Keyed as the settings say, for `_UnauditableWrite`; the two keyless refusals follow a
+        # keyless open whatever this passes.
+        keyless_left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {keyless_left}"), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
@@ -11581,7 +11614,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         _UnauditableWrite,
     ) as exc:
         # A keyless-chain or audit refusal follows a full open, which may have written (#5067).
-        left = _open_refusal_left_behind(exc, settings.store)
+        left = _open_refusal_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         _emit_error(str(exc) if left is None else f"{_sentence(exc)} {left}", as_json=args.json)
         return 2
     except _InvocationBoundOpenRefused as bound:
@@ -11782,7 +11815,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
     # that had opened, and may have written, at least once (BACKLOG #5067).
     store_returned = False
 
-    def open_refused(exc: Exception, *, hint: str = "") -> int:
+    def open_refused(exc: Exception, *, hint: str = "", after_check: bool = False) -> int:
         """The exit for a refusal raised while a store was opened or checked, before this
         command's own writes.
         ``hint`` follows the message once the key has been shown. The texts of the first two
@@ -11790,11 +11823,27 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         Each goes through ``codec_safe_str``: a key source's codec error quotes a byte of what it
         decoded (BACKLOG #2532). A short server schema, a key or cipher refusal and a keyless-chain
         refusal say what the open may have changed before them (BACKLOG #5067). So does any refusal
-        raised once an open returned (``store_returned``), never "nothing was written"."""
-        if store_returned:
-            left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        raised once an open returned (``store_returned``), never "nothing was written".
+        ``after_check`` says the refusal came from the swap's open or a read after it, so check()'s
+        open had returned before it: the text names that earlier open, not "the open", which would
+        read as the one just refused."""
+        keyed = _open_is_keyed(settings)
+        if after_check:
+            this_open = _open_refusal_left_behind(exc, settings.store, keyed=keyed)
+            earlier = _earlier_open_left_behind(
+                settings.store, keyed=keyed, which=_RESET_TOTP_CHECK_OPEN
+            )
+            left = (
+                f"The change this command makes did not land. {earlier}"
+                if this_open is None
+                else f"{_sentence(this_open)} {earlier}"
+            )
+        elif store_returned:
+            left = _opened_left_behind(exc, settings.store, keyed=keyed)
         else:
-            left = _open_refusal_left_behind(exc, settings.store) or "Nothing was written"
+            left = (
+                _open_refusal_left_behind(exc, settings.store, keyed=keyed) or "Nothing was written"
+            )
         if isinstance(exc, could_not_start):
             _emit_error(f"{_sentence(codec_safe_str(exc))} {left}.{hint}", as_json=args.json)
             return 2
@@ -12084,7 +12133,7 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
             # Before the swap, but after the key was shown: nothing written, and the new entry
             # in the app has no seed behind it, so the hint goes with every store failure here.
             if isinstance(exc, Exception) and isinstance(exc, (*open_refusals, *store_errors)):
-                return open_refused(exc, hint=unused_entry)
+                return open_refused(exc, hint=unused_entry, after_check=True)
             raise  # nothing written; not a store failure, so the dispatch floor reports it
         # The swap committed, or may have, before this failure: Ctrl-C included, the codes must
         # still reach the operator and the report must say what happened.

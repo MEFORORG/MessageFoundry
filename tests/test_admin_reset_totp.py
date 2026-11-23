@@ -1180,6 +1180,57 @@ def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_ch
     assert "nothing was written" not in error.lower(), error
 
 
+_EARLIER_OPEN = "This command's earlier open, which checked the account before the key was shown,"
+
+
+@pytest.mark.parametrize("refusal", ["busy", "cipher"])
+def test_a_refusal_at_the_second_open_names_the_earlier_open(
+    refusal: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PR 3162 hold finding 2 (BACKLOG #5067): a refusal at the swap's open said "the open may
+    already have changed the database", which reads as the open just refused. What may have
+    written is check()'s earlier open, which returned, so the text names that one. A cipher
+    refusal keeps its own text about the open it came from, then names the earlier open too.
+
+    Mutation: drop ``after_check=True`` from the swap's ``open_refused`` call."""
+    from messagefoundry.store import base
+    from messagefoundry.store.crypto import CipherError
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / f"second-open-{refusal}.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    prompted: list[bool] = []
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            if refusal == "cipher":
+                raise CipherError("synthetic cipher refusal at the second open")
+            raise RuntimeError("synthetic busy store at the second open")
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    code = main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
+    error = _error(capsys)
+    assert code in (1, 2), error
+    assert _EARLIER_OPEN in error, error
+    assert "but the open may already have changed" not in error, error
+    assert "this command makes did not land" in error and "delete it" in error, error
+    assert "nothing was written" not in error.lower(), error
+    if refusal == "cipher":
+        assert "synthetic cipher refusal at the second open" in error, error
+
+
 def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

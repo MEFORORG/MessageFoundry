@@ -483,13 +483,13 @@ def test_any_other_open_refusal_keeps_its_text() -> None:
         username="mefor",
         schema_management=SchemaManagement.AUTO,
     )
-    assert _open_refusal_left_behind(RuntimeError("a hop refusal"), store) is None
+    assert _open_refusal_left_behind(RuntimeError("a hop refusal"), store, keyed=True) is None
     wrapped_other = _StoreOpenRefused("a key refusal")
     wrapped_other.__cause__ = RuntimeError("a key refusal")
-    assert _open_refusal_left_behind(wrapped_other, store) is None
+    assert _open_refusal_left_behind(wrapped_other, store, keyed=True) is None
     wrapped = _StoreOpenRefused("short")
     wrapped.__cause__ = _refusal("sqlserver")
-    assert _RCSI in (_open_refusal_left_behind(wrapped, store) or "")
+    assert _RCSI in (_open_refusal_left_behind(wrapped, store, keyed=True) or "")
 
 
 def test_provision_admin_open_refusal_quotes_no_key_byte(
@@ -988,7 +988,7 @@ def test_an_open_that_names_no_step_still_never_says_nothing_was_written() -> No
     keyed = _open_steps_left_behind(store, keyed=True)
     assert "the audit chain's genesis record" in keyed and "salt record" not in keyed, keyed
     # A refused audit row of the command's own follows a full open too.
-    assert _open_refusal_left_behind(_UnauditableWrite("synthetic"), store) is not None
+    assert _open_refusal_left_behind(_UnauditableWrite("synthetic"), store, keyed=False) is not None
 
 
 def test_admin_reset_totp_unauditable_write_says_what_the_open_may_have_changed(
@@ -1231,3 +1231,100 @@ def test_a_key_refusal_at_the_write_open_over_an_existing_store_names_the_pre_ch
     assert "synthetic key service refusal at the write" in out, out
     assert _OWN_WRITES in out and "nothing was written" not in out.lower(), out
     assert _UNUSED_ENTRY in out, out
+
+
+# PR 3162 hold finding 1 (BACKLOG #5067): the three refusals raised only after a full open.
+
+_CERTAIN = "may already have changed the database before this refusal: at least"
+_SALT = "the store's salt record"
+_GENESIS = "the audit chain's genesis record"
+_ADMIN_ARGV: dict[str, list[str]] = {
+    "admin-unlock": ["admin-unlock", "--username", "ops"],
+    "admin-set-notify-email": [
+        "admin-set-notify-email",
+        "--username",
+        "ops",
+        "--email",
+        "ops@example.org",
+    ],
+    "admin-reset-totp": ["admin-reset-totp", "--username", "ops"],
+}
+
+
+def _after_full_open(kind: str) -> Exception:
+    from messagefoundry.__main__ import _KeylessProvisionRefused, _UnauditableWrite
+    from messagefoundry.store.base import KeylessAuditChainRefused
+
+    if kind == "unauditable":
+        return _UnauditableWrite("synthetic unauditable write")
+    if kind == "keyless-provision":
+        return _KeylessProvisionRefused("synthetic keyless provision")
+    return KeylessAuditChainRefused("mefor", "[store].synthetic")
+
+
+@pytest.mark.parametrize("kind", ["unauditable", "keyless-provision", "keyless-chain"])
+def test_a_refusal_raised_after_a_full_open_says_so_with_certainty(kind: str) -> None:
+    """Each of the three is raised only after a full open, so the text says the open may already
+    have changed the database, never that it may or may not have reached its writing steps. A
+    keyed ``_UnauditableWrite`` names the salt and genesis records; the keyless two name neither.
+
+    Mutation: word these three as ``returned=False`` again, or pass ``keyed=False`` for
+    ``_UnauditableWrite``."""
+    from messagefoundry.__main__ import _opened_left_behind
+    from messagefoundry.config.settings import StoreSettings
+
+    store = StoreSettings(path="synthetic.db")
+    left = _opened_left_behind(_after_full_open(kind), store, keyed=True)
+    assert _CERTAIN in left and _MAY_OR_MAY_NOT not in left, left
+    keyed = kind == "unauditable"
+    assert (_SALT in left) is keyed and (_GENESIS in left) is keyed, left
+
+
+@pytest.mark.parametrize("command", sorted(_ADMIN_ARGV))
+def test_a_keyed_unauditable_write_names_the_salt_and_genesis_records(
+    command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """At each admin command's could-not-start arm, an ``_UnauditableWrite`` after a keyed open
+    names the salt and genesis records that open may have written, with the certain wording.
+
+    Mutation: classify ``_UnauditableWrite`` as keyless again."""
+    from messagefoundry import __main__ as cli
+
+    monkeypatch.setattr(cli, "_open_is_keyed", lambda _settings: True)
+    _open_refuses_with(monkeypatch, _after_full_open("unauditable"))
+    settings = _settings(shell, "sqlserver", "auto")
+    out = _run([*_ADMIN_ARGV[command], "--service-config", str(settings)], capsys)
+    assert "synthetic unauditable write" in out, out
+    assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
+    assert _SALT in out and _GENESIS in out, out
+
+
+def test_provision_admin_keyed_unauditable_write_at_the_write_names_salt_and_genesis(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``provision-admin``'s arm for the three after-open refusals passed ``keyed=False`` for all
+    of them, so a keyed ``_UnauditableWrite`` omitted the salt and genesis records.
+
+    Mutation: pass ``keyed=False`` from that arm again."""
+    from messagefoundry import __main__ as cli
+
+    monkeypatch.setattr(cli, "_open_is_keyed", lambda _settings: True)
+    _refused_at_the_write(monkeypatch, "sqlserver", _after_full_open("unauditable"))
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert "synthetic unauditable write" in out, out
+    assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
+    assert _SALT in out and _GENESIS in out, out
+
+
+def test_admin_unlock_keyless_chain_refusal_says_so_with_certainty(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A keyless-chain refusal follows a keyless full open: certain wording, no salt or genesis.
+
+    Mutation: word ``KeylessAuditChainRefused`` as ``returned=False`` again."""
+    _open_refuses_with(monkeypatch, _after_full_open("keyless-chain"))
+    settings = _settings(shell, "sqlserver", "auto")
+    out = _run([*_ADMIN_ARGV["admin-unlock"], "--service-config", str(settings)], capsys)
+    assert "[store].synthetic" in out, out
+    assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
+    assert _SALT not in out and _GENESIS not in out, out
