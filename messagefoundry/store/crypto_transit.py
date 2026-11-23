@@ -29,8 +29,9 @@ from keyless SHA-256 (tamper-evident) to forgery-**resistant** (ADR 0138 §To-re
 ASVS 16.4.2 residual for this mode). The MAC key defaults to the data key and is overridable to a dedicated Transit key via
 ``MEFOR_STORE_TRANSIT_AUDIT_KEY`` for domain separation.
 
-**Fail-closed (ADR 0138).** Missing config, an unreachable/unknown Transit key, or a key whose TYPE
-cannot run the operation asked of it (BACKLOG #1166) raises
+**Fail-closed (ADR 0138).** At least missing config, a key name that is not a Transit key name
+(BACKLOG #6010), an unreachable/unknown Transit key, or a key whose TYPE cannot run the operation
+asked of it (BACKLOG #1166) raises
 :class:`~messagefoundry.store.keyprovider.KeyProviderError` at construction (``open_store`` propagates it
 → ``serve`` refuses to start, never an in-process fallback). A per-operation Transit failure raises :class:`CipherError` — the
 store's existing at-rest error discipline. On ``encrypt`` and ``decrypt``, a failure that gave no verdict
@@ -50,7 +51,6 @@ from __future__ import annotations
 import base64
 import contextlib
 import logging
-import os
 import threading
 import time
 import weakref
@@ -91,14 +91,17 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    _recorded_refusal,
     _vault_ca_kwargs,
     checked_transit_key_name,
+    is_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
     is_vault_timeout_reply,
     is_vault_unavailable,
     require_transit_key_type,
     store_vault_hop,
+    transit_key_name_setting,
     vault_failure_text,
 )
 from messagefoundry.store.row_seal import transit_mac_version
@@ -603,6 +606,12 @@ class TransitCipher(_UnmarkedPolicy):
         allow_unmarked: bool = False,
         client_factory: Callable[[], Any] | None = None,
     ) -> None:
+        # Both names go into request paths, so they are checked here as well as where the
+        # environment is read (BACKLOG #6010 item 9), before the cipher holds any client. Each
+        # refusal names the variable the name comes from there.
+        checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
+        if audit_key:
+            checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY)
         # BACKLOG #5963: requests does not document its Session as thread-safe, and this cipher is
         # called on the event loop and in worker threads. With a ``client_factory`` each thread
         # keeps its own client, ``client`` serving the thread that builds the cipher, and this
@@ -1376,7 +1385,14 @@ class TransitCipher(_UnmarkedPolicy):
         checks its shape. An HTTP 400 or 403 raises
         :class:`~messagefoundry.store.crypto.TransitSealRefused` with that status, raised outside the
         handler so no chain carries Vault's reply; anything else raises :class:`CipherError`.
-        Blocking."""
+        Blocking.
+
+        ``key_name`` goes into the request path, so a name that is not a Transit key name raises
+        :class:`CipherError` before any request (BACKLOG #6010 item 9)."""
+        if not is_transit_key_name(key_name):
+            raise CipherError(
+                "Transit row seal verify was given a key name that is not a Transit key name"
+            )
         refused = 0
         try:
             return self._transit_verify(key_name, digest, mac)
@@ -1414,24 +1430,48 @@ class _TransitAuditMac:
         return self._cipher.verify_audit_hmac(data, stored)
 
 
+def _refusal_text(exc: KeyProviderError, selector: str) -> str:
+    """The text the engine recorded for ``exc`` when it built it, else a fixed text naming
+    ``selector``. The instance's own text is never read, so a refusal raised by code this module
+    did not vet cannot pass its text through the store's fixed-text seams."""
+    from messagefoundry.store.base import _recorded_text
+
+    return _recorded_text(exc) or f"{selector} could not be read as a Vault transit key name."
+
+
 def _key_names() -> tuple[str, str]:
     """The Transit data key and audit key from the environment, read in one place for the cipher
     and for :func:`transit_cipher_required_capabilities`. Raises :class:`KeyProviderError` when the
     data-key name is not set, and when either name is not a Transit key name (BACKLOG #6010): both
-    go into Transit request paths, so each is checked here, before any client is built."""
-    key_name = os.environ.get(_ENV_TRANSIT_KEY)
-    if not key_name:
-        raise KeyProviderError(
-            f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is not set — "
-            f"supply the Transit data-key name via the environment."
-        )
-    key_name = checked_transit_key_name(key_name, selector=_ENV_TRANSIT_KEY)
+    go into Transit request paths, so each is checked here, before any client is built. Both are
+    read before either refuses, so one refusal names each variable to fix (BACKLOG #6010 item 7),
+    as :func:`~messagefoundry.store.keyprovider_vault.store_vault_hop` does for the address and
+    token."""
+    refusals: list[str] = []
+    key_name: str | None = None
+    audit_key: str | None = None
+    try:
+        key_name = transit_key_name_setting(_ENV_TRANSIT_KEY)
+    except KeyProviderError as exc:
+        refusals.append(_refusal_text(exc, _ENV_TRANSIT_KEY))
+    else:
+        if key_name is None:
+            refusals.append(
+                f"[store].cipher_provider={PROVIDER_NAME!r} is selected but {_ENV_TRANSIT_KEY} is "
+                f"not set — supply the Transit data-key name via the environment."
+            )
     # Optional dedicated audit-HMAC key; unset ⇒ reuse the data key. Either way the type is checked
     # at build — see the _ENV_AUDIT_KEY comment above for which types each use admits and why.
-    audit_key = os.environ.get(_ENV_AUDIT_KEY)
-    return key_name, (
-        checked_transit_key_name(audit_key, selector=_ENV_AUDIT_KEY) if audit_key else key_name
-    )
+    try:
+        audit_key = transit_key_name_setting(_ENV_AUDIT_KEY)
+    except KeyProviderError as exc:
+        refusals.append(_refusal_text(exc, _ENV_AUDIT_KEY))
+    # Raised outside the handlers, so nothing a read held rides along on the chain (BACKLOG #2307).
+    # Each text is one the engine built from a variable name alone, read from its record, so the
+    # joined text is recorded and the store's fixed-text seams keep it (BACKLOG #6010 item 3).
+    if refusals or key_name is None:
+        raise _recorded_refusal(" ".join(refusals))
+    return key_name, audit_key or key_name
 
 
 def build_transit_cipher(
@@ -1443,9 +1483,10 @@ def build_transit_cipher(
     (vault BACKLOG #2983). ``None`` counts as enforcing.
 
     ``settings`` is accepted for signature parity with ``make_cipher``/``build_store_cipher`` (the Vault
-    address/token/key are env-only secrets/provisioning outputs, like the KEK-unwrap provider). A missing
-    key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
-    ``open_store`` refuses to start rather than degrading to plaintext."""
+    address/token/key are env-only secrets/provisioning outputs, like the KEK-unwrap provider). At
+    least a missing or malformed key name (:func:`_key_names`), a missing extra, or an
+    unreachable/unknown Transit key raises :class:`KeyProviderError` so ``open_store`` refuses to
+    start rather than degrading to plaintext."""
     key_name, audit_key = _key_names()
     # Read once, and every client this cipher builds takes this token: the startup client below,
     # each thread's own on its first call there, and each rebuild after close_connections (BACKLOG
@@ -1541,7 +1582,8 @@ def transit_cipher_required_capabilities() -> dict[str, frozenset[str]]:
     ``transit/hmac/<audit key>``, which is the data key when no audit key is set, and the audit
     walk's check (:meth:`TransitCipher.verify_audit_hmac`, BACKLOG #2720) and the row seal check
     (:meth:`TransitCipher.verify_seal_hmac`, ADR 0217) update ``transit/verify/<audit key>``. Raises
-    :class:`KeyProviderError` when the data-key name is not set, as the cipher itself does."""
+    :class:`KeyProviderError` when the data-key name is not set or either name is malformed, as
+    the cipher itself does (:func:`_key_names`)."""
     key_name, audit_key = _key_names()
     read, update = frozenset({"read"}), frozenset({"update"})
     return {
