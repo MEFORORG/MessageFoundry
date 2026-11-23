@@ -502,3 +502,30 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     for row in rows:
         assert "*What an admin user read reports* below this table" in row, row
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
+
+
+def _statement_body() -> str:
+    text = _SECURITY_MD.read_text("utf-8")
+    return " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+
+
+def test_the_security_doc_counts_no_single_read_exceptions() -> None:
+    """The two-failing-reads rule has more than one single-read exception: a ``users`` row whose
+    timestamp or counter cell does not parse, and a record Vault transit cannot verify, which
+    ``AuthService._checked_by_id`` refuses at the first check that cannot verify it. So the
+    statement names the exceptions without counting them (Lander hold 7089092213)."""
+    body = _statement_body()
+    assert "One exception" not in body
+    assert "Among the exceptions: a `users` row with a timestamp or counter cell" in body
+
+
+def test_the_security_doc_says_where_a_factor_reset_that_issues_nothing_goes() -> None:
+    """``ui_user_reset_mfa`` shows no post-action page when the reset issued neither an
+    enrolment code nor a generated credential: it redirects to the account's detail page, whose
+    checked read answers 423 for a failing record (Lander hold 7089092213)."""
+    body = _statement_body()
+    assert (
+        "A factor reset that issues neither an enrolment code nor a generated credential shows "
+        "no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a "
+        "failing record."
+    ) in body

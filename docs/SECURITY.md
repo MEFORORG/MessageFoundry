@@ -1699,7 +1699,9 @@ offers that account's delete, through a confirmation page that names the id alon
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way; when the record fails its seal at that read, made after the action
 landed, they name the account by its id and still show what was issued, rather than answering
-423. What those pages show and log when that
+423. A factor reset that issues neither an enrolment code nor a generated credential shows no
+such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
+What those pages show and log when that
 read fails is stated in the docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
 A failure is reported
@@ -1716,7 +1718,7 @@ interval holds only while the process still remembers the account: it remembers 
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
 record is refused only after two failing reads that name the same account, or when it fails
-closed as this paragraph says below. One exception: a `users` row with a timestamp or counter cell
+closed as this paragraph says below. Among the exceptions: a `users` row with a timestamp or counter cell
 that does not parse is refused on the first read, with no re-read, on a store with or without an
 integrity key, and a list read lists it as failing even when the row is restored before its check,
 or leaves it out when its id cell is empty or not text (BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as
