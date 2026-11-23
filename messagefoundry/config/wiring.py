@@ -967,7 +967,8 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 def _tls_off_reason(tls: object) -> str | None:
     """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
     :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
-    ``tls`` is truthy, so it reads as on until it resolves."""
+    ``tls`` reads as on until it resolves, by ``unread_ca_reason``'s own rule, since
+    ``bool_setting`` refuses one."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
@@ -7173,7 +7174,11 @@ class Registry:
         ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
         ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
         check after resolution refuses it then."""
-        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+        from messagefoundry.auth.trust_anchors import (
+            unread_ca_flags_refused,
+            unread_ca_reason,
+            unread_pin_message,
+        )
 
         dialling = [
             ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
@@ -7188,9 +7193,9 @@ class Registry:
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
                 continue
-            if any(_bool_literal_problems_in(settings)):
-                # A non-bool literal, which bool_literal_problems names, and which the strict read
-                # in unread_ca_reason would raise on, ending validate_config's collection.
+            if unread_ca_flags_refused(settings):
+                # The strict read in unread_ca_reason would raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7849,12 +7854,12 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
     # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230). Any
-    # other non-bool literal counts too: a connector that reads the key refuses it (vault BACKLOG
-    # #3234), and a register of loosenings reports it rather than raise.
+    # other non-bool literal is not counted: a connector that reads the key refuses it (vault
+    # BACKLOG #3234), so no hop runs with it, and this register does not raise on it.
     value = settings.get("tls_check_hostname")
-    if value is None or value == "":
-        return False
-    return value is not True
+    if isinstance(value, EnvRef):
+        return True
+    return value is False
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

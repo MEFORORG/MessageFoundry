@@ -1952,6 +1952,15 @@ def _token_hop_reads_ca(settings: Mapping[str, Any]) -> bool:
     return smart_auth_configured(settings) or oauth2_auth_configured(settings)
 
 
+#: The boolean flags :func:`unread_ca_reason` reads, each with its default.
+_UNREAD_CA_FLAGS: tuple[tuple[str, bool], ...] = (
+    ("tls", False),
+    ("use_tls", True),
+    ("tls_verify", True),
+    ("verify_tls", True),
+)
+
+
 def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
     """``bool_setting``, except that an unresolved ``env()`` reference reads as on: its value is
     not known yet, so no CA reads as unread on it, and the check after resolution decides. Any
@@ -1962,6 +1971,17 @@ def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool)
     if isinstance(settings.get(key), EnvRef):
         return True
     return bool_setting(settings, key, default=default)
+
+
+def unread_ca_flags_refused(settings: Mapping[str, Any]) -> bool:
+    """Whether any flag :func:`unread_ca_reason` reads holds a value its strict read refuses, so a
+    reader that collects problems can leave that connection to the pass naming the literal."""
+    for key, default in _UNREAD_CA_FLAGS:
+        try:
+            _flag_or_unresolved(settings, key, default=default)
+        except ValueError:
+            return True
+    return False
 
 
 def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
