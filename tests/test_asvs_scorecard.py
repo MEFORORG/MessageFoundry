@@ -3282,18 +3282,17 @@ def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path:
     (problem,) = _screen(plain, cached, tmp_path)
     assert "where a value was expected" not in problem
     assert "the function the def itself makes" in problem
-    assert "a cache wrapper, whose call results are cached, where what it wraps is" in problem
+    assert "a cache wrapper if what it wraps is callable, whose call results are cached" in problem
     # A property swapped for a cached_property: the text names what differs.
     prop = _OUTER_HEAD + _decorated(("property", "w"), method=True)
     (swapped,) = _screen(_decorated(("functools.cached_property",), method=True), prop, tmp_path)
-    assert "has a __dict__ holding no result for it yet" in swapped
-    assert "runs its getter on each read through an instance" in swapped
+    assert "a cached_property, which is not callable" in swapped
+    assert "a property, which is not callable" in swapped
     # Control: a signature refusal keeps its own text.
     bare = _OUTER_HEAD + plain
     (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
     assert "where a value was expected" in renamed
-    # Some differences it refuses change nothing a call sees, and the text says so.
-    assert "positional-only, *args or **kwargs parameter" in renamed
+    assert "A difference of this kind can change what a call of the name gets" in renamed
 
 
 def test_signature_fields_name_every_signature_value() -> None:
