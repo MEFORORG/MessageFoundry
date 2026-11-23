@@ -33,8 +33,10 @@ from tests._serviceenv_remedy import (
     ADD_BACK_STEP,
     COUNTED_ONCE,
     CREATE,
+    CREATE_INSTALLER,
     DOUBT_PASS_BACK,
     DOUBT_STEP,
+    DOUBT_STEP_RUN_ON,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
@@ -501,26 +503,29 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
     )
     assert refusal is not None
     assert SET_NO not in refusal
-    assert refusal.count(DOUBT_STEP) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
+    assert refusal.count(DOUBT_STEP_RUN_ON) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
     step = ADD_BACK_DOUBT + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
+    # The password runs on into an AppEnvironmentExtra string the installer reads as the
+    # directory, which the doubt step keeps for it, so the create step says so.
+    assert refusal.count(CREATE + CREATE_INSTALLER) == 1
 
 
 def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
     """The review of the repair for the Lander's hold on PR 3142, comment 7090314503, finding
     1, and round 2's finding 3: the store password runs on into a string that holds a
-    directory line and a PATH line. The run-on step says to remove that string, so the
-    doubt step keeps only the other lines no step above says to remove, rather than telling the
-    operator to keep all of them, and the add-back step passes back none of them."""
+    directory line and a PATH line. The doubt step now comes first and keeps that string whole,
+    since it may hold the password, for the Put step (the Lander's ruling (a) on comment
+    7112155891); the run-on step below the Put step removes it, and the add-back step passes
+    back none of it."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
-    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP) == 1
-    assert "keeping each other line no step above says to remove" in refusal
+    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP_RUN_ON) == 1
     assert refusal.count(DOUBT_PASS_BACK) == 1 and WIDER not in refusal
-    assert refusal.index(RUNS_ON) < refusal.index(DOUBT_STEP)
+    assert refusal.index(DOUBT_STEP_RUN_ON) < refusal.index("Put ") < refusal.index(RUNS_ON)
 
 
 @pytest.mark.parametrize("where", [_PLAIN, "Environment"], ids=["AppEnvironment", "Environment"])

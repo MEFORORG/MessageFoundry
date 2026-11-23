@@ -25,9 +25,9 @@ from tests._serviceenv_remedy import (
     ADD_BACK_CREATE,
     ADD_BACK_DOUBT,
     CREATE,
-    CREATE_DOUBT,
+    DOUBT_CREATE_RUN_ON,
     DOUBT_PASS_BACK,
-    DOUBT_STEP,
+    DOUBT_STEP_RUN_ON,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
@@ -221,8 +221,12 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
     remedy = key_alone.split("each value refused here. ", 1)[1]
-    # The key file comes first and the removal last (fourth hold, H1).
-    assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
+    # The doubt step comes first, keeping the joined string that may hold the key whole, then the
+    # key file, and the removal last (fourth hold, H1; the Lander's ruling (a) on PR 3142's
+    # repair handback, comment 7112155891).
+    assert remedy.startswith(
+        f"{DOUBT_STEP_RUN_ON}. Keep the store key in a DPAPI-protected key file instead"
+    )
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{_END}")
     # The directory item may still be read as its own variable, so no "set no" opener, and the
     # pass-back leaves out the strings the run-on step removes, which hold the key (the
@@ -442,8 +446,8 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     line shares its string with other lines, so it is in doubt, and removing the variable may
     change the directory the engine reads, so the add-back step names it again (the Lander's
     ruling B on PR 3142's repair handback, comment 7106776128). The directory is listed only by
-    that entry, so the create step prints before the Put step (round-3 open finding 1 on that
-    handback, comment 7110577570)."""
+    that entry, so the doubt step, then the create step, print before the Put step (the
+    Lander's ruling (a) on that handback's round-3 open findings 1 and 2, comment 7112155891)."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
     assert posture.value_runs_on and posture.directory_in_doubt
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
@@ -451,12 +455,14 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     assert refusal is not None
     assert REMOVE in refusal and RUNS_ON in refusal
     remedy = refusal.split("each value refused here. ", 1)[1]
-    assert remedy.startswith(f"{CREATE_DOUBT}. Put MEFOR_STORE_PASSWORD in the secrets directory")
+    assert remedy.startswith(
+        f"{DOUBT_CREATE_RUN_ON}. Put MEFOR_STORE_PASSWORD in the secrets directory"
+    )
     # The password moves to the secrets directory, so the step carries its create clause.
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
-    # The third hold's H1: no step before the doubt step names a string. That step and the
-    # add-back step read and pass back a list, so they name the strings they leave out.
-    assert "string" not in remedy.split(DOUBT_STEP, 1)[0]
+    # The third hold's H1: no step between the doubt step and the add-back step names a string.
+    # Those two read and pass back a list, so they name the strings they keep or leave out.
+    assert "string" not in remedy.split(DOUBT_STEP_RUN_ON, 1)[1].split(ADD_BACK_DOUBT, 1)[0]
 
 
 def test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step() -> None:

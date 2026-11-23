@@ -177,21 +177,27 @@ class ServiceEnvPosture:
     #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
     #: ``MEFOR_SECRETS_DIRECTORY``, and the string alone is not plainly a path. Where this is
     #: True the remedy prints no keep-one step and no clause sparing directory lines from its
-    #: removal steps. It prints a step that says to take every line that may name the directory
-    #: (:func:`_may_name_directory`) out of every list, and then the add-back step, which says
-    #: to add one entry naming the path wherever the directory exists, even where a directory
-    #: entry is listed. Where a setting moves to the secrets directory, the create step also
-    #: prints up front, before the step that moves it, even where a directory entry is listed,
-    #: and says to run the installer only once those lines are out. Where it is False, every
-    #: directory entry is plainly a path on its own, so the keep-one step prints where a refused
-    #: value runs on into one (``directory_run_on``), and no step removes one otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
-    #: PR 3142's repair handback, comment 7106776128).
+    #: removal steps. Its first step says to take every line that may name the directory
+    #: (:func:`_may_name_directory`) out of every list, and those lines alone, keeping every
+    #: refused variable for the steps below. Where a setting moves to the secrets directory, the
+    #: create step prints next, even where a directory entry is listed, then the step that moves
+    #: it, the removal steps, and the add-back step, which says to add one entry naming the path
+    #: wherever the directory exists. Where it is False, every directory entry is plainly a path
+    #: on its own, so the keep-one step prints where a refused value runs on into one
+    #: (``directory_run_on``), and no step removes one otherwise. The remedy alone reads this,
+    #: never the refusal itself (the Lander's ruling B on PR 3142's repair handback, comment
+    #: 7106776128, and its ruling (a) on comment 7112155891).
     directory_in_doubt: bool = False
     #: Whether a refused value runs on into a string whose first non-blank line sets
     #: ``MEFOR_SECRETS_DIRECTORY``. Where no directory entry is in doubt, the remedy then prints
     #: the keep-one step and spares directory lines from the run-on step; otherwise the run-on
     #: step removes the string. The remedy alone reads this.
     directory_run_on: bool = False
+    #: Whether a refused value runs on, in AppEnvironmentExtra, into a string install-service.ps1
+    #: reads as setting ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`). The doubt step
+    #: keeps such a string for the value, so where a directory entry is in doubt the create step
+    #: then says not to run the installer while it is there. The remedy alone reads this.
+    installer_run_on: bool = False
     #: Whether a value that runs on takes, as the first string after its own that is not blank
     #: (:func:`_still_blank`), one whose first non-blank line sets ``MEFOR_SECRETS_DIRECTORY``
     #: (:func:`_sets_directory`), whether or not :func:`_names` keeps the variable it was joined
@@ -669,6 +675,10 @@ class _Variable:
     #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
     #: on its first line (:func:`_sets_directory`).
     holds_directory: bool = False
+    #: Whether it runs on, in AppEnvironmentExtra, and a string after its own in the joined group
+    #: starts with ``MEFOR_SECRETS_DIRECTORY=`` in any letter case (:func:`_installer_reads`).
+    #: Remedy only.
+    takes_installer_entry: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -961,9 +971,22 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
                     takes_directory=ran_on and set_after[index + 1],
                     holds_directory=holds,
+                    takes_installer_entry=ran_on
+                    and where.endswith(NSSM_EXTRA_VALUE)
+                    and any(_installer_reads(s) for s in strings[index + 1 :]),
                 )
             )
     return read
+
+
+def _installer_reads(entry: str) -> bool:
+    """Whether install-service.ps1 takes the AppEnvironmentExtra string ``entry`` as one that
+    sets ``MEFOR_SECRETS_DIRECTORY``: its ``Test-EnvironmentEntryNames`` matches a string that
+    starts with the name and an equals sign, ignoring case, reads the value after it as the
+    directory the service names, and drops the whole string when it adds its own. The case fold
+    here is Python's ``str.upper``, not measured against .NET's ordinal one for a letter outside
+    ASCII."""
+    return entry[: len(_DIRECTORY_VARIABLE) + 1].upper() == f"{_DIRECTORY_VARIABLE}="
 
 
 def _sets_directory(entry: str) -> bool:
@@ -1151,6 +1174,7 @@ def read_service_env_posture(
         # absorbed into a broken name or an uncounted twin is still judged.
         directory_in_doubt=any(_directory_entry_in_doubt(entry) for _where, entry in entries),
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
+        installer_run_on=any(v.takes_installer_entry and _names([v]) for v in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
@@ -1299,6 +1323,44 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     moving_others = [o for o in others if o not in only]
     moving_values = [v for v in values if v not in only]
     steps: list[str] = []
+    doubt = posture.directory_in_doubt
+    if doubt:
+        # First, so the remedy can be followed top to bottom (the Lander's ruling (a) on round-3
+        # open findings 1 and 2 of PR 3142's repair handback, comment 7112155891): once these
+        # lines are out, the create step below runs the installer with no line left in any list
+        # that may set the directory, and the Put step after it still finds every refused value
+        # where it was, since this step takes out those lines alone and keeps each refused
+        # variable for the steps below, which move each value before its entry goes. It names
+        # every list it acts in, with how each is edited, since `nssm set` replaces a whole list
+        # and the service's own Environment value is no NSSM list (code review round 2 on the
+        # earlier repair). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
+        # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
+        # directory and nothing else, or beside other lines, is now either plainly a path, and
+        # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
+        # comment 7106776128). A string a refused value runs on into is kept whole, directory
+        # lines and all, since it may hold that value, a store key among them, which the steps
+        # below move before the run-on step removes the string.
+        steps.append(
+            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
+            "plainly to a path under that name, in ASCII with no blank around it, so first take "
+            "each line that may set it out of every list, whatever its letter case, a blank "
+            "around its name, or a letter outside ASCII that upper-cases to one of its letters"
+            + (
+                ", but keep whole each string a refused variable's value runs on into, which a "
+                "step below removes with that value"
+                if posture.value_runs_on
+                else ""
+            )
+            + ". Take out those lines alone, and keep every refused variable and every other "
+            "line where it is, for the steps below to move each value before its entry goes: "
+            "where such a line shares a registry string with other lines, write that string "
+            "back with its other lines as they were, in their order, and leave out only a string "
+            "that holds nothing else. `nssm set` replaces a whole list, so read AppEnvironment and "
+            "AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by "
+            "its full path, and pass back every entry, with only those lines taken out. "
+            "The service's own Environment value is no NSSM list and is edited in the registry "
+            'key named above: see docs/SERVICE.md, "Start / stop / status"'
+        )
     if moving_keys:
         steps.append(
             "Keep the store key in a DPAPI-protected key file instead: `messagefoundry protect-key "
@@ -1311,13 +1373,13 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # The installer refuses an existing directory the service does not name, so this points
         # only at how one is created, and before the step that moves a setting there (the third
         # hold's H2, the fourth hold's H1). Where a directory entry is in doubt, the doubt step
-        # below takes out every line that may name the directory, so a listed name settles
-        # nothing and the step prints before the Put step all the same (round-3 open finding 1
-        # on PR 3142's repair handback, comment 7110577570). install-service.ps1 drops whole
-        # each AppEnvironmentExtra entry that starts with the name and "=", joined lines and
-        # all, and may echo the value it reads, so there the step says to run it only once those
-        # lines are out (code review rounds 1 and 2 on this repair).
-        if (_DIRECTORY_VARIABLE not in posture.listed or posture.directory_in_doubt) and (
+        # above has taken out every line that may name the directory, so a listed name settles
+        # nothing and the step prints all the same (round-3 open finding 1 on PR 3142's repair
+        # handback, comment 7110577570). The doubt step leaves the installer no line to read or
+        # drop that may set the directory, but for a string a refused value runs on into, which
+        # it keeps for that value; only where such a string is one the installer reads does the
+        # step carry a clause about it (the Lander's ruling (a), comment 7112155891).
+        if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
             steps.append(
@@ -1325,11 +1387,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
                 + (
-                    ", but run install-service.ps1 only once the steps below have taken out each "
-                    f"line that may set {_DIRECTORY_VARIABLE}, since it drops whole each "
-                    f"AppEnvironmentExtra entry that starts with {_DIRECTORY_VARIABLE}= in any "
-                    "letter case, every line in it included, and may print the value it reads"
-                    if posture.directory_in_doubt
+                    ". Where a refused variable's value runs on into an AppEnvironmentExtra "
+                    f"string that starts with {_DIRECTORY_VARIABLE}= in any letter case, which "
+                    "the first step keeps, install-service.ps1, which `messagefoundry service "
+                    "install` also runs, may read that string as the directory the service names "
+                    "and print it, so run the installer only once that string is out: where a "
+                    "secrets directory already exists, put that value in it first, and where none "
+                    "does, remove that string as a step below says, then run the installer, and "
+                    "put the value in the new directory from where it came"
+                    if doubt and posture.installer_run_on
                     else ""
                 )
             )
@@ -1397,12 +1463,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     # directory line goes, as origin/main's joined-directory step said; the removal steps then
     # spare each directory line, so no step removes an entry a later one keeps (code review on
     # PR 3142). directory_run_on needs a refused value that runs on, so the run-on step prints
-    # too. Where any entry is in doubt, nothing is spared or kept: a step of its own, with no
-    # condition, says to take every line that may name the directory out of every list, and the
-    # add-back step then names the path again wherever the directory exists, so no step changes
-    # the directory the engine reads without naming it (code review rounds 1 and 2 on this
-    # repair).
-    doubt = posture.directory_in_doubt
+    # too. Where any entry is in doubt, nothing is spared or kept: the doubt step, first and with
+    # no condition, says to take every line that may name the directory out of every list, and
+    # the add-back step then names the path again wherever the directory exists, so no step
+    # changes the directory the engine reads without naming it (code review rounds 1 and 2 on
+    # the earlier repair).
     keep_one = posture.directory_run_on and not doubt
     add_back_due = doubt or (
         not posture.directory_run_on
@@ -1425,30 +1490,6 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             + (spare if keep_one else "")
             + ", or the value stays in the registry key"
         )
-    if doubt:
-        # Its own step, so the operator takes the lines out whether or not the installer made
-        # the directory, which the add-back step's condition asks, and the add-back step's
-        # `nssm get` and `nssm set` stay about AppEnvironmentExtra alone (code review round 1
-        # on this repair). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
-        # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
-        # directory and nothing else, or beside other lines, is now either plainly a path, and
-        # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
-        # comment 7106776128). It names every list it acts in, with how each is edited, since
-        # `nssm set` replaces a whole list and the service's own Environment value is no NSSM
-        # list (code review round 2 on this repair).
-        steps.append(
-            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
-            "plainly to a path under that name, in ASCII with no blank around it, so take each "
-            "line that may set it out of every list, whatever its letter case, a blank around "
-            "its name, or a letter outside ASCII that upper-cases to one of its letters, "
-            "removing an entry that holds nothing else and keeping each other line no step "
-            "above says to remove. `nssm set` replaces a whole list, so read AppEnvironment and "
-            "AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by "
-            "its full path, and pass back every entry but the strings and lines this step and "
-            "the steps above say to remove or take out. "
-            "The service's own Environment value is no NSSM list and is edited in the registry "
-            'key named above: see docs/SERVICE.md, "Start / stop / status"'
-        )
     if add_back_due:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
@@ -1461,9 +1502,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        # Where an entry is in doubt, the step above may have taken out a working entry, so the
+        # Where an entry is in doubt, the doubt step may have taken out a working entry, so the
         # step says to add one back wherever the directory exists, however it was made (code
-        # review round 2 on this repair).
+        # review round 2 on the earlier repair).
         # The step says the lists set no directory only where no line of any string in them
         # sets one (directory_in_lists) and no directory entry is in doubt. Where one is in
         # doubt, the entries it says to pass back leave out the strings and lines the steps

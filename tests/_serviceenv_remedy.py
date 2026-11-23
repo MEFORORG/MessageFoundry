@@ -79,34 +79,50 @@ ADD_BACK_BARE = ADD_BACK_STEP.removeprefix(f"{SET_NO}. ")
 #: Main's wider pass-back exclusion, from its joined-directory step.
 WIDER = "and the strings this step and any step above say to remove"
 
-#: The step printed wherever a directory entry is in doubt
+#: The step printed first wherever a directory entry is in doubt
 #: (``ServiceEnvPosture.directory_in_doubt``), with no condition: every line that may name the
-#: directory, in every list, comes out, a string that holds nothing else whole, and each other
-#: line no step above removes stays. It replaces the two AppEnvironmentExtra clauses of the
-#: Lander's holds on PR 3142, comments 7089064404, 7089400537 and 7090314503 (the Lander's
-#: ruling B on PR 3142's repair handback, comment 7106776128).
+#: directory, in every list, comes out, and those lines alone, so every refused variable is still
+#: where it was when the Put step reads it, and a string holding such a line beside others is
+#: written back with only that line taken out (the Lander's ruling (a) on PR 3142's repair
+#: handback, comment 7112155891). It replaces the two AppEnvironmentExtra clauses of the Lander's
+#: holds on PR 3142, comments 7089064404, 7089400537 and 7090314503 (the Lander's ruling B on
+#: PR 3142's repair handback, comment 7106776128).
 DOUBT_STEP = (
     "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not one line setting it plainly "
-    "to a path under that name, in ASCII with no blank around it, so take each line that may set "
-    "it out of every list, whatever its letter case, a blank around its name, or a letter outside "
-    "ASCII that upper-cases to one of its letters, removing an entry that holds nothing else and "
-    "keeping each other line no step above says to remove. `nssm set` replaces a whole list, so "
-    "read AppEnvironment and AppEnvironmentExtra first with `nssm get`, running the service's own "
-    "nssm.exe by its full path, and pass back every entry but the strings and lines this step and "
-    "the steps above say to remove or take out. The service's own Environment value is no NSSM "
-    'list and is edited in the registry key named above: see docs/SERVICE.md, "Start / stop / '
-    'status"'
+    "to a path under that name, in ASCII with no blank around it, so first take each line that "
+    "may set it out of every list, whatever its letter case, a blank around its name, or a letter "
+    "outside ASCII that upper-cases to one of its letters. Take out those lines alone, and keep "
+    "every refused variable and every other line where it is, for the steps below to move each "
+    "value before its entry goes: where such a line shares a registry string with other lines, "
+    "write that string back with its other lines as they were, in their order, and leave out "
+    "only a string that holds nothing else. `nssm set` replaces a whole list, so read "
+    "AppEnvironment and AppEnvironmentExtra first with `nssm get`, running the service's own "
+    "nssm.exe by its full path, and pass back every entry, with only those lines taken out. The "
+    "service's own Environment value is no NSSM list and is edited in the registry key named "
+    'above: see docs/SERVICE.md, "Start / stop / status"'
+)
+
+#: DOUBT_STEP's clause where a refused value runs on: a string the value runs on into stays whole
+#: until the run-on step, since it may hold that value, a store key among them.
+DOUBT_KEEP_RUN_ON = (
+    ", but keep whole each string a refused variable's value runs on into, which a step below "
+    "removes with that value"
+)
+
+#: DOUBT_STEP as printed where a refused value runs on.
+DOUBT_STEP_RUN_ON = DOUBT_STEP.replace(
+    "one of its letters. Take out", f"one of its letters{DOUBT_KEEP_RUN_ON}. Take out", 1
 )
 
 #: The add-back step's pass-back exclusion where a directory entry is in doubt, so no line the
 #: step above takes out is written back (the Lander's hold on PR 3142, comment 7090314503).
 DOUBT_PASS_BACK = "and the strings and lines the steps above say to remove or take out"
 
-#: DOUBT_STEP and the add-back step after it, as printed wherever a directory entry is in doubt:
-#: no opener, a condition on the directory existing however it was made, since DOUBT_STEP may
-#: take out a working entry (code review round 2 on the repair of PR 3142), and the doubt
+#: The add-back step as printed wherever a directory entry is in doubt, after the removal
+#: steps: no opener, a condition on the directory existing however it was made, since DOUBT_STEP
+#: may take out a working entry (code review round 2 on the repair of PR 3142), and the doubt
 #: pass-back exclusion.
-ADD_BACK_DOUBT = f"{DOUBT_STEP}. " + ADD_BACK_BARE.replace(
+ADD_BACK_DOUBT = ADD_BACK_BARE.replace(
     "Where install-service.ps1 already made the secrets directory,",
     "Where the secrets directory already exists, however it was made,",
     1,
@@ -140,20 +156,34 @@ ADD_BACK_CREATE = (
 #: The step with its create clause, as origin/main prints it.
 ADD_BACK = ADD_BACK_STEP + ADD_BACK_CREATE
 
-#: Printed when a setting goes to the secrets directory and no entry is read as naming it, and
-#: no directory entry is in doubt; where one is, CREATE_DOUBT prints in its place, before the Put
-#: step (round-3 open finding 1 on PR 3142's repair handback, comment 7110577570).
+#: Printed when a setting goes to the secrets directory and no entry is read as naming it, or a
+#: directory entry is in doubt; there it prints after DOUBT_STEP and before the Put step, so the
+#: installer it points at runs with no line left that may set the directory (round-3 open
+#: finding 1 on PR 3142's repair handback, comment 7110577570, and the Lander's ruling (a) on
+#: comment 7112155891).
 CREATE = (
     'Where no secrets directory exists yet, the bullet "The other secrets: a secrets directory" '
     'under docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created'
 )
 
-#: CREATE as printed wherever a setting goes to the secrets directory and a directory entry is
-#: in doubt, listed or not: the installer runs only once the doubt step has taken those lines
-#: out (code review rounds 1 and 2 on the repair of PR 3142's round-3 open finding 1).
-CREATE_DOUBT = (
-    f"{CREATE}, but run install-service.ps1 only once the steps below have taken out each line "
-    "that may set MEFOR_SECRETS_DIRECTORY, since it drops whole each AppEnvironmentExtra entry "
-    "that starts with MEFOR_SECRETS_DIRECTORY= in any letter case, every line in it included, "
-    "and may print the value it reads"
+#: How the remedy opens wherever a directory entry is in doubt, a setting moves to the secrets
+#: directory and no store key moves to a key file: the doubt step, then the create step, so the
+#: Put step after them finds a directory and every refused value still in place (the Lander's
+#: ruling (a) on PR 3142's repair handback, comment 7112155891).
+DOUBT_CREATE = f"{DOUBT_STEP}. {CREATE}"
+
+#: DOUBT_CREATE where a refused value runs on.
+DOUBT_CREATE_RUN_ON = f"{DOUBT_STEP_RUN_ON}. {CREATE}"
+
+#: CREATE's clause where a directory entry is in doubt and a refused value runs on, in
+#: AppEnvironmentExtra, into a string install-service.ps1 reads as setting the directory, which
+#: DOUBT_STEP_RUN_ON keeps for that value (``ServiceEnvPosture.installer_run_on``).
+CREATE_INSTALLER = (
+    ". Where a refused variable's value runs on into an AppEnvironmentExtra string that starts "
+    "with MEFOR_SECRETS_DIRECTORY= in any letter case, which the first step keeps, "
+    "install-service.ps1, which `messagefoundry service install` also runs, may read that string "
+    "as the directory the service names and print it, so run the installer only once that string "
+    "is out: where a secrets directory already exists, put that value in it first, and where none "
+    "does, remove that string as a step below says, then run the installer, and put the value in "
+    "the new directory from where it came"
 )
