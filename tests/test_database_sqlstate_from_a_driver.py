@@ -588,9 +588,9 @@ class _FakesStr:
 
 
 def test_an_object_faking_str_reads_as_no_sqlstate() -> None:
-    """Review of the hold's fix: an ``isinstance`` gate would let this through to
-    ``str.__str__``, which raises, and ``_sqlstate`` runs in the send's error arm before its
-    rollback. The readers answer None instead."""
+    """Review of the hold's fix: an ``isinstance`` gate would let this through to ``str.__len__``,
+    the first ``str`` method ``sqlstate_text`` calls on it, which raises, and ``_sqlstate`` runs in
+    the send's error arm before its rollback. The readers answer None instead."""
     from messagefoundry.redaction import driver_sqlstate_of, sqlstate_text
 
     exc = DriverError(_FakesStr(), "x")
@@ -613,6 +613,46 @@ async def test_a_fetch_deadlock_with_a_sqlstate_subclass_still_propagates() -> N
 
     with pytest.raises(DriverError):
         await database._fetch_result_set(_Cursor())
+
+
+class _ClassRaises(DriverError):
+    """A driver error whose ``__class__`` attribute raises when read, as ``isinstance`` reads it
+    for a class that does not match."""
+
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        raise RuntimeError("__class__ read")
+
+
+async def test_a_send_rolls_back_when_the_errors_class_attribute_raises() -> None:
+    """Review of the hold's fix, finding 1 of round-15921764ae: red on 094202761556, where
+    ``_sqlstate``'s ``isinstance`` tests read ``exc.__class__`` and raised before the send's
+    rollback, so the INSERT could be left open on a pooled connection (BACKLOG #5010). It reads
+    the class with ``type()`` now, and the send is still a classified rejection."""
+    from messagefoundry.redaction import is_a_sqlite_error
+
+    exc = _ClassRaises("23505", f"duplicate key ({_VALUE})")
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    # The outcome is read outside the except arms: pytest's own report reads ``__class__`` on a
+    # failure chained to this error, and would crash rather than report it.
+    outcome = "returned"
+    try:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    except NegativeAckError as refused:
+        outcome = str(refused)
+    except Exception as failed:  # noqa: BLE001 - recorded and asserted below
+        outcome = f"raised {type(failed).__name__}"
+    assert outcome == "database rejected the statement [23505]"
+    assert conn.rolledback
+    readers = []
+    for read in (database._sqlstate, database._log_sqlstate, is_a_sqlite_error):
+        try:
+            readers.append(read(exc))
+        except Exception as failed:  # noqa: BLE001 - recorded and asserted below
+            readers.append(f"raised {type(failed).__name__}")
+    assert readers == ["23505", "23505", False]
 
 
 async def test_a_connect_refusal_with_a_sqlstate_subclass_keeps_its_disposition() -> None:

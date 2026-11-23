@@ -3148,11 +3148,13 @@ def known_driver_error(exc: BaseException) -> bool:
 
 
 def is_a_sqlite_error(exc: BaseException) -> bool:
-    """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings."""
+    """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings. The class is read with
+    ``type()``, not ``isinstance``, which falls back to ``exc.__class__``, an attribute a class can
+    define to raise; an error arm calls this before its cleanup (engine PR 3163)."""
     # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
     # and the CLI defers loading it (tests/test_startup_import_budget.py).
     sqlite = sys.modules.get("sqlite3")
-    return sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning))
+    return sqlite is not None and issubclass(type(exc), (sqlite.Error, sqlite.Warning))
 
 
 def reads_as_a_sqlstate(value: object) -> TypeGuard[str]:
@@ -3186,10 +3188,10 @@ def driver_sqlstate_of(
     attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set
     but is no SQLSTATE then ends the read with None unless ``past_attribute`` is true. Then None
     for an error from a package in :func:`args_hold_a_message`, at least asyncpg, whose
-    ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's does. None for any error that is no known
-    driver's, so a ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose
-    ``args[0]`` is its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's
-    SQLSTATE by it. The DATABASE connector reads its own state, which can differ from this one.
+    ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's
+    does. None for any error that is no known driver's, so a ``KeyError('MRN42')`` is never read
+    as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG #1661).
+    :func:`safe_traceback` names a driver error's SQLSTATE by it. The DATABASE connector reads its own state, which can differ from this one.
 
     A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
     answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A

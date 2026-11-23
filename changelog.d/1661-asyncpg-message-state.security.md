@@ -5,9 +5,6 @@
   and send errors, their `code`, the stored `last_error` and its log lines. They now name no
   state: for example a rejected send reads `[SQLSTATE withheld]` with the code `db`, and a log
   line reads `<type> [message withheld]`. The traceback line did the same when the
-  attribute was absent or None, and now prints `[driver message withheld]`. A SQLSTATE that is
-  a `str` subclass, in `args[0]` or the attribute, is read by its data, and the connector's error
-  texts and log lines and the traceback line now print an exact `str` copy of that data rather
-  than the subclass's own `__str__`. The error is still
+  attribute was absent or None, and now prints `[driver message withheld]`. The error is still
   classified by that shape, as before, so its disposition is unchanged. The store's own SQLSTATE
   readers are unchanged. (vault `BACKLOG #1661`)

@@ -2813,8 +2813,10 @@ def _sqlstate(exc: BaseException) -> str | None:
     ``args[0]`` is its message; for one, :func:`_shown_state` names a state only from the error's
     own ``sqlstate`` attribute, and only when that equals the state read. What this returns is an
     exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but
-    ``args``, with ``getattr`` and a default, so an error arm can call it before its cleanup."""
-    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
+    ``args``, with ``getattr`` and a default, so an error arm can call it before its cleanup; its
+    class is read with ``type()``, since ``isinstance`` falls back to ``exc.__class__``, which a
+    class can define to raise (engine PR 3163)."""
+    if issubclass(type(exc), UnicodeError) or is_a_sqlite_error(exc):
         return None
     return _shaped_state(getattr(exc, "args", ()))
 
@@ -2828,9 +2830,9 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     state read. What this returns is an exact ``str`` copy
     (:func:`~messagefoundry.redaction.sqlstate_text`), the attribute's or ``args[0]``'s. Never
     for a ``UnicodeError`` or an exception that holds one, whose text a codec name can make read
-    like a SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text
-    names."""
-    if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
+    like a SQLSTATE. Like :func:`_sqlstate`, it classifies, and reads the class with ``type()``;
+    :func:`_shown_state` says what text names."""
+    if issubclass(type(exc), UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = sqlstate_text(getattr(exc, "sqlstate", None))
     return state if state is not None else _shaped_state(getattr(exc, "args", ()))
