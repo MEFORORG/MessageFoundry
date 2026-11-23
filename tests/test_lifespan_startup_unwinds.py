@@ -429,12 +429,24 @@ class _FailingTransport:
         raise OSError("synthetic refusal")
 
 
+class _SelfCancellingEmail(_HealthyEmail):
+    """Takes the alert, then cancels its own task and returns before the cancel lands."""
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        await super().send(event)
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+
 @pytest.mark.parametrize(
     ("transports", "expected"),
     [
         pytest.param(lambda: [_HealthyEmail()], 0, id="delivered"),
         pytest.param(lambda: [_FailingTransport()], 2, id="every-send-failed"),
-        pytest.param(lambda: [_FailingTransport(), _HealthyEmail()], 2, id="one-transport-lost-it"),
+        pytest.param(lambda: [_FailingTransport(), _HealthyEmail()], 0, id="one-transport-took-it"),
+        pytest.param(lambda: [_SelfCancellingEmail()], 0, id="ended-cancelled-after-its-send"),
+        pytest.param(lambda: [], 2, id="no-transport-selected"),
     ],
 )
 async def test_undelivered_counts_alerts_not_delivered_rather_than_handled(
@@ -442,13 +454,36 @@ async def test_undelivered_counts_alerts_not_delivered_rather_than_handled(
 ) -> None:
     """BACKLOG #5907 step 4: the drain took an alert off the count once it was handled, whether
     or not any transport took it, so a failed send read as delivered. An alert stays counted
-    unless every transport its rule selected took it."""
+    unless at least one transport its rule selected took it."""
     sink = NotifierAlertSink(transports())
     sink.start()
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     sink.connection_stopped("IB_TEST_ORU", detail="probe")
     await asyncio.wait_for(sink.aclose(), 10.0)
     assert sink.undelivered == expected
+
+
+async def test_the_unwind_reports_alerts_no_transport_took_when_the_drain_ends_in_time(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5907 step 4: the unwind read the count only once its drain wait timed out, so an
+    alert whose sends all failed fast was lost with no count. A drain that ends in time now logs
+    the count when it is not zero, and nothing when every alert was taken."""
+
+    class _Store:
+        async def close(self) -> None:
+            return None
+
+    store: Any = _Store()
+    with caplog.at_level(logging.ERROR, logger=appmod._log.name):
+        sink = NotifierAlertSink([_HealthyEmail()])
+        sink.connection_stopped("IB_TEST_ADT", detail="probe")
+        await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+        assert "not confirmed delivered" not in caplog.text  # the control
+        sink = NotifierAlertSink([_FailingTransport()])
+        sink.connection_stopped("IB_TEST_ADT", detail="probe")
+        await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    assert "startup unwind: 1 alert(s) not confirmed delivered" in caplog.text
 
 
 async def test_a_close_cancelled_on_a_full_queue_still_stops_the_drain() -> None:

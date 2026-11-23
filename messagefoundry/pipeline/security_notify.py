@@ -796,7 +796,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
 
     async def _handle(self, event: SecurityEvent) -> bool:
         try:
-            await asyncio.to_thread(self._send, event)
+            return await asyncio.to_thread(self._send, event)
         except Exception:
             # Best-effort: a failed send must never propagate. The event is usually also in the audit
             # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
@@ -814,7 +814,6 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             # even its class would tell the recipient, in their own feed, that the relay is broken.
             await self._record_undelivered(event, {"reason": "send_failed"})
             return False
-        return True
 
     async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
@@ -847,9 +846,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     type(exc).__name__,
                 )
 
-    def _send(self, event: SecurityEvent) -> None:
+    def _send(self, event: SecurityEvent) -> bool:
+        """Mail the notice, returning whether it was sent."""
         if not event.email:  # narrowed for mypy; notify() already filtered these out
-            return
+            return False
         send_plain_email(
             host=self._host,
             port=self._port,
@@ -866,6 +866,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             tls_ca_file=self._tls_ca_file,
             trust_anchor_policy=self._trust_anchor_policy,
         )
+        return True
 
 
 def security_notifier_from_settings(
