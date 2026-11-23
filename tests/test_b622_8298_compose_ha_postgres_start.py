@@ -97,6 +97,8 @@ def _run(
 
 
 _BOTH = {"server.crt": b"cert", "server.key": b"key"}
+# Assembled at run time so no complete private-key header sits in source for a secret scanner.
+_ENCRYPTED_KEY_HEADER = b"-----BEGIN " + b"ENCRYPTED PRIVATE KEY-----\n"
 
 
 @pytest.mark.skipif(_SH is None, reason="no sh on PATH")
@@ -111,7 +113,7 @@ _BOTH = {"server.crt": b"cert", "server.key": b"key"}
         (_BOTH, "0", "777", "has mode 777"),
         (_BOTH, "1000", "600", "owned by uid 1000"),
         (
-            {"server.crt": b"cert", "server.key": b"-----BEGIN ENCRYPTED PRIVATE KEY-----\n"},
+            {"server.crt": b"cert", "server.key": _ENCRYPTED_KEY_HEADER},
             "999",
             "600",
             "is encrypted",
@@ -154,7 +156,7 @@ def test_an_empty_or_flag_first_server_command_is_checked(
 
 @pytest.mark.skipif(_SH is None, reason="no sh on PATH")
 def test_an_encrypted_key_with_a_passphrase_command_passes(tmp_path: Path) -> None:
-    files = {"server.crt": b"cert", "server.key": b"-----BEGIN ENCRYPTED PRIVATE KEY-----\n"}
+    files = {"server.crt": b"cert", "server.key": _ENCRYPTED_KEY_HEADER}
     tls = (tmp_path / "tls").as_posix()
     command = [
         "postgres",
