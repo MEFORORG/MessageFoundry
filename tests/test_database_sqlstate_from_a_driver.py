@@ -3,8 +3,8 @@
 """Only a database driver's own error NAMES a SQLSTATE in text (engine PR 3150 open findings 1,
 5 and 6); an error shaped like one is still classified by it. The connector's reading
 (``_log_sqlstate``, ``_shown_state``) and the traceback line's (``redaction.driver_sqlstate_of``)
-are separate, and neither reads an asyncpg error's ``args[0]``, its message, as a SQLSTATE. Also two log-path changes in the same module (vault BACKLOG #1661, added items 5
-and 6).
+are separate, and neither reads an asyncpg error's ``args[0]``, its message, as a SQLSTATE.
+Also two log-path changes in the same module (vault BACKLOG #1661, added items 5 and 6).
 
 Each test was red on the code before its fix, except at least those whose docstring calls it a
 control or a regression check that is not red on main. All values are synthetic.
@@ -448,13 +448,15 @@ def test_an_asyncpg_sqlstate_attribute_is_still_read() -> None:
     exc.sqlstate = "23505"
     assert database._log_sqlstate(exc) == "23505"
     assert database._safe_db_error(exc) == "_AsyncpgMessage [23505]"
+    assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
 
 
 async def test_an_asyncpg_message_in_a_send_is_not_named_as_a_state() -> None:
     """Red on the branch head before this fix (2c4ced1906e): the send's arm read ``args[0]`` and
     dead-lettered the message as ``database rejected the statement [MRN42]``, code ``MRN42``, the
     text the alert carries. With no state it is an internal error, which the runner logs and
-    alerts by its type."""
+    alerts by its type; the runner still stores ``safe_exc`` of it, the message included, as
+    ``last_error``, as it does for any internal error."""
     conn = _FakeConn(_FakeCursor(_AsyncpgClientMessage(_VALUE)))
     dest = _dest()
     dest._pool = _FakePool(conn)

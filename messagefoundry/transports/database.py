@@ -2875,8 +2875,9 @@ _raised_by_a_driver = raised_by_a_driver
 
 
 def _withheld(exc: BaseException) -> str:
-    """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
-    since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
+    """``<type> [driver message withheld]``, for a driver error with no SQLSTATE or a link held
+    under one, with SQLite's result-code name inside the brackets when it has one, since SQLite has
+    no SQLSTATE and that name is its only PHI-free diagnostic."""
     name = sqlite_errorname_of(exc)
     code = f" {name}" if name is not None else ""
     return f"{type(exc).__name__} [driver message withheld{code}]"
@@ -2909,7 +2910,7 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
-    ``withhold``, its type alone, so this never prints a codec error's text;
+    ``withhold``, ``<type> [driver message withheld]``, so this never prints a codec error's text;
     ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an

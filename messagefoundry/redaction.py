@@ -3101,8 +3101,9 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
-#: The driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE: asyncpg
-#: names its state in a ``sqlstate`` attribute, when it names one.
+#: Driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE, so no state is
+#: read from it: at least asyncpg, which names its state in a ``sqlstate`` attribute when it names
+#: one. Not a complete list of such drivers; SQLite is tested apart (:func:`is_a_sqlite_error`).
 _MESSAGE_IN_ARGS_DRIVERS = frozenset({"asyncpg"})
 
 
@@ -3199,9 +3200,9 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
-    carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
-    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet; a
-    SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
+    carried, such as a duplicate key, so it is withheld. A driver error keeps the SQLSTATE
+    :func:`driver_sqlstate_of` reads: asyncpg's ``sqlstate``, or ``args[0]`` for a driver other
+    than asyncpg, when that is five characters of SQL's alphabet; a SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
     builtin one its codec raised, whose text can quote the value too. An attribute that raises
     when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
