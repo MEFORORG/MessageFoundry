@@ -3477,7 +3477,15 @@ class _PinGatedExecutor(ThreadPoolExecutor):
     step 11). The pool opens its connections itself, as it grows or replaces one, and aioodbc
     0.5.0, pinned exactly, runs each through this executor as a ``functools.partial`` of
     ``pyodbc.connect``, so this is where a pool connect can be refused before it dials. Every
-    other call runs as before."""
+    other call runs as before.
+
+    **The gate depends on that shape.** It refuses a call only when :func:`_is_odbc_connect`
+    reads it as ``pyodbc.connect``, bare or as a ``functools.partial``. An aioodbc that dialled
+    off this executor, or wrapped the connect in another callable, would dial with no refusal.
+    ``test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_reads`` in
+    ``tests/test_store_pin_connect_refusal.py`` drives the installed aioodbc's own ``connect``
+    over a stub ``pyodbc.connect`` and fails if the shape changes; it runs where the
+    ``sqlserver`` extra is installed, so re-read it on any change to the aioodbc pin."""
 
     def __init__(self, spec: AnchorSpec, **kwargs: Any) -> None:
         super().__init__(**kwargs)

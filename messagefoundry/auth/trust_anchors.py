@@ -250,10 +250,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
     device at the path among them, or an ACL or path that could not be read, since whoever
-    swapped the file can make its ACL unreadable. Two file read faults set nothing
-    (:func:`_transient_read_fault`): a file not there, as between the steps of some renewals, and
-    one the engine may not open, as while a scanner holds it. Any other read fault, such as a
-    network error on a share, sets the hold. What it refuses: at least the new connects the
+    swapped the file can make its ACL unreadable. Some file read faults set nothing
+    (:func:`_transient_read_fault`, which lists at least which): a file not there, as between the
+    steps of some renewals, any ``PermissionError``, as while a scanner holds the file, and a
+    network or I/O fault under the read, such as a share whose network name went away. Since every
+    ``PermissionError`` counts, a sharing violation among them, a party who can deny the engine
+    reads of the pin file can keep the hold from being set; that is a known residual. Any other
+    ``OSError`` sets the hold. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2912,13 +2915,34 @@ async def _preflight_one(
         raise
 
 
+#: Windows error codes for a network path or connection lost under a read (module item 11):
+#: ERROR_BAD_NETPATH, ERROR_UNEXP_NET_ERR, ERROR_NETNAME_DELETED, ERROR_BAD_NET_NAME,
+#: ERROR_NETWORK_UNREACHABLE and ERROR_CONNECTION_ABORTED. Python maps 53 and 67 to
+#: ``FileNotFoundError`` already; they are listed so the rule does not rest on that mapping.
+_TRANSIENT_WINERRORS: frozenset[int] = frozenset({53, 59, 64, 67, 1231, 1236})
+
+
 def _transient_read_fault(exc: OSError | ValueError) -> bool:
-    """Whether reading an anchor failed in one of the two ways that set no store pin hold
-    (module item 11), since the next check may not repeat them: a file not there, as between the two steps of some
-    renewals, or one the engine may not open, which is also what a Windows sharing or lock
-    violation arrives as. Not a pipe or device refused as not a regular file, and not a path the
-    OS cannot take: those are verdicts."""
-    return isinstance(exc, (FileNotFoundError, PermissionError))
+    """Whether reading an anchor failed in a way that sets no store pin hold (module item 11),
+    since the next check may not repeat it. At least these: a file not there, as between the two
+    steps of some renewals; any ``PermissionError``; a network or I/O fault under the read, which
+    is a ``ConnectionError`` or ``TimeoutError``, ``EIO``, or on Windows one of
+    :data:`_TRANSIENT_WINERRORS`, such as a share whose network name went away.
+
+    **Every** ``PermissionError`` counts, a Windows sharing or lock violation among them, since
+    that is what a scanner holding the file arrives as and the read cannot tell it from a denied
+    read. **That is a known residual**: a party who can deny the engine reads of the pin file,
+    or hold it open without sharing, can keep a refusal at ``enforce`` from setting the hold, so
+    new store connects go on while the file stays unreadable. Each such check still refuses the
+    reload.
+
+    Verdicts about the file still set the hold: at least a pipe or device refused as not a
+    regular file, a path the OS cannot take, and any other ``OSError``."""
+    if isinstance(exc, (FileNotFoundError, PermissionError, ConnectionError, TimeoutError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return exc.errno == errno.EIO or getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS
 
 
 async def _preflight_checks(

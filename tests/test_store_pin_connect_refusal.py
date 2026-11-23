@@ -16,6 +16,7 @@ executor as ``pyodbc.connect``, which is what the executor gate keys on.
 
 from __future__ import annotations
 
+import errno
 import sys
 import types
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ from messagefoundry.store.sqlserver import (
     SqlServerStore,
     StorePinConnectRefused,
     _build_pool_executor,
+    _is_odbc_connect,
     check_pinned_certificate,
     refuse_connect_after_pin_refusal,
 )
@@ -63,6 +65,14 @@ def _fresh_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ta, "_STORE_PIN_RELEASE_REFUSED", set())
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+
+
+def _winerror(code: int, message: str) -> OSError:
+    """An ``OSError`` carrying a Windows error code on any platform. CPython sets ``winerror``
+    only on Windows, so elsewhere it is set by hand, as the read would see it there."""
+    exc = OSError(errno.EINVAL, message)
+    exc.winerror = code  # type: ignore[attr-defined,unused-ignore]
+    return exc
 
 
 def _pin(tmp_path: Path) -> Path:
@@ -208,15 +218,19 @@ async def test_a_swapped_pin_does_not_lift_its_own_refusal(
     [
         FileNotFoundError(2, "No such file or directory"),  # mid-renewal, between unlink and write
         PermissionError(13, "The process cannot access the file"),  # a scanner's lock
+        _winerror(64, "The specified network name is no longer available"),  # a share dropped
+        ConnectionResetError(104, "Connection reset by peer"),
+        OSError(errno.EIO, "Input/output error"),
     ],
-    ids=["renewal-by-rename", "scanner-lock"],
+    ids=["renewal-by-rename", "scanner-lock", "winerror-64", "connection-reset", "eio"],
 )
 async def test_a_pin_that_cannot_be_read_sets_no_hold(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: OSError
 ) -> None:
     """A read fault at ``enforce`` still refuses the reload, but it is no verdict on the file,
     so it sets no hold and new store connects go on. Red under: the hold set for every refusal
-    (head c985a608fee)."""
+    (head c985a608fee); for the network and I/O faults, the two-type rule of head
+    3ebf16fc862."""
     settings = _settings(_pin(tmp_path))
 
     def unreadable(_spec: Any) -> Any:
@@ -436,3 +450,38 @@ async def test_aioodbc_dials_through_the_pool_executor_as_pyodbc_connect(
         assert dialled == []
     finally:
         executor.shutdown(wait=True)
+
+
+async def test_the_installed_aioodbc_submits_its_connect_in_the_shape_the_gate_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The canary for the gate's dependency on aioodbc: ``_PinGatedExecutor`` refuses a call only
+    when :func:`~messagefoundry.store.sqlserver._is_odbc_connect` reads it as ``pyodbc.connect``,
+    bare or as a ``functools.partial``. This drives the installed aioodbc's real ``connect`` into
+    an executor with no gate that records each call, over a stub ``pyodbc.connect``, and fails if
+    the dial reached the stub without one recorded call in that shape, as it would if aioodbc
+    dialled off the executor or wrapped the connect in another callable. No server is reached.
+    Skipped without the ``sqlserver`` extra; it runs where that extra is installed."""
+    aioodbc = pytest.importorskip("aioodbc")
+    pytest.importorskip("pyodbc")
+    submitted: list[Any] = []
+
+    class _Recording(ThreadPoolExecutor):
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            submitted.append(fn)
+            return super().submit(fn, *args, **kwargs)
+
+    class _Stop(Exception):
+        pass
+
+    def connect(dsn: str, **_kwargs: Any) -> object:
+        raise _Stop(dsn)
+
+    monkeypatch.setattr(sys.modules["pyodbc"], "connect", connect)
+    executor = _Recording(max_workers=1)
+    try:
+        with pytest.raises(_Stop):
+            await aioodbc.connect(dsn="DRIVER=x", executor=executor)
+    finally:
+        executor.shutdown(wait=True)
+    assert [fn for fn in submitted if _is_odbc_connect(fn)], submitted
