@@ -317,6 +317,7 @@ def test_a_traceback_the_filter_cannot_read_is_withheld_not_raised() -> None:
     )
     assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
     assert record.exc_info is None
+    assert record.exc_text is not None
     assert record.exc_text.endswith("Unprintable: [message withheld]")
 
 

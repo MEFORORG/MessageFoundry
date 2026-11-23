@@ -281,7 +281,6 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
     {
         # BEGIN GENERATED
         "",
-        "\n<'-' * 80>",
         "    Proposed Transfer Syntax:",
         "    Proposed Transfer Syntaxes:",
         "    Related General SOP Class(es):",
@@ -292,7 +291,6 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "# DICOM Dataset",
         "# Request Identifier",
         "# Response Identifier",
-        "%04x: Read 0 bytes after delimiter",
         "'datetime.datetime' doesn't allow a value of '60' for the seconds component, changing to '59'",
         "'datetime.time' doesn't allow a value of '60' for the seconds component, changing to '59'",
         "'sop_class_uid' must be set prior to Association",

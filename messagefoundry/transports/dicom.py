@@ -495,27 +495,10 @@ def _drain_readable(sock: socket.socket) -> None:
 _SERVED_COMMANDS = frozenset({0x0001, 0x0030})
 
 
-#: The ``pynetdicom._handlers`` labels whose value is an AE title, or a version name pynetdicom checks
-#: as one. :func:`_kept` applies ``set_ae``'s check to each, including the A-ASSOCIATE-AC's two
-#: titles, which pynetdicom reads from reserved fields with ``decode_bytes`` and no title check.
-_TITLE_LABELS = frozenset(
-    {
-        "Move Originator",
-        "Calling Application Name",
-        "Called Application Name",
-        "Their Implementation Version Name",
-    }
-)
-
-#: The :func:`_kept` label for each kind of template slot that holds a peer's value and may stay.
-_KIND_LABELS = {
-    "uid": "",
-    "quoted_uid": "",
-    "instance": "Affected SOP Instance UID",
-    "title": "Calling Application Name",
-    "version": "Their Implementation Version Name",
-    "move": "Move Originator",
-}
+#: The template slots whose value is an AE title, or a version name pynetdicom checks as one.
+#: :func:`_kept` applies ``set_ae``'s check to each, including the A-ASSOCIATE-AC's two titles, which
+#: pynetdicom reads from reserved fields with ``decode_bytes`` and no title check.
+_TITLE_KINDS = frozenset({"title", "version", "move"})
 
 #: What a withheld line says, after its logger and level. Fixed text, so nothing of the line is in it.
 _LINE_WITHHELD = "line withheld: it matches no pinned template"
@@ -582,7 +565,7 @@ _PYDICOM_WARNING_FILTERS = [
 _PRE_READ = threading.local()
 
 
-def _kept(label: str, value: str) -> bool:
+def _kept(kind: str, value: str) -> bool:
     """Whether a peer's value passes the check pynetdicom flags it on. A check that raises redacts
     the value, since a filter that raised would raise on the pynetdicom thread that logged the line.
 
@@ -592,16 +575,16 @@ def _kept(label: str, value: str) -> bool:
     redacted: ``set_uid`` takes any 1 to 64 characters unless ``ENFORCE_UID_CONFORMANCE`` is set,
     so a peer can send ``unknown`` itself, and the line cannot say which it is."""
     try:
-        if label in _TITLE_LABELS:
+        if kind in _TITLE_KINDS:
             from pynetdicom import _config as netdicom_config
 
             # A quote is not in a real title; it is in the repr of one with more than one value,
             # which message_to_primitive flags before it takes the first.
-            if label == "Move Originator" and "'" in value:
+            if kind == "move" and "'" in value:
                 return False
             return bool(netdicom_config.VALIDATORS["AE"](value)[0])
         # A class or syntax is logged by its name; an instance UID never is.
-        named = not label.endswith("Instance UID") and value in _uid_names()
+        named = kind != "instance" and value in _uid_names()
         return named or _loggable_uid(value) == value
     except Exception as exc:  # noqa: BLE001 - a third-party check on a peer's text; redact, not raise
         # The engine's own logger, which no filter here holds or reads.
@@ -647,7 +630,7 @@ def _screened_line(text: str) -> str | None:
             if kind not in PEER_VALUE_KINDS:
                 continue
             start, end = line.span(group)
-            if kind in ALWAYS_REDACTED_KINDS or not _kept(_KIND_LABELS[kind], text[start:end]):
+            if kind in ALWAYS_REDACTED_KINDS or not _kept(kind, text[start:end]):
                 kept += (text[position:start], _REDACTED)
                 position = end
         kept.append(text[position:])
@@ -673,7 +656,8 @@ def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) ->
         if id(node) in seen:
             continue
         seen.add(id(node))
-        if getattr(node, "_is_syntax_error", False):
+        # The stdlib sets these fields on a syntax error's node alone, and prints them.
+        if "text" in vars(node):
             raise ValueError("a syntax error's text is not screened")
         message: str = node._str  # type: ignore[attr-defined]
         line = _screened_line(message)
@@ -752,8 +736,13 @@ def _screening_record_factory(previous: Callable[..., logging.LogRecord]) -> Any
     def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = previous(*args, **kwargs)
         name = str(record.name)
-        if name.partition(".")[0] in _LIBRARY_ROOTS and not (
-            name in _FILTERED_LOGGER_NAMES and getattr(_PRE_READ, "held", None) is not None
+        # startswith first: this runs on every record of every logger in the process.
+        if (
+            name.startswith(("pynetdicom", "pydicom"))
+            and name.partition(".")[0] in _LIBRARY_ROOTS
+            and not (
+                name in _FILTERED_LOGGER_NAMES and getattr(_PRE_READ, "held", None) is not None
+            )
         ):
             _screen_record(record)
         return record

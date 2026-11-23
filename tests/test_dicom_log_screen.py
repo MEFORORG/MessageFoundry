@@ -11,7 +11,6 @@ included, since that is what reaches a log file.
 from __future__ import annotations
 
 import ast
-import collections
 import io
 import logging
 import re
@@ -19,7 +18,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -330,6 +329,16 @@ def test_a_malformed_exc_info_does_not_raise(exc_info: tuple[object, ...]) -> No
     assert _PLANTED not in record.getMessage()
 
 
+def test_a_syntax_errors_source_text_is_not_written() -> None:
+    # The stdlib prints a syntax error's text from its own fields, which no message screen reads.
+    exc = SyntaxError("bad", ("peer.py", 1, 1, f"text {_PLANTED}", 1, 2))
+    written = _written(
+        logging.getLogger("pynetdicom.dul"), lambda log: log.error("x", exc_info=exc)
+    )
+    assert _PLANTED not in written
+    assert "SyntaxError (traceback withheld: it did not render)" in written
+
+
 def test_a_line_break_in_a_value_cannot_forge_a_second_line() -> None:
     # `.` stops at a line break, so the value slot does not span it and no template matches.
     forged = f"Calling Application Name:    A\nAssociation Accepted {_PLANTED}"
@@ -415,15 +424,9 @@ def test_the_guard_sees_a_planted_library_line(planted: str) -> None:
 
 
 def test_the_value_free_lines_are_the_census_literals() -> None:
-    literals = {"Association Aborted (A-P-ABORT)"}  # built by += in association.py
-    for row in census.read_pinned():
-        text = row.split(" ", 2)[2] if row.count(" ") >= 2 else ""
-        if "{}" in text or text.startswith("<") or "<''" in text:
-            continue
-        if re.search(r"%[sdxrXi]", text):
-            continue
-        literals.add(text.replace("\\n", "\n").replace("\\r", "\r").replace("\\\\", "\\"))
-    assert literals == lines.VALUE_FREE_LINES
+    pinned = census.read_pinned()
+    assert "Association Accepted" in census.value_free_lines(pinned)  # CONTROL
+    assert census.value_free_lines(pinned) == lines.VALUE_FREE_LINES
 
 
 def test_each_template_still_has_its_text_in_a_library() -> None:
@@ -445,15 +448,12 @@ def test_each_template_still_has_its_text_in_a_library() -> None:
 def test_each_slot_kind_is_defined_and_used() -> None:
     used = {kind for t in lines.TEMPLATES for kind in re.findall(r"\{([a-z_]+)\}", t)}
     assert used == set(lines._SLOT_PATTERNS)
-    assert set(dicom_module._KIND_LABELS) == lines.PEER_VALUE_KINDS - lines.ALWAYS_REDACTED_KINDS
-
-
-def test_the_census_counts_by_library_and_level() -> None:
-    """The figures in docs/DICOM.md's account come from here; a change moves both."""
-    counts = collections.Counter(
-        (row.split(" ", 1)[0].split(".")[0], row.split(" ", 2)[1]) for row in census.read_pinned()
-    )
-    assert counts[("pynetdicom", "INFO")] > 0 and counts[("pydicom", "WARNING")] > 0
+    assert {
+        "uid",
+        "quoted_uid",
+        "instance",
+        *dicom_module._TITLE_KINDS,
+    } == lines.PEER_VALUE_KINDS - lines.ALWAYS_REDACTED_KINDS
 
 
 # --- Warnings ------------------------------------------------------------------------------------
@@ -510,10 +510,9 @@ _WARNINGS_PROBE = textwrap.dedent(
 )
 
 
-@pytest.mark.parametrize("context_aware", ["0", "1"])
-def test_the_ignore_is_scoped_to_pydicom_under_either_warnings_mode(context_aware: str) -> None:
+def _probe_stderr(script: str, *flags: str) -> str:
     done = subprocess.run(  # noqa: S603 - this interpreter, on a fixed script
-        [sys.executable, "-X", f"context_aware_warnings={context_aware}", "-c", _WARNINGS_PROBE],
+        [sys.executable, *flags, "-c", script],
         capture_output=True,
         text=True,
         timeout=60,
@@ -521,8 +520,14 @@ def test_the_ignore_is_scoped_to_pydicom_under_either_warnings_mode(context_awar
         check=False,
     )
     assert done.returncode == 0, done.stderr
-    assert "PLANTED-WARNING-VALUE" not in done.stderr, done.stderr
-    assert "ANOTHER-LIBRARY-WARNING" in done.stderr, done.stderr  # another library's still shows
+    return done.stderr
+
+
+@pytest.mark.parametrize("context_aware", ["0", "1"])
+def test_the_ignore_is_scoped_to_pydicom_under_either_warnings_mode(context_aware: str) -> None:
+    stderr = _probe_stderr(_WARNINGS_PROBE, "-X", f"context_aware_warnings={context_aware}")
+    assert "PLANTED-WARNING-VALUE" not in stderr, stderr
+    assert "ANOTHER-LIBRARY-WARNING" in stderr, stderr  # another library's still shows
 
 
 def test_the_probe_warns_with_the_value_when_the_ignore_is_off() -> None:
@@ -530,20 +535,7 @@ def test_the_probe_warns_with_the_value_when_the_ignore_is_off() -> None:
     probe = _WARNINGS_PROBE.replace(
         "dicom._redact_flagged_peer_values()", "warnings.resetwarnings()"
     )
-    done = subprocess.run(  # noqa: S603 - this interpreter, on a fixed script
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        cwd=Path(__file__).resolve().parents[1],
-        check=False,
-    )
-    assert done.returncode == 0, done.stderr
-    assert "PLANTED-WARNING-VALUE" in done.stderr
-
-
-def _iter_templates() -> Iterator[str]:
-    yield from lines.TEMPLATES
+    assert "PLANTED-WARNING-VALUE" in _probe_stderr(probe)
 
 
 def test_every_template_compiles_and_matches_its_own_shape() -> None:
@@ -576,7 +568,7 @@ def test_every_template_compiles_and_matches_its_own_shape() -> None:
         "identity_type": "SAML",
         "dataset_encoding": "Little Endian Implicit",
     }
-    for text in _iter_templates():
+    for text in lines.TEMPLATES:
         filled = re.sub(
             r"\{([a-z_]+)\}", lambda m: samples.get(m.group(1), "1.2.826.0.1.3680043.2.1"), text
         )

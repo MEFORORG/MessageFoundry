@@ -8,19 +8,26 @@ line is withheld, but it would change what an operator reads with nothing saying
 installed libraries so a test fails on such a change.
 
 Run ``python -P tests/_dicom_log_census.py --write`` from the repository root, after reading the
-difference, to accept a new library version's lines.
+difference, to accept a new library version's lines. It rewrites the census and the generated block
+of value-free lines; run ``ruff format`` on that module after it.
 """
 
 from __future__ import annotations
 
 import ast
+import functools
 import importlib
+import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
 
 #: The pinned result of :func:`census`, one call per line.
 CENSUS_FILE = Path(__file__).with_name("_dicom_log_census.txt")
+_LINES_MODULE = Path(__file__).parents[1] / "messagefoundry" / "transports" / "_dicom_log_lines.py"
+
+#: A whole line a library builds with ``+=``, so the scan sees it only as a variable.
+_BUILT_LINES = frozenset({"Association Aborted (A-P-ABORT)"})
 
 LIBRARIES = ("pynetdicom", "pydicom")
 
@@ -99,8 +106,13 @@ def _strings_in(node: ast.AST) -> Iterator[str]:
         yield skeleton(node.elt)
 
 
-def library_sources() -> Iterator[tuple[str, str, str]]:
+@functools.cache
+def library_sources() -> tuple[tuple[str, str, str], ...]:
     """Each module of both libraries the engine can run: its name, logger name and source."""
+    return tuple(_read_sources())
+
+
+def _read_sources() -> Iterator[tuple[str, str, str]]:
     for library in LIBRARIES:
         package = importlib.import_module(library)
         root = Path(str(package.__file__)).parent
@@ -160,9 +172,35 @@ def read_pinned() -> list[str]:
     return CENSUS_FILE.read_text(encoding="utf-8").splitlines()
 
 
+def value_free_lines(rows: list[str]) -> frozenset[str]:
+    """The census rows with nothing interpolated, as the text a library writes."""
+    found = set(_BUILT_LINES)
+    for row in rows:
+        text = row.split(" ", 2)[2] if row.count(" ") >= 2 else ""
+        if "{}" in text or re.search(r"<.*>|%[-0-9]*[sdxXri]", text):
+            continue
+        found.add(text.replace("\\n", "\n").replace("\\r", "\r").replace("\\\\", "\\"))
+    return frozenset(found)
+
+
+def _write_value_free_lines(rows: list[str]) -> None:
+    body = "".join(f"        {text!r},\n" for text in sorted(value_free_lines(rows)))
+    source = _LINES_MODULE.read_text(encoding="utf-8")
+    written, count = re.subn(
+        r"(# BEGIN GENERATED\n).*?( *# END GENERATED)",
+        lambda found: found.group(1) + body + found.group(2),
+        source,
+        flags=re.DOTALL,
+    )
+    if count != 1:
+        raise SystemExit(f"no generated block in {_LINES_MODULE}")
+    _LINES_MODULE.write_text(written, encoding="utf-8", newline="\n")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] != ["--write"]:
         raise SystemExit("usage: python -P tests/_dicom_log_census.py --write")
     rows = census()
     CENSUS_FILE.write_text("\n".join(rows) + "\n", encoding="utf-8", newline="\n")
+    _write_value_free_lines(rows)
     print(f"{len(rows)} lines written to {CENSUS_FILE}")
