@@ -45,6 +45,13 @@ def test_an_enabled_box_with_no_seed_is_refused() -> None:
         DrSettings(enabled=True)
 
 
+def test_a_latched_box_with_no_seed_loads_as_on_main() -> None:
+    """The startup latch reads no seed, and its behaviour is unchanged here, so a box under
+    activate = true with no seed key still loads."""
+    dr = DrSettings(enabled=True, activate=True)
+    assert dr.enabled and dr.activate
+
+
 @pytest.mark.parametrize(
     "seed", [{"seed_archive": "C:/dr/seed.mfbak"}, {"seed_dir": str(Path.cwd().resolve())}]
 )

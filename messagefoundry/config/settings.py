@@ -7885,10 +7885,12 @@ class DrSettings(_Section):
 
     @model_validator(mode="after")
     def _enabled_names_a_seed(self) -> DrSettings:
-        # BACKLOG #5965 item 1: with neither set, every activation aborts for want of a seed, and
-        # that is found only during the disaster. seed_archive names one; seed_dir lets the
-        # POST /dr/activate request name one.
-        if self.enabled and not self.seed_archive and not self.seed_dir:
+        # BACKLOG #5965 item 1: on a passive box with neither set, every activation aborts for
+        # want of a seed, and that is found only during the disaster. seed_archive names one;
+        # seed_dir lets the POST /dr/activate request name one. A box under activate = true is
+        # exempt: it takes the startup latch, which reads no seed, and that path is unchanged
+        # here (its routing through a seeded activation is the open part of BACKLOG #5965).
+        if self.enabled and not self.activate and not self.seed_archive and not self.seed_dir:
             raise ValueError(
                 "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
                 "POST /dr/activate could never name the cold seed it verifies, so every activation "
