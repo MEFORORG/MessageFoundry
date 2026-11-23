@@ -20,8 +20,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import threading
-from collections.abc import Callable
+import sys
 from math import nan as NAN
 
 import pytest
@@ -60,46 +59,26 @@ def _tee(detail: str | None, action: str = AUDIT_KEY_EPOCH_ACTION) -> list[str]:
     return handler.messages
 
 
-#: The stack the too-deep cases are read on. ``json`` refuses a nest by the C stack the reading
-#: thread has left, not by ``sys.getrecursionlimit()``. A 30 000-deep nest parses on Linux's 8 MiB
-#: main stack and is refused on a 256 KiB Linux thread (measured 2026-11-22, Python 3.14.4 under
-#: WSL). On Windows ``threading.stack_size`` sets a thread's commit size, not its reserve, so the
-#: thread keeps python.exe's linked reserve, which refused the same nest there. Each test that
-#: relies on the refusal checks it first, on the same stack, with :func:`_the_nest_is_refused`.
-_SMALL_STACK = 256 * 1024
-_TOO_DEEP = 30_000
-#: Inside the redaction window, so the tee parses it.
-_DEEP_WRAP = "[" * _TOO_DEEP + f'{{"recovery_wrap": "{_WRAP.hex()}"}}' + "]" * _TOO_DEEP
-_DEEP_NAME = "[" * _TOO_DEEP + '"recovery_wrap"' + "]" * _TOO_DEEP
+_REAL_LOADS = json.loads
 
 
-def _on_a_small_stack[T](call: Callable[[], T]) -> T:
-    """Run ``call`` on a thread created with :data:`_SMALL_STACK`, re-raising what it raised."""
-    result: list[T] = []
-    raised: list[BaseException] = []
+def _refuse_the_withholding_parse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the tee's withholding parse, the one ``json.loads`` call given an ``object_hook``,
+    raise ``RecursionError``, as ``json`` does on a nest too deep for the stack it reads on.
 
-    def body() -> None:
-        try:
-            result.append(call())
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the test's thread below
-            raised.append(exc)
+    Raised on purpose rather than by a real nest, because how deep ``json`` reads depends on the C
+    stack the reading thread has left, not on ``sys.getrecursionlimit()``: a 30 000-deep nest,
+    inside the redaction window, parsed on the ubuntu leg's main thread and was refused on
+    Windows' (measured 2026-11-22, Python 3.14). ``tests/test_sandbox_codec.py``'s
+    ``test_recursion_error_is_not_a_value_error`` records the same lesson. Every other call goes
+    to the real ``json.loads``."""
 
-    previous = threading.stack_size(_SMALL_STACK)
-    try:
-        thread = threading.Thread(target=body)
-        thread.start()
-    finally:
-        threading.stack_size(previous)
-    thread.join()
-    if raised:
-        raise raised[0]
-    return result[0]
+    def loads(text: str, **kwargs: object) -> object:
+        if "object_hook" in kwargs:
+            raise RecursionError("simulated deep nesting")
+        return _REAL_LOADS(text, **kwargs)  # type: ignore[arg-type]
 
-
-def _the_nest_is_refused(detail: str) -> None:
-    """The precondition of a too-deep case: ``json`` refuses ``detail`` on the stack it runs on."""
-    with pytest.raises(RecursionError):
-        _on_a_small_stack(lambda: json.loads(detail))
+    monkeypatch.setattr(json, "loads", loads)
 
 
 def test_the_withheld_field_is_the_name_the_genesis_writer_uses() -> None:
@@ -189,21 +168,27 @@ def test_a_json_text_held_in_a_string_is_withheld_too(detail: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "detail",
+    ("detail", "too_deep"),
     [
-        _DEEP_WRAP,
-        f'{{"recovery_wrap": "{_WRAP.hex()}", "n": {"1" * 5000}}}',
+        pytest.param(json.dumps({"recovery_wrap": _WRAP.hex()}), True, id="too-deep-to-read"),
+        pytest.param(
+            f'{{"recovery_wrap": "{_WRAP.hex()}", "n": {"1" * 5000}}}',
+            False,
+            id="an-integer-too-long-to-parse",
+        ),
     ],
-    ids=["too-deep-to-read", "an-integer-too-long-to-parse"],
 )
 def test_a_fault_while_withholding_withholds_the_whole_detail(
-    detail: str, monkeypatch, caplog
+    detail: str, too_deep: bool, monkeypatch, caplog
 ) -> None:
-    if detail == _DEEP_WRAP:
-        _the_nest_is_refused(detail)
+    if too_deep:
+        _refuse_the_withholding_parse(monkeypatch)
+    else:
+        # The precondition: this interpreter refuses a 5000-digit integer, as by default.
+        assert 0 < sys.get_int_max_str_digits() < 5000
     monkeypatch.setattr(audit_tee, "_WITHHOLD_FAULT_LOGGED", False)
     with caplog.at_level(logging.WARNING, logger=audit_tee.__name__):
-        (line,) = _on_a_small_stack(lambda: _tee(detail))
+        (line,) = _tee(detail)
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
     assert any("could not withhold" in r.getMessage() for r in caplog.records)
@@ -226,13 +211,17 @@ def test_a_detail_over_the_window_that_names_the_field_ships_whole_unparsed(monk
 def test_a_fault_in_the_withholding_warning_does_not_escape_the_tee(monkeypatch) -> None:
     """The row is committed before the tee runs, so no logging fault may reach its caller."""
 
-    def broken(*_args: object, **_kwargs: object) -> None:
+    calls: list[object] = []
+
+    def broken(*args: object, **_kwargs: object) -> None:
+        calls.append(args)
         raise RuntimeError("a log filter failed")
 
     monkeypatch.setattr(audit_tee, "_WITHHOLD_FAULT_LOGGED", False)
     monkeypatch.setattr(audit_tee.log, "warning", broken)
-    _the_nest_is_refused(_DEEP_WRAP)
-    (line,) = _on_a_small_stack(lambda: _tee(_DEEP_WRAP))
+    _refuse_the_withholding_parse(monkeypatch)
+    (line,) = _tee(json.dumps({"recovery_wrap": _WRAP.hex()}))
+    assert len(calls) == 1  # the control: the warning ran, and raised
     assert _WRAP.hex() not in line
     assert json.loads(json.loads(line)["detail"]) == {"withheld": "<withheld>"}
 
@@ -247,7 +236,7 @@ def test_the_withheld_action_is_the_key_epoch_action() -> None:
         json.dumps({"recovery_wrap": _WRAP.hex()}),
         json.dumps({"username": "1" * 4400 + "recovery_wrap", "reason": "x"}),
         json.dumps({"username": "u recovery_wrap", "pad": "x" * _REDACT_WINDOW}),
-        _DEEP_NAME,
+        "[" * 30_000 + '"recovery_wrap"' + "]" * 30_000,
     ],
     ids=["holds-the-key", "a-4400-digit-run", "over-the-window", "too-deep"],
 )
@@ -255,11 +244,9 @@ def test_any_other_rows_detail_ships_as_without_the_withholding(detail: str, mon
     """A client can write the name into a row; only the engine's key epoch rows are withheld
     from, so its copy ships as the tee shipped it before the placeholder existed. The control is
     the same row with the withheld field list emptied, which is that tee's path."""
-    if detail == _DEEP_NAME:
-        _the_nest_is_refused(detail)
-    (line,) = _on_a_small_stack(lambda: _tee(detail, action="user.create"))
+    (line,) = _tee(detail, action="user.create")
     monkeypatch.setattr(audit_tee, "_WITHHELD_DETAIL_FIELDS", frozenset())
-    (control,) = _on_a_small_stack(lambda: _tee(detail, action="user.create"))
+    (control,) = _tee(detail, action="user.create")
     assert line == control
     assert "<withheld>" not in line
 
