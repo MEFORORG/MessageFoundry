@@ -79,33 +79,28 @@ ADD_BACK_BARE = ADD_BACK_STEP.removeprefix(f"{SET_NO}. ")
 #: Main's wider pass-back exclusion, from its joined-directory step.
 WIDER = "and the strings this step and any step above say to remove"
 
-#: The clause printed wherever a directory entry is in doubt
-#: (``ServiceEnvPosture.directory_in_doubt``): every other line that may name the directory, in
-#: every list, comes out, a string that holds nothing else whole, and each other line no step
-#: above removes stays. It replaces the two AppEnvironmentExtra clauses of the Lander's holds on
-#: PR 3142, comments 7089064404, 7089400537 and 7090314503 (the Lander's ruling B on PR 3142's
-#: repair handback, comment 7106776128).
-DOUBT_CLAUSE = (
-    "and take each other line that may set MEFOR_SECRETS_DIRECTORY out of every list, whatever "
-    "its letter case, a blank around its name, or a letter outside ASCII that upper-cases to one "
-    "of its letters, removing an entry that holds nothing else and keeping each other line no "
-    "step above says to remove"
+#: The step printed wherever a directory entry is in doubt
+#: (``ServiceEnvPosture.directory_in_doubt``), with no condition: every line that may name the
+#: directory, in every list, comes out, a string that holds nothing else whole, and each other
+#: line no step above removes stays. It replaces the two AppEnvironmentExtra clauses of the
+#: Lander's holds on PR 3142, comments 7089064404, 7089400537 and 7090314503 (the Lander's
+#: ruling B on PR 3142's repair handback, comment 7106776128).
+DOUBT_STEP = (
+    "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not plainly a path on its own, so "
+    "take each line that may set it out of every list, whatever its letter case, a blank around "
+    "its name, or a letter outside ASCII that upper-cases to one of its letters, removing an "
+    "entry that holds nothing else and keeping each other line no step above says to remove. "
+    'See docs/SERVICE.md, "Start / stop / status"'
 )
 
-#: Printed with DOUBT_CLAUSE, at the end of the pass-back, so the lines it takes out are not
-#: passed back (the Lander's hold on PR 3142, comment 7090314503).
-TAKE_OUT = ", leaving out the lines this step says to take out"
+#: The add-back step's pass-back exclusion where a directory entry is in doubt, so no line the
+#: step above takes out is written back (the Lander's hold on PR 3142, comment 7090314503).
+DOUBT_PASS_BACK = "and the strings and lines the steps above say to remove or take out"
 
-#: The step wherever a directory entry is in doubt: no opener, the clause, "a whole list", the
-#: wider exclusion and the take-out phrase.
-ADD_BACK_DOUBT = (
-    "Where install-service.ps1 already made the secrets directory, add MEFOR_SECRETS_DIRECTORY "
-    "naming that existing path back to the service's AppEnvironmentExtra, beside its other "
-    f"entries, {DOUBT_CLAUSE}, before any re-run of the installer, which refuses an existing "
-    "directory the service does not name. `nssm set` replaces a whole list, so read it first "
-    "with `nssm get`, running the service's own nssm.exe by its full path, and pass back every "
-    f"entry but those refused above {WIDER}{TAKE_OUT}: see docs/SERVICE.md, "
-    '"Start / stop / status"'
+#: DOUBT_STEP and the add-back step after it, as printed wherever a directory entry is in doubt:
+#: no opener, and the doubt pass-back exclusion.
+ADD_BACK_DOUBT = f"{DOUBT_STEP}. " + ADD_BACK_BARE.replace(
+    "refused above: see", f"refused above {DOUBT_PASS_BACK}: see", 1
 )
 
 #: The step where a value runs on and no line of any string sets the directory: the opener,

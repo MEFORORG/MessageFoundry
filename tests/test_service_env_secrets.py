@@ -684,7 +684,9 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
     out, and main's wider pass-back exclusion (comment 7088102723; the Lander's ruling B on the
     repair handback, comment 7106776128). Where a value runs on, the step keeps the opener but
     leaves out the strings the steps above say to remove (comment 7088663896). A store key alone
-    with no run-on goes to a key file and gets none."""
+    with no run-on and no directory entry in doubt goes to a key file and gets none; beside an
+    entry in doubt it gets the step, as
+    ``test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step`` pins."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     if form is None:

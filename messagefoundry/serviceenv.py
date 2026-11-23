@@ -177,15 +177,18 @@ class ServiceEnvPosture:
     #: (:func:`_directory_entry_in_doubt`): one of its lines, or its whole-string name, may name
     #: ``MEFOR_SECRETS_DIRECTORY``, and the string alone is not plainly a path. Where this is
     #: True the remedy prints no keep-one step and no clause sparing directory lines from its
-    #: removal steps, and it prints the add-back step, which says to take every other line that
-    #: may name the directory out of every list and to add one entry naming the path. Where it
-    #: is False, every directory entry is plainly a path on its own, so the keep-one step prints
+    #: removal steps. It prints a step that says to take every line that may name the directory
+    #: (:func:`_may_name_directory`) out of every list, and then the add-back step, which says
+    #: to add one entry naming the path, even where a directory entry is listed. Where it is
+    #: False, every directory entry is plainly a path on its own, so the keep-one step prints
     #: where a refused value runs on into one (``directory_run_on``), and no step removes one
     #: otherwise. The remedy alone reads this, never the refusal itself (the Lander's ruling B on
     #: PR 3142's repair handback, comment 7106776128).
     directory_in_doubt: bool = False
     #: Whether a refused value runs on into a string whose first non-blank line sets
-    #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
+    #: ``MEFOR_SECRETS_DIRECTORY``. Where no directory entry is in doubt, the remedy then prints
+    #: the keep-one step and spares directory lines from the run-on step; otherwise the run-on
+    #: step removes the string. The remedy alone reads this.
     directory_run_on: bool = False
     #: Whether a value that runs on takes, as the first string after its own that is not blank
     #: (:func:`_still_blank`), one whose first non-blank line sets ``MEFOR_SECRETS_DIRECTORY``
@@ -969,7 +972,7 @@ def _sets_directory(entry: str) -> bool:
     removes a blank such as U+00A0 (the Lander's hold on PR 3142, comment 7090314503)."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
     written, equals, _rest = first.partition("=")
-    return bool(equals) and written.isascii() and written.strip().upper() == _DIRECTORY_VARIABLE
+    return bool(equals) and written.isascii() and _may_name_directory(written)
 
 
 def _directory_entry_value(entry: str) -> str | None:
@@ -995,11 +998,14 @@ def _directory_entry_value(entry: str) -> str | None:
 
 def _may_name_directory(text: str) -> bool:
     """Whether the text before the first equals sign of ``text``, or all of it where it has none,
-    is ``MEFOR_SECRETS_DIRECTORY`` once blanks around it are stripped and it is upper-cased. That
-    is broader than :func:`_sets_directory` on purpose: it takes a padded name, a name written
-    alone, and a non-ASCII letter ``str.upper`` maps onto an ASCII one, such as U+017F or U+0131,
-    since Python's ``os.environ`` on Windows upper-cases each name it reads (the Lander's hold on
-    PR 3142, comment 7104660861)."""
+    is ``MEFOR_SECRETS_DIRECTORY`` once blanks around it are stripped and it is upper-cased.
+    :func:`_sets_directory` adds an equals sign and ASCII to this. Without them it is broader on
+    purpose, to fail closed. It takes a non-ASCII letter ``str.upper`` maps onto an ASCII one,
+    such as U+017F or U+0131, since Python's ``os.environ`` on Windows upper-cases each name it
+    reads, so the engine may read such a name as the directory (the Lander's hold on PR 3142,
+    comment 7104660861). It takes a padded name, U+00A0 included, which ``os.environ`` does not
+    strip, because the reader's whole-string reading strips one. And it takes a name written
+    alone, which a value on a later line may still complete."""
     return text.partition("=")[0].strip().upper() == _DIRECTORY_VARIABLE
 
 
@@ -1373,17 +1379,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     # directory line goes, as origin/main's joined-directory step said; the removal steps then
     # spare each directory line, so no step removes an entry a later one keeps (code review on
     # PR 3142). directory_run_on needs a refused value that runs on, so the run-on step prints
-    # too. Where any entry is in doubt, nothing is spared or kept, and the add-back step says to
-    # take every directory line out and name the path again, so no step changes the directory
-    # the engine reads without naming it.
+    # too. Where any entry is in doubt, nothing is spared or kept: a step of its own, with no
+    # condition, says to take every line that may name the directory out of every list, and the
+    # add-back step then names the path again, so no step changes the directory the engine reads
+    # without naming it (code review round 1 on this repair).
     doubt = posture.directory_in_doubt
     keep_one = posture.directory_run_on and not doubt
-    add_back_due = not keep_one and (
-        doubt
-        or (
-            bool(others or values or posture.directory_run_on)
-            and _DIRECTORY_VARIABLE not in posture.listed
-        )
+    add_back_due = doubt or (
+        not keep_one and bool(others or values) and _DIRECTORY_VARIABLE not in posture.listed
     )
     spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
     # Last, so protect-key and the secrets directory take each value before its entry goes. It
@@ -1401,6 +1404,22 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             + (spare if keep_one else "")
             + ", or the value stays in the registry key"
         )
+    if doubt:
+        # Its own step, so the operator takes the lines out whether or not the installer made
+        # the directory, which the add-back step's condition asks, and the add-back step's
+        # `nssm get` and `nssm set` stay about AppEnvironmentExtra alone (code review round 1
+        # on this repair). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
+        # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
+        # directory and nothing else, or beside other lines, is now either plainly a path, and
+        # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
+        # comment 7106776128).
+        steps.append(
+            f"At least one entry that may set {_DIRECTORY_VARIABLE} is not plainly a path on its "
+            "own, so take each line that may set it out of every list, whatever its letter case, "
+            "a blank around its name, or a letter outside ASCII that upper-cases to one of its "
+            "letters, removing an entry that holds nothing else and keeping each other line no "
+            'step above says to remove. See docs/SERVICE.md, "Start / stop / status"'
+        )
     if add_back_due:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
@@ -1415,41 +1434,24 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # sent to the installer, which would say to remove the directory holding the files.
         # The step says the lists set no directory only where no line of any string in them
         # sets one (directory_in_lists) and no directory entry is in doubt. Where one is in
-        # doubt, it says to take every other line that may name the directory
-        # (:func:`_may_name_directory`) out of every list, removing a string that holds nothing
-        # else and keeping each other line no step above removes, so no entry in doubt is left
-        # to override the one added or to keep key text, and to leave the strings and lines it
-        # and the steps above take out of what it passes back. That clause replaces the two
-        # AppEnvironmentExtra clauses of the Lander's holds on PR 3142, comments 7089064404,
-        # 7089400537 and 7090314503: a string that sets the directory and nothing else, or
-        # beside other lines, is now either plainly a path, and so kept or listed, or in doubt
-        # (the Lander's ruling B on PR 3142's repair handback, comment 7106776128). Where a value
-        # runs on, the entries it says to pass back also leave out the strings the steps above
-        # say to remove, which may hold the refused value or set the directory (the Lander's
-        # holds on PR 3142, comments 7088102723 and 7088663896).
+        # doubt, the entries it says to pass back leave out the strings and lines the steps
+        # above say to remove or take out, so none in doubt is written back to override the one
+        # added or to keep key text. Where a value runs on, they leave out the strings the steps
+        # above say to remove, which may hold the refused value or set the directory (the
+        # Lander's holds on PR 3142, comments 7088102723 and 7088663896).
         none_set = (others or values) and not posture.directory_in_lists and not doubt
         add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
             f"Where install-service.ps1 already made the secrets directory, add "
             f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
-            "AppEnvironmentExtra, beside its other entries, "
+            "AppEnvironmentExtra, beside its other entries, before any re-run of the installer, "
+            "which refuses an existing directory the service does not name. `nssm set` replaces "
+            "that whole list, so read it first with `nssm get`, running the service's own "
+            "nssm.exe by its full path, and pass back every entry but those refused above"
         )
         if doubt:
-            add_back += (
-                f"and take each other line that may set {_DIRECTORY_VARIABLE} out of every "
-                "list, whatever its letter case, a blank around its name, or a letter outside "
-                "ASCII that upper-cases to one of its letters, removing an entry that holds "
-                "nothing else and keeping each other line no step above says to remove, "
-            )
-        add_back += (
-            "before any re-run of the installer, which refuses an existing directory the "
-            f"service does not name. `nssm set` replaces {'a' if doubt else 'that'} whole list, "
-            "so read it first with `nssm get`, running the service's own nssm.exe by its full "
-            "path, and pass back every entry but those refused above"
-        )
-        if doubt or posture.value_runs_on or posture.directory_joined:
+            add_back += " and the strings and lines the steps above say to remove or take out"
+        elif posture.value_runs_on or posture.directory_joined:
             add_back += " and the strings this step and any step above say to remove"
-        if doubt:
-            add_back += ", leaving out the lines this step says to take out"
         add_back += ': see docs/SERVICE.md, "Start / stop / status"'
         # Only where a setting moves, as the create step reads: a store key alone goes to a
         # key file and needs no secrets directory (the third hold's H2; the Lander's ruling on

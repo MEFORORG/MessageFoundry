@@ -25,13 +25,13 @@ from tests._serviceenv_remedy import (
     ADD_BACK_CREATE,
     ADD_BACK_DOUBT,
     CREATE,
+    DOUBT_PASS_BACK,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
     RUNS_ON,
     RUNS_ON_SPARING,
     SET_NO,
-    WIDER,
 )
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
@@ -223,8 +223,9 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{_END}")
     # The directory item may still be read as its own variable, so no "set no" opener, and the
-    # pass-back leaves out the strings the run-on step removes, which hold the key (the Lander's hold on PR 3142, comment 7088102723).
-    assert WIDER in remedy and SET_NO not in remedy
+    # pass-back leaves out the strings the run-on step removes, which hold the key (the
+    # Lander's hold on PR 3142, comment 7088102723).
+    assert DOUBT_PASS_BACK in remedy and SET_NO not in remedy
     # No create guidance anywhere, the add-back step included (the third hold, H2).
     assert "how it is created" not in remedy and "how the directory is created" not in remedy
     assert "The other secrets: a secrets directory" not in remedy
@@ -448,6 +449,22 @@ def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -
     remedy = refusal.split("each value refused here. ", 1)[1]
     # The password moves to the secrets directory, so the step carries its create clause.
     assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
+    # The third hold's H1: no step before the add-back step, which reads and passes back a
+    # list, names a string.
+    assert "string" not in remedy.split(ADD_BACK_ANY, 1)[0]
+
+
+def test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step() -> None:
+    """The Lander's ruling B on PR 3142's repair handback, comment 7106776128: where any
+    directory entry is in doubt, the remedy says to take every directory line out and add one
+    back, for a store key alone too, though no step above removes the entry. A store key alone
+    goes to a key file, so the step carries no create clause (the third hold, H2)."""
+    refusal = service_env_refusal(
+        _read([f"{_KEY}={_KEY_B64}", "TZ=UTC\nMEFOR_SECRETS_DIRECTORY=C:\\d"])
+    )
+    assert refusal is not None
+    assert refusal.endswith(f"{REMOVE}. {ADD_BACK_DOUBT}{_END}"), refusal
+    assert ADD_BACK_CREATE not in refusal and CREATE not in refusal and KEEP not in refusal
 
 
 @pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])

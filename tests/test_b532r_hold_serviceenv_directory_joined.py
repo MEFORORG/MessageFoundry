@@ -33,14 +33,14 @@ from tests._serviceenv_remedy import (
     ADD_BACK_STEP,
     COUNTED_ONCE,
     CREATE,
-    DOUBT_CLAUSE,
+    DOUBT_PASS_BACK,
+    DOUBT_STEP,
     KEEP,
     REMOVE,
     REMOVE_SPARING,
     RUNS_ON,
     RUNS_ON_SPARING,
     SET_NO,
-    TAKE_OUT,
     WIDER,
 )
 
@@ -493,16 +493,15 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
 ) -> None:
     """The Lander's hold on PR 3142, comment 7090314503, item 1: the store password runs on
     into a string that sets only the directory, and a string sets the directory along with
-    PATH. One clause says to take every other directory line out of every list, removing a
-    string that holds nothing else and keeping PATH, so, read line by line, the entry the
-    operator adds is the only one (the Lander's ruling B on PR 3142's repair handback, comment
-    7106776128)."""
+    PATH. One step says to take every directory line out of every list, removing a string that
+    holds nothing else and keeping PATH, so, read line by line, the entry the operator adds is
+    the only one (the Lander's ruling B on PR 3142's repair handback, comment 7106776128)."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1", mixed])
     )
     assert refusal is not None
     assert SET_NO not in refusal
-    assert refusal.count(DOUBT_CLAUSE) == 1 and refusal.count(WIDER) == 1
+    assert refusal.count(DOUBT_STEP) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
     step = ADD_BACK_DOUBT + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
@@ -512,16 +511,16 @@ def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
     """The review of the repair for the Lander's hold on PR 3142, comment 7090314503, finding
     1, and round 2's finding 3: the store password runs on into a string that holds a
     directory line and a PATH line. The run-on step says to remove that string, so the
-    clause keeps only the other lines no step above says to remove, rather than telling the
-    operator to keep all of them."""
+    doubt step keeps only the other lines no step above says to remove, rather than telling the
+    operator to keep all of them, and the add-back step passes back none of them."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
-    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_CLAUSE) == 1
+    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP) == 1
     assert "keeping each other line no step above says to remove" in refusal
-    assert refusal.count(WIDER) == 1 and refusal.count(TAKE_OUT) == 1
-    assert refusal.index(RUNS_ON) < refusal.index(DOUBT_CLAUSE)
+    assert refusal.count(DOUBT_PASS_BACK) == 1 and WIDER not in refusal
+    assert refusal.index(RUNS_ON) < refusal.index(DOUBT_STEP)
 
 
 @pytest.mark.parametrize("where", [_PLAIN, "Environment"], ids=["AppEnvironment", "Environment"])
