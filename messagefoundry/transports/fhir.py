@@ -2009,6 +2009,15 @@ def _mint_bearer(token: Any, prefix: str) -> str:
     return bearer
 
 
+def _bounded_lookup_request(url: str, headers: dict[str, str], label: str) -> None:
+    """:func:`enforce_outbound_length_limits` for a ``FhirLookup``, its refusal named by
+    :func:`hop_name_prefix` (BACKLOG #8299 item 9)."""
+    try:
+        enforce_outbound_length_limits(url, headers)
+    except ValueError as exc:
+        raise ValueError(f"{hop_name_prefix(label)}FhirLookup {exc}") from exc
+
+
 class _LookupPlan(NamedTuple):
     """What :meth:`FhirLookupExecutor._planned` settles for one lookup before any is built."""
 
@@ -2117,10 +2126,7 @@ class FhirLookupExecutor:
                 headers.update(proxy_dest.auth_headers())  # pre-emptive Proxy-Authorization (0126)
                 # ASVS 4.2.5: _planned bounded the static url and headers; this bounds the header
                 # just added, after the proxy route's gate.
-                try:
-                    enforce_outbound_length_limits(url, headers)
-                except ValueError as exc:
-                    raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
+                _bounded_lookup_request(url, headers, label)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
             # BACKLOG #8299 item 4: judged before the SMART provider is built, so a lookup this
             # refuses builds no token hop. smart_auth_configured is the provider's own switch.
@@ -2224,7 +2230,10 @@ class FhirLookupExecutor:
                 f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
             )
         refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
-        _refuse_unsendable_static_headers(s, setting=f"FhirLookup {cname!r}:", connection=None)
+        # Named by hop_name_prefix, whose `;` keeps a credential-word lookup name from making
+        # the log scrubber redact the rest of the refusal.
+        label = fhir_lookup_record_name(cname)
+        _refuse_unsendable_static_headers(s, setting="FhirLookup", connection=label)
         headers = cls._build_headers(s)
         refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
         # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
@@ -2239,12 +2248,12 @@ class FhirLookupExecutor:
         # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
         # arrives in these settings, mirrored from the spec's typed fields by
         # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
+        # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
+        # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
+        # headers were unbounded on both sides.
+        _bounded_lookup_request(url, headers, label)
         # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
         try:
-            # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
-            # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
-            # headers were unbounded on both sides.
-            enforce_outbound_length_limits(url, headers)
             attested = hop_attestation_from_settings(s)
             accepted, reason, _ = cleartext_acceptance_from_settings(s)
             # FhirLookupSpec refuses an acceptance or a revocation attestation with no reason,

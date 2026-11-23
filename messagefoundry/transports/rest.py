@@ -2920,8 +2920,10 @@ def _refuse_unsendable_static_auth(
     One Basic half without the other, or a half that resolves empty, would send no Authorization
     at all. A ``:`` in ``basic_user`` would move the rest of the user into the password, since RFC
     7617 splits the pair at the first colon. ``bearer_token`` beside a Basic pair would be replaced
-    by it without a word. Each refusal names settings, never a value. Digest beside either was
-    already refused by ``refuse_http_digest_conflicts``."""
+    by it without a word. Each refusal names settings, never a value. On the REST and FHIR
+    destinations, Digest beside either was already refused by ``refuse_http_digest_conflicts``,
+    which they call first. ``FhirLookup`` does not call that function and builds no Digest
+    handler."""
     prefix = hop_name_prefix(connection)
     user, password = s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):

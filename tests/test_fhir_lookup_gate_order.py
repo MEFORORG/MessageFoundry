@@ -112,7 +112,7 @@ def test_a_lookup_refused_by_a_pure_check_leaves_no_crossing_from_an_earlier_loo
     """Items 2, 3 and 6: the first lookup crosses in cleartext, the second fails a check that
     needs no I/O, so no gate runs for either and nothing is recorded."""
     caplog.set_level(logging.WARNING)
-    with pytest.raises(ValueError, match="FhirLookup 'second'"):
+    with pytest.raises(ValueError, match="FhirLookup 'second'|'fhir_lookup:second'"):
         _build({"first": dict(_FIRST), "second": bad})
     assert gates == []
     assert _crossed(caplog, "first.partner.invalid") == []
@@ -122,7 +122,9 @@ def test_an_over_length_lookup_is_refused_before_its_own_gates_and_named(
     gates: list[tuple[str, str]],
 ) -> None:
     """Items 2 and 9: the length refusal names the lookup and runs before its hop gates."""
-    with pytest.raises(ValueError, match=r"^FhirLookup 'big': outbound header 'X-Pad'"):
+    with pytest.raises(
+        ValueError, match=r"^connection 'fhir_lookup:big'; FhirLookup outbound header 'X-Pad'"
+    ):
         _build(
             {"big": {"url": "https://big.partner.invalid/fhir", "headers": {"X-Pad": "a" * 9000}}}
         )
@@ -183,7 +185,7 @@ def test_a_static_credential_the_lookup_would_drop_is_refused(
     in place of the bearer, without a word."""
     with pytest.raises(ValueError, match=match) as ei:
         _build({"epic": {"url": "https://fhir.partner.invalid/fhir", **over}})
-    assert str(ei.value).startswith("FhirLookup 'epic': ")
+    assert str(ei.value).startswith("connection 'fhir_lookup:epic'; FhirLookup ")
 
 
 @pytest.mark.parametrize(
@@ -232,3 +234,28 @@ def test_the_fhir_destination_refuses_the_same_dropped_credentials(
 
 def test_the_control_the_fhir_destination_still_builds_a_whole_credential() -> None:
     assert _destination(basic_user="u", basic_password="p", headers={"X-Site": "1"})
+
+
+@pytest.mark.parametrize(
+    "over",
+    [
+        {"headers": ["X-Site", "1"]},
+        {"basic_user": "u"},
+        {"basic_user": "a:b", "basic_password": "p"},
+        {"basic_user": "u", "basic_password": "p", "bearer_token": "t"},
+        {"headers": {"X-Pad": "a" * 9000}},
+    ],
+    ids=["headers-list", "user-only", "colon", "bearer-and-basic", "over-length"],
+)
+@pytest.mark.parametrize("name", ["EPIC_TOKEN", "epic_api_key", "PARTNER_PASSWORD"])
+def test_a_lookup_refusal_survives_the_credential_scrubber(over: dict[str, Any], name: str) -> None:
+    """The refusals this row added name the lookup the scrub-safe way, ``connection '<record>'; ``
+    (hop_name_prefix), so a lookup named with a credential word does not redact the rest of the
+    message in the log."""
+    from messagefoundry.secretscrub import scrub_credentials
+
+    with pytest.raises(ValueError) as ei:
+        _build({name: {"url": "https://fhir.partner.invalid/fhir", **over}})
+    text = str(ei.value)
+    assert text.startswith(f"connection 'fhir_lookup:{name}'; ")
+    assert scrub_credentials(text) == text
