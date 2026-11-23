@@ -5286,6 +5286,11 @@ class SqlServerStore:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            # A read CONTROL is an over-grant this report may refuse on, so it is named as read.
+            if control_server:
+                held_labels.append("control server")
+            if control_database:
+                held_labels.append(f"CONTROL on database {database}")
             also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
                 if create_table:

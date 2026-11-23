@@ -291,6 +291,9 @@ class StorePrivilegePosture:
     excess: tuple[str, ...] = ()
     #: Why the probe could not observe (``UNOBSERVABLE``), or what it observed against (otherwise).
     detail: str = ""
+    #: Grants the probe named as not read (BACKLOG #6015). Beside an ``OBSERVED`` excess the
+    #: over-grant entry names them, so it does not read as a complete observation.
+    unread: tuple[str, ...] = ()
 
 
 class SchemaManagement(str, Enum):  # noqa: UP042
@@ -11591,13 +11594,19 @@ def security_loosenings(
             )
         elif store_privilege.excess:
             named = ", ".join(store_privilege.excess)
+            not_read = (
+                "; these grants were not read, so the list may be incomplete: "
+                f"{', '.join(store_privilege.unread)}"
+                if store_privilege.unread
+                else ""
+            )
             out.append(
                 (
                     "store_principal_over_granted",
                     f"the store principal holds {len(store_privilege.excess)} privilege(s) BEYOND the "
                     f"least-privilege grant docs/DEPLOY-SERVER-DB.md prescribes ({named}) — the "
                     "engine's own database credential can reach data and administrative operations "
-                    "its runbook says it must not",
+                    f"its runbook says it must not{not_read}",
                 )
             )
     # --- the AUDIT CHAIN's observed keying (BACKLOG #1905). An observation, like the entry above: no

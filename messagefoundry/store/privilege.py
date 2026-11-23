@@ -507,7 +507,9 @@ class StorePrivilegeReport:
         """The settings-layer view :func:`security_loosenings` consumes (a plain data type, so
         ``config.settings`` never has to know the store package — the same reason the connection-scoped
         deviations arrive there as plain names)."""
-        return StorePrivilegePosture(status=self.status, excess=self.excess, detail=self.detail)
+        return StorePrivilegePosture(
+            status=self.status, excess=self.excess, detail=self.detail, unread=self.unread
+        )
 
     def summary(self, *, quote: Callable[[str], str] = repr) -> str:
         """One operator-readable line. The three statuses read differently ON PURPOSE.

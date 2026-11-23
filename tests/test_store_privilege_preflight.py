@@ -817,8 +817,53 @@ async def test_a_read_over_grant_refuses_under_enforce_beside_an_unread_role(
         unread=unread,
     )
     store = _sqlserver_probe(monkeypatch, row)
-    with pytest.raises(StorePrivilegeError):
+    report = await store.probe_principal_privileges()
+    # The over-grant arm, not an unobserved one: OBSERVED, with the read over-grant in the excess.
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert report.excess
+    with pytest.raises(StorePrivilegeError, match="BEYOND the documented least-privilege grant"):
         await run_store_privilege_preflight(store, require_least_privilege=False, enforcing=True)
+
+
+async def test_a_read_control_is_named_as_read_beside_an_unread_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read CONTROL SERVER or database CONTROL was in the excess but missing from "what DID read
+    as held", so a refusing report's detail said "nothing" was read as held."""
+    row = _probe_row(
+        database_roles=("db_datareader", "db_datawriter"),
+        control_server=1,
+        control_db=1,
+        unread=("sysadmin",),
+    )
+    report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
+    assert report.status is StorePrivilegeStatus.OBSERVED
+    assert "control server" in report.excess
+    held = report.detail.split("what DID read as held:", 1)[1]
+    assert "nothing" not in held
+    assert "control server" in held
+    assert "CONTROL on database MessageFoundry" in held
+
+
+def test_the_posture_keeps_the_unread_grants_of_an_over_granted_report() -> None:
+    """A report OBSERVED with unread grants hands them on: the registry's over-grant entry names
+    them, so it does not read as a complete observation."""
+    report = StorePrivilegeReport(
+        backend=StoreBackend.SQLSERVER,
+        status=StorePrivilegeStatus.OBSERVED,
+        excess=("server role sysadmin",),
+        unread=("database role db_owner",),
+    )
+    posture = report.posture()
+    assert posture.unread == ("database role db_owner",)
+    entry = _names(posture)["store_principal_over_granted"]
+    assert "not read" in entry
+    assert "database role db_owner" in entry
+    # The other direction: with nothing unread, the entry adds no such clause.
+    assert (
+        "not read"
+        not in _names(_clean(("server role sysadmin",)).posture())["store_principal_over_granted"]
+    )
 
 
 async def test_an_unread_role_with_nothing_over_granted_read_still_only_warns(
@@ -1537,8 +1582,21 @@ async def test_posture_route_reports_an_observed_over_grant(engine: Engine) -> N
     )
     assert body["store_privilege"]["status"] == "observed"
     assert body["store_privilege"]["excess"] == ["server role sysadmin"]
+    assert body["store_privilege"]["unread"] == []
     switches = [entry["switch"] for entry in body["loosenings"]]
     assert "store_principal_over_granted" in switches
+
+
+async def test_posture_route_reports_the_unread_grants_beside_an_over_grant(engine: Engine) -> None:
+    body = await _posture(
+        engine,
+        store_privilege=StorePrivilegePosture(
+            status=StorePrivilegeStatus.OBSERVED,
+            excess=("server role sysadmin",),
+            unread=("database role db_owner",),
+        ),
+    )
+    assert body["store_privilege"]["unread"] == ["database role db_owner"]
 
 
 async def test_posture_route_reports_an_unobservable_probe(engine: Engine) -> None:
