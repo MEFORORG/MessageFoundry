@@ -149,6 +149,13 @@ def _mllp_in_reg(outdir: Path) -> Registry:
 async def test_hung_outbound_does_not_block_graceful_stop(
     store: MessageStore, tmp_path: Path
 ) -> None:
+    """Cause of the 2026-10-12 windows-2025 failure (BACKLOG #3456), read from job 114945524918's
+    log: a slow runner, not a hang. The ``TimeoutError`` came from the 3s setup wait for send() to
+    be entered, not from the stop. That suite ran 33:05. The teardown log shows the routed stage's
+    dispatcher running a buildup check on ``file_in`` against the closed store, a check it runs
+    after it processes an item, so the one message had reached the transform stage by the time the
+    store closed: it was moving through the pooled stages, too slowly for 3s. The wait is now a wall-time ceiling the passing case
+    never reaches."""
     # An outbound stuck in send() must not wedge stop(): the supervised delivery worker is cancelled,
     # which unblocks the hung await, so teardown completes promptly (no leaked/hung task).
     inbox, outdir = tmp_path / "in", tmp_path / "out"
