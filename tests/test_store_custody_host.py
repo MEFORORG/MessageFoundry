@@ -413,7 +413,7 @@ def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
 def test_a_custody_directory_overlapping_the_secrets_directory_is_refused(
     tmp_path: Path, where: str
 ) -> None:
-    """The custody directory must stay apart from the administrator-written secrets directory, so
+    """The custody directory must stay apart from the secrets directory (ADR 0214's amendment), so
     one that is, sits inside or holds it is refused, and the remedy never tells anyone to give the
     service add-file there. The control: two sibling directories pass this rule."""
     secrets = tmp_path / "secrets"
@@ -516,7 +516,7 @@ def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_
     for needed in (
         "only files you know are this store's or this service's",
         "any other database with its `-wal` and `-shm` files",
-        "`api-generated-cert.pem` with `api-generated-key.pem`. Move that pair together",
+        "`api-generated-cert.pem` with `api-generated-key.pem`. Move the pair together",
         "Moving a file into another folder does not do that",
         "/remove:g",
         "/setowner",
@@ -679,7 +679,7 @@ def test_the_way_on_moves_off_every_directory_the_left_behind_check_reads(
 @host_file_platforms
 @pytest.mark.parametrize("named", ["neither", "custody is the data directory"])
 def test_the_way_on_from_a_key_file_beside_the_store_reaches_a_mint(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: str
+    tmp_path: Path, named: str
 ) -> None:
     """PR 3168 review round-ddf319bc80: mint_target's refusal of a key file beside the store keeps
     the store location by its caller, so the step moves it; following the step's text reaches a
@@ -721,9 +721,8 @@ def test_the_unusable_directory_refusals_name_their_own_way_on(
     with pytest.raises(HostCustodyRefused) as refused:
         custody_host._refuse_an_unusable_directory(missing, service_account=None, named=named)
     text = " ".join(str(refused.value).split())
-    created = "create it with the access list docs/SERVICE.md, 'The custody directory under"
-    assert (created in text) is (named == "MEFOR_CUSTODY_DIRECTORY"), text
-    assert "create it," not in text, text
+    # None is offered for making by hand: the install script makes and restricts each one.
+    assert "create it" not in text.lower(), text
     monkeypatch.setattr(restricted_file, "can_add_a_file", lambda _d: True)
     monkeypatch.setattr(
         restricted_file, "key_directory_volume_problem", lambda _d: "a network share"
@@ -740,6 +739,33 @@ def test_the_unusable_directory_refusals_name_their_own_way_on(
     assert ("Let this account add files there" in text) is (named != "MEFOR_SECRETS_DIRECTORY"), (
         text
     )
+    assert ". To go on, set MEFOR_CUSTODY_DIRECTORY" in text or named != "MEFOR_SECRETS_DIRECTORY"
+
+
+@host_file_platforms
+def test_the_way_on_moves_off_every_directory_holding_a_key_file(tmp_path: Path) -> None:
+    """PR 3168 review round-1d986c2c9d: a key file in the secrets directory and an older one beside
+    the store. The step names a new one of each, and following it reaches a mint."""
+    store_dir = tmp_path / "old"
+    store_dir.mkdir()
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    settings = _settings(store_dir)
+    for kept in (secrets / custody_host.HOST_FILE_NAME, store_dir / custody_host.HOST_FILE_NAME):
+        kept.write_bytes(b"not read")
+    with pytest.raises(FileExistsError) as refused:
+        mint_target(settings, service_account=None, enforcing=True, environ=environ)
+    text = " ".join(str(refused.value).split())
+    assert "a new secrets directory, named by MEFOR_SECRETS_DIRECTORY" in text, text
+    assert "a new SQLite path in a directory with no master.key" in text, text
+    followed = {
+        "MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody")),
+        "MEFOR_SECRETS_DIRECTORY": str(_own_custody_directory(tmp_path / "new-secrets")),
+    }
+    (tmp_path / "new").mkdir()
+    moved = settings.model_copy(update={"path": str(tmp_path / "new" / "store.db")})
+    target = mint_target(moved, service_account=None, enforcing=True, environ=followed)
+    assert target == tmp_path / "custody" / custody_host.HOST_FILE_NAME
 
 
 @windows_only

@@ -246,21 +246,6 @@ Administrator from an elevated shell on the host:
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
 ```
 
-Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
-LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
-install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
-describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
-environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
-`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
-`[security].enforcement = 'enforce'` the provider also refuses an account that is not local to
-this host, such as a domain user or a gMSA, and the script does not check for that.
-
-The steps above do not yet cover that provider. It refuses a store key set beside it, so step 1's
-key makes `provision-admin` refuse; and it mints the store key, which `--service-account` mints for
-the service's account rather than yours. The script grants that account read only on the secrets
-directory, where the service's first start must write its own key file, so a service the script
-installs under this provider does not start yet (vault BACKLOG #3411).
-
 If the service started first, at the shipped posture it refuses to start. Once the earlier start
 checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
 log; run the command, then restart the service. In the data directory the install script hardens,
@@ -293,8 +278,10 @@ the service's account rather than yours (vault BACKLOG #3411).
 
 The host key provider keeps two files, `handoff.key`, which `provision-admin --service-account`
 writes, and `master.key`, which the service's first start writes from it and then reads at every
-start. The service must be able to add a file where they live, and the secrets directory gives it
-read only, since administrators write that directory (ADR 0214). So when the install script reads
+start. The service must be able to add a file where they live, and a service that may add a file
+to the secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment); the
+install script's own grant there is read, though it keeps a wider grant the service account
+already holds. So when the install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
 files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names
 it to the service as `MEFOR_CUSTODY_DIRECTORY`. It is judged before anything acts by the secrets
@@ -385,8 +372,8 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    shared. Those files are at least this store's database, the file the service's `--db` names,
    with that file's own `-wal` and `-shm` files; and, only where no other store's database sits
    in the same directory, the `log-spool` folder and the generated API certificate pair,
-   `api-generated-cert.pem` with `api-generated-key.pem`. Move that pair together or not at all:
-   the engine mints a new pair when it finds either one missing, and a client that pins the old
+   `api-generated-cert.pem` with `api-generated-key.pem`. Move the pair together: where the new
+   directory lacks either file, the engine mints a new pair there, and a client that pins the old
    certificate then refuses the new one. Leave `master.key` and `handoff.key` where they are: in
    this step they may be another store's.
 5. **Moving a file.** Within one volume, move it as an administrator
