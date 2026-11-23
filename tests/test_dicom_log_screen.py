@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -888,16 +889,76 @@ async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
 
 
 def _release_that_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The peer's association still ends; only the library's call raises afterwards."""
+    """The release fails where the library's own can: inside the negotiation, after ``release()``
+    has paused the reactor, so the association stays up unless something ends it."""
+    from pynetdicom.acse import ACSE
+
+    monkeypatch.setattr(ACSE, "negotiate_release", _raiser(RuntimeError(_REFUSAL)))
+
+
+def _live_associations() -> set[threading.Thread]:
+    """Every association thread in this process: the SCU's and the in-process peer's."""
     from pynetdicom.association import Association
 
-    real_release = Association.release
+    return {t for t in threading.enumerate() if isinstance(t, Association) and t.is_alive()}
 
-    def release(self: Any) -> None:
-        real_release(self)
-        raise RuntimeError(_REFUSAL)
 
-    monkeypatch.setattr(Association, "release", release)
+async def _associations_left(before: set[threading.Thread]) -> set[threading.Thread]:
+    """The associations started since ``before`` that are still up after a short grace."""
+    deadline = time.monotonic() + 3.0
+    while (left := _live_associations() - before) and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+    return left
+
+
+@pytest.mark.parametrize("status", [0x0000, 0xC000], ids=["confirmed-store", "peer-refused"])
+async def test_a_failed_release_aborts_the_association(
+    status: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.transports.base import NegativeAckError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    _release_that_raises(monkeypatch)
+    before = _live_associations()
+    with _storage_scp(status=status) as port:
+        scu = _scu(port)
+        if status:
+            with pytest.raises(NegativeAckError):
+                await scu.send(_carry(make_sr_part10()))
+        else:
+            await scu.send(_carry(make_sr_part10()))
+        # Inside the block: the server's shutdown would end the peer's side either way.
+        left = await _associations_left(before)
+    assert not left
+
+
+async def test_an_abort_that_raises_after_a_failed_release_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pynetdicom.association import Association
+
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    _release_that_raises(monkeypatch)
+    real_abort = Association._abort_blocking
+
+    def abort(self: Any, block: bool = True) -> None:
+        real_abort(self, block)  # ends the test's association, then the library raises
+        if self.is_requestor:  # the in-process peer's own shutdown must not raise
+            raise RuntimeError(_REFUSAL)
+
+    # Not Association.abort: pynetdicom's event dispatch binds this method over it on the instance.
+    monkeypatch.setattr(Association, "_abort_blocking", abort)
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"),
+        _storage_scp() as port,
+    ):
+        assert await _scu(port).send(_carry(make_sr_part10())) is None
+    logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
+    assert [entry for entry in logged if "abort failed" in entry and "RuntimeError" in entry]
+    assert _UID not in caplog.text
 
 
 @pytest.mark.parametrize("send_raises", [True, False], ids=["send-raised", "peer-refused"])

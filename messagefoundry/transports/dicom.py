@@ -3198,7 +3198,11 @@ class DicomScuDestination(DestinationConnector):
         """Release ``assoc``. A raise here would replace the delivery error in flight, and
         :meth:`_c_store` scrubs only a delivery error's chain, so the library's text would reach the
         runner. So it is logged, screened, and never raised. The peer's status has already decided
-        the delivery: a store it confirmed stays delivered, since a retry would store it again."""
+        the delivery: a store it confirmed stays delivered, since a retry would store it again.
+
+        A release that raises has left pynetdicom's reactor paused, so the association's thread,
+        its socket and the peer's slot for it would stay up. So it is aborted, and an abort that
+        raises is logged the same way."""
         try:
             assoc.release()
         except Exception as exc:  # noqa: BLE001 - a third-party call; the outcome must survive it
@@ -3208,6 +3212,15 @@ class DicomScuDestination(DestinationConnector):
                 self._port,
                 _safe_library_exc(exc),
             )
+            try:
+                assoc.abort()
+            except Exception as failed:  # noqa: BLE001 - as above
+                logger.warning(
+                    "DICOM client (SCU) to %s:%s: the association abort failed: %s",
+                    self._host,
+                    self._port,
+                    _safe_library_exc(failed),
+                )
 
     def _count_unanswered(self, key: int | None, size: int) -> NegativeAckError | None:
         """Count one store of an object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` that ended with no
