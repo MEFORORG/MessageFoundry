@@ -33,6 +33,7 @@ import smtplib
 import string
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -2705,14 +2706,18 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 # never its free text, which can echo a partner's reply (docs/PHI.md row 10).
                 if transport.name == "webhook":
                     # The webhook's URL is its credential, and a send's exception text can quote
-                    # it (an http.client InvalidURL does), so this line names the class only,
-                    # with no message and no exc_info (vault BACKLOG #3533 item 14).
+                    # it (an http.client InvalidURL does), so this line names the class, and for
+                    # an HTTPError its integer status code, with no message and no exc_info
+                    # (vault BACKLOG #3533 item 14).
+                    failure = type(exc).__name__
+                    if isinstance(exc, urllib.error.HTTPError) and isinstance(exc.code, int):
+                        failure = f"{failure} {exc.code}"
                     log.warning(
                         "alert transport %s failed for %s/%r: %s",
                         transport.name,
                         event.get("type"),
                         event.get("connection"),
-                        type(exc).__name__,
+                        failure,
                     )
                 else:
                     # The other transports' exceptions were made safe to log with their text

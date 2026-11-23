@@ -18,8 +18,10 @@ with no escape, because every call sends the api_key. Its tests below pin that r
 from __future__ import annotations
 
 import asyncio
+import email.message
 import http.client
 import logging
+import urllib.error
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -362,6 +364,55 @@ async def test_a_failed_send_logs_the_exception_class_only(
     assert record.exc_info is None and record.exc_text is None
     assert record.getMessage().endswith(": InvalidURL")
     assert _WEBHOOK_TOKEN not in caplog.text
+
+
+class _RaisingWebhook:
+    """A webhook transport whose send raises the exception it was given."""
+
+    name = "webhook"
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def send(self, event: object, **_: object) -> None:
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    ("exc", "tail"),
+    [
+        (
+            urllib.error.HTTPError(
+                f"https://hooks.example/{_WEBHOOK_TOKEN}",
+                403,
+                f"Forbidden {_WEBHOOK_TOKEN}",
+                email.message.Message(),
+                None,
+            ),
+            ": HTTPError 403",
+        ),
+        (urllib.error.URLError(f"no route to /{_WEBHOOK_TOKEN}"), ": URLError"),
+    ],
+    ids=["http-error", "url-error"],
+)
+async def test_a_failed_send_logs_an_http_status_and_nothing_of_the_url(
+    exc: Exception, tail: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An HTTPError's integer status code is added to the class; its URL and reason are not.
+    sink = NotifierAlertSink([_RaisingWebhook(exc)])
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.alert_sinks"):
+        sink.connection_stopped("OB_X", detail="synthetic")
+        sink.start()
+        for _ in range(500):
+            if any("alert transport webhook failed" in r.getMessage() for r in caplog.records):
+                break
+            await asyncio.sleep(0.01)
+        await sink.aclose()
+    [record] = [r for r in caplog.records if "alert transport webhook failed" in r.getMessage()]
+    assert record.exc_info is None and record.exc_text is None
+    assert record.getMessage().endswith(tail)
+    assert _WEBHOOK_TOKEN not in caplog.text
+    assert "hooks.example" not in caplog.text
 
 
 def test_post_re_raises_invalid_url_with_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
