@@ -2007,7 +2007,7 @@ def require_monitoring_read(
     *Monitoring-read pacing*, says the default's basis.
 
     Charged at ADMISSION, before the route does its work. A throttled read is logged (not silent),
-    answered 429 with a ``Retry-After`` (:func:`enforce_monitoring_read_pacing` says its value), and
+    answered 429 with a ``Retry-After`` (:func:`_charge_monitoring_read` says its value), and
     recorded as an ``auth.gate_refused`` row with reason ``throttled`` wherever
     :func:`_audited_permission` names one (on by default). It does not ask the new-address
     question: :func:`refuse_from_new_address` says why these reads stay outside it. No pace on the
@@ -2016,16 +2016,17 @@ def require_monitoring_read(
     ``defer_when_query`` names a query parameter that delays the REFUSAL, not the charge: when the
     request carries it, the gate still charges the budget at admission, but a 429 it would answer
     is held on the request, with no decision row yet, until the route body calls
-    :func:`raise_deferred_monitoring_refusal` after its own scope check. ``GET /connections``
-    defers on ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says
-    why."""
+    :func:`raise_deferred_monitoring_refusal` after its own scope check. A held 429 the route
+    never raises, because the scope check or query validation refused the request first, is
+    answered by that refusal and writes no throttled row or line. ``GET /connections`` defers on
+    ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says why."""
 
     async def dependency(request: Request) -> Identity:
         auth, identity = await _admit(request, permissions, mfa_gate=True)
         if auth is None:
             return identity
         if defer_when_query is not None and defer_when_query in request.query_params:
-            refusal = _monitoring_read_refusal(request, auth, identity)
+            refusal = _charge_monitoring_read(request, auth, identity)
             if refusal is None:
                 await _record_grant(request, auth, identity, permissions)
             else:
@@ -2056,38 +2057,35 @@ _DEFERRED_MONITORING_REFUSAL_ATTR = "mefor_deferred_monitoring_refusal"
 
 async def raise_deferred_monitoring_refusal(request: Request) -> None:
     """Raise the monitoring-read 429 a :func:`require_monitoring_read` gate held for this request,
-    writing its ``auth.gate_refused`` row (reason ``throttled``) where :func:`_audited_permission`
-    names one, as the gate itself would have. The gate wrote no grant row for such a request.
+    logging it and writing its ``auth.gate_refused`` row (reason ``throttled``) where
+    :func:`_audited_permission` names one, as the gate itself would have. The gate wrote no grant
+    row for such a request.
 
-    A no-op where nothing is held: the budget had room (the gate wrote its grant row), the no-auth
-    path, a request without the deferring parameter, and the web console's in-process call, whose
-    own request carries nothing held. A route that defers must call this on every path that does
-    the paced work; ``tests/test_monitoring_read_pacing.py`` pins the one route that does."""
+    A no-op where nothing is held, at least: the budget had room, the no-auth path, a request
+    without the deferring parameter, and the web console's in-process call, whose own request
+    carries nothing held. A route that defers must call this on every path that does the paced
+    work; nothing checks that it does, so a missed call serves a throttled caller."""
     held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
     if not isinstance(held, _DeferredRefusal):
         return
     delattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR)
     decision = held.decision
+    _log_monitoring_throttle(request, decision.identity)
     await _record_gate_refusal(
         request, decision.auth, decision.identity, decision.permissions, held.refusal
     )
     raise held.refusal
 
 
-def _monitoring_read_refusal(
+def _charge_monitoring_read(
     request: Request, auth: AuthService, identity: Identity
 ) -> _GateRefusal | None:
     """Charge the per-actor monitoring-read budget (vault BACKLOG #1191) and return the 429 to
-    answer when it is spent, or None. Logged, not silent. Its Retry-After is the actor's own wait,
-    in whole seconds, or the whole window while the all-accounts count is spent
-    (:meth:`AuthService.monitoring_read_retry_after`)."""
+    answer when it is spent, or None. Its caller logs the refusal when it raises it. Its
+    Retry-After is the actor's own wait, in whole seconds, or the whole window while the
+    all-accounts count is spent (:meth:`AuthService.monitoring_read_retry_after`)."""
     if auth.allow_monitoring_read(identity.user_id):
         return None
-    log.warning(
-        "monitoring-read throttled (anti-automation): actor=%s path=%s",
-        identity.username,
-        request.url.path,
-    )
     return _GateRefusal(
         status.HTTP_429_TOO_MANY_REQUESTS,
         "too many requests; please slow down",
@@ -2096,11 +2094,21 @@ def _monitoring_read_refusal(
     )
 
 
+def _log_monitoring_throttle(request: Request, identity: Identity) -> None:
+    """The WARNING line a raised monitoring-read 429 writes (logged, not silent)."""
+    log.warning(
+        "monitoring-read throttled (anti-automation): actor=%s path=%s",
+        identity.username,
+        request.url.path,
+    )
+
+
 def enforce_monitoring_read_pacing(request: Request, auth: AuthService, identity: Identity) -> None:
-    """Charge the per-actor monitoring-read budget, raising the 429 of
-    :func:`_monitoring_read_refusal` when it is spent."""
-    refusal = _monitoring_read_refusal(request, auth, identity)
+    """Charge the per-actor monitoring-read budget, logging and raising the 429 of
+    :func:`_charge_monitoring_read` when it is spent."""
+    refusal = _charge_monitoring_read(request, auth, identity)
     if refusal is not None:
+        _log_monitoring_throttle(request, identity)
         raise refusal
 
 

@@ -264,6 +264,12 @@ async def test_a_refused_reveal_still_spends_the_budget(engine: Engine) -> None:
         invalid = await c.get("/connections", params={"reveal": ""}, headers=h_other)
         assert invalid.status_code == 422
         assert (await c.get("/status", headers=h_other)).status_code == 429
+        # Over the budget, an invalid reveal is still answered by its validation 422: the held 429
+        # is never raised, so it writes no throttled row on the path.
+        again = await c.get("/connections", params={"reveal": ""}, headers=h_other)
+        assert again.status_code == 422
+    rows = await engine.store.list_audit(limit=1000)
+    assert [a for a, _ in _decisions_on(rows, "/connections") if a == "auth.gate_refused"] == []
 
 
 async def test_an_in_scope_reveal_under_the_budget_is_charged_once(engine: Engine) -> None:
@@ -296,8 +302,9 @@ async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
         # Signed out, these pages answer 303; a 200 here means the signed-in handler ran. Each
         # calls a paced handler (``/ui/connections`` the ``GET /connections`` one,
         # ``/ui/monitoring/live`` the ``GET /graph/edges`` and ``/metrics/history`` ones,
-        # ``/ui/nav-status`` the ``GET /status`` one, though it answers 200 even if that call
-        # fails). The bearer reads below are what prove none of them spent the budget.
+        # ``/ui/nav-status`` the ``GET /status`` one; it swallows that call's other failures but
+        # re-raises an HTTPException, so a charged 429 would show here). The bearer reads below
+        # prove none of them spent the budget.
         for path in ("/ui/connections", "/ui/monitoring/live", "/ui/nav-status"):
             for _ in range(3):
                 assert (await c.get(path)).status_code == 200, path

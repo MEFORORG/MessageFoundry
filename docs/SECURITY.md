@@ -7698,7 +7698,9 @@ its pace bounds only JSON clients. The gate charges a per-actor sliding window a
 admission, before the route's own work. On `GET /connections?reveal=` the read is still charged
 at admission, but a 429 is held until the route has run its channel-scope check, so a reveal naming
 a connection outside the caller's scope is still denied and audited as `auth.channel_denied` when
-the budget is spent. The six routes share ONE budget per account: a read of any of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
+the budget is spent. A held 429 the route never raises, because the scope check or query
+validation refused first, is answered by that refusal and writes no throttled row or log line. The
+six routes share ONE budget per account: a read of any of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 
 **Key.** `identity.user_id` of the bearer session the request presents. A Prometheus-style scraper
