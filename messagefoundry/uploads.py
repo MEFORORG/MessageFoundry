@@ -4241,8 +4241,8 @@ class UploadStore:
         kept, because this pass checks that the sidecar's name exists without opening it — a
         rotated-away key can no more destroy data here than it can in the age pass.
 
-        **A read fault that raises is not read as a missing sidecar (BACKLOG #6575).** The root is
-        listed once, whole, before anything is removed. A listing error
+        **A fault whose code does not mean a missing name keeps the body (BACKLOG #6575).** The root
+        is listed once, whole, before anything is removed. A listing error
         :func:`~messagefoundry.path_reach.is_absent` reads as no root is an empty pass, and any
         other raises with nothing removed. A body the listing shows with no sidecar goes only once
         it is past the floor and :func:`_sidecar_is_absent`, asked right before the unlink, reports
@@ -4256,8 +4256,9 @@ class UploadStore:
         that check and the unlink.
 
         A fault on one entry leaves that entry for the next pass. If the root then fails a ``stat``
-        too, the pass stops and returns what it removed, logged at ERROR with the root's own error,
-        repeats damped while :class:`_OncePerInterval` still holds the key.
+        too, the pass stops and returns what it removed, logged at ERROR with the root's own error.
+        :class:`_OncePerInterval` damps only a repeat inside its interval, and the default pass
+        interval is as long, so a lasting fault can log on every scheduled pass.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4333,8 +4334,8 @@ class UploadStore:
                 # Already gone (a sibling shard's sweep), held open by another process, or not a file
                 # at all. Never fatal — the next pass retries. The NAME is safe to log: a file_id and
                 # a random tag, never a body. What is_name_absent does not read as gone is logged,
-                # repeats damped while the memo holds its key, since a body whose sidecar cannot be
-                # checked stays until someone looks. A dangling link does read as gone.
+                # since a body whose sidecar cannot be checked stays until someone looks. A dangling
+                # link whose target alone is missing reads as gone.
                 quiet = is_name_absent(exc) or not self._link_logged.first(f"orphan sweep {name}")
                 _log.log(
                     logging.DEBUG if quiet else logging.WARNING,

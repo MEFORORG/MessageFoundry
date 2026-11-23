@@ -309,7 +309,7 @@ async def test_the_sweep_does_not_remove_a_body_still_waiting_for_its_sidecar(
     assert await store.read_bytes(listed[0].file_id) == _TXT
 
 
-# --- a read fault that raises is not read as an absence (BACKLOG #6575) --------------------------
+# --- a read fault whose code is not absence keeps the body (BACKLOG #6575) -----------------------
 
 
 _ORPHAN_TEXT = "SYNTHETIC-ORPHAN-BODY-TEXT"
