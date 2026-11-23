@@ -2313,10 +2313,11 @@ def test_the_lexer_verdict_positive_control_reds_when_the_template_scan_is_dead(
     assert gate.lexer_verdict_self_test("operations")
 
 
-def test_list_operations_prints_each_sites_verdict(
+def test_list_operations_prints_each_tokens_verdict_at_every_site(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Added item 7: --list-operations printed no verdict on origin/main.
+    # Added item 7: --list-operations printed no verdict on origin/main. It prints each token's
+    # verdict at every site that carries the token, not each site's own.
     gate = _gate()
     package = tmp_path / "selftest"
     package.mkdir()
