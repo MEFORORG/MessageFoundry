@@ -2356,6 +2356,17 @@ def test_an_out_of_scope_label_variant_is_judged_at_its_own_site() -> None:
     )
 
 
+def test_the_positive_control_reds_when_judgment_is_file_wide(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The gate's own control must notice a revert to judging by callee file-wide (added item 4).
+    gate = _gate()
+    assert gate.operations_self_test() == []
+    real = gate._site_key
+    monkeypatch.setattr(gate, "_site_key", lambda op: (*real(op)[:1], 0, real(op)[2]))
+    assert gate.operations_self_test()
+
+
 def test_list_operations_judges_the_scanned_operations_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2380,10 +2391,10 @@ def test_list_operations_judges_the_scanned_operations_once(
     assert [paths for paths in calls if "listed/x.py" in paths] == [{"listed/x.py"}], calls
 
 
-def test_a_weak_call_in_a_later_line_template_hole_names_both_remedies(tmp_path: Path) -> None:
+def test_a_weak_call_marked_not_code_names_both_remedies(tmp_path: Path) -> None:
     # #8299 item 24: on origin/main the message offered only rewording for a real call it marks.
     gate = _gate()
     repo = _ts_repo(tmp_path, {"ide/src/planted.ts": "const t = `a\n * ${Math.random()}\n`;\n"})
     weak = [v for v in gate.check_non_python_randomness(repo)[0] if "WEAK randomness" in v]
     assert len(weak) == 1 and "Math.random (not code)" in weak[0], weak
-    assert "${} hole" in weak[0] and "reword" in weak[0], weak
+    assert "THE RESIDUAL" in weak[0] and "only if it is prose, reword" in weak[0], weak

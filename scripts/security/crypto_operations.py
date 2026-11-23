@@ -88,8 +88,10 @@ seen:
   ``globals()`` or ``sys.modules`` write) still reads as served, so a call the hook never
   answers can be confirmed;
 * A union token is confirmed by its callee before ``[`` at one of its own sites, a file and a
-  line, so an out-of-scope label variant on a line that also holds an in-scope call of the same
-  callee stays confirmed.
+  line, not by its label. So an out-of-scope label variant on a line that also holds an in-scope
+  call of the same callee stays confirmed, and so does an in-scope call whose algorithm label
+  only an out-of-scope binding gives (``hmac.new(k, m, hashlib.md5)`` where that ``hashlib`` is
+  a function-local first-party import).
 * A provider ``via`` token is marked out of scope when the module's only direct operation is out
   of scope, though the call reaches crypto in scope.
 * a parameter or local assignment that shadows an imported name. Only imports are bindings, so a
