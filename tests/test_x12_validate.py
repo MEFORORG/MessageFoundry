@@ -1004,6 +1004,30 @@ def test_a_refusal_with_a_map_does_not_claim_there_is_none(name: str) -> None:
     assert "no map" not in str(caught.value)
 
 
+@pytest.mark.parametrize("kind", ["parent", "subdirectory", "absolute"])
+def test_a_map_name_that_is_not_a_bare_file_name_gives_no_ids(
+    kind: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # pyx12's own load_map_file refuses these. Without the same check the reader would open a file
+    # outside the map directory and trust the ids in it.
+    map_dir = tmp_path / "map"
+    (map_dir / "sub").mkdir(parents=True)
+    for target in (tmp_path / "outside.xml", map_dir / "sub" / "inner.xml"):
+        target.write_text("<map><segment xid='ZZZ'/></map>", encoding="utf-8")
+    name = {
+        "parent": "../outside.xml",
+        "subdirectory": "sub/inner.xml",
+        "absolute": str(tmp_path / "outside.xml"),
+    }[kind]
+    (map_dir / "maps.xml").write_text(
+        f"<maps><version><map>{name}</map></version></maps>", encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING):
+        assert _read_map_segment_ids(map_dir) == frozenset()
+    assert "no segment id" in caplog.text
+    assert name not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("target", "fault"),
     [

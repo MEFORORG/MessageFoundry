@@ -21,6 +21,7 @@ is not pure: :mod:`messagefoundry.parsing.x12` says what the strict path reads a
 from __future__ import annotations
 
 import logging
+import os.path
 import threading
 import time
 from collections.abc import Callable
@@ -111,13 +112,17 @@ def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
 
     pyx12 selects its maps from that index, so a bundled file it omits (``comp_test.xml``, the only
     source of ``TST`` and ``UNU``) adds no id. All or nothing: an index or listed map that cannot be
-    read or parsed, or a set with no id, gives the empty set, so a caller keeps no id rather than
-    trusting the shape alone."""
+    read or parsed, a listed name that is not a bare file name (the check pyx12's ``load_map_file``
+    makes), or a set with no id, gives the empty set, so a caller keeps no id rather than trusting
+    the shape alone."""
     ids: set[str] = set()
     try:
         with map_dir.joinpath("maps.xml").open("rb") as fd:
             index = _parse_map_xml(fd)
         map_files = {name for m in index.iter("map") if (name := (m.text or "").strip())}
+        # Before any map is opened. An absolute name has a separator, so this refuses it too.
+        if any(name != os.path.basename(name) for name in map_files):
+            raise ValueError("a name in pyx12's map index is not a bare file name")
         for map_file in map_files:
             with map_dir.joinpath(map_file).open("rb") as fd:
                 # Inside the `with`, unbound, so one map's tree is freed before the next is parsed.

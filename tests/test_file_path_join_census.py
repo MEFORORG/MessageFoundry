@@ -728,7 +728,7 @@ SITES: dict[str, Site] = {
         2,
         INTERNAL,
         "The fixed index name, and map names read from that index inside the installed pyx12 "
-        "package; no interchange value reaches either.",
+        "package, each refused unless a bare file name; no interchange value reaches either.",
     ),
     "messagefoundry/parsing/x12/_deps.py::load_x12_map_segment_ids": Site(
         1, INTERNAL, "The fixed name map under the installed pyx12 package."
