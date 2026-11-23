@@ -544,12 +544,23 @@ def evaluate(
             slots.append(None)
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
-    seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
-    # A first-page commit GraphQL could not resolve has an unknown key. A refusal below still
-    # holds, since an unsigned author owes a signature wherever the action sees them, but its
-    # reason must not claim the author is absent from that commit.
-    unresolved = any(index < read.first_page for index in read.tainted)
-    where = "the ones this read could resolve" if unresolved else "them"
+    first_slots = slots[: read.first_page]
+    seen_by_action = {slot.name for slot in first_slots if slot is not None}
+    # A first-page commit this read could not key (an error inside it, a malformed author or
+    # committer, a null author) has an unknown key. A refusal below still holds, since an unsigned
+    # author owes a signature wherever the action sees them, but its reason must not claim that
+    # commit's key. It names keys, not people: an author may be a first-page committer, or carry
+    # another key there, and still be absent from the action's list under this key.
+    keyed = sum(1 for slot in first_slots if slot is not None)
+    if keyed == len(first_slots):
+        where = "none of them is"
+    else:
+        where = f"none of the {keyed} of them this read could key is"
+    unsigned = (
+        "the CLA signature file holds no signature for that account"
+        if signatures is not None
+        else "no CLA signature file was given to check that account against"
+    )
     checked: set[int] = set()  # linked accounts already judged under rule 2
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
@@ -566,9 +577,9 @@ def evaluate(
         skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
         if not skipped and has_signed(who) is False:
             rule_two.append(
-                f"commit {who.oid} is past the {read.first_page} commits the action reads, its "
-                f"author {who.name!r} appears in none of {where}, and the CLA signature file "
-                "holds no signature for that account"
+                f"commit {who.oid} is past the {read.first_page} commits the action reads, "
+                f"{where} filed under its author's key {who.name!r} in the action's committer "
+                f"list, and {unsigned}"
             )
     # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
     refusals = [
@@ -727,6 +738,18 @@ def read_judged_head(
                 raise
             return exc.partial, False, str(exc)
         if expected_head and not any(c.get("oid") == expected_head for c in read.commits):
+            # A commit whose id GraphQL nulled, or that came back in another form, may be the head.
+            unreadable = sum(1 for c in read.commits if not _SHA.fullmatch(str(c.get("oid") or "")))
+            if unreadable:
+                return (
+                    read,
+                    True,
+                    (
+                        "the commit ids this read could resolve do not include CLA_HEAD_SHA, and "
+                        f"{unreadable} commit(s) carry no 40-character lowercase id, so whether the "
+                        "pull request's commits include it is unknown"
+                    ),
+                )
             return read, True, "the pull request's commits do not include CLA_HEAD_SHA"
         return read, True, None
 

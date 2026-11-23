@@ -717,12 +717,80 @@ def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent() -> N
     read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert len(verdict.refusals) == 1
-    assert "appears in none of the ones this read could resolve" in verdict.refusals[0]
+    assert (
+        "none of the 0 of them this read could key is filed under its author's key "
+        "'octo-contributor'" in verdict.refusals[0]
+    )
     assert verdict.fault is not None and "not judged" in verdict.fault
     # The neighbour: with page one readable, the same author is on it, so nothing is owed.
     pages = [_page([octo], 2, True), pages[1]]
     read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
     assert evaluate(read, _ALLOWLIST, _no_signatures) == cla_precheck.Verdict(())
+
+
+_UNLINKED = {"name": "Anon", "user": None}
+_OCTO = {"name": "Octo", "user": {"databaseId": 90000001, "login": "octo-contributor"}}
+
+
+@pytest.mark.parametrize(
+    "unkeyed",
+    [
+        # Rule 1 cannot read the author, so no key is formed.
+        {"oid": f"{1:040x}", "author": "not-an-object", "committer": _OCTO},
+        # Rule 1 refuses the unlinked author, and the committer it would be keyed under is null.
+        {"oid": f"{1:040x}", "author": _UNLINKED, "committer": None},
+        # ... or not an object.
+        {"oid": f"{1:040x}", "author": _UNLINKED, "committer": "not-an-object"},
+        # A null author: the action would throw, so the commit has no key.
+        {"oid": f"{1:040x}", "author": None, "committer": _OCTO},
+    ],
+    ids=["malformed-author", "null-committer", "malformed-committer", "null-author"],
+)
+def test_every_first_page_commit_without_a_key_narrows_the_rule_two_reason(
+    unkeyed: Mapping[str, Any],
+) -> None:
+    """BACKLOG #5645: not only an errored commit leaves a first-page key unknown. The rule-2
+    reason must count the commits the read could key, never claim them all; the refusal itself
+    and the fault beside it are unchanged."""
+    pages = [
+        _page([unkeyed, _commit(2, "Bob", "bob", 90000002)], 3, True),
+        _page([_commit(3, "New Person", "new-person", 90000003)], 3, False),
+    ]
+    verdict = evaluate(fetch_commits(_serve(pages), "M", "N", 7), _ALLOWLIST, _no_signatures)
+    rule_two = [r for r in verdict.refusals if f"{3:040x}" in r]
+    assert rule_two == [
+        f"commit {3:040x} is past the 2 commits the action reads, none of the 1 of them this "
+        "read could key is filed under its author's key 'new-person' in the action's committer "
+        "list, and the CLA signature file holds no signature for that account"
+    ]
+    # A null author is refused under rule 1 and is no fault; every other shape here is one.
+    assert (verdict.fault is None) == (unkeyed["author"] is None)
+
+
+def test_a_fully_keyed_first_page_names_keys_not_people() -> None:
+    """The author past page one is a first-page COMMITTER under a linked author, so they appear
+    in the action's page; only their key is absent. The reason says that, not that they appear
+    nowhere."""
+    bob = {"name": "Bob", "user": {"databaseId": 90000002, "login": "bob"}}
+    pages = [
+        _page([{"oid": f"{1:040x}", "author": _OCTO, "committer": bob}], 2, True),
+        _page([_commit(2, "Bob", "bob", 90000002)], 2, False),
+    ]
+    read = fetch_commits(_serve(pages), "M", "N", 7)
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict == cla_precheck.Verdict(
+        (
+            f"commit {2:040x} is past the 1 commits the action reads, none of them is filed "
+            "under its author's key 'bob' in the action's committer list, and the CLA signature "
+            "file holds no signature for that account",
+        )
+    )
+    # With no signature reader given, the reason does not claim a file was read.
+    assert (
+        evaluate(read, _ALLOWLIST)
+        .refusals[0]
+        .endswith("and no CLA signature file was given to check that account against")
+    )
 
 
 @pytest.mark.parametrize(
@@ -772,6 +840,25 @@ def test_a_commit_list_without_its_head_is_judged_with_a_fault(
     assert _run(env, _serve([linked])) == EXIT_FAULT
     assert "do not include CLA_HEAD_SHA" in capsys.readouterr().out
     assert _run(env, _serve([_page([_commit(1, "wshallwshall")], 1, False)])) == EXIT_REFUSED
+
+
+def test_a_head_whose_id_graphql_nulled_is_not_said_to_be_missing(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BACKLOG #5645: an errored node whose oid GraphQL nulled may be CLA_HEAD_SHA itself, so the
+    fault says the head is unknown rather than absent. The exit is the same fault as before."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    page = _page([_commit(1, "Octo", "octo-contributor", 90000001), _commit(2, "x")], 2, False)
+    page["data"]["repository"]["pullRequest"]["commits"]["nodes"][1] = None
+    page = {**page, "errors": [_node_error(1, "commit", "oid")]}
+    assert _run(env, _serve([page])) == EXIT_FAULT
+    out = capsys.readouterr().out
+    assert "the pull request's commits do not include CLA_HEAD_SHA" not in out
+    assert (
+        "the commit ids this read could resolve do not include CLA_HEAD_SHA, and 1 commit(s) "
+        "carry no 40-character lowercase id, so whether the pull request's commits include it "
+        "is unknown" in out
+    )
 
 
 def test_a_lagging_first_page_with_a_pathless_error_is_re_read() -> None:
