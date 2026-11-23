@@ -306,7 +306,7 @@ def test_restore_refuses_a_dangling_wal_symlink(tmp_path, key_b64, capsys) -> No
         pytest.param(
             " ", marks=pytest.mark.skipif(sys.platform != "win32", reason="Win32 strips it")
         ),
-        # Refused on every host: a POSIX host can write to an NTFS volume over SMB.
+        # Refused on every host, so one --to means the same everywhere.
         "::$DATA",
     ],
 )
@@ -332,8 +332,9 @@ def test_restore_refuses_a_to_that_windows_opens_as_another_name(
     assert stale.read_bytes() == b"stale wal"
 
 
-def test_restore_refuses_a_sidecar_planted_during_the_decrypt(
-    tmp_path, key_b64, capsys, monkeypatch
+@pytest.mark.parametrize("sidecar", ["-wal", "-shm", "-journal"])
+def test_restore_refuses_a_sidecar_planted_before_the_placement(
+    tmp_path, key_b64, capsys, monkeypatch, sidecar
 ) -> None:
     # The up-front check runs before the decrypt; the exclusive create covers only the store's own
     # name. A sidecar that appears in between is caught by the second read just before placement.
@@ -341,12 +342,12 @@ def test_restore_refuses_a_sidecar_planted_during_the_decrypt(
     dr = tmp_path / "dr"
     dr.mkdir()
     dest = dr / "restored.db"
-    planted = dr / "restored.db-wal"
+    planted = dr / f"restored.db{sidecar}"
     real_verify = dr_backup._verify_extracted_store
 
     def _plant_a_sidecar(snap, manifest):
         counts = real_verify(snap, manifest)
-        planted.write_bytes(b"planted wal")
+        planted.write_bytes(b"planted sidecar")
         return counts
 
     monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_sidecar)
@@ -354,11 +355,10 @@ def test_restore_refuses_a_sidecar_planted_during_the_decrypt(
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing to overwrite" in err and "-wal" in err
-    assert sorted(p.name for p in dr.iterdir()) == [
-        "restored.db-wal"
-    ]  # nothing placed, staging gone
-    assert planted.read_bytes() == b"planted wal"
+    assert "refusing to overwrite" in err and sidecar in err
+    # nothing placed, and the staging directory is gone
+    assert sorted(p.name for p in dr.iterdir()) == [planted.name]
+    assert planted.read_bytes() == b"planted sidecar"
 
 
 def test_a_fault_reading_a_sidecar_name_is_a_refusal_not_a_free_name(tmp_path, monkeypatch) -> None:

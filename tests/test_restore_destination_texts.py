@@ -17,6 +17,7 @@ import argparse
 from pathlib import Path
 
 from messagefoundry.__main__ import _build_parser
+from messagefoundry.pipeline.dr_backup import _OVERWRITE_REFUSAL
 
 _GUIDE = Path(__file__).resolve().parents[1] / "docs" / "EARLY-ADOPTER-GUIDE.md"
 
@@ -51,7 +52,7 @@ def test_the_guide_says_what_is_refused_and_gives_the_safe_remedy() -> None:
         "`-journal`, as one set",
     ):
         assert needle in body, needle
-    for unsafe in ("clear the destination's sidecars", "by hand", "delete"):
+    for unsafe in ("clear the destination's sidecars", "clear any `-wal`"):
         assert unsafe not in body, unsafe
 
 
@@ -64,3 +65,11 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
     ):
         assert needle in text, needle
+
+
+def test_the_overwrite_refusal_gives_the_safe_remedy() -> None:
+    # The refusal an operator actually reads names the taken path, which may be a sidecar alone.
+    assert (
+        "stop the engine and move the existing store aside with its -wal, -shm and -journal as one set"
+        in _flat(_OVERWRITE_REFUSAL)
+    )

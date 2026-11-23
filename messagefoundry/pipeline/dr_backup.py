@@ -5152,8 +5152,7 @@ def _safe_segment(value: str) -> str:
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
 #: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so a taken
 #: sidecar name is refused too, not just the main file: a file, a directory or a link, a dangling one
-#: included, read before the decrypt and again just before the placement
-#: (:func:`_refuse_existing_sidecars`). A sidecar created after that second read is not caught.
+#: included. When the names are read, and what that misses, is :func:`_refuse_existing_sidecars`.
 #: ``-journal`` is here for the same reason: SQLite replays a hot rollback journal on first open, even
 #: into a WAL-mode store (measured).
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -5168,7 +5167,8 @@ _MAX_CONFIG_MEMBERS = 10_000
 #: the same sentence as the one who was refused up front.
 _OVERWRITE_REFUSAL = (
     "refusing to overwrite an existing path at {path} — restoring over a live store is unrecoverable; "
-    "choose an empty --to path (or move the existing store aside first)"
+    "choose an empty --to path, or stop the engine and move the existing store aside with its -wal, "
+    "-shm and -journal as one set"
 )
 
 #: The one place the RESTORE path words a codec-level archive failure, so the operator whose header will
@@ -5738,10 +5738,7 @@ def _restore_blocking(
             # link or the copy lands, so a placement that raises after that is rolled back like any
             # later failure, and the staged store stays spared while it is a name for that file.
             #
-            # The up-front check ran before the decrypt, which can take minutes. A sidecar planted
-            # since then would be replayed over the verified pages on first open, and the exclusive
-            # create below covers only the store's own name, so the sidecar names are read again
-            # here, while nothing is placed. A sidecar planted after this read is not caught.
+            # The second sidecar read, while nothing is placed; its docstring says why and what it misses.
             _refuse_existing_sidecars(dest_store_path)
 
             def _placed() -> None:
@@ -6359,9 +6356,10 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
 
 
 _REWRITTEN_TO_REFUSAL = (
-    "refusing --to {path}: its last component ends in a dot or a space, holds a ':', or is otherwise "
-    "a name Windows opens as a different path, so the never-overwrite check would look for the "
-    "store's -wal, -shm and -journal under names SQLite never uses — spell --to as the plain file name"
+    "refusing --to {path}: its file name holds a ':', which names an alternate data stream on an NTFS "
+    "volume, or Windows would open it as a different name, such as one ending in a dot or a space; "
+    "the never-overwrite check could then miss the store's real -wal, -shm and -journal — spell --to "
+    "as the plain file name"
 )
 
 
@@ -6376,7 +6374,9 @@ def _occupied(path: Path) -> bool:
         return False
     except OSError as exc:
         raise BackupError(
-            "destination", f"cannot tell whether {path} is free: {safe_exc(exc)}"
+            "destination",
+            f"cannot tell whether {path} is free: {safe_exc(exc)} — choose another --to path, or "
+            "check that this account can read its directory",
         ) from exc
     return True
 
@@ -6398,7 +6398,9 @@ def _refuse_existing_sidecars(dest_store_path: Path) -> None:
     :func:`_refuse_existing_destination` and again just before the placement in
     :func:`_restore_blocking`, because the decrypt between them can take minutes and a sidecar planted
     then would be replayed over the verified pages on first open. The store's own name needs no second
-    read: its placement is an exclusive create, which refuses a name taken in that window."""
+    read: its placement is an exclusive create, which refuses a name taken in that window. A sidecar
+    created after the second read is not caught, including one created while a volume with no hard
+    links copies the store into place."""
     _refuse_taken(_store_sidecars(dest_store_path))
 
 
@@ -6409,11 +6411,12 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
 
     The store arm refuses at least: an existing store name, and an existing ``-wal``, ``-shm`` or
     ``-journal`` beside it, whether file, directory or link, a dangling link included
-    (:func:`_occupied`); and a ``--to`` whose last component holds a ``:`` (an
-    alternate data stream on NTFS, on every host, since a POSIX host can write to an SMB share) or
-    that Windows would open as another name, such as one ending in a dot or a space
-    (:func:`_win_rewritten`). Those spellings derive sidecar names SQLite never uses, so the sidecar
-    check would read the wrong files. The sidecars are checked again just before the placement.
+    (:func:`_occupied`); and a ``--to`` whose last component holds a ``:``, or that Windows would open
+    as another name, such as one ending in a dot or a space (:func:`_win_rewritten`). On Windows those
+    spellings derive sidecar names SQLite never uses, so the sidecar check would read the wrong files.
+    The ``:`` is refused on every host, so one ``--to`` means the same everywhere; a POSIX host can
+    reach an NTFS volume, where a ``:`` can name a stream. The sidecars are read again just before
+    the placement (:func:`_refuse_existing_sidecars`).
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
