@@ -94,7 +94,7 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any, Final, TypeIs
+from typing import Any, Final, TypeGuard
 
 __all__ = [
     "RepeatedKeyError",
@@ -3112,7 +3112,8 @@ def args_hold_a_message(exc: BaseException) -> bool:
     """Whether ``exc``'s class, or a class it inherits, is from a package in
     :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
     the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
-    connector's ``_shown_state`` names none read from it. The connector still CLASSIFIES such an
+    connector's ``_shown_state`` returns no object read from it, only the error's own
+    ``sqlstate`` attribute, an exact ``str`` equal to it. The connector still CLASSIFIES such an
     error by the shape of ``args[0]``, and the store's ``driver_sqlstate`` does not call this, so
     it still reads and prints that ``args[0]``. A class that cannot be read answers ``False``, so
     it is read by shape, as any other error is; that does not raise, so this runs on every link of
@@ -3153,9 +3154,12 @@ def is_a_sqlite_error(exc: BaseException) -> bool:
     return sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning))
 
 
-def reads_as_a_sqlstate(value: object) -> TypeIs[str]:
-    """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters."""
-    return isinstance(value, str) and _DRIVER_SQLSTATE.fullmatch(value) is not None
+def reads_as_a_sqlstate(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters.
+    Exactly ``str``: a subclass's ``__str__`` can print anything, such as a value from the
+    message, however its data matches (engine PR 3163). A ``TypeGuard``, not a ``TypeIs``: a
+    ``False`` answer does not say ``value`` is no ``str``."""
+    return type(value) is str and _DRIVER_SQLSTATE.fullmatch(value) is not None
 
 
 def driver_sqlstate_of(

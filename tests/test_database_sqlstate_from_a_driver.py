@@ -471,6 +471,87 @@ def test_a_sqlstate_text_subclass_cannot_name_an_asyncpg_message() -> None:
     assert _VALUE not in database._safe_db_error(exc)
 
 
+class _Loud(str):
+    """SQLSTATE-shaped data, ``23505``, whose ``__str__`` prints a value instead."""
+
+    def __str__(self) -> str:
+        return _VALUE
+
+
+class _Permissive(str):
+    """Text whose ``==`` says yes to anything, so it answers first as ``==``'s right operand."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+def _asyncpg_error(message: object, sqlstate: object) -> _AsyncpgMessage:
+    exc = _AsyncpgMessage(message)
+    exc.sqlstate = sqlstate  # type: ignore[assignment]  # the fake's attribute is typed str
+    return exc
+
+
+def test_the_shown_state_is_the_vetted_attribute_not_the_callers_state() -> None:
+    """Hold item 1 on engine PR 3163: red on 05ee5958ff9, whose ``_shown_state`` returned the
+    caller's ``state``, a ``str`` subclass from ``args[0]`` that prints ``MRN42``, once it equalled
+    the vetted attribute. Another driver's state is returned only as exactly ``str``."""
+    shown = database._shown_state(_Loud("23505"), _asyncpg_error(_Loud("23505"), "23505"))
+    assert type(shown) is str and shown == "23505"
+    assert _VALUE not in f"[{shown}]"
+    assert database._shown_state(_Loud("23505"), DriverError(_Loud("23505"), "x")) is None
+
+
+def test_the_shown_state_compares_by_strs_own_method() -> None:
+    """Hold item 6: the mutant ``type(attribute) is str and attribute == state`` names a state for
+    a ``str`` subclass from ``args[0]`` whose reflected ``__eq__`` says yes to anything."""
+    exc = _asyncpg_error(_Permissive(_VALUE), "23505")
+    assert database._shown_state(_Permissive(_VALUE), exc) is None
+
+
+def test_a_classified_error_prints_the_shown_state_never_its_sqlstate() -> None:
+    """Hold item 2: red on 05ee5958ff9, where ``shown`` was a bool and the text and ``code``
+    printed the ``sqlstate`` argument, here a ``str`` subclass that prints ``MRN42``."""
+    for connecting in (False, True):
+        err = database._classify_db_error(_Loud("23505"), "x", shown="23505", connecting=connecting)
+        assert _VALUE not in str(err)
+        assert _VALUE not in str(getattr(err, "code", ""))
+    refused = database._send_refusal(_Loud("23505"), _asyncpg_error(_Loud("23505"), "23505"))
+    assert isinstance(refused, NegativeAckError)
+    assert str(refused) == "database rejected the statement [23505]"
+    assert type(refused.code) is str and refused.code == "23505"
+
+
+def test_a_sqlstate_subclass_is_no_sqlstate() -> None:
+    """Hold item 3: red on 05ee5958ff9, whose ``isinstance`` test let a ``str`` subclass in the
+    ``sqlstate`` attribute be printed by the traceback line as ``[MRN42]``. The one exact-type test
+    closes the attribute read and the ``args[0]`` read of every reader."""
+    from messagefoundry.redaction import driver_sqlstate_of, reads_as_a_sqlstate
+
+    assert not reads_as_a_sqlstate(_Loud("23505"))
+    exc = _raised(_asyncpg_error(_VALUE, _Loud("23505")))
+    assert _VALUE not in safe_traceback((type(exc), exc, None))
+    assert driver_sqlstate_of(exc) is None
+    assert database._shown_state(database._log_sqlstate(exc), exc) is None
+    shaped = DriverError(_Loud("23505"), "x")
+    assert database._sqlstate(shaped) is None and database._log_sqlstate(shaped) is None
+    assert driver_sqlstate_of(shaped) is None
+    assert _VALUE not in database._safe_db_error(shaped)
+
+
+async def test_a_probe_prints_no_sqlstate_subclass() -> None:
+    """Hold item 2, the probe's caller: red on 05ee5958ff9, whose ``test_connection`` error read
+    ``database rejected the statement [MRN42]`` for this asyncpg error."""
+    dest = _dest()
+    dest._pool = _FakePool(_FakeConn(_FakeCursor(_asyncpg_error(_Loud("23505"), "23505"))))
+    with pytest.raises(DeliveryError) as failed:
+        await dest.test_connection()
+    assert _VALUE not in str(failed.value)
+    assert _VALUE not in str(getattr(failed.value, "code", ""))
+    assert _VALUE not in safe_exc(failed.value)
+
+
 async def test_an_asyncpg_message_in_a_send_is_dead_lettered_naming_no_state(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

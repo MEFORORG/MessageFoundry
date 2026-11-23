@@ -109,8 +109,10 @@ def test_is_transient_by_sqlstate() -> None:
 
 
 def test_classify_db_error() -> None:
-    assert type(_classify_db_error("08S01", "x")) is DeliveryError  # transient → retry
-    permanent = _classify_db_error("23000", "constraint")
+    assert (
+        type(_classify_db_error("08S01", "x", shown="08S01")) is DeliveryError
+    )  # transient → retry
+    permanent = _classify_db_error("23000", "constraint", shown="23000")
     assert isinstance(permanent, NegativeAckError) and permanent.permanent is True
 
 
@@ -149,7 +151,7 @@ def test_classify_db_error_never_carries_the_driver_message(state: str, message:
 
     Red mutation: restore the ``: {message}`` suffix on either branch. Both arms red.
     """
-    err = _classify_db_error(state, str(_driver_exc(state, message)))
+    err = _classify_db_error(state, str(_driver_exc(state, message)), shown=state)
     assert _SYNTHETIC_ID not in str(err)
     assert "duplicate key" not in str(err).lower()
     assert "Key (mrn)" not in str(err)
@@ -161,11 +163,13 @@ def test_classify_db_error_keeps_the_sqlstate_and_the_driver_error_number() -> N
     Red mutation: drop ``_driver_code`` from the detail — the second assertion reds while the
     PHI-freedom tests above stay green, so the two properties are pinned independently.
     """
-    permanent = _classify_db_error("23000", str(_driver_exc("23000", _SQLSERVER_DUP)))
+    permanent = _classify_db_error(
+        "23000", str(_driver_exc("23000", _SQLSERVER_DUP)), shown="23000"
+    )
     assert "[23000]" in str(permanent)
     assert "driver error 2627" in str(permanent)
     link_down = str(_driver_exc("08S01", "[08S01] link failure (10054) (SQLDriverConnect)"))
-    transient = _classify_db_error("08S01", link_down)
+    transient = _classify_db_error("08S01", link_down, shown="08S01")
     assert isinstance(transient, DeliveryError) and "driver error 10054" in str(transient)
 
 
@@ -1046,17 +1050,17 @@ def test_classify_db_error_marks_connection_faults() -> None:
     marked for the lane-stopping arm instead of reading as a per-message reject.
 
     Red on the old code: every permanent state was a plain reject with neither marker."""
-    login = _classify_db_error("28000", str(_login_failed()), connecting=True)
+    login = _classify_db_error("28000", str(_login_failed()), connecting=True, shown="28000")
     assert isinstance(login, NegativeAckError) and login.permanent
     assert login.credential_fault and not login.config_fault
     assert "svc_feed" not in str(login) and "[28000]" in str(login)  # #1661 still holds
-    no_driver = _classify_db_error("IM002", str(_no_driver()), connecting=True)
+    no_driver = _classify_db_error("IM002", str(_no_driver()), connecting=True, shown="IM002")
     assert isinstance(no_driver, NegativeAckError) and no_driver.permanent
     assert no_driver.config_fault and not no_driver.credential_fault
     # Off the connect path a permanent state is the statement's own and keeps no marker, so an
     # IM001 one message's parameter shape raises dead-letters that message, not the lane.
     for state in ("42000", "28000", "IM001", "01000"):
-        plain = _classify_db_error(state, "x")
+        plain = _classify_db_error(state, "x", shown=state)
         assert isinstance(plain, NegativeAckError) and plain.permanent
         assert not plain.credential_fault and not plain.config_fault
 
@@ -1065,13 +1069,15 @@ def test_classify_db_error_connecting_is_never_a_per_message_reject() -> None:
     """Before the statement runs no message can be at fault. unixODBC's missing driver library
     (``01000``) is a config fault there; any other permanent state retries, since a server in
     recovery or failing over may refuse a login under 42000 or HY000."""
-    login = _classify_db_error("28000", "x", connecting=True)
+    login = _classify_db_error("28000", "x", connecting=True, shown="28000")
     assert isinstance(login, NegativeAckError) and login.credential_fault
-    no_lib = _classify_db_error("01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True)
+    no_lib = _classify_db_error(
+        "01000", "Can't open lib (0) (SQLDriverConnect)", connecting=True, shown="01000"
+    )
     assert isinstance(no_lib, NegativeAckError) and no_lib.config_fault
     # Only 01000 of class 01: an invalid connection-string attribute (01S00) is retried.
     for state in ("42000", "HY000", "08001", "01S00"):
-        assert type(_classify_db_error(state, "x", connecting=True)) is DeliveryError
+        assert type(_classify_db_error(state, "x", connecting=True, shown=state)) is DeliveryError
 
 
 async def test_connect_codec_error_is_not_read_as_a_sqlstate() -> None:
