@@ -113,7 +113,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
-from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
+from messagefoundry.hostlist import allow_entry_problem, names_no_host, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -1238,9 +1238,6 @@ class StoreSettings(_Section):
             # `server` row of docs/CONFIGURATION.md says what an empty value means there.
             server = self.server or ""  # `missing` above already refused None
             if self.backend is StoreBackend.SQLSERVER:
-                # Here, not at module level: importing the transports package loads this module.
-                from messagefoundry.transports.db_endpoint import names_no_host
-
                 unnamed = names_no_host(server)
             else:
                 unnamed = bool(server) and not server.strip()

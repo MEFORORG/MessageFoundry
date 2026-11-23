@@ -26,6 +26,8 @@ or allowed everything, would fail too. Nothing here touches the network.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -35,12 +37,13 @@ from pydantic import ValidationError
 
 from messagefoundry.__main__ import _warn_on_an_unrevoked_store_hop
 from messagefoundry.auth.trust_anchors import smtp_hop_anchor_spec
-from messagefoundry.config.models import Destination
+from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AiSettings,
     AlertsSettings,
     AuthSettings,
+    EgressSettings,
     LoggingSettings,
     SecurityEnforcement,
     StoreBackend,
@@ -60,9 +63,14 @@ from messagefoundry.config.tls_policy import (
     is_loopback_hop_host,
     resolve_trust_anchor,
 )
+from messagefoundry.pipeline.reference_sync import database_source_dsn
 from messagefoundry.restricted_file import _loopback_share_problem
 from messagefoundry.store.postgres import _build_ssl
-from messagefoundry.transports.database import DatabaseDestination, DatabaseSource
+from messagefoundry.transports.database import (
+    DatabaseDestination,
+    DatabaseLookupExecutor,
+    DatabaseSource,
+)
 from messagefoundry.transports.mllp import InsecureHopGuard
 from messagefoundry.transports.strict_requests import _stays_on_the_box
 from messagefoundry.transports.tcp import TcpDestination
@@ -171,6 +179,8 @@ _GENERIC_SERVERS_NAMING_NO_HOST = [
     ":5432",
     "[]",
     "[ ]:5432",
+    "[,]",
+    ":1433:",
     ",1433",
     " ,db.example",
     "db.example,",
@@ -220,6 +230,98 @@ def test_nothing_declared_covers_a_generic_hop_with_no_named_host(
         connector(config(server="  ", **declared))
     with active_hop_posture(ENFORCING):
         assert connector(config(server=REMOTE, **declared))
+
+
+# --- the SQL Server preset: Database, DatabasePoll, DatabaseLookup, DatabaseRef ---------------------
+
+#: "" is left out: the connectors refuse it earlier, as a missing setting.
+_PRESET_NO_HOST = ["  ", ":1433", "[]", ",1433", "[,]", ":1433:"]
+_PRESET_BASE = {"database": "d", "statement": "INSERT INTO t (x) VALUES (:x)"}
+
+
+def _preset_dest(**overrides: object) -> Destination:
+    attested = bool(overrides.pop("tls_hop_attested", False))
+    return Destination(
+        name="OB_DB_PRE",
+        type=ConnectorType.DATABASE,
+        settings={**_PRESET_BASE, **overrides},
+        tls_hop_attested=attested,
+        tls_hop_attested_reason="a segment the engine cannot see" if attested else None,
+    )
+
+
+def _preset_source(**overrides: object) -> Source:
+    settings = {"database": "d", "poll_statement": "SELECT 1", **overrides}
+    return Source(name="IB_DB_PRE", type=ConnectorType.DATABASE, settings=settings)
+
+
+def _preset_lookup(**overrides: object) -> object:
+    settings = {"database": "d", **overrides}
+    return DatabaseLookupExecutor({"c": settings}, egress=EgressSettings(deny_by_default=False))
+
+
+def _preset_ref(**overrides: object) -> object:
+    return database_source_dsn({"database": "d", **overrides})
+
+
+_PRESET_ENTRY_POINTS = [
+    (DatabaseDestination, _preset_dest),
+    (DatabaseSource, _preset_source),
+    (None, _preset_lookup),
+    (None, _preset_ref),
+]
+
+
+@pytest.mark.parametrize("server", _PRESET_NO_HOST)
+@pytest.mark.parametrize("posture", [ENFORCING, HopPosture(enforcing=False), None], ids=str)
+@pytest.mark.parametrize(("connector", "config"), _PRESET_ENTRY_POINTS)
+def test_a_sql_server_preset_server_naming_no_host_is_refused_at_every_posture(
+    connector: Callable[[Any], object] | None,
+    config: Callable[..., Any],
+    posture: HopPosture | None,
+    server: str,
+) -> None:
+    """It would reach the driver as ``SERVER=,1433``. CONTROL: a named host builds at the same
+    posture."""
+
+    def build(**overrides: object) -> object:
+        made = config(**overrides)
+        return made if connector is None else connector(made)
+
+    with active_hop_posture(posture), pytest.raises(InsecureHopRefused, match="names no host"):
+        build(server=server)
+    with active_hop_posture(posture):
+        assert build(server=LOOPBACK)
+
+
+def test_a_database_ref_with_an_empty_server_is_refused() -> None:
+    """The DatabaseRef path has no required-setting check ahead of the build."""
+    with active_hop_posture(None), pytest.raises(InsecureHopRefused, match="names no host"):
+        database_source_dsn({"database": "d", "server": ""})
+
+
+@pytest.mark.parametrize("server", ["  ", ":1433"])
+def test_an_attestation_does_not_cover_a_preset_server_with_no_host(server: str) -> None:
+    with active_hop_posture(ENFORCING), pytest.raises(InsecureHopRefused, match="names no host"):
+        DatabaseDestination(_preset_dest(server=server, tls_hop_attested=True))
+    with active_hop_posture(ENFORCING):
+        assert DatabaseDestination(_preset_dest(server=REMOTE, tls_hop_attested=True))
+
+
+# --- the leaf module: settings may not import the transports package -----------------------------
+
+
+def test_validating_a_sql_server_store_does_not_import_the_transports_package() -> None:
+    """In a subprocess, so another test's imports cannot mask it."""
+    code = (
+        "import sys\n"
+        "from messagefoundry.config.settings import StoreBackend, StoreSettings\n"
+        "StoreSettings(backend=StoreBackend.SQLSERVER, server='db.example', database='d',"
+        " username='u')\n"
+        "raise SystemExit(1 if 'messagefoundry.transports' in sys.modules else 0)\n"
+    )
+    done = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
 
 
 # --- what a blank [store].server means on each backend ------------------------------------------

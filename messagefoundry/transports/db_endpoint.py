@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any, NamedTuple
 
-from messagefoundry.hostlist import port_or_zero
+from messagefoundry.hostlist import port_or_zero, split_generic_server
 
 #: The port the SQL Server preset's connection string uses when ``port`` is not set.
 SQLSERVER_DEFAULT_PORT = 1433
@@ -66,37 +66,6 @@ def _preset_port(value: object) -> int | None:
     except (ValueError, OverflowError):
         return None
     return port if 1 <= port <= 65535 else None
-
-
-def split_generic_server(server: str) -> tuple[str, str]:
-    """Split a generic-dialect ``server`` into its host and the text after a port separator, which
-    is ``""`` when it carries none and is not necessarily a port (:func:`port_or_zero` decides).
-
-    ``host:port`` and ``[v6]:port`` are split. A bare IPv6 literal carries more than one colon and
-    is left whole. A comma is NOT split on (BACKLOG #4874): libpq reads a comma in a host as a list
-    of hosts, so the text before it need not be the only host dialled. Both callers deal with a
-    comma before they get here: the egress reading refuses it, and :func:`generic_hop_endpoint`
-    reads it as its docstring says."""
-    host = server.strip()
-    in_server = ""
-    if host.startswith("["):  # a bracketed IPv6 literal, optionally followed by ":port"
-        close = host.find("]")
-        if close != -1:
-            host, rest = host[1:close], host[close + 1 :]
-            in_server = rest[1:] if rest.startswith(":") else ""
-    elif host.count(":") == 1:  # "host:port" — a bare IPv6 literal carries more than one colon
-        host, _, in_server = host.partition(":")
-    return host.strip(), in_server.strip()
-
-
-def names_no_host(server: str) -> bool:
-    """Whether ``server`` is blank, a bare port or empty brackets, or has an empty entry on either
-    side of a comma (BACKLOG #5512). A driver has to pick such a destination itself, so no reading
-    here can place the hop.
-
-    **Not every value with no host.** A single colon reads as ``host:port``, so a protocol prefix
-    with nothing after it, such as ``tcp:``, counts as naming the host ``tcp``."""
-    return not all(split_generic_server(entry)[0] for entry in server.split(","))
 
 
 def _exact_split(text: str) -> tuple[str, str] | None:

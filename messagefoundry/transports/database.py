@@ -108,6 +108,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.connection_names import db_lookup_record_name, inbound_record_name
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.hostlist import names_no_host
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
     CallGate,
@@ -160,7 +161,6 @@ from messagefoundry.transports.db_endpoint import (
     generic_driver_family,
     generic_hop_endpoint,
     is_remote_spelling,
-    names_no_host,
     odbc_keyword_name,
     odbc_param,
     sqlserver_preset_refusal,
@@ -264,7 +264,8 @@ def _build_dsn(
 
     It refuses settings under which the driver might not read ``SERVER={server},{port}`` as one
     host and its port (:func:`~messagefoundry.transports.db_endpoint.sqlserver_preset_refusal`,
-    BACKLOG #4873).
+    BACKLOG #4873), and a ``server`` that :func:`~messagefoundry.hostlist.names_no_host` reads,
+    whatever the posture or declaration (BACKLOG #5512).
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
     ``ServerCertificate`` pin. A weakened TLS posture is **refused** (:func:`_weakened_tls_permitted`,
@@ -284,6 +285,14 @@ def _build_dsn(
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     where = hop_name_prefix(connection)
+    # BACKLOG #5512: before the preset's own refusals and the weakened-TLS check, and at every
+    # posture, as on the generic dialect. `,{port}` is added to whatever `server` holds, so one that
+    # names no host reaches the driver as `SERVER=,1433`. No declaration speaks for a hop with no
+    # named destination.
+    if names_no_host(str(s.get("server", ""))):
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
+        )
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
         raise ValueError(f"{where}DATABASE {refusal}")
@@ -1996,7 +2005,7 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
     they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
     or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, a ``server``
-    that :func:`~messagefoundry.transports.db_endpoint.names_no_host` reads is refused whatever the
+    that :func:`~messagefoundry.hostlist.names_no_host` reads is refused whatever the
     posture or declaration (BACKLOG #5512), an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
@@ -2259,7 +2268,7 @@ def _build_connection(
     generic arm's own refusal is :func:`generic_cleartext_hop_guard`, called by the connectors beside
     this dispatcher rather than from inside it, so a direct DSN-shape caller (tests, checks) still gets
     a string back without a hop decision it did not ask for. The exception is a generic ``server``
-    that :func:`~messagefoundry.transports.db_endpoint.names_no_host` matches, which
+    that :func:`~messagefoundry.hostlist.names_no_host` matches, which
     :func:`_build_odbc_dsn` refuses at every posture (BACKLOG #5512).
 
     ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
