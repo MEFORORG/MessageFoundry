@@ -27,6 +27,11 @@ import * as path from "node:path";
  * source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).
  *
+ * Builds covered: debugpy 1.8.0 and later. The sys.path steps of debugpy's `run_file` and
+ * `run_module` read at tags v1.8.0, v1.8.21 and v1.8.22 and at `main` (2026-11-23) take two shapes,
+ * 1.8.0 to 1.8.21, and 1.8.22 on, whose two runners skip their prepend under `-P`; and b532w3-ide-debugpy.test.ts
+ * runs the launch under a stand-in for each. No build before 1.8.0 was read.
+ *
  * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads an
  * env file into the debuggee, the workspace's `.env` by default. At least a PYTHONPATH that env file
  * sets, whichever file `python.envFile` names, or one the window inherits, can still put a workspace

@@ -5,8 +5,10 @@
 // `sys.path` when they run a MODULE, whatever `-P` says (debugpy commit 7959635126, first released
 // in 1.8.22, added the `safe_path` check), so the launch hands debugpy a PROGRAM the extension
 // writes into its own storage folder, for which those builds add only that folder. testBench.ts
-// imports vscode, so its wiring is pinned by reading its source; the program itself is run under a
-// stand-in for both debugpy 1.8.21 runners. A PYTHONPATH entry, which `-P` keeps, is out of scope
+// imports vscode, so its wiring is pinned by reading its source; the program itself is run under
+// stand-ins for the two runner shapes debugpy has shipped from 1.8.0 on: 1.8.0 to 1.8.21, and 1.8.22
+// to `main` as read on 2026-11-23, which honour `-P`. No build before 1.8.0 is covered (the floor
+// TEST_BENCH_DEBUG_PROGRAM names). A PYTHONPATH entry, which `-P` keeps, is out of scope
 // (TEST_BENCH_DEBUG_PROGRAM's open limit). The write itself is vscode-free (testBenchDebugProgram.ts),
 // so it is run against a real temporary folder, with one fs call made to fail where a case needs it.
 import * as assert from "assert";
@@ -52,7 +54,9 @@ function testBench(): string {
 }
 
 /** debugpy 1.8.21's `run_module` (src/debugpy/server/cli.py at tag v1.8.21), reduced to its
- *  sys.path step and the run: it inserts "" with no check of `sys.flags.safe_path`. */
+ *  sys.path step and the run: it inserts "" with no check of `sys.flags.safe_path`. The sys.path
+ *  steps of `run_module` and `run_file` read the same at tag v1.8.0, so these stand in for 1.8.0
+ *  to 1.8.21; no tag before v1.8.0 was read. */
 const OLD_RUN_MODULE = [
   "import runpy, sys",
   "sys.argv = ['messagefoundry'] + sys.argv[1:]",
@@ -69,6 +73,38 @@ const OLD_RUN_FILE = [
   "    sys.path.insert(0, os.path.dirname(target))",
   "runpy.run_path(target, run_name='__main__')",
 ].join("\n");
+
+/** debugpy 1.8.22's `_skip_sys_path_prepend`, which `run_module` and `run_file` consult from that
+ *  release on (identical at debugpy `main`, read 2026-11-23): Python's own rule for `-I` and `-P`. */
+const SKIP_PREPEND = [
+  "def _skip_sys_path_prepend():",
+  "    return sys.flags.isolated or getattr(sys.flags, 'safe_path', False)",
+].join("\n");
+
+/** debugpy 1.8.22's `run_module`, reduced the same way: "" goes in only when `-P` is off. */
+const NEW_RUN_MODULE = [
+  "import runpy, sys",
+  SKIP_PREPEND,
+  "sys.argv = ['messagefoundry'] + sys.argv[1:]",
+  "if not _skip_sys_path_prepend():",
+  '    sys.path.insert(0, "")',
+  "runpy.run_module('messagefoundry', run_name='__main__', alter_sys=True)",
+].join("\n");
+
+/** debugpy 1.8.22's `run_file`, reduced the same way: the file's folder goes in only when `-P` is off. */
+const NEW_RUN_FILE = [
+  "import os, runpy, sys",
+  SKIP_PREPEND,
+  "target = sys.argv[1]",
+  "sys.argv = sys.argv[1:]",
+  "if os.path.isfile(target):",
+  "    if not _skip_sys_path_prepend():",
+  "        sys.path.insert(0, os.path.dirname(target))",
+  "runpy.run_path(target, run_name='__main__')",
+].join("\n");
+
+/** Runs a runner stand-in as the debuggee's interpreter would, and returns its output lines. */
+type Runner = (code: string, args: string[], options?: readonly string[]) => string[];
 
 /** A Python 3.11 or later on PATH, which `-P` needs, or undefined. */
 function python(): string | undefined {
@@ -130,46 +166,94 @@ suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch 
     );
   });
 
-  test("under debugpy 1.8.21's runners, the module form is shadowed by the workspace and the program is not", function () {
+  /**
+   * A temporary launch: a workspace, the working directory, holding a `messagefoundry.py`; the
+   * installed package standing in on PYTHONPATH, which `-P` keeps; and the program as
+   * writeDebugProgram writes it. `run` starts the interpreter as the debug adapter's launcher does,
+   * the launch's `python` with its `pythonArgs` first (debugpy's launcher/handlers.py at `main`),
+   * then a script in a folder of its own in place of the debugpy server's folder, so the
+   * interpreter itself adds no working directory and only the runner stand-in can. The installed `__main__` prints its
+   * arguments, then whether the working directory, `""` or the program's folder is on `sys.path`.
+   */
+  function launch(exe: string, body: (l: { ws: string; program: string; run: Runner }) => void): void {
+    const base = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "b532w3-ide-debugpy-")));
+    try {
+      const ws = path.join(base, "ws");
+      fs.mkdirSync(ws);
+      fs.writeFileSync(path.join(ws, "messagefoundry.py"), "print('SHADOWED')\n");
+      const site = path.join(base, "site");
+      fs.mkdirSync(path.join(site, "messagefoundry"), { recursive: true });
+      fs.writeFileSync(path.join(site, "messagefoundry", "__init__.py"), "");
+      const dir = path.join(base, "storage", TEST_BENCH_DEBUG_PROGRAM.folder);
+      fs.writeFileSync(
+        path.join(site, "messagefoundry", "__main__.py"),
+        [
+          "import os, sys",
+          "print('INSTALLED', sys.argv[1:])",
+          `seen = {os.path.normcase(os.path.abspath(p or os.getcwd())) for p in sys.path}`,
+          `print('CWD' if os.path.normcase(os.getcwd()) in seen else 'NO-CWD',`,
+          `      'DIR' if os.path.normcase(${JSON.stringify(dir)}) in seen else 'NO-DIR')`,
+          "",
+        ].join("\n"),
+      );
+      fs.mkdirSync(dir, { recursive: true });
+      const program = path.join(dir, debugProgramFileName(TEST_BENCH_DEBUG_PROGRAM.source));
+      fs.writeFileSync(program, TEST_BENCH_DEBUG_PROGRAM.source);
+      const env = { ...process.env, PYTHONPATH: site, PYTHONSAFEPATH: "" };
+      const server = path.join(base, "debugpy");
+      fs.mkdirSync(server);
+      let runs = 0;
+      const run: Runner = (code, args, options = INTERPRETER_OPTIONS) => {
+        const runner = path.join(server, `runner${runs++}.py`);
+        fs.writeFileSync(runner, code);
+        const r = spawnSync(exe, [...options, runner, ...args], { cwd: ws, env, encoding: "utf8", timeout: 20000 });
+        assert.strictEqual(r.status, 0, r.stderr);
+        return r.stdout.trim().split(/\r?\n/);
+      };
+      body({ ws, program, run });
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }
+
+  test("under debugpy 1.8.0 to 1.8.21's runners, the module form is shadowed by the workspace and the program is not", function () {
     const exe = python();
     if (exe === undefined) {
       this.skip(); // no Python 3.11 or later on PATH; the wiring is pinned above
     }
     this.timeout(30000);
-    const base = fs.mkdtempSync(path.join(os.tmpdir(), "b532w3-ide-debugpy-"));
-    try {
-      // The workspace, the launch's working directory, holds a module named like the package.
-      const ws = path.join(base, "ws");
-      fs.mkdirSync(ws);
-      fs.writeFileSync(path.join(ws, "messagefoundry.py"), "print('SHADOWED')\n");
-      // The installed package stands in on PYTHONPATH, which `-P` keeps.
-      const site = path.join(base, "site");
-      fs.mkdirSync(path.join(site, "messagefoundry"), { recursive: true });
-      fs.writeFileSync(path.join(site, "messagefoundry", "__init__.py"), "");
-      fs.writeFileSync(path.join(site, "messagefoundry", "__main__.py"), "import sys\nprint('INSTALLED', sys.argv[1:])\n");
-      // The program, as writeDebugProgram writes it.
-      const dir = path.join(base, "storage", TEST_BENCH_DEBUG_PROGRAM.folder);
-      fs.mkdirSync(dir, { recursive: true });
-      const program = path.join(dir, debugProgramFileName(TEST_BENCH_DEBUG_PROGRAM.source));
-      fs.writeFileSync(program, TEST_BENCH_DEBUG_PROGRAM.source);
-      const env = { ...process.env, PYTHONPATH: site, PYTHONSAFEPATH: "" };
-      const run = (code: string, args: string[]): string => {
-        const r = spawnSync(exe!, [...INTERPRETER_OPTIONS, "-c", code, ...args], {
-          cwd: ws,
-          env,
-          encoding: "utf8",
-          timeout: 20000,
-        });
-        assert.strictEqual(r.status, 0, r.stderr);
-        return r.stdout.trim();
-      };
+    launch(exe!, ({ program, run }) => {
       // THE CONTROL: the module form, which the launch used before, runs the workspace's module.
-      assert.strictEqual(run(OLD_RUN_MODULE, ["dryrun"]), "SHADOWED");
-      // The program runs the installed package, with the launch's arguments.
-      assert.strictEqual(run(OLD_RUN_FILE, [program, "dryrun", "--show-phi"]), "INSTALLED ['dryrun', '--show-phi']");
-    } finally {
-      fs.rmSync(base, { recursive: true, force: true });
+      assert.deepStrictEqual(run(OLD_RUN_MODULE, ["dryrun"]), ["SHADOWED"]);
+      // The program runs the installed package, with the launch's arguments. These builds put the
+      // program's folder on the import path, never the working directory.
+      assert.deepStrictEqual(run(OLD_RUN_FILE, [program, "dryrun", "--show-phi"]), [
+        "INSTALLED ['dryrun', '--show-phi']",
+        "NO-CWD DIR",
+      ]);
+    });
+  });
+
+  test("under debugpy 1.8.22 and later's runners, the launch's -P keeps both the working directory and the program's folder off the import path", function () {
+    const exe = python();
+    if (exe === undefined) {
+      this.skip(); // no Python 3.11 or later on PATH; the wiring is pinned above
     }
+    this.timeout(30000);
+    launch(exe!, ({ program, run }) => {
+      // THE CONTROL: without -P, these builds put "" first for a module too, so the workspace's
+      // module wins. It is -P from pythonArgs that turns the prepend off.
+      const noP = INTERPRETER_OPTIONS.filter((o) => o !== "-P");
+      assert.ok(noP.length === INTERPRETER_OPTIONS.length - 1, "INTERPRETER_OPTIONS holds no -P");
+      assert.deepStrictEqual(run(NEW_RUN_MODULE, ["dryrun"], noP), ["SHADOWED"]);
+      // With the launch's options, the module form is not shadowed either.
+      assert.deepStrictEqual(run(NEW_RUN_MODULE, ["dryrun"]), ["INSTALLED ['dryrun']", "NO-CWD NO-DIR"]);
+      // The program the launch hands debugpy runs the installed package, with nothing added.
+      assert.deepStrictEqual(run(NEW_RUN_FILE, [program, "dryrun", "--show-phi"]), [
+        "INSTALLED ['dryrun', '--show-phi']",
+        "NO-CWD NO-DIR",
+      ]);
+    });
   });
 });
 
