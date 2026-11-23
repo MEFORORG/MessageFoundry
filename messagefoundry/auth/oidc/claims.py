@@ -261,20 +261,29 @@ def _check_core_claims(
         raise ClaimsError("claim_iss", "iss does not match the pinned issuer")
 
     aud = claims.get("aud")
-    # A ``list`` aud whose elements are unhashable (a list-of-lists, or a list carrying a dict)
-    # raises ``TypeError`` from ``set(aud)`` — the one malformed shape that escapes past the fall-
-    # through to an empty set. Convert it into the same audited ``claim_aud`` rejection the
-    # membership check below emits, rather than a 500 with no closed-set audit row. The body is kept
-    # to the single set-building expression so the only TypeError caught is the one from that call.
-    try:
-        audiences = {aud} if isinstance(aud, str) else set(aud) if isinstance(aud, list) else set()
-    except TypeError as exc:
-        raise ClaimsError("claim_aud", "aud is malformed") from exc
+    # RFC 7519 section 4.1.3: an array ``aud`` is an array of strings. One carrying a non-string or
+    # an empty element is malformed, and is refused even when it also names our client_id rather
+    # than having the stray element silently ignored (BACKLOG #5339). Checking the elements first
+    # also keeps an unhashable one (a nested list or a dict) away from ``set()``, whose TypeError
+    # would otherwise escape as a 500 with no closed-set audit row. Any other non-string shape falls
+    # through to an empty set and the membership refusal below.
+    if isinstance(aud, list):
+        if not all(isinstance(entry, str) and entry for entry in aud):
+            raise ClaimsError("claim_aud", "aud is malformed")
+        audiences = set(aud)
+    else:
+        audiences = {aud} if isinstance(aud, str) else set()
     if policy.client_id not in audiences:
         raise ClaimsError("claim_aud", "aud does not contain the client_id")
-    # With multiple audiences, azp MUST be present and equal to our client_id (OIDC core 3.1.3.7/2).
-    if len(audiences) > 1 and claims.get("azp") != policy.client_id:
-        raise ClaimsError("claim_azp", "multi-aud token without a matching azp")
+    # OIDC Core 1.0, ID Token Validation, item 4: with multiple audiences, azp must be present.
+    # Item 5: a present azp must equal our client_id whatever the audience count, so a single-aud
+    # token whose authorized party is another client is refused too (BACKLOG #5339). ``in`` rather
+    # than ``get`` so an azp present as null is refused, not read as absent.
+    if "azp" in claims:
+        if claims["azp"] != policy.client_id:
+            raise ClaimsError("claim_azp", "azp does not match the client_id")
+    elif len(audiences) > 1:
+        raise ClaimsError("claim_azp", "multi-aud token without an azp")
 
     skew = policy.clock_skew_seconds
     exp = _require_number(claims, "exp", "expired")

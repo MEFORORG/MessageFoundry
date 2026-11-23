@@ -429,17 +429,83 @@ def test_unknown_kid_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
     assert exc.value.reason == "unknown_kid"
 
 
-def test_multi_aud_without_azp_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
-    jws = _mint(rsa_key, "k1", _good_claims(aud=["mefor-console", "another"]))
+# --- claims: azp is checked whenever present, and a malformed aud array is refused (BACKLOG #5339) --
+#
+# OpenID Connect Core 1.0, ID Token Validation, item 5: if an azp claim is present, the client must
+# verify that its client_id is the claim value, whatever the audience count. RFC 7519 section 4.1.3:
+# an array aud is an array of case-sensitive strings, so a non-string or empty element is malformed.
+
+_ABSENT = object()
+
+
+@pytest.mark.parametrize(
+    ("aud", "azp"),
+    [
+        # The single-aud rows were accepted before BACKLOG #5339: azp was read only with 2+ auds.
+        ("mefor-console", "another-client"),
+        ("mefor-console", ""),
+        ("mefor-console", None),
+        ("mefor-console", 7),
+        ("mefor-console", ["mefor-console"]),
+        (["mefor-console"], "another-client"),
+        (["mefor-console", "another"], "another"),
+        (["mefor-console", "another"], _ABSENT),
+    ],
+)
+def test_an_azp_that_is_not_our_client_is_refused(
+    rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
+) -> None:
+    over = {"aud": aud} if azp is _ABSENT else {"aud": aud, "azp": azp}
+    jws = _mint(rsa_key, "k1", _good_claims(**over))
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert exc.value.reason == "claim_azp"
+    assert exc.value.reason in oidc.REASONS
 
 
-def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
-    jws = _mint(rsa_key, "k1", _good_claims(aud=["mefor-console", "another"], azp="mefor-console"))
+@pytest.mark.parametrize(
+    ("aud", "azp"),
+    [
+        ("mefor-console", "mefor-console"),
+        (["mefor-console"], "mefor-console"),
+        (["mefor-console", "another"], "mefor-console"),
+        ("mefor-console", _ABSENT),
+        (["mefor-console"], _ABSENT),
+        (["mefor-console", "mefor-console"], _ABSENT),
+    ],
+)
+def test_a_matching_or_absent_azp_is_accepted(
+    rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
+) -> None:
+    over = {"aud": aud} if azp is _ABSENT else {"aud": aud, "azp": azp}
+    jws = _mint(rsa_key, "k1", _good_claims(**over))
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"
+
+
+@pytest.mark.parametrize(
+    "aud",
+    [
+        ["mefor-console", 5],
+        ["mefor-console", None],
+        ["mefor-console", ""],
+        ["mefor-console", True],
+        ["mefor-console", 1.5],
+        ["mefor-console", ["x"]],
+        ["mefor-console", {"a": 1}],
+    ],
+)
+def test_a_malformed_aud_array_is_refused_even_when_it_names_our_client(
+    rsa_key: rsa.RSAPrivateKey, aud: Any
+) -> None:
+    """Each array carries our client_id and a matching azp, so only the malformed element can refuse
+    it. Before BACKLOG #5339 the scalar cases were accepted; the unhashable ones (a nested list, a
+    dict) raised TypeError from ``set()`` and are refused by the same element check now."""
+    jws = _mint(rsa_key, "k1", _good_claims(aud=aud, azp="mefor-console"))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_aud"
+    assert exc.value.reason in oidc.REASONS
 
 
 # --- claims: two malformed-IdP shapes reject as audited ClaimsErrors, not 500s (BACKLOG #1016) -----
@@ -454,22 +520,6 @@ def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey)
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert exc.value.reason == "nonce_mismatch"
-    assert exc.value.reason in oidc.REASONS
-
-
-@pytest.mark.parametrize("aud", [[["mefor-console"]], [{"a": 1}]])
-def test_an_unhashable_aud_element_is_claim_aud_not_a_crash(
-    rsa_key: rsa.RSAPrivateKey, aud: Any
-) -> None:
-    """A ``list`` aud carrying an unhashable element (a nested list, or a dict) raises ``TypeError``
-    from ``set(aud)`` — the one malformed shape that escapes the fall-through to an empty set. It
-    must reject as an audited ``claim_aud``, not a 500. A top-level dict/int/None already falls
-    through cleanly, so reaching the guard proves it fired: pre-fix the path raises before the
-    membership check below it could run."""
-    jws = _mint(rsa_key, "k1", _good_claims(aud=aud))
-    with pytest.raises(oidc.ClaimsError) as exc:
-        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
-    assert exc.value.reason == "claim_aud"
     assert exc.value.reason in oidc.REASONS
 
 
