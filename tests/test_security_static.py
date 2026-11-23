@@ -815,6 +815,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     # it, a tchar, so each character is read once; the optional tail is one ``.*`` with nothing
     # after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
+    # BACKLOG #5062 -- the server schema check's EXEC-of-a-variable reading, in
+    # ``_assigned_and_run``. Unresolvable BY CONSTRUCTION: both patterns name the variable that
+    # ``_ASSIGNED_LITERAL`` captured from the DDL text being read, so there is no literal to write.
+    # The capture is ``(?P<var>\w+)``, and a ``\w`` character is never a regex metacharacter, so the
+    # splice adds only literal word characters, unescaped. The shapes are linear by inspection: each
+    # is an alternation of literal keywords joined by single ``\s*`` or ``\s+`` runs, quantified
+    # nowhere and inside no quantified group. No ``\s`` run is followed by a token that can match
+    # whitespace (``(``, ``@``, ``)``, the optional operator class, ``=``), so there is one way to
+    # split any prefix. The callers use the unanchored ``finditer``, and each start is a ``\b`` or
+    # an ``@`` before a literal.
+    "messagefoundry/store/server_schema_verify.py": (
+        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
+        "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
+    ),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
