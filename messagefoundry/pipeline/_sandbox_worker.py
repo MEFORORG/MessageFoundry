@@ -422,9 +422,9 @@ def _run_one(
             # e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's strict
             # JSON-bool slot — content-dependent, since a non-match returns None. Coercing to the
             # contract type here is what lets the parent demand a strict bool, and makes
-            # ``[sandbox].mode`` never change the routing decision (ADR 0087). An awaitable or a
-            # generator is refused first, as at mode=off (BACKLOG #5514).
-            result = bool(accepts_verdict(name, result))
+            # ``[sandbox].mode`` never change the routing decision (ADR 0087). An awaitable or an
+            # iterator is refused first, as at mode=off (BACKLOG #5514).
+            result = accepts_verdict(name, result)
     except (DbLookupError, FhirLookupError) as exc:
         if broker is not None:
             # mode=isolated: the lookup ran, or was refused, through the parent, so its error is the

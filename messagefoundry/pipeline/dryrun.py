@@ -161,7 +161,7 @@ class TraceHook(Protocol):
 
     def trace_accepts(
         self, pred: HandlerAccepts, name: str, payload: Message | RawMessage
-    ) -> bool: ...
+    ) -> object: ...
 
 
 def _handler_names(result: list[str] | str | None) -> list[str]:
@@ -359,10 +359,13 @@ def _accepted(
                     origin=origin,
                 )
             )
-        elif tracer is not None:
-            verdict = tracer.trace_accepts(pred, hname, payload)
         else:
-            verdict = accepts_verdict(hname, pred(payload))
+            # One refusal for both in-process branches (BACKLOG #5514): an awaitable or iterator
+            # verdict would read as True and accept every message, so it raises here instead.
+            verdict = accepts_verdict(
+                hname,
+                pred(payload) if tracer is None else tracer.trace_accepts(pred, hname, payload),
+            )
         if verdict:
             kept.append(hname)
     return kept

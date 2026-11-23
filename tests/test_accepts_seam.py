@@ -24,8 +24,9 @@ from __future__ import annotations
 import asyncio
 import functools
 import gc
+import re
 import warnings
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -1017,33 +1018,74 @@ def _returns_generator(msg: Any) -> Any:
     return _verdict_gen()
 
 
-@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
-def test_an_awaitable_or_generator_verdict_passes_validate_but_raises(
+async def _verdict_agen() -> AsyncIterator[bool]:
+    yield False
+
+
+class _Awaitable:
+    """An awaitable that is not a coroutine, such as a Future-like object."""
+
+    def __await__(self) -> Iterator[None]:
+        yield None
+
+
+_STATIC_PASSING_VERDICTS = [
+    pytest.param(_returns_coroutine, id="coroutine"),
+    pytest.param(_returns_generator, id="generator"),
+    pytest.param(lambda m: _verdict_agen(), id="async-generator"),
+    pytest.param(lambda m: _Awaitable(), id="awaitable"),
+    pytest.param(lambda m: filter(None, []), id="filter-iterator"),
+    pytest.param(lambda m: re.finditer("ESC", str(m)), id="finditer"),
+]
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+def test_an_awaitable_or_iterator_verdict_passes_validate_but_raises(
     tmp_path: Path, pred: Any
 ) -> None:
     reg = _reg(tmp_path, accepts={"h": pred})  # the static check does not see it
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        with pytest.raises(TypeError, match="accepts= predicate for handler 'h' returned a"):
+        with pytest.raises(
+            TypeError, match="accepts= predicate for handler 'h' returned an object"
+        ):
             route_only(reg, reg.inbound["IB"], ADT)
         gc.collect()
-    # The coroutine is closed before the raise, so no "was never awaited" warning leaks.
-    assert [w for w in caught if issubclass(w.category, RuntimeWarning)] == []
+    # The coroutine is closed before the raise, so no "was never awaited" warning leaks. Filtered on
+    # this test's own coroutine, since the collection can finalize an earlier test's garbage.
+    assert [w for w in caught if "_verdict_coro" in str(w.message)] == []
 
 
-@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
-def test_an_awaitable_or_generator_verdict_raises_on_the_traced_path(
+def test_a_started_generator_whose_finally_raises_still_names_the_handler(tmp_path: Path) -> None:
+    def gen() -> Iterator[bool]:
+        try:
+            yield False
+        finally:
+            raise ValueError("synthetic: finally boom")
+
+    def pred(msg: Any) -> Any:
+        g = gen()
+        next(g)
+        return g
+
+    reg = _reg(tmp_path, accepts={"h": pred})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
+        route_only(reg, reg.inbound["IB"], ADT)
+
+
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+def test_an_awaitable_or_iterator_verdict_raises_on_the_traced_path(
     tmp_path: Path, pred: Any
 ) -> None:
     reg = _reg(tmp_path, accepts={"h": pred})
     out = trace_dry_run(reg, ADT, inbound="IB", show_phi=True)
     assert out["disposition"] == MessageStatus.ERROR.value
     assert out["handlers"] == []
-    assert "returned a" in (out["error"] or "")
+    assert "returned an object" in (out["error"] or "")
 
 
-@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
-async def test_an_awaitable_or_generator_verdict_dead_letters(
+@pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)
+async def test_an_awaitable_or_iterator_verdict_dead_letters(
     store: MessageStore, tmp_path: Path, pred: Any
 ) -> None:
     ran: list[str] = []
@@ -1062,6 +1104,35 @@ async def test_an_awaitable_or_generator_verdict_dead_letters(
     assert status == MessageStatus.ERROR.value
     assert rows == [(Stage.INGRESS.value, OutboxStatus.DEAD.value)]
     assert ran == []
+
+
+@pytest.mark.parametrize("pred", [_returns_coroutine, _returns_generator])
+async def test_an_awaitable_or_iterator_verdict_is_a_content_error_on_the_fused_twin(
+    store: MessageStore, tmp_path: Path, pred: Any
+) -> None:
+    reg = _reg(tmp_path, accepts={"h": pred})
+    runner = RegistryRunner(
+        reg, store, claim_mode="pooled", egress=EgressSettings(deny_by_default=False)
+    )
+    fake_pool = _FakeSyncPool()
+    store.sync_handoff_pool = lambda stage: fake_pool  # type: ignore[attr-defined]
+    runner._fuse_route_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="t-fuse")
+    item = OutboxItem(
+        id="ing-1",
+        message_id="m-1",
+        channel_id="IB",
+        destination_name=None,
+        payload=ADT,
+        attempts=1,
+        stage=Stage.INGRESS.value,
+    )
+    try:
+        result = await runner._fused_route_and_handoff("IB", reg.inbound["IB"], item)
+    finally:
+        runner._fuse_route_executor.shutdown(wait=True)
+    assert isinstance(result.route_exc, TypeError)  # CONTENT, not INFRA
+    assert result.handed_off is False and result.names == []
+    assert fake_pool.acquired == 0
 
 
 @pytest.mark.parametrize(
@@ -1113,7 +1184,7 @@ def h_gen(msg):
 """
 
 
-def test_an_awaitable_or_generator_verdict_raises_in_the_sandbox_child(tmp_path: Path) -> None:
+def test_an_awaitable_or_iterator_verdict_raises_in_the_sandbox_child(tmp_path: Path) -> None:
     (tmp_path / "graph.py").write_text(_SANDBOX_AWAITABLE_GRAPH, encoding="utf-8")
     registry = load_config(tmp_path)
     ic = registry.inbound["IB_T"]
@@ -1126,7 +1197,12 @@ def test_an_awaitable_or_generator_verdict_raises_in_the_sandbox_child(tmp_path:
     )
     try:
         for raw, hname in ((ADT, "h_coro"), (ESC, "h_gen")):
-            with pytest.raises(Exception, match=f"handler '{hname}' returned a"):
+            # "sandbox failed accepts" is the parent's text for an error the CHILD reported, so the
+            # refusal ran across the process boundary rather than in the parent.
+            with pytest.raises(
+                SandboxError,
+                match=f"sandbox failed accepts '{hname}'.*'{hname}' returned an object",
+            ):
                 route_only(registry, ic, raw, sandbox=session, run_context=RunContext())
     finally:
         session.close()
