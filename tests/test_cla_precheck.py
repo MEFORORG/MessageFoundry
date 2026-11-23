@@ -219,7 +219,7 @@ def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
     malformed commit must still count toward the first page, or new-person slides into the
     first page's keys and rule 2's refusal is lost. A null author is now refused under rule 1,
     so the malformed shape here is one GitHub never sends: this guards the slot-keeping path as
-    defence in depth, and test_only_a_readable_unlinked_commit_keys_the_actions_view covers it
+    defence in depth, and test_only_a_readable_unlinked_commit_keys_the_first_page covers it
     for a refused commit."""
     malformed = {"oid": f"{1:040x}", "author": "not-an-object", "committer": None}
     pages = [
@@ -232,14 +232,15 @@ def test_a_malformed_first_page_commit_keeps_its_slot() -> None:
 
 
 def test_an_author_first_seen_past_the_hundredth_commit_is_refused() -> None:
-    """BACKLOG #5645: upstream's action never read commit 101, so its new author went unchecked.
-    The patched action reads past page one and asks that author to sign; rule 2 refuses them too,
-    until they sign."""
+    """BACKLOG #5645: upstream's action never read commit 101, so it never asked that commit's new
+    author to sign; rule 2 of this pre-check refused them. The patched action reads past page one
+    and asks that author to sign, and rule 2 still refuses them while the signature file lacks
+    their id."""
     refusals = _verdict("new_author_past_100")
     assert len(refusals) == 1 and "new-person" in refusals[0]
 
 
-def test_the_actions_view_is_the_first_page_however_short_it_is() -> None:
+def test_rule_two_keys_the_first_page_however_short_it_is() -> None:
     """Rule 2 keys the first page, whatever its length. An unsigned author first seen on page two
     is refused, even though fewer than 100 commits came before it. (Upstream's action read that
     one page only; the patched action reads page two as well and asks the author to sign.)"""
@@ -265,10 +266,14 @@ def test_an_author_past_the_first_page_who_signed_is_not_refused() -> None:
 
     assert evaluate(read, _ALLOWLIST, signed).refusals == ()
     assert len(evaluate(read, _ALLOWLIST, _no_signatures).refusals) == 1
-    assert calls == [1], "the signature file is read once, and only for an unseen author"
+    assert calls == [1], (
+        "the signature file is read once, and only for an author first seen past the first page"
+    )
     linked = fetch_commits(_Replay("linked_on_page_two"), "MEFORORG", "MessageFoundry", 7)
     evaluate(linked, _ALLOWLIST, signed)
-    assert calls == [1], "a pull request with no unseen author never reads the signature file"
+    assert calls == [1], (
+        "a pull request with no author first seen past the first page does not read the signature file"
+    )
 
 
 def _serve(pages: list[Mapping[str, Any]]) -> cla_precheck.Transport:
@@ -489,7 +494,7 @@ def test_both_rules_reach_the_first_annotations_and_the_rest_reach_the_log(
     ],
     ids=["unreadable-user", "null-committer", "readable"],
 )
-def test_only_a_readable_unlinked_commit_keys_the_actions_view(
+def test_only_a_readable_unlinked_commit_keys_the_first_page(
     committer: Mapping[str, Any] | None, refusals: int
 ) -> None:
     """A page-one unlinked commit is filed under its author name when its committer reads, as the
@@ -781,8 +786,8 @@ def test_every_first_page_commit_without_a_key_narrows_the_rule_two_reason(
 
 def test_a_fully_keyed_first_page_names_keys_not_people() -> None:
     """The author past page one is a first-page COMMITTER under a linked author, so they appear
-    in the action's page; only their key is absent. The reason says that, not that they appear
-    nowhere."""
+    on the first page; only their key is absent from its keys. The reason says that, not that they
+    appear nowhere."""
     bob = {"name": "Bob", "user": {"databaseId": 90000002, "login": "bob"}}
     pages = [
         _page([{"oid": f"{1:040x}", "author": _OCTO, "committer": bob}], 2, True),

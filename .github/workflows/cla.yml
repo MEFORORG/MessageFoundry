@@ -244,7 +244,7 @@ jobs:
            (github.event.comment.body == 'recheck' ||
             github.event.comment.body == 'I have read the CLA and I agree to its terms.')) ||
           github.event_name == 'pull_request_target')
-        uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1), locally patched fork (BACKLOG #5644, #5645); upstream archived, see .github/actions/cla-assistant-lite/README.md
+        uses: ./.github/actions/cla-assistant-lite # vendored ca4a40a7d1004f18d9960b404b97e5f30a505a08 (v2.6.1), a locally patched fork (at least BACKLOG #5644, #5645); upstream archived, see .github/actions/cla-assistant-lite/README.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
