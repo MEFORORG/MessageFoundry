@@ -1277,7 +1277,8 @@ def build_batch_comparison(
     #812, delivered/offered floor, hard zero-loss gate) — only the arm discriminator
     (``batch_handoff_statements`` instead of ``fuse_thread_hops``) and the axis labels differ. Returns
     ``None`` for a single-arm ``batch_modes`` (nothing to compare). ``missing_detail`` maps a
-    ``(claim_mode, sweep_mode, count)`` whose B1 (batching-on) arm never ran to a loud reason."""
+    ``(claim_mode, sweep_mode, count)`` whose B1 (batching-on) arm never ran to a loud reason; a key
+    with no record in either arm is reported in ``unrun_cells`` and makes the comparison NO-GO."""
     return build_fuse_comparison(
         records,
         batch_modes,
