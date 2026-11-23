@@ -28,10 +28,9 @@ KEEP = (
     "entry"
 )
 
-#: The add-back step, printed where the lists name no secrets directory, no joined path
-#: entry is kept, and a refused name outside the key class is listed or the run-on step removes
-#: a directory string (the Lander's hold on PR 3142, comment 7085002242; the Lander's rulings
-#: on handback 7085947392, F1, and on comment 7087145957).
+#: The add-back step as origin/main prints it, where main prints it: a refused name outside
+#: the key class, no secrets directory in the lists, and no joined string setting one (the
+#: Lander's hold on PR 3142, comment 7085002242).
 ADD_BACK_STEP = (
     "The service's lists set no MEFOR_SECRETS_DIRECTORY. Where install-service.ps1 already "
     "made the secrets directory, add MEFOR_SECRETS_DIRECTORY naming that existing path back to "
@@ -41,6 +40,28 @@ ADD_BACK_STEP = (
     "nssm.exe by its full path, and pass back every entry but those refused above: see "
     'docs/SERVICE.md, "Start / stop / status"'
 )
+
+#: Its opener, which the step leaves out where main never printed it (the Lander's hold on PR 3142, comment 7088102723).
+SET_NO = "The service's lists set no MEFOR_SECRETS_DIRECTORY"
+
+#: Main's wider pass-back exclusion, from its joined-directory step.
+WIDER = "and the strings this step and any step above say to remove"
+
+#: The step where main never printed it: a store key alone, or a joined string that sets the
+#: directory, which a separate item may still set. No opener, and main's wider exclusion
+#: (the Lander's hold on PR 3142, comment 7088102723; the Lander's rulings on handback 7085947392, F1, and comment 7087145957).
+ADD_BACK_JOINED = (
+    "Where install-service.ps1 already made the secrets directory, add MEFOR_SECRETS_DIRECTORY "
+    "naming that existing path back to the service's AppEnvironmentExtra, beside its other "
+    "entries, before any re-run of the installer, which refuses an existing directory the "
+    "service does not name. `nssm set` replaces that whole list, so read it first with `nssm "
+    "get`, running the service's own nssm.exe by its full path, and pass back every entry but "
+    "those refused above and the strings this step and any step above say to remove: see "
+    'docs/SERVICE.md, "Start / stop / status"'
+)
+
+#: Text every form of the step carries, so a negative arm sees either.
+ADD_BACK_ANY = "Where install-service.ps1 already made the secrets directory, add"
 
 #: Its create clause, added only where a setting moves to the secrets directory (the Lander's
 #: ruling on handback 7087574833, R1).

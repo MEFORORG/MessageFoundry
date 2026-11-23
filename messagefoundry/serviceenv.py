@@ -174,6 +174,12 @@ class ServiceEnvPosture:
     #: Whether a refused value runs on into a string whose first non-blank line sets
     #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
     directory_run_on: bool = False
+    #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
+    #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
+    #: or not :func:`_names` keeps the variable it was joined to.
+    #: NSSM may read that string as its own variable, so the refusal must not say to remove every
+    #: such string, nor that the lists set no secrets directory.
+    directory_joined: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -636,6 +642,9 @@ class _Variable:
     #: ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank line (:func:`_sets_directory`).
     #: Remedy only.
     takes_directory: bool = False
+    #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
+    #: on its first line (:func:`_sets_directory`).
+    holds_directory: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -913,6 +922,19 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             key = (index, variable.written, line_on_string, variable.broken)
             joined_break = key in joined_breaks
             ran_on = (key in ran or joined_break) and bool(variable.value.strip())
+            # Its value takes the next string's first line, which may set the directory, past any
+            # string of equals signs alone, which keeps the value running on (_still_blank).
+            holds = False
+            if ran_on:
+                taken = next(
+                    (
+                        strings[i]
+                        for i in range(index + 1, len(strings))
+                        if not _still_blank(strings[i])
+                    ),
+                    "",
+                )
+                holds = _sets_directory(taken)
             read.append(
                 replace(
                     variable,
@@ -922,6 +944,7 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
                     keeps_directory=ran_on and path_after[index + 1],
                     takes_directory=ran_on and set_after[index + 1],
+                    holds_directory=holds,
                 )
             )
     return read
@@ -1081,6 +1104,9 @@ def read_service_env_posture(
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v])),
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
+        # Not filtered through ``_names``: the directory string is in the lists whichever
+        # variable it was joined to, so one ``_names`` drops counts too.
+        directory_joined=any(variable.holds_directory for variable in variables),
     )
 
 
@@ -1307,16 +1333,24 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        add_back = (
-            f"The service's lists set no {_DIRECTORY_VARIABLE}. Where install-service.ps1 "
-            f"already made the secrets directory, add {_DIRECTORY_VARIABLE} naming that "
-            "existing path back to the service's AppEnvironmentExtra, beside its other "
-            "entries, before any re-run of the installer, which refuses an existing directory "
-            "the service does not name. `nssm set` replaces that whole list, so read it first "
-            "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
-            "back every entry but those refused above: see docs/SERVICE.md, "
-            '"Start / stop / status"'
+        # Where origin/main prints this step, it prints it as main does. Where main does not,
+        # because only key-class names are refused or a joined string sets the directory, a
+        # separate item may still set it, so the step does not say the lists set none, and the
+        # entries it says to pass back leave out what the steps above say to remove, as main's
+        # directory step did (the Lander's hold on PR 3142, comment 7088102723).
+        as_on_main = (others or values) and not posture.directory_joined
+        add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if as_on_main else "") + (
+            f"Where install-service.ps1 already made the secrets directory, add "
+            f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
+            "AppEnvironmentExtra, beside its other entries, before any re-run of the "
+            "installer, which refuses an existing directory the service does not name. `nssm "
+            "set` replaces that whole list, so read it first with `nssm get`, running the "
+            "service's own nssm.exe by its full path, and pass back every entry but those "
+            "refused above"
         )
+        if not as_on_main:
+            add_back += " and the strings this step and any step above say to remove"
+        add_back += ': see docs/SERVICE.md, "Start / stop / status"'
         # Only where a setting moves, as the create step reads: a store key alone goes to a
         # key file and needs no secrets directory (the third hold's H2; the Lander's ruling on
         # handback 7087574833, R1).

@@ -25,13 +25,14 @@ from messagefoundry.serviceenv import (
     service_env_refusal,
 )
 from tests._serviceenv_remedy import (
-    ADD_BACK,
     ADD_BACK_CREATE,
+    ADD_BACK_JOINED,
     ADD_BACK_STEP,
     CREATE,
     KEEP,
     REMOVE,
     RUNS_ON,
+    SET_NO,
 )
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
@@ -79,10 +80,14 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     # The lists set no directory once the joined string goes, so the remedy says to add one
     # back (the Lander's ruling on handback 7085947392, F1), for a store key alone too
     # (the Lander's ruling on comment 7087145957, F1 on H3's terms).
-    assert refusal.count(ADD_BACK_STEP) == 1
-    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_STEP)
-    # The create clause only where a setting moves (the Lander's ruling on handback 7087574833, R1).
-    assert (ADD_BACK in refusal) is moved and (ADD_BACK_CREATE in refusal) is moved
+    # The joined string may still be read as its own item, so no "set no" opener, and the
+    # pass-back leaves out what the steps above say to remove (the Lander's hold on PR 3142, comment 7088102723).
+    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
+    assert ADD_BACK_STEP not in refusal
+    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+    # The create clause only where a setting moves (the Lander's ruling on handback
+    # 7087574833, R1).
+    assert (ADD_BACK_CREATE in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
     )
@@ -284,8 +289,8 @@ def test_a_path_the_fail_closed_rule_does_not_keep_is_added_back() -> None:
     )
     assert refusal is not None
     assert KEEP not in refusal and "Put " not in refusal
-    assert refusal.count(ADD_BACK_STEP) == 1
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_STEP)
+    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
     # Nothing moves to the directory, so no create clause (the Lander's ruling on handback
     # 7087574833, R1).
     assert ADD_BACK_CREATE not in refusal
@@ -310,11 +315,33 @@ def test_a_store_key_alone_run_on_into_the_directory_is_added_back(entries: list
     refusal = service_env_refusal(_read(entries))
     assert refusal is not None
     assert CREATE not in refusal and KEEP not in refusal
-    assert refusal.count(ADD_BACK_STEP) == 1
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_STEP)
+    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
     # A store key alone needs no secrets directory: no create clause (third hold, H2; the
     # Lander's ruling on handback 7087574833, R1).
     assert ADD_BACK_CREATE not in refusal
+
+
+def test_a_lower_case_directory_item_is_not_said_to_be_absent() -> None:
+    """The Lander's hold on PR 3142, comment 7088102723, fix 2: the store key runs on into
+    ``mefor_secrets_directory=C:\\d``, which NSSM may read as its own item, and a second key runs
+    on into other text, so nothing keeps the item. The remedy says to add the directory back,
+    but never that the lists set none, and the pass-back leaves out the strings it removes."""
+    refusal = service_env_refusal(
+        _read(
+            [
+                "MEFOR_STORE_ENCRYPTION_KEY=",
+                "mefor_secrets_directory=C:\\d",
+                "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED=",
+                "synthetic-run-on",
+            ]
+        )
+    )
+    assert refusal is not None
+    assert KEEP not in refusal and SET_NO not in refusal
+    assert refusal.count(ADD_BACK_JOINED) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+    assert ADD_BACK_CREATE not in refusal and "synthetic-run-on" not in refusal
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:

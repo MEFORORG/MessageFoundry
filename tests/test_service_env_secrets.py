@@ -51,7 +51,17 @@ from messagefoundry.serviceenv import (
     service_env_loosenings,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import ADD_BACK, CREATE, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import (
+    ADD_BACK,
+    ADD_BACK_ANY,
+    ADD_BACK_CREATE,
+    ADD_BACK_JOINED,
+    ADD_BACK_STEP,
+    CREATE,
+    REMOVE,
+    RUNS_ON,
+    SET_NO,
+)
 
 #: Synthetic stand-ins. Never a real key: the tests check that no value is kept, by searching for
 #: these strings in what the reading returns.
@@ -615,16 +625,16 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
 
 
 @pytest.mark.parametrize(
-    ("entries", "adds_back"),
+    ("entries", "form"),
     [
-        pytest.param(["MEFOR_VALUE_PARTNER_HOST=example.test"], True, id="value"),
-        pytest.param(["MEFOR_STORE_PASSWORD=x"], True, id="directory-secret"),
+        pytest.param(["MEFOR_VALUE_PARTNER_HOST=example.test"], "main", id="value"),
+        pytest.param(["MEFOR_STORE_PASSWORD=x"], "main", id="directory-secret"),
         pytest.param(
-            ["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"], True, id="run-on"
+            ["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"], "main", id="run-on"
         ),
         pytest.param(
             ["MEFOR_VALUE_PARTNER_HOST=example.test", "MEFOR_SECRETS_DIRECTORY=C:/s"],
-            False,
+            None,
             id="directory-listed",
         ),
         # A joined directory string that no step keeps goes with the run-on (the Lander's
@@ -632,12 +642,12 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
         # fail-closed rule does not keep.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
-            True,
+            "joined",
             id="directory-joined",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
-            True,
+            "joined",
             id="directory-joined-spaced",
         ),
         pytest.param(
@@ -647,31 +657,37 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
                 "MEFOR_VALUE_A=",
                 "synthetic-run-on",
             ],
-            True,
+            "joined",
             id="directory-path-not-kept",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory=C:\\d", "MEFOR_VALUE_B=1"],
-            False,
+            None,
             id="directory-path-kept",
         ),
-        pytest.param([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], False, id="store-key"),
+        pytest.param([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], None, id="store-key"),
     ],
 )
 def test_an_unnamed_directory_is_added_back_as_main_says(
-    entries: list[str], adds_back: bool
+    entries: list[str], form: str | None
 ) -> None:
-    """origin/main's step for a secrets directory that exists but the lists no longer name,
-    restored by the Lander's hold on PR 3142 (comment 7085002242): printed once, after the Put
-    step and the removal, where the lists set no MEFOR_SECRETS_DIRECTORY and the remedy keeps
-    no joined path entry. A store key alone goes to a key file and gets none."""
+    """The add-back step, printed once after the Put step and the removal where no listed variable
+    is MEFOR_SECRETS_DIRECTORY and the remedy keeps no joined path entry: as origin/main prints it
+    where main prints it (the Lander's hold on PR 3142, comment 7085002242), and where a joined
+    string sets the directory with no opener and main's wider pass-back exclusion (comment
+    7088102723). A store key alone with no run-on goes to a key file and gets neither."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
-    assert refusal.count(ADD_BACK) == (1 if adds_back else 0)
-    if adds_back:
-        assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK)
+    if form is None:
+        # Neither form, so a guard that lets one more case through fails here.
+        assert ADD_BACK_STEP not in refusal and ADD_BACK_ANY not in refusal
+    else:
+        step = ADD_BACK if form == "main" else ADD_BACK_JOINED + ADD_BACK_CREATE
+        assert refusal.count(step) == 1
+        assert (SET_NO in refusal) is (form == "main")
+        assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
         # The list it says to pass back is the one the run-on sentence left.
-        assert RUNS_ON not in refusal or refusal.index(RUNS_ON) < refusal.index(ADD_BACK)
+        assert RUNS_ON not in refusal or refusal.index(RUNS_ON) < refusal.index(step)
     assert "synthetic-run-on" not in refusal
 
 

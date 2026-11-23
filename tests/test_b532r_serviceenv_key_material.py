@@ -20,7 +20,15 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
-from tests._serviceenv_remedy import ADD_BACK_STEP, CREATE, KEEP, REMOVE, RUNS_ON
+from tests._serviceenv_remedy import (
+    ADD_BACK_JOINED,
+    CREATE,
+    KEEP,
+    REMOVE,
+    RUNS_ON,
+    SET_NO,
+    WIDER,
+)
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
 #: A base64url stand-in of a 32-byte secret's length, with one ``=``, a "-" and a "_" in it, and
@@ -206,7 +214,10 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     remedy = key_alone.split("each value refused here. ", 1)[1]
     # The key file comes first and the removal last (fourth hold, H1).
     assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
-    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_STEP}{_END}")
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_JOINED}{_END}")
+    # The directory item may still be read as its own variable, so no "set no" opener, and the
+    # pass-back leaves out the strings the run-on step removes, which hold the key (the Lander's hold on PR 3142, comment 7088102723).
+    assert WIDER in remedy and SET_NO not in remedy
     # No create guidance anywhere, the add-back step included (the third hold, H2).
     assert "how it is created" not in remedy and "how the directory is created" not in remedy
     assert "The other secrets: a secrets directory" not in remedy
