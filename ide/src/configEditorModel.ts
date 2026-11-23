@@ -88,9 +88,12 @@ export function shouldPushDocumentChange(opts: {
  * `.`) or absolute, a root such as `/` included; relative is resolved against `workspaceDir`, and dot
  * segments on both sides are resolved before comparing. Case is folded, so the segments come back
  * lower-cased, only on `win32` and `darwin`, whose default filesystems are case-insensitive; elsewhere
- * a wrong-cased path names a different file, so it is outside (BACKLOG #5832). Folding misses at least
- * a case-sensitive volume or directory on those two platforms. `platform` defaults to the host's; it
- * is a parameter so tests pin each rule on any runner.
+ * a wrong-cased path names a different file, so it is outside (BACKLOG #5832). Only ASCII A-Z is
+ * folded: toLowerCase() maps at least U+212A KELVIN SIGN onto "k", a name NTFS keeps apart from "k",
+ * so a different directory would pass; a non-ASCII case difference reads as outside instead, which
+ * falls back to the text editor. Folding misses at least a case-sensitive volume or directory on
+ * those two platforms. `platform` defaults to the host's; it is a parameter so tests pin each rule on
+ * any runner.
  */
 function configDirSegments(
   documentFsPath: string,
@@ -100,20 +103,26 @@ function configDirSegments(
 ): string[] | undefined {
   const p = platform === "win32" ? path.win32 : path.posix;
   const caseInsensitive = platform === "win32" || platform === "darwin";
-  const fold = (s: string): string => (caseInsensitive ? s.toLowerCase() : s);
-  const dir =
-    platform === "win32"
-      ? path.win32.resolve(workspaceDir, configDir)
-      : path.posix.resolve(workspaceDir, configDir);
-  const doc =
-    platform === "win32" ? path.win32.resolve(documentFsPath) : path.posix.resolve(documentFsPath);
-  const rel = p.relative(fold(dir), fold(doc));
-  // `relative` is "" for the dir itself, absolute across Windows drives, and starts with a `..`
-  // SEGMENT when outside -- not merely those characters, so a child dir named "..x" is still inside.
-  if (p.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${p.sep}`)) {
+  const fold = (s: string): string => (caseInsensitive ? s.replace(/[A-Z]+/g, (m) => m.toLowerCase()) : s);
+  // Compared segment by segment, not with path.relative: win32.relative lower-cases both sides with
+  // toLowerCase() itself, which would undo the ASCII-only fold.
+  const dir = fold(p.resolve(workspaceDir, configDir));
+  const doc = fold(p.resolve(documentFsPath));
+  const root = p.parse(dir).root;
+  if (p.parse(doc).root !== root) {
+    return undefined; // another drive or share
+  }
+  const segments = (s: string): string[] =>
+    s
+      .slice(root.length)
+      .split(p.sep)
+      .filter((seg) => seg !== "");
+  const dirSegs = segments(dir);
+  const docSegs = segments(doc);
+  if (docSegs.length < dirSegs.length || dirSegs.some((seg, i) => seg !== docSegs[i])) {
     return undefined;
   }
-  return rel === "" ? [] : rel.split(p.sep);
+  return docSegs.slice(dirSegs.length);
 }
 
 /**
@@ -144,8 +153,10 @@ export function isConfigDirCodeSetFile(
 ): boolean {
   const segs = configDirSegments(documentFsPath, workspaceDir, configDir, platform);
   // No /i: the segments are already folded where the filesystem folds, and elsewhere the CLI looks up
-  // only the lower-case extensions.
-  return segs?.length === 2 && segs[0] === "codesets" && /\.(csv|toml)$/.test(segs[1]);
+  // only the lower-case extensions. A file name holding a `\` is refused: on posix it is one segment,
+  // but codeSetNameFromPath splits on `\` too, so `a\b.csv` would be edited and saved as code set `b`
+  // (BACKLOG #5834).
+  return segs?.length === 2 && segs[0] === "codesets" && !segs[1].includes("\\") && /\.(csv|toml)$/.test(segs[1]);
 }
 
 /**
