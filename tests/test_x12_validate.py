@@ -954,17 +954,36 @@ def test_a_map_file_gone_from_the_real_walk_is_an_install_fault(
     _assert_no_plant(caught.value)
 
 
-def test_a_damaged_pyx12_config_is_an_install_fault(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: ParseError(_PLANT),
+        lambda: IndexError(_PLANT),  # what pyx12's params raise on an empty sys.argv
+        lambda: ValueError(_PLANT),
+        lambda: AttributeError(_PLANT),
+        lambda: type("EngineError", (Exception,), {})("Map not found " + _PLANT),
+    ],
+    ids=["parse", "index", "value", "attribute", "no-map-text"],
+)
+def test_any_failure_building_pyx12s_params_is_an_install_fault(
+    fault: Callable[[], Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The params read no sender data, so none of their failures is a refusal of the interchange.
     def make_params() -> Any:
-        raise ParseError(_PLANT)
+        raise fault()
 
-    monkeypatch.setattr(
-        _X12_VALIDATE, "load_x12_validator", lambda: (lambda *_args: True, make_params)
-    )
-    with pytest.raises(RuntimeError) as caught:
+    def walk(*_args: Any) -> bool:
+        raise AssertionError("the walk must not run without its params")
+
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", lambda: (walk, make_params))
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as caught:
         validate(_conformant_270())
     assert type(caught.value) is RuntimeError
+    assert type(fault()).__name__ in str(caught.value)
     _assert_no_plant(caught.value)
+    assert _refusal_records(caplog) == []  # counted as an install fault, not as a refusal
 
 
 @pytest.fixture

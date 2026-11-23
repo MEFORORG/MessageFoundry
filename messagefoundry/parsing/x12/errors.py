@@ -37,15 +37,17 @@ class X12ValidationError(X12Error):
     bundle also meets, and when pyx12 raises partway through a walk, as a non-numeric GE01 makes it
     do. So this does not always mean the interchange is bad.
 
-    A walk failure of a type a sender's bytes cannot raise
-    (:func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault`) is a :class:`RuntimeError`
+    A failure building pyx12's params, and a walk failure of a type a sender's bytes cannot raise
+    (:func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault`), is a :class:`RuntimeError`
     instead. A Handler's ``except ValueError`` does not catch that, but left uncaught it takes the
     ``internal_error`` policy, whose default, ``CONTINUE``, also dead-letters the row.
 
     **A damaged install can land here too.** A map or table that still parses but is wrong raises
     an ordinary error, and an index that lost a map's entry reads as having no map, so each is this
-    error, which a Handler's ``except ValueError`` would dead-letter. Each refusal logs its exception
-    class at WARNING, rate-limited, so a run of one class shows an operator the damage.
+    error, which a Handler's ``except ValueError`` would dead-letter. A refusal from a walk that
+    raised logs its exception class at WARNING, rate-limited, so a run of one class can show an
+    operator the damage. The two refusals with no exception to name log nothing: pyx12 wrote no
+    report ("does not look like an X12 data file"), or its report could not be read.
 
     The X12 analog of
     :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass

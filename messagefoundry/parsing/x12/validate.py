@@ -302,7 +302,7 @@ def _flatten_errors(
 
 
 def _walk_refusal(failure: str, *, install_fault: bool, no_map: bool) -> Exception:
-    """The exception for a walk that raised, holding only that exception's class name. An install
+    """The exception for a walk, or its params, that raised, holding only the class name. An install
     fault is a :class:`RuntimeError`, which a Handler's ``except ValueError`` does not catch. Every
     other failure is an :class:`X12ValidationError`, which says what pyx12 could not do and does not
     claim the interchange is bad: it can conform to a guide pyx12 does not bundle. Called outside
@@ -376,8 +376,10 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     (``valid=False``), not raised, so a Handler can still emit the negative ack.
 
     Raises :class:`RuntimeError`, a deploy/config error distinct from the ``ValueError``-rooted data
-    errors and chaining nothing from pyx12, if the ``[x12]`` extra is absent or the walk raises a
-    type :func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault` names.
+    errors, if the ``[x12]`` extra is absent or too old, if pyx12's params cannot be built, or if
+    the walk raises a type :func:`~messagefoundry.parsing.x12._deps.is_x12_install_fault` names. The
+    last two keep only the exception's class name and chain nothing. The first chains its
+    ``ImportError``, which is raised before any interchange is read.
 
     **A damaged install does not always reach that path**: :class:`X12ValidationError` says when it
     does not, and :func:`_note_walk_refusal` what an operator then sees."""
@@ -392,11 +394,18 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     fd_json = io.StringIO()
 
     _mute_pyx12_logger()
+    params_failure: str | None = None
+    try:
+        params = make_params()
+    except Exception as exc:  # it reads pyx12's config and no sender data, so never a refusal
+        params_failure = type(exc).__name__
+    if params_failure is not None:  # raised out here so that nothing is chained
+        raise _walk_refusal(params_failure, install_fault=True, no_map=False)
+
     walk_failure: str | None = None
     install_fault = no_map = False
     try:
-        # The params are built in here because they read pyx12's config file, which can be damaged.
-        valid = bool(x12n_document(make_params(), io.StringIO(text), fd_ack, None, None, fd_json))
+        valid = bool(x12n_document(params, io.StringIO(text), fd_ack, None, None, fd_json))
     except Exception as exc:  # pyx12 raises bare Exception/EngineError on unwalkable input
         walk_failure = type(exc).__name__
         install_fault = is_x12_install_fault(exc)
