@@ -73,7 +73,12 @@ from xml.sax.handler import (  # nosec B406 — see _assert_well_formed_fragment
 from xml.sax.saxutils import escape as _xml_escape  # nosec B406 — pure string escaper, not a parser
 from xml.sax.xmlreader import InputSource  # nosec B406 — fed only the hardened, no-DTD parser
 
-from messagefoundry.config.models import ConnectorType, Destination, bool_setting
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    bool_setting,
+    flag_from_settings,
+)
 from messagefoundry.config.tls_policy import (
     SYSTEM_TRUST_ANCHOR,
     TrustAnchor,
@@ -848,13 +853,16 @@ class SoapDestination(DestinationConnector):
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
         verify = bool_setting(s, "verify_tls", default=True)
+        # Read strictly, once, so a non-bool is refused on every branch: bool("false") is True
+        # (vault BACKLOG #3234 added step 8).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
                 self.client_key_file,
                 self.client_key_password,
                 *proxy_handlers,  # ADR 0126: forward proxy threaded through the mTLS opener too
-                allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
+                allow_expired=allow_expired,  # #129 (ADR 0094)
                 host=urllib.parse.urlsplit(self.url).hostname or "",
                 trust_anchor=anchor,
             )
@@ -862,7 +870,7 @@ class SoapDestination(DestinationConnector):
             # #129 (ADR 0094): granular expiry-only relaxation — verify the chain's signatures + hostname
             # but tolerate an expired peer cert, and at least the other chain certificates' and a CRL's
             # validity windows (opt-in; default off = the shared verifying opener, byte-identical).
-            if bool(s.get("tls_allow_expired", False)):
+            if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
                     *proxy_handlers,
@@ -945,7 +953,6 @@ class SoapDestination(DestinationConnector):
         # Below every statement that builds or replaces `self._opener`, and no opener with
         # tls_allow_expired: see refuse_unrevoked_verified_hop.
         if verify:
-            allow_expired = bool(s.get("tls_allow_expired", False))
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.url,

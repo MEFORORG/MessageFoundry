@@ -239,7 +239,10 @@ def require_flag(value: object, key: str) -> bool:
 
 
 def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
-    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232).
+    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232), and
+    the strict read of some other default-off boolean connector settings, at least
+    ``tls_allow_expired`` in the DICOM, FHIR, SOAP and remote-file connectors and ``tls`` in the
+    DICOM ones (vault BACKLOG #3234 added step 8).
 
     Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
     :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past
@@ -262,8 +265,8 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
 
     Use it for a transport setting with a default, such as a TLS check, and read it the same way in
     every connector and every reader that reports on it, so the two cannot disagree. Use
-    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin),
-    which defaults off and must refuse a value that is not a real ``bool``."""
+    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin), or
+    another setting that defaults off and must refuse a value that is not a real ``bool``."""
     value = settings.get(key)
     return default if value is None or value == "" else bool(value)
 
