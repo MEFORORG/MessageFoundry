@@ -42,18 +42,16 @@ TWO CASES BACKLOG #5645 item 1 names, where a fault used to discard every refusa
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
     nulls the field it could not resolve and a nulled ``author.user`` would read as an unlinked
-    author. The other commits on the page are judged, so a refusal they prove stands. While a
-    first-page commit is unjudged its author's key is unknown, so rule 2 faults rather than
-    refuses. An error with no such path still faults the whole page, keeping the pages read
-    before it.
+    author. The other commits on the page are judged, so a refusal they prove stands. An error
+    with no such path still faults the whole page, keeping the pages read before it.
   * A head that lags the push event. When ``CLA_HEAD_SHA`` is set and the first page's
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
-    ``HEAD_RETRY_DELAYS``. If no read reaches that head, the run is a fault: a read of another
-    head proves nothing about this one, so nothing it read is judged. A read that reaches the
-    head but whose commits do not include it is repeated the same way; if the waits run out it is
-    judged with a fault added. A head that moves after the first page is not re-read: the pages
-    before the move are of ``CLA_HEAD_SHA`` and are judged, as before. Without ``CLA_HEAD_SHA`` (a
-    comment event) nothing is re-read.
+    ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
+    is judged: a read of another head proves nothing about this one. Only that case is re-read. A
+    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged, as before; if its commits do not
+    include that head, a fault is added beside the verdict, so a pass is not silent. A head that
+    moves after the first page leaves the pages before the move, which are of ``CLA_HEAD_SHA``,
+    to be judged, as before. Without ``CLA_HEAD_SHA`` (a comment event) nothing is re-read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -81,12 +79,15 @@ read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13) and warns and 
 and the count check gives no warning.
 
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
-how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess; a longer lag leaves the run a fault that
-warns and passes.
+how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
+head after them leaves the run a fault that warns and passes. A commit list that trails a current
+``headRefOid`` is not waited for: it is judged, as it was before, so after a force-push it can
+refuse a commit the pull request no longer holds.
 
-UNMEASURED: that GitHub names every field a partial error nulled by its own ``path``, as the
-GraphQL specification's field-error rule requires. A nulled ``author.user`` that no error names
-reads as an unlinked author and is refused.
+UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
+commit node. The GraphQL specification implies it: an error's path names the field that raised it,
+and null propagation reaches only that field's ancestors. A nulled ``author.user`` that no error
+path reaches reads as an unlinked author and is refused.
 
 INPUT COMES ONLY FROM THE ENVIRONMENT, never from the command line or a templated ``run:`` line,
 so a workflow step can pass event data through ``env:`` (zizmor's template-injection rule):
@@ -382,6 +383,11 @@ def _fetch_pages(
     first_page: int | None = None
     while True:
         reply = transport(QUERY, {"owner": owner, "name": name, "number": number, "cursor": cursor})
+        if head is None and expected_head:
+            # Before the errors list, so a lagging first page is re-read whatever else it holds.
+            first_head = _dig(reply, "data", "repository", "pullRequest", "headRefOid")
+            if isinstance(first_head, str) and first_head != expected_head:
+                raise _StaleHead("the pull request's head is not CLA_HEAD_SHA")
         errors = reply.get("errors")
         # A partial error: the data beside it still holds the commits no error points inside.
         errored = _errored_nodes(errors) if errors else set()
@@ -399,8 +405,6 @@ def _fetch_pages(
             raise PrecheckFault("the GraphQL reply holds no pull request head")
         if head is not None and page_head != head:
             raise PrecheckFault("the pull request's head moved while its commits were being read")
-        if head is None and expected_head and page_head != expected_head:
-            raise _StaleHead("the pull request's head is not CLA_HEAD_SHA")
         head = page_head
         if any(index >= len(nodes) for index in errored):
             raise PrecheckFault(
@@ -436,6 +440,15 @@ def _fetch_pages(
         seen_cursors.add(next_cursor)
         cursor = next_cursor
     return _snapshot(commits, total, state)
+
+
+def _dig(value: object, *keys: str) -> object:
+    """``value[k1][k2]...``, or None where a step is missing or not an object."""
+    for key in keys:
+        if not isinstance(value, Mapping):
+            return None
+        value = value.get(key)
+    return value
 
 
 def _total_count(connection: Mapping[str, Any]) -> int:
@@ -501,7 +514,8 @@ def evaluate(
         oid = commit.get("oid", "")
         if index in read.tainted:
             # GraphQL could not resolve part of it, and a nulled user reads as an unlinked author.
-            faults.append(f"commit {oid or index}: GraphQL reported an error inside it; not judged")
+            where = f"commit {oid}" if oid else f"the commit at position {index + 1}"
+            faults.append(f"{where}: GraphQL reported an error inside it; not judged")
             slots.append(None)
             continue
         try:
@@ -529,8 +543,11 @@ def evaluate(
     # The action's committer list: the FIRST page only, one key per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
     seen_by_action = {slot.name for slot in slots[: read.first_page] if slot is not None}
-    # A first-page commit GraphQL could not resolve has an unknown key, which could be anyone's.
-    unknown_key = any(index < read.first_page for index in read.tainted)
+    # A first-page commit GraphQL could not resolve has an unknown key. A refusal below still
+    # holds, since an unsigned author owes a signature wherever the action sees them, but its
+    # reason must not claim the author is absent from that commit.
+    unresolved = any(index < read.first_page for index in read.tainted)
+    where = "the ones this read could resolve" if unresolved else "them"
     checked: set[int] = set()  # linked accounts already judged under rule 2
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
@@ -546,16 +563,10 @@ def evaluate(
         checked.add(who.database_id)
         skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
         if not skipped and has_signed(who) is False:
-            if unknown_key:
-                faults.append(
-                    f"commit {who.oid}: its author {who.name!r} may be the author of a first-page "
-                    "commit GraphQL could not resolve, so rule 2 cannot be judged for it"
-                )
-                continue
             rule_two.append(
                 f"commit {who.oid} is past the {read.first_page} commits the action reads, its "
-                f"author {who.name!r} appears in none of them, and the CLA signature file holds "
-                "no signature for that account"
+                f"author {who.name!r} appears in none of {where}, and the CLA signature file "
+                "holds no signature for that account"
             )
     # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
     refusals = [
@@ -689,12 +700,12 @@ def read_judged_head(
     expected_head: str,
     sleep: Callable[[float], None],
 ) -> tuple[PullRequestRead, bool, str | None]:
-    """Read the pull request, re-reading while it is not of the head the run judges.
+    """Read the pull request, re-reading while its first page shows another head.
 
     Returns the read, whether it is complete, and a fault to report beside its verdict, if any.
-    With ``expected_head`` set, a first page of another head, or a complete read whose commits do
-    not include that head, is read again after each wait in ``HEAD_RETRY_DELAYS``. When the waits
-    run out, the first is a fault that judges nothing, and the second is judged with a fault.
+    With ``expected_head`` set, a first page of another head is read again after each wait in
+    ``HEAD_RETRY_DELAYS``, and is a fault that judges nothing once the waits run out. A complete
+    read of that head whose commits do not include it is judged, with a fault.
     """
     delays = iter(HEAD_RETRY_DELAYS)
     while True:
@@ -713,12 +724,9 @@ def read_judged_head(
             if exc.partial is None:
                 raise
             return exc.partial, False, str(exc)
-        if not expected_head or any(c.get("oid") == expected_head for c in read.commits):
-            return read, True, None
-        delay = next(delays, None)
-        if delay is None:
+        if expected_head and not any(c.get("oid") == expected_head for c in read.commits):
             return read, True, "the pull request's commits do not include CLA_HEAD_SHA"
-        sleep(delay)
+        return read, True, None
 
 
 def run(
