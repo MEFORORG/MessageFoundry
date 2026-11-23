@@ -6728,8 +6728,9 @@ class SqlServerStore:
     ) -> None:
         if not should_record_event(event, self._message_events):
             return  # #63 verbosity gate — floor events always pass; routine ones thinnable
+        # A lambda, not the bound method: the PHI logging inventory reads each _event_stmt call site.
         sql, params = await cipher_call(
-            self._cipher, self._event_stmt, message_id, event, destination, detail, now
+            self._cipher, lambda: self._event_stmt(message_id, event, destination, detail, now)
         )
         await cur.execute(sql, params)
 
@@ -7904,12 +7905,9 @@ class SqlServerStore:
                         *(
                             await cipher_call(
                                 self._cipher,
-                                self._event_stmt,
-                                message_id,
-                                event,
-                                None,
-                                f"{len(handlers)} handler(s)",
-                                now,
+                                lambda: self._event_stmt(
+                                    message_id, event, None, f"{len(handlers)} handler(s)", now
+                                ),
                             )
                         )
                     )
@@ -8214,12 +8212,13 @@ class SqlServerStore:
                         *(
                             await cipher_call(
                                 self._cipher,
-                                self._event_stmt,
-                                message_id,
-                                "transformed",
-                                None,
-                                f"{len(deliveries)} destination(s)",
-                                now,
+                                lambda: self._event_stmt(
+                                    message_id,
+                                    "transformed",
+                                    None,
+                                    f"{len(deliveries)} destination(s)",
+                                    now,
+                                ),
                             )
                         )
                     )
