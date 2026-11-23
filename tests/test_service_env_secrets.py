@@ -56,6 +56,7 @@ from tests._serviceenv_remedy import (
     ADD_BACK_ANY,
     ADD_BACK_CREATE,
     ADD_BACK_JOINED,
+    ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
     REMOVE,
@@ -630,7 +631,9 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
         pytest.param(["MEFOR_VALUE_PARTNER_HOST=example.test"], "main", id="value"),
         pytest.param(["MEFOR_STORE_PASSWORD=x"], "main", id="directory-secret"),
         pytest.param(
-            ["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"], "main", id="run-on"
+            ["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"],
+            "run-on",
+            id="run-on",
         ),
         pytest.param(
             ["MEFOR_VALUE_PARTNER_HOST=example.test", "MEFOR_SECRETS_DIRECTORY=C:/s"],
@@ -675,16 +678,22 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
     is MEFOR_SECRETS_DIRECTORY and the remedy keeps no joined path entry: as origin/main prints it
     where main prints it (the Lander's hold on PR 3142, comment 7085002242), and where a joined
     string sets the directory with no opener and main's wider pass-back exclusion (comment
-    7088102723). A store key alone with no run-on goes to a key file and gets neither."""
+    7088102723). Where a value runs on, the step keeps the opener but leaves out the strings
+    the steps above say to remove (comment 7088663896). A store key alone with no run-on goes
+    to a key file and gets none."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     if form is None:
         # Neither form, so a guard that lets one more case through fails here.
         assert ADD_BACK_STEP not in refusal and ADD_BACK_ANY not in refusal
     else:
-        step = ADD_BACK if form == "main" else ADD_BACK_JOINED + ADD_BACK_CREATE
+        step = {
+            "main": ADD_BACK,
+            "run-on": ADD_BACK_RUN_ON + ADD_BACK_CREATE,
+            "joined": ADD_BACK_JOINED + ADD_BACK_CREATE,
+        }[form]
         assert refusal.count(step) == 1
-        assert (SET_NO in refusal) is (form == "main")
+        assert (SET_NO in refusal) is (form in ("main", "run-on"))
         assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
         # The list it says to pass back is the one the run-on sentence left.
         assert RUNS_ON not in refusal or refusal.index(RUNS_ON) < refusal.index(step)
@@ -692,15 +701,20 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
 
 
 @pytest.mark.parametrize(
-    ("entries", "adds_back"),
+    ("entries", "step"),
     [
-        (["MEFOR_STORE_PASSWORD=x"], True),
-        ([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], False),
-        (["MEFOR_VALUE_PARTNER_HOST=example.test"], True),
-        (["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"], True),
+        (["MEFOR_STORE_PASSWORD=x"], ADD_BACK),
+        ([f"MEFOR_STORE_ENCRYPTION_KEY={_KEY_VALUE}"], None),
+        (["MEFOR_VALUE_PARTNER_HOST=example.test"], ADD_BACK),
+        # A value runs on, so the step leaves out the strings the run-on step removes (the
+        # Lander's hold on PR 3142, comment 7088663896).
+        (
+            ["MEFOR_STORE_ENCRYPTION_KEY=", "abc==", "MEFOR_AUTH_AD_BIND_PASSWORD=x"],
+            ADD_BACK_RUN_ON + ADD_BACK_CREATE,
+        ),
     ],
 )
-def test_the_remedy_names_no_list_string_or_command(entries: list[str], adds_back: bool) -> None:
+def test_the_remedy_names_no_list_string_or_command(entries: list[str], step: str | None) -> None:
     """The installer refuses an existing directory the service does not name, so the remedy
     sends nobody to a re-run. It says what to remove and points at SERVICE.md."""
     refusal = service_env_refusal(_service(entries))
@@ -710,8 +724,11 @@ def test_the_remedy_names_no_list_string_or_command(entries: list[str], adds_bac
     remedy = refusal.split("each value refused here. ", 1)[1]
     # origin/main's add-back step, which names the list, nssm and the installer, is restored
     # by the Lander's hold in comment 7085002242; the rest of the remedy still names none.
-    assert (ADD_BACK in remedy) is adds_back
-    remedy = remedy.replace(ADD_BACK, "")
+    if step is None:
+        assert ADD_BACK_ANY not in remedy
+    else:
+        assert remedy.count(step) == 1
+        remedy = remedy.replace(step, "")
     # Removal comes after every step that moves a value (the fourth hold, H1).
     tail = remedy[remedy.index(REMOVE) :]
     assert "protect-key" not in tail and "Put " not in tail

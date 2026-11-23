@@ -27,6 +27,7 @@ from messagefoundry.serviceenv import (
 from tests._serviceenv_remedy import (
     ADD_BACK_CREATE,
     ADD_BACK_JOINED,
+    ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
     KEEP,
@@ -343,6 +344,37 @@ def test_a_lower_case_directory_item_is_not_said_to_be_absent() -> None:
     assert refusal.count(ADD_BACK_JOINED) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
     assert ADD_BACK_CREATE not in refusal and "synthetic-run-on" not in refusal
+
+
+def test_no_opener_while_a_list_string_sets_the_directory() -> None:
+    """The Lander's hold on PR 3142, comment 7088663896, finding 1: the password runs on past
+    its name, written alone, into ``mefor_secrets_directory=C:\\d``, which NSSM may read as its
+    own item. The first string the value takes does not set the directory, so origin/main said
+    the lists set none. The step reads every string as the run-on step does, so it says no
+    such thing, and since a value runs on it leaves out the strings the steps above say to
+    remove."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_STORE_PASSWORD=", "MEFOR_STORE_PASSWORD", "mefor_secrets_directory=C:\\d"])
+    )
+    assert refusal is not None
+    assert SET_NO not in refusal and ADD_BACK_STEP not in refusal
+    assert refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+
+
+def test_a_value_that_runs_on_is_not_passed_back() -> None:
+    """The Lander's hold on PR 3142, comment 7088663896, finding 4: the password runs on into
+    ``synthetic-run-on``, which the run-on step says to remove. No string sets the directory, so
+    the step keeps origin/main's opener, but the entries it says to pass back leave out the
+    strings the steps above say to remove, so the value is not written back."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_STORE_PASSWORD=", "synthetic-run-on", "MEFOR_VALUE_B=1"])
+    )
+    assert refusal is not None
+    assert ADD_BACK_STEP not in refusal
+    assert refusal.count(ADD_BACK_RUN_ON + ADD_BACK_CREATE) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_RUN_ON)
+    assert "synthetic-run-on" not in refusal
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_still_moved() -> None:

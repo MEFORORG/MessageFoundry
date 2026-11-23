@@ -174,12 +174,17 @@ class ServiceEnvPosture:
     #: Whether a refused value runs on into a string whose first non-blank line sets
     #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
     directory_run_on: bool = False
-    #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
-    #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
-    #: or not :func:`_names` keeps the variable it was joined to.
-    #: NSSM may read that string as its own variable, so the refusal must not say to remove every
-    #: such string, nor that the lists set no secrets directory.
+    #: Whether a value that runs on takes, as the first string after its own that is not blank
+    #: (:func:`_still_blank`), one whose first non-blank line sets ``MEFOR_SECRETS_DIRECTORY``
+    #: (:func:`_sets_directory`), whether or not :func:`_names` keeps the variable it was joined
+    #: to. The remedy alone reads this: its add-back step then says to pass back none of the
+    #: strings the steps above it say to remove.
     directory_joined: bool = False
+    #: Whether any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank
+    #: line (:func:`_sets_directory`), as its own item or joined to a value. The remedy alone
+    #: reads this, and then never says the lists set no secrets directory (the Lander's hold
+    #: on PR 3142, comment 7088663896).
+    directory_in_lists: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -1107,6 +1112,7 @@ def read_service_env_posture(
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
+        directory_in_lists=any(_sets_directory(entry) for _where, entry in entries),
     )
 
 
@@ -1333,13 +1339,13 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        # Where origin/main prints this step, it prints it as main does. Where main does not,
-        # because only key-class names are refused or a joined string sets the directory, a
-        # separate item may still set it, so the step does not say the lists set none, and the
-        # entries it says to pass back leave out what the steps above say to remove, as main's
-        # directory step did (the Lander's hold on PR 3142, comment 7088102723).
-        as_on_main = (others or values) and not posture.directory_joined
-        add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if as_on_main else "") + (
+        # The step says the lists set no directory only where no string in them sets one, read
+        # as the run-on step reads it (_sets_directory). Where a value runs on, or a joined
+        # string sets the directory, the strings the steps above say to remove may hold the
+        # refused value, so the entries it says to pass back leave them out (the Lander's holds
+        # on PR 3142, comments 7088102723 and 7088663896).
+        none_set = (others or values) and not posture.directory_in_lists
+        add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
             f"Where install-service.ps1 already made the secrets directory, add "
             f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
             "AppEnvironmentExtra, beside its other entries, before any re-run of the "
@@ -1348,7 +1354,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             "service's own nssm.exe by its full path, and pass back every entry but those "
             "refused above"
         )
-        if not as_on_main:
+        if posture.value_runs_on or posture.directory_joined:
             add_back += " and the strings this step and any step above say to remove"
         add_back += ': see docs/SERVICE.md, "Start / stop / status"'
         # Only where a setting moves, as the create step reads: a store key alone goes to a
