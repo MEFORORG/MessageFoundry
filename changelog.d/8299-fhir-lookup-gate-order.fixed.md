@@ -1,0 +1,10 @@
+- **A `FhirLookup` refused for a setting no longer leaves a crossing record from another lookup
+  first, in at least these cases.** Its url and header screens, its length limits, its
+  `timeout_seconds` and its hop declarations are now checked for every lookup before any lookup
+  reaches a hop gate, and a lookup's bearer is judged against a cleartext `http` read before its
+  SMART token provider is built. A length refusal now names the lookup. A refusal from a check
+  that runs later in the build can still follow such a record. A FHIR destination or `FhirLookup`
+  whose `headers` is not a table, which sets one of `basic_user` and `basic_password` without the
+  other, puts a `:` in `basic_user`, or sets `bearer_token` beside a Basic pair is refused at
+  build; each used to build and send no headers, no Basic credential, or Basic in place of the
+  bearer. (`BACKLOG #8299`)
