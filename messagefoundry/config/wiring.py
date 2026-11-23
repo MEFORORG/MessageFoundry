@@ -6182,13 +6182,14 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
 
     The refusal neither consumes nor closes the object, because the predicate may share it, for
     example a module-level generator, and closing it would end it for its other holders. It drops its
-    own reference before raising, so the exception's traceback does not keep the object alive. One the
-    predicate made for this call is then collected at once, on the calling thread and inside whatever
-    run context the caller holds, which is when Python finalizes it: a started generator's
-    ``finally`` runs there, a raise from that ``finally`` goes to Python's unraisable-exception hook
-    rather than into this error, and a coroutine draws Python's "never awaited" warning. Its callers,
-    ``dryrun._accepted``, the dry-run tracer and the sandbox worker, pass the verdict straight in
-    rather than binding it to a local, so their frames do not hold it either.
+    own reference before raising. ``dryrun._accepted`` and the sandbox worker pass the verdict straight
+    in rather than binding it to a local, so on those paths an object the predicate made for this
+    call, and that is in no reference cycle, is collected before the error leaves this function, on
+    the calling thread and inside whatever run context the caller holds. The dry-run tracer's
+    recorder keeps the predicate's frame, so on the traced path the object waits for the cyclic
+    collector, as does an object in a cycle on any path. When Python finalizes it, a started
+    generator's ``finally`` runs, a raise from that ``finally`` goes to Python's unraisable-exception
+    hook rather than into this error, and a coroutine draws Python's "never awaited" warning.
 
     An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
     read by that value as before, iterator or not."""

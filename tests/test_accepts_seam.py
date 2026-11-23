@@ -1029,8 +1029,9 @@ class _Awaitable:
         yield None
 
 
-# The refusal leaves the verdict untouched (the predicate may share it), so a coroutine a predicate
-# made draws Python's "never awaited" warning when it is collected, which can be during a later test.
+# The refusal leaves the verdict unclosed (the predicate may share it), so a coroutine a predicate made
+# draws Python's "never awaited" warning when it is collected. The traced path collects it later, in
+# the cyclic collector, which can run during another test of this module.
 pytestmark = pytest.mark.filterwarnings(
     "ignore:coroutine '_verdict_coro' was never awaited:RuntimeWarning"
 )
