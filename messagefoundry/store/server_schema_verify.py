@@ -42,9 +42,10 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a second ``CREATE
 INDEX`` of a name an index it read still holds, DDL in a single-quoted string literal the reader
-sees no ``EXEC`` run, that a ``+`` or ``||`` joins to more text (other than a ``DROP CONSTRAINT``
-whose name a ``+ QUOTENAME(@x)`` ending the statement or the ``EXEC`` supplies), each at any
-depth of ``EXEC``, a default followed by a token that opens no column clause, a ``USING`` access
+sees no ``EXEC`` run, or whose closing quote a ``+`` or ``||`` follows (other than a ``DROP
+CONSTRAINT`` whose name a ``+ QUOTENAME(@x)`` ending the statement or the ``EXEC`` supplies), each
+at any depth of ``EXEC`` (DDL at a second depth is not read, and raises), a default followed by a
+token that opens no column clause, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
 that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
@@ -55,12 +56,17 @@ reads each shipped batch, so a new form fails there before it reaches an open.
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
 before it, is read as reaching every store, and one with anything before it, even a statement a
 ``;`` ends, as reaching only an older store, so the latter raises where its result differs from
-the ``CREATE TABLE``, even if it would run on a new store too.
+the ``CREATE TABLE``, even if it would run on a new store too. A column no ``CREATE TABLE``
+declares, which only a guarded ``ADD`` builds, has no create shape to hold the latter to, so it is
+applied to that column's every shape.
 
-Not every misread raises (BACKLOG #5062). At least: DDL in a PostgreSQL dollar-quoted body, or in
-a T-SQL procedure's body, is read as run, though a function's or a procedure's body runs only when
-it is called; a literal a variable holds is read as run by an ``EXEC`` of that variable whatever
-the text between them does to it, other than a ``SET`` or ``SELECT`` that assigns it; and a
+Not every misread raises (BACKLOG #5062). At least: DDL in a PostgreSQL dollar-quoted string, a
+function's body included, or in a T-SQL procedure's body, is read as run, though a function's or a
+procedure's body runs only when it is called; DDL an ``EXEC ... AT`` runs on a linked server, or
+after a ``USE`` in another database, is read as this store's; a literal joined to more text by
+anything other than a ``+`` or ``||`` right after its closing quote is read whole; a literal a
+variable holds is read as run by an ``EXEC`` of that variable whatever the text between them does
+to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; and a
 ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
 ``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
 a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
@@ -889,8 +895,8 @@ class _Built:
     """Every shape a store may hold one column in. ``create`` is what ``CREATE TABLE`` builds on a
     new store. ``later`` is what a guarded ``ADD`` builds on an older store that lacked the column,
     and what an ``ALTER COLUMN`` or an added ``PRIMARY KEY`` leaves on an older store. A guarded
-    one is not taken to reach a new store, because its guard may test for the old state: its result
-    must equal ``create``, or the column is built two ways. An ``ALTER TABLE`` that opens its
+    one is not taken to reach a new store, because its guard may test for the old state: where
+    ``create`` is set, its result must equal it, or the column is built two ways. An ``ALTER TABLE`` that opens its
     entry in the batch, with nothing before it, runs on every store, so it changes ``create`` too (BACKLOG
     #5062)."""
 
@@ -1248,7 +1254,7 @@ class _Reader:
 #: What opens a string literal the server runs as SQL: an ``EXEC`` or ``EXECUTE`` argument, an
 #: ``sp_executesql`` statement, PL/pgSQL's ``EXECUTE`` without one, or a value a ``DECLARE`` or
 #: ``SET`` gives a variable, which counts only once an ``EXEC`` outside any literal runs that
-#: variable later in the text, with no ``SET`` or ``SELECT`` changing it first.
+#: variable later in the text, with no assignment :func:`_assigned_and_run` sees changing it first.
 _EXEC_LITERAL = re.compile(r"\b(?:EXEC(?:UTE)?\s*\(\s*|sp_executesql\s+(?:@\w+\s*=\s*)?)N?$", re.I)
 _PLPGSQL_EXECUTE = re.compile(r"\bEXECUTE\s+$", re.I)
 _ASSIGNED_LITERAL = re.compile(
@@ -1264,8 +1270,10 @@ def _enclosing_span(spans: list[tuple[int, int]], pos: int) -> tuple[int, int] |
 
 
 def _assigned_and_run(text: str, spans: list[tuple[int, int]], var: str, end: int) -> bool:
-    """Whether an ``EXEC`` outside any literal runs ``@var`` after ``text[end]``, with no ``SET``
-    or ``SELECT`` assigning it, nor a ``+=``, outside a literal in between."""
+    """Whether an ``EXEC`` outside any literal runs ``@var`` after ``text[end]``, with no ``SET
+    @var``, ``SELECT @var`` or compound assignment such as ``@var +=``, outside a literal, in
+    between. An assignment written another way, such as ``SELECT @a = 1, @var = ...``, is not
+    seen."""
     runs = re.compile(rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)", re.I)
     changes = re.compile(rf"\b(?:SET|SELECT)\s+@{var}\s*[-+*/|&^%]?=|@{var}\s*[-+*/|&^%]=", re.I)
     first = next(
