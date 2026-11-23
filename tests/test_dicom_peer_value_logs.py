@@ -1423,12 +1423,17 @@ def test_the_warnings_filters_are_not_reinstalled_while_they_are_first(
 
 def test_the_ds_warning_filter_costs_one_pass_on_a_crafted_value() -> None:
     # A UID of repeated `Value "`, under the 64 KiB command set cap: every UserWarning meets this
-    # filter first, and a leading `.*` here took over a second on it.
+    # filter first. Timed against the quadratic form on the same text, so load slows both.
     crafted = "Invalid value for VR UI: '" + 'Value "' * 9000
-    started = time.monotonic()
-    for pattern in dicom_module._PYDICOM_VALUE_WARNINGS:
-        re.compile(pattern, re.IGNORECASE).match(crafted)
-    assert time.monotonic() - started < 0.5
+
+    def seconds(patterns: tuple[str, ...]) -> float:
+        started = time.monotonic()
+        for pattern in patterns:
+            re.compile(pattern, re.IGNORECASE).match(crafted)
+        return time.monotonic() - started
+
+    quadratic = seconds((r'.*Value ".*" is not valid for elements with a VR of ',))  # CONTROL
+    assert seconds(dicom_module._PYDICOM_VALUE_WARNINGS) < quadratic / 10
 
 
 async def test_the_scus_delivery_error_names_no_refused_value(
