@@ -4306,7 +4306,11 @@ class UploadStore:
         # nothing. An error is_absent reads as no root ends the pass at 0, and any other raises;
         # prune_expired logs that and keeps its result (BACKLOG #6575).
         try:
-            entries = list(root.iterdir())
+            entries: list[Path] = []
+            for listed in root.iterdir():
+                if stop.is_set():
+                    return 0  # nothing has gone yet; the next pass lists again
+                entries.append(listed)
         except OSError as exc:
             if is_absent(exc):
                 return 0  # read as no root yet, as a lost drive or parent also is
