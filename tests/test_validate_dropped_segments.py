@@ -205,6 +205,7 @@ def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
         "MFN^m02^MFN_M01",
         "MFN^M02 ^MFN_M01",
         "MFN^XY1^MFN_M01",
+        "MFN^z44^MFN_M01",
     ],
 )
 def test_a_same_code_borrow_for_an_event_with_its_own_structure_gets_no_exemption(
@@ -232,7 +233,9 @@ def test_a_same_code_borrow_for_an_event_with_its_own_structure_gets_no_exemptio
         "MFN^M01 ",
         "MFN^m01",
         "MFN^ZZZ^MFN_M01",
+        "MFN^Z44 ^MFN_M01",
         "MFN^M14^MFN_M01",
+        "MFN^A01^MFN_M01",
     ],
 )
 def test_the_own_structure_or_one_for_an_event_without_one_keeps_the_exemption(
@@ -240,9 +243,10 @@ def test_the_own_structure_or_one_for_an_event_without_one_keeps_the_exemption(
 ) -> None:
     """Control for the test above: a message with no MSH-9.3 borrows nothing and keeps it,
     padded or lower-case, as it did before this check; so does the structure MSH-9.1 and MSH-9.2
-    name, padded or lower-case in MSH-9.2, a site-defined Z event, and a same-code borrow for a
-    table 0003 event hl7apy gives no structure of its own (no MFN_M14). The last is a known
-    limit: the standard gives M14 the MFN_Znn structure, not MFN_M01."""
+    name, padded or lower-case in MSH-9.2, a site-defined Z event (the Z test is on the raw
+    MSH-9.2, so a trailing pad keeps it), and a same-code borrow for a table 0003 event with no
+    ``MFN_<event>`` structure in hl7apy (no MFN_M14, no MFN_A01). The last two are a known
+    limit: the standard gives M14 the MFN_Znn structure, and A01 is an ADT event."""
     message = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
     result = validate(message + "\rORC|NW|ORD1\r" + _PV1)
     assert result.ok, result.errors
@@ -279,6 +283,15 @@ def test_a_site_defined_z_event_borrowing_a_structure_keeps_the_exemption(
     result = validate(head + body)
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("PID", line),)
+
+
+def test_a_z_event_with_a_structure_of_its_own_gets_no_exemption() -> None:
+    """hl7apy's 2.5 has a QBP_Z73 structure, so borrowing QBP_Q15's slot for Z73 is refused, as
+    ``MFN^M02^MFN_M01`` is: the Z test comes after the own-structure lookup."""
+    head = "MSH|^~\\&|A|B|C|D|20260101||QBP^Z73^QBP_Q15|N1|P|2.5\r"
+    result = validate(head + "QPD|Z73^Query|Q1\rPID|1||1^^^A||DOE^J\rRCP|I")
+    assert result.errors == ["segment PID at line 3 has no place in this message's structure"]
+    assert result.unvalidated_segments == ()
 
 
 _PGL = "\rPID|1||1^^^A||DOE^J\rGOL|AD|20260101|G1^Goal|1\rLOC|L1^Loc||C"

@@ -3,7 +3,9 @@
   itself, not a barrier: a sender controls all of MSH-9, and one that names a structure's own
   event keeps the exemption. A message that names such a structure in MSH-9.3 under its own
   message code, as `MFN^M02^MFN_M01` does, had dropped defined segments passed and listed in
-  `unvalidated_segments`. They are now refused where MSH-9.2 names a trigger event that has a
-  structure of its own in `hl7apy`'s tables, or a non-Z event that is not in the version's HL7
-  table 0003 as `hl7apy` ships it. A site-defined Z event (`QBP^Z44^QBP_Q15`) and a message with
-  no MSH-9.3 are unchanged. (`BACKLOG #5920`)
+  `unvalidated_segments`. Where MSH-9.2, stripped and upper-cased, names the borrowed structure's
+  own event, that is unchanged. Otherwise the dropped segments are now refused where `hl7apy`'s
+  tables have a structure named for MSH-9.1 and MSH-9.2 (`MFN_M02`, or `QBP_Z73` in 2.5), or
+  where MSH-9.2 neither starts with Z nor is in the version's HL7 table 0003 as `hl7apy` ships
+  it. A site-defined Z event (`QBP^Z44^QBP_Q15`), an event in that table with no structure of
+  that name, and a message with no MSH-9.3 are unchanged. (`BACKLOG #5920`)
