@@ -1809,3 +1809,22 @@ against the OS trust store, whose roots no CRL file names, so the start rule wou
 `capath=` loading stays out of scope, for the reason the out-of-scope bullet gives.
 
 Pinned by `tests/test_inbound_listener_crl_chain.py` and `tests/test_api_tls_client_trust.py`.
+
+## 15. Amendment 2026-11-23 -- an opt-in whole-chain check on the outbound hops (vault BACKLOG #5511)
+
+**What changed.** `[tls].crl_check_chain`, default `false`, turns on the chain check of section 14
+on the outbound hops `[tls].crl_file` reaches. Section 14's *Still leaf only* now holds while it is
+unset. It is opt-in, not automatic, for the reason that section gives, and for one measured on
+OpenSSL 3.5.7: `ssl.create_default_context` sets `VERIFY_X509_PARTIAL_CHAIN`, so a CA file holding
+an intermediate ends the chain there, and every handshake is refused with `unable to get
+certificate CRL`.
+
+**Where it holds, and where it refuses.** It holds on a hop that trusts operator CAs alone, a
+connection's `tls_ca_file` or a pinned `[tls].internal_ca_file`. There
+`build_verifying_client_context` refuses a CA file that loads a CA that is not self-signed, clears
+`VERIFY_X509_PARTIAL_CHAIN`, and applies section 14's start rule, worded for a server chain. The
+running-hop reload applies the same rule. On the `system` and `augment` arms it refuses the build,
+since no CRL file covers the OS roots. Hops with their own CRL setting keep the leaf check, at least
+LDAPS, OIDC, the log forwarder and the Postgres store.
+
+Pinned by `tests/test_outbound_crl_chain.py`.

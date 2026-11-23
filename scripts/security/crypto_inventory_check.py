@@ -1365,6 +1365,8 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # Vault BACKLOG #5627, #5511: harden_crl_check(chain=True), the whole-chain CRL of the
             # API listener and the MLLP, HTTP and DICOM inbound listeners.
             "tls_context:.verify_flags |= VERIFY_CRL_CHECK_CHAIN",
+            # Vault BACKLOG #5511: [tls].crl_check_chain makes an outbound chain end at a root.
+            "tls_context:.verify_flags &= ~VERIFY_X509_PARTIAL_CHAIN",
             "tls_context:.verify_mode =",
             "tls_context:.verify_mode = CERT_NONE",
             "tls_context:ssl.SSLContext",

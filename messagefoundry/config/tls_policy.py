@@ -88,6 +88,7 @@ __all__ = [
     "APPROVED_KEX_GROUPS",
     "CONNECTION_TLS_CIPHERS_SETTING",
     "MIRRORED_CONNECTION_SETTING",
+    "OUTBOUND_CRL_SETTING",
     "TLS_REVOCATION_ATTESTED_ENV",
     "apply_connection_tls_ciphers",
     "fips_attestation",
@@ -321,9 +322,11 @@ def harden_crl_check(
     The listeners that require a client certificate pass it: the API listener (#5627) and, since
     vault BACKLOG #5511, the MLLP, HTTP and DICOM inbound listeners' ``tls_crl_file``. On each,
     the start rule reads the CAs loaded from the operator's own client-CA setting, not an OS trust
-    store. Every other hop keeps the
-    leaf check, at least the outbound hops under ``[tls].crl_file``: one may verify against the
-    OS trust store, whose roots no CRL file names, so the start rule would refuse it.
+    store. The outbound hops under ``[tls].crl_file`` pass it only with ``[tls].crl_check_chain``,
+    and only where they trust operator CAs alone (:func:`build_verifying_client_context`): a hop
+    on the OS trust store, whose roots no CRL file names, is refused at build instead. The start
+    rule's refusal is worded for a server chain when ``setting`` is
+    :data:`OUTBOUND_CRL_SETTING`. Every other hop keeps the leaf check.
 
     The opt-in revocation half of :func:`harden_verify_flags`, which does strict RFC 5280 path
     validation and explicitly NOT revocation. Call it only on a context that already verifies the
@@ -504,7 +507,11 @@ def harden_crl_check(
         pem,
         anchors,
         label=label,
-        refusal=own_crl_reason(anchors, pem) if chain else None,
+        refusal=(
+            own_crl_reason(anchors, pem, outbound=setting == OUTBOUND_CRL_SETTING)
+            if chain
+            else None
+        ),
         chain=chain,
     )
     if chain:
@@ -3281,6 +3288,9 @@ class TrustAnchorPolicy:
     #: ``system``-mode instance can still check a CRL. Loopback hops are exempt, matching the
     #: exemption ``internal_ca_file`` already has and the revocation guard's own on-box ALLOW arm.
     crl_file: str | None = None
+    #: ``[tls].crl_check_chain`` (vault BACKLOG #5511): check ``crl_file`` against the peer's whole
+    #: chain, not only its leaf. :func:`build_verifying_client_context` says which hops honour it.
+    crl_check_chain: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -3308,6 +3318,9 @@ class TrustAnchor:
     #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
     #: configures one.
     crl_file: str | None = None
+    #: Whether ``crl_file`` is checked against the peer's whole chain (``[tls].crl_check_chain``,
+    #: vault BACKLOG #5511). Only ever True beside a ``crl_file``.
+    crl_check_chain: bool = False
     #: Where ``cafile`` came from, for a refusal to name: ``[tls].internal_ca_file``, or a
     #: connection's ``tls_ca_file`` with its name (vault BACKLOG #2370). Not part of equality.
     cafile_setting: str | None = field(default=None, compare=False)
@@ -3374,22 +3387,25 @@ def resolve_trust_anchor(
     # Loopback is exempt from BOTH the internal anchor and the CRL; resolved once so the arms below
     # cannot disagree about it.
     crl = None if is_loopback_hop_host(host) else policy.crl_file
+    chain = policy.crl_check_chain and crl is not None
     if connection_ca_file is not None:
         # Per-connection pin wins verbatim (single-anchor, no OS roots — the historical behaviour).
         return TrustAnchor(
             cafile=connection_ca_file,
             load_system_roots=False,
             crl_file=crl,
+            crl_check_chain=chain,
             cafile_setting=f"{setting} of connection {connection!r}" if connection else setting,
         )
     if policy.mode == "system" or policy.internal_ca_file is None or is_loopback_hop_host(host):
         # Unchanged trust store: OS roots only (byte-identical default / loopback exemption).
-        return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl)
+        return TrustAnchor(cafile=None, load_system_roots=True, crl_file=crl, crl_check_chain=chain)
     # pinned: ONLY the internal CA, the forward_tls_ca_file template. augment: OS roots + it.
     return TrustAnchor(
         cafile=policy.internal_ca_file,
         load_system_roots=policy.mode != "pinned",
         crl_file=crl,
+        crl_check_chain=chain,
         cafile_setting="[tls].internal_ca_file",
     )
 
@@ -3435,6 +3451,70 @@ def _naming_the_ca_setting(anchor: TrustAnchor) -> Iterator[None]:
         raise CaFileUnreadable(f"{setting} names a CA file that {problem}") from exc
 
 
+#: The setting a hop's ``crl_file`` comes from on the outbound hops a trust anchor reaches. A CRL
+#: refusal leads with it, and the own-CRL rule reads it to word its refusal for a server chain.
+OUTBOUND_CRL_SETTING = "[tls].crl_file"
+
+
+def _refuse_chain_check_on_os_roots(anchor: TrustAnchor) -> None:
+    """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
+
+    The whole-chain check needs a CRL in ``[tls].crl_file`` from every CA in the peer's chain, the
+    root included, and no CRL file names the OS trust store's roots. So the setting cannot be
+    honoured there, and building the hop would refuse every server at the handshake."""
+    if not (anchor.crl_check_chain and anchor.load_system_roots):
+        return
+    arm = (
+        f"the augment arm (the OS trust store plus {anchor.cafile_setting or 'an internal CA'}, "
+        '[tls].trust_anchor_mode = "augment")'
+        if anchor.cafile is not None
+        else "the system arm (the OS trust store, with no CA file of its own)"
+    )
+    raise ValueError(
+        f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. The "
+        "whole-chain check needs a CRL from every CA in the chain, and [tls].crl_file holds none "
+        "for the OS trust store's roots, so the setting cannot be honoured here. Give the "
+        'connection its own tls_ca_file, or set [tls].trust_anchor_mode = "pinned", or unset '
+        "[tls].crl_check_chain"
+    )
+
+
+def _require_self_signed_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
+    """Refuse a whole-chain hop whose CA file loads a CA that is not self-signed, then make the
+    chain end at a self-signed root (vault BACKLOG #5511).
+
+    ``ssl.create_default_context`` sets ``VERIFY_X509_PARTIAL_CHAIN``, so OpenSSL accepts a chain
+    that ends at any CA in the store. Measured on OpenSSL 3.5.7: with an intermediate in the CA
+    file, the chain ended there, and every handshake was refused with ``unable to get certificate
+    CRL``. So a CA file holding a CA another CA issued is refused here, at build, and the flag is
+    cleared, so a chain must end at a root."""
+    from messagefoundry.pki import cas_not_self_signed
+
+    issued = cas_not_self_signed(ctx.get_ca_certs(binary_form=True))
+    if issued:
+        raise ValueError(
+            f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
+            f"loads CA(s) that are not self-signed: {', '.join(issued)}. The whole-chain "
+            "check needs the chain to end at a root whose CRL is in [tls].crl_file. Put only the "
+            "root CA(s) in that CA file; the server sends its intermediates"
+        )
+    ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN
+
+
+def _harden_outbound_crl(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
+    """Load ``anchor.crl_file`` onto an outbound ``ctx`` whose trust store is final: the leaf
+    check, or with ``[tls].crl_check_chain`` the whole chain (vault BACKLOG #5511)."""
+    if anchor.crl_file is None:
+        return
+    if anchor.crl_check_chain:
+        _require_self_signed_cas(ctx, anchor)
+    harden_crl_check(
+        ctx, anchor.crl_file, setting=OUTBOUND_CRL_SETTING, chain=anchor.crl_check_chain
+    )
+    # Vault BACKLOG #2319: a CRL inside the CA file is live now that the check is on.
+    record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
+
+
 def build_verifying_client_context(
     anchor: TrustAnchor, *, purpose: ssl.Purpose = ssl.Purpose.SERVER_AUTH
 ) -> ssl.SSLContext:
@@ -3449,7 +3529,14 @@ def build_verifying_client_context(
 
     The ``tls_verify=false`` arms of the SMTP, MLLP and FTPS contexts build here too, with the empty
     policy, and turn verification off afterwards (vault BACKLOG #2370). So a step added here must
-    not assume the hop it builds verifies its peer."""
+    not assume the hop it builds verifies its peer.
+
+    With ``anchor.crl_check_chain`` (``[tls].crl_check_chain``, vault BACKLOG #5511) the CRL is
+    checked against the peer's whole chain. Only a hop that trusts operator CAs alone can honour
+    that, a connection's ``tls_ca_file`` or a pinned ``[tls].internal_ca_file``. A hop on the OS
+    trust store is refused before anything is built, as is a CA file that loads a CA another CA
+    issued; on the rest the chain must end at a root."""
+    _refuse_chain_check_on_os_roots(anchor)
     ctx: ssl.SSLContext
     if anchor.load_system_roots:
         ctx = ssl.create_default_context(purpose)
@@ -3464,10 +3551,7 @@ def build_verifying_client_context(
     # BACKLOG #299: the CRL loads LAST, once the trust store is final -- harden_crl_check asserts the
     # CRL actually landed in that store, and a later load_verify_locations would make the assertion
     # answer for a different store than the one the handshake uses.
-    if anchor.crl_file is not None:
-        harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
-        # Vault BACKLOG #2319: a CRL inside the CA file is live now that the check is on.
-        record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
+    _harden_outbound_crl(ctx, anchor)
     return ctx
 
 
@@ -3508,6 +3592,7 @@ def build_anchored_https_handler(
     :func:`build_asserted_https_handler`, so the suite list does not depend on the anchor."""
     if not anchor.narrows:
         return build_asserted_https_handler(connector=connector)
+    _refuse_chain_check_on_os_roots(anchor)  # vault BACKLOG #5511, before anything is built
     if anchor.load_system_roots:
         # augment (and the CRL-only shape below): urllib's OWN context, with the internal CA and/or the
         # CRL loaded on top. Nothing is replayed because nothing is rebuilt -- the only changes are one
@@ -3520,9 +3605,7 @@ def build_anchored_https_handler(
         # BACKLOG #299: `system` mode plus a CRL narrows without naming a CA, so this arm now runs with
         # `cafile is None`. load_verify_locations rejects an all-None call, hence the guard above; the
         # CRL still loads last, against the final trust store.
-        if anchor.crl_file is not None:
-            harden_crl_check(ctx, anchor.crl_file, setting="[tls].crl_file")
-            record_ca_bundle_crls(ctx, anchor.cafile, setting=anchor.cafile_setting)
+        _harden_outbound_crl(ctx, anchor)
         return handler
     ctx = build_verifying_client_context(anchor)
     ctx.set_alpn_protocols(_URLLIB_HTTPS_ALPN_PROTOCOLS)
