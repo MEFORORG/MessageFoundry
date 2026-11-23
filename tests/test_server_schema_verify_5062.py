@@ -680,7 +680,7 @@ def test_ddl_in_a_plpgsql_execute_literal_is_read() -> None:
 
 def test_ddl_in_a_literal_joined_to_more_text_raises() -> None:
     """The literal cut the clause short: ``DROP COLUMN b`` read alone left c expected."""
-    with pytest.raises(ValueError, match="joins to more text"):
+    with pytest.raises(ValueError, match="join adds more text"):
         declared_schema(
             (
                 "CREATE TABLE t (a INT NULL, b INT NULL, c INT NULL)",
@@ -690,16 +690,71 @@ def test_ddl_in_a_literal_joined_to_more_text_raises() -> None:
         )
 
 
-def test_a_drop_constraint_named_by_quotename_is_still_read() -> None:
-    shape = declared_schema(
-        (
-            "CREATE TABLE t (a INT NOT NULL)",
-            "DECLARE @drop nvarchar(400) = N'ALTER TABLE t DROP CONSTRAINT ' + QUOTENAME(@pk);"
-            " EXEC(@drop);",
-        ),
-        "sqlserver",
-    )
+def test_ddl_in_a_plpgsql_literal_joined_by_a_pipe_pair_raises() -> None:
+    with pytest.raises(ValueError, match="join adds more text"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT, b INT, c INT)",
+                "DO $$ BEGIN EXECUTE 'ALTER TABLE t DROP COLUMN b' || ', DROP COLUMN c'; END $$",
+            ),
+            "postgres",
+        )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DECLARE @drop nvarchar(400) = N'ALTER TABLE t DROP CONSTRAINT ' + QUOTENAME(@pk);"
+        " EXEC(@drop);",
+        "EXEC(N'ALTER TABLE t DROP CONSTRAINT ' + QUOTENAME(@pk))",
+    ],
+)
+def test_a_drop_constraint_named_by_quotename_is_still_read(statement: str) -> None:
+    shape = declared_schema(("CREATE TABLE t (a INT NOT NULL)", statement), "sqlserver")
     assert shape.columns["t"] == frozenset({"a"})
+
+
+@pytest.mark.parametrize(
+    "between",
+    ["SET @s = @s + N', COLUMN c';", "SET @s += N', COLUMN c';", "SELECT @s = N'PRINT 1';"],
+)
+def test_a_variable_changed_before_its_exec_is_not_read_as_run(between: str) -> None:
+    with pytest.raises(ValueError, match="sees no EXEC run"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT NULL, b INT NULL, c INT NULL)",
+                f"DECLARE @s nvarchar(max) = N'ALTER TABLE t DROP COLUMN b'; {between} EXEC(@s)",
+            ),
+            "sqlserver",
+        )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # A comparison, not an assignment, so the literal is never run.
+        "IF @mode = N'ALTER TABLE t ADD b INT NULL' PRINT 1; EXEC(@mode)",
+        # T-SQL reads a bare string after EXECUTE as a module's name, not as SQL.
+        "EXECUTE N'ALTER TABLE t ADD b INT NULL'",
+    ],
+)
+def test_a_literal_sql_server_does_not_run_as_sql_raises(statement: str) -> None:
+    with pytest.raises(ValueError, match="sees no EXEC run"):
+        declared_schema(("CREATE TABLE t (a INT NULL)", statement), "sqlserver")
+
+
+def test_a_guarded_alter_column_after_a_rename_is_held_to_the_create() -> None:
+    """A rename once moved the CREATE TABLE shape into the older-store shapes, so a guarded ALTER
+    COLUMN after it changed every shape and was read as reaching a new store."""
+    with pytest.raises(ValueError, match="built two ways"):
+        declared_schema(
+            (
+                "CREATE TABLE t (a INT NULL)",
+                "EXEC sp_rename 't.a', 'b', 'COLUMN'",
+                "IF 1 = 0 ALTER TABLE t ALTER COLUMN b BIGINT NULL",
+            ),
+            "sqlserver",
+        )
 
 
 def test_a_default_of_more_than_one_token_is_named_as_the_default() -> None:

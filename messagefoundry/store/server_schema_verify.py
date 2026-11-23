@@ -42,9 +42,9 @@ DDL the reader cannot place raises ``ValueError`` rather than being skipped or m
 not match, an ``ALTER TABLE`` with more than one clause or an action it does not know, a table rename,
 an ``ALTER INDEX``, a second ``CREATE TABLE`` of a table no ``DROP`` removed, a second ``CREATE
 INDEX`` of a name an index it read still holds, DDL in a single-quoted string literal the reader
-sees no ``EXEC`` run, at any depth of ``EXEC``, or that a ``+`` joins to more text (other than a
-``DROP CONSTRAINT`` named by ``QUOTENAME``), a default followed by a token that opens no column
-clause, a ``USING`` access
+sees no ``EXEC`` run, that a ``+`` or ``||`` joins to more text (other than a ``DROP CONSTRAINT``
+whose name a ``+ QUOTENAME(@x)`` ending the statement or the ``EXEC`` supplies), each at any
+depth of ``EXEC``, a default followed by a token that opens no column clause, a ``USING`` access
 method, a key column or expression carrying a collation, an operator class or a ``NULLS`` order, a key
 that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
@@ -57,8 +57,10 @@ before it, is read as reaching every store, and one with anything before it, eve
 ``;`` ends, as reaching only an older store, so the latter raises where its result differs from
 the ``CREATE TABLE``, even if it would run on a new store too.
 
-Not every misread raises (BACKLOG #5062). At least: DDL in a PostgreSQL dollar-quoted body is read
-as run, a function's body included, which runs only when it is called; and a
+Not every misread raises (BACKLOG #5062). At least: DDL in a PostgreSQL dollar-quoted body, or in
+a T-SQL procedure's body, is read as run, though a function's or a procedure's body runs only when
+it is called; a literal a variable holds is read as run by an ``EXEC`` of that variable whatever
+the text between them does to it, other than a ``SET`` or ``SELECT`` that assigns it; and a
 ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
 ``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
 a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
@@ -1000,7 +1002,7 @@ class _Reader:
             else:
                 built.later.add(shape)
 
-    def index(self, text: str, m: re.Match[str]) -> None:
+    def index(self, text: str, m: re.Match[str], spans: list[tuple[int, int]]) -> None:
         if m["using"]:
             raise ValueError(f"index access method not compared: {m.group(0)!r}")
         body, end = _balanced(text, m.end())
@@ -1031,10 +1033,8 @@ class _Reader:
             # To the statement's end: a predicate has no closing mark of its own. Inside an
             # EXEC string, to the string's end, its quotes undoubled, as alter() reads one.
             tail = text[end:]
-            for start, stop in _string_spans(text):
-                if start < m.start() < stop:
-                    tail = text[end : stop - 1].replace("''", "'")
-                    break
+            if span := _enclosing_span(spans, m.start()):
+                tail = text[end : span[1] - 1].replace("''", "'")
             tail = " " + tail  # so the scan never starts at index 0
             # Nested dynamic SQL's quotes can defeat the scan: keep it all, which only raises more.
             with contextlib.suppress(ValueError):
@@ -1174,7 +1174,13 @@ class _Reader:
         moved = cols.pop(old, None)
         built = cols.setdefault(new, _Built())
         if moved is not None:
-            built.later |= moved.ways()
+            # A new store renames what its CREATE TABLE built too, so that shape stays the create
+            # one, and a later guarded ALTER COLUMN is still held to it (BACKLOG #5062).
+            if built.create is None:
+                built.create = moved.create
+            elif moved.create is not None:
+                built.later.add(moved.create)
+            built.later |= moved.later
         self._rewrite_keys(table, old, new)
         for (on, index), (used, keys) in list(self.opaque.items()):
             if on == table:
@@ -1240,16 +1246,16 @@ class _Reader:
 
 
 #: What opens a string literal the server runs as SQL: an ``EXEC`` or ``EXECUTE`` argument, an
-#: ``sp_executesql`` statement, or a value assigned to a variable, which counts only once an
-#: ``EXEC`` outside any literal runs that variable later in the text.
-_EXEC_LITERAL = re.compile(
-    r"\b(?:EXEC(?:UTE)?\s*\(\s*|EXECUTE\s+|sp_executesql\s+(?:@\w+\s*=\s*)?)N?$", re.I
-)
+#: ``sp_executesql`` statement, PL/pgSQL's ``EXECUTE`` without one, or a value a ``DECLARE`` or
+#: ``SET`` gives a variable, which counts only once an ``EXEC`` outside any literal runs that
+#: variable later in the text, with no ``SET`` or ``SELECT`` changing it first.
+_EXEC_LITERAL = re.compile(r"\b(?:EXEC(?:UTE)?\s*\(\s*|sp_executesql\s+(?:@\w+\s*=\s*)?)N?$", re.I)
+_PLPGSQL_EXECUTE = re.compile(r"\bEXECUTE\s+$", re.I)
 _ASSIGNED_LITERAL = re.compile(
-    r"@(?P<var>\w+)(?:\s+(?:AS\s+)?\w+(?:\s*\([^()]*\))?)?\s*=\s*N?$", re.I
+    r"\b(?:DECLARE|SET)\s+@(?P<var>\w+)(?:\s+(?:AS\s+)?\w+(?:\s*\([^()]*\))?)?\s*=\s*N?$", re.I
 )
 #: A literal joined to a quoted name and nothing else, as a ``DROP CONSTRAINT`` takes its name.
-_QUOTENAME_TAIL = re.compile(r"\s*\+\s*QUOTENAME\s*\(\s*@\w+\s*\)\s*(?:;|$)", re.I)
+_QUOTENAME_TAIL = re.compile(r"\s*\+\s*QUOTENAME\s*\(\s*@\w+\s*\)\s*(?:;|\)|$)", re.I)
 
 
 def _enclosing_span(spans: list[tuple[int, int]], pos: int) -> tuple[int, int] | None:
@@ -1257,37 +1263,64 @@ def _enclosing_span(spans: list[tuple[int, int]], pos: int) -> tuple[int, int] |
     return next(((start, end) for start, end in spans if start < pos < end), None)
 
 
+def _assigned_and_run(text: str, spans: list[tuple[int, int]], var: str, end: int) -> bool:
+    """Whether an ``EXEC`` outside any literal runs ``@var`` after ``text[end]``, with no ``SET``
+    or ``SELECT`` assigning it, nor a ``+=``, outside a literal in between."""
+    runs = re.compile(rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)", re.I)
+    changes = re.compile(rf"\b(?:SET|SELECT)\s+@{var}\s*[-+*/|&^%]?=|@{var}\s*[-+*/|&^%]=", re.I)
+    first = next(
+        (f for f in runs.finditer(text, end) if _enclosing_span(spans, f.start()) is None), None
+    )
+    if first is None:
+        return False
+    return not any(
+        _enclosing_span(spans, c.start()) is None
+        for c in changes.finditer(text, end, first.start())
+    )
+
+
 def _check_literal(
-    text: str, spans: list[tuple[int, int]], kind: str, at: int, stop: int, label: str
+    text: str, spans: list[tuple[int, int]], kind: str, m: re.Match[str], dialect: Dialect | None
 ) -> None:
-    """Raise when DDL the reader matched, ``text[at:stop]``, sits in a string literal it cannot
-    read as run (BACKLOG #5062): one it sees no ``EXEC`` run, or one joined to more text by ``+``,
-    whose clause the literal cuts short. The one join read is an ``ALTER TABLE ... DROP
-    CONSTRAINT`` given its name by ``QUOTENAME``, a clause the reader does not apply. A literal
-    that is run is read again as SQL of its own, its quotes undoubled, so a literal inside it
-    is held to the same rule."""
+    """Raise when DDL the reader matched sits in a string literal it cannot read as run (BACKLOG
+    #5062): one it sees no ``EXEC`` run, or one joined to more text by ``+`` or ``||``, whose
+    clause the literal cuts short. The one join read is an ``ALTER TABLE ... DROP CONSTRAINT``
+    given its name by ``QUOTENAME``, a clause the reader does not apply. A literal that is run is
+    read again as SQL of its own, its quotes undoubled, so a literal inside it is held to the same
+    rule."""
+    _check_literal_at(text, spans, kind, m.start(), m.end(), m.group(0), dialect)
+
+
+def _check_literal_at(
+    text: str,
+    spans: list[tuple[int, int]],
+    kind: str,
+    at: int,
+    stop: int,
+    label: str,
+    dialect: Dialect | None,
+) -> None:
+    """:func:`_check_literal` for the DDL at ``text[at:stop]``, one ``EXEC`` depth at a time."""
     if (span := _enclosing_span(spans, at)) is None:
         return
     start, end = span
-    run = _EXEC_LITERAL.search(text, 0, start) is not None
+    run = _EXEC_LITERAL.search(text, 0, start) is not None or (
+        dialect != "sqlserver" and _PLPGSQL_EXECUTE.search(text, 0, start) is not None
+    )
     if not run and (assigned := _ASSIGNED_LITERAL.search(text, 0, start)):
-        var = assigned["var"]
-        runs = re.compile(rf"\b(?:EXEC(?:UTE)?\s*\(\s*@{var}\s*\)|sp_executesql\s+@{var}\b)", re.I)
-        run = any(_enclosing_span(spans, f.start()) is None for f in runs.finditer(text, end))
+        run = _assigned_and_run(text, spans, assigned["var"], end)
     if not run:
-        raise ValueError(
-            f"DDL inside a string literal the reader sees no EXEC run: {label[:120]!r}"
-        )
-    if text[end:].lstrip().startswith("+") and not (
+        raise ValueError(f"DDL inside a string literal the reader sees no EXEC run: {label!r}")
+    if text[end:].lstrip().startswith(("+", "||")) and not (
         kind == "alter"
         and re.fullmatch(r"\s*DROP\s+CONSTRAINT\s*", text[stop : end - 1], re.I)
         and _QUOTENAME_TAIL.match(text, end)
     ):
-        raise ValueError(f"DDL in a string literal that a + joins to more text: {label!r}")
+        raise ValueError(f"DDL in a string literal that a join adds more text to: {label!r}")
     body = text[start + 1 : end - 1].replace("''", "'")
     offset = len(text[start + 1 : at].replace("''", "'"))
     length = len(text[at:stop].replace("''", "'"))
-    _check_literal(body, _string_spans(body), kind, offset, offset + length, label)
+    _check_literal_at(body, _string_spans(body), kind, offset, offset + length, label, dialect)
 
 
 @cache
@@ -1324,11 +1357,11 @@ def declared_schema(
         ):
             events.extend((m.start(), kind, m) for m in pattern.finditer(text))
         for _pos, kind, m in sorted(events, key=lambda e: e[0]):
-            _check_literal(text, spans, kind, m.start(), m.end(), m.group(0))
+            _check_literal(text, spans, kind, m, dialect)
             if kind == "table":
                 reader.table(text, m)
             elif kind == "index":
-                reader.index(text, m)
+                reader.index(text, m, spans)
             elif kind == "alter":
                 reader.alter(text, m, spans)
             elif kind == "rename":
