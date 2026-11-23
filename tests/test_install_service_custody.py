@@ -68,6 +68,25 @@ _SETTINGS: list[tuple[str, str | None]] = [
     ('[api]\nhosts = [\n  ["store"]\n]\nkey_provider = "host"\n', None),
     ('[api]\nhosts = [ # "]"\n  ["store"]\n]\nkey_provider = "host"\n', None),
     ('[store]\nnote = """\n[api]\n"""\nkey_provider = "host"\n', "host"),
+    # The array is open after a multi-line string ends, so its element lines are not headers.
+    ('[store]\nx = [ """\na""",\n  [1]\n]\nkey_provider = "host"\n', "host"),
+    ('[api]\nx = [ """\nq""",\n  ["store"]\n]\nkey_provider = "host"\n', None),
+    ("[store]\nx = [ '''\nq''', [\n  [[1]]\n]]\nkey_provider = \"host\"\n", "host"),
+    ('[store]\nx = [\n"""a\n""", [\n[[1]]]]\nkey_provider = "host"\n', "host"),
+    # A triple quote that opens no multi-line string: in a one-line string, in a comment.
+    ('[api]\nnote = \'say """\'\n[store]\nkey_provider = "host"\n', "host"),
+    ("# don't '''\n[store]\nkey_provider = \"host\"\n", "host"),
+    ('[store]\nn = """a""""\nkey_provider = "host"\n', "host"),
+    ('[store]\nn = """a\\"""\n[api]\n"""\nkey_provider = "host"\n', "host"),
+    # Headers: tabs, quoted keys, arrays of tables. One the reader cannot classify ends [store].
+    ('[\tstore\t]\nkey_provider = "host"\n', "host"),
+    ('[store]\n[\tapi\t]\nkey_provider = "host"\n', None),
+    ('[store]\n["a:b"]\nkey_provider = "host"\n', None),
+    ('["sto re"]\nkey_provider = "host"\n', None),
+    ('[ "store" ]\nkey_provider = "host"\n', "host"),
+    ('[store]\n["\\u0061pi"]\nkey_provider = "host"\n', None),
+    ('[store]\n[[array.of.tables]]\nkey_provider = "host"\n', None),
+    ('[[array.of.tables]]\nx = 1\n[store]\nkey_provider = "host"\n', "host"),
     ("", None),
 ]
 
