@@ -256,10 +256,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     network or I/O faults, such as a share whose network name went away. Since every
     ``PermissionError`` counts, a sharing violation among them, a party who can deny the engine
     reads of the pin file can keep the hold from being set; that function names this and the
-    other known residuals. Any other ``OSError`` sets the hold. A pin on a share or network
-    mount does not ride out a network fault at ``enforce``: its path verdict is indeterminate,
-    which ``enforce`` refuses, and that refusal sets the hold, so at ``enforce`` the network-fault
-    exemption takes effect at least for a read fault on a local disk. What it refuses: at least the new connects the
+    other known residuals. Any other ``OSError`` sets the hold. A pin whose path verdict is
+    indeterminate, as on a share, never reaches such a read at ``enforce``: the SQL Server store
+    open refuses that verdict, so ``serve`` fails at the open whatever the network does. The
+    network-fault exemption therefore takes effect at ``enforce`` only for a pin whose path passes,
+    at least block-level network storage formatted with a trusted file system, such as iSCSI,
+    NBD or RBD under ext4 or xfs, which can see a network fault as ``EIO``, and a pin location
+    that becomes networked after the open. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2934,10 +2937,14 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     a Windows error code; at least some failures of the open and of the read itself carry none,
     so a share lost at those steps can still set the hold.
 
-    **A pin on a share does not survive a network fault at** ``enforce``. Its path verdict is
-    indeterminate, which ``enforce`` refuses, and that refusal sets the hold at the next read
-    that succeeds. So at ``enforce`` the network-fault exemption takes effect at least for a read
-    fault on a local disk; at ``warn`` no refusal sets the hold at all.
+    **A pin whose path verdict is indeterminate never reaches this read at** ``enforce``. The
+    SQL Server store open refuses that verdict
+    (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
+    open whatever the network does. On POSIX at least a share, a local disk of a type outside
+    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
+    host without ``/proc/self/mountinfo`` read as indeterminate. So at ``enforce`` this exemption
+    takes effect only for a pin whose path passes, such as on a trusted local file system or on
+    block-level network storage formatted with one; at ``warn`` no refusal sets the hold at all.
 
     **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
     among them, since on Windows that is what a scanner holding the file arrives as and the read
@@ -2945,11 +2952,13 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     no sharing violation. So a party who can deny the engine reads of the pin file, or on
     Windows hold it open without sharing, can keep a refusal at ``enforce`` from setting the
     hold, and new store connects go on while the file stays unreadable. The same holds for a
-    party who can make the read fail with one of the network or I/O faults above, such as one
-    who controls the share or the network path to it, and for a read that fails with ``EIO``,
-    as on a failing disk or, on POSIX, a device swapped in between the stat and the open. A
+    party who can make the read fail with one of the network or I/O faults above, at least one
+    who controls the network path to block-level storage whose path passes, or to a pin location
+    that becomes networked after the open, and for a read that fails with ``EIO``, as on a
+    failing disk or, on POSIX, a device swapped in between the stat and the open. On POSIX a
     device already at the path when the stat runs is refused as not a regular file and sets
-    the hold. Windows also reports at
+    the hold. On Windows ``os.stat`` of a device the account cannot open can raise
+    ``PermissionError``, which sets no hold. Windows also reports at
     least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
     such check still refuses the reload.
 

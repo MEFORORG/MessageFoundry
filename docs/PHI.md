@@ -1469,7 +1469,8 @@ route and transform it (BACKLOG #1174).
   those columns do not linger in plaintext at rest, and the staged queue carries the message
   forward rather than holding it open. Not every column that can hold PHI is covered: the
   [section 2 inventory](#2-where-phi-lives--data-at-rest-inventory) says which columns are, and
-  which stay plaintext at rest. The decrypted body in
+  which stay plaintext at rest. `[security].allow_unencrypted_phi` is the audited keyless opt-out.
+  The decrypted body in
   process memory is never re-encrypted. It lives at least in the engine's heap, and under
   `[sandbox].mode = "subprocess"` in a per-inbound worker's too. It stays there as immutable Python
   strings, and so does every copy the Router's or Handler's own code makes. It is gone only when that

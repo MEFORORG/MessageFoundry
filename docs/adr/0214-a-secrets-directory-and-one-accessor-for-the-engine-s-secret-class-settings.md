@@ -215,7 +215,11 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   link on POSIX too, so a secrets directory, or a file in it, that is itself a link is refused
   there as well. A Kubernetes Secret volume serves each file as a link, so it cannot be this
   directory. On POSIX the same check also judges the owner of a directory or file and the
-  directory that holds it; `docs/CONFIGURATION.md` states the rule.
+  directory that holds it; `docs/CONFIGURATION.md` states the rule. *(Corrected 2026-11-22, vault
+  BACKLOG #5657 step 14: this sentence said the check refuses a directory or file another account
+  owns, and one held in a directory that another account owns or that a group or other may write
+  without the sticky bit. Root may own either as well, so the rule now lives in
+  `docs/CONFIGURATION.md` alone.)*
 - **2026-11-11, half of slice B built: the NSSM reading refuses every secret-class name.** A
   name from `DIRECTORY_SETTING_NAMES` in the service's own environment lists now refuses `serve`
   and `supervise`, under every enforcement setting, as a store key there already did, and the
