@@ -276,7 +276,7 @@ see its *What it widens* and *Left open*.
   shares one security descriptor, so once the published store is restricted the staged link carries the
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
-  operator's user SID alone, so the explicit entries are removed too. Where it fails, or the token
+  account the process runs as alone, so the explicit entries are removed too. Where it fails, or the token
   cannot be read, it logs a WARNING and the file keeps the list it had.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
@@ -310,8 +310,9 @@ checks resolve the path by name, so someone able to swap an ancestor for a junct
 create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
 leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
 replaces only the principals it names (measured while building this); that predates this change.
-**AMENDED 2026-11-23:** this rewrite is unchanged for the store trio. Every other caller of
-`_secure_file` now writes one protected DACL whole, granting the account in the process token, so
+**AMENDED 2026-11-23:** this rewrite is unchanged for the store trio. At least the DR and restore
+staging callers and the config editors' fallback now get one protected DACL written whole by
+`_secure_file`, granting the account in the process token, so
 where that write succeeds no other principal's entry is left on those files.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.

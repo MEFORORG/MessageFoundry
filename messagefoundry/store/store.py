@@ -9153,9 +9153,9 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     file another account owns is left to this process's account, not to its owner. A skipped or
     failed restriction is **logged** (STORE-2), and leaves the file's access list as it was.
 
-    ``keep_explicit_entries`` is the store trio's owner-only fallback (:func:`_secure_store_file`),
-    unchanged: ``icacls /inheritance:r /grant:r``, which removes only INHERITED entries and replaces
-    only this account's own grant, so every explicit entry the file carries stays. ADR 0163 relies
+    ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
+    and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
+    entries and replaces only this account's own grant, so every explicit entry the file carries stays. ADR 0163 relies
     on that: an existing store file keeps the service account's trio entry when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
@@ -9686,7 +9686,9 @@ def _reaches_through_a_link(path: Path) -> bool:
             return True
         if attributes & reparse:
             log.warning(
-                "%s is reached through a link, so the store there is restricted owner-only", path
+                "%s is reached through a link, so the store there gets this account's grant and "
+                "keeps its explicit entries",
+                path,
             )
             return True
     return False
@@ -9714,7 +9716,8 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
-                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "%s is locked down but %s, so the store there gets the opener's grant and keeps its "
+                "explicit entries; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
                 "of 2026-09-24 and 2026-11-05)",
                 directory,
@@ -9869,7 +9872,8 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
     outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
-    owner-only icacls rewrite, exactly as before. Otherwise
+    icacls rewrite, exactly as before: it grants the opener and keeps every explicit entry.
+    Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -12423,7 +12427,8 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each a blocking ACL write on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each an ACL write on Windows, and outside a
+        # hardened directory an icacls subprocess (21 to 28 ms each, measured). Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)

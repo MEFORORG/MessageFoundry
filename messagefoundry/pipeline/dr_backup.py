@@ -2810,7 +2810,8 @@ def _discard_verify_staging(
 # * A SQLite store stages in its own DATA DIRECTORY, beside the store, and applies the store's
 #   best-effort `_secure_file` to each staged tar and extracted store before its first byte, the way
 #   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. On
-#   Windows `_secure_file` leaves a file owner-only only where its ACL write succeeds (ADR 0163).
+#   Windows, where its ACL write succeeds, `_secure_file` grants only the account the process runs
+#   as, and does not change the owner, which keeps an owner's implicit access (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
 #   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
 #   staged file. A share that will not keep the directory owner-only refuses the run (see
@@ -5065,8 +5066,8 @@ def _extract_member(
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
     ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
-    exists, BEFORE the first byte is streamed into it; on Windows that leaves it owner-only only where
-    the ACL write succeeds (ADR 0163). The restore path passes it: its staging directory sits on the destination
+    exists, BEFORE the first byte is streamed into it. On Windows, where the ACL write succeeds, that
+    grants only the account the process runs as, and leaves the owner unchanged (ADR 0163). The restore path passes it: its staging directory sits on the destination
     volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
     under the inherited ACL for as long as the write takes. The verify path passes it on each staging

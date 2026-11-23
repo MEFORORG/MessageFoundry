@@ -249,10 +249,10 @@ _SERVICE_SID = "S-1-5-80-1000000001-1000000002-1000000003-1000000004-1000000005"
 @_windows_only
 def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> None:
     # A store file the installer's rule already restricted (SYSTEM, Administrators, the service at
-    # Modify) whose directory is later refused, so the open takes the owner-only fallback. That
-    # fallback is unchanged: it keeps every explicit entry and adds the opener, so it does not shut
-    # the service out (ADR 0163). A guard against this change reaching it, green before and after;
-    # the stray entries it keeps are the gap the ADR records.
+    # Modify) whose directory is later refused, so the open takes the fallback. That fallback keeps
+    # the trio's entries and adds the opener, so it does not shut the service out (ADR 0163). A
+    # guard, green before and after. It asserts a subset on purpose: the stray Everyone entry the
+    # fallback also keeps today is the gap the ADR records, not behaviour to pin.
     import messagefoundry.store.store as store_mod
     from tests._win_acl import folder_granting, protected_entries
 
@@ -265,15 +265,12 @@ def test_the_store_trio_fallback_still_keeps_every_explicit_entry(tmp_path) -> N
     assert seeded.failure is None and seeded.dacl_status == 0, seeded
     store_mod._secure_store_file(path, dir_grants=None)
     sddl, _, entries = protected_entries(path)
-    assert sorted(entries) == sorted(
-        [
-            ("A", "", "FA", sid),
-            ("A", "", "FA", "S-1-5-18"),
-            ("A", "", "FA", "S-1-5-32-544"),
-            ("A", "", "0X1301BF", _SERVICE_SID),
-            ("A", "", "FR", "S-1-1-0"),
-        ]
-    ), sddl
+    assert {
+        ("A", "", "FA", sid),
+        ("A", "", "FA", "S-1-5-18"),
+        ("A", "", "FA", "S-1-5-32-544"),
+        ("A", "", "0X1301BF", _SERVICE_SID),
+    } <= set(entries), sddl
 
 
 @_windows_only

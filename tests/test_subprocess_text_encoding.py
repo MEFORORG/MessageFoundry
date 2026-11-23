@@ -95,3 +95,4 @@ def test_icacls_output_for_a_non_ascii_path_decodes(tmp_path: Path) -> None:
     target = tmp_path / "caf\u00e9_\u00fc.db"
     target.write_bytes(b"")
     store_mod._grant_read(target, "*S-1-5-32-545")  # BUILTIN\Users, a well-known SID
+    store_mod._secure_file(target, keep_explicit_entries=True)  # the store trio's icacls rewrite

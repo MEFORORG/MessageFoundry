@@ -44,7 +44,8 @@ elevated administrator of a file Administrators owns, makes the owner-only rewri
 the editing account, not SYSTEM, Administrators or another reader. That holds only when this
 process's account can be read from its token and the list can be written. When the token cannot be
 read, no list is written, the edit logs it, and the file keeps what its staging directory gave it.
-When only the write fails, the ``store._secure_file`` fallback can leave more entries than one.
+When only the write fails, ``store._secure_file`` retries the same one-entry list, so where it
+fails too the file keeps the candidate's or staging directory's list, which can hold more entries.
 A config file that is itself a link is refused rather than replaced: the rename would put a detached
 regular file where the link was and leave its target unedited.
 
@@ -445,7 +446,8 @@ def replace_validated(
     if sys.platform == "win32" and live.windows_owner is not None:
         # store._secure_file writes a list granting the editing account alone, which would take the
         # owning account's entry the candidate gave the file (vault BACKLOG #5619). The file keeps
-        # the candidate's list, and _restrict_to_editor has logged its failure.
+        # whatever list it has: the candidate's where that write took, else the staging directory's,
+        # which may not grant the owner. _restrict_to_editor has logged its failure.
         return
     _secure_file(path)
 
