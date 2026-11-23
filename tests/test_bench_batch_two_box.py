@@ -761,17 +761,28 @@ def test_text_within_the_cap_carries_no_cut_marker_bug_5857() -> None:
     assert bb._RESET_CUT_MARK not in text
 
 
-def test_the_cap_holds_after_escaping_and_never_splits_an_escape_bug_5857() -> None:
-    emoji = "\U0001f600"
-    one = escape_for_terminal(emoji, single_line=True)
-    assert len(one) > 1  # the input must actually grow when escaped, or this proves nothing
+def test_the_cap_holds_on_5000_emoji_bug_5857() -> None:
+    text = bb._store_reset_failure(RuntimeError("\U0001f600" * 5000))
+    assert bb._RESET_CUT_MARK in text
+    assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
 
-    text = bb._store_reset_failure(RuntimeError(emoji * 5000))
+
+def test_the_cap_holds_after_escaping_and_never_splits_an_escape_bug_5857() -> None:
+    control = "\x1b"  # escaped under every option, so the input grows when escaped
+    one = escape_for_terminal(control, single_line=True, keep_printable_unicode=True)
+    assert len(one) > 1  # or this proves nothing
+
+    text = bb._store_reset_failure(RuntimeError(control * 5000))
 
     assert len(text) + bb._RESET_ERROR_WRAP <= bb._RESET_ERROR_CHARS
     tail = text.split(bb._RESET_CUT_MARK, 1)[1]
     assert tail and len(tail) % len(one) == 0
     assert tail == one * (len(tail) // len(one))
+
+
+def test_a_remedy_naming_a_non_ascii_database_stays_pasteable_bug_5857() -> None:
+    remedy = _REMEDY.replace("mefor_test", "Prüfung")
+    assert remedy in bb._store_reset_failure(RuntimeError(remedy))
 
 
 @pytest.mark.usefixtures("no_auth_env")

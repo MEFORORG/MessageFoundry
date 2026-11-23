@@ -949,9 +949,9 @@ class FuseModeComparison:
 
     @property
     def overall_verdict(self) -> str:
-        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO if any cell is NO-GO, the
-        B1 arm is missing, or a cell has no record in either arm; otherwise INCONCLUSIVE (some cell
-        could not clear the noise bar, none failed outright)."""
+        """GO only if EVERY present cell is GO and no cell went unrun; NO-GO if any cell is NO-GO, a
+        B0 baseline or B1 arm is missing, or a cell has no record in either arm; otherwise
+        INCONCLUSIVE (some cell could not clear the noise bar, none failed outright)."""
         verdicts = [row.verdict for row in self.rows]
         # A swallowed B0 baseline or an unrun cell is a run gap, never a GO. Checked before the
         # empty-rows branch, because every cell unrun is not INCONCLUSIVE.

@@ -1061,19 +1061,25 @@ async def run_batch_engine(
 def _store_reset_failure(exc: Exception) -> str:
     """Why a store reset failed, for the cell's error. The store's refusal names its remedy (the RCSI
     statement a DBA runs, for one), so its text is kept, through the log redactor and escaped to one
-    line because it reaches a terminal.
+    line because it reaches a terminal. A printable non-ASCII character stays as it is, so a remedy
+    naming such a database can still be pasted.
 
-    The redactor masks credentials, not every connection detail: a host, login or database name can
-    remain, in the READY file and the report. It also over-redacts, so a database name of several
-    words can come out masked inside the remedy. Past the cap the START is cut, because the store
-    puts a driver's diagnostics before the remedy."""
+    The redactor is best effort and this text reaches the READY file and the report. It masks the
+    credential shapes it recognises, so a secret in another shape can remain, as can a host, login
+    or database name. It also over-redacts, so a database name of several words can come out masked
+    inside the remedy. Past the cap the START is cut, because the store puts a driver's diagnostics
+    before the remedy."""
     prefix = f"store reset failed: {type(exc).__name__}: "
     room = _RESET_ERROR_CHARS - _RESET_ERROR_WRAP - len(prefix)
     detail = redact_log_text(str(exc))
-    text = escape_for_terminal(detail, single_line=True)
+    text = _escape_reset_text(detail)
     if len(text) > room:
         text = _RESET_CUT_MARK + _escaped_tail(detail, room - len(_RESET_CUT_MARK))
     return prefix + text
+
+
+def _escape_reset_text(text: str) -> str:
+    return escape_for_terminal(text, single_line=True, keep_printable_unicode=True)
 
 
 def _escaped_tail(text: str, limit: int) -> str:
@@ -1082,11 +1088,11 @@ def _escaped_tail(text: str, limit: int) -> str:
     low, high = max(0, len(text) - limit), len(text)  # a character escapes to at least one
     while low < high:
         mid = (low + high) // 2
-        if len(escape_for_terminal(text[mid:], single_line=True)) <= limit:
+        if len(_escape_reset_text(text[mid:])) <= limit:
             high = mid
         else:
             low = mid + 1
-    return escape_for_terminal(text[high:], single_line=True)
+    return _escape_reset_text(text[high:])
 
 
 async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
