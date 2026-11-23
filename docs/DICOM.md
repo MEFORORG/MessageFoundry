@@ -335,10 +335,11 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
   refusal in an exception logged by any pynetdicom module that logs one, such as its DUL when a received PDU
   does not decode or its DIMSE provider when a received message does not convert, in the record's message
-  and in each link of its traceback's chain; pydicom's invalid value, Specific Character Set and VR IS and
-  DS lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
+  and in each link of its traceback's chain; pydicom's invalid value, Specific Character Set, VR IS and
+  DS, and invalid private creator lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
   line, which keeps its SOP class and transfer syntax only when both are conformant or named in pydicom's
-  UID dictionary; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
+  UID dictionary; its `No supported service class` line, which keeps a SOP class on the same terms; the
+  UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
   association acceptance and a DIMSE message; and the username and password of a user identity and the
   hex of an extended negotiation item's application information in those dumps, which are never kept. A
   dump field otherwise keeps at
@@ -355,8 +356,10 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   run in, and when a line they read changes, so a change to the lock has to re-read the shapes. They do not
   reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
   release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
-  yet, at least: a flagged UID that spells a name in pydicom's UID dictionary, which a dump field and the
-  `No presentation context for` line keep. The SCP reads each association
+  yet, at least: a flagged UID that spells a name in pydicom's UID dictionary, which a dump field, the
+  `No presentation context for` line and the `No supported service class` line keep; and pydicom's
+  `Unknown VR` line, which names two bytes of an object and is written only with pydicom's own debug
+  switched on. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written

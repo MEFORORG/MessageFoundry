@@ -500,8 +500,10 @@ class _Shape(NamedTuple):
     it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
     after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
     with the same value in it. ``needs`` is fixed text a line must hold for a head this general to
-    count at all. No pattern here can backtrack over the peer's text, so a long value
-    costs one pass, on whatever thread logged it."""
+    count at all. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
+    it, so a long value costs one pass, on whatever thread logged it. A ``warning`` pattern can
+    backtrack over the value: ``.*`` gives text back one character at a time. Each is matched from
+    the start of the warning with at most one such run, so its cost stays linear in the text."""
 
     head: re.Pattern[str]
     anchor: str | None = None
