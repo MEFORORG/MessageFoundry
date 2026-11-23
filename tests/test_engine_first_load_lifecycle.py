@@ -15,6 +15,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, TeardownReason
+from tests.test_cluster_graph_gating import _FlipCoordinator
 from tests.test_cluster_graph_gating import _minimal_graph as _graph
 
 
@@ -212,5 +213,224 @@ async def test_a_single_node_first_load_failure_still_raises_and_clears(
             await eng._first_load(load_config(cfg), {"K": "new"})
         assert eng._registry_runner is None
         assert eng._env_values is before
+    finally:
+        await eng.stop()
+
+
+# --- a clustered first load (BACKLOG #5743) ---------------------------------------------------
+
+
+def _record_starts(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    real = RegistryRunner.start
+
+    async def recording(self: RegistryRunner, **kwargs: Any) -> None:
+        calls.append(kwargs)
+        await real(self, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording)
+    return calls
+
+
+def _record_destructive(eng: Engine, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record each dead-letter sweep and startup reference write a bring-up makes."""
+    seen: list[str] = []
+
+    def sweep_for(name: str) -> Any:
+        async def sweep(*_a: Any, **_k: Any) -> int:
+            seen.append(name)
+            return 0
+
+        return sweep
+
+    for name in (
+        "dead_letter_missing_destinations",
+        "dead_letter_missing_handlers",
+        "dead_letter_missing_inbounds",
+    ):
+        monkeypatch.setattr(eng.store, name, sweep_for(name))
+    real_sync = eng._reconcile_reference_sync
+
+    async def sync(*, startup: bool) -> None:
+        if startup:
+            seen.append("reference_sync_startup")
+        await real_sync(startup=startup)
+
+    monkeypatch.setattr(eng, "_reconcile_reference_sync", sync)
+    return seen
+
+
+async def test_a_standby_first_load_installs_without_starting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    coord = _FlipCoordinator(leader=False)
+    eng = await _engine(tmp_path, coordinator=coord)
+    await eng.start()
+    calls = _record_starts(monkeypatch)
+    try:
+        await eng._first_load(load_config(cfg), {"K": "new"})
+        runner = eng._registry_runner
+        assert runner is not None and runner.running is False
+        assert calls == []
+        assert eng._graph_supervisor is not None
+        # The first load's CA reading is not carried to a later promotion.
+        coord.leader = True
+        await eng._reconcile_graph()
+        assert runner.running is True
+        assert calls == [{}]
+    finally:
+        await eng.stop()
+
+
+async def test_a_leader_first_load_starts_once_with_the_checked_lookups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
+    await eng.start()
+    calls = _record_starts(monkeypatch)
+    try:
+        runner = await eng._first_load(load_config(cfg), {"K": "new"})
+        assert runner.running is True
+        assert eng._graph_supervisor is not None
+        assert calls == [{"warn_query_credentials": False, "fhir_lookup_refused": {}}]
+    finally:
+        await eng.stop()
+
+
+async def test_a_failed_leader_first_load_commits_no_sweep_and_leaves_no_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regressions 1 and 3, and the failure semantics of a leader's first load."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
+    await eng.start()
+    before = eng._env_values
+    seen = _record_destructive(eng, monkeypatch)
+
+    async def failing(self: RegistryRunner, **kwargs: Any) -> None:
+        raise RuntimeError("the start failed")
+
+    monkeypatch.setattr(RegistryRunner, "start", failing)
+    try:
+        with pytest.raises(RuntimeError, match="the start failed"):
+            await eng._first_load(load_config(cfg), {"K": "new"})
+        assert seen == []
+        assert eng._registry_runner is None
+        assert eng._env_values is before
+        assert eng._graph_supervisor is None
+    finally:
+        await eng.stop()
+
+
+@pytest.mark.parametrize("still_leader", [True, False])
+async def test_a_kept_runner_gets_no_supervisor_to_start_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, still_leader: bool
+) -> None:
+    """Regression 3: a supervisor would start the failed reload's graph on a promotion."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    coord = _FlipCoordinator(leader=True)
+    eng = await _engine(tmp_path, coordinator=coord)
+    await eng.start()
+    reached = _hold_start(monkeypatch)
+    _failing_teardown(monkeypatch)
+    task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
+    await asyncio.wait_for(reached.wait(), 15)
+    coord.leader = still_leader
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    try:
+        assert eng._registry_runner is not None
+        assert eng._graph_supervisor is None
+    finally:
+        monkeypatch.undo()
+        await eng.stop()
+
+
+async def test_no_runner_is_visible_during_a_clustered_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A DR activation reads the installed runner, so none may sit unstarted in this window."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
+    await eng.start()
+    before = eng._env_values
+    calls = _record_starts(monkeypatch)
+    in_recovery = asyncio.Event()
+
+    async def held() -> None:
+        in_recovery.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(eng, "_recover_for_bring_up", held)
+    task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
+    await asyncio.wait_for(in_recovery.wait(), 15)
+    assert eng._registry_runner is None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    try:
+        assert calls == []
+        assert eng._registry_runner is None
+        assert eng._env_values is before
+        assert eng._graph_supervisor is None
+    finally:
+        await eng.stop()
+
+
+async def test_a_stop_during_a_clustered_first_load_starts_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
+    await eng.start()
+    calls = _record_starts(monkeypatch)
+    in_recovery = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held() -> None:
+        in_recovery.set()
+        await release.wait()
+
+    monkeypatch.setattr(eng, "_recover_for_bring_up", held)
+    task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
+    await asyncio.wait_for(in_recovery.wait(), 15)
+    eng._stopping = True
+    release.set()
+    with pytest.raises(RuntimeError, match="stopping"):
+        await task
+    assert calls == []
+    assert eng._registry_runner is None
+    assert eng._graph_supervisor is None
+    await eng.stop()
+
+
+async def test_a_promotion_still_runs_the_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    coord = _FlipCoordinator(leader=False)
+    eng = await _engine(tmp_path, coordinator=coord)
+    eng.add_registry(load_config(cfg))
+    await eng.start()
+    seen = _record_destructive(eng, monkeypatch)
+    try:
+        coord.leader = True
+        await eng._reconcile_graph()
+        assert seen == [
+            "dead_letter_missing_destinations",
+            "dead_letter_missing_handlers",
+            "dead_letter_missing_inbounds",
+            "reference_sync_startup",
+        ]
     finally:
         await eng.stop()

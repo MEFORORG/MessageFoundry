@@ -1700,12 +1700,55 @@ class Engine:
         # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
         if self._stopping:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
+        if not self._coordinator.is_clustered():
+            return await self._install_first_load(registry, env_values, refused, start=True)
+        # BACKLOG #5743: only the leader runs the graph, with its epoch pushed first. The recovery
+        # runs before the runner is installed, so nothing (a DR activation, say) can take an
+        # unstarted runner as live in that window. It only re-pends rows. The dead-letter sweeps and
+        # the reference write are not run here, as a first load never ran them: they would commit
+        # before a start that can still fail. reload_detail syncs the references after the start,
+        # and the sweeps run at the next promotion.
+        async with self._graph_lock:
+            leading = self._coordinator.is_leader()
+            if leading:
+                await self._recover_for_bring_up()
+                # Read before the warm too: a stop past its warm cancel would not reach this task.
+                if self._stopping:
+                    raise RuntimeError(
+                        "the engine is stopping, so the first load started no runner"
+                    )
+                await self._fire_pool_warm()
+            if self._stopping:
+                raise RuntimeError("the engine is stopping, so the first load started no runner")
+            leading = leading and self._coordinator.is_leader()
+            if leading:
+                self.store.set_leader_epoch(
+                    self._coordinator.current_epoch(), lease_key=self._coordinator.lease_key()
+                )
+            runner = await self._install_first_load(registry, env_values, refused, start=leading)
+        # Only after a first load that applied, so a failed one leaves nothing that could start
+        # its graph on a promotion. Its first pass stops a graph whose leader was fenced mid-start.
+        self._ensure_graph_supervisor()
+        return runner
+
+    async def _install_first_load(
+        self,
+        registry: Registry,
+        env_values: dict[str, Any],
+        refused: dict[str, Exception],
+        *,
+        start: bool,
+    ) -> RegistryRunner:
+        """Install the first load's runner and, if ``start``, start it. Nothing yields between
+        the install and the start taking the runner's reload lock."""
         previous_env_values, self._env_values = self._env_values, env_values
         try:
             runner = self.add_registry(registry)
-            # That check warned for this graph, so this start does not (vault BACKLOG #2910),
-            # except for a lookup it left out, which the start warns for (vault BACKLOG #3582).
-            await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
+            if start:
+                # The build check warned for this graph, so this start does not (vault BACKLOG
+                # #2910), except for a lookup it left out, which the start warns for (vault
+                # BACKLOG #3582).
+                await runner.start(warn_query_credentials=False, fhir_lookup_refused=refused)
         except asyncio.CancelledError:
             # BACKLOG #5705: cleared when the cancelled start finished its own teardown, or never
             # began. Otherwise it may still hold live state, so it stays, with the values it was
@@ -1718,6 +1761,15 @@ class Engine:
                 self._env_values = previous_env_values
             raise
         except Exception:
+            installed = self._registry_runner
+            if (
+                self._coordinator.is_clustered()
+                and installed is not None
+                and (installed.running or installed.has_residual_state)
+            ):
+                # The failed start's own teardown failed: cleared, its live listeners would be
+                # orphaned. Kept for engine.stop(), with no supervisor (BACKLOG #5743).
+                raise
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
             self._registry_runner = None
@@ -2661,24 +2713,7 @@ class Engine:
         # row is independently prevented by the store's per-row leases (see __init__). Single-node
         # never spawns it (the graph is already running, brought up directly above).
         if self._coordinator.is_clustered() and self._registry_runner is not None:
-            ttl = self._cluster_settings.leader_lease_ttl_seconds
-            fence = self._cluster_settings.leader_fence_timeout_seconds
-            # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
-            self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
-            self._graph_stop.clear()
-            self._graph_wake.clear()
-            # ADR 0157 Inc 5: register the demotion edge-trigger if this coordinator supports it.
-            # An isinstance gate rather than hasattr, and a test pins that BOTH shipped coordinators
-            # satisfy the Protocol — otherwise the capability degrades to the poll path SILENTLY,
-            # which is the defect class the ADR itself criticises elsewhere.
-            if isinstance(self._coordinator, _SupportsDemoteHook):
-                self._coordinator.set_on_demote(self._on_demote_edge)
-            else:
-                log.info(
-                    "engine: coordinator has no demotion edge-trigger; graph teardown follows the "
-                    "%.2fs poll instead",
-                    self._graph_reconcile_interval,
-                )
+            self._arm_graph_supervision()
             # Reconcile ONCE synchronously before the loop: if this node is already the leader (it
             # acquired the lease on coordinator.start()'s first tick, or in tests a stand-in reports
             # leader immediately), the graph comes up during start() rather than a poll-interval later.
@@ -2688,6 +2723,36 @@ class Engine:
             self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
+
+    def _arm_graph_supervision(self) -> None:
+        """Set the supervisor's poll interval and latches and register the demotion edge."""
+        ttl = self._cluster_settings.leader_lease_ttl_seconds
+        fence = self._cluster_settings.leader_fence_timeout_seconds
+        # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
+        self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
+        self._graph_stop.clear()
+        self._graph_wake.clear()
+        # ADR 0157 Inc 5: register the demotion edge-trigger if this coordinator supports it.
+        # An isinstance gate rather than hasattr, and a test pins that BOTH shipped coordinators
+        # satisfy the Protocol — otherwise the capability degrades to the poll path SILENTLY,
+        # which is the defect class the ADR itself criticises elsewhere.
+        if isinstance(self._coordinator, _SupportsDemoteHook):
+            self._coordinator.set_on_demote(self._on_demote_edge)
+        else:
+            log.info(
+                "engine: coordinator has no demotion edge-trigger; graph teardown follows the "
+                "%.2fs poll instead",
+                self._graph_reconcile_interval,
+            )
+
+    def _ensure_graph_supervisor(self) -> None:
+        """Spawn the supervisor for a clustered first load that applied (BACKLOG #5743), unless
+        one exists or a stop has begun: that stop has passed its supervisor step, so a task
+        spawned now would outlive it."""
+        if self._graph_supervisor is not None or self._stopping:
+            return
+        self._arm_graph_supervision()
+        self._graph_supervisor = asyncio.create_task(self._graph_supervisor_loop())
 
     def _check_pt_backend_supported(self) -> None:
         """Gate the start-time graph through the SINGLE source of truth for the PT-backend allow-list
@@ -2713,14 +2778,10 @@ class Engine:
             return
         check_reference_backend_supported(self._registry_runner.registry, self.store)
 
-    async def _start_graph(self) -> None:
-        """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
-        leases on promotion, (A3) dead-letter rows whose outbound/handler left the config, materialize
-        reference sets, then start the listeners + workers. In a cluster this runs ONLY on the leader and
-        is (re)invoked on each leadership acquire; single-node runs it once at startup. Idempotent
-        against the runner's own ``running`` guard."""
-        if self._registry_runner is None:
-            return
+    async def _recover_for_bring_up(self) -> None:
+        """The part of a bring-up that needs no runner: push the epoch, recover the prior leader's
+        in-flight rows and re-read transform state. For :meth:`_start_graph` and a clustered first
+        load, which runs it before it installs a runner (BACKLOG #5743)."""
         # H1 FENCING TOKEN. Push THIS node's held leader epoch (+ the lease row to validate it against)
         # into the store BEFORE any worker drains, so every FIFO claim this node makes as leader carries
         # the fence. The engine reads it from the coordinator and pushes it down (the store never imports
@@ -2795,6 +2856,16 @@ class Engine:
                 alert_state_cache_failure(
                     self._alert_sink, f"state cache re-read on promotion failed ({kind})"
                 )
+
+    async def _start_graph(self) -> None:
+        """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
+        leases on promotion, (A3) dead-letter rows whose outbound/handler left the config, materialize
+        reference sets, then start the listeners + workers. In a cluster this runs ONLY on the leader and
+        is (re)invoked on each leadership acquire; single-node runs it once at startup. Idempotent
+        against the runner's own ``running`` guard."""
+        if self._registry_runner is None:
+            return
+        await self._recover_for_bring_up()
         # A3 — dead-letter OUTBOUND/ROUTED rows whose destination/handler left the config (no worker
         # would ever drain them). Now part of graph bring-up, so in a cluster ONLY the leader (the one
         # node that runs the graph) sweeps — a restarting standby never dead-letters the primary's
