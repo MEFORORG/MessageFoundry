@@ -3151,7 +3151,7 @@ class DicomScuDestination(DestinationConnector):
         re-sends the identical bad object)."""
         _ignore_pydicom_value_warnings()  # ahead of the reads below, which can flag a value
         dcmread = load_dcmread()
-        from pydicom.multival import MultiValue
+        from pydicom.uid import UID
 
         # Also outside the try, for the same reason: a pydicom without the readers the guard replays is
         # a deploy error, and the broad except below must not turn it into a per-message bad-object.
@@ -3174,18 +3174,21 @@ class DicomScuDestination(DestinationConnector):
         try:
             dataset = dcmread(BytesIO(object_bytes))
             transfer_syntax = dataset.file_meta.TransferSyntaxUID
-            sop_class = str(dataset.SOPClassUID)
+            read_class = dataset.SOPClassUID
+            sop_class = str(read_class)
             # For the log lines and errors alone; the raw class is what the association proposes.
             # The read is lazy, so an instance UID that does not convert raises here.
             instance = getattr(dataset, "SOPInstanceUID", "")
-            # Each fails the same way inside send_c_store on every attempt, as an error that reads
-            # as transient there. An absent UID is caught at that call, below.
+            # A value of another type or count fails the same way inside send_c_store on every
+            # attempt, as an error that reads as transient there. An absent UID is caught at that
+            # call, below.
             if (
-                isinstance(transfer_syntax, MultiValue)
-                or isinstance(instance, MultiValue)
+                not isinstance(transfer_syntax, UID)
+                or not isinstance(read_class, str)
+                or not isinstance(instance, str)
                 or ("SOPInstanceUID" in dataset and not instance)
             ):
-                raise ValueError("a transfer syntax or SOP instance UID is not one value")
+                raise ValueError("a transfer syntax, SOP class or SOP instance UID is not one UID")
             sop_instance = _loggable_uid(instance)
         except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
             raise NegativeAckError(

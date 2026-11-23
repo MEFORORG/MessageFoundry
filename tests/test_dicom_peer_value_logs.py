@@ -1916,7 +1916,7 @@ def test_the_private_creator_line_is_still_pydicoms() -> None:
 # --- What the SCU refuses in an object before it associates (vault BACKLOG #6637) ------------------
 
 
-def _object_with_class(sop_class: str) -> bytes:
+def _object_with_class(sop_class: Any) -> bytes:
     from pydicom import dcmread
 
     from tests._dicom_sample import make_sr_part10
@@ -1995,10 +1995,40 @@ def _object_with_two_transfer_syntaxes() -> bytes:
     )
 
 
+def _object_with_transfer_syntax_as_lo() -> bytes:
+    """A synthetic object whose (0002,0010) is encoded as LO, so it reads as a plain string."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x02\x00\x10\x00UI")
+    assert found > 0
+    return data[: found + 4] + b"LO" + data[found + 6 :]
+
+
+def _object_with_instance_as_us() -> bytes:
+    """A synthetic object whose (0008,0018) is encoded as US, so it reads as an int."""
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x08\x00\x18\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    return (
+        data[: found + 4]
+        + b"US"
+        + (2).to_bytes(2, "little")
+        + b"\x05\x00"
+        + data[found + 8 + length :]
+    )
+
+
 @pytest.mark.parametrize(
     "build",
     [
         lambda: _object_with_class(_PLANTED_REFUSED),
+        lambda: _object_with_class(["1.2", "1.3"]),
+        _object_with_transfer_syntax_as_lo,
+        _object_with_instance_as_us,
         _object_whose_instance_uid_will_not_read,
         lambda: _object_with_instance(None),
         lambda: _object_with_instance(""),
@@ -2007,6 +2037,9 @@ def _object_with_two_transfer_syntaxes() -> bytes:
     ],
     ids=[
         "refused-sop-class",
+        "two-sop-classes",
+        "transfer-syntax-as-lo",
+        "instance-uid-as-us",
         "instance-uid-does-not-read",
         "no-instance-uid",
         "empty-instance-uid",
