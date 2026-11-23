@@ -690,7 +690,6 @@ async def reconcile_rotation_meta(
         changed_fp = dek_changed(prior, fingerprint)
         record = stored.get(ROTATION_RECORD_ID)
         hold = None if changed_fp is False else _rotation_hold(record, fingerprint)
-        deferred_open = False  # its warning waits for the save, which is what makes it true
         # Not only a key that changed: one whose stamp names an unknown scheme (`None`) cannot say,
         # and re-stamping it with the new fingerprint would hide the change from the run.
         # On a keyed chain a record open for another key holds this key too, even one the chain
@@ -710,23 +709,19 @@ async def reconcile_rotation_meta(
                 # The same outcome in memory. `hold` is None here, so an open record names another
                 # key and is kept. With none, the record this start would open dates from today,
                 # which is what `dated` below reads from None.
-                if _record_open(record):
-                    hold = _HELD_FOR_ANOTHER_RECORD
-                else:
+                if not _record_open(record):
                     defer_writes.record = (dek_key_id, today.isoformat())
-                    record = None
-                    hold = _OPENED_AT_START
-                    deferred_open = True
+                    record, hold = None, _OPENED_AT_START
             else:
                 opened = await open_rotation_record(
                     meta_store, dek_key_id, today.isoformat(), keep_another=True
                 )
                 record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
                 hold = _rotation_hold(record, fingerprint)
-                if hold is None and _record_open(record):
-                    hold = _HELD_FOR_ANOTHER_RECORD
-                elif hold is not None and opened:
+                if hold is not None and opened:
                     hold = _OPENED_AT_START
+            if hold is None and _record_open(record):
+                hold = _HELD_FOR_ANOTHER_RECORD
         # With no stamp yet, a held key's age runs from the record, whose dates a re-run keeps, so
         # it is never younger than the run that opened it. A floor of today would restart at every
         # start, and a key held that way could never go overdue.
@@ -735,7 +730,8 @@ async def reconcile_rotation_meta(
         if hold is not None:
             # BACKLOG #3737. Nothing is written, so the run that completes still sees a change and
             # stamps it.
-            if not deferred_open:
+            # Under defer_writes the opened-record line waits for the save, which makes it true.
+            if defer_writes is None or hold is not _OPENED_AT_START:
                 log.warning(hold)
         elif changed_fp:
             last_rotated = today  # rotation auto-detected, so reset the clock

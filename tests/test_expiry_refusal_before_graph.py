@@ -353,8 +353,8 @@ class _KeySite:
         cipher = make_cipher(self.keys[active], retired)
         return await MessageStore.open(self.db, cipher=cipher, audit_mac_key=cipher.audit_mac_key())
 
-    async def seed_chain(self, active: str = "a") -> None:
-        store = await self.open(active)
+    async def seed_chain(self) -> None:
+        store = await self.open("a")
         await store.record_audit("test.seed", actor="u")
         await store.close()
 
@@ -416,7 +416,7 @@ class _KeySite:
     def record_names(self, rows: dict[str, Any]) -> str | None:
         """The named key an open record holds, or None when no record stands open."""
         record = rows.get(_REC)
-        if record is None or record.fingerprint == sr._ROTATION_RECORD_CLOSED:
+        if not sr._record_open(record):
             return None
         return next(n for n in self.keys if self.fingerprint(n) == record.fingerprint)
 
