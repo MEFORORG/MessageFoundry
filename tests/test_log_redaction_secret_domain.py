@@ -4798,8 +4798,11 @@ def test_each_taken_tail_shape_is_masked_on_every_surface(monkeypatch: pytest.Mo
     old = _before_the_tails(monkeypatch, corpus)
     new = _tail_outputs(corpus)
     for surface, _apply in _TAIL_SURFACES:
-        if surface == "verify detail":
-            continue  # reads without the tails on purpose; verify_leaf says why
+        if surface in ("verify detail", "scrub_log_text"):
+            # Each reads without the tails on purpose; verify_leaf and scrub_log_text say why. So
+            # each must print what it printed before them.
+            assert new[surface] == old[surface], surface
+            continue
         same = [
             line for line, a, b in zip(corpus, old[surface], new[surface], strict=True) if a == b
         ]

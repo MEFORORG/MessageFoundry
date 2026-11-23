@@ -1071,8 +1071,11 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # field runs below the PHI pass's threshold. Here each pattern keeps the match it had, and an
 # optional possessive TAIL group after it takes what the old match left printing. The tail is
 # written back masked, one character for one, by :func:`_mask_tail`: every character becomes "x",
-# except whitespace, the quotes and the HL7 delimiters ``|^~\&``. So the line keeps its length and
-# its delimiters, and a pass after this one reads the same separators it read before.
+# except whitespace, the quotes and the HL7 delimiters ``|^~\&``. So the line keeps its length, its
+# whitespace, its quotes and its HL7 delimiters, and nothing else of the tail: a tail's other
+# separators, at least "=", ":", ".", "-" and "/", become "x" too, and a masked word no longer reads
+# as a label or a name. A pass after this one can therefore read the line differently from the line
+# before the tails, which is why the control below is a comparison.
 #
 # WHAT THE TAIL GRAMMAR AIMS AT, each item a reason one of those designs regressed. These are aims
 # of the grammar, and a review found shapes each missed; the control is the next paragraph.
@@ -1096,10 +1099,22 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # code before them printed. :func:`scrub_credentials` does it on its own output,
 # ``support.redact.redact_log_line`` on its output before the long-base64 sweep, the query filter in
 # ``logging_setup`` on the credential pass's reading of its output, and the key-block mask on the PHI
-# pass's (:func:`mask_private_key_blocks_then`). So a shape the grammar gets wrong costs coverage,
-# never a value the code before it hid. At least two places are not covered: a record that two
-# handlers filter, where the second pass reads the first's output, and the line across filters on
-# the installed chain, where only the query filter's step is compared.
+# pass's (:func:`mask_private_key_blocks_then`), read through the credential passes after it on the
+# installed chain and the tray. So where a comparison runs, a shape the grammar gets wrong costs
+# coverage rather than a value the code before it hid. At least these places are not covered:
+#
+# * a record that two handlers filter, where the second pass reads the first's output;
+# * the line across filters on the installed chain, where only the query filter's step and the
+#   key-block mask are compared;
+# * the filter-less ``JsonFormatter``'s ``exc_info`` branch, whose key-block mask is compared
+#   through the PHI pass alone, since no credential pass runs after it there;
+# * the support bundle read over a line the chain already masked: ``redact_log_line`` compares its
+#   own two readings of that line, not a reading of the line the chain would have written without
+#   the tails, and its long-base64 sweep can join the chain's "x" runs, so the line comes out
+#   shorter;
+# * the audit tee, whose field scrub reads without the tails and the key-block mask
+#   (``logging_setup.scrub_log_text``), so its fields are the reading before them, while the chain
+#   reads its encoded line with them as it reads any other line.
 #
 # RESIDUALS, at least: a bytes literal whose value holds ":" or "=" prints as before, and so does a
 # quoted scheme token whose padding follows a label word, a token68 followed by anything but
@@ -2161,9 +2176,12 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
-    #5550). Run first on every surface: ``scrub_credentials`` runs it as its first pass, and
-    ``support/redact.py`` and ``logging_setup`` run it before the PHI pass, which would rewrite the
-    markers. Text holding no ``-----`` returns as the same object."""
+    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass, and
+    ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass, which
+    would rewrite the markers. At least :func:`scrub_credentials_without_tails`, and so the verify
+    details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
+    (``logging_setup.scrub_log_text``), do not run it, by design: they read as the code before it.
+    Text holding no ``-----`` returns as the same object."""
     if "-----" not in text:
         return text
     return _PRIVATE_KEY_BLOCK.sub(_keep_key_marker, text)

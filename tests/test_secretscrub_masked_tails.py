@@ -184,3 +184,96 @@ def test_the_tails_grow_linearly_in_line_length() -> None:
         lambda text: control.search(text), "a." * 256, "a." * 2048, rounds=3
     )
     assert control_growth > _MAX_GROWTH, f"the control grew only {control_growth:.1f}x"
+
+
+# --- The follow-up to round 3 of the review (BACKLOG #5546 to #5550) -------------------------------
+
+#: A tee field holding a control character beside a tail, each as the field scrub shipped it before
+#: the tails, measured on the base. Read with its controls as spaces, a tail fires that the value
+#: itself refuses, and the field scrub hid the whole field where the two readings differed.
+_TEE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("password=b'v\x01w'", "password=<redacted>'v\x01w'"),
+    ("user=bob password=b'v w'\x07", "user=bob password=<redacted>'v w'\x07"),
+    (
+        'Authorization: Digest username="u\x01", nonce="n", response="r"',
+        'Authorization=<redacted>"u\x01", nonce="n", response="r"',
+    ),
+    ('{"Authorization": "Basic dXNl=="}\x01', '{"Authorization=<redacted> dXNl=="}\x01'),
+)
+
+
+@pytest.mark.parametrize(("value", "expected"), _TEE_FIELDS)
+def test_a_tee_field_with_a_control_and_a_tail_ships_the_base_text(
+    value: str, expected: str
+) -> None:
+    """The audit tee's field scrub reads without the tails, so a field is the text it was before
+    them, not ``[redacted]`` whole. The chain the handler runs over the encoded line still takes
+    the tails."""
+    from messagefoundry.store.audit_tee import _scrub_field
+
+    assert _scrub_field(value) == expected
+
+
+def test_the_filter_less_json_formatter_branch_is_mask_only_against_the_phi_pass() -> None:
+    """The ``exc_info`` branch of a filter-less ``JsonFormatter`` writes the PHI pass's reading of
+    the clamped traceback, or that reading with characters written as "x". It compared the key-block
+    mask through credential passes it never runs, which let the masked body keep a "+" and drop a
+    placeholder the PHI pass wrote (found by code review)."""
+    import json
+
+    from messagefoundry.logging_setup import JsonFormatter
+    from messagefoundry.redaction import redact_untrusted
+
+    escaped = "\\n"
+    message = (
+        "{token:"
+        + pem_marker("BEGIN", "PRIVATE KEY")
+        + escaped
+        + "+19800505"
+        + escaped
+        + pem_marker("END", "PRIVATE KEY")
+    )
+    try:
+        raise RuntimeError(message)
+    except RuntimeError as exc:
+        record = logging.LogRecord(
+            "mefor.test", logging.ERROR, __file__, 1, "failed", (), (type(exc), exc, None)
+        )
+    formatter = JsonFormatter()
+    shipped = json.loads(formatter.format(record))["exception"]
+    assert record.exc_info is not None and record.exc_info[0] is not None
+    base = redact_untrusted(formatter.formatException(record.exc_info))
+    assert scrub_mod._mask_only(base, shipped), (base[-60:], shipped[-60:])
+
+
+def test_the_query_filter_registers_its_tails_for_the_strip_check() -> None:
+    from messagefoundry import logging_setup
+
+    assert scrub_mod._SHIPPED_TAILS[id(logging_setup._CREDENTIAL_QUERY_RE)] == (
+        scrub_mod._KV_TAILS,
+        scrub_mod._BYTES_PROBE,
+    )
+
+
+def test_a_respelled_query_tail_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A query pattern whose tail fragment is spelled differently from secretscrub's is not stripped
+    by ``_without_tails``, so the query filter's comparison would compare a reading with itself. The
+    registration makes the strip raise instead. The respelled pattern takes the shipped one's
+    registration, as an edit to the pattern's source would."""
+    from messagefoundry import logging_setup
+
+    shipped = logging_setup._CREDENTIAL_QUERY_RE
+    # The same optional possessive group, spelled with a counted repeat rather than "?+".
+    assert scrub_mod._KV_TAILS.endswith(")?+")
+    respelled_tail = scrub_mod._KV_TAILS[:-2] + "{0,1}+"
+    respelled = re.compile(
+        shipped.pattern.replace(scrub_mod._KV_TAILS, respelled_tail, 1), shipped.flags
+    )
+    assert scrub_mod._KV_TAILS not in respelled.pattern
+    assert respelled.sub("", "token=b'zqv1 zqv2'") == shipped.sub("", "token=b'zqv1 zqv2'")
+    monkeypatch.setitem(
+        scrub_mod._SHIPPED_TAILS, id(respelled), scrub_mod._SHIPPED_TAILS[id(shipped)]
+    )
+    monkeypatch.setattr(logging_setup, "_CREDENTIAL_QUERY_RE", respelled)
+    with pytest.raises(ValueError, match="to strip"):
+        logging_setup._scrub_credential_query("token=b'zqv1 zqv2'")
