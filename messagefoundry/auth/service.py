@@ -2284,8 +2284,8 @@ class UserSealRefused(RuntimeError):
     from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
     answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
     writes the ``integrity.authority_seal_failed`` audit row and raises the alert only for the
-    first failure under its report key, ``user:`` followed by the account's stored id
-    (:meth:`AuthService._user_seal_failed`), in each report interval
+    first failure under its report key, which :meth:`AuthService._user_seal_failed` builds, in
+    each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal under that key inside that interval adds no such row. Not "no
     such user": the row is there, and an administrator may still delete it.
