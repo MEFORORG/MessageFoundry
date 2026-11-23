@@ -81,6 +81,12 @@ def test_the_ha_compose_engines_run_the_postgres_variant() -> None:
     assert ha["image"] == "messagefoundry:postgres", (
         "the ha engines run the Postgres store, which the slim messagefoundry:latest cannot open"
     )
+    # The resolved services, merge keys applied, so a service-level image override that put one of
+    # them back on the slim image would show here.
+    for name in ("engine-ha", "engine-standby", "schema-provision"):
+        svc = compose["services"][name]
+        assert svc["environment"]["MEFOR_STORE_BACKEND"] == "postgres", name
+        assert svc["image"] == "messagefoundry:postgres", f"{name} runs {svc['image']!r}"
 
 
 def test_the_ha_manifest_names_the_postgres_variant() -> None:

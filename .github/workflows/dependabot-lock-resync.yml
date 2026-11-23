@@ -35,8 +35,8 @@ name: Dependabot lock resync
 #    attacker-controlled build backend ever runs while the token is on the runner.
 #  - ONE repository script runs: scripts/security/runtime_closure.py (BACKLOG #1812, #1955), under
 #    the runner's own python3 with nothing installed. It is standard-library only (import names
-#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads six files,
-#    writes at most three. The checkout pins the SHA that triggered the run, and a "pull_request" run
+#    checked by tests/test_dep1_lock_resync_lockstep.py; its gaps are listed there), reads eight files,
+#    writes at most four. The checkout pins the SHA that triggered the run, and a "pull_request" run
 #    takes THIS workflow's definition from that same PR, so anyone able to change the script could
 #    already change the steps around it.
 

@@ -798,7 +798,8 @@ jobs:
     # A REAL INSTALL, not `--dry-run`, so a wheel that downloads and hashes clean but will not install
     # is caught too. Each lock goes into a freshly cleared venv, so one lock cannot satisfy another's
     # pin. Measured 2026-11-14 on Windows 11 with CPython 3.14, as a `--dry-run` under these flags:
-    # all five locks resolve, and zeroing sspilib's hashes in a copy of the core lock fails with a
+    # all five locks then on this list resolve (the postgres lock came later and was not measured),
+    # and zeroing sspilib's hashes in a copy of the core lock fails with a
     # hash mismatch. release.yml installs release-tools.lock without `--only-binary`, so a red on
     # that line here is stricter than the release, not a prediction of it.
     #
@@ -809,7 +810,7 @@ jobs:
     # `ci/locks/release-tools.lock` is here too: it is not a runtime lock, but release.yml's
     # `sbom-windows` job installs it on Windows, so a gap there would first fail during a release.
     runs-on: windows-latest
-    # Five hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
+    # Six hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

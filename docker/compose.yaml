@@ -21,7 +21,8 @@ x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?re
 
 # The engine image, named once: the revocation-attestation-check service must run the same image
 # as the engines so it reads the value with the same parser. Change it here, for example to
-# messagefoundry:sqlserver or a config-baked derived image.
+# messagefoundry:sqlserver or a config-baked derived image. It does NOT set the `ha` engines'
+# image: x-ha-engine names theirs, the runtime-postgres variant, so change that line too.
 x-engine-image: &engine-image messagefoundry:latest
 
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
