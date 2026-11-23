@@ -3183,7 +3183,7 @@ class DicomScuDestination(DestinationConnector):
                 f"{_safe_library_exc(exc)}"
             ) from exc
         finally:
-            released = self._release(assoc)
+            self._release(assoc)
         if getattr(status_ds, "Status", None) is None:
             final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
             if final is not None:
@@ -3192,25 +3192,22 @@ class DicomScuDestination(DestinationConnector):
             # Any status, a refusal included, means the peer answers this object: so the count,
             # which is of unanswered ends in a row, starts again.
             self._forget_object(object_bytes)
-        self._classify(
-            status_ds, sop_class=logged_class, sop_instance=sop_instance, released=released
-        )
+        self._classify(status_ds, sop_class=logged_class, sop_instance=sop_instance)
 
-    def _release(self, assoc: Any) -> bool:
-        """Release ``assoc``, and say whether that worked. A raise here would replace the delivery
-        error in flight, and :meth:`_c_store` scrubs only a delivery error's chain, so the library's
-        text would reach the runner. So it is logged, screened, and never raised."""
+    def _release(self, assoc: Any) -> None:
+        """Release ``assoc``. A raise here would replace the delivery error in flight, and
+        :meth:`_c_store` scrubs only a delivery error's chain, so the library's text would reach the
+        runner. So it is logged, screened, and never raised. The peer's status has already decided
+        the delivery: a store it confirmed stays delivered, since a retry would store it again."""
         try:
             assoc.release()
         except Exception as exc:  # noqa: BLE001 - a third-party call; the outcome must survive it
             logger.warning(
-                "DICOM C-STORE client (SCU) to %s:%s: the association release failed: %s",
+                "DICOM client (SCU) to %s:%s: the association release failed: %s",
                 self._host,
                 self._port,
                 _safe_library_exc(exc),
             )
-            return False
-        return True
 
     def _count_unanswered(self, key: int | None, size: int) -> NegativeAckError | None:
         """Count one store of an object over :data:`_ENGINE_SCP_ABORT_PAST_BYTES` that ended with no
@@ -3270,14 +3267,9 @@ class DicomScuDestination(DestinationConnector):
             return  # a body no send could carry was never counted
         self._forget_object(object_bytes)
 
-    def _classify(
-        self, status_ds: Any, *, sop_class: str, sop_instance: str, released: bool = True
-    ) -> None:
+    def _classify(self, status_ds: Any, *, sop_class: str, sop_instance: str) -> None:
         """Map the C-STORE response status onto the retry model. PHI-safe: only the status + routing
-        identifiers are logged/raised, never the dataset. With ``released`` false, a status that
-        would count as delivered is a transient failure instead: the association did not end
-        cleanly, so the send is not reported as done, and the retry may store the object twice,
-        which an outbound's at-least-once contract allows. Any other status keeps its own outcome."""
+        identifiers are logged/raised, never the dataset."""
         status = getattr(status_ds, "Status", None)
         if status is None:
             # An empty status dataset means the association aborted / timed out with no response —
@@ -3288,11 +3280,6 @@ class DicomScuDestination(DestinationConnector):
                 "(aborted/timeout)"
             )
         code = int(status)
-        if not released and (code == _STATUS_SUCCESS or 0xB000 <= code <= 0xBFFF):
-            raise DeliveryError(
-                f"DICOM C-STORE to {self._host}:{self._port} answered 0x{code:04X}, but the "
-                "association release failed"
-            )
         if code == _STATUS_SUCCESS:
             logger.info(
                 "DICOM C-STORE delivered to %s:%s (SOP class %s, instance %s)",

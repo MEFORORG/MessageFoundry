@@ -811,7 +811,7 @@ def _raiser(exc: BaseException) -> Callable[..., Any]:
 
 
 async def _worker_fault_text(
-    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, status: int = 0x0000
 ) -> str:
     """One object sent through the real delivery arm with every write of its failure to the store
     raising ``fault``, and what the worker's fault log then writes through the engine's
@@ -836,7 +836,7 @@ async def _worker_fault_text(
         )
         item = await store.claim_next_fifo("OB_SCU")
         assert item is not None
-        with _storage_scp() as port:
+        with _storage_scp(status=status) as port:
             runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
             runner._destinations["OB_SCU"] = _scu(port)
             runner._retry["OB_SCU"] = RetryPolicy()
@@ -900,7 +900,7 @@ def _release_that_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(Association, "release", release)
 
 
-@pytest.mark.parametrize("send_raises", [True, False], ids=["send-raised", "peer-answered"])
+@pytest.mark.parametrize("send_raises", [True, False], ids=["send-raised", "peer-refused"])
 async def test_a_failed_release_puts_no_library_text_in_the_worker_fault_log(
     send_raises: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -912,37 +912,98 @@ async def test_a_failed_release_puts_no_library_text_in_the_worker_fault_log(
     if send_raises:
         monkeypatch.setattr(Association, "send_c_store", _raiser(RuntimeError(_REFUSAL)))
     written = await _worker_fault_text(
-        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"), tmp_path, monkeypatch
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"),
+        tmp_path,
+        monkeypatch,
+        status=0xA700,  # out of resources: a failed delivery whichever arm is taken
     )
     assert "StoreAcquireTimeout" in written and "DeliveryError" in written  # CONTROL
     assert _UID not in written, written
 
 
 @pytest.mark.parametrize(
+    ("status", "line"),
+    [(0x0000, "delivered"), (0xB007, "stored with warning")],
+    ids=["success", "warning"],
+)
+async def test_a_confirmed_store_with_a_failed_release_is_delivered_once(
+    status: int,
+    line: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The peer's status decides delivery. Through the real delivery arm, so a retry would show as a
+    # second stored object and the row would not read as done.
+    from messagefoundry.config.models import RetryPolicy
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.store import MessageStore
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    _release_that_raises(monkeypatch)
+    received: list[bytes] = []
+    store = await MessageStore.open(tmp_path / "delivered.db")
+    try:
+        payload = _carry(make_sr_part10())
+        await store.enqueue_message(
+            channel_id="IB", raw=payload, deliveries=[("OB_SCU", payload)], now=100.0
+        )
+        item = await store.claim_next_fifo("OB_SCU")
+        assert item is not None
+        with (
+            caplog.at_level(logging.INFO, logger="messagefoundry.transports.dicom"),
+            _storage_scp(status=status, received=received) as port,
+        ):
+            runner = RegistryRunner(Registry(), store, egress=EgressSettings(deny_by_default=False))
+            runner._destinations["OB_SCU"] = _scu(port)
+            runner._retry["OB_SCU"] = RetryPolicy()
+            runner._simulate["OB_SCU"] = False
+            await runner._process_delivery_item("OB_SCU", item)
+        rows = await store.outbox_for(item.message_id)
+        assert await store.claim_next_fifo("OB_SCU", now=1e12) is None  # nothing left to re-send
+        assert await store.count_dead(allowed_channels=None) == 0
+    finally:
+        await store.close()
+    assert [row["status"] for row in rows] == ["done"] and not rows[0]["last_error"]
+    assert len(received) == 1
+    logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
+    assert [entry for entry in logged if line in entry]
+    assert [entry for entry in logged if "release failed" in entry and "RuntimeError" in entry]
+    assert _UID not in caplog.text
+
+
+@pytest.mark.parametrize(
     ("status", "kind", "says"),
     [
-        (0x0000, "DeliveryError", "release"),
-        (0xB007, "DeliveryError", "release"),
         (0xA700, "DeliveryError", "out-of-resources"),
         (0xC000, "NegativeAckError", "0xC000"),
+        (None, "DeliveryError", "no response status"),
     ],
-    ids=["success", "warning", "out-of-resources", "hard-refusal"],
+    ids=["out-of-resources", "hard-refusal", "no-confirmed-status"],
 )
-async def test_a_failed_release_keeps_the_peers_answer_and_is_never_a_send(
-    status: int,
+async def test_a_failed_release_keeps_any_answer_that_is_not_a_confirmed_store(
+    status: int | None,
     kind: str,
     says: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from pydicom.dataset import Dataset
+    from pynetdicom.association import Association
+
     from messagefoundry.transports.base import DeliveryError
     from tests._dicom_sample import make_sr_part10
     from tests.test_dicom_scu import _carry, _scu, _storage_scp
 
     _release_that_raises(monkeypatch)
+    if status is None:  # what pynetdicom returns for an abort or a timeout: an empty status
+        monkeypatch.setattr(Association, "send_c_store", lambda *a, **k: Dataset())
     with (
         caplog.at_level(logging.INFO, logger="messagefoundry.transports.dicom"),
-        _storage_scp(status=status) as port,
+        _storage_scp(status=status or 0) as port,
         pytest.raises(DeliveryError) as raised,
     ):
         await _scu(port).send(_carry(make_sr_part10()))
@@ -950,8 +1011,8 @@ async def test_a_failed_release_keeps_the_peers_answer_and_is_never_a_send(
     assert says in str(raised.value) and _UID not in str(raised.value)
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
-    assert not [line for line in logged if "delivered" in line or "stored with" in line]
-    assert [line for line in logged if "release failed" in line and "RuntimeError" in line]
+    assert not [entry for entry in logged if "delivered" in entry or "stored with" in entry]
+    assert [entry for entry in logged if "release failed" in entry and "RuntimeError" in entry]
     assert _UID not in caplog.text
 
 
