@@ -235,8 +235,8 @@ async def test_write_in_progress_is_not_interleaved_by_a_later_load(
 async def test_pass_on_the_old_graph_does_not_outrank_a_reload_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A pass still iterating the old graph starts its next set after the reload's load of it, so
-    that load must read the live declaration, or the replaced source wins the ordering."""
+    """A pass still iterating the old graph reaches its next set after the reload's load of it
+    began. It holds the old spec, so it must rank below that load, or the replaced source wins."""
     old_host, new_host = "old.example.test", "new.example.test"
     a_entered, a_release, b_entered, b_release = (asyncio.Event() for _ in range(4))
     new_b_reads = 0

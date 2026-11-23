@@ -660,6 +660,10 @@ class ReferenceSyncRunner:
         if self._coordinator.is_leader():
             # LEADER (or single-node): re-read the external source for the due sets and write the
             # shared snapshot. A follower skips this entirely so the source is read once per cluster.
+            # BACKLOG #5892: one sequence for the pass, taken as it reads its specs. A pass still
+            # iterating a graph a reload replaced then ranks below that reload's loads, for every
+            # set, however late it reaches one.
+            pass_started = self._next_load_sequence()
             for spec in self._specs():
                 if spec.name in self._unsupported:
                     continue  # backend can never materialize it — already reported once, don't re-spam
@@ -667,7 +671,7 @@ class ReferenceSyncRunner:
                 if not force and last is not None and (now - last) < spec.refresh_seconds:
                     continue
                 try:
-                    await self._sync_one(spec)
+                    await self._sync_one(spec, started=pass_started)
                     self._last_sync[spec.name] = now
                     synced += 1
                 except NotImplementedError:
@@ -735,14 +739,15 @@ class ReferenceSyncRunner:
             await self._audit(result)
         return result
 
-    async def _sync_one(self, spec: ReferenceSpec) -> None:
-        # BACKLOG #5892: taken first, because the env() read below is part of what this load read.
+    def _next_load_sequence(self) -> int:
         self._load_sequence += 1
-        started = self._load_sequence
-        # A pass can still be iterating the graph a reload replaced. This load is ordered as started
-        # now, so it must read what is declared now, or the replaced source outranks the reload's
-        # own load. A name the live graph no longer declares keeps the spec the pass holds.
-        spec = next((s for s in self._specs() if s.name == spec.name), spec)
+        return self._load_sequence
+
+    async def _sync_one(self, spec: ReferenceSpec, *, started: int | None = None) -> None:
+        # BACKLOG #5892: taken first, because the env() read below is part of what this load read.
+        # A pass hands in the sequence it took when it read its specs; see run_once.
+        if started is None:
+            started = self._next_load_sequence()
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
