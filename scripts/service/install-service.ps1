@@ -979,16 +979,17 @@ function New-RestrictedDirectory {
     $acl = Get-Acl -LiteralPath $Path
     $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($owner -ne $OwnerSid -or -not $acl.AreAccessRulesProtected) {
-        # The custody directory may hold a store's only key, so its refusal never says remove.
-        $remedy = if ($What -eq "the custody directory") {
+        # A custody directory, or any folder holding a key file or one that cannot be listed, may
+        # hold a store's only key, so its refusal never says remove (vault BACKLOG #3411).
+        $keyHeld = try {
+            [bool]@(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop |
+                    Where-Object { $_.Name -in @("master.key", "handoff.key") }).Count
+        } catch { $true }
+        $remedy = if ($What -eq "the custody directory" -or $keyHeld) {
             "Check who made it. Leave every key file in it where it is, and delete nothing: a " +
                 "master.key or handoff.key there may be the only copy of a store's key on this " +
                 "host. Then follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'."
-        } else {
-            "Remove it, check who made it, and re-run the installer. If it holds master.key or " +
-                "handoff.key, do not remove it or delete either file: follow docs/SERVICE.md 'When " +
-                "a refusal names master.key or handoff.key'."
-        }
+        } else { "Remove it, check who made it, and re-run the installer." }
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
             "the restricted folder the install asked for. $remedy")
     }
@@ -1104,6 +1105,14 @@ function Get-SecretsDirHeldProblem {
     param([Parameter(Mandatory)][string]$Path)
     $held = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Stop)
     if ($held.Count -eq 0) { return "" }
+    # A key file there may be a store's only key (vault BACKLOG #3411), so no remove is said then.
+    $keys = @($held | Where-Object { $_.Name -in @("master.key", "handoff.key") })
+    if ($keys) {
+        return ("it holds $($held.Count) item(s) the installer did not put there, among them " +
+            "'$($keys[0].Name)', which may be the only copy of a store's key on this host. Leave " +
+            "every key file in it where it is, and delete nothing; check who wrote them, and follow " +
+            "docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
+    }
     return ("it holds $($held.Count) item(s) the installer did not put there, such as " +
         "'$($held[0].Name)'. Remove the directory, check who wrote them, and re-run the installer; " +
         "after the install create or copy each file in, never move one: a moved file keeps its " +
@@ -3024,11 +3033,21 @@ if (-not $secretsProblem) {
 $SecretsDirNamed = [bool]$RegisteredSecretsDir -and ($RegisteredSecretsDir.TrimEnd('\') -eq $SecretsDir.TrimEnd('\'))
 if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir)) {
     if (-not $SecretsDirNamed) {
-        $secretsProblem = ("it already exists and the service does not name it. Remove it, check who " +
-            "made it, and re-run the installer, which then makes it restricted. If it holds " +
-            "master.key or handoff.key, which may be the only copy of a store's key on this host, " +
-            "do not remove it or delete either file: pass -SecretsDir naming a new folder, and " +
-            "follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
+        # A key file there, or a listing that fails, may be a store's only key (vault BACKLOG
+        # #3411), so no remove is said then.
+        $secretsKeyHeld = try {
+            [bool]@(Get-ChildItem -LiteralPath $SecretsDir -Force -ErrorAction Stop |
+                    Where-Object { $_.Name -in @("master.key", "handoff.key") }).Count
+        } catch { $true }
+        $secretsProblem = if ($secretsKeyHeld) {
+            ("it already exists, the service does not name it, and it may hold master.key or " +
+                "handoff.key, which may be the only copy of a store's key on this host. Leave every " +
+                "key file in it where it is, and delete nothing: pass -SecretsDir naming a new " +
+                "folder, and follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
+        } else {
+            ("it already exists and the service does not name it. Remove it, check who made it, " +
+                "and re-run the installer, which then makes it restricted")
+        }
     } else {
         $owner = (Get-Acl -LiteralPath $SecretsDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") {
@@ -3594,12 +3613,12 @@ try {
     # A named directory is the same one in another spelling, never a replaced one: its files stay.
     if ($replacedSecretsDir -and -not $SecretsDirNamed) {
         Write-Warning ("The service's MEFOR_SECRETS_DIRECTORY named '$replacedSecretsDir' and now names " +
-            "'$SecretsDir', as -SecretsDir asked. Copy each file from the old directory, never move " +
-            "it: a moved file keeps its old access list, not the new directory's. Then delete the old " +
-            "files you copied, and remove the service account's grant there. Leave a master.key or " +
-            "handoff.key there where it is, and delete neither: either may be the only copy of a " +
-            "store's key on this host, and docs/SERVICE.md 'When a refusal names master.key or " +
-            "handoff.key' says how to go on.")
+            "'$SecretsDir', as -SecretsDir asked. Leave a master.key or handoff.key in the old " +
+            "directory where it is, and delete neither: either may be the only copy of a store's key " +
+            "on this host, and docs/SERVICE.md 'When a refusal names master.key or handoff.key' says " +
+            "how to go on. Copy each other file from the old directory, never move it: a moved file " +
+            "keeps its old access list, not the new directory's. Then delete the old files you " +
+            "copied, and remove the service account's grant there.")
     }
     Write-Host "  Secrets: '$SecretsDir', named to the service as MEFOR_SECRETS_DIRECTORY (docs/SERVICE.md)."
 } catch {

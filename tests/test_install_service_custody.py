@@ -509,13 +509,34 @@ def test_the_secrets_directory_texts_never_send_a_key_file_to_be_deleted(tmp_pat
     # The script's string pieces joined, so a sentence split over `" +` lines reads whole.
     joined = re.sub(r'"\s*\+\s*"', "", " ".join(_script_text().split()))
     title = "When a refusal names master.key or handoff.key"
-    for start in (
-        "Then delete the old files you copied",
-        "it already exists and the service does not name it. Remove it, check who made it",
-        "Remove it, check who made it, and re-run the installer. If it holds master.key",
-    ):
-        window = joined[joined.index(start) : joined.index(start) + 500]
-        assert "handoff.key" in window and title in window, window
+    # The -SecretsDir change warning carves the key files out before it says to copy and delete.
+    keep = joined.index("Leave a master.key or handoff.key in the old directory where it is")
+    assert keep < joined.index("Then delete the old files you copied"), keep
+    assert title in joined[keep : keep + 400], joined[keep : keep + 400]
+    # The existing-directory refusal and the squatter refusal say remove only when no key file
+    # is listed there, and a listing that fails counts as one.
+    held = joined.index("$secretsProblem = if ($secretsKeyHeld) {")
+    assert title in joined[held : held + 500] and "} catch { $true }" in joined[held - 300 : held]
+    assert '$remedy = if ($What -eq "the custody directory" -or $keyHeld) {' in joined
+    assert "} catch { $true }" in joined[joined.index("$keyHeld = try {") :][:300]
+    # Get-SecretsDirHeldProblem says no remove over a key file; the control is another file.
+    assert _SCRIPT is not None
+    with_key = tmp_path / "with-key"
+    with_key.mkdir()
+    (with_key / "handoff.key").write_bytes(b"k")
+    other = tmp_path / "other-file"
+    other.mkdir()
+    (other / "MEFOR_X").write_bytes(b"v")
+    body = (
+        "  [pscustomobject]@{ key = [string](Get-SecretsDirHeldProblem -Path "
+        f"{_psq(str(with_key))}); other = [string](Get-SecretsDirHeldProblem -Path "
+        f"{_psq(str(other))}) }} | ConvertTo-Json -Compress\n"
+    )
+    out = _ok(_extract(_SCRIPT, ["Get-SecretsDirHeldProblem"], body), tmp_path)
+    got = json.loads(out.strip().splitlines()[-1])
+    assert "handoff.key" in got["key"] and title in got["key"], got
+    assert not re.search(r"\bremov", got["key"], re.IGNORECASE), got
+    assert "Remove the directory" in got["other"], got
     notice = " ".join(_notice(tmp_path, {**_FULL_FACTS, "CustodyDir": ""}).split())
     assert "except master.key and handoff.key" in notice, notice
     assert "never delete either" in notice, notice

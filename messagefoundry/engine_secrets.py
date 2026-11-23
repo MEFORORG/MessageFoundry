@@ -22,9 +22,12 @@ the readers of those settings go through. The design is ADR 0214.
   UTF-8, or one over :data:`MAX_FILE_BYTES`.
 * **The store key is not read from here as a setting.** A file named for the store key, or for its
   retired keys, is refused. The key custody host blob and its handoff (:data:`CUSTODY_FILE_NAMES`)
-  may sit here, and the listing passes over them: the ``host`` key provider reads them itself
-  (:mod:`messagefoundry.store.custody_host`, vault BACKLOG #3411), checking each as a key file.
-  :data:`CUSTODY_DIRECTORY_VARIABLE`, when set, names another directory for them.
+  may sit here, and the listing passes over them: with :data:`CUSTODY_DIRECTORY_VARIABLE` unset,
+  the ``host`` key provider reads them itself (:mod:`messagefoundry.store.custody_host`, vault
+  BACKLOG #3411), checking each as a key file. With it set, the provider reads them in the
+  directory that variable names instead, and a key file left here is not checked as one: its
+  name alone refuses another key provider, and a read or a mint while that directory holds
+  neither file.
 
 **What this slice does not do**, at least: refuse a secret found in the environment (slice B
 later made the NSSM reading in :mod:`messagefoundry.serviceenv` refuse one in the service's own

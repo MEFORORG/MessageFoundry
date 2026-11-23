@@ -198,7 +198,9 @@ def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
 
     Refused first, whether or not it exists: a custody directory that is, holds or sits inside
     the directory ``MEFOR_SECRETS_DIRECTORY`` names, compared where each resolves to
-    (:func:`_overlaps`), so a link or another spelling of the same place does not pass. The
+    (:func:`_overlaps`), so at least a link, or a spelling in another case where the platform
+    folds case, does not pass. A UNC spelling of a local path, such as ``\\\\localhost\\C$\\...``,
+    is not read as that path, so it is not caught. The
     service may add files to its custody directory, and the secrets directory is
     administrator-written (ADR 0214), so the two must stay apart."""
     raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()
@@ -242,7 +244,7 @@ def _overlaps(first: str, second: str) -> bool:
     resolves to: links followed as far as the path exists (:func:`os.path.realpath`, which on
     Windows also reads a short 8.3 name as the long one for the part that exists), then
     case-folded where the platform folds case (:func:`os.path.normcase`). Two paths on different
-    drives do not overlap."""
+    drives do not overlap, and a UNC spelling of a local path reads as a different drive."""
     own, shared = (os.path.normcase(os.path.realpath(p)) for p in (first, second))
     try:
         return os.path.commonpath([own, shared]) in (own, shared)

@@ -291,7 +291,7 @@ directory's rules, made restricted in one step, and then given this list:
 
 The script replaces any other grant the service account holds there, and removes every other
 account's allow entry and every deny entry, whoever it names. It then reads the list back, and
-refuses, disabling the service, at least when it has another owner, still inherits, still has an
+refuses, disabling the service, at least when its owner is neither Administrators nor SYSTEM, still inherits, still has an
 allow entry for another account or a deny entry on the directory, or gives the service account
 more or less than that grant. When the script does not read that provider, it refuses
 `-CustodyDir`.
