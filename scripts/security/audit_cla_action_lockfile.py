@@ -256,8 +256,8 @@ def evaluate(
         problems.append(
             f"STALE BASELINE ENTRY: {ident} in {package} is acknowledged but no longer reported. "
             "The tree is frozen, so at least these could explain it: the advisory was withdrawn, "
-            "its affected range no longer covers the locked version, or the audit stopped seeing "
-            "the package. Find out which before removing the entry."
+            "its affected range no longer covers any locked version of the package, or the audit "
+            "stopped seeing the package. Find out why before removing the entry."
         )
     return problems
 
@@ -474,10 +474,10 @@ bundle, which needs a Node toolchain this repository does not carry.
     "STALE BASELINE ENTRY": """\
 What to do about a STALE BASELINE ENTRY. Read its WITHDRAWN_AT line above where the run printed
 one with a timestamp or NOT withdrawn; otherwise open the advisory's GitHub page. If it was
-withdrawn or its affected range no longer covers the locked version, remove the entry. If neither,
-look for a NEW ADVISORY on the same package in this run, which may be the same flaw re-keyed, and
-then check whether the audit stopped seeing the package; if it did, the audit is what needs
-fixing.""",
+withdrawn or its affected range covers none of the locked versions of the package, remove the
+entry. If neither, look for a NEW ADVISORY on the same package in this run, which may be the same
+flaw re-keyed, and then check whether the audit stopped seeing the package; if it did, the audit
+is what needs fixing.""",
     "COVERAGE": """\
 What to do about COVERAGE. The audit did not read the whole lockfile, so none of its other results
 mean anything yet. Check what npm printed, and whether a new npm counts dependencies differently.""",

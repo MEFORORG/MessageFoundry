@@ -363,7 +363,7 @@ package = "micromatch"
 # these three minimatch entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE, on the reading the separate
 # minimatch GHSA-g3hv-75wg-m249 triage at the end of this file records for the same node, minimatch
 # 3.1.2, and the same chain to actions-toolkit; this comment does not cover GHSA-g3hv-75wg-m249,
-# which that triage covers. That reading was taken again for this triage: every
+# which that triage covered until its entry was removed on 2026-11-23. That reading was taken again for this triage: every
 # identifier it lists returned 0 in the bundle, and the control 2. Its probes' discrimination at
 # the upstream tags is recorded there and is not repeated here. The gate test already re-runs some
 # of them. GHSA-3ppc-4f35-3m26 and GHSA-7r86-cg39-jmmj are ReDoS through repeated wildcards and

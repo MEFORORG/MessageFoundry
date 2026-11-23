@@ -442,9 +442,10 @@ run opens an issue through `nightly-notice.yml`. The tree does not audit clean a
 here, so the job compares against a baseline of advisories already known,
 [`scripts/security/cla-action-advisories.toml`](../scripts/security/cla-action-advisories.toml),
 and fails on a new one. It also fails when a known one stops being reported, and a person has to find
-out why. The causes include at least a withdrawn advisory and an audit that stopped seeing the
-package; the script's own advice on a STALE BASELINE ENTRY says what to check. That
-check is what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
+out why. The causes include at least a withdrawn advisory, an affected range narrowed so it no
+longer covers any locked version of the package, and an audit that stopped seeing the package;
+the script's own advice on a STALE BASELINE ENTRY says what to check. The stale-entry check is
+what shows, on each run, that the audit still sees the known-vulnerable packages. *This paragraph used to say nothing in CI scans this closure;
 that was true until BACKLOG #1578's audit job landed.* The baseline's first entries were recorded as
 found, not triaged for reachability. Some have since been triaged, and the baseline's header says
 how to tell which: a triage comment names each advisory id it covers, and says who triaged it
