@@ -214,26 +214,58 @@ def blank_to_none(value: str | None) -> str | None:
     return value or None
 
 
-def posted_field_value(form: Mapping[str, str]) -> str | None:
-    """The Field value a needle form POST carries as a criterion, or ``None`` (BACKLOG #6700).
+class PostedNeedle(NamedTuple):
+    """The needle terms a form POST carries as criteria (BACKLOG #6700). ``notice`` says that a
+    refilled leftover was not sent, or is empty when none was."""
 
-    The search and uploaded-log filter pages refill their boxes after a run, so an operator who ran a
-    field-path search and then clears Field path to search on a substring posts the old Field value
-    beside the new substring. The engine refuses that pair, so that leftover is not sent: it is the
-    case where Field path is blank, a substring is given, and the Field value is unchanged from the
-    one the page rendered beside a Field path, whether that page showed results or a refusal. A
-    value the operator typed or changed, or one a refusal page echoed back with no Field path, is
-    sent as posted, so the engine's refusal of it reaches the page rather than the value being
-    dropped."""
-    value = form.get("field_value") or None
+    content: str | None
+    field_path: str | None
+    field_value: str | None
+    notice: str
+
+
+#: The on-page notice for a dropped leftover. Fixed text, so nothing the operator typed is echoed.
+DROPPED_FIELD_VALUE = (
+    "The Field value left from the last search was not sent, because Field path is now blank."
+)
+
+
+def posted_needle(form: Mapping[str, str]) -> PostedNeedle:
+    """The Substring, Field path and Field value a needle form POST carries as criteria (BACKLOG
+    #6700).
+
+    The search and uploaded-log filter pages refill their boxes after a run, so an operator who ran
+    a field-path search and then clears Field path to search on a substring posts the old Field
+    value beside the new substring. The engine refuses that pair, so that leftover is not sent: it
+    is the case where Field path is blank, a substring is given, and the Field value is unchanged
+    from the one the page rendered beside a Field path, whether that page showed results or a
+    refusal. The notice names the drop, unless the value held only whitespace, which the engine
+    would not have read either. A value the operator typed or changed, or one a refusal page echoed
+    back with no Field path, is sent as posted, so the engine's refusal of it reaches the page
+    rather than the value being dropped."""
+    content = form.get("content") or None
+    field_path = form.get("field_path") or None
+    field_value = form.get("field_value") or None
+    notice = ""
     if (
-        value is not None
-        and value == form.get(REFILLED_FIELD_VALUE)
-        and not form.get("field_path", "").strip()
-        and form.get("content", "").strip()
+        field_value is not None
+        and field_value == form.get(REFILLED_FIELD_VALUE)
+        and not (field_path or "").strip()
+        and (content or "").strip()
     ):
-        return None
-    return value
+        notice = "" if field_value.isspace() else DROPPED_FIELD_VALUE
+        field_value = None
+    return PostedNeedle(content, field_path, field_value, notice)
+
+
+def sends_a_needle(content: str | None, field_path: str | None, field_value: str | None) -> bool:
+    """Whether a form sent any needle term, by the engine's rule for a route where a needle is
+    optional: any non-empty Substring or Field path, spaces only included, or a Field value with
+    something besides whitespace (BACKLOG #6700). A copy, because the console may not import
+    ``messagefoundry.store``; ``test_console_needle_rule_matches_the_engine`` pins it to the
+    engine's ``content_search.sends_a_needle``."""
+    has_value = isinstance(field_value, str) and bool(field_value) and not field_value.isspace()
+    return bool(content or field_path) or has_value
 
 
 async def _form_pairs(request: Request) -> list[tuple[str, str]]:
