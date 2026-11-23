@@ -862,13 +862,14 @@ def _reject_config_control_chars(value: str, setting: str, where: str = "destina
 def _refuse_unsendable_static_headers(
     s: Mapping[str, Any], *, setting: str, connection: str | None
 ) -> None:
-    """Refuse at construction a static ``headers`` or credential ``_build_headers`` would drop or
-    replace without a word (BACKLOG #8299 item 8): a ``headers`` that is not a table, one Basic half
-    without the other, and ``bearer_token`` beside a Basic pair. The credential rules are REST's,
-    :func:`~messagefoundry.transports.rest._refuse_unsendable_static_auth`. Names settings, never a
-    value."""
+    """Refuse at construction at least these static settings ``_build_headers`` would drop or
+    send other than as configured (BACKLOG #8299 item 8): a ``headers`` that is not a ``dict``, the
+    one table type ``_build_headers`` and the static-credential census read, and the credential
+    rules of :func:`~messagefoundry.transports.rest._refuse_unsendable_static_auth`. A static
+    ``Authorization`` entry in ``headers`` beside ``bearer_token`` or Basic is not refused here.
+    Names settings, never a value."""
     extra = s.get("headers")
-    if extra is not None and not isinstance(extra, Mapping):
+    if extra is not None and not isinstance(extra, dict):
         raise ValueError(
             f"{hop_name_prefix(connection)}{setting} 'headers' must be a table of header names "
             "to values"
@@ -1413,7 +1414,7 @@ class FhirDestination(DestinationConnector):
         media = "application/fhir+json"  # format is constrained to json in __init__ (XML deferred)
         headers: dict[str, str] = {"Content-Type": media, "Accept": media}
         extra = s.get("headers") or {}
-        if isinstance(extra, Mapping):
+        if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
         if token:
@@ -2223,7 +2224,7 @@ class FhirLookupExecutor:
                 f"FhirLookup {cname!r} 'url' must be http or https, got scheme {scheme!r}"
             )
         refuse_url_credentials(url, f"FhirLookup {cname!r} 'url'")
-        _refuse_unsendable_static_headers(s, setting=f"FhirLookup {cname!r}", connection=None)
+        _refuse_unsendable_static_headers(s, setting=f"FhirLookup {cname!r}:", connection=None)
         headers = cls._build_headers(s)
         refuse_unsendable_static_request(url, headers, setting=f"FhirLookup {cname!r}")
         # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
@@ -2266,7 +2267,7 @@ class FhirLookupExecutor:
         media = "application/fhir+json"
         headers: dict[str, str] = {"Accept": media}
         extra = s.get("headers") or {}
-        if isinstance(extra, Mapping):
+        if isinstance(extra, dict):
             headers.update({str(k): str(v) for k, v in extra.items()})
         token = s.get("bearer_token")
         if token:

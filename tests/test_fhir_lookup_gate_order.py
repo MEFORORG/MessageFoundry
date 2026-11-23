@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -144,6 +145,11 @@ def test_the_static_credential_check_runs_before_the_token_provider_is_built(
     names = [name for name, _ in gates]
     assert "token_provider_from_settings" not in names
     assert "refuse_cleartext_credentials" in names
+    # The control: on https the cleartext check passes, and the spy sees the provider built.
+    gates.clear()
+    with pytest.raises(ValueError, match="signing-key file"):
+        _build({"smart": {**settings, "url": "https://fhir.partner.invalid/fhir"}})
+    assert [name for name, _ in gates][-1] == "token_provider_from_settings"
 
 
 @pytest.mark.parametrize(
@@ -152,6 +158,7 @@ def test_the_static_credential_check_runs_before_the_token_provider_is_built(
         ({"headers": ["X-Site", "1"]}, "'headers' must be a table"),
         ({"basic_user": "u"}, "basic_user and basic_password must be set together"),
         ({"headers": []}, "'headers' must be a table"),
+        ({"headers": MappingProxyType({"X-Site": "1"})}, "'headers' must be a table"),
         ({"basic_password": "p"}, "basic_user and basic_password must be set together"),
         ({"basic_user": "a:b", "basic_password": "p"}, "basic_user must not contain ':'"),
         (
@@ -163,6 +170,7 @@ def test_the_static_credential_check_runs_before_the_token_provider_is_built(
         "headers-list",
         "user-only",
         "headers-empty-list",
+        "headers-mapping-proxy",
         "password-only",
         "colon",
         "bearer-and-basic",
@@ -175,7 +183,7 @@ def test_a_static_credential_the_lookup_would_drop_is_refused(
     in place of the bearer, without a word."""
     with pytest.raises(ValueError, match=match) as ei:
         _build({"epic": {"url": "https://fhir.partner.invalid/fhir", **over}})
-    assert "FhirLookup 'epic'" in str(ei.value) or "fhir_lookup:epic" in str(ei.value)
+    assert str(ei.value).startswith("FhirLookup 'epic': ")
 
 
 @pytest.mark.parametrize(

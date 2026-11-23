@@ -209,8 +209,8 @@ def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool)
 
     A minted SMART or OAuth2 bearer replaces the ``Authorization`` header, so a static bearer or
     Basic credential configured beside it never leaves the engine. Basic needs both halves: SOAP
-    and DICOMweb (vault BACKLOG #5359) refuse to build on one, and REST and FHIR send nothing on
-    one. A WS-Security
+    and DICOMweb (vault BACKLOG #5359), REST (BACKLOG #5354) and FHIR (BACKLOG #8299) refuse to
+    build on one. A WS-Security
     UsernameToken rides in the SOAP body, so token auth does not displace it, but it is stamped only
     with ``ws_security`` on. Its user and password are ``ws_username`` and ``ws_password`` alone; they
     stopped falling back to the Basic pair in BACKLOG #5526. ``Soap()`` hoists ``body_secrets`` into
