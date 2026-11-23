@@ -3037,26 +3037,22 @@ class RemoteFileSource(SourceConnector):
         disposed = 0  # files this poll finished with — the per-tick ceiling's budget (_at_ceiling)
         # BACKLOG #5750: remembered rejects due a retry, by name, for the retry pass below.
         due: dict[str, tuple[float, _Listed]] = {}
-        stopped = False
         reached = len(listing)
         for position, entry in enumerate(listing):
             if self._stop.is_set():
-                stopped = True  # shutting down — leave the rest for the next start (at-least-once)
-                break
+                break  # shutting down — leave the rest for the next start (at-least-once)
             if self._at_ceiling(disposed, len(listing) - position):
                 reached = position
                 break
             step = await self._examine(entry)
             if step is _Step.STOP:
-                stopped = True
                 break
             if step is _Step.DUE:
                 due.setdefault(entry.name, (self._stuck[entry.name][0].due, entry))
             elif step is not _Step.FREE:
                 disposed += 1
                 newly_recorded += step is _Step.RECORDED
-        if not stopped:
-            newly_recorded += await self._retry_stuck(listing[reached:], due)
+        newly_recorded += await self._retry_stuck(listing[reached:], due)
         if newly_recorded and self.processed_ledger is not None:
             # Bound growth (age + count), only when something new. A store call, so the stop bound
             # waits for it rather than cutting it (#4685).
@@ -3073,16 +3069,18 @@ class RemoteFileSource(SourceConnector):
 
         ``due`` holds those the poll's pass met. ``unreached`` is the listing past the ceiling's
         break, whose due rejects join them, or a sustained backlog would keep them waiting. A due
-        reject with no slot stays due for a later poll and drops any settle sighting, which must
-        come from consecutive polls."""
+        reject with no slot stays due for a later poll. A stop takes every slot away. Every
+        remembered reject without a slot drops any settle sighting, which must come from
+        consecutive polls."""
         now = time.monotonic()
         for entry in unreached if self._stuck else ():
             stuck = self._stuck_reject(entry.name, entry.size, entry.mtime)
             if stuck is not None and stuck.due <= now:
                 due.setdefault(entry.name, (stuck.due, entry))
-        slots = heapq.nsmallest(self._stuck_retry_allowance(), due.values(), key=itemgetter(0))
-        for name in due.keys() - {entry.name for _, entry in slots}:
-            self._settle_seen.pop(name, None)
+        allowance = 0 if self._stop.is_set() else self._stuck_retry_allowance()
+        slots = heapq.nsmallest(allowance, due.values(), key=itemgetter(0))
+        for name in (self._stuck.keys() & self._settle_seen.keys()) - {e.name for _, e in slots}:
+            del self._settle_seen[name]
         recorded = 0
         for _, entry in slots:
             if self._stop.is_set():
@@ -3140,15 +3138,11 @@ class RemoteFileSource(SourceConnector):
         # BACKLOG #5750: a reject that could not be moved, unchanged since, is skipped unread and
         # uncharged until its retry falls due, and then waits for the retry pass. Before the ledger
         # read, so a skip costs no store call, and a slot bounds the store calls of the retries too.
-        # A skip drops any settle sighting, which must come from consecutive polls.
         stuck = self._stuck_reject(name, size, mtime)
         if retry and stuck is None:
             return _Step.FREE  # its listing moved on, so a later poll examines it as new
         if stuck is not None and not retry:
-            if time.monotonic() >= stuck.due:
-                return _Step.DUE
-            self._settle_seen.pop(name, None)
-            return _Step.FREE
+            return _Step.DUE if time.monotonic() >= stuck.due else _Step.FREE
         path = posixpath.join(self._remote_dir, name)
         # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
         # then the durable ledger). Keyed on a HASHED id (path + size + the listed mtime where the
@@ -3162,9 +3156,8 @@ class RemoteFileSource(SourceConnector):
             self._stuck.pop(name, None)
             return _Step.FREE
         if forms is not None and self._stop.is_set():
-            return (
-                _Step.STOP
-            )  # met during the ledger read: retrieve nothing the bound must then cut
+            # A stop met during the ledger read: retrieve nothing the bound must then cut.
+            return _Step.STOP
         if not self._settled(name, size, mtime):
             # BACKLOG #2071: first sighting, or the listed size or mtime changed since the last poll.
             # Nothing is read, moved or charged against the per-tick budget. A due retry settles
@@ -3497,8 +3490,12 @@ class RemoteFileSource(SourceConnector):
         it is. A replacement that lists the same size and time is seen only by that retry. At
         ``SETTLE_SEEN_MAX`` a new reject is not remembered, so it is read and charged again.
         :meth:`_at_ceiling` states what this does to the budget."""
-        first = name not in self._stuck
-        if first and len(self._stuck) >= SETTLE_SEEN_MAX:
+        if name in self._stuck:
+            # Only its wait changes: the record keeps a time this poll's listing may have lost, so
+            # a later change of the time still shows.
+            self._delay_retry(name, STUCK_RETRY_SECONDS)
+            return
+        if len(self._stuck) >= SETTLE_SEEN_MAX:
             if not self._stuck_full_logged:
                 self._stuck_full_logged = True
                 logger.warning(
@@ -3508,19 +3505,15 @@ class RemoteFileSource(SourceConnector):
                     SETTLE_SEEN_MAX,
                 )
             return
-        wait = STUCK_TRANSIENT_RETRY_SECONDS if first else STUCK_RETRY_SECONDS
-        if mtime is None and not first:
-            # A listing that lost the time keeps the one already known, so a later change shows.
-            mtime = self._stuck[name][0].mtime
-        self._stuck[name] = (_StuckReject(size, mtime, time.monotonic() + wait), 0)
-        if first:
-            logger.warning(
-                "REMOTEFILE %s: rejected file %s stays in place; it is tried again once it changes "
-                "or %.0f seconds pass, then less often",
-                _where(self._host, self._remote_dir),
-                safe_name(name),
-                wait,
-            )
+        due = time.monotonic() + STUCK_TRANSIENT_RETRY_SECONDS
+        self._stuck[name] = (_StuckReject(size, mtime, due), 0)
+        logger.warning(
+            "REMOTEFILE %s: rejected file %s stays in place; it is tried again once it changes "
+            "or %.0f seconds pass, then less often",
+            _where(self._host, self._remote_dir),
+            safe_name(name),
+            STUCK_TRANSIENT_RETRY_SECONDS,
+        )
 
     def _file_key(self, name: str, size: int, mtime: str | None) -> str:
         """The key this release writes for ``name``: the first of :meth:`_file_key_forms`."""
@@ -3577,7 +3570,7 @@ class RemoteFileSource(SourceConnector):
         :func:`_is_other_listing_form`). At most one WARNING per
         :data:`OTHER_FORM_WARNING_SECONDS`, DEBUG on the polls between, and a poll with none clears
         the clock so a recurrence warns at once. No name is logged, for the reason the unsafe-name
-        arm in :meth:`_poll_once` gives: the guard has refused these names."""
+        arm in :meth:`_examine` gives: the guard has refused these names."""
         if not count:
             self._other_form_warned_at = None
             return

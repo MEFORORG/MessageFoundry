@@ -34,6 +34,7 @@ from tests.test_remotefile_transport import (
 
 _GOOD = b"MSH|^~\\&|A|B"
 _BAD = b"this is not an HL7 message"
+_GOOD_AT_BAD_SIZE = _GOOD + b"x" * (len(_BAD) - len(_GOOD))  # lists as the reject it replaced
 _REFUSED = _RemoteError("FTP rejected the operation: 550", permanent=True)
 
 
@@ -217,7 +218,7 @@ async def test_a_due_retry_of_a_file_still_being_rewritten_waits_to_settle(
     await _settle(src)
     await src._poll_once()
     _make_due(src, "a.hl7")
-    partial = _GOOD + b"x" * (len(_BAD) - len(_GOOD))  # the remembered size, mid-rewrite
+    partial = _GOOD_AT_BAD_SIZE  # the remembered size, mid-rewrite
     client.files["/in/a.hl7"] = partial
     await src._poll_once()
     assert src._handler.bodies == [], "one listing at the remembered size must not admit it"
@@ -236,7 +237,7 @@ async def test_a_retried_reject_that_now_passes_is_ingested_and_forgotten(
     await _settle(src)
     await src._poll_once()
     # The same listed size and no listed time, so only the retry can see the new content.
-    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/a.hl7"] = _GOOD_AT_BAD_SIZE
     await src._poll_once()
     assert src._handler.bodies == []
     _make_due(src, "a.hl7")
@@ -327,7 +328,7 @@ async def test_a_retry_held_back_by_the_allowance_does_not_keep_an_old_sighting(
     assert "b.hl7" in src._settle_seen
     _make_due(src, "a.hl7", 0.5)  # as a reject one listing missed comes back due before b
     await src._poll_once()  # a takes the slot and settles; b has none
-    client.files["/in/b.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/b.hl7"] = _GOOD_AT_BAD_SIZE
     await src._poll_once()  # a is read; b still has no slot
     await src._poll_once()  # b's first sighting of this content
     assert src._handler.bodies == [], "a single listing must not admit it"
@@ -344,10 +345,43 @@ async def test_a_skipped_reject_does_not_keep_an_old_sighting(
     await src._poll_once()
     src._settle_seen["a.hl7"] = ((len(_BAD), None), 0)
     await src._poll_once()  # not due, so skipped
-    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/a.hl7"] = _GOOD_AT_BAD_SIZE
     _make_due(src, "a.hl7")
     await src._poll_once()  # its first sighting of this content
     assert src._handler.bodies == [], "a single listing must not admit it"
+    assert _retrieved(client, "/in/a.hl7") == 1
+
+
+async def test_a_waiting_reject_past_the_ceiling_does_not_keep_an_old_sighting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pass never reaches it, so the retry pass is what drops the sighting."""
+    client = _read_only({"/in/z.hl7": _BAD})
+    src = _leave(monkeypatch, client, poll_max_files=1)
+    await _settle(src)
+    await src._poll_once()
+    client.files |= {"/in/a.hl7": _GOOD, "/in/b.hl7": _GOOD}
+    await src._poll_once()  # a and b are first seen
+    src._settle_seen["z.hl7"] = ((len(_BAD), None), 0)
+    await src._poll_once()  # a spends the budget, so the pass stops before z
+    assert _retrieved(client, "/in/b.hl7") == 0, "the premise: the ceiling cut this poll"
+    assert "z.hl7" not in src._settle_seen
+
+
+async def test_a_stopped_poll_drops_the_sighting_of_a_due_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop gives no reject a slot, so none keeps a sighting into the next start."""
+    client = _read_only({"/in/a.hl7": _BAD})
+    src = _leave(monkeypatch, client)
+    await _settle(src)
+    await src._poll_once()
+    _make_due(src, "a.hl7")
+    await src._poll_once()  # it takes the slot and settles
+    assert "a.hl7" in src._settle_seen
+    src._stop.set()
+    await src._poll_once()
+    assert "a.hl7" not in src._settle_seen
     assert _retrieved(client, "/in/a.hl7") == 1
 
 
@@ -401,8 +435,8 @@ async def test_every_stuck_reject_gets_its_retry_when_slots_are_scarce(
         await src._poll_once()  # the ceiling lets ten through a poll
     assert len(src._stuck) == len(names)
     for _ in range(100):
-        for name, (seen, missed) in list(src._stuck.items()):
-            src._stuck[name] = (seen._replace(due=seen.due - 30.0), missed)
+        for name, (seen, _) in list(src._stuck.items()):
+            _make_due(src, name, seen.due - 30.0)
         await src._poll_once()
     never = [name for name in names if _retrieved(client, f"/in/{name}") < 2]
     assert never == []
@@ -433,7 +467,7 @@ async def test_a_failed_retry_does_not_promise_the_next_poll(
     src = _leave(monkeypatch, client)
     await _settle(src)
     await src._poll_once()
-    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/a.hl7"] = _GOOD_AT_BAD_SIZE
     _make_due(src, "a.hl7")
     await _settle(src)
     if failure == "retrieve":
@@ -467,7 +501,7 @@ async def test_a_retry_whose_hand_off_fails_keeps_its_memory_on_the_short_wait(
     src = _leave(monkeypatch, client)
     await _settle(src)
     await src._poll_once()
-    client.files["/in/a.hl7"] = _GOOD + b"x" * (len(_BAD) - len(_GOOD))
+    client.files["/in/a.hl7"] = _GOOD_AT_BAD_SIZE
     _make_due(src, "a.hl7")
     await _settle(src)
     src._handler = _RecordingHandler(exc=RuntimeError("synthetic store failure"))
