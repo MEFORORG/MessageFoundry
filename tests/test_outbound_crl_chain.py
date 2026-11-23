@@ -224,7 +224,8 @@ def test_an_anchor_cannot_check_the_chain_without_a_crl() -> None:
 
 @_BUILDERS
 def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _TwoTier) -> None:
-    """No CRL file names the OS roots, so the whole-chain check cannot hold on augment or system."""
+    """The check would need a CRL from every CA the OS trust store holds, so augment and system
+    refuse the build."""
     augment = _anchor(two_tier.revokes_nothing, internal_ca=two_tier.root_file, mode="augment")
     with pytest.raises(ValueError, match=r"crl_check_chain is set, .* the augment arm"):
         build(augment)
