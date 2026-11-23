@@ -1095,9 +1095,9 @@ def test_the_smart_revocation_attestation_comes_from_its_own_settings_key(smart_
 
 
 # BACKLOG #1924. Each URL parses to NO hostname (`urlsplit(...).hostname is None`). The guard used to
-# pass `hostname or ""`, and `is_loopback_hop_host("")` is True, so a hop it could not classify took
-# the on-box carve-out and crossed an enforcing posture with no refusal. It is now refused outright,
-# as a plain ValueError. `pytest.raises(ValueError)` alone would also catch a posture refusal, since
+# pass `hostname or ""`, and `is_loopback_hop_host("")` was True until BACKLOG #5512, so a hop it
+# could not classify took the on-box carve-out and crossed an enforcing posture with no refusal. It
+# is now refused outright, as a plain ValueError. `pytest.raises(ValueError)` alone would also catch a posture refusal, since
 # InsecureHopRefused subclasses it, so every arm matches the message.
 _HOSTLESS_HTTPS = ("https:///token", "https://:443/token")
 
@@ -1570,9 +1570,9 @@ async def test_the_blanket_env_does_not_cross_the_enforcing_oidc_legs(
 
 
 async def test_an_oidc_leg_with_no_host_is_refused_not_treated_as_loopback() -> None:
-    """FAIL-CLOSED on a host the guard cannot read. ``is_loopback_hop_host("")`` is True, so a guard
-    fed an empty host would take the on-box carve-out and ALLOW. The settings validator refuses a
-    missing URL, so only unvalidated settings reach this; ``model_copy`` builds them here."""
+    """FAIL-CLOSED on a host the guard cannot read, whatever the posture, rather than leaving an
+    empty host to the guard's remote reading. The settings validator refuses a missing URL, so only
+    unvalidated settings reach this; ``model_copy`` builds them here."""
     settings = _oidc_settings(
         oidc_issuer=f"https://{REMOTE}",
         oidc_authorization_endpoint=f"https://{REMOTE}/authorize",

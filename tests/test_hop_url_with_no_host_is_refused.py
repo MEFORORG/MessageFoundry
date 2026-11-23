@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """One refusal for a hop URL that names no host, at the sites BACKLOG #2207 names.
 
-``tls_policy.is_loopback_hop_host("")`` is True. So a site that wrote ``hostname or ""`` took the
-on-box carve-out for the one hop it could not classify. BACKLOG #1924 closed that in the four
-construction guards in ``transports/rest.py``. This file covers the sites that still read an empty
-host after it:
+``tls_policy.is_loopback_hop_host("")`` was True until BACKLOG #5512. So a site that wrote
+``hostname or ""`` took the on-box carve-out for the one hop it could not classify. BACKLOG #1924
+closed that in the four construction guards in ``transports/rest.py``. This file covers the sites
+that still read an empty host after it:
 
 * the send-time re-check in ``_post`` and ``_probe`` of the four HTTP destinations, and in
   ``FhirLookupExecutor``;

@@ -496,9 +496,8 @@ def http_family_trust_anchor(
     :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
     default resolves to, so callers have ONE "nothing configured" value to handle rather than two.
 
-    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
-    ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
-    place. ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
+    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207).
+    ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
     their provider checks the URL, so they pass the setting's name and the operator learns which
     URL to fix."""
     ca = settings.get("tls_ca_file")
@@ -813,8 +812,9 @@ class InsecureHopGuard:
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture.
 
-        An empty ``host`` is refused whatever the posture (BACKLOG #2207): the authority below reads
-        ``""`` as loopback and would ALLOW it. The text is fixed and names no part of the URL."""
+        An empty ``host`` is refused whatever the posture (BACKLOG #2207), where the authority below
+        could still let an attested or accepted hop cross. The text is fixed and names no part of
+        the URL."""
         if not host:
             raise InsecureHopRefused(
                 f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal: the URL names "

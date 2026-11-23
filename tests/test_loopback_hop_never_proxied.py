@@ -496,9 +496,9 @@ def test_a_percent_encoded_host_goes_to_this_box_on_a_direct_leg() -> None:
 
 
 def test_the_host_a_plain_rstrip_would_empty_stays_off_box() -> None:
-    """Why a plain ``rstrip`` is not the fix. ``http://./x`` names the host ``.``, which is remote
-    today; stripped, it would be the empty host, which the predicate reads as loopback."""
+    """``http://./x`` names the host ``.``, which is remote. Stripped, it is the empty host, which
+    is remote too since BACKLOG #5512."""
     host = hop_url_host("http://./x", cell="test")
     assert host == "."
     assert not is_loopback_hop_host(host)
-    assert is_loopback_hop_host(host.rstrip("."))
+    assert not is_loopback_hop_host(host.rstrip("."))

@@ -16422,10 +16422,11 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     """
     if source.type is not ConnectorType.HTTP:
         return
-    host = str(source.settings.get("host", "127.0.0.1"))
-    # CIDR-aware, and it treats an empty host as loopback — which matches HttpSource's own
-    # `s.get("host") or "127.0.0.1"` fallback. Reused rather than minting another _LOOPBACK_HOSTS
-    # frozenset; the tree already carries five same-named copies across two distinct contents.
+    # A blank host binds loopback: this is HttpSource's own `s.get("host") or "127.0.0.1"` fallback,
+    # read here because the shared predicate does not take "" as loopback (BACKLOG #5512).
+    host = str(source.settings.get("host", "127.0.0.1")) or "127.0.0.1"
+    # CIDR-aware. Reused rather than minting another _LOOPBACK_HOSTS frozenset; the tree already
+    # carries five same-named copies across two distinct contents.
     if is_loopback_hop_host(host):
         return
     if _has_effective_peer_control(source.settings):

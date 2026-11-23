@@ -906,8 +906,7 @@ def _stays_on_the_box(host: str, proxy: str | None) -> bool:
     One rule for the cleartext refusal and the revocation refusal: a loopback host, by
     ``tls_policy.is_loopback_hop_host``, which never resolves DNS, reached with no proxy. A
     loopback address behind a proxy is not on the box, because the proxy carries it elsewhere.
-    A blank host is not either: that function counts ``""`` as loopback, and here it names no
-    hop at all."""
+    A blank host is not either, because it names no hop at all."""
     return not proxy and bool(host) and is_loopback_hop_host(host)
 
 

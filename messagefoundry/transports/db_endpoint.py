@@ -95,8 +95,8 @@ def _exact_split(text: str) -> tuple[str, str] | None:
 
     Anything else, at least ``[::1]remote``, ``[::1]:5432x``, ``127.0.0.1 : 5432`` and ``[]``,
     gets ``None``, so no text the split would drop can sit behind a loopback host. An empty host
-    from a non-empty ``text`` is refused because the loopback check reads an empty host as on-box,
-    while the driver is handed the text, not an empty one."""
+    from a non-empty ``text`` gets ``None`` too, so a refusal names the text the driver is handed
+    rather than an empty host."""
     host, in_server = split_generic_server(text)
     written = (f"[{host}]" if text.startswith("[") else host) + (
         f":{in_server}" if in_server else ""

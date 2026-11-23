@@ -4247,7 +4247,7 @@ that carries no recognized credential crosses in three ways that do not claim th
 
 | | claim | disposition |
 |---|---|---|
-| the hop is **on-box** (loopback / `localhost` / empty host) | not a network exposure | ALLOW |
+| the hop is **on-box** (loopback / `localhost`; an empty host is not on-box) | not a network exposure | ALLOW |
 | `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
 | `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
 

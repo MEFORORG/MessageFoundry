@@ -5150,11 +5150,12 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host, and so must
+    a value that trims to nothing, which names no other system (BACKLOG #5512). No DNS.
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5451,15 +5452,16 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     instance carrying patient data there is no instance left for it to fire on, so it is gone. A
     ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
     way this cell could express an acceptance."""
+    if not log.forward_host:
+        # An unconfigured forwarder: `serve` builds none without a host, so there is no hop to
+        # refuse. Said here because the shared predicate no longer reads "" as loopback (#5512).
+        return HopDisposition.ALLOW
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
-        # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
-        # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
-        # can never be refused.
-        is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
+        is_loopback_hop=is_loopback_hop_host(log.forward_host),
         hop_attested=log.forward_hop_attested,
         # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
         # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
