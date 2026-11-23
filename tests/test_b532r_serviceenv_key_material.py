@@ -313,7 +313,7 @@ def test_a_name_that_upper_cases_to_the_directory_is_kept_as_os_environ_reads_it
     """The Lander's hold on PR 3142, comment 7091598959: the engine reads its directory through
     ``os.environ``, which on Windows folds a key with ``str.upper``, so these spellings name the
     secrets directory and the path entry joined into the empty key stays, as for the ASCII
-    spelling."""
+    spelling. This pin said the opposite until that hold ruled the ASCII check out."""
     refusal = service_env_refusal(_read([f"{_KEY}=", f"{name}=C:/d"]))
     assert refusal is not None
     assert refusal.count(KEEP) == 1

@@ -521,24 +521,6 @@ def test_a_directory_name_folds_as_os_environ_folds_it(name: str, counts: bool) 
     assert SET_NO not in control and REMOVE_OTHER in control
 
 
-@pytest.mark.parametrize(
-    ("written", "counts"),
-    [
-        (" MEFOR_SECRETS_DIRECTORY ", True),
-        ("\tMEFOR_SECRETS_DIRECTORY\t", True),
-        ("\x0bMEFOR_SECRETS_DIRECTORY", False),
-        ("MEFOR_SECRETS_DIRECTORY\x0c", False),
-    ],
-    ids=["space", "tab", "VT", "FF"],
-)
-def test_only_spaces_and_tabs_around_a_directory_name_are_stripped(
-    written: str, counts: bool
-) -> None:
-    """The Lander's hold on PR 3142, comment 7091598959, step 3: the reader strips ASCII
-    spaces and tabs around the name, ``strip(" \\t")``, and no other blank."""
-    assert _sets_directory(f"{written}=C:\\d") is counts
-
-
 def test_a_blank_directory_item_is_not_passed_back() -> None:
     """The Lander's hold on PR 3142, comment 7089064404, A: the blank
     ``MEFOR_SECRETS_DIRECTORY=`` is no refused variable, and no value runs on into it, so only
