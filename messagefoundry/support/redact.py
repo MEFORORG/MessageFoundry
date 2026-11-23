@@ -341,8 +341,9 @@ _PLAIN_SCHEME_VALUE = (
 # why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
 #: This copy's scheme words with a marker on ``digest``, which the Digest tail reads (BACKLOG
 #: #5548). The tails themselves are secretscrub's fragments, imported, and the contract they hold
-#: is stated once, on ``_NO_LABEL_BEFORE`` there. This copy has no union behind it, so a cascade
-#: that contract misses is not covered here.
+#: is stated once, on ``_NO_LABEL_BEFORE`` there. This copy has no union behind it; the control on
+#: its tails is the comparison in :func:`redact_log_line`, which keeps the reading without them
+#: where the two differ at anything but an "x".
 _SCHEME_WORDS = r"(?:(?i:bearer|basic|digest)\s+)?"
 _MARKED_SCHEME_WORDS = r"(?:(?i:bearer|basic|(?P<digest>digest))\s+)?"
 _BEARER = re.compile(

@@ -758,8 +758,10 @@ class JsonFormatter(_SafeExcFormatter):
     alphabet. It writes the rest raw: at least DEL, the C1 controls, the format characters such as a
     bidirectional override, U+2028 and U+2029, a lone surrogate, and the private-use and unassigned
     code points (vault BACKLOG #2815). Such a handler also leaves the message, its arguments and
-    ``stack_info`` unredacted, and scrubs no credential anywhere but the body of a PRIVATE KEY block
-    in the traceback the ``exc_info`` branch below renders (BACKLOG #5550). That branch is the only
+    ``stack_info`` unredacted, and scrubs no credential anywhere, except that the ``exc_info``
+    branch below can mask the body of a PRIVATE KEY block in the traceback it renders, where the
+    masked reading passes that branch's comparison; where it does not, the body prints whole
+    (BACKLOG #5550). That branch is the only
     PHI redaction on it, and it runs only when no earlier formatter on the same record has already
     cached a raw traceback in ``exc_text``. Every handler :func:`configure_logging` builds
     carries the filters, so none of this reaches a configured sink. Use this formatter only on a
@@ -1302,9 +1304,9 @@ def _install_phi_filters(handler: logging.Handler) -> None:
 
 
 def scrub_log_text(text: str) -> str:
-    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order: PHI
-    redaction (bounded), the credential query scrub, the credential scrub, then the binary-carriage
-    pass. The control scrub, which runs last on a handler, is left out, so a control character stays
+    """``text`` through the text passes :func:`_install_phi_filters` installs, in its order, as
+    they read before the masked tails (see below): PHI redaction (bounded), the credential query
+    scrub, the credential scrub, then the binary-carriage pass. The control scrub, which runs last on a handler, is left out, so a control character stays
     as it is.
 
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG

@@ -1072,15 +1072,17 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # optional possessive TAIL group after it takes what the old match left printing. The tail is
 # written back masked, one character for one, by :func:`_mask_tail`: every character becomes "x",
 # except whitespace, the quotes and the HL7 delimiters ``|^~\&``. So the line keeps its length, its
-# whitespace, its quotes and its HL7 delimiters, and nothing else of the tail: a tail's other
-# separators, at least "=", ":", ".", "-" and "/", become "x" too, and a masked word no longer reads
-# as a label or a name. A pass after this one can therefore read the line differently from the line
+# whitespace, its quotes and its HL7 delimiters, and nothing else of a scheme, bytes or Digest tail:
+# its other separators, at least "=", ":", ".", "-" and "/", become "x" too, and a masked word no
+# longer reads as a label or a name. A key body keeps more, its escaped line breaks and its
+# ``Proc-Type:`` and ``DEK-Info:`` header lines (:func:`_mask_key_body`). A pass after this one can therefore read the line differently from the line
 # before the tails, which is why the control below is a comparison.
 #
 # WHAT THE TAIL GRAMMAR AIMS AT, each item a reason one of those designs regressed. These are aims
 # of the grammar, and a review found shapes each missed; the control is the next paragraph.
 #
-# * No "{", no line break, no "://" and no quote other than the tail's own inside a tail.
+# * No "{", no line break, no "://" and no quote other than the tail's own inside a scheme, bytes
+#   or Digest tail. A key body holds line breaks by design; its pattern says what else.
 # * No label head inside a tail unless the label's whole value is inside too. A bytes literal or a
 #   token68 body holds no ":" or "=", except token68's trailing padding, and that padding is refused
 #   when a label word ends right before it (:data:`_NO_LABEL_BEFORE`): ``Basic abc.password==``
@@ -2371,11 +2373,14 @@ def _admits(folded: str | None, words: tuple[str, ...]) -> bool:
 
 
 def scrub_credentials(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
-    """Return ``text`` with credential VALUES replaced by ``placeholder``, keeping every label.
+    """Return ``text`` with credential VALUES replaced by ``placeholder``, keeping the label of
+    each match.
 
     The label survives on purpose: an operator reading a scrubbed line must still be able to tell WHICH
-    credential the failing code was handling. Nothing else about the line is touched -- this is a
-    credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
+    credential the failing code was handling. Some text after a match is written back masked rather
+    than replaced, one character for one, at least a braced run-on, the masked tails and a PRIVATE
+    KEY block body (BACKLOG #5546 to #5550); a Digest tail masks the names of the parameters after
+    the first, which are labels too. This is a credential pass, not a PHI pass (:mod:`messagefoundry.redaction` owns that) and not a control-char
     pass (:func:`messagefoundry.controlchars.scrub_control_chars` owns that).
 
     Idempotent on ordinary lines, which matters because a record dispatched to stdout *and* the off-box
