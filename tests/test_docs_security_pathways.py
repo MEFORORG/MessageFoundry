@@ -2520,7 +2520,9 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             # Item 6: once TOTP is on, a covered account cannot remove it while no DISCOVERABLE
             # passkey remains; this one is not discoverable ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
-            staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+            staged_cell = await store.set_totp_secret(
+                identity.user_id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+            )
             assert await store.enable_totp(
                 identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
             )

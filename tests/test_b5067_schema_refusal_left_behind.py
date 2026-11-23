@@ -98,7 +98,9 @@ def _refused_at_the_write(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
 
 
@@ -420,7 +422,7 @@ def test_provision_admin_names_the_os_user_before_the_key_is_shown(
 
     def enrol(**_k: object) -> tuple[str, str, float]:
         shown.append(_k)
-        return ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        return ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0)
 
     def no_user() -> str:
         raise OSError("no user name for this shell")
