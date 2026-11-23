@@ -53,13 +53,19 @@ import re
 
 from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
+    _BEARER_TAILS,
+    _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
+    _KV_TAILS,
+    _MEFOR_TAILS,
     _braced_tail,
     _dsn_password_repl,
+    _keep_key_marker,
     _mask_member,
     scrub_credentials,
 )
 from messagefoundry.secretscrub import _DSN_PASSWORD as _SHARED_NARROW_DSN_PASSWORD
+from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY_BLOCK
 from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
@@ -326,10 +332,23 @@ _PLAIN_SCHEME_VALUE = (
 # never (the reason is at ``_CREDENTIAL_KV``); otherwise the plain class stops at the first quote. A
 # QUOTED KEY is a label when a colon follows the quote, here and in ``_LABEL_HEAD`` (BACKLOG #3038);
 # why the colon only is on the same pattern in ``messagefoundry/secretscrub.py``.
+#: This copy's scheme words with a marker on ``digest``, which the Digest tail reads (BACKLOG
+#: #5548). The tails themselves are secretscrub's fragments, imported, and the contract they hold
+#: is stated once, on ``_NO_LABEL_BEFORE`` there. This copy has no union behind it, so a cascade
+#: that contract misses is not covered here.
+_SCHEME_WORDS = r"(?:(?i:bearer|basic|digest)\s+)?"
+_MARKED_SCHEME_WORDS = r"(?:(?i:bearer|basic|(?P<digest>digest))\s+)?"
 _BEARER = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:bearer|authorization|token|session|api[_-]?key))\b"
-    r"(?:['\"]\s*:|\s*[:=])\s*(?:(?i:bearer|basic|digest)\s+)?"
-    r"(?:" + _GUARDED_QUOTED_VALUE + r"|" + _PLAIN_VALUE + r")"
+    r"(?:['\"]\s*:|\s*[:=])\s*"
+    + _MARKED_SCHEME_WORDS
+    + _BYTES_PROBE
+    + r"(?:"
+    + _GUARDED_QUOTED_VALUE
+    + r"|"
+    + _PLAIN_VALUE
+    + r")"
+    + _BEARER_TAILS
 )
 
 # A bare auth scheme carrying its credential with no preceding header label — "Bearer <tok>" as it
@@ -361,7 +380,8 @@ _AUTH_SCHEME = re.compile(
 # a space does not; why is on the same pattern in ``messagefoundry/secretscrub.py``.
 _MEFOR_SECRET = re.compile(
     r"\b(MEFOR_[A-Z0-9_]+)\b['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_NO_SPACE
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     + r"['\"]?|"
@@ -375,6 +395,7 @@ _MEFOR_SECRET = re.compile(
     + r"|"
     + _PLAIN_VALUE
     + r"['\"]?)"
+    + _MEFOR_TAILS
 )
 
 # A credential in a "<label>=<value>" pair: an ODBC "PWD=", a "password=" in a connection error, a
@@ -422,7 +443,8 @@ _MEFOR_SECRET = re.compile(
 _CREDENTIAL_KV = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\b"
     r"['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _ODBC_BRACED
     + r"|"
     + _KV_QUOTED_VALUE
@@ -431,6 +453,7 @@ _CREDENTIAL_KV = re.compile(
     + r"|"
     + _PLAIN_KV_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # Key MATERIAL in a "<label>=<value>" pair, where the label ends in a credential word neither pattern
@@ -503,13 +526,15 @@ _CREDENTIAL_KV = re.compile(
 _KEY_MATERIAL = re.compile(
     _LABEL_START + r"(" + _LABEL_PREFIX + r"(?i:encryption_key(?:s_retired)?|private_key"
     r"|intake_api_key_next))\b['\"]?\s*[:=]\s*"
-    r"(?:"
+    + _BYTES_PROBE
+    + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _PLAIN_KEY_VALUE
     + r")"
+    + _KV_TAILS
 )
 
 # An inline password in a URL-shaped DSN: "postgres://user:<pw>@host/db". The scheme and the user
@@ -548,6 +573,9 @@ _KEY_MATERIAL = re.compile(
 #: strict mypy lets a test name each on this module; a test disables each here by that name.
 _DSN_PASSWORD = _SHARED_NARROW_DSN_PASSWORD
 _WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
+#: A PRIVATE KEY block, its body masked (BACKLOG #5550): secretscrub's object, assigned under the
+#: same name so a test disables it in both layers by that name.
+_PRIVATE_KEY_BLOCK = _SHARED_PRIVATE_KEY_BLOCK
 
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
@@ -644,6 +672,11 @@ def redact_log_line(line: str) -> str:
     ts = _LEADING_TS.match(line)
     prefix, body = (line[: ts.end()], line[ts.end() :]) if ts else ("", line)
     logged_placeholder = REDACTION_PLACEHOLDER in body
+    # First, before the PHI pass rewrites a PRIVATE KEY block's markers (BACKLOG #5550). Spelled
+    # out rather than through ``mask_private_key_blocks`` so this function applies the pattern by
+    # its name here, which the family table and its mutation test read.
+    if "-----" in body:
+        body = _PRIVATE_KEY_BLOCK.sub(_keep_key_marker, body)
     body = _MFB64.sub(REDACTION_PLACEHOLDER, body)
     body = _MEFOR_SECRET.sub(_keep_label, body)
     body = _BEARER.sub(_keep_label, body)

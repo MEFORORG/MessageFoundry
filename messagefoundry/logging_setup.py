@@ -80,6 +80,14 @@ from messagefoundry.redaction import (
     redact_untrusted,
     safe_traceback,
 )
+from messagefoundry.secretscrub import (
+    _BYTES_PROBE,
+    _KV_TAILS,
+    CREDENTIAL_PLACEHOLDER,
+    _braced_tail,
+    mask_private_key_blocks,
+    scrub_credentials,
+)
 
 # THE OTHER LEAF IMPORTED FOR ITS DEFINITION (BACKLOG #1478): the credential-label vocabulary, held in
 # one place so the write-time filters here and the read-time support-bundle redactor cannot disagree
@@ -91,7 +99,6 @@ from messagefoundry.redaction import (
 from messagefoundry.secretscrub import (
     _CREDENTIAL_QUERY_KEYS as _CREDENTIAL_QUERY_KEYS,
 )
-from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 
 __all__ = [
     "LogFile",
@@ -308,7 +315,7 @@ class RedactionFilter(logging.Filter):
         # pattern can tell from prose. The tray's chain shares the step, through the same function.
         prepare_log_record(record)
         try:
-            _rewrite_record(record, redact_untrusted)
+            _rewrite_record(record, _redact_masking_key_blocks)
         except Exception as exc:  # noqa: BLE001 -- a log call must never raise, as in the tray's filter
             # getMessage() runs the caller's % format and its arguments' own __str__/__repr__, and
             # Handler.handle does not guard a filter. Fail closed: a fixed line, never the raw record.
@@ -390,8 +397,11 @@ _QUERY_VALUE = (
     r"(?:[A-Za-z0-9._\-]++|[^A-Za-z0-9._\-&\s\"'](?!" + _LABEL_WITH_ITS_VALUE_OUTSIDE + r"))++"
 )
 
+#: A query value that is a Python bytes literal, ``token=b"v w"``, takes ``secretscrub``'s bytes tail
+#: after the ``b`` the value class takes, and writes it back masked (BACKLOG #5547). Refusing the
+#: ``b`` instead would print what the value class hid.
 _CREDENTIAL_QUERY_RE = re.compile(
-    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _QUERY_VALUE,
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=" + _BYTES_PROBE + _QUERY_VALUE + _KV_TAILS,
 )
 
 
@@ -401,7 +411,17 @@ def _scrub_credential_query(text: str) -> str:
     ``CREDENTIAL_PLACEHOLDER`` rather than a second literal ``<redacted>``: one log line must not be
     able to carry two spellings of "a credential was here", and a hand-copied literal is how it
     would."""
-    return _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}", text)
+    return _CREDENTIAL_QUERY_RE.sub(
+        lambda m: f"{m.group(1)}={CREDENTIAL_PLACEHOLDER}{_braced_tail(m)}", text
+    )
+
+
+def _redact_masking_key_blocks(text: str) -> str:
+    """:func:`~messagefoundry.redaction.redact_untrusted` after the PRIVATE KEY block mask (BACKLOG
+    #5550). The mask runs first because the PHI pass reads a block's markers as a name run and
+    rewrites them, so no pass after it could find the block. It runs on the field before the clamp,
+    but only on text holding ``-----``, and it keeps the length, so the clamp cuts where it did."""
+    return redact_untrusted(mask_private_key_blocks(text))
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:
@@ -1243,7 +1263,7 @@ def scrub_log_text(text: str) -> str:
     For a caller that must filter a value before it is encoded, as the audit tee does (BACKLOG
     #3045). A handler still runs its chain over the encoded line afterwards."""
     return redact_binary_carriage(
-        scrub_credentials(_scrub_credential_query(redact_untrusted(text)))
+        scrub_credentials(_scrub_credential_query(_redact_masking_key_blocks(text)))
     )
 
 
