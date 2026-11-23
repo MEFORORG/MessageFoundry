@@ -2953,6 +2953,17 @@ def recover_dicom_object_bytes(payload: str, *, label: str) -> bytes:
         ) from exc
 
 
+def _hold_the_reactor(event: Any) -> None:
+    """Keep a requestor's reactor at its checkpoint until the association's one send has its answer
+    (vault BACKLOG #6637, item 19). pynetdicom 3.0.4's send clears the checkpoint and trusts
+    ``_is_paused``, which still reads ``True`` for a reactor just past it. That reactor runs one more
+    pass, can take the response off the queue and drops it, so the send waits out its DIMSE timeout
+    and a peer that stored the object is sent it again. Cleared here, on ``EVT_ACCEPTED``, before
+    the association reads as established and before the reactor starts, its first pass stops at the
+    checkpoint. The send's own ``set()``, or ``release()``'s, lets it go on."""
+    event.assoc._reactor_checkpoint.clear()
+
+
 class DicomScuDestination(DestinationConnector):
     """Outbound **C-STORE SCU** (ADR 0025 Phase 2): forward a DICOM object to a downstream PACS over a
     C-STORE association, and verify reachability with **C-ECHO** (``test_connection``). The blocking
@@ -3092,12 +3103,15 @@ class DicomScuDestination(DestinationConnector):
 
     def _associate(self, ae: Any) -> Any:
         """Open a blocking association to the peer (DICOM-over-TLS when configured). Caller releases it."""
+        from pynetdicom import evt
+
         return ae.associate(
             self._host,
             self._port,
             ae_title=self._called_ae_title,
             max_pdu=self._max_pdu_size,
             tls_args=(self._ssl, self._host) if self._ssl is not None else None,
+            evt_handlers=[(evt.EVT_ACCEPTED, _hold_the_reactor)],
         )
 
     def _c_store(self, object_bytes: bytes) -> None:
