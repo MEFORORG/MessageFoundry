@@ -416,8 +416,31 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert webhook.entered.is_set()  # the control: the webhook did hang
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
-    # Only the queued one is counted: the email took the first while the webhook still hung.
+    # Both are counted: the webhook had not finished the first when the cut came, though the
+    # email took it.
+    assert sink.undelivered == 2
+
+
+async def test_an_alert_the_email_took_while_the_webhook_was_cut_is_still_counted(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5907 step 4: a rule selects [webhook, email], the webhook is blackholed and the
+    email takes the one alert. On the cut drain the sink took the alert off its count because a
+    transport had taken it, so the unwind logged nothing, and the cut webhook send was reported
+    nowhere. An alert whose handling the cut ended stays counted."""
+    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
+    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
+    webhook, email = _BlackholedTransport(), _HealthyEmail()
+    sink = NotifierAlertSink([webhook, email])
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    store: Any = _ClosingStore()
+    with caplog.at_level(logging.ERROR, logger=appmod._log.name):
+        await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    assert webhook.entered.is_set()  # the control: the webhook did hang
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # and the email took it
     assert sink.undelivered == 1
+    assert "did not drain" in caplog.text
+    assert "1 alert(s) not confirmed delivered" in caplog.text
 
 
 class _FailingTransport:

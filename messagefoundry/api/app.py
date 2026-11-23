@@ -1837,8 +1837,9 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     which also holds an alert whose sends all failed before the cut; a drain that ends in time logs
     that count too, when it is not zero.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). An alert one
-    transport took counts as delivered, whether or not another had finished. The cut does not
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). On a cut, the
+    count includes an alert one transport took while another had not finished; on a drain that
+    ends in time, an alert one transport took counts as delivered. The cut does not
     end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
     which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS

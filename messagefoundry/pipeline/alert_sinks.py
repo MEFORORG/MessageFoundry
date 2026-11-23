@@ -2662,8 +2662,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
     async def _handle(self, event: dict[str, Any]) -> bool:
         """Send the event to each transport its rule selected, and return whether at least one
         of them took it (BACKLOG #5907 step 4): a send that returned, the point at which the
-        delivery observer is told. A drain cancelled during the sends takes the alert off
-        :attr:`undelivered` itself when a send had returned by the end of the cut's grace."""
+        delivery observer is told. A drain cancelled during the sends leaves the alert in
+        :attr:`undelivered`, whether or not a send had returned, since a send the cut ended did
+        not take it."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
         # #146: pop the per-rule EMAIL recipient override BEFORE the fan-out so it never reaches the
         # webhook (which serializes the event to JSON); only the email transport consumes it.
@@ -2771,8 +2772,6 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             await asyncio.wait(sends)
         except asyncio.CancelledError:
             await self._cut_sends(sends)
-            if taken:
-                self._undelivered -= 1  # the drain re-raises, so it does not take it off
             raise
         escaped: list[BaseException] = []
         for transport, task in zip(chosen, sends, strict=True):
