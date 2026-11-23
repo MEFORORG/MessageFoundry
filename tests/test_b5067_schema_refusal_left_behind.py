@@ -1271,8 +1271,8 @@ def test_a_refusal_raised_after_a_full_open_says_so_with_certainty(kind: str) ->
     its audit rows under the active key when the chain's own key is not held (PR 3162 hold 3
     item 4).
 
-    Mutation: word these three as ``returned=False`` again, or pass ``keyed=True`` for
-    ``_UnauditableWrite``."""
+    Mutation: word these three as ``returned=False`` again, or return ``keyed=True`` for
+    ``_UnauditableWrite`` from ``_refused_open_keying``."""
     from messagefoundry.__main__ import _opened_left_behind
     from messagefoundry.config.settings import StoreSettings
 

@@ -10045,8 +10045,8 @@ def _refused_open_keying(exc: BaseException) -> _RefusedOpenKeying | None:
     (``_KeylessProvisionRefused``) follow a keyless open, which writes neither. The check that
     this command's audit row would be refused (``_UnauditableWrite``) does not refuse a keyed
     handle: one that does not hold the chain's current range key keys new audit rows under the
-    active key instead (``MessageStore``'s audit range read, PR 3162 hold 3), so it follows a
-    keyless open."""
+    active key instead (``settle_audit_ranges`` in ``store/store.py``, which every backend's
+    chain load runs), so it follows a keyless open."""
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
 
     if _raised_after_a_full_open(exc):
@@ -11557,7 +11557,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
     actor = f"cli:{getpass.getuser()}"
     # Store failures a refused write can raise on every backend (BACKLOG #1983). `RuntimeError` covers
     # at least the store's own acquire timeout. The chain's in-memory key check (no key in this
-    # shell, or the current range's key not held) is asked before the append, so that refusal does
+    # shell over a keyed chain) is asked before the append, so that refusal does
     # not arrive here (BACKLOG #2124); a failure the check cannot predict still can. `OSError` covers
     # a server backend's lost connection; the rest are the drivers' own bases, which subclass neither.
     # RowSealError (BACKLOG #3510): the account's record fails its seal, so the write helper refused.
@@ -11626,8 +11626,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
             # PHI-free, and the address itself is left out, as `provision-admin` records only
             # whether one was set. The actor names the OS user, as `admin-unlock` does.
             detail = json.dumps({"username": user.username})
-            # The chain's key check, asked before the append: no key in this shell, or the current
-            # range's key not held. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
+            # The chain's key check, asked before the append: no key in this shell over a keyed
+            # chain. Exit 2 below, as `admin-unlock` exits on it (BACKLOG #2124, a
             # seat decision under owner delegation 2026-10-08, not an owner ruling).
             _refuse_an_unauditable_write(store)
             try:
