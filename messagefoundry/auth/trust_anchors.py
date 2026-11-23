@@ -256,7 +256,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     network or I/O faults, such as a share whose network name went away. Since every
     ``PermissionError`` counts, a sharing violation among them, a party who can deny the engine
     reads of the pin file can keep the hold from being set; that function names this and the
-    other known residuals. Any other ``OSError`` sets the hold. What it refuses: at least the new connects the
+    other known residuals. Any other ``OSError`` sets the hold. A pin on a share or network
+    mount does not ride out a network fault at ``enforce``: its path verdict is indeterminate,
+    which ``enforce`` refuses, and that refusal sets the hold, so at ``enforce`` the network-fault
+    exemption takes effect at least for a read fault on a local disk. What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2930,6 +2933,11 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     code in :data:`_TRANSIENT_WINERRORS`. On Windows at least ``os.stat`` and ``os.fstat`` carry
     a Windows error code; at least some failures of the open and of the read itself carry none,
     so a share lost at those steps can still set the hold.
+
+    **A pin on a share does not survive a network fault at** ``enforce``. Its path verdict is
+    indeterminate, which ``enforce`` refuses, and that refusal sets the hold at the next read
+    that succeeds. So at ``enforce`` the network-fault exemption takes effect at least for a read
+    fault on a local disk; at ``warn`` no refusal sets the hold at all.
 
     **Known residuals.** Every ``PermissionError`` counts, a Windows sharing or lock violation
     among them, since on Windows that is what a scanner holding the file arrives as and the read
