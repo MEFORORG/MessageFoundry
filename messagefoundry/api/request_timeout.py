@@ -22,9 +22,8 @@ has taken the 413, or the write fails, the deadline is back on its own time.
 **The deadline cancels only the task running the route.** If the read that crossed the cap ran on
 that task, a client stalling the write past the later of the grace and the deadline's own time is
 cut off with the route, and can be left with a 413 head and no body. If the read ran on a task of
-its own, the deadline does not cancel the write: the route is cut off and the request ends here,
-while the write runs on until the host's send returns or raises, or something else cancels that
-task.
+its own, this deadline does not cancel the write. Whether the client still receives it once the
+request ends is up to the host, which may close the connection.
 
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
