@@ -676,7 +676,8 @@ def _screened_traceback(info: tuple[type[BaseException], BaseException, Any]) ->
         message: str = node._str  # type: ignore[attr-defined]
         line = _screened_line(message)
         screened = _MESSAGE_WITHHELD if line is None else line
-        if node.__notes__ or node.exceptions:
+        # Not truthiness: the stdlib prints any notes value that is not None, even a falsy one.
+        if node.__notes__ is not None or node.exceptions is not None:
             screened = f"{screened} {_PARTS_WITHHELD}"
             node.__notes__ = None
             node.exceptions = None

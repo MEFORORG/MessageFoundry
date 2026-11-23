@@ -777,3 +777,20 @@ def test_a_host_factory_that_copied_the_marker_is_not_taken_for_the_screen() -> 
     finally:
         logging.setLogRecordFactory(original)
     assert _PLANTED not in written and _WITHHELD in written
+
+
+class _FalsyNotes(list[str]):
+    def __bool__(self) -> bool:
+        return False
+
+
+def test_notes_that_read_as_false_are_not_written() -> None:
+    exc = ValueError("Network timeout reached")
+    exc.__notes__ = _FalsyNotes([f"note {_PLANTED}"])
+    record = logging.LogRecord(
+        "pynetdicom.dul", logging.ERROR, __file__, 1, "x", (), (ValueError, exc, None)
+    )
+    assert dicom_module._PEER_VALUE_FILTER.filter(record) is True
+    written = logging.Formatter("%(message)s").format(record)
+    assert "ValueError: Network timeout reached" in written  # CONTROL: the traceback is written
+    assert _PLANTED not in written
