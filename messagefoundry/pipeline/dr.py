@@ -60,7 +60,7 @@ import time
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from messagefoundry import proctree
 from messagefoundry.auth.trust_anchors import trust_anchor_cause
@@ -72,7 +72,6 @@ from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, 
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
-from messagefoundry.store.base import Row
 from messagefoundry.store.store import OwnedLanes
 
 __all__ = [
@@ -587,8 +586,9 @@ class DrCoordinator:
             "threshold": self._settings.priority_threshold.value,
             "seed_segment": progress.seed_segment,
             "vip_hook_ran": progress.hook_ran,
-            # The host this activation ran on, so a boot under [dr].activate = true resumes only an
-            # activation made on this box, never one carried in a restored store (BACKLOG #5965).
+            # The host this activation ran on. A start under [dr].activate = true resumes only an
+            # activation recorded on this host, so one carried in a restored store from another
+            # host is not resumed; one this host made earlier can be (BACKLOG #5965).
             "node": self._node,
         }
         if step_failures:
@@ -1691,41 +1691,38 @@ def _parse_restore_token(text: str) -> str | None:
     return None
 
 
-async def _latest_audit_row(store: Store, action: str) -> Row | None:
-    """The newest audit row with ``action``, or ``None``. ``list_audit`` reads newest first."""
-    rows = await store.list_audit(action=action, limit=1)
-    return rows[0] if rows else None
+#: The rows that end the activation before them, with what each says (BACKLOG #5965). On a box
+#: that is not an engine shard, an active box writes none of them: a POST /dr/activate on an
+#: active box returns before any seed marker or abort row, and a lapse is written only by a passive
+#: start.
+_ENDS_AN_ACTIVATION: dict[str, str] = {
+    _ACTION_RELEASE: "the last activation was released by POST /dr/release",
+    _ACTION_LAPSED: "the box has started passive since the last activation",
+    _ACTION_SEED: "a later activation attempt was made from a passive box",
+    _ACTION_ABORTED: "a later activation attempt was made from a passive box",
+}
 
 
-def _row_id(row: Row | None) -> int:
-    """An audit row's id, or -1 for no row. Ids grow with each write on every backend."""
-    if row is None:
-        return -1
-    value = row["id"]
-    return value if isinstance(value, int) else -1
-
-
-#: The rows that end the activation before them, each with what it says (BACKLOG #5965). A box
-#: that is active writes none of them: a POST /dr/activate on an active box returns before any
-#: seed marker or abort row, and a lapse is written only by a passive boot.
-_ENDS_AN_ACTIVATION: tuple[tuple[str, str], ...] = (
-    (_ACTION_RELEASE, "the last activation was released by POST /dr/release"),
-    (_ACTION_LAPSED, "the box has started passive since the last activation"),
-    (_ACTION_SEED, "a later activation attempt was made from a passive box"),
-    (_ACTION_ABORTED, "a later activation attempt was made from a passive box"),
-)
-
-
-async def _live_activation(store: Store) -> tuple[Row | None, str | None]:
-    """The newest ``dr.activate`` row, and why it is not live, or ``None`` when it is."""
-    activation = await _latest_audit_row(store, _ACTION_ACTIVATE)
-    if activation is None:
+async def _live_activation(store: Store) -> tuple[dict[str, Any] | None, str | None]:
+    """The newest ``dr.activate`` row when it is live, else ``None`` and why not. One read: the
+    newest row among ``dr.activate`` and the actions that end one."""
+    rows = await store.recent_audit_of([_ACTION_ACTIVATE, *_ENDS_AN_ACTIVATION], limit=1)
+    if not rows:
         return None, "this store records no POST /dr/activate"
-    activation_id = _row_id(activation)
-    for action, reason in _ENDS_AN_ACTIVATION:
-        if _row_id(await _latest_audit_row(store, action)) > activation_id:
-            return activation, reason
-    return activation, None
+    newest = rows[0]
+    if newest["action"] == _ACTION_ACTIVATE:
+        return newest, None
+    return None, _ENDS_AN_ACTIVATION.get(str(newest["action"]), "the last activation has ended")
+
+
+def _detail(row: Mapping[str, Any]) -> dict[str, Any]:
+    """An audit row's JSON detail as a dict; empty when it is not one."""
+    raw = row.get("detail")
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else None
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 async def note_passive_start(store: Store, *, now: float) -> None:
@@ -1735,25 +1732,27 @@ async def note_passive_start(store: Store, *, now: float) -> None:
     stopped serving at this start, however long ago, as when a box fails back by restarting
     passive rather than through ``POST /dr/release``, or comes up over a restored store that
     carries an earlier incident's activation (BACKLOG #5965). Written whatever host the activation
-    names, and only when one is live, so a passive box that keeps restarting adds no rows."""
-    activation, ended = await _live_activation(store)
-    if activation is None or ended is not None:
+    names, and only while one is live, so one passive box that keeps restarting adds one row. The
+    engine does not call it on an engine shard, whose siblings' activations it cannot tell apart."""
+    activation, _ended = await _live_activation(store)
+    if activation is None:
         return
-    activation_id = _row_id(activation)
     await store.record_audit(
         _ACTION_LAPSED,
         actor="system",
-        detail=json.dumps({"activation_id": activation_id}, sort_keys=True),
+        detail=json.dumps({"activation_id": activation["id"]}, sort_keys=True),
         now=now,
     )
     log.warning(
-        "DR: this box started passive over the activation recorded as audit row %d, which has "
+        "DR: this box started passive over the activation recorded as audit row %s, which has "
         "ended; [dr].activate = true will not resume it",
-        activation_id,
+        activation["id"],
     )
 
 
-async def resume_prior_activation(store: Store, settings: DrSettings, *, now: float) -> int:
+async def resume_prior_activation(
+    store: Store, settings: DrSettings, *, now: float, engine_shard: bool = False
+) -> int:
     """Resume, at start, an activation this box already made through ``POST /dr/activate``.
 
     ``[dr].activate = true`` keeps a promoted box active across a restart (BACKLOG #5965). It
@@ -1763,27 +1762,28 @@ async def resume_prior_activation(store: Store, settings: DrSettings, *, now: fl
     restore token is compared with. It never stands in for the activation itself, which alone runs
     the seed verify and the takeover hook and writes the ``dr.activate`` row.
 
-    So the store must show that activation: the newest ``dr.activate`` row, written on this host,
-    with no row of :data:`_ENDS_AN_ACTIVATION` after it. A start that finds none raises
-    :class:`DrResumeRefused`, which refuses the start, and binds nothing. One that finds it writes
-    a ``dr.resume`` row naming that activation, before the rest of the start, and returns its row
-    id. A store error propagates, so a store that cannot be read refuses the start too.
+    So the store must show that activation: the newest row among ``dr.activate`` and
+    :data:`_ENDS_AN_ACTIVATION` is a ``dr.activate`` written on this host at the configured
+    ``priority_threshold``. An engine shard never resumes, since the rows name the host and not
+    the engine shard. A start that finds none raises :class:`DrResumeRefused`, which refuses the
+    start, and binds nothing. One that finds it writes a ``dr.resume`` row naming that activation,
+    before the rest of the start, and returns its row id. A store error propagates, so a store that
+    cannot be read refuses the start too.
 
     The checks read what the store records, and at least these cases pass them: an activation
     this host made in an earlier incident, carried in a restored store, when no passive start or
-    attempt has followed it there; a completed release whose ``dr.release`` row could not be
-    written; and, on an engine-shard fleet, a shard that was not itself activated, since the rows
-    name the host and not the shard."""
+    attempt has followed it there; and a completed release whose ``dr.release`` row could not be
+    written."""
     node = socket.gethostname()
     activation, reason = await _live_activation(store)
-    if activation is not None and reason is None:
-        raw = activation["detail"]
-        try:
-            detail = json.loads(raw) if isinstance(raw, str) else None
-        except ValueError:
-            detail = None
-        if not isinstance(detail, dict) or detail.get("node") != node:
+    if engine_shard:
+        reason = "an engine shard cannot tell its own activation from a sibling engine shard's"
+    elif activation is not None:
+        detail = _detail(activation)
+        if detail.get("node") != node:
             reason = "the last activation was not recorded on this host"
+        elif detail.get("threshold") != settings.priority_threshold.value:
+            reason = "the last activation ran at a different [dr].priority_threshold"
     if activation is None or reason is not None:
         raise DrResumeRefused(
             f"[dr].activate = true found no activation of this box to resume: {reason}. A DR box "
@@ -1792,7 +1792,7 @@ async def resume_prior_activation(store: Store, settings: DrSettings, *, now: fl
             "such a box active across a restart. Set [dr].activate = false, start the box passive, "
             "and promote it with POST /dr/activate"
         )
-    activation_id = _row_id(activation)
+    activation_id = int(activation["id"])
     await store.record_audit(
         _ACTION_RESUME,
         actor="system",

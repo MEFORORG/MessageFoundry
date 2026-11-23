@@ -2296,19 +2296,23 @@ class Engine:
                 self._audit_anchor_file,
             )
         # BACKLOG #5965: [dr].activate = true keeps a box promoted by POST /dr/activate active across
-        # a restart. It resumes only an activation the store shows this box made and did not
-        # release, and refuses the start otherwise, before any listener binds, so a boot can never
-        # latch the run-profile without the seed verify, takeover hook and dr.activate row that
-        # endpoint runs. The latch goes to the runner before the graph comes up below.
+        # a restart. It resumes only an activation the store records on this host with nothing
+        # ending it since, and refuses the start otherwise, before any listener binds, so a boot
+        # latches the run-profile only behind a dr.activate row that endpoint wrote. What that
+        # check cannot see is in resume_prior_activation's docstring. The latch goes to the runner
+        # before the graph comes up below.
+        engine_shard = self.filters_its_graph or self.instance_identity is not None
         if self._dr_settings.enabled and self._dr_settings.activate and not self._dr_active:
-            await resume_prior_activation(self.store, self._dr_settings, now=time.time())
+            await resume_prior_activation(
+                self.store, self._dr_settings, now=time.time(), engine_shard=engine_shard
+            )
             self._set_dr_active(True)
             self._dr_profile_applied = True
             if self._dr_coordinator is not None:
                 # Built before start, it read the latch as off; a repeated POST /dr/activate must
                 # find the box active rather than seed it again.
                 self._dr_coordinator.note_resumed()
-        elif self._dr_settings.enabled and not self._dr_active:
+        elif self._dr_settings.enabled and not self._dr_active and not engine_shard:
             # A passive start ends any activation the store still shows, so a later start under
             # [dr].activate = true cannot resume one this box stopped serving here (BACKLOG #5965).
             await note_passive_start(self.store, now=time.time())

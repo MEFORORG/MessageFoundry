@@ -15,13 +15,14 @@ from messagefoundry.store import MessageStore
 
 
 async def record_prior_activation(db: Path) -> None:
-    """Record, in the store at ``db``, a ``dr.activate`` row made on this host and not released."""
+    """Record, in the store at ``db``, a ``dr.activate`` row made on this host at the default
+    threshold and not released."""
     store = await MessageStore.open(db)
     try:
         await store.record_audit(
             "dr.activate",
             actor="alice",
-            detail=json.dumps({"node": socket.gethostname()}),
+            detail=json.dumps({"node": socket.gethostname(), "threshold": "critical"}),
             now=1.0,
         )
     finally:

@@ -205,6 +205,8 @@ async def _record(store: MessageStore, action: str, detail: dict[str, object]) -
         # A later attempt from a passive box opened a seed segment: the activation had ended.
         ([("dr.activate", {"node": "HERE"}), ("dr_seed", {})], "passive box"),
         ([("dr.activate", {"node": "HERE"}), ("dr.release", {})], "released"),
+        # Recorded at another threshold than the one configured now.
+        ([("dr.activate", {"node": "HERE", "threshold": "normal"})], "different"),
         # A later attempt refused before its seed marker came from a passive box too.
         ([("dr.activate", {"node": "HERE"}), ("dr_activation_aborted", {})], "passive box"),
         ([("dr.activate", {"node": "HERE"}), ("dr.lapsed", {})], "started passive"),
@@ -217,7 +219,7 @@ async def test_an_activation_that_is_not_this_boxes_live_one_is_refused(
     try:
         for action, detail in rows:
             if detail.get("node") == "HERE":
-                detail = {"node": socket.gethostname()}
+                detail = {"threshold": "critical", **detail, "node": socket.gethostname()}
             await _record(store, action, detail)
         with pytest.raises(DrResumeRefused, match=reason):
             await resume_prior_activation(store, DrSettings(), now=2.0)
@@ -260,5 +262,18 @@ async def test_a_server_db_box_resumes_where_activating_again_is_refused(tmp_pat
         with pytest.raises(DrActivationError) as exc:
             await _coord().activate(dba_attests_restored=True, actor="alice")
         assert exc.value.kind == "seed"
+    finally:
+        await store.close()
+
+
+async def test_an_engine_shard_never_resumes(tmp_path: Path) -> None:
+    """The rows name the host, not the engine shard, so a sibling's live activation would read as
+    this engine shard's own. The control is the same row resuming on a lone engine."""
+    store = await MessageStore.open(tmp_path / "s.db")
+    try:
+        await _record(store, "dr.activate", {"node": socket.gethostname(), "threshold": "critical"})
+        with pytest.raises(DrResumeRefused, match=r"engine shard cannot tell"):
+            await resume_prior_activation(store, DrSettings(), now=2.0, engine_shard=True)
+        assert await resume_prior_activation(store, DrSettings(), now=2.0) > 0
     finally:
         await store.close()
