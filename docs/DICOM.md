@@ -357,9 +357,15 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   and reason, released and aborted, the send and receive lines for C-STORE and C-ECHO with their status, and the
   library's fixed protocol error lines stay, at least those for a malformed PDU or association field. Lost, at least: the C-FIND, C-GET and C-MOVE progress lines and
   identifier dumps, which this engine does not serve; the text of a library exception that matches no template,
-  including an operating system's socket error text, where the log and a delivery error keep the exception class
-  and read `[message withheld]` with the file, line and function that raised it; every note and group member of an exception; and any line a library upgrade adds,
+  including an operating system's socket error text; every note and group member of an exception; and any line
+  a library upgrade adds,
   until it is pinned.
+
+  Where the engine quotes such an exception, in its own C-STORE line or a delivery error, it keeps the class
+  and reads `[message withheld]` with the file, line and function that raised it. pynetdicom's own
+  `TCP Initialisation Error: {exc}` line is different. It has no `exc_info`, so its withheld line keeps
+  neither the class nor the raising place, and an operator cannot tell a refused connection from a timeout or
+  a DNS failure from the log.
 
   **How far it reaches.** A filter on each logger the libraries create, and a log record factory for any other
   logger under those names, so a logger created later, one that does not propagate, and a host with no
@@ -367,7 +373,11 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
   the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
   `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
-  they are code. A failure inside the screen withholds the line. Matching is linear in the line's length.
+  they are code. A failure inside the screen withholds the line. A
+  delivery error the SCU raises holds an empty exception of the library's class on its chain, not the library's
+  text. A library exception the SCU does not wrap, at least one raised while it opens the association, keeps its
+  text: the delivery worker logs only its class, but if the worker's store write for that row then fails with
+  an error that is not a database driver's, its fault log prints that text. Matching is linear in the line's length.
 
   `tests/_dicom_log_census.py` scans both installed libraries' log and `warn_and_log` calls against a pinned
   census, so a call it can read that a library adds or rewords fails a test until it is read: at least a
