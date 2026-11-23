@@ -841,7 +841,7 @@ REFINED_FALSE_DENY_ALLOW = [
         "(" * 250 + "true" + ") " * 250 + '; echo "$(( find / 2 ))"',
         id="arithmetic-after-many-nested-subshells",
     ),
-    # Shallow enough that the refined view runs to the end rather than giving up on its budget.
+    # The same form, shallower.
     pytest.param(
         "(" * 60 + "true" + ") " * 60 + '; echo "$(( find / 2 ))"',
         id="arithmetic-after-some-nested-subshells",
@@ -947,6 +947,16 @@ FALLBACK_DENY = [
         'echo "q" $((true) ) $(( $((cat <<X) ) + 1 ))\nfind /proc\nX',
         id="heredoc-in-a-subshell-in-arithmetic",
     ),
+    # Arithmetic after all, which a reading of the site as a subshell alone missed: the shift's
+    # line ends inside it, or a `#` in it would end the line as a comment.
+    pytest.param(
+        "(( mask = 1 << bit\n )); grep -rE 'foo|bar' /", id="shift-on-a-line-ending-in-arithmetic"
+    ),
+    pytest.param('echo "$(( a #b ))"; echo "$((grep -r \'a;b\' /proc) )"', id="hash-in-arithmetic"),
+    pytest.param(
+        "(( a << b\n ))\nb\n(( c << d ))\necho \"$((grep -rE 'x|y' /) )\"",
+        id="shift-after-a-shift-on-a-line-ending-in-arithmetic",
+    ),
 ]
 
 # THE PRICE OF FAILING CLOSED, pinned so the fallback cannot stop running unnoticed: the raw scan
@@ -977,6 +987,11 @@ FALLBACK_CONTROL_ALLOW = [
         'echo "$(( ${#x} + $(echo 1) ))"; echo "x; find /proc"', id="frame-after-closed-braces"
     ),
     pytest.param('(( `echo 1` )); echo "x; find /proc"', id="backtick-in-a-top-level-site"),
+    # A newline in a site leaves line flags only a glued heredoc opener reads.
+    pytest.param(
+        'end=$((\n  start + $(date +%s)\n))\necho "x; find /proc"',
+        id="substitution-on-a-later-line-of-arithmetic",
+    ),
 ]
 
 
@@ -1018,10 +1033,14 @@ def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
     """Doubling the nested `$(( ... ) )` sites must not quadruple the time.
 
     Every site is a subshell, which the earlier cut found only by reading the site again, once per
-    site around it. The bound allows for pwsh's fixed start cost, as the test above does.
+    site around it, and whose budget then gave up in about the same time and allowed the walk. So
+    the verdict is checked too. The bound allows for pwsh's fixed start cost, as the test above does.
     """
     half = _guard_seconds(_nested_subshell_substitutions(2000))
-    full = _guard_seconds(_nested_subshell_substitutions(4000))
+    started = time.monotonic()
+    decision = run_guard(bash(_nested_subshell_substitutions(4000)))
+    full = time.monotonic() - started
+    assert_denied(decision)
     assert full < 3 * half + 3
 
 
@@ -1029,8 +1048,9 @@ def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
 
 # THE REFINED VIEW MAY ONLY ADD DENIES, AND THE BASH AND PLAIN VIEWS MAY NOT MOVE AT ALL. A row list
 # pins the forms someone thought of; these two compare the guard with origin/main's copy over the
-# whole corpus and a seeded generated set, so a form nobody listed still has to agree. Both run
-# every command inside ONE pwsh process, because a cold start per command would take an hour.
+# whole corpus and a seeded generated set, so a form nobody listed is compared too, as far as the
+# generator's pieces reach. Both run every command inside ONE pwsh process, because a cold start
+# per command would take an hour. Where the two copies are the same bytes, they are skipped.
 _BASE_REF = "origin/main"
 
 # Runs Hide-QuotedSpans from two copies of the guard, read out of each file's syntax tree so the
@@ -1089,6 +1109,8 @@ def _base_guard(tmp_path: Path, ref: str = _BASE_REF) -> Path:
     )
     if proc.returncode != 0:
         pytest.skip(f"{ref} is not readable here: {proc.stderr.decode(errors='replace').strip()}")
+    if proc.stdout.replace(b"\r\n", b"\n") == GUARD.read_bytes().replace(b"\r\n", b"\n"):
+        pytest.skip(f"the guard is the same as {ref}'s, so there is nothing to compare")
     base = tmp_path / "base-guard.ps1"
     base.write_bytes(proc.stdout)
     return base
@@ -1130,6 +1152,7 @@ _WALKS = [
 _WRAPPERS = [
     ("$((", ") )"), ("$((", "))"), ("((", "))"), ("((", ") )"), ("$(", ")"), ('"$(', ')"'),
     ("${x:-", "}"), ("$(( ", " ))"), ("(", ")"), ("$[", "]"), ("`", "`"), ("'", "'"),
+    ("$(( a #b ", " ))"), ("(( m = 1 << bit\n", " ))"), ("$(( $'1' ", " ))"),
 ]  # fmt: skip
 
 
@@ -1225,9 +1248,9 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_CONTROL_ALLOW": 2,
     "REFINED_FALSE_DENY_ALLOW": 14,
     "ONE_PASS_DENY": 5,
-    "FALLBACK_DENY": 9,
+    "FALLBACK_DENY": 12,
     "FALLBACK_FIRES_DENY": 2,
-    "FALLBACK_CONTROL_ALLOW": 6,
+    "FALLBACK_CONTROL_ALLOW": 7,
 }
 
 
