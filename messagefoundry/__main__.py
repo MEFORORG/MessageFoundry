@@ -1256,9 +1256,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         default=None,
         help="destination store path to write. It must NOT already exist — restoring over a live store "
         "is unrecoverable, so a taken store name, or a taken SQLite -wal/-shm/-journal name beside it "
-        "(a file, a directory or a link, a dangling one included), is refused, and the sidecar names "
-        "are read again just before the write. Not caught: a sidecar created after that re-read, and "
-        "on Windows without hard links a link planted at the store name after it, which is followed. "
+        "(a file, a directory or a link, a dangling one included), is refused, and the store and "
+        "sidecar names are read again just before the write. Not caught, at least: a sidecar created "
+        "after that re-read, and on Windows, when the store is copied rather than hard-linked into "
+        "place, a dangling link planted at the store name after it, which is followed. "
         "Also refused: a name holding ':', and on Windows a "
         "name ending in a dot or a space or otherwise opened as another path. To reuse a path, stop "
         "the engine and move the old store aside with its -wal, -shm and -journal as one set. "

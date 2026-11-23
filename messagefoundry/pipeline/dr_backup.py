@@ -6358,24 +6358,24 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
 #: The ``--to`` refusals of :func:`_refuse_existing_destination`, one per trigger, so each is true
 #: on every host it can fire on. The ':' one fires on every host; the other two only on Windows.
 _COLON_TO_REFUSAL = (
-    "refusing --to {path}: its file name holds a ':'. On Windows a ':' names an alternate data "
-    "stream, where the never-overwrite check could miss the store's real -wal, -shm and -journal, so "
-    "a ':' is refused on every host, and the store can later be opened on Windows — choose a --to "
-    "whose file name holds no ':'"
+    "refusing --to {path}: its file name holds a ':'. It is refused on every host, so one --to means "
+    "the same everywhere: on Windows, or on an NTFS volume another host reaches, a ':' names an "
+    "alternate data stream, where the never-overwrite check could miss the store's real -wal, -shm "
+    "and -journal — choose a --to whose file name holds no ':'"
 )
 _TRAILING_TO_REFUSAL = (
-    "refusing --to {path}: Windows drops a trailing dot or space from a file name, so the "
-    "never-overwrite check could miss the store's real -wal, -shm and -journal — choose a --to whose "
-    "file name does not end in a dot or a space"
+    "refusing --to {path}: its file name ends in a {what}, which Windows does not keep as part of "
+    "the name, so the never-overwrite check could miss the store's real -wal, -shm and -journal — "
+    "choose a --to whose file name does not end in a dot or a space"
 )
 _DEVICE_TO_REFUSAL = (
-    "refusing --to {path}: Windows opens that name as another object, such as the device NUL, not "
-    "as a file of its own — choose another --to file name"
+    "refusing --to {path}: Windows would not open that name as a file of its own, for example a "
+    "device name such as NUL, or a path with no file name — choose another --to file name"
 )
 #: The fault refusal of :func:`_occupied` for WinError 123, an invalid name.
 _INVALID_NAME_REFUSAL = (
-    "cannot use {path} as a file name: {exc} — Windows refuses it as invalid, for example for a "
-    "character such as < > | ? or *; choose another --to file name"
+    "cannot use {path}: {exc} — Windows refuses the path as invalid, for example for a character "
+    "such as < > | ? or * in its file name or in one of its directories; choose another --to path"
 )
 _FAULT_REFUSAL = (
     "cannot tell whether {path} is free: {exc} — choose another --to path, or check that this "
@@ -6388,15 +6388,16 @@ def _rewritten_to_refusal(path: Path) -> str:
     if ":" in path.name:
         return _COLON_TO_REFUSAL.format(path=path)
     if path.name.endswith((".", " ")):
-        return _TRAILING_TO_REFUSAL.format(path=path)
+        what = "dot" if path.name.endswith(".") else "space"
+        return _TRAILING_TO_REFUSAL.format(path=path, what=what)
     return _DEVICE_TO_REFUSAL.format(path=path)
 
 
 def _occupied(path: Path) -> bool:
     """Whether anything has the name ``path``, a link included, dangling or not, read without
     following a link. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
-    ``FileNotFoundError`` also covers at least network and invalid-drive errors (WinError 53, 67, 15,
-    161 and 206). Any other fault is a refusal, where ``os.path.lexists`` would answer ``False``."""
+    ``FileNotFoundError`` also covers at least network, invalid-drive, bad-path and too-long-path
+    errors (WinError 53, 67, 15, 161 and 206). Any other fault is a refusal, where ``os.path.lexists`` would answer ``False``."""
     try:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -6426,9 +6427,9 @@ def _refuse_taken_store_names(dest_store_path: Path) -> None:
     writes the store to the link's target (measured), so the store name is read again too.
 
     After the second read, a regular file at the store name is still refused, by the placement's
-    exclusive create. Not caught: a sidecar created after the second read, including while a volume
-    with no hard links copies the store into place; and, on Windows with no hard links, a link
-    planted at the store name after it, which that create follows."""
+    exclusive create. Not caught, at least: a sidecar created after the second read, including while
+    the store is copied into place; and, on Windows when the store is copied rather than hard-linked
+    into place, a dangling link planted at the store name after it, which that create follows."""
     for path in _store_names(dest_store_path):
         if _occupied(path):
             raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))

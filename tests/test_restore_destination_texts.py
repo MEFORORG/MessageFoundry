@@ -63,9 +63,9 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
     text = _to_help()
     for needle in (
         "(a file, a directory or a link, a dangling one included), is refused",
-        "the sidecar names are read again just before the write",
-        "Not caught: a sidecar created after that re-read",
-        "on Windows without hard links a link planted at the store name after it, which is followed",
+        "the store and sidecar names are read again just before the write",
+        "Not caught, at least: a sidecar created after that re-read",
+        "a dangling link planted at the store name after it, which is followed",
         "a name holding ':', and on Windows a name ending in a dot or a space",
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
     ):
@@ -83,17 +83,17 @@ def test_the_overwrite_refusal_gives_the_safe_remedy() -> None:
 @pytest.mark.parametrize(
     ("name", "own", "foreign"),
     [
-        ("store.db::$DATA", "its file name holds a ':'", ("trailing dot", "device")),
-        ("store.db.", "drops a trailing dot or space", ("':'", "device")),
-        ("store.db ", "drops a trailing dot or space", ("':'", "device")),
-        ("NUL", "opens that name as another object", ("':'", "trailing dot")),
+        ("store.db::$DATA", "its file name holds a ':'", ("dot or a space", "device", "ends in")),
+        ("store.db.", "its file name ends in a dot,", ("':'", "device")),
+        ("store.db ", "its file name ends in a space,", ("':'", "device")),
+        ("NUL", "would not open that name as a file of its own", ("':'", "ends in a")),
     ],
 )
 def test_each_to_refusal_names_only_its_own_trigger(
     name: str, own: str, foreign: tuple[str, ...]
 ) -> None:
     # One text per trigger, chosen by name alone, so this runs on every host. The ':' text, the one
-    # that fires on POSIX too, must not say the check could miss a sidecar there.
+    # that fires on POSIX too, names only the ':' and scopes its sidecar reason to Windows and NTFS.
     text = dr_backup._rewritten_to_refusal(Path("dr") / name)
     assert own in text, text
     for other in foreign:
@@ -102,12 +102,13 @@ def test_each_to_refusal_names_only_its_own_trigger(
 
 def test_the_colon_refusal_gives_its_cross_host_reason() -> None:
     text = _flat(dr_backup._COLON_TO_REFUSAL)
-    assert "On Windows a ':' names an alternate data stream" in text
-    assert "refused on every host, and the store can later be opened on Windows" in text
+    assert "It is refused on every host, so one --to means the same everywhere" in text
+    assert "on Windows, or on an NTFS volume another host reaches, a ':' names an alternate" in text
 
 
 def test_the_fault_refusals_give_their_own_remedies() -> None:
     assert "check that this account can read its directory" in dr_backup._FAULT_REFUSAL
     invalid = _flat(dr_backup._INVALID_NAME_REFUSAL)
-    assert "Windows refuses it as invalid" in invalid
+    assert "Windows refuses the path as invalid" in invalid
+    assert "in its file name or in one of its directories; choose another --to path" in invalid
     assert "check that this account" not in invalid

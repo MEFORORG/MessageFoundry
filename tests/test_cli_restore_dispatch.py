@@ -427,11 +427,19 @@ def test_an_invalid_name_fault_gets_its_own_remedy(tmp_path, monkeypatch) -> Non
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", _invalid)
-    with pytest.raises(dr_backup.BackupError, match="as a file name") as caught:
+    with pytest.raises(dr_backup.BackupError, match="refuses the path as invalid") as caught:
         dr_backup._refuse_existing_destination(tmp_path / "restored.db", None)
     text = str(caught.value)
-    assert "Windows refuses it as invalid" in text and "choose another --to file name" in text
+    assert "choose another --to path" in text
     assert "check that this account can read its directory" not in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WinError 123 is a Win32 error")
+def test_a_real_invalid_name_reaches_the_invalid_name_remedy(tmp_path) -> None:
+    # Measures the mapping the test above assumes: a '<' makes lstat raise a plain OSError with
+    # winerror 123, not a FileNotFoundError that would read as free.
+    with pytest.raises(dr_backup.BackupError, match="refuses the path as invalid"):
+        dr_backup._refuse_existing_destination(tmp_path / "a<b.db", None)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a reserved device name is a Win32 rewrite")
@@ -439,8 +447,8 @@ def test_restore_refuses_a_to_that_names_a_device(tmp_path) -> None:
     with pytest.raises(dr_backup.BackupError) as caught:
         dr_backup._refuse_existing_destination(tmp_path / "NUL", None)
     text = str(caught.value)
-    assert "Windows opens that name as another object" in text
-    assert "holds a ':'" not in text and "trailing dot" not in text
+    assert "would not open that name as a file of its own" in text
+    assert "holds a ':'" not in text and "ends in a" not in text
 
 
 # --- (3) the archive must verify before anything lands -----------------------
