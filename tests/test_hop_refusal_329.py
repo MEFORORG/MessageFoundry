@@ -391,9 +391,20 @@ class _RaisingWebhook:
             ),
             ": HTTPError 403",
         ),
+        # A code that is not an int is left out, whatever it holds.
+        (
+            urllib.error.HTTPError(
+                "https://hooks.example/x",
+                f"403 {_WEBHOOK_TOKEN}",  # type: ignore[arg-type]
+                "Forbidden",
+                email.message.Message(),
+                None,
+            ),
+            ": HTTPError",
+        ),
         (urllib.error.URLError(f"no route to /{_WEBHOOK_TOKEN}"), ": URLError"),
     ],
-    ids=["http-error", "url-error"],
+    ids=["http-error", "http-error-non-int-code", "url-error"],
 )
 async def test_a_failed_send_logs_an_http_status_and_nothing_of_the_url(
     exc: Exception, tail: str, caplog: pytest.LogCaptureFixture
