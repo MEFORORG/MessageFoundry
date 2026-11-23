@@ -25,9 +25,10 @@
   `admin-unlock`'s refused row seal. A keyless-chain, keyless-provision or unauditable-write
   refusal is raised only after a full open, so it says the open may already have changed the
   database; after a keyed open an unauditable-write refusal also names the salt record where
-  the cipher binds one. In `admin-reset-totp` a refusal at the replacement's own open, or after it,
-  names the earlier open, the one that checked the account before the key was shown, apart from
-  the replacement's own. Other refusals after an open still say nothing was written,
+  the cipher binds one. In `admin-reset-totp` a store refusal or store failure raised at the
+  replacement's own open, or after it but before the replacement is tried, names the earlier
+  open, the one that checked the account before the key was shown, apart from the replacement's
+  own. Other refusals after an open still say nothing was written,
   at least a store pin refusal under the host key provider, a refusal about the account itself
   such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
 - **`provision-admin` would now keep its result when the store fails to close after the grant
