@@ -1703,15 +1703,15 @@ returned, they name the account by its id and still show what was issued, rather
 `_shown_name` in [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
 A factor reset whose action returns has already stood, the account's factors cleared; if it issued neither
 an enrolment code nor a generated credential, it redirects to `GET /ui/users/{user_id}`, which
-answers 423 for a failing record. The password reset, factor reset and enrolment-code actions answer a
-record that already fails its seal with 404 "no such user", though its row is still there. A
+answers 423 for a failing record. At least the password reset, factor reset and enrolment-code
+actions answer a record that already fails its seal with 404 "no such user", though its row is still there. A
 failure is reported and rate-limited per report key, the record's part and the account's id, in
 each engine process: only the first refusal under a key in each report interval
 (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's WARNING, writes the
 `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A later
-refusal under that key inside the interval, from any reader in that process, is still refused,
-never served, and adds no row and no alert. Each engine
-process sharing the store keeps its own interval, so each may report the same key once. The
+refusal under that key inside the interval, from any reader in that process, adds no row and no
+alert; the record is still refused, never served. Each engine
+process sharing the store keeps its own interval. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
@@ -1740,8 +1740,7 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-refused at the first check that cannot verify it, with no further read, and then answered as a
-record that fails its seal is, but reported under
+refused at the first check that cannot verify it, with no further read, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. Except where a console page catches the refusal, as at least the next two sentences
 state, a Vault transit Outage on any account these reads check answers 503 with `Retry-After`

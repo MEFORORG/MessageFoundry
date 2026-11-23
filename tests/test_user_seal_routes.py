@@ -483,7 +483,6 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         # routes the code answers that way, and the console's own answers are the last sentences'.
         "logs the report's WARNING",
         "refused at the first check that cannot verify it, with no further read",
-        "answered as a record that fails its seal is",
         "Except where a console page catches the refusal, as at least the next two sentences state",
         "writes no audit row of its own",
     ):
@@ -513,13 +512,13 @@ _KEPT = {
         r"rate-limited per report key, the record's part and the account's id"
     ),
     "first refusal under a key": r"only the first refusal under a key in each report interval",
-    "a later refusal is still refused": (
+    "a later refusal adds nothing, and the record is still refused": (
         r"later refusal under that key inside the interval, from any reader in that process, "
-        r"is still refused, never served,? and adds no row and no alert"
+        r"adds no row and no alert; the record is still refused, never served"
     ),
-    "404 for an already-failing record": (
-        r"password reset, factor reset and enrolment-code actions answer a record that already "
-        r"fails its seal with 404 \"no such user\""
+    "404 for an already-failing record, as a floor": (
+        r"\bat least the password reset, factor reset and enrolment-code actions answer a record "
+        r"that already fails its seal with 404 \"no such user\""
     ),
     "the redirecting reset has stood": r"factor reset whose action returns has already stood",
     "the redirect": (
@@ -536,6 +535,15 @@ _REMOVED = {
     "uncounted exceptions with no floor": r"\bamong the exceptions:",
     "a counted exception": r"(?<!at least )\bone exception\b",
     "landed": r"\bthe action landed\b|\bthat lands\b",
+    # Repair Manager round on findings 1, 2, 6 and 11 of the hold-7089872291 review.
+    "a closed three-name 404 list": (
+        r"(?<!at least )\bthe password reset, factor reset and enrolment-code actions answer"
+    ),
+    "a refusal that is still refused": r"\brefusal\b[^.;]*\bis still refused",
+    "a count of reports per process": r"may report the same (key|account) once",
+    "an unverifiable record answered as a failing one": (
+        r"cannot verify[^.]*answered as a record that fails its seal"
+    ),
 }
 
 
