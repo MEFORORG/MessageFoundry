@@ -5727,12 +5727,11 @@ def create_app(
         # it is raised here, after this check and the reveal's own refusals (its permission, the
         # serve hop and the new address), and each is answered as before pacing. With the budget
         # spent none of them writes the monitoring:read grant row main wrote: the scope and
-        # permission refusals write only their denial row (owner ruling 2026-11-23). Every hop or
-        # new-address refusal also writes the held throttled row, naming the 403 and the reason it
-        # answered with, before it propagates, where the gate records decisions: the hop refusal
-        # writes no row of its own and a repeated new-address row is deduped, so without it such
-        # a request would leave no decision row (vault BACKLOG #1191). A scoped caller's dashboard
-        # carries no outbound rows at all.
+        # permission refusals write only their denial row (owner ruling 2026-11-23). The hop and
+        # new-address refusals also record the held decision, through _refuse_reveal_phi_read,
+        # because the hop refusal writes no row of its own and a repeated new-address row is
+        # deduped (vault BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at
+        # all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
             await _refuse_reveal(request, identity)
@@ -6827,9 +6826,8 @@ def create_app(
         """The PHI-read refusals of a reveal over HTTP: the serve hop and the new address.
 
         Where a monitoring-read 429 is held for the request (``GET /connections``), each refusal
-        writes that held decision's throttled row, recording the 403 it answers and its own
-        reason, before it propagates (:func:`record_deferred_monitoring_refusal`); elsewhere
-        that call is a no-op."""
+        calls :func:`record_deferred_monitoring_refusal` before it propagates; that function says
+        what it records and when. Elsewhere the call is a no-op."""
         if not _reveal_over_http(request):
             return
         try:

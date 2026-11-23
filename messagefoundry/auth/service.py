@@ -22165,15 +22165,18 @@ class AuthService:
         (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
         per-actor pacing (``throttled``).
 
-        ``answered_status`` and ``answered_reason``, when given, record a different refusal the
-        caller was actually answered with, as when a held monitoring-read 429 is recorded but a
-        route's own refusal is returned in its place (vault BACKLOG #1191).
+        Where ``answered_status`` is given, the row also records it and ``answered_reason`` (null
+        if that is not given): a different refusal the caller was actually answered with, as when
+        a held monitoring-read 429 is recorded but a route's own refusal is returned in its place
+        (vault BACKLOG #1191). Without ``answered_status``, ``answered_reason`` is not recorded.
 
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
-        ``_recorded_decision`` in ``api/security.py`` decides when this row is written for a gate's
-        own refusals, and ``_record_route_refusal`` for the step-up refusals a ``proof_in_route``
-        route body makes. ``client`` is required, as for :meth:`audit_self_target_refused`."""
+        Its writers in ``api/security.py`` include at least ``_recorded_decision`` for a gate's own
+        refusals, ``_record_route_refusal`` for the step-up refusals a ``proof_in_route`` route
+        body makes, and ``raise_deferred_monitoring_refusal`` and
+        ``record_deferred_monitoring_refusal`` for a monitoring-read 429 a gate held for its
+        route body. ``client`` is required, as for :meth:`audit_self_target_refused`."""
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,

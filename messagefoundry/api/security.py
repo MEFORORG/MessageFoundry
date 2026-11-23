@@ -2103,9 +2103,10 @@ async def record_deferred_monitoring_refusal(
 
     The row keeps the throttle fact and also records what the caller was answered:
     ``answered_status`` is ``answered``'s status, and ``answered_reason`` is ``answered_reason``
-    where given, else the reason a :class:`_GateRefusal` carries. It is written only where
-    :func:`_audited_permission` names one, as on the gate's own refusals. A no-op where nothing is
-    held."""
+    where given, else the reason a :class:`_GateRefusal` carries, else null. It is written only
+    where :func:`_audited_permission` names one, as on the gate's own refusals, so with
+    ``[security].audit_all_authorization_decisions`` off no row is written for a GET. A failed
+    write raises in place of ``answered``. A no-op where nothing is held."""
     held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
     if not isinstance(held, _DeferredRefusal):
         return
