@@ -23,12 +23,11 @@ well-formed; see :class:`X12ValidationResult`.
 
 **PHI rule (do not break).** A failing X12 element error from pyx12 embeds the *offending data value*
 (potential PHI) in its raw error string, and an exception pyx12 raises can quote the interchange. This
-module does not surface either: each :class:`X12SegmentError` carries only structural locators — the
-error code, a segment id only when it has a segment id's shape (:class:`X12SegmentError` states what a
-shape cannot rule out), the element position, a schema-label *type name*, and the line — and a refusal
-chains no pyx12 exception. The ack does echo sender values, so it is left out of the result's repr. The
-full interchange goes only to the secured store (CLAUDE.md §9). The pyx12 logger tree (which logs the
-raw, value-bearing strings at ERROR) is muted from the first validation pass on, and never unmuted.
+module surfaces neither: an :class:`X12SegmentError` holds structural locators (its docstring names
+them, and the one limit on its segment id), and a refusal chains no pyx12 exception. The ack does echo
+sender values, so it is left out of the result's repr. The full interchange goes only to the secured
+store (CLAUDE.md §9). The pyx12 logger tree (which logs the raw, value-bearing strings at ERROR) is
+muted from the first validation pass on, and never unmuted.
 
 Pure: no I/O to disk/network, no engine imports. ``pyx12``'s sole runtime dependency is ``defusedxml``
 (already in tree), used to parse its bundled, trusted map XML — not attacker input.
@@ -62,8 +61,9 @@ class X12SegmentError:
     ``element_name`` is the *schema* data-element label (e.g. ``"Transaction Set Creation Date"``).
 
     ``segment_id`` comes from the input, so it is kept only when shaped like an X12 segment id (a
-    capital, then one or two capitals or digits) and is ``None`` otherwise (BACKLOG #5370). A sender
-    value of that exact shape, standing where the id goes, cannot be told from an id and is kept."""
+    capital, then one or two capitals or digits) and is ``None`` otherwise (BACKLOG #5370). The check
+    reads shape alone, so a two- or three-character sender value of that shape standing where the id
+    goes is kept, in ``segment_id`` and in ``message``, even when it matches no segment in the map."""
 
     code: str
     message: str
@@ -107,8 +107,8 @@ def _mute_pyx12_logger() -> None:
     """Mute the whole ``pyx12`` logger tree, and never unmute it (BACKLOG #1603).
 
     pyx12 logs each violation's *raw* error string, which embeds the offending data value (potential
-    PHI), at ERROR from child loggers such as ``pyx12.error_handler``. We build our own value-free
-    errors from pyx12's structured JSON instead, so nothing pyx12 logs is wanted anywhere.
+    PHI), at ERROR from child loggers such as ``pyx12.error_handler``. We build our own errors from
+    pyx12's structured JSON instead, so nothing pyx12 logs is wanted anywhere.
 
     **No restore step, on purpose.** The old context manager raised the level for one pass and put
     the previous level back afterwards. Two overlapping passes on two threads would interleave: the
