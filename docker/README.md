@@ -193,7 +193,9 @@ against one case that matters, described under
   reads; the `ha` engines still read their own store password from `secrets.env`). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
   `docker compose up` and `docker compose --profile ha up` run that check before they start any
-  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. Not
+  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. The
+  `ha` engines run the `postgres` image, so they wait instead on `revocation-attestation-check-ha`,
+  the same check in that image; read its logs for them. Not
   every command runs the check: at least `docker compose up --no-deps <engine>` and
   `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
   comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;

@@ -111,12 +111,28 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
 # --- a value the engine reads as false (BACKLOG #5400 item 3) ------------------------------------
 
 _CHECK = "revocation-attestation-check"
+_CHECK_HA = "revocation-attestation-check-ha"
 
 
 def _check_argv() -> list[str]:
     """The check service's argv after the image's interpreter, to run with this interpreter."""
     entry = [str(a) for a in _all_services()[_CHECK]["entrypoint"]]
     return entry[entry.index("/opt/venv/bin/python") + 1 :]
+
+
+def _checks() -> dict[str, dict[str, Any]]:
+    """Every attestation check service: the default one and each image's variant of it."""
+    return {n: s for n, s in _all_services().items() if n == _CHECK or n.startswith(_CHECK + "-")}
+
+
+def _gating_checks(svc: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The attestation checks ``svc`` waits on to complete successfully before it starts."""
+    deps = svc.get("depends_on") or {}
+    return {
+        n: c
+        for n, c in _checks().items()
+        if deps.get(n) == {"condition": "service_completed_successfully"}
+    }
 
 
 @pytest.mark.parametrize("service", sorted(_serving_engines()))
@@ -126,25 +142,52 @@ def test_a_gated_engine_waits_on_the_attestation_check(service: str) -> None:
     svc = _serving_engines()[service]
     if not _gated(svc):
         pytest.skip(f"{service} does not bind in-process TLS off loopback")
-    dep = (svc.get("depends_on") or {}).get(_CHECK)
-    assert dep == {"condition": "service_completed_successfully"}, (
-        f"{service} does not wait on {_CHECK}, so a false attestation restarts it forever"
+    assert _gating_checks(svc), (
+        f"{service} waits on no attestation check, so a false attestation restarts it forever"
     )
 
 
-def test_the_check_reads_the_same_required_value_and_never_restarts() -> None:
-    check = _all_services()[_CHECK]
+def test_the_compose_file_has_both_checks() -> None:
+    # Positive control: the default engine and the ha pair each wait on their own image's check.
+    assert set(_checks()) == {_CHECK, _CHECK_HA}
+    engines = _serving_engines()
+    assert set(_gating_checks(engines["engine"])) == {_CHECK}
+    assert set(_gating_checks(engines["engine-ha"])) == {_CHECK_HA}
+    assert set(_gating_checks(engines["engine-standby"])) == {_CHECK_HA}
+
+
+@pytest.mark.parametrize("name", sorted(_checks()))
+def test_each_check_reads_the_same_required_value_and_never_restarts(name: str) -> None:
+    check = _checks()[name]
     assert _REQUIRED.match(str(_env(check).get(TLS_REVOCATION_ATTESTED_ENV)))
     assert str(check.get("restart")) == "no"
-    assert not check.get("profiles"), "a profiled check would not run for every engine"
+    assert check.get("network_mode") == "none"
+    assert check.get("healthcheck") == {"disable": True}
+    # The command test below runs only the default check's text; every variant must run that text.
+    assert check.get("entrypoint") == _all_services()[_CHECK]["entrypoint"], name
 
 
-def test_the_check_runs_the_engines_image() -> None:
+def test_the_default_check_has_no_profile() -> None:
+    assert not _all_services()[_CHECK].get("profiles"), (
+        "a profiled check would not run for the default engine"
+    )
+
+
+@pytest.mark.parametrize("service", sorted(_serving_engines()))
+def test_the_check_runs_the_engines_image(service: str) -> None:
     # A check in another image would read the value with another version's parser, or fail to
-    # pull an image the operator never built.
-    image = _all_services()[_CHECK]["image"]
-    for name, svc in _serving_engines().items():
-        assert svc["image"] == image, f"{name} runs {svc['image']!r}, the check {image!r}"
+    # pull an image the operator never built. So every check an engine waits on runs its image,
+    # and runs under every profile the engine does.
+    svc = _serving_engines()[service]
+    checks = _gating_checks(svc)
+    if not checks:
+        pytest.skip(f"{service} waits on no attestation check")
+    for name, check in checks.items():
+        assert check["image"] == svc["image"], (
+            f"{service} runs {svc['image']!r}, the check {name} {check['image']!r}"
+        )
+        missing = set(check.get("profiles") or []) - set(svc.get("profiles") or [])
+        assert not missing, f"{name} needs profiles {sorted(missing)} that {service} does not"
 
 
 @pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])

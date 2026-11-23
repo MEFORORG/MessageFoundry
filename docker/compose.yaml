@@ -11,8 +11,8 @@
 
 # The API revocation attestation every serving engine below needs, as a required compose
 # substitution with no default. The default `engine` service's comment says why; this key only
-# holds the value once so every service that reads it, at least the three engines and the
-# revocation-attestation-check service, aliases one copy.
+# holds the value once so every service that reads it, at least the three engines and the two
+# revocation-attestation-check services, aliases one copy.
 # The required substitutions in this file, at least this one and the Postgres password, read the
 # same sources, and their messages name them in the same words. Supply them from one place:
 # --env-file replaces the .env beside compose.yaml, so a value kept in that .env goes unread once
@@ -22,8 +22,12 @@ x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?re
 # The engine image, named once: the revocation-attestation-check service must run the same image
 # as the engines so it reads the value with the same parser. Change it here, for example to
 # messagefoundry:sqlserver or a config-baked derived image. It does NOT set the `ha` engines'
-# image: x-ha-engine names theirs, the runtime-postgres variant, so change that line too.
+# image: x-ha-engine-image below names theirs.
 x-engine-image: &engine-image messagefoundry:latest
+
+# The `ha` engines' image, the runtime-postgres variant, named once for the same reason: the
+# revocation-attestation-check-ha service must run it too. Change it here, never on one service.
+x-ha-engine-image: &ha-engine-image messagefoundry:postgres
 
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
 # extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose
@@ -33,16 +37,16 @@ x-ha-engine: &ha-engine
   # The Postgres variant: the slim *engine-image above carries no asyncpg, so the Postgres store
   # below could not open on it. Build it from the repository root with:
   #   docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
-  # So the x-engine-image anchor above does NOT set these engines' image: change this line too.
-  # The revocation-attestation-check runs *engine-image; build both tags from the same checkout so
-  # it reads the attestation with the same parser these engines run.
-  image: messagefoundry:postgres
+  # So the x-engine-image anchor above does NOT set these engines' image; x-ha-engine-image does,
+  # and revocation-attestation-check-ha runs the same one, so it reads the attestation with the
+  # parser these engines run.
+  image: *ha-engine-image
   depends_on:
     postgres:
       condition: service_healthy
     schema-provision:
       condition: service_completed_successfully
-    revocation-attestation-check:
+    revocation-attestation-check-ha:
       condition: service_completed_successfully
   command: ["serve", "--config", "/config", "--env", "prod"]
   env_file:
@@ -281,14 +285,16 @@ services:
   # revocation gate and restarts forever. This reads the value with serve's own parser
   # (tls_revocation_attested), in the same image, exits 1 naming the gate when it does not read as
   # true, and an `up` without `--no-deps` stops there. It does not read the bind, so it refuses a
-  # false value even where serve's gate would not apply. It has no profile, so the `ha` engines
-  # wait on it too. down and logs never run it, which keeps the =0 path above working.
+  # false value even where serve's gate would not apply. It has no profile, so it runs for the
+  # default engine under any profile; the `ha` engines run another image and wait instead on
+  # revocation-attestation-check-ha below, the same check in their image. down and logs never run
+  # either, which keeps the =0 path above working.
   # `docker compose run` of an engine service, for an admin command such as gen-key, does run it.
   # At least two commands skip it: `docker compose run --no-deps` and
   # `docker compose up --no-deps <engine>`. The second starts that engine with no check, so a false
   # value there would exit 2 and restart forever; never use it to start a serving engine. It writes
   # nothing and needs no network.
-  revocation-attestation-check:
+  revocation-attestation-check: &revocation-attestation-check
     image: *engine-image
     entrypoint:
       - "tini"
@@ -312,6 +318,14 @@ services:
     healthcheck:
       disable: true
     restart: "no"
+
+  # The same one-shot check in the `ha` engines' image, so they read the attestation with their own
+  # parser and the ha pair alone never needs the default image built. Everything but the image and
+  # the profile is merged from the service above; the notes there apply to this one too.
+  revocation-attestation-check-ha:
+    <<: *revocation-attestation-check
+    profiles: ["ha"]
+    image: *ha-engine-image
 
   # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------
   # A local Postgres + a PAIR of clustered engines so you can exercise the ACTIVE-PASSIVE HA shape
