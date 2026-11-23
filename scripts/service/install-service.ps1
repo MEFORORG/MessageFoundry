@@ -1136,6 +1136,89 @@ function Get-RegisteredEnvironmentValue {
     return Get-EnvironmentListValue -List $key.GetValue('AppEnvironmentExtra', $null) -Name $Name
 }
 
+function Get-SettingsKeyProvider {
+    <#
+      The [store].key_provider the settings file $Path names, or $null when this reader finds none
+      (vault BACKLOG #3411, key custody S3 slice B3c).
+
+      READ AS TEXT. Running the install's interpreter would run its code from this elevated prompt,
+      which the interpreter check below declines to do. So this reads at least a key_provider line in
+      a [store] table, a top-level store.key_provider dotted key, and a one-line store inline table
+      with no table nested before the key, each holding a one-line string with no escape. Lines
+      inside a multi-line array or string are skipped. Names compare case-sensitively, as TOML's
+      do. Other forms can misread either way: at least a header it does not recognize (a tab, or a
+      quoted key with a space or punctuation) leaves the lines after it credited to the table
+      before it, and a triple quote in a comment or a one-line string, or a multi-line string
+      holding the other delimiter, can make it misread every line after it. What the installer does
+      with the answer is an early refusal: the engine applies its own key custody refusals at start
+      whatever this returns.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $value = '(?:"(?<v>[^"\\]*)"|''(?<v>[^'']*)'')'
+    $key = '(?:key_provider|"key_provider"|''key_provider'')'
+    $store = '(?:store|"store"|''store'')'
+    $tail = '\s*(?:#.*)?$'
+    $table = ""
+    $found = $null
+    $inString = $false
+    $arrayDepth = 0
+    foreach ($line in [IO.File]::ReadAllLines($Path)) {
+        $line = $line.TrimStart([char]0xFEFF)
+        # A line inside a multi-line string is never a header or a key; an odd count of
+        # triple quotes opens or closes one.
+        $wasInString = $inString
+        if (([regex]::Matches($line, '"""|''''''').Count % 2) -eq 1) { $inString = -not $inString }
+        if ($wasInString -or $inString) { continue }
+        # A line inside a multi-line array is an element, never a header or a key, even one shaped
+        # like a header such as ["store"] or [1]. The depth counts the brackets left open, outside
+        # strings and comments, by the lines before this one.
+        $inArray = $arrayDepth -gt 0
+        $code = ($line -creplace '"(?:[^"\\]|\\.)*"|''[^'']*''', '""') -creplace '#.*$', ''
+        $arrayDepth = [Math]::Max(0, $arrayDepth + ([regex]::Matches($code, '\[').Count -
+            [regex]::Matches($code, '\]').Count))
+        if ($inArray) { continue }
+        if ($line -cmatch '^\s*\[\[') { $table = "[[]]"; $arrayDepth = 0; continue }
+        # A header names a table by bare or quoted keys.
+        if ($line -cmatch ('^\s*\[(?<t>[A-Za-z0-9_.\-"'' ]+)\]' + $tail)) {
+            $table = $Matches.t -creplace '[\s"'']', ''
+            $arrayDepth = 0
+            continue
+        }
+        # A [store] line; a top-level dotted key; a top-level one-line inline table.
+        if (($table -ceq "store" -and $line -cmatch ('^\s*' + $key + '\s*=\s*' + $value + $tail)) -or
+            ($table -ceq "" -and $line -cmatch ('^\s*' + $store + '\s*(?:\.\s*' + $key + '\s*=\s*' +
+                $value + $tail + '|=\s*\{(?:(?:[^{}"''#]|"[^"\\]*"|''[^'']*'')*[,\s])?' + $key + '\s*=\s*' + $value + ')'))) {
+            $found = $Matches.v
+        }
+    }
+    return $found
+}
+
+function Get-HostCustodyAccountProblem {
+    <#
+      Why the service cannot run as the account this install would give it under
+      [store].key_provider = 'host', or "" when this check finds no reason (vault BACKLOG #3411, key
+      custody S3 slice B3c; Manager decision d20261105T144832834-1567f8). The host provider refuses
+      at least SYSTEM, LOCAL SERVICE and NETWORK SERVICE as the engine account, so a service that runs
+      as one of them refuses to start. This names them before anything acts. An explicit
+      -ServiceAccount wins over -AllowLocalSystem, as it does when the account is set.
+    #>
+    param([string]$ServiceAccount, [switch]$AllowLocalSystem)
+    if (-not $ServiceAccount) {
+        if ($AllowLocalSystem) { return "-AllowLocalSystem would run the service as LocalSystem" }
+        return ""
+    }
+    $shared = '^(\.\\)?LocalSystem$|^(NT AUTHORITY\\)?(SYSTEM|LocalService|NetworkService|LOCAL SERVICE|NETWORK SERVICE)$|^\*?S-1-5-(18|19|20)$'
+    # By SID too, so a spelling the pattern misses still counts once the name resolves.
+    $sid = try {
+        ([Security.Principal.NTAccount]$ServiceAccount.Trim()).Translate([Security.Principal.SecurityIdentifier]).Value
+    } catch { "" }
+    if ($ServiceAccount.Trim() -match $shared -or $sid -match '^S-1-5-(18|19|20)$') {
+        return "-ServiceAccount '$ServiceAccount' is SYSTEM, LOCAL SERVICE or NETWORK SERVICE"
+    }
+    return ""
+}
+
 function Set-ServiceEnvironmentValue {
     <#
       Set one variable in the service's NSSM environment (AppEnvironmentExtra under its Parameters
@@ -2770,6 +2853,28 @@ if ($LockConfigDir) {
 
 if ($ServiceConfig -and -not (Test-Path -LiteralPath $ServiceConfig -PathType Leaf)) {
     throw "Service settings file not found at: $ServiceConfig"
+}
+
+# --- key custody: [store].key_provider = 'host' (vault BACKLOG #3411, S3 slice B3c) --------------------
+# On a rerun, a MEFOR_STORE_KEY_PROVIDER in the service's NSSM environment (AppEnvironmentExtra)
+# wins over the settings file, as an environment variable does at start. No other environment is
+# read here, the machine's included. Refused before anything acts. Get-SettingsKeyProvider says
+# what it reads, and why the engine's own refusal at start does not rest on it.
+$RegisteredKeyProvider = Get-RegisteredEnvironmentValue -ServiceName $ServiceName -Name "MEFOR_STORE_KEY_PROVIDER"
+$HostCustody = if ($null -ne $RegisteredKeyProvider) { $RegisteredKeyProvider -ceq "host" }
+               else { (Get-SettingsKeyProvider -Path $ServiceConfig) -ceq "host" }
+if ($HostCustody) {
+    $custodyAccountProblem = Get-HostCustodyAccountProblem -ServiceAccount $ServiceAccount -AllowLocalSystem:$AllowLocalSystem
+    if ($custodyAccountProblem) {
+        $namedBy = if ($null -ne $RegisteredKeyProvider) {
+            "the service's own environment sets MEFOR_STORE_KEY_PROVIDER=host"
+        } else { "the settings file '$ServiceConfig' names [store].key_provider = 'host'" }
+        $remedy = if ($ServiceAccount) { "Pass a -ServiceAccount of the service's own, or leave it and -AllowLocalSystem out" }
+                  else { "Leave out -AllowLocalSystem" }
+        throw ("$custodyAccountProblem, and $namedBy, a key provider whose custody refuses that " +
+            "account, so the service would not start. $remedy to run as the virtual account " +
+            "'NT SERVICE\$ServiceName' (docs/SERVICE.md 'Run as a least-privilege account').")
+    }
 }
 
 # An install that builds its root (vault BACKLOG #2626) resolves NSSM first. Resolve-Nssm's
