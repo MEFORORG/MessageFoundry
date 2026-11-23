@@ -72,7 +72,7 @@
               {
                 "type": "security",
                 "name": "BACKLOG #5645 item 2",
-                "description": "getCommitters follows GraphQL pagination past the first 100 commits."
+                "description": "getCommitters follows GraphQL pagination past the first 100 commits, up to GitHub's 250-commit stop."
               }
             ]
           }

@@ -30,7 +30,7 @@ from the files on disk:
     sha256 of (dist/index.js, first two lines removed, BUNDLE_PATCHES reverted) == UPSTREAM_BUNDLE_SHA256
     git blob id of upstream-package-lock.json                                  == UPSTREAM_LOCK_BLOB_ID
 
-The first is what :func:`split_vendoring_header` and :func:`revert_bundle_patches` check -- the
+The first is what :func:`split_vendoring_header` and :func:`revert_bundle_patches_reporting` check -- the
 vendored bundle is the upstream blob at commit ``ca4a40a7`` with the recorded patches applied and a
 two-line header prepended, verified byte for byte. Since 2026-11-23 the bundle is a PATCHED FORK
 (BACKLOG #5644, #5645; see :data:`BUNDLE_PATCHES`), so the derivation reverts the patches before it
@@ -227,7 +227,7 @@ UNRECORDED_BY_DESIGN = frozenset({f"{ACTION_DIR}/README.md", RECORD_PATH})
 
 #: The vendoring header prepended to the upstream bundle, byte for byte. The vendored file is this
 #: followed by the upstream blob with :data:`BUNDLE_PATCHES` applied and nothing else, which
-#: :func:`split_vendoring_header` and :func:`revert_bundle_patches` verify between them. The second
+#: :func:`split_vendoring_header` and :func:`revert_bundle_patches_reporting` verify between them. The second
 #: line says the file is modified because Apache-2.0 section 4(b) asks a modified file to carry a
 #: prominent notice saying so.
 VENDORING_HEADER = (
@@ -239,7 +239,7 @@ VENDORING_HEADER = (
 
 #: THE BUNDLE IS A PATCHED FORK (owner ruling 2026-11-23, "Fork, patch, re-provenance"). Each entry
 #: is ``(upstream bytes, patched bytes)``; the vendored body is the upstream blob with each upstream
-#: span replaced by its patched one. :func:`revert_bundle_patches` runs that backwards, so the
+#: span replaced by its patched one. :func:`revert_bundle_patches_reporting` runs that backwards, so the
 #: upstream digest is still DERIVED from the file on disk rather than asserted. Changing a patch is
 #: a deliberate edit to this constant, the same friction :data:`PINNED_DIGESTS` puts on its files.
 #:
@@ -320,9 +320,10 @@ def revert_bundle_patches_reporting(body: bytes) -> tuple[bytes, list[str]]:
     """Revert what can be reverted, and return it with EVERY problem found, not the first.
 
     A patch whose patched span does not occur exactly once is left as it is, and the others are
-    still reverted. Stopping at the first bad patch would skip the digest comparison, so a second
-    change made beside the bad patch, anywhere else in the bundle, would go unreported until the
-    first was fixed: the hidden-second-change shape :func:`verify_derivation` accumulates against.
+    still reverted, and every bad patch is named. Stopping at the first bad patch also skipped the
+    digest comparison. Comparing it anyway names a change outside the patches when each bad patch is
+    an exact revert to upstream text; an EDITED patch mismatches the digest by itself, so a second
+    change beside one still shows only once that patch is fixed.
     """
     problems: list[str] = []
     for number, (upstream, patched) in enumerate(BUNDLE_PATCHES, start=1):
@@ -670,7 +671,7 @@ def build_record(contents: dict[str, bytes]) -> dict[str, Any]:
                                     "name": "BACKLOG #5645 item 2",
                                     "description": (
                                         "getCommitters follows GraphQL pagination past the "
-                                        "first 100 commits."
+                                        "first 100 commits, up to GitHub's 250-commit stop."
                                     ),
                                 }
                             ],
@@ -734,7 +735,9 @@ def verify_derivation(contents: dict[str, bytes]) -> list[str]:
         problems.append(str(exc))
     else:
         # Every bad patch is reported, and the digest is compared whatever they found: any bad
-        # patch already fails the gate, and the digest is what names a change outside the patches.
+        # patch already fails the gate. The digest names a change outside the patches only when each
+        # bad patch is an exact revert to upstream text; an edited patch mismatches the digest on its
+        # own, so a second change beside it still shows only once that patch is fixed.
         body, patch_problems = revert_bundle_patches_reporting(patched_body)
         problems += patch_problems
         body_sha = hashlib.sha256(body).hexdigest()

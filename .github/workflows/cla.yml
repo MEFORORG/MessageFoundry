@@ -173,7 +173,7 @@ jobs:
       # WHAT THE VENDORED ACTION CANNOT SEE (BACKLOG #5644, #5645). It matches its allowlist on an unlinked
       # commit's free-text git name. A patched fork since 2026-11-23 (its README): it pages commits, to
       # GitHub's 250 stop, past which NEITHER step checks an author. scripts/security/cla_precheck.py
-      # refuses what the action would pass unsigned; its docstring states the two rules it refuses on. It runs on the
+      # refuses unlinked authors the action could pass unsigned; its docstring states its two rules. It runs on the
       # same events as the action's step; the action's `if:` alone adds `!cancelled()`, so after an
       # earlier step fails the action still runs and this step does not.
       #

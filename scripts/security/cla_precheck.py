@@ -5,7 +5,8 @@
 
 WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/dist/index.js``. That
 bundle is a PATCHED FORK of upstream v2.6.1 since 2026-11-23 (owner ruling "Fork, patch,
-re-provenance"; BACKLOG #5644 item 2, #5645 item 2). The action's README lists the patches:
+re-provenance"; BACKLOG #5644 item 2, #5645 item 2). The action's README lists the patches; the two bullets marked PATCHED
+below are them, and the other two describe upstream behaviour the fork keeps:
 
   * ``getCommitters`` asks GraphQL for ``commits(first: 100)`` and, PATCHED, follows ``hasNextPage``
     to the end of the list. Upstream read one page with an empty cursor and never followed it.
@@ -34,12 +35,13 @@ EVERY commit it can read, paging on ``hasNextPage``:
      2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
      author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
      either that is neither null nor an object, is a reply in the wrong shape and a fault.
-  2. A linked author first seen past the first page (the first 100 commits) is refused only when
+  2. A linked author first seen past the first page (as many commits as GitHub returned
+     first, at most 100) is refused only when
      absent from the signature file the action keeps (below). The first page's keys are built as
      the action builds its list, first commit seen under each key. Rule 2 was written for the
      upstream action, which read that page only. The patched action now lists such an author
-     itself and asks them to sign, so rule 2 repeats the action's own demand there; it is kept as
-     a tightening, and it is cleared the same way, by the author signing.
+     itself and asks them to sign, so rule 2 duplicates the action's own demand there rather than
+     adding to it; it is kept, and it is cleared the same way, by the author signing.
 
 It faults in at least these cases: the pull request's head moved while it read, it read fewer
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
@@ -83,7 +85,7 @@ It CANNOT see a spoofed AUTHOR email. GitHub links a commit to an account by its
 author email set to an allowlisted account's address reads as that account, here and in the action
 alike. Only commit signature verification separates the two, and neither checks it.
 
-MEASURED 2026-11-23, by the Builder of the patched-fork change, with ``gh api graphql`` against a
+MEASURED 2026-11-23 (first by the patched-fork change's code review, then repeated by its Builder), with ``gh api graphql`` against a
 public pull request of 4096 commits (home-assistant/core 189294): the GraphQL commit connection
 returned 100, 100 and 50 commits, then ``hasNextPage`` false, while ``totalCount`` reported 4096 on
 every page. So GitHub stops the list at 250 and ``totalCount`` reports the real count. One pull
@@ -271,7 +273,7 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
     chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
     null person there would throw in the action: that is a fault here, and the commit keys nothing
-    in the action's view.
+    among the first page's keys.
     """
     author = _person(commit, "author")
     if author is None:
@@ -534,7 +536,7 @@ def evaluate(
             "unread commits are not checked"
         )
     # One slot per commit, None for a malformed one, so the first-page slice below never shifts a
-    # second-page commit into the action's view.
+    # second-page commit among the first page's keys.
     slots: list[Attribution | None] = []
     for index, commit in enumerate(read.commits):
         oid = commit.get("oid", "")
@@ -553,7 +555,7 @@ def evaluate(
         if refusal is not None:
             # Judged before the key below, so a commit whose committer cannot be read is refused.
             rule_one.append(refusal)
-            # Past the action's view, rule 2 judges linked authors only, so no rule reads this
+            # Past the first page, rule 2 judges linked authors only, so no rule reads this
             # commit's key, and an unreadable committer here is not a fault. A null author, which
             # the schema allows, has no key anywhere: the action would throw on it.
             if index >= read.first_page or commit["author"] is None:
@@ -562,9 +564,9 @@ def evaluate(
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            # Only an unlinked author on the action's page gets here, so its key, the committer's
-            # account the action would file it under, is then missing from the action's view.
-            faults.append(f"commit {oid}: {exc}; its key is missing from the action's view")
+            # Only an unlinked author on the first page gets here, so its key, the committer's
+            # account the action would file it under, is then missing from the first page's keys.
+            faults.append(f"commit {oid}: {exc}; its key is missing from the first page's keys")
             slots.append(None)
     # The first page's keys, one per `login || name`, as the action keys its list. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
