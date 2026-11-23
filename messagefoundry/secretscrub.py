@@ -1124,7 +1124,11 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
 # A quoted scheme token after an EARLIER label's plain value, as in
 # ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
-# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3).
+# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A
+# tail or a key body prints as before on a line the camelCase union returns its reading before for, whole: a line
+# where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``, and
+# an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
+# reading, so on such a line none of them runs.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
@@ -2779,7 +2783,8 @@ def _run(
 # newly read value could take a later label that hid something, and that something printed (the
 # comment on :data:`_CAMEL_START` gives the measurement). So on a line where they can read anything,
 # :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns and once with
-# :func:`_pre_camel` of each, which is exactly the pattern without them, and keeps a character of the
+# :func:`_pre_camel` of each, which is the pattern without them and without the masked tails, with
+# the key-block pass as a pattern that never matches, and keeps a character of the
 # first output only where the second kept it too. Before those two runs :func:`_union` probes the
 # second reading with a search per pattern, stopping at the first match (BACKLOG #5386); a line
 # where none matches takes the shipped run alone. So a union line costs that probe and two runs, or
@@ -2862,8 +2867,9 @@ _PRE_CAMEL: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
 
 
 def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
-    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back.
-    Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
+    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back,
+    and the masked tails stripped, with the key-block pass as a pattern that never matches (the
+    comment in the body says why). Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
     readings, and a pattern change cannot leave this one behind. Compiled once per pattern."""
     found = _PRE_CAMEL.get(id(pattern))
     if found is not None and found[0] is pattern:
