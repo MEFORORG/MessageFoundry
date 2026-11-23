@@ -2762,8 +2762,8 @@ still pass:
   the character alone. A code a vertical tab or file separator interrupts there is found, and a
   carriage return or line feed there ends the line, so the message is refused as holding a line
   no rule can reach.
-- The IPv6 check misses some routable addresses. At least these pass: one after two or more
-  dotted groups with no colon among them, such as `1.2.4000::5`, and an IPv4-mapped or
+- The IPv6 check misses some routable addresses. At least these pass: some addresses after
+  dotted groups with no colon before them in the run, such as `1.2.4000::5`, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
   last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
   (BACKLOG #5654). It reads text folded too, so an address in fullwidth digits or colons counts.
@@ -2781,7 +2781,7 @@ allowed link-local address.
 
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
-phone shapes, so every IPv6 address written with ASCII colons there passes, and `1::1234`
+phone shapes, so every IPv6 address whose colons are literal field separators there passes, and `1::1234`
 refuses nothing (BACKLOG #5654).
 
 **A shape cut across fields by the message's own field separator is refused, but not in every

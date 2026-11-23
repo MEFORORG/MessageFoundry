@@ -302,8 +302,9 @@ def _judge_ipv6_run(run: str, ipv4_is_routable: Callable[[str], bool]) -> bool:
 
 
 def _dot_joined_pieces(run: str) -> tuple[str, ...]:
-    """``run`` cut at each dot that has two colons or more before it in the run and a colon in
-    the group after it, as in ``fe80::1.4000:a1::5``, or nothing when it has no such dot. The run
+    """``run`` cut at each dot that has a colon before it in the run and a colon in the group
+    after it, as in ``fe80::1.4000:a1::5`` or ``x:1.2.4000:a1::5``, or nothing when it has no
+    such dot. The run
     whole parses to the allowed address before the dot, so the address after it is read only as a
     piece (BACKLOG #5654). A dot with no colon before it, as in ``1.2.3::a``, does not cut, so a
     version number before an address is read as before. Each group is visited once, so the cost
@@ -313,7 +314,7 @@ def _dot_joined_pieces(run: str) -> tuple[str, ...]:
     current = [groups[0]]
     colons = groups[0].count(":")
     for group in groups[1:]:
-        if colons >= 2 and ":" in group:
+        if colons and ":" in group:
             pieces.append(".".join(current))
             current = [group]
         else:
