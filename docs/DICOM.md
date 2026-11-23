@@ -382,7 +382,8 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   Success or Warning stays delivered and is not sent again, any other status keeps its own outcome, and a send
   with no status stays a failure. After a C-ECHO, the test passes only on Success. The release failure is logged
   through the screen and the association is aborted. If the abort raises too, that is logged the same way and
-  the engine makes no further attempt to end the association.
+  the engine makes no further attempt to end the association. The tests cover this for a library exception whose
+  class raises when its name or an attribute is read.
 
   **A library exception the SCU does not wrap keeps its text.** At least one raised while the SCU opens the
   association does. The delivery worker logs only its class, but the text would reach the row's `last_error`
