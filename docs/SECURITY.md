@@ -1699,11 +1699,11 @@ offers that account's delete, through a confirmation page that names the id alon
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way; when the record fails its seal at that read, made after the action
 landed, they name the account by its id and still show what was issued, rather than answering
-423. A factor reset that issues neither an enrolment code nor a generated credential shows no
-such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
-What those pages show and log when that
+423. What those pages show and log when that
 read fails is stated in the docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
+A factor reset that lands but issues neither an enrolment code nor a generated credential shows
+no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
 A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's

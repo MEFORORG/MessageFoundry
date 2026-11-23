@@ -520,12 +520,18 @@ def test_the_security_doc_counts_no_single_read_exceptions() -> None:
 
 
 def test_the_security_doc_says_where_a_factor_reset_that_issues_nothing_goes() -> None:
-    """``ui_user_reset_mfa`` shows no post-action page when the reset issued neither an
-    enrolment code nor a generated credential: it redirects to the account's detail page, whose
-    checked read answers 423 for a failing record (Lander hold 7089092213)."""
+    """``ui_user_reset_mfa`` shows no post-action page when the reset landed (its JSON handler
+    returned) but issued neither an enrolment code nor a generated credential: it redirects to the
+    account's detail page, whose checked read answers 423 for a failing record. The sentence
+    follows the ``_shown_name`` pointer, so that pointer's "those pages" still names the
+    post-action pages (Lander hold 7089092213)."""
     body = _statement_body()
-    assert (
-        "A factor reset that issues neither an enrolment code nor a generated credential shows "
-        "no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a "
-        "failing record."
-    ) in body
+    pointer = "What those pages show and log when that read fails is stated in the docstring"
+    reset = (
+        "A factor reset that lands but issues neither an enrolment code nor a generated "
+        "credential shows no such page: it redirects to `GET /ui/users/{user_id}`, which answers "
+        "423 for a failing record."
+    )
+    assert reset in body
+    assert pointer in body and body.index(pointer) < body.index(reset)
+    assert "rather than answering 423. What those pages show and log" in body
