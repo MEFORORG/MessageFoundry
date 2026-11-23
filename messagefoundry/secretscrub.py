@@ -1136,7 +1136,13 @@ _SCHEME_TOKEN_TAIL = (
 #: anything, that the value is exactly a ``b`` and a quote; :data:`_BYTES_TAIL` then takes the
 #: literal's body up to its closer, which stays. ``_MEFOR_SECRET``'s plain value takes the opening
 #: quote as well, so its tail, :data:`_MEFOR_BYTES_TAIL`, starts after it.
-_BYTES_CHARS = r"[^'\"{:=\r\n]"
+#: What a bytes literal's body may hold: printable ASCII and the space, without the quotes, "{",
+#: ":", "=", "%", "\", the brackets "[" "]" and "<" ">" of a placeholder, and "}". So a tail holds no
+#: control character, which the control-character filter after it would escape to another length,
+#: no escape, no placeholder, and no ``mfb64:`` carriage marker in any spelling (found by code
+#: review). A literal holding one prints as before.
+_TAIL_TEXT = r"[ !#$&(-9;?-Z^-z|~]"
+_BYTES_CHARS = _TAIL_TEXT
 _BYTES_PROBE = r"(?:(?=(?P<bytes_open>)b['\"]))?"
 _BYTES_TAIL = (
     r"(?(bytes_open)|(?!))(?<=b)(?P<bytes_tail>'"
@@ -1166,7 +1172,7 @@ _MEFOR_BYTES_TAIL = (
 _SCHEME_WORDS = r"(?:(?:bearer|basic|digest)\s+)?"
 _MARKED_SCHEME_WORDS = r"(?:(?:bearer|basic|(?P<digest>digest))\s+)?"
 #: A quoted Digest parameter value: ":" and "=" are allowed inside, and "'", "{" and "://" are not.
-_DIGEST_QUOTED = r"\"(?:[^\"'{:\r\n]|:(?!//))*+\""
+_DIGEST_QUOTED = r"\"(?:" + _TAIL_TEXT[:-1] + r"=]|(?<!mfb64):(?!//))*+\""
 #: After ``digest`` and the value ``_BEARER`` took, which stops before the first parameter's quote:
 #: the rest of that parameter, then every later ``, name=value`` on the line, to :data:`_TAIL_END`.
 _DIGEST_TAIL = (
@@ -1209,7 +1215,7 @@ def _strip_tails(source: str) -> str:
 # first and rewrote the markers as a name run, so nothing after it could find the block either.
 #
 # Group 1 is the BEGIN marker, kept. ``key_body`` is every whole line after it that is a base64 run
-# (its padding refused after a label word, as a token68's is), a ``Proc-Type:`` or ``DEK-Info:``
+# not ending in a label word (:data:`_NO_LABEL_BEFORE`), with its padding, a ``Proc-Type:`` or ``DEK-Info:``
 # header or an empty line, each line separated by a real or an escaped line break, with spaces or
 # tabs allowed at its end. A line is taken
 # only where it ends where a line ends, so a block cut off mid-line by a driver or a clamp is masked
@@ -1221,9 +1227,9 @@ def _strip_tails(source: str) -> str:
 # are: a PGP block (its marker ends ``PRIVATE KEY BLOCK``), a certificate and a public key.
 _KEY_SEPARATOR = r"(?:\r\n|\n|\r|\\r\\n|\\n)"
 _KEY_LINE = (
-    r"(?:[A-Za-z0-9+/]++(?:"
+    r"(?:[A-Za-z0-9+/]++"
     + _NO_LABEL_BEFORE
-    + r"={1,2})?+|Proc-Type:[ ]*+[0-9]++,[A-Z]++|DEK-Info:[ ]*+[A-Za-z0-9-]++,[0-9A-Fa-f]++|)"
+    + r"(?:={1,2})?+|Proc-Type:[ ]*+[0-9]++,[A-Z]++|DEK-Info:[ ]*+[A-Za-z0-9-]++,[0-9A-Fa-f]++|)"
 )
 _PRIVATE_KEY_BLOCK = re.compile(
     r"(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \t]*+"
@@ -2166,13 +2172,26 @@ def mask_private_key_blocks(text: str) -> str:
 def _mask_only(before: str, after: str) -> bool:
     """Whether ``after`` is ``before`` with some characters written as "x": the same length, and
     every character that differs is an "x". The comparison the comment above
-    :data:`_NO_LABEL_BEFORE` calls the control."""
-    return len(before) == len(after) and all(
-        a == b or a == "x" for b, a in zip(before, after, strict=True)
-    )
+    :data:`_NO_LABEL_BEFORE` calls the control. It compares the text between the "x" runs of
+    ``after``, so it costs one slice per run rather than a step per character."""
+    if len(before) != len(after):
+        return False
+    if before == after:
+        return True
+    pos = 0
+    for run in _X_RUN.finditer(after):
+        if before[pos : run.start()] != after[pos : run.start()]:
+            return False
+        pos = run.end()
+    return before[pos:] == after[pos:]
 
 
-def mask_private_key_blocks_then(text: str, then: Callable[[str], str]) -> str:
+_X_RUN = re.compile("x+")
+
+
+def mask_private_key_blocks_then(
+    text: str, then: Callable[[str], str], after: Callable[[str], str] | None = None
+) -> str:
     """``then`` over ``text`` with its PRIVATE KEY block bodies masked, where that output is
     ``then(text)`` with characters written as "x"; ``then(text)`` otherwise (BACKLOG #5550).
 
@@ -2180,13 +2199,19 @@ def mask_private_key_blocks_then(text: str, then: Callable[[str], str]) -> str:
     them, so the mask must run before it. The PHI pass may read the masked body differently from
     the body, as it read the ``ENCRYPTED`` header against the next line's ``DEK``, and the comparison
     keeps that from printing anything ``then(text)`` hid. A caller clamps ``text`` first, so the mask
-    scans no more than the PHI pass does."""
+    scans no more than the PHI pass does.
+
+    ``after`` is what the caller runs over the result next, at least its credential passes: the two
+    outputs are compared through it, because a masked body line can take away a label those passes
+    read (found by code review: a body line ``token`` before a line opening ``: v``)."""
     masked = mask_private_key_blocks(text)
     plain = then(text)
     if masked is text or masked == text:
         return plain
     tailed = then(masked)
-    return tailed if _mask_only(plain, tailed) else plain
+    if after is None:
+        return tailed if _mask_only(plain, tailed) else plain
+    return tailed if _mask_only(after(plain), after(tailed)) else plain
 
 
 # --- ADMISSION GATING: what makes a per-record credential pass affordable --------------------------
@@ -2982,7 +3007,10 @@ class _Trace:
 
 #: What a line must hold for a masked tail or the key-block pass to fire, folded: each tail's
 #: lookbehind or marker, and the BEGIN marker's tail.
-_TAIL_TRIGGERS = (*_KEY_BLOCK_HINT, "digest", "'basic", '"basic', "'bearer", '"bearer')
+_TAIL_TRIGGERS = (*_KEY_BLOCK_HINT, "'basic", '"basic', "'bearer", '"bearer')
+#: Where :data:`_DIGEST_TAIL` can fire: ``digest`` as a scheme word after a label's ":" or "=",
+#: not the word anywhere, which a hash mismatch message holds.
+_DIGEST_TRIGGER = re.compile(r"[:=]\s*+digest\s")
 #: Where :data:`_BYTES_PROBE` can fire: a ``b`` and a quote at a value's start, which follows a
 #: ":", an "=" or white space. Searched for rather than a bare ``b'`` substring, which ``'job'``
 #: and ``"db":`` hold too.
@@ -3006,6 +3034,8 @@ def could_take_a_tail(text: str) -> bool:
 
 def _could_take_a_tail(folded: str | None) -> bool:
     if folded is None or any(trigger in folded for trigger in _TAIL_TRIGGERS):
+        return True
+    if "digest" in folded and _DIGEST_TRIGGER.search(folded) is not None:
         return True
     return _BYTES_TRIGGER.search(folded) is not None
 

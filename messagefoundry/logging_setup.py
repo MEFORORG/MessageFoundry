@@ -442,7 +442,13 @@ def _redact_masking_key_blocks(text: str) -> str:
     after the clamp, so it scans no more than the PHI pass does (BACKLOG #1576).
     :func:`~messagefoundry.secretscrub.mask_private_key_blocks_then` keeps the PHI pass's reading of
     the unmasked text wherever the masked one differs from it at anything but an "x"."""
-    return mask_private_key_blocks_then(clamp_untrusted(text), redact)
+    return mask_private_key_blocks_then(clamp_untrusted(text), redact, _credential_passes)
+
+
+def _credential_passes(text: str) -> str:
+    """The credential passes the chain runs after the PHI pass, which the key-block comparison
+    reads through: a masked body line can take away a label they read."""
+    return scrub_credentials(_scrub_credential_query(text))
 
 
 def _shipped_filters() -> tuple[logging.Filter, ...]:

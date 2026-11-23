@@ -86,7 +86,10 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
     capitalized two-word phrase such as ``Program Files``."""
     from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, clamp_untrusted, redact
-    from messagefoundry.secretscrub import scrub_credentials
+
+    # Without the masked tails (BACKLOG #5546 to #5550): _printed_by_both counts word fragments, and
+    # a tail's "x" run is a fragment neither result hid, so the tails printed words this hid.
+    from messagefoundry.secretscrub import scrub_credentials_without_tails as scrub_credentials
 
     bounded = clamp_untrusted(text)
     # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it

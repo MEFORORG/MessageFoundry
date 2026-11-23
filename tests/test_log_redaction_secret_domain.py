@@ -88,6 +88,8 @@ from messagefoundry.redaction import redact_untrusted, safe_text
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
+from messagefoundry.tray import logscrub as tray_logscrub
+from messagefoundry.verify_leaf import safe_detail_text
 from tests._ast_sites import named_func
 from tests._growth import _growth_between
 from tests._pem_fixture import b64_run, pem_block, pem_marker
@@ -4604,6 +4606,9 @@ _TAIL_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
     ("scrub_credentials", scrub_credentials),
     ("redact_log_line", redact_log_line),
     ("installed chain", _through_the_installed_chain),
+    ("scrub_log_text", logging_mod.scrub_log_text),
+    ("tray chain", tray_logscrub._scrub_text),
+    ("verify detail", safe_detail_text),
 )
 
 
@@ -4685,6 +4690,18 @@ _TAIL_REVIEW_SHAPES = (
     pem_marker("BEGIN", "RSA PRIVATE KEY")
     + " \nvq1vq2 \nvq3\n"
     + pem_marker("END", "RSA PRIVATE KEY"),
+    # Round two: a body line ending in a label word, its value on the next line; control
+    # characters and a carriage marker inside a tail; a sweep joining masked runs.
+    pem_marker("BEGIN", "PRIVATE KEY") + "\ntoken\n: vq1 more",
+    pem_marker("BEGIN", "PRIVATE KEY") + "\nAAAA/Bearer\nvq2-tok rest",
+    pem_marker("BEGIN", "PRIVATE KEY") + "\r\nAAAA/password\r\n= vq3",
+    "vq0:pwd: b'a/b vq2'",
+    "token=b'a\x1bb'",
+    "code=b'+\x00\x00'}",
+    'Authorization: Digest username="u", nonce="mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"',
+    'api_key = b"mfb64%3Av1%3AQUJD"',
+    "password=b'hunter2.abcdefghijklmnopqrstuvwxyz0123'",
+    pem_block("RSA PRIVATE KEY", "\\n", b64_run(11, 64), b64_run(12, 30) + "=="),
 )
 
 #: The pieces the tail-aware corpus joins: every tail's trigger and closers, label heads, PHI
@@ -4696,6 +4713,7 @@ _TAIL_FUZZ_PIECES = (
     *("\n", "\\n", "==", "=", ":", " = ", "'", '"', "'", '"', " ", " ", ",", ";", "{", "}"),
     *("password", "pwd", "token", "private_key", "MEFOR_X", "Authorization: ", "code"),
     *("SMITH JOHN ", "DOE JANE", "PID|", "|", "^", "2024-01-01", ".", "+", "/", "-", "AAAA"),
+    *("\n: ", "\n= ", "/Bearer", "Password", "\x1b", "mfb64:v1:", "[REDACTED]", "<redacted>"),
 )
 
 
@@ -4780,6 +4798,8 @@ def test_each_taken_tail_shape_is_masked_on_every_surface(monkeypatch: pytest.Mo
     old = _before_the_tails(monkeypatch, corpus)
     new = _tail_outputs(corpus)
     for surface, _apply in _TAIL_SURFACES:
+        if surface == "verify detail":
+            continue  # reads without the tails on purpose; verify_leaf says why
         same = [
             line for line, a, b in zip(corpus, old[surface], new[surface], strict=True) if a == b
         ]

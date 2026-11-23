@@ -59,6 +59,7 @@ from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
     _KV_TAILS,
     _MEFOR_TAILS,
+    _SHIPPED_TAILS,
     _braced_tail,
     _dsn_password_repl,
     _keep_key_marker,
@@ -583,6 +584,18 @@ _WIDE_DSN_PASSWORD = _SHARED_DSN_PASSWORD
 #: same name so a test disables it in both layers by that name.
 _PRIVATE_KEY_BLOCK = _SHARED_PRIVATE_KEY_BLOCK
 
+# The tails each copy pattern holds, registered where secretscrub's ``_without_tails`` checks them,
+# so a strip of this copy that changes nothing raises rather than leaving the comparison in
+# :func:`redact_log_line` comparing a reading with itself.
+_SHIPPED_TAILS.update(
+    {
+        id(_BEARER): (_BEARER_TAILS, _BYTES_PROBE),
+        id(_MEFOR_SECRET): (_MEFOR_TAILS, _BYTES_PROBE),
+        id(_CREDENTIAL_KV): (_KV_TAILS, _BYTES_PROBE),
+        id(_KEY_MATERIAL): (_KV_TAILS, _BYTES_PROBE),
+    }
+)
+
 # A long base64-ish run (>= 24 chars) that isn't otherwise matched — likely a key/token/encoded body.
 _LONG_B64 = re.compile(r"\b[A-Za-z0-9+/]{24,}={0,2}\b")
 
@@ -730,8 +743,26 @@ def redact_log_line(line: str) -> str:
         before = layers(original, _without_tails, scrub_credentials_without_tails)
         if not _mask_only(before, body):
             body = before
+        elif body != before:
+            # The sweep reads a masked run as base64 and would join runs the reading before kept
+            # apart, so it hides exactly the runs it hides there, at the same places.
+            return prefix + _swept_as(before, body)
     body = _LONG_B64.sub(REDACTION_PLACEHOLDER, body)
     return prefix + body
+
+
+def _swept_as(before: str, after: str) -> str:
+    """``after``, which is ``before`` with characters written as "x", with the long-base64 sweep's
+    matches on ``before`` replaced at the same spans, so the result is the swept ``before`` with
+    characters written as "x"."""
+    out: list[str] = []
+    pos = 0
+    for run in _LONG_B64.finditer(before):
+        out.append(after[pos : run.start()])
+        out.append(REDACTION_PLACEHOLDER)
+        pos = run.end()
+    out.append(after[pos:])
+    return "".join(out)
 
 
 def split_log_lines(text: str) -> list[str]:

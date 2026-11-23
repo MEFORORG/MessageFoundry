@@ -57,7 +57,9 @@ def _scrub_text(text: str) -> str:
     # The PRIVATE KEY block mask sits between the clamp and the PHI pass, as on the engine chain
     # (BACKLOG #5550): that pass rewrites a block's markers, so nothing after it finds the block.
     return redact_binary_carriage(
-        scrub_credentials(mask_private_key_blocks_then(clamp_untrusted(text), redact))
+        scrub_credentials(
+            mask_private_key_blocks_then(clamp_untrusted(text), redact, scrub_credentials)
+        )
     )
 
 
