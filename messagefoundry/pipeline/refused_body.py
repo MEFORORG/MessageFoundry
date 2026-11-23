@@ -262,7 +262,10 @@ def head_only_resubmit_refusal(message_id: str, metadata: str | None) -> str | N
         return None
     try:
         parsed = json.loads(metadata)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):
+        # Deep nesting overflows the decoder with a RecursionError, which is not a ValueError. The
+        # store's edit paths decode the same cell again and refuse it as a 409 when it overflows
+        # there too (BACKLOG #5758); nothing here pins that both overflow at the same depth.
         return None
     record = parsed.get(METADATA_KEY) if isinstance(parsed, dict) else None
     if not isinstance(record, dict) or record.get("stored") != "head":

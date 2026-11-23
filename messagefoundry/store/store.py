@@ -1014,6 +1014,58 @@ class ReingressOriginMissing(ResendError):
     belt-and-suspenders race guard; the txn rolls back and nothing is written."""
 
 
+class ResendOriginMetadataUnreadable(ResendError):
+    """The origin's ``metadata`` cell opened, but building an edited child's correlation metadata
+    from it raised (BACKLOG #5758). At least: the cell nests too deep to decode, its
+    ``correlation_depth`` cannot be read as an integer, or the child's metadata cannot be
+    serialized from it. Most cells the pass-through transform handoff now dead-letters are such
+    cells, so without this refusal the operator's edit of that message raised out of the API as a
+    500; it is now a 409. The txn rolls back and nothing is written: the origin and its queue rows
+    stay as they were, and the idempotency key stays free."""
+
+
+def edit_child_metadata(raw_meta: str | None, *, origin_message_id: str) -> str:
+    """The ``metadata`` of an edit-and-resend or edit-and-resubmit child of ``origin_message_id``,
+    correlated to the origin from its opened ``raw_meta`` (ADR 0090 §9, BACKLOG #153).
+
+    Every cell the inline copies this replaced turned into a child still does, with the same
+    metadata: a cell that decodes to something other than a JSON object, or fails to decode with a
+    ``ValueError``, carries no lineage. A cell on which they raised one of the errors the outer
+    ``except`` names is now refused with :class:`ResendOriginMetadataUnreadable` (BACKLOG #5758),
+    and that includes one that nests too deep to decode. The refusal is raised outside the
+    ``except``, because json's error holds the whole cell, and neither it nor the log names more
+    than the message id."""
+    try:
+        try:
+            parent_meta = json.loads(raw_meta) if raw_meta else {}
+        except (ValueError, TypeError):
+            parent_meta = {}
+        if not isinstance(parent_meta, dict):
+            parent_meta = {}
+        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
+        root = parent_meta.get("correlation_root_id") or origin_message_id
+        return json.dumps(
+            {
+                "correlation_id": origin_message_id,
+                "correlation_root_id": root,
+                "correlation_depth": child_depth,
+                "edited_from": origin_message_id,
+            }
+        )
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        # json.loads overflows on deep nesting with a RecursionError, not a ValueError, so it lands
+        # here rather than in the inner "no lineage" reading.
+        pass
+    log.warning(
+        "message %s metadata does not hold readable correlation metadata; the edit was refused",
+        origin_message_id,
+    )
+    raise ResendOriginMetadataUnreadable(
+        f"message {origin_message_id} metadata does not hold readable correlation metadata"
+        " -- cannot edit-and-resend or edit-and-resubmit it"
+    )
+
+
 #: The ``resend_log.to_destination`` sentinel prefix an edit-and-resubmit RE-INGRESS records instead of
 #: a real outbound name (ADR 0090 §9, BACKLOG #153). A re-ingress re-enters the ORIGIN channel (not an
 #: outbound lane), so its idempotency-key binding is ``(origin_message_id, "@reingress:<channel>")`` —
@@ -17478,9 +17530,10 @@ class MessageStore:
 
         Rejects (raise, no mutation): :class:`ResendSourceNotFound` (no delivered source body),
         :class:`ResendSourceEmpty` (retention nulled the source body — must-fix #2),
-        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination), or
+        :class:`ResendSourceAmbiguous` (``from_`` omitted with >1 delivered destination),
         :class:`ResendKeyConflict` (the ``idempotency_key`` was already used for a different
-        message/target — review #123-4).
+        message/target — review #123-4), or, on the edit path, :class:`ResendOriginMetadataUnreadable`
+        (the origin's correlation lineage cannot be carried onto the child, BACKLOG #5758).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resend (BACKLOG #2624, :data:`OperatorAudit`). On the edit path the child records
@@ -17564,22 +17617,7 @@ class MessageStore:
                     message_id=message_id,
                     channel_id=src_channel,
                 )
-                try:
-                    parent_meta = json.loads(raw_meta) if raw_meta else {}
-                except (ValueError, TypeError):
-                    parent_meta = {}
-                if not isinstance(parent_meta, dict):
-                    parent_meta = {}
-                child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                root = parent_meta.get("correlation_root_id") or message_id
-                child_meta = json.dumps(
-                    {
-                        "correlation_id": message_id,
-                        "correlation_root_id": root,
-                        "correlation_depth": child_depth,
-                        "edited_from": message_id,
-                    }
-                )
+                child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                 # The child is created ROUTED with its single outbound delivery already in flight (it
                 # skips router/transform — the operator supplied the final body); the finalizer drives
                 # it to PROCESSED/ERROR from that row, exactly like any message at the outbound stage.
@@ -17712,9 +17750,10 @@ class MessageStore:
         double-delivers. Defense-in-depth: the child id is a deterministic content-address of the key +
         channel + body, pre-checked before INSERT, so even a partial-rollback re-run cannot double-inject.
 
-        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first) or
-        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target). No mutation
-        on a raise (the whole txn rolls back).
+        Raises :class:`ReingressOriginMissing` (origin gone — belt-and-suspenders; the API 404s first),
+        :class:`ResendKeyConflict` (the key was already used for a DIFFERENT origin/target), or
+        :class:`ResendOriginMetadataUnreadable` (the origin's correlation lineage cannot be carried onto
+        the child, BACKLOG #5758). No mutation on a raise (the whole txn rolls back).
 
         ``audit`` builds the operator's audit row from the outcome, a duplicate included, and the row
         commits with the resubmit (BACKLOG #2624, :data:`OperatorAudit`). The child records origin
@@ -17772,22 +17811,7 @@ class MessageStore:
                 message_id=origin_message_id,
                 channel_id=channel_id,
             )
-            try:
-                parent_meta = json.loads(raw_meta) if raw_meta else {}
-            except (ValueError, TypeError):
-                parent_meta = {}
-            if not isinstance(parent_meta, dict):
-                parent_meta = {}
-            child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-            root = parent_meta.get("correlation_root_id") or origin_message_id
-            child_meta = json.dumps(
-                {
-                    "correlation_id": origin_message_id,
-                    "correlation_root_id": root,
-                    "correlation_depth": child_depth,
-                    "edited_from": origin_message_id,
-                }
-            )
+            child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
             new_mid = self._edit_resubmit_message_id(idempotency_key, channel_id, raw)
             # Explicit-id INSERT-OR-IGNORE ingress (defense-in-depth): a re-run after a rolled-back
             # partial re-derives the SAME id and skips the re-insert instead of minting a new one.

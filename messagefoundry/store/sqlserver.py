@@ -367,6 +367,7 @@ from messagefoundry.store.store import (
     create_batch_failure,
     decoded_rows,
     delivery_key,
+    edit_child_metadata,
     enrolment_code_issue,
     enrolment_code_revoke,
     enrolment_code_spend,
@@ -13393,22 +13394,7 @@ class SqlServerStore:
                             message_id=message_id,
                             channel_id=src_channel,
                         )
-                        try:
-                            parent_meta = json.loads(raw_meta) if raw_meta else {}
-                        except (ValueError, TypeError):
-                            parent_meta = {}
-                        if not isinstance(parent_meta, dict):
-                            parent_meta = {}
-                        child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                        root = parent_meta.get("correlation_root_id") or message_id
-                        child_meta = json.dumps(
-                            {
-                                "correlation_id": message_id,
-                                "correlation_root_id": root,
-                                "correlation_depth": child_depth,
-                                "edited_from": message_id,
-                            }
-                        )
+                        child_meta = edit_child_metadata(raw_meta, origin_message_id=message_id)
                         # ROUTED child with its single outbound delivery already in flight (skips router/
                         # transform); the finalizer drives it. Idempotency is the resend_log gate above.
                         child_mid = uuid4().hex
@@ -13649,22 +13635,7 @@ class SqlServerStore:
                         message_id=origin_message_id,
                         channel_id=channel_id,
                     )
-                    try:
-                        parent_meta = json.loads(raw_meta) if raw_meta else {}
-                    except (ValueError, TypeError):
-                        parent_meta = {}
-                    if not isinstance(parent_meta, dict):
-                        parent_meta = {}
-                    child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
-                    root = parent_meta.get("correlation_root_id") or origin_message_id
-                    child_meta = json.dumps(
-                        {
-                            "correlation_id": origin_message_id,
-                            "correlation_root_id": root,
-                            "correlation_depth": child_depth,
-                            "edited_from": origin_message_id,
-                        }
-                    )
+                    child_meta = edit_child_metadata(raw_meta, origin_message_id=origin_message_id)
                     new_mid = MessageStore._edit_resubmit_message_id(
                         idempotency_key, channel_id, raw
                     )
