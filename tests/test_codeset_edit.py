@@ -739,8 +739,51 @@ def test_rename_split_pair_error_says_where_each_file_is_and_where_they_belong(
     with pytest.raises(WiringError) as err:
         codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
     message = str(err.value)
-    assert "the table is meals.csv while its policy is still diets.policy.toml" in message
-    assert "put the code set back as diets.csv and diets.policy.toml" in message
+    assert "the table is meals.csv and its policy diets.policy.toml" in message
+    assert "put the table back as diets.csv, and any policy as diets.policy.toml" in message
+
+
+def test_rename_reads_what_moved_when_interrupted_after_the_sidecar_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt that lands after the sidecar's replace finished moves both files back, not
+    the table alone."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+    fired: list[str] = []
+
+    def interrupt_after_sidecar(staged: Path, live: Path) -> None:
+        real(staged, live)
+        if staged.name == "diets.policy.toml" and not fired:
+            fired.append(staged.name)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(restricted_file, "replace_generated", interrupt_after_sidecar)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert fired == ["diets.policy.toml"]
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_interrupted_in_the_referent_write_moves_the_sidecar_back_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename's interrupt rollback (no reference left rewritten) puts table and policy back."""
+    from messagefoundry.config import impact
+
+    _with_policy(tmp_path, "diets")
+
+    def interrupt(_prepared: object) -> list[object]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(impact, "write_rename", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
 
 
 def test_rename_refuses_a_folder_at_the_target_sidecar_name(tmp_path: Path) -> None:
@@ -802,6 +845,25 @@ def test_remove_names_a_sidecar_it_could_not_delete(
     ):
         codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
     assert [p.name for p in _codesets(tmp_path).iterdir()] == ["diets.policy.toml"]
+
+
+def test_remove_interrupted_after_the_table_unlink_still_drops_the_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+
+    def interrupt_after_table(path: Path) -> None:
+        real(path)
+        if path.name == "diets.csv":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", interrupt_after_table)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert list(_codesets(tmp_path).iterdir()) == []
 
 
 def test_remove_missing_raises(tmp_path: Path) -> None:

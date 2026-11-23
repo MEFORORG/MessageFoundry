@@ -63,7 +63,8 @@ def _policy_detail(policy: UnmappedPolicy) -> dict[str, Any]:
 #: Run before a write to prove the file loads; the CLI passes the real loader. It receives the
 #: CANDIDATE ``.csv`` (the live file's name, in a private directory beside it, with the policy sidecar
 #: copied next to it) and raises on any problem, which leaves the live file untouched. A rename,
-#: whose bytes do not change, passes the source table in place, its sidecar already beside it.
+#: whose bytes do not change, passes the LIVE source table in place instead, ``.csv`` or ``.toml``,
+#: its sidecar already beside it, so a validator must only read the path it is given.
 Validate = Callable[[Path], None]
 
 
@@ -255,12 +256,10 @@ def rename_code_set(
         prepared = impact.prepare_rename(plan)
         try:
             had_sidecar = _move_with_sidecar(src, dest)
-        except WiringError as exc:
-            if src.exists():
-                raise
+        except _SplitPairError as exc:
             raise WiringError(
-                f"{exc}. No reference was rewritten, so they still name {old!r}: put the code "
-                f"set back as {src.name} and {_policy_sidecar_path(src).name} by hand"
+                f"{exc}. No reference was rewritten, so they still name {old!r}: put the table "
+                f"back as {src.name}, and any policy as {_policy_sidecar_path(src).name}, by hand"
             ) from exc
         # Where table and policy belong if the rename must be undone by hand.
         home = src.name + (f" and {_policy_sidecar_path(src).name}" if had_sidecar else "")
@@ -277,7 +276,9 @@ def rename_code_set(
                 _move_with_sidecar(dest, src)
             except (WiringError, OSError) as back:
                 # A split pair's own error (in ``back``) says where each file is.
-                where = f"left as {dest.name}" if dest.exists() else "left split"
+                where = (
+                    "left split" if isinstance(back, _SplitPairError) else f"left as {dest.name}"
+                )
                 raise WiringError(
                     f"{exc}. The code set was then {where}, because moving it back failed "
                     f"({back}), while its references still name {old!r}: put it back as {home} "
@@ -307,7 +308,7 @@ def rename_code_set(
                 _log.error(
                     "code set rename interrupted: moving the code set back failed (%s); its "
                     "references name %r, so put it back as %s by hand",
-                    back,
+                    type(back).__name__,
                     old,
                     home,
                 )
@@ -349,27 +350,26 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
         # graph yields no referrers.
         dangling = _code_set_referrers(config_dir, name)
         sidecar = _policy_sidecar_path(path)
-        has_sidecar = atomic_edit.is_file(sidecar, refused_error=WiringError)
-        with atomic_edit.refused_as(path, WiringError, "remove it"):
-            unlink_generated(path)
+        # Decided before the unlink: a second same-stem table (a duplicate the loader refuses)
+        # still reads the sidecar as its policy, so it is kept for that table.
+        drop_sidecar = atomic_edit.is_file(
+            sidecar, refused_error=WiringError
+        ) and not _other_table_exists(path)
+        try:
+            with atomic_edit.refused_as(path, WiringError, "remove it"):
+                unlink_generated(path)
+        except BaseException:
+            # An interrupt after the unlink: the sidecar still must not outlive its table.
+            if drop_sidecar and not path.exists():
+                try:
+                    _remove_orphan_sidecar(name, sidecar, dangling)
+                except WiringError as orphan:
+                    _log.error("%s", orphan)
+            raise
         # After the table, so a failure here is loud rather than a table silently stripped of its
-        # policy. Kept when a second same-stem table remains, since it still reads the sidecar.
-        if has_sidecar and _existing_path_or_none(codesets_dir, name) is None:
-            try:
-                with atomic_edit.refused_as(sidecar, WiringError, "remove it"):
-                    unlink_generated(sidecar)
-            except (WiringError, OSError) as exc:
-                still = (
-                    "; these still reference it: "
-                    + ", ".join(f"{r['referrer_kind']} {r['referrer']!r}" for r in dangling)
-                    if dangling
-                    else ""
-                )
-                raise WiringError(
-                    f"code set {name!r} was removed, but its policy sidecar {sidecar.name} was "
-                    f"not ({exc}); it now loads as a code set of its own, so remove it by hand"
-                    f"{still}"
-                ) from exc
+        # policy.
+        if drop_sidecar:
+            _remove_orphan_sidecar(name, sidecar, dangling)
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -562,38 +562,90 @@ def _existing_path_or_none(codesets_dir: Path, name: str) -> Path | None:
     return None
 
 
+class _SplitPairError(WiringError):
+    """A move and its move back both failed: the table, and any policy sidecar, are not where
+    their references read them. The message says where each file is."""
+
+
 def _move_with_sidecar(src: Path, dest: Path) -> bool:
     """Move table ``src`` to ``dest`` and its policy sidecar (#162), if any, beside it (BACKLOG
-    #5776), returning whether a sidecar moved. A sidecar move that fails or is interrupted moves the
-    table back, so the pair is never split; if that move back fails too, the error names where each
-    file is, and the caller says which name they belong under."""
+    #5776), returning whether a sidecar moved.
+
+    A failure or an interrupt at any point moves back whatever had moved, read from the files
+    rather than assumed, since an interrupt can land on either side of a replace. If that move back
+    fails too, a failure raises :class:`_SplitPairError` naming where each file is, and an
+    interrupt logs it; the caller says which name they belong under."""
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
     src_sidecar = _policy_sidecar_path(src)
     dest_sidecar = _policy_sidecar_path(dest)
     has_sidecar = atomic_edit.is_file(src_sidecar, refused_error=WiringError)
-    with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
-        replace_generated(src, dest)
-    if not has_sidecar:
-        return False
     try:
-        with atomic_edit.refused_as(src_sidecar, WiringError, f"rename it to {dest_sidecar.name}"):
-            replace_generated(src_sidecar, dest_sidecar)
+        with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
+            replace_generated(src, dest)
+        if has_sidecar:
+            with atomic_edit.refused_as(
+                src_sidecar, WiringError, f"rename it to {dest_sidecar.name}"
+            ):
+                replace_generated(src_sidecar, dest_sidecar)
     except BaseException as exc:
         try:
-            with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
-                replace_generated(dest, src)
+            if has_sidecar and dest_sidecar.exists() and not src_sidecar.exists():
+                with atomic_edit.refused_as(
+                    dest_sidecar, WiringError, f"rename it back to {src_sidecar.name}"
+                ):
+                    replace_generated(dest_sidecar, src_sidecar)
+            if dest.exists() and not src.exists():
+                with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
+                    replace_generated(dest, src)
         except (WiringError, OSError) as back:
-            split = (
-                f"the table is {dest.name} while its policy is still {src_sidecar.name}, because "
-                f"moving the table back failed ({back})"
-            )
+            table_at = src.name if src.exists() else dest.name
+            layout = f"the table is {table_at}"
+            if has_sidecar:
+                policy_at = src_sidecar.name if src_sidecar.exists() else dest_sidecar.name
+                layout += f" and its policy {policy_at}"
             if isinstance(exc, (WiringError, OSError)):
-                raise WiringError(f"{exc}; {split}") from exc
-            _log.error("code set move interrupted: %s", split)
+                raise _SplitPairError(f"{exc}; moving back failed ({back}), so {layout}") from exc
+            # File names and the error's type only: a log line carries no host path.
+            _log.error(
+                "code set move interrupted: moving back failed (%s), so %s",
+                type(back).__name__,
+                layout,
+            )
         raise
-    return True
+    return has_sidecar
+
+
+def _other_table_exists(path: Path) -> bool:
+    """Whether a second supported table of ``path``'s stem sits beside it."""
+    return any(
+        atomic_edit.is_file(path.with_suffix(ext), refused_error=WiringError)
+        for ext in _SUPPORTED_EXTS
+        if ext != path.suffix
+    )
+
+
+def _remove_orphan_sidecar(name: str, sidecar: Path, dangling: list[dict[str, str]]) -> None:
+    """Delete the policy sidecar of the removed code set ``name``; one that cannot be deleted
+    would load as a code set of its own, so that raises :class:`WiringError` naming it."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import unlink_generated
+
+    try:
+        with atomic_edit.refused_as(sidecar, WiringError, "remove it"):
+            unlink_generated(sidecar)
+    except (WiringError, OSError) as exc:
+        still = (
+            "; these still reference it: "
+            + ", ".join(f"{r['referrer_kind']} {r['referrer']!r}" for r in dangling)
+            if dangling
+            else ""
+        )
+        raise WiringError(
+            f"code set {name!r} was removed, but its policy sidecar {sidecar.name} was not "
+            f"({exc}); it now loads as a code set of its own, so remove it by hand{still}"
+        ) from exc
 
 
 def _load_all(codesets_dir: Path) -> dict[str, CodeSet]:
