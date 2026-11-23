@@ -1187,9 +1187,10 @@ function Test-TrueSeparatorIn([string]$Text) {
 # THE SPELLINGS IT REWRITES, each measured ALLOW from outside the primary, or from the primary where
 # the cwd decides, before this reading:
 #   * A GIT WORD THE OWNING-WORD SEARCH SKIPS. `\git` (posix) and a path-qualified `/usr/bin/git` or
-#     `C:/Program Files/.../git.exe` unquoted at command position, and on Windows `GIT` or `git.EXE`,
-#     are rewritten to `git` (`\git -C '<p>' -c user.name=$(git log -1) config <key>`; `cd <p> && git
-#     -C <o> log $(\git reset --hard)`).
+#     `C:/x/git.exe` unquoted at command position, and on Windows and macOS `GIT` or `git.EXE`, are
+#     rewritten to `git` (`\git -C '<p>' -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o>
+#     log $(\git reset --hard)`). A path with whitespace in it, which must be quoted to run (`&
+#     'C:\Program Files\Git\cmd\git.exe'`), is not rewritten.
 #   * A BACKTICK SUBSTITUTION (posix only; in PowerShell a backtick is the escape character), rewritten
 #     to `$( )`, which the rules already read as an inner invocation (`cd <p> && git -C <o> log
 #     `` `git reset --hard` ``; from the primary, `git -C <o> log `` `git config <key>` ``).
@@ -1208,7 +1209,10 @@ function Test-TrueSeparatorIn([string]$Text) {
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
 # body, a PowerShell `@' '@` here-string -- and no rewrite starts there, so a backticked command NAMED
-# in a single-quoted message or a data heredoc is not read as run. Inside DOUBLE quotes, and in an
+# in a single-quoted message or a data heredoc is not read as run. Known misreadings that make it read
+# such text as code, each a false deny (review round b16150a498): a heredoc delimiter holding a
+# character outside `\w` (`<<'END-X'`), a heredoc opened inside parentheses, and a PowerShell `@" "@`
+# here-string holding an odd number of quotes. Inside DOUBLE quotes, and in an
 # unquoted posix heredoc body, a posix backtick and a `$( )` do run, so they are rewritten there: `git
 # commit -m "see `git reset --hard`"` in the primary is refused, because bash runs that reset. A
 # backtick span holding an unpaired quote or a line break is not rewritten, since whether and where it
@@ -4025,8 +4029,10 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
 # OPEN. That is the opposite of the failure that got two earlier attempts at this file rejected: each
 # replaced matching with something NARROWER than the regex it displaced, and every place the
 # replacement was narrower became a hole. The narrowness that must survive here is pinned rather than
-# argued -- a backticked ORDINARY config key, and a backticked git inside a single- or double-quoted
-# commit message, all stay ALLOW.
+# argued -- a backticked ORDINARY config key, and a backticked git inside a single-quoted commit
+# message, stay ALLOW. The double-quoted message was pinned ALLOW too until BACKLOG #5655 step 3, and
+# is now pinned DENY on purpose: bash runs a backtick inside double quotes, and Get-AddedCommandReadings
+# reads it (tests/test_worktree_gate_control_plane.py).
 #
 # AND A `{` (review of BACKLOG #5643). A PowerShell script block opening directly on git, `& {git
 # ...}` or `. {git ...}`, had no recognised git token, so no rule saw it. Recognising the token is
