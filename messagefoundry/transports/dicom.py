@@ -482,13 +482,16 @@ class _Shape(NamedTuple):
     """One kind of log line that names a peer's value. ``head`` is matched at the start of the line,
     or found anywhere in it where ``anywhere`` is set; the value runs from there to ``tail``, the
     fixed text the line ends with, found from its last ``anchor``. A line whose end is not ``tail``
-    loses everything after its head. No pattern here can backtrack over the peer's text, so a long
-    value costs one pass, on whatever thread logged it."""
+    loses everything after its head. ``whole`` is for a line with more than one value: it stays as
+    it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
+    after its head. No pattern here can backtrack over the peer's text, so a long value costs one
+    pass, on whatever thread logged it."""
 
     head: re.Pattern[str]
     anchor: str | None = None
     tail: re.Pattern[str] | None = None
     anywhere: bool = False
+    whole: re.Pattern[str] | None = None
 
 
 #: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
@@ -529,8 +532,43 @@ _REFUSALS: tuple[_Shape, ...] = (
         re.compile(r"\. Please see <[^<>\n]*> for allowed values for each VR\."),
         anywhere=True,
     ),
+    # pydicom's Specific Character Set lines. The first names the value twice, its second copy
+    # patched from the first, so nothing after the head is fixed text.
+    _Shape(re.compile(r"Incorrect value for Specific Character Set '"), anywhere=True),
+    _Shape(
+        re.compile(r"Unknown encoding '"),
+        "' - using default encoding instead",
+        re.compile(r"' - using default encoding instead"),
+        anywhere=True,
+    ),
+    _Shape(
+        re.compile(
+            r"Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: "
+        ),
+        anywhere=True,
+    ),
+    # A DS or IS value, with the note pydicom adds to it when it raises rather than warns.
+    _Shape(
+        re.compile(r'Value "'),
+        '" is not valid for elements with a VR of ',
+        re.compile(
+            r'" is not valid for elements with a VR of (?:DS|IS)'
+            r"(?:\nSet reading_validation_mode to WARN or IGNORE to bypass)?"
+        ),
+        anywhere=True,
+    ),
 )
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
+    # An object's SOP class and transfer syntax, as the SCU found no accepted context for them.
+    "pynetdicom.association": (
+        _Shape(
+            re.compile(r"No presentation context for '"),
+            whole=re.compile(
+                r"No presentation context for '([^']*)' has been accepted by the peer"
+                r"(?: with '([^']*)' transfer syntax)? for the (?:SCU|SCP) role"
+            ),
+        ),
+    ),
     "pynetdicom.utils": (
         _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
     ),
@@ -587,6 +625,11 @@ def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
     if found is None:
         return None
     shape, head = found
+    if shape.whole is not None:
+        line = shape.whole.fullmatch(text)
+        if line is not None and all(_kept("", value) for value in line.groups() if value):
+            return None
+        return f"{text[: head.end()]}{_REDACTED}"
     rest = text[head.end() :]
     label = head.groupdict().get("label")
     if label is not None and _kept(label, rest):
@@ -608,7 +651,6 @@ _FILTERED_LOGGERS = (
     *_PEER_VALUE_LINES,
     "pydicom",
     "pynetdicom.acse",
-    "pynetdicom.association",
     "pynetdicom.dimse",
     "pynetdicom.dimse_messages",
     "pynetdicom.dimse_primitives",
@@ -625,10 +667,16 @@ _SHAPES_BY_LOGGER: dict[str, tuple[_Shape, ...]] = {
     name: (*_PEER_VALUE_LINES.get(name, ()), *_REFUSALS) for name in _FILTERED_LOGGERS
 }
 
-#: The start of the ``UserWarning`` pydicom's ``warn_and_log`` raises beside its log line, with the
-#: same value in it. It is ignored; the log line, redacted, still says what was wrong. Unignored, it
-#: goes to stderr, which the Windows service writes to a file.
-_PYDICOM_INVALID_VALUE_WARNING = r".*Invalid value for VR [A-Z]{2}: "
+#: The start of each ``UserWarning`` pydicom's ``warn_and_log`` raises beside a log line above, with
+#: the same value in it. Each is ignored; the log line, redacted, still says what was wrong.
+#: Unignored, it goes to stderr, which the Windows service writes to a file.
+_PYDICOM_VALUE_WARNINGS = (
+    r".*Invalid value for VR [A-Z]{2}: ",
+    r".*Incorrect value for Specific Character Set '",
+    r".*Unknown encoding '",
+    r".*Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: ",
+    r'.*Value ".*" is not valid for elements with a VR of ',
+)
 
 #: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
 #: sees on the thread then goes into it instead of the log.
@@ -777,7 +825,8 @@ def _redact_flagged_peer_values() -> None:
     idempotent."""
     for name in _FILTERED_LOGGERS:
         logging.getLogger(name).addFilter(_PEER_VALUE_FILTER)
-    warnings.filterwarnings("ignore", message=_PYDICOM_INVALID_VALUE_WARNING, category=UserWarning)
+    for message in _PYDICOM_VALUE_WARNINGS:
+        warnings.filterwarnings("ignore", message=message, category=UserWarning)
 
 
 _redact_flagged_peer_values()

@@ -717,9 +717,14 @@ def _formatted(records: list[logging.LogRecord]) -> list[str]:
     return [formatter.format(r) for r in records]
 
 
-def _associate_against(ac: bytes, caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+def _associate_against(
+    ac: bytes,
+    caplog: pytest.LogCaptureFixture,
+    then: Callable[[Any], None] | None = None,
+) -> list[logging.LogRecord]:
     """A pynetdicom SCU, as the engine's DICOM destination uses, asks a peer for an association and
-    gets ``ac`` back. Every record logged meanwhile is returned."""
+    gets ``ac`` back, and does ``then`` on it if it is established. Every record logged meanwhile is
+    returned."""
     from pynetdicom import AE
     from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
 
@@ -743,7 +748,11 @@ def _associate_against(ac: bytes, caplog: pytest.LogCaptureFixture) -> list[logg
         with caplog.at_level(logging.DEBUG):
             assoc = ae.associate("127.0.0.1", listener.getsockname()[1], ae_title="PLAINSCP")
             if assoc.is_established:
-                assoc.abort()
+                try:
+                    if then is not None:
+                        then(assoc)
+                finally:
+                    assoc.abort()
         peer.join(10.0)
     return list(caplog.records)
 
@@ -1143,6 +1152,195 @@ def test_a_value_ahead_of_another_shape_in_one_message_is_redacted() -> None:
     # The first head in the text decides, whichever order the shapes are listed in.
     message = f"Unable to decode '{_PLANTED}' using the ascii codec(s): {_REFUSAL}"
     assert _PLANTED not in _filtered("pynetdicom.events", message)
+
+
+# --- pydicom's character set and IS/DS lines, and "No presentation context" (#6637, item 7) --------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            f"Incorrect value for Specific Character Set '{_PLANTED}' - assuming 'ISO_IR {_PLANTED}'",
+            "Incorrect value for Specific Character Set '[redacted]",
+        ),
+        (
+            f"Unknown encoding '{_PLANTED}' - using default encoding instead",
+            "Unknown encoding '[redacted]' - using default encoding instead",
+        ),
+        (f"Unknown encoding '{_PLANTED}'", "Unknown encoding '[redacted]"),
+        (
+            f"Value 'ISO_IR 192' for Specific Character Set does not allow code extensions, "
+            f"ignoring: {_PLANTED}, {_PLANTED}",
+            "Value 'ISO_IR 192' for Specific Character Set does not allow code extensions, "
+            "ignoring: [redacted]",
+        ),
+        (
+            f'Value "{_PLANTED}" is not valid for elements with a VR of DS',
+            'Value "[redacted]" is not valid for elements with a VR of DS',
+        ),
+        (
+            f'Value "{_PLANTED}" is not valid for elements with a VR of IS\n'
+            "Set reading_validation_mode to WARN or IGNORE to bypass",
+            'Value "[redacted]" is not valid for elements with a VR of IS\n'
+            "Set reading_validation_mode to WARN or IGNORE to bypass",
+        ),
+        (
+            # A value can hold the line's own fixed text: none of it survives.
+            f'Value "x" is not valid for elements with a VR of DS {_PLANTED}" is not valid for '
+            "elements with a VR of DS",
+            'Value "[redacted]" is not valid for elements with a VR of DS',
+        ),
+    ],
+    ids=["incorrect", "unknown", "unknown-raised", "code-extension", "ds", "is-raised", "quoted"],
+)
+def test_pydicoms_character_set_and_number_lines_lose_the_value(
+    message: str, expected: str
+) -> None:
+    assert _filtered("pydicom", message) == expected
+
+
+def _pydicom_flags_planted_values() -> None:
+    """pydicom's own calls for each line, each with the planted value or one carrying it."""
+    from pydicom import charset, config
+    from pydicom.valuerep import DSdecimal
+
+    charset._warn_about_invalid_encoding(_PLANTED, "ISO_IR 192")
+    charset._warn_about_invalid_encoding(_PLANTED)
+    charset._handle_illegal_standalone_encodings(["ISO_IR 192", _PLANTED], ["utf8", "ascii"])
+    DSdecimal(_PLANTED_NAN, validation_mode=config.WARN)
+
+
+#: A DS the decimal parser takes and the DS check refuses: the case that reaches pydicom's own line.
+_PLANTED_NAN = "NaN"
+
+
+def test_pydicoms_character_set_lines_never_reach_the_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with _filter_removed(), caplog.at_level(logging.DEBUG):  # CONTROL
+            _pydicom_flags_planted_values()
+        unfiltered = _formatted(list(caplog.records))
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            _pydicom_flags_planted_values()
+        filtered = _formatted(list(caplog.records))
+    assert len([line for line in unfiltered if _PLANTED in line]) == 3, unfiltered
+    assert [line for line in unfiltered if f'Value "{_PLANTED_NAN}"' in line], unfiltered
+    assert len(filtered) == len(unfiltered)
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert not [line for line in filtered if f'Value "{_PLANTED_NAN}"' in line], filtered
+    assert 'pydicom: Value "[redacted]" is not valid for elements with a VR of DS' in filtered
+
+
+def test_pydicoms_warning_copies_of_those_lines_are_ignored() -> None:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")  # so only the filters installed next can ignore them
+        dicom_module._redact_flagged_peer_values()
+        _pydicom_flags_planted_values()
+    assert not [w for w in caught if _PLANTED in str(w.message)], [str(w.message) for w in caught]
+    assert not [w for w in caught if "is not valid for elements" in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, they carry the value
+        warnings.simplefilter("always")
+        _pydicom_flags_planted_values()
+    assert len([w for w in caught if _PLANTED in str(w.message)]) == 3
+
+
+def test_the_character_set_and_number_lines_are_still_pydicoms() -> None:
+    import inspect
+
+    from pydicom import charset, valuerep
+
+    source = inspect.getsource(charset)
+    assert "f\"Incorrect value for Specific Character Set '{encoding}' - \"" in source
+    assert "msg = f\"Unknown encoding '{encoding}' - using default encoding instead\"" in source
+    assert "f\"Value '{encodings[0]}' for Specific Character Set does not \"" in source
+    assert 'f"allow code extensions, ignoring: {' in source
+    number = inspect.getsource(valuerep)
+    assert "msg = f'Value \"{self}\" is not valid for elements with a VR of DS'" in number
+    assert "msg = f'Value \"{self}\" is not valid for elements with a VR of IS'" in number
+    assert 'msg += "\\nSet reading_validation_mode to WARN or IGNORE to bypass"' in number
+
+
+def _no_context_store(sop_class: str) -> Callable[[Any], None]:
+    """A C-STORE of a ``sop_class`` object on an association that accepted only Verification."""
+
+    def send(assoc: Any) -> None:
+        from pydicom import Dataset
+        from pydicom.dataset import FileMetaDataset
+        from pydicom.uid import ImplicitVRLittleEndian
+
+        ds = Dataset()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # pydicom flags the planted UID as it is set
+            ds.SOPClassUID = sop_class
+            ds.SOPInstanceUID = "1.2.826.0.1.3680043.2.1"
+        ds.file_meta = FileMetaDataset()
+        ds.file_meta.TransferSyntaxUID = ImplicitVRLittleEndian
+        with pytest.raises(ValueError, match="No presentation context"):
+            assoc.send_c_store(ds)
+
+    return send
+
+
+def test_the_no_presentation_context_line_loses_a_flagged_sop_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _filter_removed():  # CONTROL: the line names the planted class
+        unfiltered = _formatted(
+            _associate_against(_captured_ac(), caplog, _no_context_store(_PLANTED))
+        )
+    assert [line for line in unfiltered if f"No presentation context for '{_PLANTED}'" in line]
+    caplog.clear()
+    filtered = _formatted(_associate_against(_captured_ac(), caplog, _no_context_store(_PLANTED)))
+    assert filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert "pynetdicom.association: No presentation context for '[redacted]" in filtered
+
+
+def test_the_no_presentation_context_line_keeps_a_real_sop_class(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The CONTROL for the redaction: a conformant class is what an operator needs from this line.
+    lines = _formatted(
+        _associate_against(_captured_ac(), caplog, _no_context_store("1.2.840.10008.5.1.4.1.1.2"))
+    )
+    assert (
+        "pynetdicom.association: No presentation context for 'CT Image Storage' has been accepted "
+        "by the peer with 'Implicit VR Little Endian' transfer syntax for the SCU role"
+    ) in lines
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        f"No presentation context for 'CT Image Storage' has been accepted by the peer with "
+        f"'{_PLANTED}' transfer syntax for the SCU role",
+        f"No presentation context for '{_PLANTED}' has been accepted by the peer for the SCU role",
+        f"No presentation context for 'x' has been accepted by the peer {_PLANTED}",
+        f"No presentation context for 'it's {_PLANTED}' has been accepted by the peer for the "
+        "SCU role",
+    ],
+    ids=["syntax", "class", "unknown-end", "quote"],
+)
+def test_a_no_presentation_context_line_with_any_flagged_part_loses_it(message: str) -> None:
+    assert _filtered("pynetdicom.association", message) == (
+        "No presentation context for '[redacted]"
+    )
+
+
+def test_the_no_presentation_context_line_is_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import association
+
+    source = inspect.getsource(association.Association._get_valid_context)
+    assert "f\"No presentation context for '{ab_syntax.name}' has been \"" in source
+    assert 'f"accepted by the peer"' in source
+    assert "msg += f\" with '{tr_syntax.name}' transfer syntax\"" in source
+    assert 'msg += f" for the {role.upper()} role"' in source
 
 
 # --- A peer's DIMSE response that does not convert (vault BACKLOG #6637, item 4) -------------------

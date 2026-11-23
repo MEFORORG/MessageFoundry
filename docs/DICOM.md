@@ -316,8 +316,10 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
   refusal in an exception logged by any pynetdicom module that logs one, such as its DUL when a received PDU
   does not decode or its DIMSE provider when a received message does not convert, in the record's message
-  and in each link of its traceback's chain, and pydicom's invalid value refusal the same way; pydicom's invalid value
-  line; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
+  and in each link of its traceback's chain; pydicom's invalid value, Specific Character Set and VR IS and
+  DS lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
+  line, which keeps its SOP class and transfer syntax only when both are conformant or named in pydicom's
+  UID dictionary; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
   association acceptance and a DIMSE message; and the username and password of a user identity in the
   dump of an association request, received or sent, which are never kept. A dump field otherwise keeps at
   least these values: an empty one; a
@@ -333,17 +335,14 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   run in, and when a line they read changes, so a change to the lock has to re-read the shapes. They do not
   reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
   release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
-  yet, at least: a flagged UID that spells a name in
-  pydicom's UID dictionary, which a dump field keeps; pydicom's `Incorrect value for Specific Character Set`
-  and `Value "<value>" is not valid for elements with a VR of` lines, which name the value whole; and
-  pynetdicom's `No presentation context for` line, on `pynetdicom.association`, which the filter is not on,
-  and which names the SOP class of an object the SCU sends. The SCP reads each association
+  yet, at least: a flagged UID that spells a name in pydicom's UID dictionary, which a dump field and the
+  `No presentation context for` line keep. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
-  twice. pydicom also raises its invalid value line as a `UserWarning`, which would carry the value to stderr.
-  A warnings filter, installed at import and again at each SCP start, ignores that copy and no other pydicom
-  warning; a host that resets the process's
+  twice. pydicom also raises each of its lines above as a `UserWarning`, which would carry the value to
+  stderr. A warnings filter, installed at import and again at each SCP start, ignores those copies and no
+  other pydicom warning; a host that resets the process's
   warnings filters after that brings the copy back. The engine's
   own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
   otherwise.
