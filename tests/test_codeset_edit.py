@@ -698,6 +698,59 @@ def test_rename_moves_the_table_back_when_the_sidecar_move_fails(
     assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
 
 
+def test_rename_moves_the_table_back_when_the_sidecar_move_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C between the table move and the sidecar move does not leave the pair split."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def interrupt_sidecar(staged: Path, live: Path) -> None:
+        if staged.name.endswith(".policy.toml"):
+            raise KeyboardInterrupt
+        real(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", interrupt_sidecar)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_split_pair_error_says_where_each_file_is_and_where_they_belong(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar move and the table's move back both fail: the error names the layout and the
+    old name the unrewritten references still read."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def refuse_all_but_first(staged: Path, live: Path) -> None:
+        if staged.name == "diets.csv":
+            real(staged, live)
+            return
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(restricted_file, "replace_generated", refuse_all_but_first)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    message = str(err.value)
+    assert "the table is meals.csv while its policy is still diets.policy.toml" in message
+    assert "put the code set back as diets.csv and diets.policy.toml" in message
+
+
+def test_rename_refuses_a_folder_at_the_target_sidecar_name(tmp_path: Path) -> None:
+    _with_policy(tmp_path, "diets")
+    (_codesets(tmp_path) / "meals.policy.toml").mkdir()
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml already exists"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert (_codesets(tmp_path) / "diets.csv").is_file()
+
+
 # --- remove ------------------------------------------------------------------
 
 
@@ -716,6 +769,39 @@ def test_remove_deletes_the_policy_sidecar_with_the_table(tmp_path: Path) -> Non
     _with_policy(tmp_path, "diets")
     codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
     assert list(_codesets(tmp_path).iterdir()) == []
+
+
+def test_remove_keeps_a_sidecar_a_second_same_stem_table_still_reads(tmp_path: Path) -> None:
+    """Clearing a duplicate stem removes one table; the survivor keeps its policy."""
+    sidecar = _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    (cs_dir / "diets.toml").write_text('A = "Apple"\n', encoding="utf-8")
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "diets.toml"]
+    assert sidecar.is_file()
+    assert load_code_sets(cs_dir)["diets"].policy.kind.value == "passthrough"
+
+
+def test_remove_names_a_sidecar_it_could_not_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table is gone and the orphan sidecar is reported by name, as a WiringError."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+
+    def refuse_sidecar(path: Path) -> None:
+        if path.name.endswith(".policy.toml"):
+            raise OSError(5, "I/O error")
+        real(path)
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", refuse_sidecar)
+    with pytest.raises(
+        WiringError, match=r"was removed, but its policy sidecar diets\.policy\.toml"
+    ):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert [p.name for p in _codesets(tmp_path).iterdir()] == ["diets.policy.toml"]
 
 
 def test_remove_missing_raises(tmp_path: Path) -> None:
