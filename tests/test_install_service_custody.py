@@ -12,6 +12,7 @@ call sites are read by AST, since no test runs the script body.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -306,9 +307,8 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     facts = _preflight_facts(tmp_path)
     # Read by line: the call offsets count the file's own line endings, which read_text folds.
     text = _script_text()
-    check = _sole_call_on(facts, "Get-LockPathProblem", "-Path $CustodyDir")
-    assert "-AllowMissing" in check["text"] and "$SecretsDir" in check["text"], check["text"]
-    sharers = _sole_call_on(facts, "Get-OtherServiceNamingPath", "-Path $CustodyDir")
+    check = _sole_call_on(facts, "Get-CustodyDirProblem", "-Path $CustodyDir")
+    assert "$SecretsDir" in check["text"] and "-Named:$CustodyDirNamed" in check["text"], check
     creates = _sole_call_on(facts, "New-RestrictedDirectory", "-Path $CustodyDir")
     assert not [
         c
@@ -327,7 +327,7 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
         if c["name"] == "Invoke-Nssm" and "install" in c["text"]
     )
     host = _sole_call(facts, "Get-HostCustodyAccountProblem")
-    assert host["start"] < check["start"] < sharers["start"] < nssm
+    assert host["start"] < check["start"] < nssm
     assert creates["start"] < registered < secrets_lock["start"] < lock["start"] < named["start"]
     # Each act is inside an `if ($HostCustody)` block.
     lines = text.splitlines()
@@ -342,6 +342,20 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     flat = " ".join(text.split())
     refusal = flat.index('throw ("Could not name the custody directory')
     assert "Disable-RefusedService" in flat[refusal : refusal + 600], flat[refusal : refusal + 600]
+    # Both custody refusals after registration remove only a directory this run made, and ask for
+    # a re-run; neither tells anyone to add the variable by hand or to remove a directory.
+    removals = [
+        c
+        for c in facts["commands"]
+        if c["name"] == "Remove-CustodyDirMadeHere" and c["start"] > registered
+    ]
+    assert len(removals) == 2, removals
+    assert all("-MadeHere:$CustodyDirMadeHere" in c["text"] for c in removals), removals
+    naming = flat[refusal : refusal + 800]
+    assert "Re-run the installer" in naming, naming
+    for gone in ("by hand", "re-enable the service", "remove the empty directory"):
+        assert gone not in naming, gone
+    assert "remove the empty directory" not in flat
     assert 'Write-Warning ("Could not name the custody directory' not in flat
 
 
@@ -364,18 +378,78 @@ def test_the_uninstaller_names_the_custody_directory_and_removes_its_grant(
 
 
 def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Path) -> None:
-    """The notice names both key files, says master.key keeps its own entry for the account
-    whatever happens to the directory's, and warns that a reinstall refuses the kept directory.
-    The control: with no custody directory, none of it is printed."""
+    """The notice names each key file the directory holds, and only those, says each keeps its own
+    entry for the account, and warns that a reinstall refuses the kept directory. With no account
+    read it does not print an empty name. With no custody directory, none of it is printed."""
     from tests.test_service_install_manifest import _FULL_FACTS, _notice
 
-    flat = " ".join(_notice(tmp_path, _FULL_FACTS).split())
+    both = {**_FULL_FACTS, "CustodyFiles": ["master.key", "handoff.key"]}
+    flat = " ".join(_notice(tmp_path, both).split())
     for needed in (
-        "master.key",
-        "handoff.key",
-        "master.key keeps its own entry for 'NT SERVICE\\MessageFoundry'",
+        "master.key holds the store's key",
+        "handoff.key holds the store's key",
+        "It keeps its own entry for 'NT SERVICE\\MessageFoundry'",
         "A reinstall refuses this directory",
+        "Reinstalling over a kept custody directory",
     ):
         assert needed in flat, (needed, flat)
+    handoff_only = " ".join(
+        _notice(tmp_path, {**_FULL_FACTS, "CustodyFiles": ["handoff.key"]}).split()
+    )
+    assert "handoff.key holds" in handoff_only and "master.key" not in handoff_only, handoff_only
+    nobody = " ".join(
+        _notice(tmp_path, {**both, "ServiceAccount": "", "ServiceAccountSid": ""}).split()
+    )
+    assert "entry for ''" not in nobody and "the account the service ran as" in nobody, nobody
     without = " ".join(_notice(tmp_path, {**_FULL_FACTS, "CustodyDir": ""}).split())
     assert "handoff.key" not in without and "Custody" not in without, without
+
+
+@_windows_only
+def test_the_custody_directory_check_accepts_a_named_one_and_never_says_remove(
+    tmp_path: Path,
+) -> None:
+    """Get-CustodyDirProblem: a re-run over a service whose environment names the directory, with
+    an owner each install sets (here this account, which an unelevated test can own), accepts it;
+    the same directory the service does not name is refused without telling anyone to remove it.
+    Remove-CustodyDirMadeHere removes only a directory this run made that holds nothing."""
+    assert _SCRIPT is not None
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    made = tmp_path / "made"
+    made.mkdir()
+    full = tmp_path / "full"
+    full.mkdir()
+    (full / "master.key").write_bytes(b"k")
+    other = tmp_path / "other"
+    other.mkdir()
+    body = rf"""
+  $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+  [pscustomobject]@{{
+    named = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -Named -AcceptedOwners @($mySid))
+    unnamed = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -AcceptedOwners @($mySid))
+    owner = [string](Get-CustodyDirProblem -Path {_psq(str(kept))} -ServiceName 'NoSuchSvc-w7' -Named)
+    made = [string](Remove-CustodyDirMadeHere -Path {_psq(str(made))} -MadeHere)
+    full = [string](Remove-CustodyDirMadeHere -Path {_psq(str(full))} -MadeHere)
+    other = [string](Remove-CustodyDirMadeHere -Path {_psq(str(other))})
+  }} | ConvertTo-Json -Compress
+"""
+    names = [
+        "Get-CustodyDirProblem",
+        "Remove-CustodyDirMadeHere",
+        "Get-LockPathProblem",
+        "Get-ReparsePointAncestor",
+        "Get-OtherServiceNamingPath",
+        "ConvertTo-NormalPath",
+        "ConvertTo-EngineStripped",
+        "Get-EnvironmentListValue",
+        "Test-EnvironmentEntryNames",
+    ]
+    got = json.loads(_ok(_extract(_SCRIPT, names, body), tmp_path).strip().splitlines()[-1])
+    assert got["named"] == "", got
+    assert "does not name it" in got["unnamed"] and "do not delete" in got["unnamed"], got
+    assert not re.search(r"\bremov", got["unnamed"], re.IGNORECASE), got
+    assert "owner" in got["owner"], got  # the control: this account is not an install's owner
+    assert not made.exists() and "was removed" in got["made"], got
+    assert (full / "master.key").exists() and got["full"] == "", got
+    assert other.exists() and got["other"] == "", got

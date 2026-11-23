@@ -291,6 +291,15 @@ accounts no entry. While the variable is set and neither file is there, a key fi
 directory or beside a SQLite store refuses a read and a mint, rather than being taken for no key at
 all, so a mint run without the variable does not lead to a second key.
 
+**Reinstalling over a kept custody directory.** The install script refuses an existing custody
+directory the service does not name, as after an uninstall, and it never removes one that holds
+anything: `master.key` or `handoff.key` there may be the only copy of a store's key on this host,
+so do not delete either. To go on, re-run the install script with `-CustodyDir` naming a new
+folder. Then, with the service stopped, move each key file from the kept directory into the new
+one as an administrator, on the same volume so it keeps its own access list, and start the
+service. The same move applies to a key file left in a custody directory the service named before
+a `-CustodyDir` change.
+
 **Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
 to the same path, so the handoff lands where the service looks:
 
@@ -1286,7 +1295,7 @@ list below says what it covers.
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
 | The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
-| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. `master.key` keeps its own entry for the account, which the directory's removal does not touch. A reinstall refuses the kept directory while the new service does not name it | Keep the files while the store is kept. `-RemoveAccountAces` removes the directory's entry. To reinstall, move the key files out as an administrator, on the same volume, remove the directory, re-run the installer, and move them back |
+| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. Each file carries its own access-control entry for the account, and `-RemoveAccountAces` takes the account's entry off the directory only, not off the files. A reinstall refuses the kept directory while the new service does not name it | Keep the directory and its files while the store is kept; never delete them. `-RemoveAccountAces` removes the directory's entry. To reinstall, see [Reinstalling over a kept custody directory](#the-custody-directory-under-the-host-key-provider) |
 | The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |

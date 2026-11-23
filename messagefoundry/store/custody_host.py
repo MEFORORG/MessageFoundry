@@ -286,32 +286,38 @@ def foreign_custody_refusal(
     the blob minted for it. A directory setting that is not an absolute path is passed over here,
     and the directories the other setting names are still looked in.
 
-    The way on names each file, and a step that clears the refusal whatever the variables say:
-    moving the file out of the directories this check reads. A new custody directory would not,
-    since the secrets directory and the data directory are read whatever names it."""
+    The way on never changes a file it found (PR 2804 fifth hold; Manager ruling 2026-11-22):
+    :data:`_LEAVE_KEY_FILES_STEP`, then :func:`keep_the_key_step`."""
     environ = os.environ if environ is None else environ
     found = _key_files_outside(settings, None, environ)
     if not found:
         return None
-    named = " and ".join(str(p) for p in found)
+    # One clause per file, so two files in two directories each name their own.
+    named = "; ".join(f"{p.name} in {p.parent}" for p in found)
     return (
-        f"{named} is there, but [store].key_provider is "
+        f"host custody found ({named}), but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, keep a copy of each key setting's value first, somewhere "
         "as protected as where it is now, since it may be the only copy of a store key, and then "
         "set [store].key_provider = 'host' and remove every other store key setting, with "
         "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
-        f"whether the blob holds this store's key, so it leaves the file in place. {_MOVE_OUT_STEP}"
+        "whether the blob holds this store's key, so it leaves the file in place. "
+        f"{_LEAVE_KEY_FILES_STEP}. {keep_the_key_step(settings, new_store=False, environ=environ)}"
     )
 
 
-#: The step that clears :func:`foreign_custody_refusal` when the file holds no key this store
-#: needs (Manager decision 2026-11-22 on vault BACKLOG #3411). A move, never a delete: the file
-#: may be another store's only key.
-_MOVE_OUT_STEP = (
-    "If it holds no key this store needs, move it as an administrator out of that directory, to a "
-    "folder only administrators can read on the same volume so it keeps its own access list, and "
-    "start again; it may be another store's only key, so keep it"
+#: The way on from :func:`foreign_custody_refusal` when a file it found is not this store's own,
+#: stated once (Manager ruling 2026-11-22 on vault BACKLOG #3411). It changes no file it found:
+#: each may be another store's only key. Platform-neutral.
+_LEAVE_KEY_FILES_STEP = (
+    "Each file named here may be another store's only key: leave it where it is. To go on, run "
+    "this store from places that hold neither master.key nor handoff.key. For a file beside the "
+    "store's database, with the engine stopped, copy the database file and any -wal and -shm file "
+    "beside it into a new directory that holds neither, and point the store at the copy by its "
+    "absolute path, with --db or [store].path, here and wherever the service names it. For a file "
+    "in the directory MEFOR_CUSTODY_DIRECTORY or MEFOR_SECRETS_DIRECTORY names, set that variable, "
+    "here and in the service's environment, to a new directory, and copy into it every file the "
+    "old one holds other than master.key and handoff.key"
 )
 
 
@@ -668,18 +674,24 @@ def _left_outside_the_custody_directory(
     """Why a read or a mint that found neither file in ``directory``, the custody directory
     ``MEFOR_CUSTODY_DIRECTORY`` names, must not go on as if no key was minted, or ``None``: a host
     file or a handoff sits in another directory :func:`_key_file_directories` names, where a mint
-    run without that variable writes it. A second key would not open a store the first one made."""
+    run with other variables set wrote it. A second key would not open a store the first one made.
+
+    Read only while ``MEFOR_CUSTODY_DIRECTORY`` is set. With only ``MEFOR_SECRETS_DIRECTORY`` set,
+    a file beside the store is not read here: :func:`keep_the_key_step`'s way on (PR 2804 fifth
+    hold, item 4) is a new secrets directory and a new SQLite path, which may sit beside the key
+    file it leaves in place, and reading there would refuse that way on."""
     environ = os.environ if environ is None else environ
     if _directory_variable(environ) != CUSTODY_DIRECTORY_VARIABLE:
-        return None  # without it the provider reads where it did before the variable existed
+        return None
     found = _key_files_outside(settings, directory, environ)
     if not found:
         return None
+    named = "; ".join(f"{p.name} in {p.parent}" for p in found)
     return (
         f"no host blob or handoff is in the custody directory {directory}, which "
-        f"{CUSTODY_DIRECTORY_VARIABLE} names, but {' and '.join(str(p) for p in found)} is in a "
-        f"directory this provider reads only while {CUSTODY_DIRECTORY_VARIABLE} is unset. If it "
-        f"holds this store's key, move it into {directory} as an administrator, on the same "
+        f"{CUSTODY_DIRECTORY_VARIABLE} names, but host custody was found elsewhere "
+        f"({named}), where a mint run with other variables writes it. If one holds this store's "
+        f"key, move that file into {directory} with an account that may write there, on the same "
         "volume so it keeps its own access list, and try again; a key minted now would not open "
         "a store that key made"
     )

@@ -308,30 +308,30 @@ def test_a_key_file_left_in_the_secrets_directory_is_not_taken_for_no_key(tmp_pa
     secrets = _own_custody_directory(tmp_path / "secrets")
     (secrets / "handoff.key").write_bytes(b"not read")
     environ = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
-    with pytest.raises(HostCustodyRefused, match="move it into") as refused:
+    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
         load_host_custody(_settings(tmp_path), enforcing=True, environ=environ)
     assert not isinstance(refused.value, HostCustodyMissing)
-    assert str(secrets / "handoff.key") in str(refused.value)
+    assert f"handoff.key in {secrets}" in str(refused.value)
     # The control: without the variable the secrets directory is the custody directory, and the
     # same file is read there (and refused as no handoff).
     with pytest.raises(HostCustodyRefused) as read:
         load_host_custody(
             _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
         )
-    assert "move it into" not in str(read.value)
+    assert "move that file into" not in str(read.value)
     # With no secrets directory, beside a SQLite store, where a mint with neither variable writes.
     (secrets / "handoff.key").unlink()
     beside = tmp_path / "handoff.key"
     beside.write_bytes(b"not read")
-    with pytest.raises(HostCustodyRefused, match="move it into") as refused:
+    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
         load_host_custody(
             _settings(tmp_path),
             enforcing=True,
             environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
         )
-    assert str(beside) in str(refused.value)
+    assert f"{beside.name} in {beside.parent}" in str(refused.value)
     # A mint is stopped the same way, before anything is minted.
-    with pytest.raises(HostCustodyRefused, match="move it into"):
+    with pytest.raises(HostCustodyRefused, match="move that file into"):
         mint_target(
             _settings(tmp_path),
             service_account=None,
@@ -365,27 +365,88 @@ def test_a_host_blob_anywhere_the_host_provider_reads_refuses_every_other_key_pr
         assert foreign_custody_refusal(settings, environ=unusable) is not None
 
 
-@pytest.mark.parametrize("secrets_setting", ["absolute", "relative"])
-def test_a_file_beside_the_store_refuses_another_provider_until_it_is_moved_out(
-    tmp_path: Path, secrets_setting: str
+def test_a_file_beside_the_store_refuses_another_provider_and_the_way_on_leaves_it(
+    tmp_path: Path,
 ) -> None:
     """A host mint with neither variable writes beside the store, so a file there refuses another
-    provider whatever is set; a MEFOR_SECRETS_DIRECTORY that is not an absolute path counts as
-    unset. The refusal names the file, and moving it out, its way on, clears it."""
+    provider whatever is set. The refusal names the file, tells nobody to change it, and its way
+    on, a copy of the database in a directory that holds no key file, clears it with the file
+    still where it was."""
     secrets = _own_custody_directory(tmp_path / "secrets")
     beside = tmp_path / "master.key"
     beside.write_bytes(b"not read")
     settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
     environ = {
-        "MEFOR_SECRETS_DIRECTORY": str(secrets) if secrets_setting == "absolute" else "secrets",
+        "MEFOR_SECRETS_DIRECTORY": str(secrets),
         "MEFOR_CUSTODY_DIRECTORY": str(_own_custody_directory(tmp_path / "custody")),
     }
     refusal = foreign_custody_refusal(settings, environ=environ)
-    assert refusal is not None and str(beside) in refusal, refusal
-    assert "move it as an administrator out of that directory" in refusal, refusal
-    aside = _own_custody_directory(tmp_path / "aside")
-    beside.rename(aside / beside.name)
-    assert foreign_custody_refusal(settings, environ=environ) is None
+    assert refusal is not None and f"master.key in {tmp_path}" in refusal, refusal
+    assert "leave it where it is" in refusal, refusal
+    assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
+    # Following it: the store's database copied into a new directory, and the store pointed there.
+    copied = _own_custody_directory(tmp_path / "copied")
+    moved_store = settings.model_copy(update={"path": str(copied / "store.db")})
+    assert foreign_custody_refusal(moved_store, environ=environ) is None
+    assert beside.exists()
+
+
+def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """build_store_cipher and resolve_active_key replace a refusal they did not see recorded with a
+    fixed text (BACKLOG #4882), so resolve_key_provider records this one: the file it names and
+    the way on reach the operator through them too."""
+    from messagefoundry.store.base import build_store_cipher, resolve_active_key
+
+    (tmp_path / "master.key").write_bytes(b"not read")
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file="k.bin")
+    for seam in (build_store_cipher, resolve_active_key):
+        with pytest.raises(KeyProviderError) as refused:
+            seam(settings)
+        text = str(refused.value)
+        assert f"master.key in {tmp_path}" in text, (seam.__name__, text)
+        assert "leave it where it is" in text, (seam.__name__, text)
+
+
+def test_a_relative_secrets_variable_counts_as_unset_for_the_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A MEFOR_SECRETS_DIRECTORY that is not an absolute path names no directory to search, even
+    one that exists relative to the working directory and holds a key file. The control: the same
+    directory named absolutely is searched."""
+    monkeypatch.chdir(tmp_path)
+    relative = _own_custody_directory(tmp_path / "rel")
+    (relative / "master.key").write_bytes(b"not read")
+    data = _own_custody_directory(tmp_path / "data")
+    settings = _settings(data, key_provider="auto", encryption_key_file="k.bin")
+    assert foreign_custody_refusal(settings, environ={"MEFOR_SECRETS_DIRECTORY": "rel"}) is None
+    named = foreign_custody_refusal(settings, environ={"MEFOR_SECRETS_DIRECTORY": str(relative)})
+    assert named is not None and str(relative) in named, named
+
+
+def test_the_left_behind_check_reads_beside_the_store_with_both_variables_set(
+    tmp_path: Path,
+) -> None:
+    """Under the host provider with both variables set, the installer's environment, a key file
+    beside the store refuses a read and a mint rather than reading as no key. With only
+    MEFOR_SECRETS_DIRECTORY set it is not read there, so the PR 2804 fifth hold's way on, a new
+    secrets directory and a new SQLite path beside the old key, still goes ahead."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    beside = tmp_path / "handoff.key"
+    beside.write_bytes(b"not read")
+    both = {"MEFOR_CUSTODY_DIRECTORY": str(custody_dir), "MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    with pytest.raises(HostCustodyRefused, match="move that file into") as refused:
+        load_host_custody(_settings(tmp_path), enforcing=True, environ=both)
+    assert not isinstance(refused.value, HostCustodyMissing)
+    assert f"handoff.key in {tmp_path}" in str(refused.value), refused.value
+    with pytest.raises(HostCustodyRefused, match="move that file into"):
+        mint_target(_settings(tmp_path), service_account=None, enforcing=True, environ=both)
+    with pytest.raises(HostCustodyMissing):
+        load_host_custody(
+            _settings(tmp_path), enforcing=True, environ={"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+        )
 
 
 def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> None:
@@ -497,13 +558,11 @@ async def test_a_host_blob_refuses_every_other_key_provider(tmp_path: Path, name
     condition = low.index("if it holds this store's key")
     assert condition < low.index(keep), refusal
     assert ". " not in low[condition : low.index(_KEY_SETTINGS_OUT)], refusal
-    # The one change it may advise beside the settings is the move that clears it, which keeps
-    # the file (Manager decision 2026-11-22, vault BACKLOG #3411): a new custody directory would
-    # not clear it, since this check reads the secrets and data directories whatever is set.
-    allowed = (_KEY_SETTINGS_OUT, custody_host._MOVE_OUT_STEP)
-    assert not _advises_changing(refusal, allowed=allowed), refusal
-    assert custody_host._MOVE_OUT_STEP in refusal, refusal
-    assert custody_host.keep_the_key_step(settings, new_store=False) not in refusal, refusal
+    assert not _advises_changing(refusal, allowed=(_KEY_SETTINGS_OUT,)), refusal
+    assert custody_host.keep_the_key_step(settings, new_store=False) in refusal, refusal
+    # The file is left in place, and the way on runs the store from somewhere else (Manager
+    # ruling 2026-11-22, vault BACKLOG #3411).
+    assert custody_host._LEAVE_KEY_FILES_STEP in refusal, refusal
     assert "mints this store's key" not in refusal, refusal  # only the host provider mints
     with pytest.raises(HostCustodyRefused, match=name):
         await open_store(settings, create=True)
@@ -2255,7 +2314,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         (fallback, "run with the custody directory that holds the store's host blob"),
         ("which names the way on",),
         (fallback,),
-        ("If it holds no key this store needs, move it", "set [store].key_provider = 'host'"),
+        (fallback, "set [store].key_provider = 'host'", "leave it where it is"),
         (fallback, "leaves it in place"),
         ("Run the command again with that file in place",),
         (fallback, "This run minted it and nothing was written under it"),
@@ -2270,7 +2329,7 @@ def test_no_keep_the_key_text_advises_changing_what_exists(
         if _advises_changing(
             text,
             allowed=(
-                (_KEY_SETTINGS_OUT, custody_host._MOVE_OUT_STEP)
+                (_KEY_SETTINGS_OUT,)
                 if text is foreign
                 else (cli._REMOVE_THE_VOID_KEY,)
                 if text is held

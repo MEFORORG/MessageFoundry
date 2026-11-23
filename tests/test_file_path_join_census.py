@@ -1281,10 +1281,11 @@ SCRIPT_SITES: dict[str, Site] = {
         1, OPERATOR, "A fixed name under the install directory."
     ),
     "scripts/service/uninstall-service.ps1": Site(
-        7,
+        8,
         OPERATOR,
         "Fixed names, and a folder named from a fresh GUID, under the Windows temp folder or a "
-        "parent the tests pass, and registry keys named after the service's images.",
+        "parent the tests pass, registry keys named after the service's images, and the two "
+        "fixed custody file names under the custody directory the registration names.",
     ),
 }
 
