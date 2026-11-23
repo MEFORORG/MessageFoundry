@@ -610,18 +610,19 @@ def test_a_bash_payload_on_an_earlier_line_does_not_hide_a_later_lines_payload(
     assert "LINKED WORKTREE" in reason, reason
 
 
-def test_known_gap_an_inner_config_word_ahead_of_the_disarm(rig: SimpleNamespace) -> None:
-    # Known gap, ALLOW on origin/main f0e49f45c5c too: the disarm match starts at the `config` inside
-    # the closed `$( )`, so rule 3c's added reading reads only the inner invocation. A fix flips this.
+def test_an_inner_config_word_ahead_of_the_disarm_is_denied(rig: SimpleNamespace) -> None:
+    # Was a known gap, ALLOW on origin/main 1983d8eb79a: the disarm match starts at the `config` inside
+    # the closed `$( )`, so rule 3c's added reading reads only the inner invocation. Flipped by the hook's
+    # Get-AddedCommandReadings, whose outer reading replaces the `$( )` (BACKLOG #5655 step 3).
     command = _fmt(rig, "git -C '{p}' -c user.name=$(git config user.name) config {k}")
-    assert _allowed(rig, command, rig.outside)
+    assert "SHARED git configur" in _reason(rig, command, rig.outside)
 
 
-def test_known_gap_a_separator_inside_a_closed_substitution(rig: SimpleNamespace) -> None:
-    # Known gap, ALLOW on origin/main f0e49f45c5c too: the `|` inside the closed `$( )` stops rule 3c's
-    # owning-word reading, so the outer quoted `-C` is not read. A fix flips this row.
+def test_a_separator_inside_a_closed_substitution_is_denied(rig: SimpleNamespace) -> None:
+    # Was a known gap, ALLOW on origin/main 1983d8eb79a: the `|` inside the closed `$( )` stops rule
+    # 3c's owning-word reading, so the outer quoted `-C` is not read. Flipped the same way.
     command = _fmt(rig, "git -C '{p}' -c user.name=$(git log -1 | head -1) config {k}")
-    assert _allowed(rig, command, rig.outside)
+    assert "SHARED git configur" in _reason(rig, command, rig.outside)
 
 
 def test_a_long_run_of_glued_pairs_costs_about_what_a_short_line_does(rig: SimpleNamespace) -> None:

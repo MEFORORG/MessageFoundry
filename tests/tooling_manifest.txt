@@ -285,6 +285,7 @@ tests/test_zizmor_config_hygiene.py
 tests/test_worktree_gate_per_invocation.py
 tests/test_cla_precheck.py
 tests/test_worktree_gate_quoted_and_every_invocation.py
+tests/test_worktree_gate_added_command_readings.py
 tests/test_coord_fleet_live_fence.py
 tests/test_coord_seat_record_facts.py
 tests/test_dashboard_collect_metrics.py

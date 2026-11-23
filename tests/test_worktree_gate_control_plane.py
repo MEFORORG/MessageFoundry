@@ -920,7 +920,19 @@ def test_a_backticked_ORDINARY_config_key_is_still_allowed(repo: SimpleNamespace
     )
 
 
-@pytest.mark.parametrize("quote", ["'", '"'])
+def test_a_backticked_git_inside_a_DOUBLE_quoted_commit_message_is_denied(
+    repo: SimpleNamespace,
+) -> None:
+    """This row was the double-quote half of the control below, and moved to DENY under BACKLOG #5655
+    step 3 on purpose: bash runs a backtick inside double quotes, so this command really resets the
+    primary before git commit runs. The hook's Get-AddedCommandReadings reads it. The single-quoted
+    row stays allowed, because bash runs nothing there."""
+    command = f'git commit -m "never run {_backticked("git reset --hard")} here"'
+    reason = assert_denied(run_gate(shell(command, cwd=repo.primary), repo.repos))
+    assert "SHARED PRIMARY" in reason, reason
+
+
+@pytest.mark.parametrize("quote", ["'"])
 def test_a_backticked_git_inside_a_QUOTED_commit_message_is_still_allowed(
     repo: SimpleNamespace, quote: str
 ) -> None:

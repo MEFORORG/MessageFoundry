@@ -962,8 +962,9 @@ function Get-ScanRawIndexMap($Seg) {
 # Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
 # `$gitInvocation` misses, such as `GIT` (an unquoted `.exe` suffix is read in any case since BACKLOG
 # #5655 step 3; a quoted program path ending `git.EXE` is still not, Remove-QuotedSpans says why).
-# At least these are ALLOWED from the primary (measured 2026-11-18): `GIT reset --hard`
-# and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
+# On Windows, Get-AddedCommandReadings spells an unquoted `GIT` at command position `git`, so `GIT
+# reset --hard` and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the PowerShell
+# tool on 2026-11-18, are refused; on Linux `GIT` is not git and is not rewritten. Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
@@ -974,22 +975,23 @@ function Get-ScanRawIndexMap($Seg) {
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
 # `git -C '<p>' --git-dir=<rel> config <key>` are allowed there (fail-open, f0e49f45c5c has it too).
 # Also: a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log $(git reset
-# --hard)`) where Get-InvocationReading's bracket reading reads nothing. At least: two chdirs, a
-# relative chdir after an earlier line's, and any closed bracket between the chdir and the open one,
-# since the chdir follower gives up on any bracket in its text (`cd <p>`, then `echo $(date); git -C
-# <o> log $(git reset --hard)`, is allowed from outside); a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
+# --hard)`) where Get-InvocationReading's bracket reading reads nothing. Get-AddedCommandReadings'
+# hoisted reading refuses the measured examples of this, at least two chdirs (`cd <p> && cd sub &&
+# git -C <o> log $(git reset --hard)`) and a closed bracket between the chdir and the open one (`cd
+# <p>`, then `echo $(date); git -C <o> log $(git reset --hard)`), each ALLOWED on 2026-11-18; it reads
+# only a one-line `$( )` or backtick span with no bracket inside, so a nested one is still read only
+# here. Still allowed, at least: a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
 # because the payload's extraction stops at the first joint, as it did at f0e49f45c5c; and A GIT BASH
 # DRIVE SPELLING, `/c/<primary>`, which no reading maps to the primary, so `git -C /c/<primary> reset
-# --hard` is allowed (fail-open, f0e49f45c5c has it too). And a `config` disarm whose first `config`
-# word sits in a closed `$( )` (`git -C '<p>' -c user.name=$(git config user.name) config <key>`):
-# rule 3c's added reading reads only the inner invocation, so it is allowed from outside (fail-open,
-# f0e49f45c5c has it too). And, at least, these fail-opens of rule 3c's owning-word reading, each
-# measured ALLOW from outside on 2026-11-18. A repository token in the owning window is not
-# promoted when the first chain's window starts inside the `$( )`: `git --git-dir='<p>/.git' -c
-# user.name=$( git log -1) config <key>` and `GIT_DIR='<p>/.git' git -c user.name=$( git log -1)
-# config <key>`. And the owning-word search skips a path-qualified or escaped outer git:
-# `/usr/bin/git -C '<p>' -c user.name=$(git log -1) config <key>` and `\git -C '<p>' -c
-# user.name=$(git log -1) config <key>`.
+# --hard` is allowed (fail-open, f0e49f45c5c has it too).
+# THESE WERE ALLOWED FROM OUTSIDE ON 2026-11-18 AND ARE REFUSED BY GET-ADDEDCOMMANDREADINGS' REWRITES
+# (BACKLOG #5655 step 3), named so a reader of the old list does not take them as open: a `config`
+# disarm whose first `config` word sits in a closed `$( )` (`git -C '<p>' -c user.name=$(git config
+# user.name) config <key>`); a repository token in the owning window behind such a `-c`
+# (`git --git-dir='<p>/.git' -c user.name=$( git log -1) config <key>`, and the same behind
+# `GIT_DIR='<p>/.git'`); and a path-qualified or escaped outer git (`/usr/bin/git -C '<p>' -c
+# user.name=$(git log -1) config <key>`, the same with `\git`). Rule 3c's own readings still miss each
+# of them; the rewrites hand the rules a spelling they read.
 #
 # KNOWN FALSE DENIES OF THESE READINGS, left open, at least these. Each one with an example command
 # here is pinned as a DENY row in tests/test_worktree_gate_quoted_and_every_invocation.py,
@@ -1174,6 +1176,174 @@ function Get-GitWordBefore([string]$Scan, [int]$At) {
 # 3d's spelling of the same test, which it states the reason for.
 function Test-TrueSeparatorIn([string]$Text) {
     $Text -match '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))'
+}
+
+# THE ADDED WHOLE-COMMAND READINGS OF RULES 3c, 3d, 3 AND 3b (BACKLOG #5655 step 3). Each string this
+# returns is judged by those rules in turn, the command as given FIRST and unchanged, so a reading here
+# can only add a deny: the rules exit on a deny and fall through on an allow, and the first pass is the
+# one the gate made before this existed. A later string is returned only where it differs.
+#
+# THE SPELLINGS IT REWRITES, each measured ALLOW from outside the primary, or from the primary where
+# the cwd decides, before this reading:
+#   * A GIT WORD THE OWNING-WORD SEARCH SKIPS. `\git` (posix) and a path-qualified `/usr/bin/git` or
+#     `C:/Program Files/.../git.exe` unquoted at command position, and on Windows `GIT` or `git.EXE`,
+#     are rewritten to `git` (`\git -C '<p>' -c user.name=$(git log -1) config <key>`; `cd <p> && git
+#     -C <o> log $(\git reset --hard)`).
+#   * A BACKTICK SUBSTITUTION (posix only; in PowerShell a backtick is the escape character), rewritten
+#     to `$( )`, which the rules already read as an inner invocation (`cd <p> && git -C <o> log
+#     `` `git reset --hard` ``; from the primary, `git -C <o> log `` `git config <key>` ``).
+#   * AN INNER INVOCATION READ IN THE WRONG PLACE. A hoisted string per git-bearing `$( )`, described
+#     at the loop below, stands the inner command where the shell runs it.
+#   * AN INNER INVOCATION IN THE OUTER ONE'S FLAGS. A last string replaces every closed one-line `$( )`
+#     with the word `_`, so the outer invocation is read without it (`git -C '<p>' -c
+#     user.name=$(git config user.name) config <key>`, where the inner `config` anchored the disarm
+#     match; `git --git-dir='<p>/.git' -c user.name=$( git log -1) config <key>`; the same behind
+#     `GIT_DIR='<p>/.git'`). The inner invocations are judged by the earlier strings.
+#
+# COST: each string is a full pass of the four rules, git calls included, and a command can yield up to
+# eleven (the command, the rewrite, eight hoists, the outer reading). Under the 60 s timeout a slow pass
+# blocks the command rather than letting it through (install-gate.ps1 installs `onFailure = block`).
+#
+# A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
+# quotes, an escaped character, a quoted-delimiter posix heredoc body, a PowerShell `@' '@` here-string
+# -- and no rewrite starts there, so a backticked command NAMED in a single-quoted message or a data
+# heredoc is not read as run. Inside DOUBLE quotes a posix backtick and a `$( )` do run, so they are
+# rewritten there: `git commit -m "see `git reset --hard`"` in the primary is refused, because bash runs
+# that reset. A backtick span holding an unpaired quote or a line break is not rewritten, since whether
+# and where it runs then depends on parsing this walk does not do. The walk can still misread, and `_` can stand where a path
+# was; each misreading can only cost a false deny, never an allow, because the command as given has
+# already been judged and allowed.
+function Get-QuoteStateMap([string]$Text, [string]$Convention) {
+    # One character per input character: N outside quotes, D in double quotes, S literal, E escaped.
+    $esc = $(if ($Convention -eq 'pwsh') { [char]'`' } else { [char]'\' })
+    $map = [char[]]::new($Text.Length)
+    $heredoc = [regex]::new('\G(?<!<)<<(-?)[ \t]*(?:''(\w+)''|"(\w+)"|\\(\w+))')
+    $pending = [System.Collections.Generic.List[object]]::new()
+    $state = 'N'
+    $i = 0
+    while ($i -lt $Text.Length) {
+        $c = $Text[$i]
+        if ($state -eq 'S') {
+            $map[$i] = 'S'
+            if ($c -eq [char]"'") {
+                if ($Convention -eq 'pwsh' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
+                    $map[$i + 1] = 'S'; $i += 2; continue
+                }
+                $state = 'N'
+            }
+            $i++; continue
+        }
+        if ($c -eq $esc -and $i + 1 -lt $Text.Length) {
+            $map[$i] = $state; $map[$i + 1] = 'E'; $i += 2; continue
+        }
+        if ($state -eq 'D') {
+            $map[$i] = 'D'
+            if ($c -eq [char]'"') { $state = 'N' }
+            $i++; continue
+        }
+        $map[$i] = 'N'
+        if ($c -eq [char]"'") { $map[$i] = 'S'; $state = 'S'; $i++; continue }
+        if ($c -eq [char]'"') { $map[$i] = 'D'; $state = 'D'; $i++; continue }
+        if ($c -eq [char]'<' -and $Convention -eq 'posix') {
+            $h = $heredoc.Match($Text, $i)
+            if ($h.Success) {
+                $delim = @($h.Groups[2].Value, $h.Groups[3].Value, $h.Groups[4].Value) | Where-Object { $_ } | Select-Object -First 1
+                $pending.Add([pscustomobject]@{ Delim = $delim; Dash = ($h.Groups[1].Value -eq '-') })
+            }
+        }
+        if ($c -eq [char]'@' -and $Convention -eq 'pwsh' -and $i + 1 -lt $Text.Length -and $Text[$i + 1] -eq [char]"'") {
+            $close = [regex]::new("\n'@").Match($Text, $i)
+            $stop = $(if ($close.Success) { $close.Index + $close.Length } else { $Text.Length })
+            for ($j = $i; $j -lt $stop; $j++) { $map[$j] = 'S' }
+            $i = $stop; continue
+        }
+        if ($c -eq [char]"`n" -and $pending.Count -gt 0) {
+            # The quoted-delimiter heredoc bodies that start on the next line, each up to its delimiter.
+            $j = $i + 1
+            foreach ($hd in $pending) {
+                while ($j -lt $Text.Length) {
+                    $eol = $Text.IndexOf([char]"`n", $j)
+                    $lineEnd = $(if ($eol -lt 0) { $Text.Length } else { $eol + 1 })
+                    $line = $Text.Substring($j, $lineEnd - $j).TrimEnd("`r", "`n")
+                    if ($hd.Dash) { $line = $line.TrimStart("`t") }
+                    for ($k = $j; $k -lt $lineEnd; $k++) { $map[$k] = 'S' }
+                    $j = $lineEnd
+                    if ($line -ceq $hd.Delim) { break }
+                }
+            }
+            $pending.Clear()
+            $i = $j; continue
+        }
+        $i++
+    }
+    , $map
+}
+
+# Get-AddedCommandReadings' rewrite of each match of $Pattern that starts where $Map says the shell
+# reads code (N, or D under -InDouble), to $With; any other match is kept as written.
+function Edit-UnquotedMatches([string]$Text, [char[]]$Map, [string]$Pattern, [string]$With,
+                              [System.Text.RegularExpressions.RegexOptions]$Options, [switch]$InDouble) {
+    $out = [System.Text.StringBuilder]::new()
+    $from = 0
+    foreach ($m in [regex]::Matches($Text, $Pattern, $Options)) {
+        $st = $Map[$m.Index]
+        if (-not ($st -eq [char]'N' -or ($InDouble -and $st -eq [char]'D'))) { continue }
+        [void]$out.Append($Text, $from, $m.Index - $from)
+        [void]$out.Append($m.Result($With))
+        $from = $m.Index + $m.Length
+    }
+    [void]$out.Append($Text, $from, $Text.Length - $from)
+    $out.ToString()
+}
+
+function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
+    $Cmd
+    $opts = $(if ($IsWindows) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
+            [System.Text.RegularExpressions.RegexOptions]::None })
+    $plain = [System.Text.RegularExpressions.RegexOptions]::None
+    # At command position: the line start, a separator or opener, `$(` or a backtick, then blanks and
+    # any `NAME=value` assignments. A word ending `/git` elsewhere, such as a `cd` target, is left alone.
+    $at = '(?<=(?:^|[;&|({\r\n`]|\$\()[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|()=]*[ \t]+)*)'
+    $qualifier = $(if ($Convention -eq 'posix') { '(?:\\|[^\s;&|(){}''"`$<>=]*[\\/])?' } else { '(?:[^\s;&|(){}''"`$<>=]*[\\/])?' })
+    # Each step walks the quoting only where its pattern can change something, since the walk is a
+    # character loop and runs inside the hook's timeout.
+    $gitWord = "$at$qualifier(?<![\w.-])git(?i:\.exe)?(?=[\s;&|)}``]|$)"
+    $named = $Cmd
+    if (@([regex]::Matches($Cmd, $gitWord, $opts) | Where-Object { $_.Value -cne 'git' }).Count -gt 0) {
+        $named = Edit-UnquotedMatches $Cmd (Get-QuoteStateMap $Cmd $Convention) $gitWord 'git' $opts
+    }
+    if ($Convention -eq 'posix' -and $named.Contains([char]'`')) {
+        # A one-line span opened by a backtick the shell runs, with its quotes paired: an odd quote
+        # inside one leaves bash looking for its match, and such a command does not run at all.
+        $named = Edit-UnquotedMatches $named (Get-QuoteStateMap $named $Convention) `
+            '`((?:[^`''"\r\n]|''[^''\r\n]*''|"[^"`\r\n]*")*)`' '$$($1)' $plain -InDouble
+    }
+    if ($named -cne $Cmd) { $named }
+    if (-not $named.Contains('$(')) { return }
+    $namedMap = Get-QuoteStateMap $named $Convention
+    # A HOISTED INNER INVOCATION, one string per closed one-line `$( )` holding a git word, at most
+    # eight: the text before the `$(`, cut after its last true separator or line break, then the inner
+    # command, so it is read where the shell runs it (`echo $(git -C <wt> checkout <b>)`; `cd <p> && echo
+    # $(date); git -C <o> log $(git reset --hard)`, where the chdir follower stops at the `$(date)`).
+    $hoisted = 0
+    foreach ($sub in [regex]::Matches($named, '\$\(([^()\r\n]*)\)')) {
+        if ($hoisted -ge 8) { break }
+        if ($namedMap[$sub.Index] -ne [char]'N' -and $namedMap[$sub.Index] -ne [char]'D') { continue }
+        $inner = $sub.Groups[1].Value
+        if ($inner -cnotmatch $gitInvocation) { continue }
+        $before = $named.Substring(0, $sub.Index)
+        $cuts = [regex]::Matches($before, '(?:;|\|\|?|&&|(?<![<>&])&(?![>&])|\r?\n)')
+        $keep = $(if ($cuts.Count -gt 0) { $before.Substring(0, $cuts[$cuts.Count - 1].Index + $cuts[$cuts.Count - 1].Length) } else { "" })
+        $hoist = "$keep $inner"
+        if ($hoist -cne $Cmd -and $hoist -cne $named) { $hoist; $hoisted++ }
+    }
+    $outer = $named
+    for ($i = 0; $i -lt 32; $i++) {
+        $next = Edit-UnquotedMatches $outer (Get-QuoteStateMap $outer $Convention) '\$\([^()\r\n]*\)' '_' $plain -InDouble
+        if ($next -ceq $outer) { break }
+        $outer = $next
+    }
+    if ($outer -cne $named -and $outer -cne $Cmd) { $outer }
 }
 
 # The candidate list of one reading: the resolver's own-window answer, read from that invocation's scan
@@ -3956,8 +4126,13 @@ function Get-WorktreeVictimTokens([string]$After) {
 # constrains agents, not the human, who remains the owner of the primary's HEAD.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("Bash", "PowerShell")) {
-    $cmd = [string]$hook.tool_input.command
-    if (-not $cmd) { exit 0 }
+    $givenCmd = [string]$hook.tool_input.command
+    if (-not $givenCmd) { exit 0 }
+    # Rules 3c, 3d, 3 and 3b judge each of Get-AddedCommandReadings' strings, the command as given
+    # first. The body below is dot-sourced, so the first pass runs in this scope exactly as it ran
+    # inline; an allow inside it is a `return`, which ends that pass and starts the next. The body
+    # keeps its pre-#5655 indent so this change does not rewrite every line of it.
+    foreach ($cmd in @(Get-AddedCommandReadings $givenCmd (Get-HostConvention $tool))) { . {
 
     # -----------------------------------------------------------------------------------------------
     # Rule 3c -- a git CONFIG write that disarms the SHARED repository. `config` changes no tree, so the
@@ -4706,8 +4881,7 @@ What to do instead:
                 # only, still let a relative victim through.
                 $ownEnd = $inv.Own.Index + $inv.Own.Length
                 if ($ownEnd -gt $sm.Index) { continue }
-                if ($seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd) -match
-                    '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))') { continue }
+                if (Test-TrueSeparatorIn $seg.Scan.Substring($ownEnd, $sm.Index - $ownEnd)) { continue }
                 # AND THE git WORD MUST START ITS COMMAND (review round cfbde907): `git worktree remove
                 # <o>/nope ; echo git worktree remove <wt>` read the printed `git` as an invocation and
                 # refused the line for what it named. Between the window start and the git WORD only
@@ -4823,8 +4997,10 @@ What to do instead:
         #   * A VICTIM GLUED TO A CLOSER -- NARROWED 2026-11-13 (review round cfbde907), NOT FIXED. In the
         #     ADDED reading `<wt>}`, `<wt>)` and `<wt>&` end at the closer; the first reading keeps
         #     origin/main's split, because the closer split is not quote-aware, and the added reading
-        #     adds the closer-split victim beside it. Still open, at least: a victim glued to a closing
-        #     BACKTICK (`` x=`git worktree remove <wt>` ``).
+        #     adds the closer-split victim beside it. A victim glued to a closing posix BACKTICK (``
+        #     x=`git worktree remove <wt>` ``), ALLOWED on 2026-11-18, is refused through
+        #     Get-AddedCommandReadings, which spells the span `$( )`; this reading still does not split
+        #     at a backtick.
         #   * A `cd` WHOSE TARGET LEAF IS LITERALLY `git`. The `$at` git-token regex below matches
         #     inside that PATH, so $pfx is truncated and the prefix is misread. A `~/git` or
         #     `C:\git` directory is ordinary on a developer's box, so this is the most reachable of
@@ -5291,7 +5467,7 @@ $pruneBullet  * To find out whether a worktree is still in use, look rather than
             }
         }
     }
-    if (-not $verb) { exit 0 }
+    if (-not $verb) { return }
 
     # `cd <primary>; git checkout ...` and `pushd` defeat both of the above, so also treat any command
     # that NAMES a governed primary as targeting it -- but only where the target was inferred.
@@ -5544,7 +5720,7 @@ worktree gate blocked it." The primary's HEAD belongs to the user, not to a sess
             }
         }
         Set-PathForm $false
-        exit 0
+        return
     }
 
     $displayQ = Get-SafeForCommand $root.Display
@@ -5570,6 +5746,8 @@ You almost never need this:
 If none of those fit, STOP and tell the user: "I need to change the primary checkout's branch and the
 worktree gate blocked it." The primary's HEAD belongs to the user, not to a session.
 "@
+    } }
+    exit 0
 }
 
 # ---------------------------------------------------------------------------------------------------
