@@ -602,7 +602,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         r"""'^(?P<pre>\\s*' + re.escape(key) + '\\s*=\\s*)(?P<lit>(?P<q>[\\"\'])' + re.escape(old) + '(?P=q))'""",
     ),
     "messagefoundry/logging_setup.py": (
-        r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=' + _QUERY_VALUE""",
+        "'(?i)\\\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=' + _BYTES_PROBE + _QUERY_VALUE + _KV_TAILS",
     ),
     # BACKLOG #1572 -- the separator-aware redaction pass. Unresolvable BY CONSTRUCTION and that is the
     # point: the character class is the delimiter set the MESSAGE declares in MSH-1/MSH-2, read at
@@ -721,15 +721,36 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``dsn_placeholder``) the run is followed by tail groups (``_DSN_TAIL``), each an "@" then a
     # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before the
     # next "@", so the repeats tile the text; the final "@" follows the tail.
+    # BACKLOG #5546 to #5548: the four label patterns that take a masked tail, ``_BEARER``,
+    # ``_MEFOR_SECRET``, ``_CREDENTIAL_KV`` and ``_KEY_MATERIAL``, splice ``_BYTES_PROBE`` and a tails
+    # fragment, and ``_BEARER`` also ``_MARKED_SCHEME_WORDS``; the query filter in ``logging_setup``
+    # splices the probe and ``_KV_TAILS``. ``support/redact.py`` imports the probe and the tails from
+    # ``messagefoundry/secretscrub.py`` rather than spelling them, so that the tails' contract is
+    # stated once there, and its copies of those four patterns no longer resolve either: they have
+    # their own entry below. So the scanned twin named above covers redact.py's patterns that take no
+    # tail, at least ``_AUTH_SCHEME``, and not these four. By inspection every repetition the tails
+    # add is possessive or a fixed count, the label stops in ``_NO_LABEL_BEFORE`` are fixed-width
+    # lookbehinds with no repetition, and each tail group is optional and possessive after the whole
+    # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
+    # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
+    # ``_without_tails``' compiles of a shipped pattern rewritten at runtime.
     "messagefoundry/secretscrub.py": (
-        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')'",
+        "'(?i)(-----BEGIN (?:(?!PRIVATE )[A-Z0-9]++ )*+PRIVATE KEY-----)(?P<key_body>(?:[ \\\\t]*+' + _KEY_SEPARATOR + _KEY_LINE + '[ \\\\t]*+(?=' + _KEY_SEPARATOR + '|\\\\Z))++)'",
+        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')' + _BEARER_TAILS",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
-        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
-        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
-        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
+        "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)' + _MEFOR_TAILS",
+        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')' + _KV_TAILS",
+        "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')' + _KV_TAILS",
         "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
+        "source",
+    ),
+    "messagefoundry/support/redact.py": (
+        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:bearer|authorization|token|session|api[_-]?key))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + ')' + _BEARER_TAILS",
+        "'\\\\b(MEFOR_[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)' + _MEFOR_TAILS",
+        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')' + _KV_TAILS",
+        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:encryption_key(?:s_retired)?|private_key|intake_api_key_next))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_KEY_VALUE + ')' + _KV_TAILS",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3
     # ADR 0030 §4h: the site-code prefix is no longer a literal in the anonymizer — it is EXTERNALIZED

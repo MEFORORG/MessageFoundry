@@ -4795,6 +4795,7 @@ def test_each_taken_tail_shape_is_masked_on_every_surface(monkeypatch: pytest.Mo
     """The invariant is vacuous if no tail fires: each taken shape must differ from its output
     without the tails, on every surface."""
     corpus = list(_TAKEN_TAIL_SHAPES)
+    assert len(corpus) >= 1
     old = _before_the_tails(monkeypatch, corpus)
     new = _tail_outputs(corpus)
     for surface, _apply in _TAIL_SURFACES:

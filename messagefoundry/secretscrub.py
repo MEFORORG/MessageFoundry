@@ -2886,8 +2886,11 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
     # control on the tails is :func:`_scrub_credentials`' comparison, not the union. A shipped
     # pattern that should hold a tail and does not raises,
     # as :func:`_narrowed_value` does, so a strip cannot silently change nothing.
-    if pattern is _PRIVATE_KEY_BLOCK:
-        source = r"(?!x)x"
+    # One expression, not a bare ``source = "..."`` in an ``if``: the ReDoS scanner in
+    # ``tests/test_security_static.py`` reads a name bound to one literal anywhere in the file as
+    # that literal, so the bare form made it read both ``re.compile(source, ...)`` calls here as
+    # compiling the never-matching pattern, and hid the blind spot it pins.
+    source = r"(?!x)x" if pattern is _PRIVATE_KEY_BLOCK else source
     for fragment in _SHIPPED_TAILS.get(id(pattern), ()):
         if fragment not in source:
             raise ValueError(f"no {fragment[:40]} to strip")

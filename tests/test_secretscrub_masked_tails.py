@@ -108,6 +108,9 @@ def test_no_value_of_a_red_shape_prints(
     line: str, atoms: tuple[str, ...], surface: tuple[str, Callable[[str], str]]
 ) -> None:
     name, apply = surface
+    # An atom the line does not hold could never print, so the absence below would prove nothing.
+    assert len(atoms) >= 1
+    assert all(atom in line for atom in atoms), (line, atoms)
     out = apply(line)
     printed = [atom for atom in atoms if atom in out]
     assert not printed, f"{name} printed {printed} from {line!r}: {out!r}"
