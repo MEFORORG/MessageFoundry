@@ -1702,8 +1702,8 @@ landed, they name the account by its id and still show what was issued, rather t
 423. What those pages show and log when that
 read fails is stated in the docstring of `_shown_name` in
 [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-A factor reset that lands but issues neither an enrolment code nor a generated credential shows
-no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
+A factor reset whose action returns but issues neither an enrolment code nor a generated
+credential shows no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
 A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's

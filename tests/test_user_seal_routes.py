@@ -528,10 +528,13 @@ def test_the_security_doc_says_where_a_factor_reset_that_issues_nothing_goes() -
     body = _statement_body()
     pointer = "What those pages show and log when that read fails is stated in the docstring"
     reset = (
-        "A factor reset that lands but issues neither an enrolment code nor a generated "
-        "credential shows no such page: it redirects to `GET /ui/users/{user_id}`, which answers "
-        "423 for a failing record."
+        "A factor reset whose action returns but issues neither an enrolment code nor a "
+        "generated credential shows no such page: it redirects to `GET /ui/users/{user_id}`, "
+        "which answers 423 for a failing record."
     )
     assert reset in body
+    # "Lands" also took a reset whose writes committed and then raised, which answers 400 or 500
+    # rather than redirecting (Lander hold 7089092213, finding 2).
+    assert "that lands but" not in body
     assert pointer in body and body.index(pointer) < body.index(reset)
     assert "rather than answering 423. What those pages show and log" in body
