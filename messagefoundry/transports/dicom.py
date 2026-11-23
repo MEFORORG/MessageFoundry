@@ -551,6 +551,9 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
             )
         ),
         _Shape(re.compile(r"(?P<label>) +=")),  # a transfer syntax, alone under its context
+        # A user identity's fields, in clear in the dump of an association request either way: never
+        # kept, whatever they spell, and the bracket pynetdicom opens goes with the value.
+        _Shape(re.compile(r" +(?:Username|Password): ")),
     ),
 }
 

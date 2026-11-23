@@ -940,3 +940,95 @@ def test_pynetdicoms_dump_of_a_flagged_value_is_redacted(
     filtered = dumped()
     lines = [line for line in filtered if line.startswith(line_start)]
     assert lines and all(line.endswith(_REDACTED_MARK) for line in lines), filtered
+
+
+# --- A peer's credentials in the association dumps (vault BACKLOG #6637, item 6) -------------------
+
+_PLANTED_USERNAME = "planted-user-6637"
+_PLANTED_PASSWORD = "planted-pass-6637"
+
+
+def _a_request_with_credentials() -> Any:
+    """An A-ASSOCIATE-RQ whose user identity item is a username and password, decoded from bytes."""
+    from pynetdicom.pdu import A_ASSOCIATE_RQ
+    from pynetdicom.pdu_items import UserIdentitySubItemRQ
+
+    pdu = A_ASSOCIATE_RQ()
+    pdu.decode(_captured_request())
+    item = UserIdentitySubItemRQ()
+    item.user_identity_type = 2
+    item.positive_response_requested = 0
+    item.primary_field = _PLANTED_USERNAME.encode("ascii")
+    item.secondary_field = _PLANTED_PASSWORD.encode("ascii")
+    pdu.user_information.user_data.append(item)
+    decoded = A_ASSOCIATE_RQ()
+    decoded.decode(pdu.encode())
+    return decoded
+
+
+@pytest.mark.parametrize("dump", ["_receive_associate_rq", "_send_associate_rq"])
+def test_the_association_dump_never_writes_a_username_or_password(
+    dump: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pynetdicom import _handlers
+
+    pdu = _a_request_with_credentials()
+
+    def dumped() -> list[str]:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG):
+            getattr(_handlers, dump)(cast("Event", SimpleNamespace(pdu=pdu)))
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: the dump names both, in cleartext
+        unfiltered = dumped()
+    assert [line for line in unfiltered if f"Username: [{_PLANTED_USERNAME}]" in line]
+    assert [line for line in unfiltered if f"Password: [{_PLANTED_PASSWORD}]" in line]
+    filtered = dumped()
+    assert filtered
+    assert not [line for line in filtered if _PLANTED_USERNAME in line], filtered
+    assert not [line for line in filtered if _PLANTED_PASSWORD in line], filtered
+    # The lines stay, so a reader can still see that an identity was negotiated, and of which kind.
+    assert "pynetdicom._handlers:   Username: [redacted]" in filtered
+    assert "pynetdicom._handlers:   Password: [redacted]" in filtered
+    assert [line for line in filtered if "Authentication Mode: 2" in line]
+
+
+async def test_a_peers_credentials_never_reach_the_scp_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from tests.test_dicom_scp_pre_association import _ASSOCIATE_AC, _stall
+
+    request = _a_request_with_credentials().encode()
+
+    async def associate() -> list[str]:
+        async with _running_scp({"timeout_seconds": 30.0}) as scp:
+            with caplog.at_level(logging.DEBUG):
+                sock = await asyncio.to_thread(_stall, scp.sockport, request)
+                try:
+                    sock.settimeout(5.0)
+                    assert await asyncio.to_thread(sock.recv, 1) == _ASSOCIATE_AC
+                finally:
+                    sock.close()
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL: the same capture sees the password on the SCP's own path
+        unfiltered = await associate()
+    assert [line for line in unfiltered if _PLANTED_PASSWORD in line]
+    caplog.clear()
+    filtered = await associate()
+    assert filtered
+    leaked = [line for line in filtered if _PLANTED_PASSWORD in line or _PLANTED_USERNAME in line]
+    assert leaked == []
+    assert "pynetdicom._handlers:   Password: [redacted]" in filtered
+
+
+def test_the_credential_lines_the_filter_reads_are_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import _handlers
+
+    for dump in (_handlers._receive_associate_rq, _handlers._send_associate_rq):
+        source = inspect.getsource(dump)
+        assert "f\"  Username: [{primary.decode('utf-8')}]\"" in source
+        assert "f\"  Password: [{secondary.decode('utf-8')}]\"" in source

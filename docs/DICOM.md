@@ -315,8 +315,10 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   pynetdicom's non-conformant and refused value lines; its non-conformant transfer syntax and related SOP
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
   exception its DUL logs when a received PDU does not decode, with its traceback; pydicom's invalid value
-  line; and the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
-  association acceptance and a DIMSE message. A dump field keeps at least these values: an empty one; a
+  line; the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
+  association acceptance and a DIMSE message; and the username and password of a user identity in the
+  dump of an association request, received or sent, which are never kept. A dump field otherwise keeps at
+  least these values: an empty one; a
   conformant UID; a name in pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title
   fields and on Their Implementation Version Name, a value that passes pynetdicom's AE title check, which an
   empty or all-space value does. `_kept` in `messagefoundry/transports/dicom.py` is the source of record.
