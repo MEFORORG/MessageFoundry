@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The DICOM, FHIR, SOAP and remote-file connectors read ``tls`` and ``tls_allow_expired`` strictly
-(vault BACKLOG #3234 added step 8).
+"""The DICOM connectors read ``tls`` strictly, and the DICOM, FHIR, SOAP and FTPS reads of
+``tls_allow_expired`` are strict too (vault BACKLOG #3234 added step 8).
 
-The load and the build refuse a non-bool literal on a boolean setting, but a connector built from a
-``Destination`` or ``Source`` that never passed through them, a Registry built in code or settings
-changed after validation, reached these reads, and ``bool("false")`` is True. Each read now goes
-through ``flag_from_settings``, which refuses anything that is not a real ``bool`` with the
-``require_flag`` message. A real ``bool`` reads as before: the controls."""
+The load and the runner's builds (``_source_config``, ``_dest_config``) refuse a non-bool literal
+on a boolean setting. A connector constructed directly from a ``Source`` or ``Destination``, as
+tests and embedders do, passes neither, and reached these reads, where ``bool("false")`` is True.
+Each read now goes through ``flag_from_settings``, which refuses anything that is not a real
+``bool`` with the ``require_flag`` message. A real ``bool`` reads as before: the controls."""
 
 from __future__ import annotations
 
