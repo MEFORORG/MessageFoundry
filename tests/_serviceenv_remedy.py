@@ -29,9 +29,9 @@ KEEP = (
 )
 
 #: The add-back step as origin/main prints it, where a refused name outside the key class
-#: is listed, no value runs on, and no string in the lists sets MEFOR_SECRETS_DIRECTORY on
-#: its first non-blank line (the Lander's holds on PR 3142, comments 7085002242, 7088663896
-#: and 7089400537).
+#: is listed, no value runs on, and no line of any string in the lists sets
+#: MEFOR_SECRETS_DIRECTORY (the Lander's holds on PR 3142, comments 7085002242, 7088663896
+#: and 7089064404, B).
 ADD_BACK_STEP = (
     "The service's lists set no MEFOR_SECRETS_DIRECTORY. Where install-service.ps1 already "
     "made the secrets directory, add MEFOR_SECRETS_DIRECTORY naming that existing path back to "
@@ -42,10 +42,16 @@ ADD_BACK_STEP = (
     'docs/SERVICE.md, "Start / stop / status"'
 )
 
-#: Its opener, which the step leaves out wherever a string in the lists sets the directory on
-#: its first non-blank line (the Lander's holds on PR 3142, comments 7088102723 and
-#: 7088663896).
+#: Its opener, which the step leaves out wherever a line of any string in the lists sets the
+#: directory (the Lander's holds on PR 3142, comments 7088102723, 7088663896 and 7089064404,
+#: B).
 SET_NO = "The service's lists set no MEFOR_SECRETS_DIRECTORY"
+
+#: The step where a line of a string sets the directory but no string sets it and nothing
+#: else, and no value runs on: no opener, no removal clause, and no wider exclusion, as a
+#: string that sets another variable too is not removed whole (the Lander's holds on PR 3142,
+#: comments 7089064404, B, and 7089400537).
+ADD_BACK_BARE = ADD_BACK_STEP.removeprefix(f"{SET_NO}. ")
 
 #: Main's wider pass-back exclusion, from its joined-directory step.
 WIDER = "and the strings this step and any step above say to remove"
@@ -56,7 +62,7 @@ WIDER = "and the strings this step and any step above say to remove"
 #: 3142, comments 7089064404 and 7089400537).
 REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and nothing else"
 
-#: The step where a value runs on and no string sets the directory: the opener,
+#: The step where a value runs on and no line of any string sets the directory: the opener,
 #: and the wider exclusion, since the strings the run-on step removes may hold the refused
 #: value (the Lander's hold on PR 3142, comment 7088663896).
 ADD_BACK_RUN_ON = (

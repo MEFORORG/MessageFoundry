@@ -180,10 +180,10 @@ class ServiceEnvPosture:
     #: to. The remedy alone reads this: its add-back step then says to pass back none of the
     #: strings the steps above it say to remove.
     directory_joined: bool = False
-    #: Whether any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank
-    #: line (:func:`_sets_directory`), as its own item or joined to a value. The remedy alone
-    #: reads this, and then never says the lists set no secrets directory (the Lander's hold on
-    #: PR 3142, comment 7088663896).
+    #: Whether any line of any string in the lists sets ``MEFOR_SECRETS_DIRECTORY``, each line
+    #: read as :func:`_sets_directory` reads one, as its own item or joined to a value. The
+    #: remedy alone reads this, and then never says the lists set no secrets directory (the
+    #: Lander's holds on PR 3142, comments 7088663896 and 7089064404, B).
     directory_in_lists: bool = False
     #: Whether any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` and nothing else
     #: (:func:`_sets_only_directory`). The remedy alone reads this, and then says to remove
@@ -1126,7 +1126,10 @@ def read_service_env_posture(
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
-        directory_in_lists=any(_sets_directory(entry) for _where, entry in entries),
+        # Every line, since NSSM may read a later line of a string as its own variable.
+        directory_in_lists=any(
+            _sets_directory(line) for _where, entry in entries for line in _LINE_BREAK.split(entry)
+        ),
         directory_only_in_lists=any(_sets_only_directory(entry) for _where, entry in entries),
     )
 
@@ -1354,11 +1357,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        # The step says the lists set no directory only where no string in them sets one on
-        # its first non-blank line (directory_in_lists). Where a string sets the directory and
-        # nothing else, it says to remove every other such string, in origin/main's words
-        # narrowed to "and nothing else", so the entry the operator adds is the only one and a
-        # string that also sets another variable is never removed whole. Where a value runs on,
+        # The step says the lists set no directory only where no line of any string in them
+        # sets one (directory_in_lists). Where a string sets the directory and nothing else, it
+        # says to remove every other such string, in origin/main's words narrowed to "and
+        # nothing else", so the entry the operator adds is the only one and a string that also
+        # sets another variable is never removed whole. Where a value runs on,
         # or such a string exists, the entries it says to pass back leave out the strings this
         # step and the steps above say to remove, which may hold the refused value or set the
         # directory (the Lander's holds on PR 3142, comments 7088102723, 7088663896,
