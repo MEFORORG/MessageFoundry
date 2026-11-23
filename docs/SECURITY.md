@@ -5350,8 +5350,10 @@ flowchart TB
   valid value is raised
   by the route body after at least its scope, permission, serve-hop and new-address checks; its
   gate wrote no grant row, and
-  `raise_deferred_monitoring_refusal` writes the `auth.gate_refused` row the gate would have. Other
-  refusals a route body makes after its gate has passed write no `auth.gate_refused` row.
+  `raise_deferred_monitoring_refusal` writes the `auth.gate_refused` row the gate would have. On
+  that route, a serve-hop or new-address refusal that comes first also writes that throttled row,
+  through `record_deferred_monitoring_refusal`. Other refusals a route body makes after its gate
+  has passed write no `auth.gate_refused` row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
   empty for every role except Administrator.
 - Sensitive routes add a step-up re-check on top of this flow. See
@@ -7704,14 +7706,15 @@ BACKLOG #2620). So with the budget spent those refusals still answer with their 
 record what the pre-pacing route recorded: an `auth.channel_denied` or `auth.permission_denied`
 row, or the new-address refusal's deduped `auth.new_address_reverify_required` row; the serve-hop
 refusal writes none of its own. Unlike
-that route, they then write no `monitoring:read` grant row. The serve-hop and new-address refusals
-also write the held 429's `auth.gate_refused` row (reason `throttled`) before they are answered,
-with no log line, so each such request still leaves a decision row. A held 429 the route never
-raises, at least because one of those checks refused first, writes no throttled row or log line. A
+that route, they then write no `monitoring:read` grant row. A held 429 the route never raises,
+because one of those checks refused first, writes no log line. The scope and permission refusals
+write no throttled row either. The serve-hop and new-address refusals do write the held 429's
+`auth.gate_refused` row (reason `throttled`) before they are answered, so such a request leaves a
+decision row even when the refusal writes none of its own. Like every gate decision row, it is not
+written for a GET while `[security].audit_all_authorization_decisions` is off. A
 reveal value that will fail validation is charged and refused at the gate like any other read.
 The limiter records no refused attempt, so once the budget is spent a reveal those checks refuse
-spends nothing more: that path is not paced. Each such refusal leaves at least one row: its
-denial row, or the throttled row above. The six routes share ONE budget per account: a read of any of them spends
+spends nothing more: that path is not paced. The six routes share ONE budget per account: a read of any of them spends
 it. The budget is in-process, per API process, so N engine shards multiply it by N
 (*Business-logic limits* above).
 

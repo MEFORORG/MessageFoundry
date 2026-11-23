@@ -1485,9 +1485,9 @@ async def _recorded_decision(
     decision rows. For the step-up refusals of :func:`spend_step_up_action` and
     :func:`refuse_unless_step_up_window_live`, made in a route body after its gate admitted the
     request, see :func:`_record_route_refusal`. For the monitoring-read 429 a gate holds for its
-    route body, with no grant row written, see :func:`raise_deferred_monitoring_refusal`. Other
-    refusals a route body makes after its gate admitted the request write no ``auth.gate_refused``
-    row. The reason comes from the
+    route body, with no grant row written, see :func:`raise_deferred_monitoring_refusal` and
+    :func:`record_deferred_monitoring_refusal`. Other refusals a route body makes after its gate
+    admitted the request write no ``auth.gate_refused`` row. The reason comes from the
     :class:`_GateRefusal` the check raised. Any other exception leaves the block with no decision
     row from it, which is right for the :func:`_mfa_refusal` 403: it wrote its own
     ``auth.mfa_denied`` row where it was raised. A failed refusal-row write raises in place of the
@@ -2022,9 +2022,10 @@ def require_monitoring_read(
     is held on the request, with no decision row yet, until the route body calls
     :func:`raise_deferred_monitoring_refusal` after its own checks. ``defer_value_valid``, when
     given, defers only a value that will pass the route's validation, so an invalid one is charged
-    and refused here as any other read. A held 429 the route never raises, at least because one of
-    its own checks refused the request first, is answered by that refusal and writes no throttled
-    row or line. ``GET /connections`` defers on
+    and refused here as any other read. A held 429 the route never raises, because one of its own
+    checks refused the request first, is answered by that refusal and writes no log line. It writes
+    its throttled row only where the route calls :func:`record_deferred_monitoring_refusal` for
+    that refusal. ``GET /connections`` defers on
     ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says why."""
 
     async def dependency(request: Request) -> Identity:
@@ -2095,9 +2096,10 @@ async def record_deferred_monitoring_refusal(request: Request) -> None:
     """Write the ``auth.gate_refused`` row (reason ``throttled``) of a monitoring-read 429 a
     :func:`require_monitoring_read` gate held for this request, and drop the held refusal, without
     raising it or logging it. For a route body whose own refusal is about to propagate in place of
-    the held 429 and writes no denial row of its own, at least the serve-hop refusal and a
-    new-address refusal whose row was deduped, so the request still leaves a decision row. A no-op
-    where nothing is held."""
+    the held 429 and may write no denial row of its own, at least the serve-hop refusal and a
+    new-address refusal whose row was deduped. The row is written only where
+    :func:`_audited_permission` names one, as on the gate's own refusals. A no-op where nothing is
+    held."""
     held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
     if not isinstance(held, _DeferredRefusal):
         return

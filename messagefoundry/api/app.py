@@ -5727,11 +5727,11 @@ def create_app(
         # it is raised here, after this check and the reveal's own refusals (its permission, the
         # serve hop and the new address), and each is answered as before pacing. With the budget
         # spent none of them writes the monitoring:read grant row main wrote: the scope and
-        # permission refusals write only their denial row (owner ruling 2026-11-23). The hop and
-        # new-address refusals also write the held throttled row before they propagate, because
-        # the hop refusal writes no row of its own and a new-address row is deduped, so without
-        # it such a request would leave no decision row (vault BACKLOG #1191). A scoped caller's
-        # dashboard carries no outbound rows at all.
+        # permission refusals write only their denial row (owner ruling 2026-11-23). Every hop or
+        # new-address refusal also writes the held throttled row before it propagates, where the
+        # gate records decisions: the hop refusal writes no row of its own and a repeated
+        # new-address row is deduped, so without it such a request would leave no decision row
+        # (vault BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
             await _refuse_reveal_without_view_summary(request, identity)
