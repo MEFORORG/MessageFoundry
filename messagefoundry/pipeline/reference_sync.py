@@ -53,6 +53,7 @@ from messagefoundry.config.wiring import (
     resolve_env_settings,
 )
 from messagefoundry.connection_names import reference_record_name
+from messagefoundry.keyed_lock import KeyedLock, hold_keyed_lock
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store
@@ -530,6 +531,12 @@ class ReferenceSyncRunner:
     ``env_values`` resolves any :func:`~messagefoundry.config.wiring.env` refs in a source's settings.
     It is a mapping, copied once, or a provider read at each set's sync, which is how the engine hands
     in its values, so a reload that adds or rotates a value reaches the next sync (vault BACKLOG #5698).
+
+    ``graph_generation`` names the committed graph ``specs`` reads, or ``None`` where no graph is
+    known to be committed. Overlapping loads of one set are ordered in this process only: a load
+    writes only while the generation it read its specs under is still current, and never over a
+    load that started after it (BACKLOG #5892). Writes by a former leader or another engine shard
+    are not ordered by this.
     """
 
     def __init__(
@@ -538,6 +545,7 @@ class ReferenceSyncRunner:
         specs: Callable[[], Iterable[ReferenceSpec]],
         settings: ReferenceSettings,
         *,
+        graph_generation: Callable[[], int | None] = lambda: 0,
         env_values: Mapping[str, Any] | Callable[[], Mapping[str, Any]] | None = None,
         egress: EgressSettings,
         alert_sink: AlertSink | None = None,
@@ -547,6 +555,7 @@ class ReferenceSyncRunner:
     ) -> None:
         self._store = store
         self._specs = specs
+        self._graph_generation = graph_generation
         self._settings = settings
         if callable(env_values):
             self._env_values: Callable[[], Mapping[str, Any]] = env_values
@@ -573,6 +582,11 @@ class ReferenceSyncRunner:
         self._unsupported: set[str] = set()
         # BACKLOG #2617: each DATABASE set's login is role-probed once per DSN, not every pass.
         self._roles_probed: set[tuple[str, ...]] = set()
+        # BACKLOG #5892: load start order, the last start each set has written, and a per-set lock
+        # held across the check and the write only, so a wedged source read holds nothing.
+        self._load_sequence = 0
+        self._written_sequence: dict[str, int] = {}
+        self._write_locks: dict[str, KeyedLock] = {}
 
     @property
     def enabled(self) -> bool:
@@ -653,14 +667,18 @@ class ReferenceSyncRunner:
         if self._coordinator.is_leader():
             # LEADER (or single-node): re-read the external source for the due sets and write the
             # shared snapshot. A follower skips this entirely so the source is read once per cluster.
-            for spec in self._specs():
+            # BACKLOG #5892: read with the specs, with no await between. With no committed graph
+            # known, nothing is loaded, and the sets stay due for the next pass.
+            generation = self._graph_generation()
+            for spec in () if generation is None else self._specs():
                 if spec.name in self._unsupported:
                     continue  # backend can never materialize it — already reported once, don't re-spam
                 last = self._last_sync.get(spec.name)  # None = never synced -> always due
                 if not force and last is not None and (now - last) < spec.refresh_seconds:
                     continue
                 try:
-                    await self._sync_one(spec)
+                    if not await self._sync_one(spec, generation=generation):
+                        continue  # superseded: not counted, and the set's cadence is not moved
                     self._last_sync[spec.name] = now
                     synced += 1
                 except NotImplementedError:
@@ -728,7 +746,18 @@ class ReferenceSyncRunner:
             await self._audit(result)
         return result
 
-    async def _sync_one(self, spec: ReferenceSpec) -> None:
+    async def _sync_one(self, spec: ReferenceSpec, *, generation: int | None = None) -> bool:
+        """Load one set and write it. False when the load was superseded and wrote nothing."""
+        current = self._graph_generation()
+        if generation is None:
+            generation = current
+        if generation is None or generation != current:
+            # BACKLOG #5892: a reload committed mid-pass, so this source read would be discarded.
+            log.debug("reference set %r: pass is on a replaced graph; not loaded", spec.name)
+            return False
+        # BACKLOG #5892: taken before the env() read below, which is part of what this load read.
+        self._load_sequence += 1
+        started = self._load_sequence
         # Resolve env() refs in the source settings against this instance's environment. A hop-policy
         # flag is refused first, while still raw, as build_check does (vault BACKLOG #2232).
         try:
@@ -774,16 +803,29 @@ class ReferenceSyncRunner:
         # genuine re-materialization and keep stale data (Track B Step 6 correctness). The leading
         # seconds keep versions roughly time-ordered for an operator reading reference_version.
         version = f"v{int(self._clock())}-{uuid4().hex[:8]}"
-        try:
-            await self._store.write_reference_snapshot(name=spec.name, version=version, rows=rows)
-        except ReferenceKeyCollision as exc:
-            # BACKLOG #4917: sync_all logs only the class. This text holds the set's name and two
-            # ordinals, never a key, so it is logged whole: the ordinals find the rows in the source.
-            log.error("%s (not synced)", exc)
-            raise
+        async with hold_keyed_lock(self._write_locks, spec.name):
+            if generation != self._graph_generation():
+                log.debug("reference set %r: load is from a replaced graph; not written", spec.name)
+                return False
+            if self._written_sequence.get(spec.name, 0) > started:
+                log.debug("reference set %r: a later-started load wrote first", spec.name)
+                return False
+            try:
+                await self._store.write_reference_snapshot(
+                    name=spec.name, version=version, rows=rows
+                )
+            except ReferenceKeyCollision as exc:
+                # BACKLOG #4917: sync_all logs only the class. This text holds the set's name and
+                # two ordinals, never a key, so it is logged whole: the ordinals find the rows in
+                # the source.
+                log.error("%s (not synced)", exc)
+                raise
+            # Only after the store returned, so a refused write claims nothing.
+            self._written_sequence[spec.name] = started
         log.info(
             "reference set %r materialized: %d rows (version %s)", spec.name, len(rows), version
         )
+        return True
 
     def _alert(self, name: str, detail: str) -> None:
         # The AlertSink has no reference-specific event yet; use connection_stopped as the generic

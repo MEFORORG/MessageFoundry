@@ -2060,6 +2060,8 @@ class RegistryRunner:
         sandbox_config_source: tuple[str | None, str | None] | None = None,
     ) -> None:
         self.registry = registry
+        # BACKLOG #5892: replaced only at a commit; see committed_graph.
+        self._committed = (RegistryRunner._take_graph_generation(), registry)
         self.store = store
         #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
         #: process by construction (under HA the graph runs on the leader only), so process-local is
@@ -9576,6 +9578,25 @@ class RegistryRunner:
             )
         return stranded
 
+    # Process-wide, so a runner that replaces another never reissues a generation a load still holds.
+    _last_graph_generation = 0
+
+    @staticmethod
+    def _take_graph_generation() -> int:
+        RegistryRunner._last_graph_generation += 1
+        return RegistryRunner._last_graph_generation
+
+    def committed_graph(self) -> tuple[int, Registry]:
+        """The last committed graph and its generation (BACKLOG #5892).
+
+        :attr:`registry` holds a reload's new graph from its swap on, while that reload can still
+        be refused. This answers with the graph it replaced until the reload commits, and the
+        generation advances only at that commit, never during the swap or a rollback."""
+        return self._committed
+
+    def _commit_graph(self) -> None:
+        self._committed = (RegistryRunner._take_graph_generation(), self.registry)
+
     async def reload(
         self,
         new_registry: Registry | None = None,
@@ -9702,6 +9723,7 @@ class RegistryRunner:
                     self._park_outbounds_while_passive()
             if not self._running:
                 self.registry = new_registry
+                self._commit_graph()  # BACKLOG #5892: nothing below can refuse it
                 self._forget_removed_anchor_lanes()
                 return ()
 
@@ -9964,6 +9986,8 @@ class RegistryRunner:
                         log.exception("rollback: could not restart inbound %r", name)
                 raise
 
+            # BACKLOG #5892: the commit point. No await since step 3 returned.
+            self._commit_graph()
             # BACKLOG #5755: the closes of what step 3 retired run on every exit from here. A raise
             # or a cancellation anywhere in the commit tail, synchronous or awaited, hands the ones
             # not yet begun to a detached close rather than leaving them open with nothing holding

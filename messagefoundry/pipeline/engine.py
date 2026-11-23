@@ -1888,15 +1888,23 @@ class Engine:
         The values are the engine's applied ones, set only once a reload has committed, never the
         registry runner's, which hold a reload's values before it can still be refused. A sync
         during a reload can still pair the specs of one graph with the other graph's values, and
-        fail that set; the sync after the reload corrects it."""
+        fail that set; the sync after the reload corrects it.
+
+        The specs are the last COMMITTED graph's, with its generation, so a pass during a reload
+        never loads a graph that reload can still refuse (BACKLOG #5892)."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
-                self._registry_runner.registry.references.values()
+                self._registry_runner.committed_graph()[1].references.values()
                 if self._registry_runner is not None
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
+            graph_generation=lambda: (
+                self._registry_runner.committed_graph()[0]
+                if self._registry_runner is not None
+                else None
+            ),
             env_values=lambda: self._env_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
