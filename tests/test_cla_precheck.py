@@ -718,7 +718,7 @@ def test_an_errored_first_page_commit_does_not_claim_the_author_is_absent() -> N
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert len(verdict.refusals) == 1
     assert (
-        "none of the 0 of them this read could key is filed under its author's key "
+        "none of the 0 of them this read could key carries its author's key "
         "'octo-contributor'" in verdict.refusals[0]
     )
     assert verdict.fault is not None and "not judged" in verdict.fault
@@ -760,8 +760,9 @@ def test_every_first_page_commit_without_a_key_narrows_the_rule_two_reason(
     rule_two = [r for r in verdict.refusals if f"{3:040x}" in r]
     assert rule_two == [
         f"commit {3:040x} is past the 2 commits the action reads, none of the 1 of them this "
-        "read could key is filed under its author's key 'new-person' in the action's committer "
-        "list, and the CLA signature file holds no signature for that account"
+        "read could key carries its author's key 'new-person' (the login, or else the git name, "
+        "the action files a commit under), and the CLA signature file holds no signature for "
+        "that account"
     ]
     # A null author is refused under rule 1 and is no fault; every other shape here is one.
     assert (verdict.fault is None) == (unkeyed["author"] is None)
@@ -780,9 +781,9 @@ def test_a_fully_keyed_first_page_names_keys_not_people() -> None:
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert verdict == cla_precheck.Verdict(
         (
-            f"commit {2:040x} is past the 1 commits the action reads, none of them is filed "
-            "under its author's key 'bob' in the action's committer list, and the CLA signature "
-            "file holds no signature for that account",
+            f"commit {2:040x} is past the 1 commits the action reads, none of them carries its "
+            "author's key 'bob' (the login, or else the git name, the action files a commit "
+            "under), and the CLA signature file holds no signature for that account",
         )
     )
     # With no signature reader given, the reason does not claim a file was read.

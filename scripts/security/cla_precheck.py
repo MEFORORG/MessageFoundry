@@ -37,8 +37,9 @@ It faults in at least these cases: the pull request's head moved while it read, 
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
 not be read.
 
-TWO CASES BACKLOG #5645 item 1 names, where a fault used to discard refusals the read had proved
-(the errored page's own, or the whole read's for a head that lagged):
+TWO CASES BACKLOG #5645 item 1 names, where a fault ended the run with nothing judged: any
+``errors`` in a reply faulted its page, and a head other than ``CLA_HEAD_SHA`` faulted the whole
+read at once:
 
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
@@ -49,10 +50,11 @@ TWO CASES BACKLOG #5645 item 1 names, where a fault used to discard refusals the
     ``headRefOid`` is another commit, the read stops there and is repeated after each wait in
     ``HEAD_RETRY_DELAYS``. If every first page shows another head, the run is a fault and nothing
     is judged: a read of another head proves nothing about this one. Only that case is re-read. A
-    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged, as before; if its commits do not
-    include that head, a fault is added beside the verdict, so a pass is not silent. A head that
-    moves after the first page leaves the pages before the move, which are of ``CLA_HEAD_SHA``,
-    to be judged, as before. Without ``CLA_HEAD_SHA`` (a comment event) nothing is re-read.
+    read whose ``headRefOid`` is ``CLA_HEAD_SHA`` is judged; if its commits do not include that
+    head, or cannot show that they do, a fault is added beside the verdict, so a pass is not
+    silent. A head that moves after the first page is not re-read: the pages before the move,
+    which are of ``CLA_HEAD_SHA``, are judged, with a fault. Without ``CLA_HEAD_SHA`` (a comment
+    event) nothing is re-read.
 
 WHERE IT RUNS. ``.github/workflows/cla.yml`` runs it as a step of the required ``cla`` job, before
 the CLA action: FAIL-OPEN ON A FAULT, FAIL-CLOSED ON A DETERMINATE REFUSAL (owner ruling
@@ -82,7 +84,7 @@ and the count check gives no warning.
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
 how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
 head after them leaves the run a fault that warns and passes. A commit list that trails a current
-``headRefOid`` is not waited for: it is judged, as it was before, so after a force-push it can
+``headRefOid`` is not waited for: it is judged, so after a force-push it can
 refuse a commit the pull request no longer holds.
 
 UNMEASURED: that every field a partial error nulled lies on the ``path`` of an error naming its
@@ -97,18 +99,20 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   GITHUB_REPOSITORY   ``owner/name``
   CLA_PR_NUMBER       the pull request number
   CLA_ALLOWLIST       the same comma-separated list cla.yml passes the action
-  CLA_HEAD_SHA        optional; the head commit the run judges. A different head is re-read,
-                      then a fault.
+  CLA_HEAD_SHA        optional; the head commit the run judges. A first page showing another
+                      head is re-read, then a fault; a head that moves on a later page is not
+                      re-read.
   GITHUB_GRAPHQL_URL  optional; defaults to https://api.github.com/graphql
   GITHUB_API_URL      optional; defaults to https://api.github.com
   CLA_SIGNATURES_PATH the action's ``path-to-signatures``
   CLA_SIGNATURES_BRANCH the action's ``branch``
 
-EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation; 3 a fault
-caught by this script, at least: bad input, network, a reply in the wrong shape, a short read, a
-head still stale after the re-reads, a commit list without ``CLA_HEAD_SHA``, a commit GraphQL
-reported an error inside, or an exception raised inside ``run``. At least one other path exits 1 with no refusal annotation: an error before
-``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
+EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation, whatever
+fault is reported beside it; 3 a fault caught by this script with nothing refused, at least: bad
+input, network, a reply in the wrong shape, a short read, a head still stale after the re-reads, a
+commit list that does not include ``CLA_HEAD_SHA`` or cannot show that it does, a commit GraphQL
+reported an error inside, or an exception raised inside ``run``. At least one other path exits 1
+with no refusal annotation: an error before ``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
 The workflow tells these apart by the annotation, not the code alone.
 """
 
@@ -553,9 +557,9 @@ def evaluate(
     # another key there, and still be absent from the action's list under this key.
     keyed = sum(1 for slot in first_slots if slot is not None)
     if keyed == len(first_slots):
-        where = "none of them is"
+        where = "none of them carries"
     else:
-        where = f"none of the {keyed} of them this read could key is"
+        where = f"none of the {keyed} of them this read could key carries"
     unsigned = (
         "the CLA signature file holds no signature for that account"
         if signatures is not None
@@ -578,8 +582,8 @@ def evaluate(
         if not skipped and has_signed(who) is False:
             rule_two.append(
                 f"commit {who.oid} is past the {read.first_page} commits the action reads, "
-                f"{where} filed under its author's key {who.name!r} in the action's committer "
-                f"list, and {unsigned}"
+                f"{where} its author's key {who.name!r} (the login, or else the git name, the "
+                f"action files a commit under), and {unsigned}"
             )
     # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
     refusals = [
