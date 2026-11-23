@@ -314,8 +314,9 @@ suite("liveDebug invocationsForFile", () => {
     assert.strictEqual(only[0].file, "cfg/A.py");
   });
 
-  // Uri.fsPath lower-cases the drive letter while Python keeps the case it was given. Windows only:
-  // elsewhere the file system, and so the match, is case-sensitive.
+  // Uri.fsPath lower-cases the drive letter while Python keeps the case it was given. Windows only,
+  // because fileKey folds case only where path.sep is a backslash; off Windows the match is
+  // case-sensitive, a case-insensitive macOS volume included.
   (process.platform === "win32" ? test : test.skip)(
     "on Windows a drive-letter or segment case difference still names the active file (BACKLOG #5835)",
     () => {

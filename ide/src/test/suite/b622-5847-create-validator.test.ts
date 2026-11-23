@@ -11,6 +11,7 @@ import * as path from "node:path";
 
 interface StubRange {
   startLine: number;
+  endLine: number;
 }
 interface StubDiagnostic {
   range: StubRange;
@@ -45,10 +46,11 @@ const vscodeStub = {
   window: { showErrorMessage: (): Promise<undefined> => Promise.resolve(undefined) },
   DiagnosticSeverity: { Error: 0, Warning: 1 },
   Range: class {
-    startLine: number;
-    constructor(line: number) {
-      this.startLine = line;
-    }
+    constructor(
+      public startLine: number,
+      _startCharacter: number,
+      public endLine: number,
+    ) {}
   },
   Diagnostic: class {
     source?: string;
@@ -92,9 +94,11 @@ let createValidator!: Validate["createValidator"];
 
 if (NODE_SIDE) {
   // Loaded fresh against the stubs, and the cache put back afterwards, so another node-side suite's
-  // modules keep what they were bound to (see source-control-trust.test.ts).
+  // modules keep what they were bound to (see source-control-trust.test.ts). Any module first loaded
+  // inside the window is dropped from the cache too, so none stays bound to these stubs.
   const fresh = require.resolve("../../validate");
   const saved = require.cache[fresh];
+  const before = new Set(Object.keys(require.cache));
   delete require.cache[fresh];
   loader._load = function (request: string, parent: unknown, isMain: boolean): unknown {
     if (request === "vscode") {
@@ -106,6 +110,11 @@ if (NODE_SIDE) {
     createValidator = (require("../../validate") as Validate).createValidator;
   } finally {
     loader._load = realLoad;
+    for (const key of Object.keys(require.cache)) {
+      if (!before.has(key)) {
+        delete require.cache[key];
+      }
+    }
     if (saved) {
       require.cache[fresh] = saved;
     } else {
@@ -131,6 +140,10 @@ validatorSuite("b622 #5847 createValidator places each diagnostic", () => {
     await createValidator(context as never).run();
     return sets;
   }
+
+  suiteSetup(() => {
+    assert.notStrictEqual(ws, process.cwd(), "the workspace must differ from the cwd, or this proves nothing");
+  });
 
   teardown(() => {
     stubWorkspace = undefined;
@@ -162,13 +175,36 @@ validatorSuite("b622 #5847 createValidator places each diagnostic", () => {
     assert.strictEqual(out[0].list[0].severity, vscodeStub.DiagnosticSeverity.Warning);
   });
 
+  test("with no file, a relative configDir (the default's shape) resolves against the workspace", async () => {
+    const out = await validate([{ message: "no inbound", file: null, severity: "error" }], "samples/config");
+    assert.deepStrictEqual(
+      out.map((s) => s.fsPath),
+      [path.join(ws, "samples", "config")],
+    );
+  });
+
+  // Windows only: the key folds case only where path.sep is a backslash (pathIdentity.ts).
+  (process.platform === "win32" ? test : test.skip)(
+    "on Windows two spellings of one file share one set() call, so neither replaces the other",
+    async () => {
+      const out = await validate([
+        { message: "first", file: path.join(ws, "Config", "a.py"), severity: "error" },
+        { message: "second", file: path.join(ws, "config", "A.PY"), severity: "error" },
+      ]);
+      assert.deepStrictEqual(
+        out.map((s) => s.list.map((d) => d.message)),
+        [["first", "second"]],
+      );
+    },
+  );
+
   test("the engine's own 'at line N' puts the diagnostic on that line, 0-based", async () => {
     const abs = path.join(ws, "config", "syn.py");
     const m = "error loading config module syn.py: SyntaxError at line 7 (its message is withheld)";
     const out = await validate([{ message: m, file: abs, severity: "error" }]);
     assert.deepStrictEqual(
-      out.map((s) => s.list.map((d) => d.range.startLine)),
-      [[6]],
+      out.map((s) => s.list.map((d) => [d.range.startLine, d.range.endLine])),
+      [[[6, 6]]],
     );
   });
 });
