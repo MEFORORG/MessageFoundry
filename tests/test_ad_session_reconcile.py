@@ -2975,11 +2975,48 @@ async def test_a_flapping_directory_pages_once_for_many_unreached_accounts() -> 
 
 async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> None:
     """BACKLOG #3709. A later rollup under the bare source updates the open instance's text. The
-    text read "7 accounts' sessions are not revoked", a total, and one more account entering
-    after seven replaced it with "1 accounts' ...", though eight stood. No process can count
-    every account standing, so the text names its count as the accounts newly unreachable.
+    text read "7 accounts' sessions are not revoked", a total, and more accounts entering after
+    seven replaced it with their own count, though more stood. No process can count every
+    account standing, so the text names its count as the accounts newly unreachable.
 
     RED when: the rollup's text reads as a total of the accounts standing."""
+    store = await MessageStore.open(":memory:")
+    try:
+        late = [f"late{i}" for i in range(6)]
+        names = ["ok", *late] + [f"flap{i}" for i in range(7)]
+        ldap = _FakeLdap({n: _principal(n) for n in names})
+        service = AuthService(store, _ad_settings(), ldap=ldap)  # type: ignore[arg-type]
+        await service.initialize()
+        for n in names:
+            assert await _signed_in_ad_user(service, store, n) is not None
+        sink = _InverseSink()
+        ldap.unreachable = set(names[1 + len(late) :])
+        for _ in range(3):
+            first = await _pass(service, sink)
+        assert first.unreached_rollup and len(first.unreached) == 7
+        ldap.unreachable = set(names[1:])  # the six late ones join; the seven still fail
+        for _ in range(3):
+            later = await _pass(service, sink)
+        assert sorted(name for _uid, name, _n in later.unreached) == late
+        assert later.unreached_rollup
+        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
+        assert [p["detail"].split(".")[0] for p in rollups] == [
+            "Accounts newly unreachable: 7",
+            "Accounts newly unreachable: 6",
+        ]
+        assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
+        assert all("sessions are not revoked;" in p["detail"] for p in rollups)
+    finally:
+        await store.close()
+
+
+async def test_a_lone_account_entering_after_a_rollup_pages_under_its_own_source() -> None:
+    """BACKLOG #3100 closing step 7. With seven accounts already paged by a rollup, one more
+    account entering pages under its own source, naming it. Counted with those already paged, it
+    folded into the bare-source rollup, whose notifier cooldown and suspend are keyed by type and
+    source, so the earlier rollup's could silence its page.
+
+    RED when: the lone account pages only under the bare source, naming none."""
     store = await MessageStore.open(":memory:")
     try:
         names = ["ok", "late"] + [f"flap{i}" for i in range(7)]
@@ -2992,19 +3029,16 @@ async def test_a_later_rollup_says_it_counts_only_the_accounts_entering() -> Non
         ldap.unreachable = set(names[2:])
         for _ in range(3):
             first = await _pass(service, sink)
-        assert first.unreached_rollup and len(first.unreached) == 7
+        assert first.unreached_rollup and len(service._reconcile_unreached_paged) == 7
         ldap.unreachable = set(names[1:])  # "late" joins; the seven still fail
         for _ in range(3):
             later = await _pass(service, sink)
         assert [name for _uid, name, _n in later.unreached] == ["late"]
-        assert later.unreached_rollup
-        rollups = [p for _k, s, p in sink.events if s == _UNREACHED_ALERT_SOURCE]
-        assert [p["detail"].split(".")[0] for p in rollups] == [
-            "Accounts newly unreachable: 7",
-            "Accounts newly unreachable: 1",
+        assert not later.unreached_rollup
+        assert [source for _k, source, _p in _unreached_events(sink)] == [
+            f"{_UNREACHED_PREFIX}late"
         ]
-        assert "each failed 3+ of up to its last 5 probes" in rollups[1]["detail"]
-        assert all("sessions are not revoked;" in p["detail"] for p in rollups)
+        assert len([e for e in sink.events if e[1] == _UNREACHED_ALERT_SOURCE]) == 1
     finally:
         await store.close()
 

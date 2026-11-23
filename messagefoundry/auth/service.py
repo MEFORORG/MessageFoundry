@@ -867,11 +867,9 @@ _FORFEIT_NOBODY_ELSE: Final[str] = (
     ", because a restarted process does not resolve one it finds open, and a [cluster] node or "
     "an engine of more than one engine shard resolves none itself"
 )
-#: Where those whose row this pass wrote, plus the accounts latched as paged unreachable that still
-#: hold a live session and a directory key and whose window has not since held only answers, are
-#: more than this, those entering page as one (BACKLOG #3100 closing step 2, #3709;
-#: `AuthService._record_unreached_accounts`). A fixed number, not a setting, so tuning the
-#: mass-revoke breaker does not change how these page.
+#: Where those whose row this pass wrote are more than this, they page as one (BACKLOG #3100
+#: closing steps 2 and 7, #3709; `AuthService._record_unreached_accounts`). A fixed number, not a
+#: setting, so tuning the mass-revoke breaker does not change how these page.
 _UNREACHED_ROLLUP_ABOVE: Final[int] = 5
 #: What a forfeited standing logs when a new condition of its kind opens (BACKLOG #3083).
 _FORFEITED_EPISODE_WARNINGS: Final[dict[_EpisodeKind, str]] = {
@@ -9729,11 +9727,13 @@ class AuthService:
         account unpaged and unlatched, so a later failing probe of it can write the row and page.
 
         Then it decides the rollup (``unreached_rollup``, BACKLOG #3709), once and on the rows
-        written: whether the accounts already paged and those just written are more than
-        :data:`_UNREACHED_ROLLUP_ABOVE`. Nothing is latched before the pass ends, so the paged set
-        holds only earlier passes' accounts. Decided on the entries instead, a pass whose refusals
-        left five or fewer standing paged its written ones under the bare source, naming none, and
-        one whose every row was refused carried a rollup with nothing in it.
+        written: whether those just written are more than :data:`_UNREACHED_ROLLUP_ABOVE`.
+        Decided on the entries instead, a pass whose refusals left five or fewer standing paged
+        its written ones under the bare source, naming none, and one whose every row was refused
+        carried a rollup with nothing in it. The accounts earlier passes paged do not count
+        (BACKLOG #3100 closing step 7): counted, a lone account entering after a rollup paged
+        under the bare source too, whose notifier cooldown and suspend are keyed by type and
+        source, so the earlier rollup's could silence its page.
 
         It logs one WARNING naming each account whose row was written, or one WARNING with the
         count on a rolled-up pass; a refused row has the soft write's ERROR instead. A raise ends
@@ -9780,10 +9780,7 @@ class AuthService:
                 warn(pending[1], pending[2])
             # A rollup only with something written: one with nothing would page nothing, and the
             # lifespan task reads the run's length off the entries (final-round finding 1).
-            rollup = (
-                bool(written)
-                and len(self._reconcile_unreached_paged) + len(written) > _UNREACHED_ROLLUP_ABOVE
-            )
+            rollup = len(written) > _UNREACHED_ROLLUP_ABOVE
             if rollup:
                 _log.warning(
                     "directory reconcile: %d accounts entered the unreachable state, so "
