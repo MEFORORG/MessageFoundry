@@ -277,11 +277,10 @@ see its *What it widens* and *Left open*.
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
   account the process runs as, so explicit allows for other principals are removed too. It carries over
-  the file's explicit denies and an explicit OWNER RIGHTS allow that withholds WRITE_DAC, which the icacls
-  rewrite kept; a carried OWNER RIGHTS allow grants the file's owner what it holds. Where the current
-  list cannot be read or parsed, or a list with carried entries cannot be written, it runs the icacls
-  rewrite instead, which keeps every explicit entry, other principals' allows included. Where the write
-  fails otherwise, or the token cannot be read, it logs a WARNING and the file keeps the list it had.
+  the explicit entries whose loss would widen access, which the icacls rewrite kept: denies, and OWNER
+  RIGHTS entries that may leave the owner less than its implicit access. On some failures it runs the
+  icacls rewrite instead, which keeps every explicit entry, other principals' allows included. The
+  `_secure_file` docstring states which entries and which failures.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 

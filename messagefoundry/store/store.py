@@ -9150,14 +9150,14 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     process's token. Written whole, the list replaces the entries the file carried: inherited ones,
     and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
     a file). Two kinds of explicit entry are carried into it, because ``icacls /grant:r`` kept them
-    and dropping them would widen access: a deny, and an OWNER RIGHTS allow that withholds
-    WRITE_DAC (:func:`_entries_the_one_list_keeps`). A carried OWNER RIGHTS allow grants the
-    file's owner what it holds, in place of the READ_CONTROL and WRITE_DAC Windows otherwise gives
-    an owner beyond the list. The owner is not changed, so a file another account owns keeps that
-    owner access. Where the current list cannot be read or parsed, or a list with carried entries
-    cannot be written, the kept icacls rewrite below runs instead, and it keeps every explicit
-    entry, other principals' allows included. A skipped or failed restriction is **logged**
-    (STORE-2), and leaves the file's access list as it was.
+    and dropping them would widen access: a deny, and an OWNER RIGHTS entry that leaves the owner
+    less than the READ_CONTROL and WRITE_DAC Windows otherwise gives an owner beyond the list
+    (:func:`_entries_the_one_list_keeps`). The owner is not changed, so a file another account owns
+    keeps that owner access, or what a carried OWNER RIGHTS entry leaves it. Where the current list
+    cannot be read or parsed, or the write fails other than by access denied, the kept icacls
+    rewrite below runs instead, and it keeps every explicit entry, other principals' allows
+    included. Each of these is **logged** (STORE-2). A restriction that is skipped, or refused with
+    access denied, leaves the file's access list as it was.
 
     ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
     and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
@@ -9208,8 +9208,12 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
                     path,
                     result.failure or f"Win32 status {result.dacl_status}",
                 )
-                if denies or owner_rights:
-                    # A carried entry may be what the write refused; main's rewrite still applies.
+                if result.dacl_status != _ERROR_ACCESS_DENIED:
+                    # The list may be what failed (a carried entry that does not convert, say);
+                    # icacls needs no list text. It needs the same WRITE_DAC, so not after a denial.
+                    log.warning(
+                        "restricting %s with icacls instead, which keeps its explicit entries", path
+                    )
                     _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
@@ -9224,6 +9228,7 @@ _WRITE_DAC = 0x40000
 _GENERIC_ALL = 0x10000000
 #: OWNER RIGHTS, as an SDDL alias and as a SID.
 _OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+_ERROR_ACCESS_DENIED = 5
 
 
 def _grants_write_dac(rights: str) -> bool:
@@ -9241,11 +9246,13 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
     """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
     ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
 
-    A deny is kept because dropping it widens access. An OWNER RIGHTS allow is kept when it
-    withholds WRITE_DAC, because without any OWNER RIGHTS entry the owner holds READ_CONTROL and
-    WRITE_DAC whatever the list says; one that grants WRITE_DAC is dropped, which leaves the owner
-    no more than that. Inherited entries are not kept. The ACE text is copied as written, so an
-    object entry keeps its GUIDs. A null DACL carries nothing."""
+    A deny is kept because dropping it widens access. Without any OWNER RIGHTS entry the owner
+    holds READ_CONTROL and WRITE_DAC whatever the list says, so an OWNER RIGHTS entry is kept when
+    it may leave the owner less: an allow that withholds WRITE_DAC, and every object allow (``OA``),
+    which on a file grants the owner nothing while still removing that implicit access (measured).
+    A plain allow that grants WRITE_DAC is dropped, which leaves the owner no more than it had.
+    Inherited entries are not kept. The ACE text is copied as written, so an object entry keeps its
+    GUIDs. A null DACL carries nothing, so the bare list is written over it."""
     start = sddl.find("D:")
     body = sddl[start + 2 :] if start >= 0 else ""
     end = body.find("S:")
@@ -9267,7 +9274,9 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
             continue
         if kind in _SDDL_DENY_TYPES:
             denies.append(f"({text})")
-        elif kind in ("A", "OA") and ace_sid in _OWNER_RIGHTS and not _grants_write_dac(rights):
+        elif ace_sid in _OWNER_RIGHTS and (
+            kind == "OA" or (kind == "A" and not _grants_write_dac(rights))
+        ):
             owner_rights.append(f"({text})")
     return denies, owner_rights
 
@@ -9344,7 +9353,7 @@ async def _secure_file_async(path: Path) -> None:
 
     On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
     now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
-    subprocess again where the list cannot be read or parsed. Called straight from a
+    subprocess again on the fallbacks :func:`_secure_file` names. Called straight from a
     coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
@@ -9442,8 +9451,9 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
 
     For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
     so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
-    owner-only rewrite. :func:`_secure_file` treats it differently: it cannot tell what a whole list
-    would drop, so it runs the kept icacls rewrite, which keeps every explicit entry."""
+    owner-only rewrite. :func:`_secure_file` checks for a null DACL first, and for any other
+    ``None`` it cannot tell what a whole list would drop, so it runs the kept icacls rewrite, which
+    keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")

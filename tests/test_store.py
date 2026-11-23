@@ -165,12 +165,34 @@ def test_secure_file_logs_and_grants_nobody_when_the_token_cannot_be_read(
     assert "could not read this process's account from its token" in caplog.text
 
 
+def _capture_icacls_runs(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Capture the processes started (none run), each reporting success."""
+    runs: list[list[str]] = []
+
+    class _R:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    def _run(argv: list[str], **_kw: object) -> _R:
+        runs.append(argv)
+        return _R()
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    return runs
+
+
+#: The arguments the kept icacls rewrite passes for the token account.
+_KEPT_REWRITE_ARGS = ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
+
+
 @_windows_only
 @pytest.mark.parametrize(
-    ("failure", "status"),
+    ("failure", "status", "retried"),
     [
-        pytest.param("its DACL did not convert", None, id="not-built"),
-        pytest.param(None, 5, id="refused"),
+        pytest.param("its DACL did not convert", None, True, id="not-built"),
+        pytest.param(None, 87, True, id="invalid-parameter"),
+        pytest.param(None, 5, False, id="access-denied"),
     ],
 )
 def test_secure_file_logs_a_list_it_could_not_write(
@@ -178,8 +200,11 @@ def test_secure_file_logs_a_list_it_could_not_write(
     caplog: pytest.LogCaptureFixture,
     failure: str | None,
     status: int | None,
+    retried: bool,
 ) -> None:
-    # Best-effort, as the icacls rewrite was: a write that did not take is logged, never raised.
+    # Best-effort: a write that did not take is logged, never raised. Unless Windows denied it, the
+    # kept icacls rewrite (_icacls_grant_keeping_explicit_entries) then runs, which needs no list
+    # text; after a denial it would need the same WRITE_DAC, so it does not run.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
@@ -187,11 +212,13 @@ def test_secure_file_logs_a_list_it_could_not_write(
     captured = _capture_dacl_writes(
         monkeypatch, written=store_mod._SddlWrite(failure=failure, dacl_status=status)
     )
+    runs = _capture_icacls_runs(monkeypatch)
     with caplog.at_level("WARNING"):
         store_mod._secure_file(Path("store.db"))
     assert len(captured) == 1
     assert "could not restrict store.db to this account" in caplog.text
     assert (failure or f"Win32 status {status}") in caplog.text
+    assert [argv[1:] for argv in runs] == ([_KEPT_REWRITE_ARGS] if retried else [])
 
 
 @_windows_only
@@ -251,7 +278,7 @@ def test_secure_file_drops_another_principals_explicit_entry(tmp_path, others: s
 
 @_windows_only
 def test_secure_file_keeps_explicit_denies_and_a_restrictive_owner_rights_entry(tmp_path) -> None:
-    # The whole-list write must not loosen what main's `icacls /grant:r` kept: an explicit deny,
+    # The whole-list write must not loosen what `icacls /grant:r` kept before it: an explicit deny,
     # and an explicit OWNER RIGHTS entry that withholds WRITE_DAC from the owner. Everyone's grant,
     # and the inherited-style entries, still go. RED before the carry-over: the list written whole
     # held the token account alone, so the deny and OW:FR were dropped.
@@ -287,19 +314,18 @@ def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_
 
     import messagefoundry.store.store as store_mod
 
+    # An object allow (OA) for OWNER RIGHTS is kept whatever its rights: on a file it grants the
+    # owner nothing, yet it still removes the owner's implicit access (measured in review).
+    oa_read = "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)"
+    oa_full = "(OA;;FA;00000000-0000-0000-0000-000000000002;;OW)"
     current = (
         "O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG)(A;;FR;;;OW)(A;;0x1f01ff;;;OW)(A;;WD;;;OW)(A;;KA;;;OW)"
-        "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
+        f"{oa_read}{oa_full}(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
     )
     captured = _capture_dacl_writes(monkeypatch, current=current)
     store_mod._secure_file(Path("store.db"))
     assert captured == [
-        (
-            "store.db",
-            f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)"
-            "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)",
-            True,
-        )
+        ("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW){oa_read}{oa_full}", True)
     ]
 
 
@@ -319,35 +345,24 @@ def test_secure_file_writes_the_bare_list_over_a_null_dacl(monkeypatch: pytest.M
 def test_secure_file_takes_the_kept_icacls_rewrite_when_a_list_with_carried_entries_fails(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # A carried entry may be what the write refused. Main's icacls rewrite then still restricts the
-    # file, rather than leaving it its inherited list.
+    # A carried entry may be what the write refused. The kept icacls rewrite then still restricts
+    # the file, rather than leaving it its inherited list. The list with the deny is tried first.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
 
-    _capture_dacl_writes(
+    captured = _capture_dacl_writes(
         monkeypatch,
         written=store_mod._SddlWrite(failure="its DACL did not convert"),
         current="D:P(D;;FW;;;BG)",
     )
-    runs: list[list[str]] = []
-
-    class _R:
-        returncode = 0
-        stderr = ""
-        stdout = ""
-
-    def _run(argv: list[str], **_kw: object) -> _R:
-        runs.append(argv)
-        return _R()
-
-    monkeypatch.setattr(subprocess, "run", _run)
+    runs = _capture_icacls_runs(monkeypatch)
     with caplog.at_level("WARNING"):
         store_mod._secure_file(Path("store.db"))
+    assert captured == [("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})", True)]
     assert "could not restrict store.db to this account" in caplog.text
-    assert [argv[1:] for argv in runs] == [
-        ["store.db", "/inheritance:r", "/grant:r", f"*{_TOKEN_SID}:F"]
-    ]
+    assert "restricting store.db with icacls instead" in caplog.text
+    assert [argv[1:] for argv in runs] == [_KEPT_REWRITE_ARGS]
 
 
 @_windows_only
@@ -361,8 +376,8 @@ def test_secure_file_takes_the_kept_icacls_rewrite_when_a_list_with_carried_entr
 def test_secure_file_takes_the_kept_icacls_rewrite_when_the_list_cannot_be_read(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, current: str | None
 ) -> None:
-    # With no list to read, the whole-list write cannot tell what it would drop, so it takes main's
-    # icacls rewrite instead, which keeps every explicit entry. No whole list is written.
+    # With no list to read, the whole-list write cannot tell what it would drop, so it takes the
+    # kept icacls rewrite instead, which keeps every explicit entry. No whole list is written.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
