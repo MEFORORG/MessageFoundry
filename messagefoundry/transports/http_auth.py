@@ -78,10 +78,12 @@ __all__ = [
     "BearerTokenProvider",
     "HttpAuthError",
     "OAuth2ClientCredentialsProvider",
+    "authorization_credential",
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
     "http_digest_selected",
     "is_authorization_header_name",
+    "refuse_authorization_signer_beside_credential",
     "refuse_authorization_signer_beside_digest",
     "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
@@ -516,7 +518,8 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     """Whether Digest is selected, after refusing what cannot stand beside it (BACKLOG #5529).
 
     The connectors call this at the top of construction, so a connection that will not build logs
-    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again.
+    no insecure-hop crossing or warning first; :func:`digest_handler_from_settings` calls it again
+    unless the caller passes the answer it already holds.
     Refuses an unrecognised ``http_auth`` (:func:`http_digest_selected`), and with Digest selected,
     a static ``bearer_token``, ``basic_user``, ``basic_password`` or ``Authorization`` entry in
     ``headers``: beside Digest, a connection configures exactly one HTTP credential. Where such a
@@ -525,7 +528,8 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     is refused under the same rule. Also refuses, here rather than late, a SMART or OAuth2 bearer
     provider beside Digest and a missing Digest user or password. Names settings, never a value.
     A signing header named ``Authorization`` is refused later, once the signer is built, by
-    :func:`refuse_authorization_signer_beside_digest`."""
+    :func:`refuse_authorization_signer_beside_digest` or
+    :func:`refuse_authorization_signer_beside_credential`."""
     if not http_digest_selected(s):
         return False
     # Read strictly: a non-bool flag raises HttpAuthError naming the connection (#2232).
@@ -561,16 +565,55 @@ def refuse_authorization_signer_beside_digest(
     so under that name it would replace the Digest response on the wire. ``sign_header`` is the
     built signer's ``header_name``, or ``None`` when signing is off, so the typed
     ``Destination.sign`` and the flat ``sign_*`` settings are read by the one rule that builds the
-    signer. Called by REST, SOAP and FHIR, the Digest connectors that build a signer."""
-    if digest and sign_header is not None and is_authorization_header_name(sign_header):
+    signer. Called by FHIR; REST and SOAP call
+    :func:`refuse_authorization_signer_beside_credential`, which also reads Digest."""
+    _refuse_authorization_signer(sign_header, "HTTP Digest" if digest else None, connection)
+
+
+def authorization_credential(s: Mapping[str, Any], *, digest: bool) -> str | None:
+    """The credential a connection configures for its ``Authorization`` header, named for a
+    refusal, or ``None`` when it configures none (BACKLOG #5526 item 6). ``digest`` is
+    :func:`refuse_http_digest_conflicts`'s answer, which the caller already holds. Names a
+    setting or a mode, never a value."""
+    if digest:
+        return "HTTP Digest"
+    if smart_auth_configured(s) or oauth2_auth_configured(s):
+        return "a bearer-token provider"
+    if s.get("basic_user") and s.get("basic_password"):
+        return "HTTP Basic"
+    if s.get("bearer_token"):
+        return "a bearer_token"
+    extra = s.get("headers")
+    if isinstance(extra, Mapping) and any(is_authorization_header_name(str(k)) for k in extra):
+        return "an Authorization entry in headers"
+    return None
+
+
+def refuse_authorization_signer_beside_credential(
+    sign_header: str | None, s: Mapping[str, Any], *, digest: bool, connection: str | None
+) -> None:
+    """Refuse a detached-JWS signing header named ``Authorization``, however spelled, beside any
+    credential the connection configures for that header (:func:`authorization_credential`;
+    BACKLOG #5526 item 6). ``_post`` writes the signature per request after the configured or
+    minted credential, so under that name it would replace the credential on every send. Called
+    by REST and SOAP; a signature under that name with no credential beside it still builds."""
+    _refuse_authorization_signer(
+        sign_header, authorization_credential(s, digest=digest), connection
+    )
+
+
+def _refuse_authorization_signer(
+    sign_header: str | None, credential: str | None, connection: str | None
+) -> None:
+    if credential and sign_header is not None and is_authorization_header_name(sign_header):
         raise HttpAuthError(
-            f"{hop_name_prefix(connection)}HTTP Digest cannot be configured beside a signing "
+            f"{hop_name_prefix(connection)}{credential} cannot be configured beside a signing "
             "header named Authorization; configure exactly one"
         )
 
 
 def digest_handler_from_settings(
-    s: Mapping[str, Any], *, url: str
+    s: Mapping[str, Any], *, url: str, digest_selected: bool | None = None
 ) -> urllib.request.HTTPDigestAuthHandler | None:
     """An :class:`urllib.request.HTTPDigestAuthHandler` pre-loaded with the connection's credentials
     (BACKLOG #65, RFC 7616), or ``None`` when HTTP Digest auth is off (``http_auth`` unset, falsy
@@ -583,8 +626,13 @@ def digest_handler_from_settings(
     through the rule the delivery cells' credentials share (``refuse_cleartext_credential_hop``): only
     a loopback host lifts it, never ``tls_hop_attested`` or ``cleartext_accepted`` (vault BACKLOG #3533
     item 4). A missing user/password is a loud :class:`HttpAuthError` (fail-closed, never a silent
-    no-auth request)."""
-    if not refuse_http_digest_conflicts(s):
+    no-auth request).
+
+    ``digest_selected`` is :func:`refuse_http_digest_conflicts`'s answer where the caller already
+    ran it on these settings, so it is not run twice per build (BACKLOG #5526 item 4); ``None``, the
+    default, runs it here."""
+    selected = refuse_http_digest_conflicts(s) if digest_selected is None else digest_selected
+    if not selected:
         return None
     # The declarations are read strictly: a non-bool flag raises HttpAuthError naming the connection
     # (vault BACKLOG #2232), and the mirrored connection name heads the refusal below.

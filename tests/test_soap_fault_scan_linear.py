@@ -72,7 +72,12 @@ def _old_fault_code(body: str, fault: object = None) -> str:
 #: Markup that is not an element, whole: what the first-child search steps over and, BACKLOG
 #: #5912, what the Fault search and the Fault and Code close-tag searches step over.
 _REF_MARKUP = r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>"
-_REF_BODY_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Body[\s/>](.*)", re.IGNORECASE | re.DOTALL)
+#: The reply read from its start as tokens: each markup whole, a Body start tag (group 1), or one
+#: character, so a Body start tag in group 1 is outside markup (BACKLOG #5912 closing step 6).
+_REF_BODY_TOKEN_RE = re.compile(
+    r"(?><!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>)|((?i:<\s*(?:[\w.\-]+:)?Body[\s/>]))|.",
+    re.DOTALL,
+)
 #: Text read lazily, each markup taken whole; atomic, so no backtrack lets a tag inside one match.
 _REF_TEXT = rf"(?:(?>{_REF_MARKUP}|.))*?"
 _REF_FAULT_TAG = r"(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])"
@@ -110,11 +115,11 @@ def _ref_fault_tag_end(body: str) -> int | None:
     and, failing that, any (BACKLOG #5912)."""
     outside = [t.span(1) for t in _REF_TOKEN_RE.finditer(body) if t.group(1)]
     anywhere = [t.span() for t in _REF_FAULT_ANYWHERE_RE.finditer(body)]
-    in_body = _REF_BODY_RE.search(body)
+    in_body = next((t for t in _REF_BODY_TOKEN_RE.finditer(body) if t.group(1)), None)
     sides = (
         [(0, len(body))]
         if in_body is None
-        else [(in_body.start(1), len(body)), (0, in_body.start())]
+        else [(in_body.end(1), len(body)), (0, in_body.start(1))]
     )
     for low, high in sides:
         for spans in (outside, anywhere):
@@ -134,7 +139,7 @@ def _ref_fault_code(body: str) -> str:
     fault_inner = _REF_FAULT_INNER_RE.match(body, fault_tag.end())
     inner = "" if fault_inner is None else fault_inner.group(1)
     code = _ref_first_child_code(inner)
-    if code:
+    if code.strip():
         return code
     plain_end = _REF_FAULT_CLOSE_ANYWHERE_RE.search(body, name_end)
     return _ref_searched_code(
@@ -853,7 +858,7 @@ def test_the_fault_is_read_from_the_body(
     patched out the shape reads otherwise, as it did when the first Fault, and any WS-Security
     code, anywhere was read."""
     assert _outcome(_classify_soap(200, body)) == outcome
-    monkeypatch.setattr(soap, "_BODY_RE", _NO_BODY_ANCHOR)
+    monkeypatch.setattr(soap, "_BODY_OUTSIDE_MARKUP_RE", _NO_BODY_ANCHOR)
     assert _outcome(_classify_soap(200, body)) == unanchored
 
 
@@ -938,6 +943,21 @@ _FAULT_TAG_IN_MARKUP = {
         "soap-sender",
         "soap-sender",
     ),
+    # BACKLOG #5912 closing step 24: with two Faults, each inside markup, the first is read. The
+    # pair holds the same two Faults in both orders, so a search that took any other one would
+    # read one of the two shapes otherwise.
+    "only-commented-faults-client-first": (
+        "<soap:Body><!-- <soap:Fault><faultcode>soap:Client</faultcode></soap:Fault> -->"
+        "<!-- <soap:Fault><faultcode>soap:Server</faultcode></soap:Fault> --></soap:Body>",
+        "soap-sender",
+        "soap-sender",
+    ),
+    "only-commented-faults-server-first": (
+        "<soap:Body><!-- <soap:Fault><faultcode>soap:Server</faultcode></soap:Fault> -->"
+        "<!-- <soap:Fault><faultcode>soap:Client</faultcode></soap:Fault> --></soap:Body>",
+        "transient",
+        "transient",
+    ),
     # The first Body start tag inside a comment: the markup it sits in is known after it, so the
     # Fault in the same comment is not the Body's.
     "body-tag-in-a-comment": (
@@ -991,6 +1011,8 @@ def test_a_fault_tag_inside_markup_does_not_decide_the_fault(
     monkeypatch.setattr(soap, "_FAULT_OUTSIDE_MARKUP_RE", soap._FAULT_RE)
     monkeypatch.setattr(soap, "_FAULT_END_OUTSIDE_MARKUP_RE", soap._FAULT_END_RE)
     monkeypatch.setattr(soap, "_CODE_END_OUTSIDE_MARKUP_RE", soap._CODE_END_RE)
+    # Head adfdcd5d31 took the first Body start tag inside markup or not (closing step 6).
+    monkeypatch.setattr(soap, "_BODY_OUTSIDE_MARKUP_RE", soap._BODY_RE)
     # Head adfdcd5d31 had no fallback to the earlier search, which may read such a shape too.
     monkeypatch.setattr(soap, "_searched_code", lambda body, start, end: "")
     assert _outcome(_classify_soap(200, body)) == unmarked

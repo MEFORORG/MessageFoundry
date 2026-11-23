@@ -47,7 +47,8 @@ opt-in and off by default (2026-09-23).
 
 **Classification reads settings keys, not the built connector**, so each rule below mirrors what the
 connector does with those keys: a client certificate counts only with ``tls`` on, HTTP Basic only when
-both halves are set, a WS-Security UsernameToken only with ``ws_security`` on, and a static
+both halves are set, a WS-Security UsernameToken only with ``ws_security`` on and both
+``ws_username`` and ``ws_password`` set (BACKLOG #5526 item 11), and a static
 ``Authorization`` credential not at all when SMART or OAuth2 replaces that header with a minted token.
 An HTTP-family hop's ``headers`` table and ``url`` query are read too (BACKLOG #5510), by the
 redaction screen's header test and the query-credential reader; ``_http_literal_static`` says how.
@@ -183,25 +184,34 @@ def _oauth2(settings: Mapping[str, Any]) -> bool:
 
 
 def _digest(settings: Mapping[str, Any]) -> bool:
+    """Whether ``http_auth`` selects Digest, read as the REST, SOAP and FHIR destinations read it.
+    DICOMweb and ``FhirLookup`` build no Digest handler, so on them a ``True`` here names a
+    credential the hop does not send; the census lists it all the same."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
+    if isinstance(settings.get("http_auth"), EnvRef):
+        # BACKLOG #5526 item 9: read before env() resolves, the mode is unknown, and it may resolve
+        # to 'digest', so it is listed, as an unresolved oauth2_enabled reads as on.
+        return True
     try:
         return http_digest_selected(settings)
     except HttpAuthError as exc:
-        # An unrecognised mode refuses the connector (#5529), so no Digest credential crosses. The
-        # message names the connection and never the value; the connector's build reports it loudly.
+        # An unrecognised mode refuses the REST, SOAP and FHIR destinations (#5529), so no Digest
+        # credential crosses there. The message names the connection and never the value; the
+        # connector's build reports it loudly.
         logging.getLogger(__name__).debug("static-credential census: %s", exc)
         return False
 
 
 def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
-    """The static credentials the connector writes into its own ``Authorization`` header."""
-    out: list[str] = []
-    if settings.get("bearer_token"):
-        out.append("static bearer token")
+    """The static credential the connector writes into its own ``Authorization`` header. With both
+    a ``bearer_token`` and a Basic pair set, REST, SOAP and DICOMweb refuse to build, and FHIR
+    sends Basic, so only Basic is listed (BACKLOG #5526 item 2)."""
     if settings.get("basic_user") and settings.get("basic_password"):
-        out.append("HTTP Basic")
-    return out
+        return ["HTTP Basic"]
+    if settings.get("bearer_token"):
+        return ["static bearer token"]
+    return []
 
 
 def _http_static(ctype: ConnectorType, settings: Mapping[str, Any], token: bool) -> list[str]:
