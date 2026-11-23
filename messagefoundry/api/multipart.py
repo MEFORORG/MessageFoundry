@@ -176,8 +176,9 @@ class _LineStartDelimiters:
     2046, which keeps only ``CRLF--<boundary>`` out of content: a content line after a bare CR or a
     bare LF that starts with ``--<boundary>`` is taken as a delimiter here, though a conforming
     sender may write one. At least these are still read without a refusal: a content line that is
-    ``--<boundary>--`` with only padding after it, taken as the close; a content line that starts
-    with ``--<boundary>`` and then anything but ``--``, taken as a delimiter, which nothing after the
+    ``--<boundary>--`` with only padding after it up to a CR (bare or not), an LF or the end of the
+    body, taken as the close, whatever follows a bare CR; a content line that starts with
+    ``--<boundary>`` and then anything but ``--``, taken as a delimiter, which nothing after the
     boundary is checked for; and a preamble line that starts with the close marker and has only
     padding after it, taken as the close of a body with no parts.
 
@@ -346,9 +347,11 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # part would otherwise run to the end of the body and be taken as complete. Checked last, so a
     # body that fails a check above gets that refusal. A close marker counts only where a delimiter
     # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
-    # makes a cut-short body pass as complete. At least the shapes _LineStartDelimiters names
-    # still do. The first-delimiter and close-tail refusals it describes are raised here too, after
-    # the checks above on the parts the walk reached.
+    # makes a cut-short body pass as complete. At least two shapes _LineStartDelimiters names still
+    # do: a content line that is the close marker with only padding after it (up to a CR, an LF or
+    # the end), and a preamble line that starts with one. The first-delimiter and close-tail
+    # refusals it describes are raised here too, after the checks above on the parts the walk
+    # reached.
     if not delims.first_starts_line:
         raise MultipartError(
             "multipart body's first boundary delimiter is not at the start of a line, or the body "
