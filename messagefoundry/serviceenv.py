@@ -117,6 +117,11 @@ _NSSM_LABEL_PREFIX = "Parameters\\"
 #: on PR 3142, comment 7090314503).
 _EXTRA_LIST = f"{_NSSM_LABEL_PREFIX}{NSSM_EXTRA_VALUE}"
 
+#: Where an entry read from NSSM's ``AppEnvironment`` sits. Where that list holds anything, NSSM
+#: replaces the service's environment with it, so the Service Control Manager's ``Environment``
+#: reaches no engine (the Lander's hold on PR 3142, comment 7096232111, item 4).
+_APP_ENVIRONMENT_LIST = f"{_NSSM_LABEL_PREFIX}{NSSM_ENVIRONMENT_VALUES[0]}"
+
 _NSSM_IMAGE = "nssm.exe"
 
 
@@ -218,6 +223,21 @@ class ServiceEnvPosture:
     #: Whether ``MEFOR_SECRETS_DIRECTORY`` is in ``listed`` only through look-alike spellings, so
     #: the remedy does not take it as the real entry. The remedy alone reads this.
     directory_listed_as_lookalike: bool = False
+    #: Whether a line of any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` with a blank
+    #: around the name (:func:`_padded_directory`), which the engine does not read. The remedy
+    #: alone reads this: it says to take each such entry out (the Lander's hold on PR 3142,
+    #: comment 7096232111, item 1).
+    directory_padded: bool = False
+    #: Whether every look-alike and padded line in the lists sets a value that is blank or
+    #: plainly a path (:func:`_stray_value_plain`), so the remedy may say to name that path under
+    #: the ASCII spelling. The remedy alone reads this (comment 7096232111, item 3).
+    directory_stray_paths_plain: bool = True
+    #: Whether an ASCII spelling of ``MEFOR_SECRETS_DIRECTORY`` that :func:`_names` keeps, or one
+    #: kept as a joined path (``directory_path_joined``), is in a list the engine receives. NSSM
+    #: replaces the environment with AppEnvironment where that is set, so the Service Control
+    #: Manager's ``Environment`` then reaches no engine. The remedy alone reads this (comment
+    #: 7096232111, item 4).
+    directory_named_received: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -661,6 +681,9 @@ class _Variable:
     written: str = field(repr=False)
     #: The rest of its line, and every line after it up to the next variable's.
     value: str = field(repr=False)
+    #: The name as written, unstripped, which :func:`_names_directory` reads, since
+    #: ``os.environ`` keeps any padding in a name.
+    raw: str = field(default="", repr=False)
     #: Its line on its registry string, counted from 1, when that is not the string's first.
     line: int | None = None
     #: Whether NSSM may read the name with a line break in it.
@@ -704,11 +727,11 @@ def _read_string(
     if skip is None:
         return [], None  # a blank string sets nothing
     first, *rest_lines = lines[skip:]
-    first_written, first_equals, first_rest = first.partition("=")
-    first_written = first_written.strip()
+    first_raw, first_equals, first_rest = first.partition("=")
+    first_written = first_raw.strip()
     # The whole-string reading, below: the name is everything before the first equals sign.
-    whole_written, whole_equals, whole_value = entry.partition("=")
-    whole_written = whole_written.strip()
+    whole_raw, whole_equals, whole_value = entry.partition("=")
+    whole_written = whole_raw.strip()
     whole_kept = bool(whole_equals) and _refused_name(whole_written.upper())
     # A refused name alone in a string the whole-string reading names nothing in, such as a
     # ``MEFOR_VALUE_*`` name as ``nssm set ... MEFOR_VALUE_X =value`` writes it.
@@ -718,8 +741,9 @@ def _read_string(
     first_sets = bool(first_equals) or empty_class
     first_line = skip + 1 if skip else None
     first_parts = [first_rest]
-    # A later line kept as a variable: its line number, name as written and value parts.
-    later: list[tuple[int, str, list[str], bool]] = []
+    # A later line kept as a variable: its line number, name as written, stripped and not, its
+    # value parts, and whether it is a name alone.
+    later: list[tuple[int, str, str, list[str], bool]] = []
     starts_seen = False  # whether any later line starts a variable, kept or ordinary
     parts = first_parts  # the value the current line belongs to
     for number, line in enumerate(rest_lines, skip + 2):
@@ -751,21 +775,26 @@ def _read_string(
         starts_seen = True
         empty_class = start == "kept" and (alone or _blank_class(written, rest))
         if start == "kept":
-            later.append((number, written.strip(), parts, alone))
+            later.append((number, written.strip(), written, parts, alone))
         # an ordinary line ends the value above, and is not kept
     read: list[_Variable] = []
     ending: _Variable | None = None  # the kept variable the last line belongs to
     if first_sets:
         read.append(
             _Variable(
-                where, first_written, "\n".join(first_parts), line=first_line, alone=first_alone
+                where,
+                first_written,
+                "\n".join(first_parts),
+                raw=first_raw,
+                line=first_line,
+                alone=first_alone,
             )
         )
         if parts is first_parts:
             ending = read[-1]
     later_variables = [
-        _Variable(where, written, "\n".join(value_parts), line=number, alone=alone)
-        for number, written, value_parts, alone in later
+        _Variable(where, written, "\n".join(value_parts), raw=raw, line=number, alone=alone)
+        for number, written, raw, value_parts, alone in later
     ]
     # The whole-string reading: the name is everything before the first equals sign, stripped,
     # and the value everything after it. Kept when that name is one the refusal is about, so a
@@ -782,7 +811,15 @@ def _read_string(
         ]
         counted = not (broken and _names(same_string))
         read.append(
-            _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
+            _Variable(
+                where,
+                name,
+                whole_value,
+                raw=whole_raw,
+                line=first_line,
+                broken=broken,
+                counted=counted,
+            )
         )
         # Its value ends with the string, so it is the one the string ends on when no line of
         # the line reading starts a variable, as with ``MEFOR_VALUE_A<LF>=``, or
@@ -790,7 +827,7 @@ def _read_string(
         if not first_sets and not starts_seen:
             ending = read[-1]
     read.extend(later_variables)
-    if later and parts is later[-1][2]:
+    if later and parts is later[-1][3]:
         ending = later_variables[-1]
     if ending is None or not _value_still_open(ending):
         ending = None
@@ -995,22 +1032,27 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     return read
 
 
+def _names_directory(written: str) -> bool:
+    """Whether a name, as written before its equals sign, names ``MEFOR_SECRETS_DIRECTORY``: the
+    one rule every reader and gate here applies (decision d20261123T090650912-b8c20e, the
+    Lander's hold on PR 3142, comment 7096232111). It is the rule ``os.environ`` applies on
+    Windows, ``str.upper`` and no strip, so a name with U+017F or U+0131 counts, and a name with
+    any blank around it, ASCII or not, does not: the engine does not read it."""
+    return written.upper() == _DIRECTORY_VARIABLE
+
+
 def _sets_directory(entry: str) -> bool:
-    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case. The name is folded with ``str.upper``, as ``os.environ`` folds a key on
-    Windows, so a name with U+017F or U+0131 counts, and only ASCII spaces and tabs around it
-    are stripped, so a blank such as U+00A0 stays in it and the name does not count (the
-    Lander's hold on PR 3142, comment 7091598959)."""
+    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, read
+    under :func:`_names_directory`."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
     return _directory_name(first) is not None
 
 
 def _directory_name(line: str) -> str | None:
-    """The name ``line`` sets, as written with ASCII spaces and tabs stripped, when it sets
-    ``MEFOR_SECRETS_DIRECTORY`` as :func:`_sets_directory` reads one; else None."""
+    """The name ``line`` sets, as written, when it sets ``MEFOR_SECRETS_DIRECTORY`` as
+    :func:`_names_directory` reads one; else None."""
     written, equals, _rest = line.partition("=")
-    name = written.strip(" \t")
-    return name if equals and name.upper() == _DIRECTORY_VARIABLE else None
+    return written if equals and _names_directory(written) else None
 
 
 def _directory_lookalike(line: str) -> str | None:
@@ -1021,6 +1063,23 @@ def _directory_lookalike(line: str) -> str | None:
     3142, comment 7092584745)."""
     name = _directory_name(line)
     return name if name is not None and not name.isascii() else None
+
+
+def _padded_directory(line: str) -> bool:
+    """Whether ``line`` sets a name that is ``MEFOR_SECRETS_DIRECTORY`` once blanks around it are
+    stripped, but not as written (:func:`_names_directory`). ``os.environ`` keeps the blank in the
+    name, so the engine does not read it as the directory, and install-service.ps1's
+    ``StartsWith("$Name=")`` match does not see it either. The remedy alone reads this."""
+    written, equals, _rest = line.partition("=")
+    return bool(equals) and not _names_directory(written) and _names_directory(written.strip())
+
+
+def _stray_value_plain(line: str) -> bool:
+    """Whether the value ``line`` sets is blank or plainly a path, as :func:`_directory_entry_value`
+    judges a directory entry's value, whatever name it sets. The remedy alone reads this, to copy
+    a look-alike's or a padded entry's value under the ASCII spelling only where it is a path."""
+    value = line.partition("=")[2]
+    return _directory_entry_value(f"{_DIRECTORY_VARIABLE}={value}") is not None
 
 
 def _with_code_points(name: str) -> str:
@@ -1049,17 +1108,16 @@ def _sets_directory_beside_more(entry: str) -> bool:
 
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
-    only blanks or line breaks after it and no blank around the name, the name folding to it
-    with ``str.upper`` as ``os.environ`` folds a key on Windows (the Lander's hold on PR 3142,
-    comment 7091598959), and the value is blank or plainly a path (:data:`_PLAIN_PATH`) with no
-    key run in it (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips
-    the value it reads, so what trails it does not matter. The remedy alone reads it, to tell a
-    joined directory path from key material."""
+    only blanks or line breaks after it, the name read under :func:`_names_directory`, and the
+    value is blank or plainly a path (:data:`_PLAIN_PATH`) with no key run in it
+    (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips the value it
+    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
+    directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
         return None
     written, equals, value = line.partition("=")
-    if not equals or written.upper() != _DIRECTORY_VARIABLE:
+    if not equals or not _names_directory(written):
         return None
     if _still_blank(value):
         return value  # nothing in it, so no key and no path to keep
@@ -1096,13 +1154,14 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
     path is not a secret, so that name is not kept either (:func:`_path_form`). Only a
     secret-class name, a ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the
     text before any other line's equals sign may be key material (vault BACKLOG #5394). Windows
-    compares environment names without case, so this does too. Each name is returned with the
-    first registry value, and the line, that sets it."""
+    compares environment names without case, so this does too. ``MEFOR_SECRETS_DIRECTORY`` is
+    kept only under :func:`_names_directory`, read on the name as written, so a padded one is
+    not. Each name is returned with the first registry value, and the line, that sets it."""
     names: dict[str, tuple[str, int | None]] = {}
     for variable in variables:
         name = variable.written.upper()
         value = variable.value
-        if not variable.counted or not (_refused_name(name) or name == _DIRECTORY_VARIABLE):
+        if not variable.counted or not (_refused_name(name) or _names_directory(variable.raw)):
             continue
         # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
@@ -1178,6 +1237,15 @@ def read_service_env_posture(
     variables = _variables(entries)
     found = _names(variables)
     empty, unplain = _value_entry_shapes(variables)
+    directory_path_joined = any(v.keeps_directory and _names([v]) for v in variables) and all(
+        v.directory_only for v in variables if v.runs_on and _names([v])
+    )
+    # NSSM replaces the environment with AppEnvironment where that holds anything, so the
+    # Service Control Manager's Environment then reaches no engine.
+    replaced = any(where == _APP_ENVIRONMENT_LIST for where, _entry in entries)
+    received = [v for v in variables if not (replaced and v.where == SCM_ENVIRONMENT_VALUE)]
+    lines = [line for _where, entry in entries for line in _LINE_BREAK.split(entry)]
+    stray = [line for line in lines if _directory_lookalike(line) or _padded_directory(line)]
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
@@ -1191,16 +1259,13 @@ def read_service_env_posture(
         directory_only_names=_every_kept(variables, found, lambda v: v.directory_only),
         # Fail closed: one run-on value that takes anything but a blank or plain-path directory
         # entry may hold key material, so nothing says to keep any entry (sixth hold, H1).
-        directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
-        and all(v.directory_only for v in variables if v.runs_on and _names([v])),
+        directory_path_joined=directory_path_joined,
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
         # Every line, since NSSM may read a later line of a string as its own variable.
-        directory_in_lists=any(
-            _sets_directory(line) for _where, entry in entries for line in _LINE_BREAK.split(entry)
-        ),
+        directory_in_lists=any(_sets_directory(line) for line in lines),
         # AppEnvironmentExtra only: the add-back step's clauses act inside that list, which it
         # says to read first and pass back whole.
         directory_only_in_extra=any(
@@ -1211,18 +1276,17 @@ def read_service_env_posture(
         ),
         directory_lookalikes=tuple(
             dict.fromkeys(
-                name
-                for _where, entry in entries
-                for line in _LINE_BREAK.split(entry)
-                if (name := _directory_lookalike(line)) is not None
+                name for line in lines if (name := _directory_lookalike(line)) is not None
             )
         ),
         directory_listed_as_lookalike=any(name == _DIRECTORY_VARIABLE for name, _w, _l in found)
-        and all(
-            not v.written.isascii()
-            for v in variables
-            if v.written.upper() == _DIRECTORY_VARIABLE and _names([v])
-        ),
+        and all(not v.raw.isascii() for v in variables if _names_directory(v.raw) and _names([v])),
+        directory_padded=any(_padded_directory(line) for line in lines),
+        directory_stray_paths_plain=all(_stray_value_plain(line) for line in stray),
+        directory_named_received=any(
+            _names_directory(v.raw) and v.raw.isascii() and _names([v]) for v in received
+        )
+        or (directory_path_joined and any(v.keeps_directory and _names([v]) for v in received)),
     )
 
 
@@ -1356,6 +1420,27 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     directory_named = (
         _DIRECTORY_VARIABLE in posture.listed and not posture.directory_listed_as_lookalike
     )
+    lookalikes = posture.directory_lookalikes
+    # The take-out step prints for a look-alike or a padded entry. It leaves an ASCII entry as
+    # the one that names the directory only where the engine receives that entry (the Lander's
+    # hold on PR 3142, comment 7096232111, item 4).
+    takes_out = bool(lookalikes) or posture.directory_padded
+    leave = takes_out and posture.directory_named_received
+    plain = posture.directory_stray_paths_plain
+    files_path = "the path of the directory that holds the secrets directory's files"
+
+    def leave_path(stray: str) -> str:
+        # A stray entry's value is offered as that path only where it is plainly one (item 3).
+        if plain:
+            return f"{files_path}, which may be the path {stray} named"
+        return f"{files_path}, not the value of {stray}, which is not plainly a path"
+
+    copied_path = (
+        "the path that entry named"
+        if plain
+        else f"{files_path}, not that entry's value, which is not plainly a path"
+    )
+    repoint = False
     steps: list[str] = []
     if moving_keys:
         steps.append(
@@ -1378,6 +1463,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         put = [", ".join(moving_others)] if moving_others else []
         if moving_values:
             put.append("each MEFOR_VALUE_* variable")
+        repoint = bool(leave and put)
+        if repoint:
+            # The Put step sends files where the ASCII entry points, so that entry names the
+            # final path first (the Lander's hold on PR 3142, comment 7096232111, item 6).
+            steps.append(
+                "Before moving anything into the secrets directory, set the entry spelled in "
+                f"ASCII that sets {_DIRECTORY_VARIABLE} to "
+                f"{leave_path('an entry a later step says to take out')}"
+            )
         parts = (
             [
                 f"Put {' and '.join(put)} in the secrets directory MEFOR_SECRETS_DIRECTORY "
@@ -1444,47 +1538,88 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         and not directory_named
         and not posture.directory_path_joined
     )
-    lookalikes = posture.directory_lookalikes
-    if lookalikes:
-        # Never kept, blank or not, and never taken as the real entry: the engine reads it
-        # through os.environ, install-service.ps1 does not see it, and a blank one beside an
-        # ASCII entry still reads as '' (the Lander's hold on PR 3142, comment 7092584745).
-        lookalike = (
-            f"At least one entry spells {_DIRECTORY_VARIABLE} with a character outside ASCII, "
-            "written here with each such character as its code point: "
-            f"{', '.join(_with_code_points(name) for name in lookalikes)}. Windows keeps such a "
-            "name apart from the ASCII one, but the engine reads its environment through "
-            f"Python's os.environ, which folds it to {_DIRECTORY_VARIABLE}, so the engine may "
-            "read it as the secrets directory. install-service.ps1 does not match it, so a "
-            "re-run of the installer may add a second entry beside it. Take each such entry "
-            "out of the service's environment, whether its value is blank or not, taking only "
-            "its own line out of an entry that holds other lines too"
-        )
-        if directory_named or posture.directory_path_joined:
-            # An ASCII entry already names the directory, so adding one would make two. The
-            # engine may be reading the look-alike's path, so the ASCII entry must name the
-            # path that holds the files before the look-alike goes.
-            lookalike += (
-                ", and leave the entry spelled in ASCII as the one that names it, first setting "
-                "it to the path that holds the secrets directory's files, which may be the one a "
-                "look-alike named"
+    if takes_out:
+        # Never kept, blank or not, and never taken as the real entry: a look-alike the engine
+        # reads through os.environ and install-service.ps1 does not see, a blank one beside an
+        # ASCII entry still reading as '' (the Lander's hold on PR 3142, comment 7092584745), and
+        # a padded one neither of them reads (comment 7096232111, item 1).
+        said: list[str] = []
+        if lookalikes:
+            said.append(
+                f"At least one entry spells {_DIRECTORY_VARIABLE} with a character outside "
+                "ASCII, written here with each such character as its code point: "
+                f"{', '.join(_with_code_points(name) for name in lookalikes)}. Windows was "
+                "measured keeping a name with U+017F apart from the ASCII one, but the engine "
+                "reads its environment through Python's os.environ, which folds such a name to "
+                f"{_DIRECTORY_VARIABLE}, so the engine may read it as the secrets directory. "
+                "install-service.ps1 does not match it, so a re-run of the installer may add a "
+                "second entry beside it"
             )
+        if posture.directory_padded:
+            said.append(
+                f"At least one entry spells {_DIRECTORY_VARIABLE} with a blank before or after "
+                "the name, such as a space, a tab or U+00A0. Python's os.environ keeps that "
+                "blank in the name, so the engine does not read it as the secrets directory, "
+                "and install-service.ps1, which matches the name followed at once by an equals "
+                "sign, does not see it either"
+            )
+        said.append(
+            "Take each such entry out of the service's environment, whether its value is blank "
+            "or not, taking only its own line out of an entry that holds other lines too, "
+            "keeping each other line no step above says to remove"
+        )
+        takeout = ". ".join(said)
+        if leave:
+            # An ASCII entry the engine receives already names the directory, so adding one
+            # would make two. The engine may be reading a look-alike's path, so the ASCII entry
+            # names the path that holds the files before the look-alike goes (items 4 and 6).
+            if repoint:
+                takeout += (
+                    ", and leave the entry spelled in ASCII as the one that names it, set to the "
+                    "path the step before the move into the secrets directory gave it"
+                )
+            else:
+                takeout += (
+                    ", and leave the entry spelled in ASCII as the one that names it, first "
+                    f"setting it to {leave_path('an entry this step takes out')}"
+                )
         elif add_back_prints:
-            lookalike += (
-                ". Where one named the secrets directory, name that same path under the ASCII "
-                f"spelling {_DIRECTORY_VARIABLE} in the service's AppEnvironmentExtra; the next "
-                "step says how"
+            # The next step opens on install-service.ps1 having made the directory, and names
+            # that path, so this says to follow it either way, and which path to name (item 8).
+            takeout += (
+                ". Where an entry this step takes out was meant to name the secrets directory, "
+                "follow the next step even where install-service.ps1 did not make that "
+                f"directory, and name {copied_path}, in place of the path that step names. As "
+                "it says, `nssm set` replaces that whole list, so read AppEnvironmentExtra first "
+                "with `nssm get`, running the service's own nssm.exe by its full path"
             )
         else:
-            lookalike += (
-                f". Where one named the secrets directory, add {_DIRECTORY_VARIABLE}, spelled in "
-                "ASCII, naming that path to the service's AppEnvironmentExtra, the list "
-                "install-service.ps1 reads. `nssm set` replaces that whole list, so read it first "
+            # The add-back step's clauses, so the new entry is the only one there that sets the
+            # directory, and its warning about the installer (items 2 and 7).
+            takeout += (
+                ". Where an entry this step takes out was meant to name the secrets directory, "
+                f"add {_DIRECTORY_VARIABLE}, spelled in ASCII, to the service's "
+                f"AppEnvironmentExtra, the list install-service.ps1 reads, naming {copied_path}, "
+                "as the only entry there that sets it, "
+            )
+            if posture.directory_only_in_extra:
+                takeout += (
+                    f"and remove any other entry that sets {_DIRECTORY_VARIABLE} and nothing else, "
+                )
+            if posture.directory_mixed_in_extra:
+                takeout += (
+                    f"and take each line that sets {_DIRECTORY_VARIABLE} out of any other entry "
+                    "that holds other lines too, keeping each other line no step above says to "
+                    "remove, "
+                )
+            takeout += (
+                "before any re-run of the installer, which refuses an existing directory the "
+                "service does not name. `nssm set` replaces that whole list, so read it first "
                 "with `nssm get`, running the service's own nssm.exe by its full path, and pass "
                 "back every entry but those this remedy says to remove, leaving out the lines "
                 "this step says to take out"
             )
-        steps.append(lookalike)
+        steps.append(takeout)
     if add_back_prints:
         # After the removal and the run-on sentence, as on origin/main, so the list it says
         # to pass back is the one those steps left. A joined directory string is removed with
@@ -1550,8 +1685,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # every refused variable that runs on takes nothing else (sixth hold, H1).
         # Where the look-alike step sits between, "them" would bind to the look-alikes, so the
         # sentence names its own antecedent there.
-        them = "any entry a refused value runs on into" if lookalikes else "any of them"
-        spelled = ", spelled in ASCII," if lookalikes else ""
+        them = "any entry a refused value runs on into" if takes_out else "any of them"
+        spelled = ", spelled in ASCII," if takes_out else ""
         steps.append(
             f"Keep {them} that sets {_DIRECTORY_VARIABLE}{spelled} to a path and nothing else, as "
             "its own entry"
