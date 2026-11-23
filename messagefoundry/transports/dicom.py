@@ -493,7 +493,8 @@ class _Shape(NamedTuple):
     loses everything after its head. ``whole`` is for a line with more than one value: it stays as
     it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
     after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
-    with the same value in it. No pattern here can backtrack over the peer's text, so a long value
+    with the same value in it. ``needs`` is fixed text a line must hold for a head this general to
+    count at all. No pattern here can backtrack over the peer's text, so a long value
     costs one pass, on whatever thread logged it."""
 
     head: re.Pattern[str]
@@ -502,6 +503,7 @@ class _Shape(NamedTuple):
     anywhere: bool = False
     whole: re.Pattern[str] | None = None
     warning: str | None = None
+    needs: str | None = None
 
 
 #: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
@@ -520,6 +522,7 @@ class _Shape(NamedTuple):
 _NON_CONFORMANT_NAME = _Shape(
     re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
 )
+_NOT_A_PRIVATE_CREATOR = "' is not a valid private creator"
 #: What ``set_uid``, ``set_ae``, ``decode_bytes`` and pydicom's ``validate_value`` say as they refuse
 #: a value, read wherever it appears in any record or traceback on a filtered logger, since a
 #: refusal is logged by whichever module caught it and pydicom's ``tag_in_exception`` wraps it in a
@@ -587,6 +590,16 @@ _REFUSALS: tuple[_Shape, ...] = (
         ),
         anywhere=True,
     ),
+    # A private element's creator with more than one value, which pydicom prints whole, as a line
+    # and in the KeyError it raises, whose str() is the repr of the line and so ends in a quote.
+    _Shape(
+        re.compile(r"\([0-9A-F]{4},[0-9A-F]{4}\) '"),
+        _NOT_A_PRIVATE_CREATOR,
+        re.compile(_NOT_A_PRIVATE_CREATOR + "[\"']?"),
+        anywhere=True,
+        warning=r"\([0-9A-F]{4},[0-9A-F]{4}\) '(?s:.*)" + _NOT_A_PRIVATE_CREATOR,
+        needs=_NOT_A_PRIVATE_CREATOR,
+    ),
 )
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
     # An object's SOP class and transfer syntax, as the SCU found no accepted context for them.
@@ -596,6 +609,15 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
             whole=re.compile(
                 r"No presentation context for '([^']*)' has been accepted by the peer"
                 r"(?: with '([^']*)' transfer syntax)? for the (?:SCU|SCP) role"
+            ),
+        ),
+        # The SOP class of a request pynetdicom has no service for, which a peer's command names.
+        _Shape(
+            re.compile(r"No supported service class available for the SOP Class UID '"),
+            whole=re.compile(
+                r"No supported service class available for the SOP Class UID '([^']*)', please see "
+                r"the pynetdicom\.sop_class\.register_uid\(\) function if you need to add support "
+                r"for a private, retired or otherwise unknown SOP Class UID"
             ),
         ),
     ),
@@ -651,6 +673,8 @@ def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
     further on goes with the first."""
     found: tuple[_Shape, re.Match[str]] | None = None
     for shape in shapes:
+        if shape.needs is not None and shape.needs not in text:
+            continue
         head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
         if head is not None and (found is None or head.start() < found[1].start()):
             found = (shape, head)
@@ -3086,17 +3110,29 @@ class DicomScuDestination(DestinationConnector):
             dataset = dcmread(BytesIO(object_bytes))
             transfer_syntax = dataset.file_meta.TransferSyntaxUID
             sop_class = str(dataset.SOPClassUID)
+            # For the log lines and errors alone; the raw class is what the association proposes.
+            # The read is lazy, so an instance UID that does not convert raises here.
+            sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
         except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
             raise NegativeAckError(
                 "DICOM C-STORE client (SCU): outgoing object is not a parseable DICOM Part-10 object (no retry)",
                 code="bad-object",
                 permanent=True,
             ) from exc
-        # For the log lines and errors alone; the raw class is what the association proposes.
-        sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
         logged_class = _loggable_uid(sop_class)
         ae = self._build_ae()
-        ae.add_requested_context(sop_class, transfer_syntax)
+        try:
+            ae.add_requested_context(sop_class, transfer_syntax)
+        except ValueError as exc:
+            # pynetdicom refuses the object's own class or syntax (at least one over 64 characters),
+            # so a retry repeats it; raw, its text would carry the value into last_error, and the
+            # internal-error arm could stop the lane on one object.
+            raise NegativeAckError(
+                "DICOM C-STORE client (SCU): outgoing object names a SOP class or transfer syntax "
+                "that cannot be proposed (no retry)",
+                code="bad-object",
+                permanent=True,
+            ) from exc
         assoc = self._associate(ae)
         if not assoc.is_established:
             # A peer that **answered** but accepted no presentation context for this object (rejected the

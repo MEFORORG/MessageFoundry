@@ -1733,3 +1733,202 @@ def test_a_refused_value_in_a_peers_dimse_response_never_reaches_the_log(
         if line.startswith("pynetdicom.dimse: Invalid 'Affected SOP Class UID' value '[redacted]'")
         and "Traceback" in line
     ], filtered
+
+
+# --- The no-service-class and private creator lines (vault BACKLOG #6637) --------------------------
+
+_NO_SERVICE_TAIL = (
+    "', please see the pynetdicom.sop_class.register_uid() function if you need to add support "
+    "for a private, retired or otherwise unknown SOP Class UID"
+)
+#: The length of the class UID in ``_c_store_command``, so a replace keeps the command set's lengths.
+_PLANTED_CLASS = (_PLANTED + ".9" * 7)[:30]
+
+
+def _no_service_line(value: str) -> str:
+    return f"No supported service class available for the SOP Class UID '{value}{_NO_SERVICE_TAIL}"
+
+
+def test_the_no_service_class_line_keeps_only_a_conformant_class() -> None:
+    assert _filtered("pynetdicom.association", _no_service_line(_PLANTED)) == (
+        "No supported service class available for the SOP Class UID '[redacted]"
+    )
+    # The CONTROL: a real private class is what an operator needs from this line.
+    real = _no_service_line("1.2.826.0.1.3680043.2.1")
+    assert _filtered("pynetdicom.association", real) == real
+
+
+def test_the_no_service_class_line_is_still_pynetdicoms() -> None:
+    import inspect
+
+    from pynetdicom import association
+
+    source = inspect.getsource(association.Association._serve_request)
+    assert '"No supported service class available for the SOP "' in source
+    assert "f\"Class UID '{class_uid}', please see the \"" in source
+    assert '"pynetdicom.sop_class.register_uid() function if you need to add "' in source
+    assert '"support for a private, retired or otherwise unknown SOP Class UID"' in source
+
+
+async def _store_of_a_class_no_service_serves(
+    caplog: pytest.LogCaptureFixture,
+) -> list[str]:
+    """A C-STORE on an accepted context whose command names a class pynetdicom has no service for."""
+    command = _c_store_command().replace(
+        b"1.2.840.10008.5.1.4.1.1.88.11\x00", _PLANTED_CLASS.encode("ascii")
+    )
+    async with _running_scp({"timeout_seconds": 30.0}) as scp:
+        sock = await _a_held_association(scp.sockport)
+        try:
+            with caplog.at_level(logging.DEBUG):
+                sock.sendall(_p_data(0x03, command) + _p_data(0x02, b"\x00" * 16))
+                assert await asyncio.to_thread(_first_bytes, sock, 1), "the SCP did not end it"
+        finally:
+            sock.close()
+    return _formatted(list(caplog.records))
+
+
+async def test_a_peers_class_with_no_service_never_reaches_the_scp_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _filter_removed():  # CONTROL: a peer's command reaches the line, with its value whole
+        unfiltered = await _store_of_a_class_no_service_serves(caplog)
+    assert [line for line in unfiltered if "No supported service" in line and _PLANTED in line]
+    caplog.clear()
+    filtered = await _store_of_a_class_no_service_serves(caplog)
+    assert [line for line in filtered if "No supported service" in line], filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+
+
+def _read_a_bad_private_creator() -> None:
+    """pydicom's own lookup of a private element whose creator has more than one value."""
+    from pydicom.datadict import get_private_entry
+    from pydicom.multival import MultiValue
+    from pydicom.tag import Tag
+
+    with pytest.raises(KeyError):
+        get_private_entry(Tag(0x0009, 0x1001), MultiValue(str, ["A", _PLANTED]))  # type: ignore[arg-type]
+
+
+def test_a_bad_private_creator_never_reaches_the_log(caplog: pytest.LogCaptureFixture) -> None:
+    def lines() -> list[str]:
+        caplog.clear()
+        with warnings.catch_warnings(), caplog.at_level(logging.DEBUG):
+            warnings.simplefilter("ignore")
+            _read_a_bad_private_creator()
+        return _formatted(list(caplog.records))
+
+    with _filter_removed():  # CONTROL
+        assert [line for line in lines() if _PLANTED in line]
+    filtered = lines()
+    assert filtered
+    assert not [line for line in filtered if _PLANTED in line], filtered
+    assert "pydicom: (0009,0010) '[redacted]' is not a valid private creator" in filtered
+
+
+def test_a_bad_private_creators_warning_copy_is_ignored() -> None:
+    with warnings.catch_warnings(record=True) as caught:  # CONTROL: unignored, it carries the value
+        warnings.simplefilter("always")
+        _read_a_bad_private_creator()
+    assert [w for w in caught if _PLANTED in str(w.message)]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dicom_module._redact_flagged_peer_values()
+        _read_a_bad_private_creator()
+    assert not [w for w in caught if _PLANTED in str(w.message)]
+
+
+def test_a_bad_private_creator_in_a_raised_error_is_redacted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pydicom.datadict import get_private_entry
+    from pydicom.multival import MultiValue
+    from pydicom.tag import Tag
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(KeyError) as raised:
+            get_private_entry(
+                Tag(0x0009, 0x1001),
+                MultiValue(str, ["A", _PLANTED]),  # type: ignore[arg-type]
+            )
+    assert _PLANTED in str(raised.value)  # CONTROL
+    assert _PLANTED not in dicom_module._safe_library_exc(raised.value)
+    lines = _logged("pynetdicom.events", raised.value, caplog)
+    assert lines
+    assert not [line for line in lines if _PLANTED in line], lines
+
+
+def test_a_tag_and_quote_on_any_other_line_stay_as_they_are() -> None:
+    # The CONTROL on the shape's width: the head alone is not enough to redact a line.
+    line = "Element (0009,0010) 'LO' has no value"
+    assert _filtered("pydicom", line) == line
+
+
+def test_the_private_creator_line_is_still_pydicoms() -> None:
+    import inspect
+
+    from pydicom import datadict
+
+    source = inspect.getsource(datadict.get_private_entry)
+    assert "f\"{tag.private_creator} '{private_creator}' \"" in source
+    assert 'f"is not a valid private creator"' in source
+    assert "warn_and_log(msg)" in source
+
+
+# --- What the SCU refuses in an object before it associates (vault BACKLOG #6637) ------------------
+
+
+def _object_with_class(sop_class: str) -> bytes:
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    dataset = dcmread(io.BytesIO(make_sr_part10()))
+    buffer = io.BytesIO()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dataset["SOPClassUID"].value = sop_class
+        dataset.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
+
+
+def _object_whose_instance_uid_will_not_read() -> bytes:
+    """Its SOP Instance UID is declared US with three bytes, which pydicom raises on when read."""
+    from pydicom import dcmread
+
+    from tests._dicom_sample import make_sr_part10
+
+    data = make_sr_part10()
+    found = data.find(b"\x08\x00\x18\x00UI")
+    assert found > 0
+    length = int.from_bytes(data[found + 6 : found + 8], "little")
+    broken = (
+        data[: found + 4]
+        + b"US"
+        + (3).to_bytes(2, "little")
+        + b"\xff\xfe\xfd"
+        + data[found + 8 + length :]
+    )
+    with pytest.raises(Exception, match="bytes per value"):  # CONTROL: this is what the SCU meets
+        _ = dcmread(io.BytesIO(broken)).SOPInstanceUID
+    return broken
+
+
+@pytest.mark.parametrize(
+    "build",
+    [lambda: _object_with_class(_PLANTED_REFUSED), _object_whose_instance_uid_will_not_read],
+    ids=["refused-sop-class", "instance-uid-does-not-read"],
+)
+async def test_an_object_the_scu_cannot_propose_is_a_bad_object(
+    build: Callable[[], bytes],
+) -> None:
+    from messagefoundry.transports.base import NegativeAckError
+    from tests.test_dicom_scu import _carry, _scu
+
+    with pytest.raises(NegativeAckError) as raised:
+        await _scu(1).send(_carry(build()))
+    assert raised.value.code == "bad-object"
+    assert raised.value.permanent is True
+    assert _PLANTED_REFUSED not in str(raised.value)
+    assert "xff" not in str(raised.value)
