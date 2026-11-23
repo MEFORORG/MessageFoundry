@@ -3,7 +3,8 @@
 """Outside a hardened data directory, in a folder whose entries its files inherit, opening a store
 leaves each file's access list granting the process token's account alone, for each USERNAME
 value sampled below (vault BACKLOG #5612). A folder that hands its entries down as explicit ones is
-not built here.
+not built here, and there the restriction is not owner-only: the icacls call it runs is recorded
+leaving such entries on a file (``tests/_win_acl.py``).
 
 These cover the owner-only restriction only: a hardened directory's grants, and the file owner,
 are not read here. They drive ``MessageStore.open`` with a real icacls, then read each file's
