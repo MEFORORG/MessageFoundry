@@ -14,10 +14,12 @@ It lives under ``tests/fixtures/cla_action_audit/``. It replaced the 2026-10-31 
 GHSA-f23m-r3pf-42rh and minimatch GHSA-g3hv-75wg-m249 so they no longer cover the locked versions.
 The findings the gate compares differ by exactly those three. The dependency counts are unchanged.
 Seven ``vulnerabilities`` entries left, deepmerge and the six packages that reached it, with the
-low and total counts down by seven, and two changed, lodash and minimatch, whose ``via`` lost the
-advisory and whose ``range`` narrowed. The 2026-10-31 reading had replaced the 2026-10-28 one, also
-npm 11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares differ
-by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
+low and total counts down by seven. Two entries changed, lodash and minimatch, in their ``via``
+and ``range`` fields only. Each ``via`` lost the removed advisory. lodash's also re-issued
+GHSA-xxjr-mmjv-4gpg under a new npm source id with ``_.pullAt`` added to its title; the baseline's
+header says what that means. The 2026-10-31 reading had replaced the 2026-10-28 one, also npm
+11.19.0, after GitHub published minimatch GHSA-g3hv-75wg-m249. The findings the gate compares
+differ by exactly that one. The ``vulnerabilities`` entries and the counts are unchanged in number, and the
 only entry that moved is minimatch, whose ``via`` gains the advisory and whose ``range`` widens.
 The 2026-10-28 reading had replaced the 2026-10-24 one, also npm 11.19.0, after GitHub published
 deepmerge GHSA-gcqx-w48m-w2h4. Those two differ by exactly that one finding, plus seven
@@ -624,7 +626,7 @@ def test_the_committed_baseline_still_acknowledges_the_recorded_reading() -> Non
 #: reading redone, not just this edit.
 #:
 #: - Packages on the braces and js-yaml chains: what that reading settles is stated in the header
-#:   paragraph "A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT".
+#:   paragraph "A BUNDLE MEASUREMENT FROM PR 2112'S TRIAGE IS KEPT".
 #: - deepmerge, read 2026-10-28: what that reading settles is stated in the deepmerge triage
 #:   comment, kept after its entry was removed on 2026-11-23. Only names deepmerge alone defines
 #:   are re-run here, two of the six it measured. The other four are left out because other code uses them too: the
