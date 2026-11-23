@@ -306,6 +306,27 @@ def _not_a_plain_file(path: Path) -> str | None:
     return None
 
 
+_WINERROR_FILE_NOT_FOUND = 2
+
+
+def _sidecar_is_absent(sidecar: Path) -> bool:
+    """Whether the file system says ``sidecar`` is not there; ``False`` when it is, in any form,
+    since an ``lstat`` follows no link. Any failure to find out raises ``OSError`` (BACKLOG #6575).
+
+    ``FileNotFoundError`` alone does not say so on Windows, which also maps at least an unreachable
+    share (``ERROR_BAD_NETPATH``, ``ERROR_BAD_NET_NAME``) and a missing parent to it. Only
+    ``ERROR_FILE_NOT_FOUND`` (2) is the directory answering that it holds no such name. That is
+    why this is not :func:`~messagefoundry.path_reach.is_absent`, which counts a missing parent as
+    absence: here the answer authorises an unlink."""
+    try:
+        os.lstat(sidecar)
+    except FileNotFoundError as exc:
+        if getattr(exc, "winerror", None) in (None, _WINERROR_FILE_NOT_FOUND):
+            return True
+        raise
+    return False
+
+
 def _names_a_link(info: os.stat_result) -> bool:
     """Whether an ``lstat`` result is a symbolic link or a name-surrogate reparse point."""
     reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
@@ -4211,8 +4232,15 @@ class UploadStore:
         **This pass UNLINKS, so it refuses anything it cannot positively identify as ours.** A name
         matching neither exact shape is an operator's own file and is never touched, the same way
         :meth:`_iter_sidecars` skips it. A ``.blob`` whose sidecar exists but cannot be DECRYPTED is
-        kept, because :meth:`_iter_sidecars` yields that sidecar without opening it — a rotated-away key
-        can no more destroy data here than it can in the age pass.
+        kept, because this pass checks that the sidecar's name exists without opening it — a
+        rotated-away key can no more destroy data here than it can in the age pass.
+
+        **A read fault is never read as a missing sidecar (BACKLOG #6575).** The root is listed
+        once, whole, before anything is removed. A root that is not there is an empty pass, and any
+        other listing failure raises with nothing removed. A body the listing shows with no sidecar
+        goes only once :func:`_sidecar_is_absent`
+        confirms it, so a sidecar that landed after the listing keeps its body. Any other answer
+        from that check stops the pass where it is, logged at ERROR, and returns what it removed.
 
         **A live write is safe by IDENTITY, not by age.** ``_inflight_names`` holds every name a write
         in this process currently holds, and a held name is skipped outright, so the threshold never
@@ -4233,31 +4261,49 @@ class UploadStore:
         next one resumes."""
         stop = abort if abort is not None else threading.Event()
         root = self._root
-        if stop.is_set() or not root.is_dir():
+        if stop.is_set():
             return 0
         cutoff = now - _ORPHAN_MIN_AGE_SECONDS
+        # The one listing, read whole before anything goes, so a failure at any point raises with
+        # nothing removed. prune_expired logs it and keeps its result (BACKLOG #6575).
+        try:
+            entries = list(root.iterdir())
+        except OSError as exc:
+            if is_absent(exc):
+                return 0  # no root yet: the first save creates it
+            raise
         # A sidecar is the listing key, so an id with one is reachable and this pass is not about it.
-        reachable: set[str] = set()
-        for fid, _ in self._iter_sidecars():
-            if stop.is_set():
-                return 0  # nothing removed yet; the listing alone can be long on a large dir
-            reachable.add(fid)
+        names = {entry.name for entry in entries}
         removed = 0
-        for entry in root.iterdir():
+        for entry in entries:
             if stop.is_set():
                 break
             name = entry.name
+            if _is_inflight(name):
+                continue  # a write in this process is holding it right now
             stem = name[: -len(_BLOB_SUFFIX)] if name.endswith(_BLOB_SUFFIX) else ""
             if _ORPHAN_TMP_RE.match(name):
                 kind = "temp file"
             elif _FILE_ID_RE.match(stem):
-                if stem in reachable:
+                sidecar = f"{stem}{_META_SUFFIX}"
+                if sidecar in names:
                     continue
+                # The listing is a snapshot and a share can return a short one with no error, so
+                # only a direct answer that the sidecar is not there lets its body go.
+                try:
+                    if not _sidecar_is_absent(root / sidecar):
+                        continue
+                except OSError as exc:
+                    _log.error(
+                        "uploaded-logs orphan sweep stopped: could not check the sidecar of %s "
+                        "(%s); no further file was removed and the next pass retries",
+                        stem,
+                        exc.strerror or type(exc).__name__,
+                    )
+                    break
                 kind = "body with no sidecar"
             else:
                 continue  # not one of ours — never touched
-            if _is_inflight(name):
-                continue  # a write in this process is holding it right now
             try:
                 if entry.stat().st_mtime > cutoff:
                     continue  # too young to be certain it is abandoned
