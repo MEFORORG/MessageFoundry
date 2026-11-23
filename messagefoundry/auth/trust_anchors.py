@@ -2938,8 +2938,10 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     Windows hold it open without sharing, can keep a refusal at ``enforce`` from setting the
     hold, and new store connects go on while the file stays unreadable. The same holds for a
     party who can make the read fail with one of the network or I/O faults above, such as one
-    who controls the share or the network path to it, and for a device at the path whose open
-    fails with ``EIO`` rather than being refused as not a regular file. Windows also reports at
+    who controls the share or the network path to it, and for a read that fails with ``EIO``,
+    as on a failing disk or, on POSIX, a device swapped in between the stat and the open. A
+    device already at the path when the stat runs is refused as not a regular file and sets
+    the hold. Windows also reports at
     least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
     such check still refuses the reload.
 

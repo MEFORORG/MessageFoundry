@@ -9,9 +9,10 @@ Step 11, re-scoped: after a settings check at ``enforce`` refuses the SQL Server
 store refuses new connects. Item 11 of the trust anchors module docstring states the hold.
 
 ``aioodbc`` and ``pyodbc`` are the optional ``sqlserver`` extra, so recording modules stand in for
-them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. At least the two
-tests that need the real ``aioodbc`` skip without it: they pin that aioodbc 0.5.0's connect, and
-its pool's, reach the executor as ``pyodbc.connect``, which is what the executor gate keys on.
+them through ``sys.modules``, as ``tests/test_sqlserver_login_timeout.py`` does. The tests that
+need the real ``aioodbc`` skip without it. They pin that aioodbc 0.5.0's connect, and its pool's,
+reach the executor as ``pyodbc.connect``, which is what the executor gate keys on, and that the
+store's own pool open hands the pool the gated executor.
 """
 
 from __future__ import annotations
