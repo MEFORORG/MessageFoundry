@@ -164,7 +164,8 @@ class _LineStartDelimiters:
     such text was taken as the first delimiter wherever it sat. The refusal is raised after the
     walk's size and part checks on the parts the walk reached, so a body with such a part gets that
     refusal, as before. The walk stops at the first close marker, so the parts after it are not
-    checked, and close-marker text before the first delimiter stops it before any part.
+    checked, and close-marker text that is the first ``--<boundary>`` in the body stops it
+    before any part.
 
     What may follow a delimiter on its line is read the same way for every delimiter the walk
     reaches, the first included: optionally ``--`` (which makes it the close), then transport
@@ -178,7 +179,9 @@ class _LineStartDelimiters:
     step per such line, with nothing bounding their number; refusing avoids that.
 
     When the first ``--<boundary>`` does not start a line, the walk still starts there, so that the
-    size checks on the parts after it rank as before. The segment from that text to the next
+    size checks on the parts after it rank as before where the walk gets past that text. Where that
+    text is a close marker or has other text after it on its line, the walk stops there, before
+    any part, and the body gets the first-delimiter refusal. The segment from that text to the next
     delimiter is not counted toward the part cap, and the header-size refusal on it, or the size
     refusal for a segment with no header block, gives way to the first-delimiter refusal, since
     that segment is a part only because of the text. The 413 size checks on a file part or text
@@ -223,8 +226,9 @@ class _LineStartDelimiters:
         return self._first
 
     def any_starts_line(self) -> bool:
-        """Whether any ``--<boundary>`` in the body starts a line, for the wording of the
-        first-delimiter refusal. At most two ``find`` calls in C over the body."""
+        """Whether any ``--<boundary>`` in the body follows a CR or an LF, for the wording of the
+        first-delimiter refusal, whose body has no ``--<boundary>`` at offset 0. At most two
+        ``find`` calls in C over the body."""
         return self._body.find(self._after_lf) != -1 or self._body.find(self._after_cr) != -1
 
     def find(self, at: int) -> int:
@@ -318,12 +322,9 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # A body cut inside its close marker (``--<boundary>-`` and nothing after it): leave it
             # unclosed, so it gets the missing-terminator refusal that names the cause.
             break
-        line_end = _line_end(body, start)
-        if line_end == -1:
+        if _line_end(body, start) == -1:
             bad_tail = True
             break
-        # The padding is part of the delimiter line, so the part starts after it.
-        start = line_end
         nxt = delims.find(start)
         end = len(body) if nxt == -1 else nxt
         # After each delimiter comes CRLF, then the part's header block.
@@ -421,7 +422,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # No delimiter text at all. At least an empty body, one built with another boundary than
             # the Content-Type names, and one cut before its first ``--<boundary>`` is whole land here.
             # A body built with a boundary the declared one is a prefix of (declared B, body uses
-            # BX) does not: it holds delimiter text, so it gets one of the refusals above.
+            # BX) does not: it holds delimiter text, so it can get one of the refusals above,
+            # or, where X starts with "--", be read as the close of a body with no parts.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )

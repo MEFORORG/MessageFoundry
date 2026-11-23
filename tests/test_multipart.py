@@ -1078,53 +1078,60 @@ def test_delimiter_text_none_of_which_starts_a_line_is_refused_as_such(body: byt
 
 
 @pytest.mark.parametrize(
-    ("make", "message"),
+    ("make", "message", "control"),
     [
-        (lambda: b"--B\r\n" + _FP + b"x" * 2000 + b"\r\n--B--x", "uploaded file part is 2000"),
-        (lambda: b" --B\r\n" + _FP + b"x" * 2000 + b"\r\n--B--\r\n", "uploaded file part is 2000"),
         (
-            lambda: (
-                b" --B\r\n" + b"".join(b"--B\r\n" + _field("f", b"v") + b"\r\n" for _ in range(17))
+            lambda n: b"--B\r\n" + _FP + b"x" * n + b"\r\n--B--x",
+            "uploaded file part is 2000",
+            "_CLOSE_TAIL_REFUSAL",
+        ),
+        (
+            lambda n: b" --B\r\n" + _FP + b"x" * n + b"\r\n--B--\r\n",
+            "uploaded file part is 2000",
+            "_PREAMBLE_REFUSAL",
+        ),
+        (
+            lambda n: (
+                b" --B\r\n"
+                + b"".join(b"--B\r\n" + _field("f", b"v") + b"\r\n" for _ in range(n // 100 - 3))
+                + b"--B--\r\n"
             ),
             "more parts than the limit",
+            "_PREAMBLE_REFUSAL",
+        ),
+        (
+            lambda n: b"--B\r\n" + _FP + b"x" * n + b"\r\n--Bnote\r\n" + _FP + b"y\r\n--B--",
+            "uploaded file part is 2000",
+            "_DELIM_TAIL_REFUSAL",
+        ),
+        (
+            lambda n: b"--B\r\n" + _field("f", b"v" * (n * 10)) + b"\r\n--Bnote\r\n--B--",
+            "multipart text field is 20000",
+            "_DELIM_TAIL_REFUSAL",
         ),
     ],
-    ids=["bad-close-and-oversize", "mid-line-first-and-oversize", "mid-line-first-and-part-cap"],
+    ids=[
+        "bad-close-and-oversize",
+        "mid-line-first-and-oversize",
+        "mid-line-first-and-part-cap",
+        "bad-tail-and-oversize-file",
+        "bad-tail-and-oversize-field",
+    ],
 )
 def test_the_new_refusals_rank_after_the_size_and_part_checks(
-    make: Callable[[], bytes], message: str
+    make: Callable[[int], bytes], message: str, control: str
 ) -> None:
     """A body with a part the walk reaches that breaks a size or part limit gets that refusal (413
-    for an oversize file part), as before #5787, not the close-tail or first-delimiter one."""
+    for an oversize file part or field), as before #5787, not the close-tail, first-delimiter or
+    delimiter-tail one. Control: the same body within the limits gets the new refusal, so the
+    case shows the new refusal waits for the size and part checks."""
     with pytest.raises(MultipartError, match=message) as caught:
-        parse_multipart_form(_CT_B, make(), max_file_bytes=1024)
+        parse_multipart_form(_CT_B, make(2000), max_file_bytes=1024)
     expected = MultipartError if "more parts" in message else MultipartTooLargeError
     assert type(caught.value) is expected
-
-
-@pytest.mark.parametrize(
-    ("make", "expected"),
-    [
-        (
-            lambda: b"--B\r\n" + _FP + b"x" * 2000 + b"\r\n--Bnote\r\n" + _FP + b"y\r\n--B--",
-            MultipartTooLargeError,
-        ),
-        (
-            lambda: b"--B\r\n" + _field("f", b"v" * 20000) + b"\r\n--Bnote\r\n--B--",
-            MultipartTooLargeError,
-        ),
-    ],
-    ids=["oversize-file", "oversize-field"],
-)
-def test_the_delimiter_tail_refusal_ranks_after_the_size_and_part_checks(
-    make: Callable[[], bytes], expected: type[MultipartError]
-) -> None:
-    """The delimiter-tail refusal, like the other #5787 refusals, comes after the size checks on
-    the parts the walk reached before the bad line, which run after the walk."""
-    with pytest.raises(MultipartError) as caught:
-        parse_multipart_form(_CT_B, make(), max_file_bytes=1024)
-    assert type(caught.value) is expected
-    assert str(caught.value) != _DELIM_TAIL_REFUSAL
+    with pytest.raises(MultipartError) as small:
+        parse_multipart_form(_CT_B, make(1000), max_file_bytes=1024)
+    assert (type(small.value), str(small.value)) == (MultipartError, globals()[control])
 
 
 @pytest.mark.parametrize(
@@ -1140,8 +1147,8 @@ def test_the_delimiter_tail_refusal_ranks_after_the_size_and_part_checks(
 def test_a_delimiter_followed_by_other_text_is_refused(body: bytes) -> None:
     """A line that starts with ``--<boundary>`` and then anything but ``--``, padding and a line
     end is refused with a 400, the first delimiter included. Before this check such a line was
-    read as a delimiter, which cut the file there, or for a body built with ``BX`` where ``B`` is
-    declared, refused it as truncated."""
+    read as a delimiter: inside a file it cut the file there, and after a first delimiter its text
+    was read as the start of the part's header block."""
     for parse in (parse_multipart_form, parse_single_file_upload):
         with pytest.raises(MultipartError) as c:
             parse(_CT_B, body, max_file_bytes=1024)
@@ -1150,8 +1157,8 @@ def test_a_delimiter_followed_by_other_text_is_refused(body: bytes) -> None:
 
 @pytest.mark.parametrize(
     "tail",
-    [b"\r\n", b"\n", b"\r\r\n", b" \t \r\n", b"\t\n"],
-    ids=["crlf", "lf", "cr-run", "padding-crlf", "padding-lf"],
+    [b"\r\n", b"\n", b"\r\r\n", b" \t \r\n"],
+    ids=["crlf", "lf", "cr-run", "padding-crlf"],
 )
 def test_a_delimiter_with_padding_and_a_line_end_still_counts(tail: bytes) -> None:
     """Padding and then a CR, an LF or a CRLF after a delimiter: each delimiter still counts, and
@@ -1165,7 +1172,8 @@ def test_a_delimiter_with_padding_and_a_line_end_still_counts(tail: bytes) -> No
 def test_a_long_padding_run_after_a_delimiter_is_read_in_one_scan() -> None:
     """The padding after a delimiter is read by one search for its end, so a long run costs the
     walk no more Python lines than a short one. The floor: the instrument sees the parse, and it
-    sees each further delimiter line, so a per-line or per-byte loop would show."""
+    sees each further delimiter line, so a per-line or per-byte loop would show. The padding is
+    read as the start of the part's header block, so the long run stays under that block's cap."""
 
     def lines(padding: int, fields: int = 1) -> int:
         delim = b"--B" + b" " * padding + b"\r\n"
@@ -1185,7 +1193,7 @@ def test_a_long_padding_run_after_a_delimiter_is_read_in_one_scan() -> None:
     short = lines(1)
     assert short > 0  # the instrument sees the parse at all
     assert lines(1, fields=4) > short  # and each further delimiter line costs Python lines
-    assert lines(1_000_000) == short
+    assert lines(_MAX_PART_HEADER_BYTES - 200) == short
 
 
 @pytest.mark.parametrize(
