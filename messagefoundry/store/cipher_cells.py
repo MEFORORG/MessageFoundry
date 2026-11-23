@@ -137,9 +137,10 @@ class CipherCell:
         """The row's ``locator`` values as ``column=value`` pairs, for a PHI-free failure message.
 
         A value is read from the store, and a planted row is one thing a cipher read hunts for, so
-        each is shown at most :data:`_LOCATOR_LIMIT` characters and an elision mark, escaped
-        whole-escape by whole-escape where it holds a non-printable character (:func:`_shown`): a
-        locator cannot forge a line of the report or carry a long value out whole."""
+        each is shown at most :data:`_LOCATOR_LIMIT` characters and an elision mark. It is escaped,
+        whole escape by whole escape, only when the shown head of that many characters holds a
+        non-printable character (:func:`_shown`), so a locator cannot forge a line of the report or
+        carry a long value out whole."""
         return " ".join(f"{c}={_shown(v)}" for c, v in zip(self.locator, values, strict=True))
 
 
@@ -148,9 +149,10 @@ _LOCATOR_LIMIT = 64
 
 
 def _shown(value: object) -> str:
-    # Only as much of the value as can be shown is read: an escape makes one character up to ten
-    # (`\U000e0001`), so a head with a non-printable character is escaped character by character,
-    # its backslashes included, and cut at the last whole escape that fits. A shown value is then
+    # `str(value)` renders the whole value first; only its head is then shown. An escape makes one
+    # character up to ten (`\U000e0001`), so a head with a non-printable character is escaped
+    # character by character, its backslashes included, and cut at the last whole escape that
+    # fits. A shown value is then
     # at most the limit plus the elision mark, whatever it holds (BACKLOG #1719). A printable head
     # is shown as it is, so a value that spells an escape reads the same as one that holds it.
     text = str(value)

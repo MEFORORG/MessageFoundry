@@ -4908,9 +4908,11 @@ _INCOMPATIBLE_REASON_LIMIT = 600
 
 #: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
 #: are bounded where they are made: at least a cell's locator values, at 64 characters and an
-#: elision mark each (`cipher_cells._shown`), and error text at safe_exc's 200 plus its notes. A
-#: reading's line, the foreign-key note included, then stays well inside this, verdict and reason
-#: words included, so the cut only stops a defect from making the sentence unbounded.
+#: elision mark each (`cipher_cells._shown`), and error text, cut at safe_text's 200 plus its
+#: notes. safe_exc adds the class name and ": " outside that 200; the SQLite arm's text is bounded
+#: by safe_text in `_sqlite_error_reason`, with its class name inside the 200. A reading's line,
+#: the foreign-key note included, is then expected to stay well inside this, verdict and reason
+#: words included, so the cut is there to stop a defect from making the sentence unbounded.
 _WALK_REASON_LIMIT = 2000
 
 #: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
@@ -4963,9 +4965,11 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
-#: What decided a :func:`_decrypt_check` verdict. ``cell`` is a sealed value that did not open or
-#: a value with no marker; ``damaged`` a BLOB or a TEXT value SQLite cannot decode, neither of
-#: which this build's writer stores; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
+#: What decided a :func:`_decrypt_check` verdict. ``cell`` is at least a sealed value that did not
+#: open, a value that opened but its reader refuses (a ``QueueTagError``), a value whose AAD could
+#: not be built, a marker in another ASCII case, and a value with no marker; ``damaged`` a BLOB, or a
+#: TEXT value that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least
+#: the store's own writer stores neither; ``sqlite_schema`` a statement the snapshot's schema could not answer, by
 #: :func:`is_schema_step_error`, other than a virtual table's missing module; ``sqlite`` any other
 #: SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key service that gave no
 #: verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
@@ -4980,9 +4984,11 @@ WalkKind = Literal[
     "key_mismatch",
 ]
 
-#: The kinds a walk under this build can reach by reading another version's cells or schema
+#: Kinds a walk under this build can reach by reading another version's cells or schema
 #: differently, as well as by real damage, so the incompatible-snapshot refusal offers that reading
-#: for these. It is a possible cause there, never a finding that the cells are sound.
+#: for these. They are at least these, not every such kind: a cipher column with an unregistered
+#: collation ("no such collation sequence") yields kind ``sqlite``, which gets no misread framing.
+#: The reading is a possible cause there, never a finding that the cells are sound.
 _MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
 
 
@@ -5008,8 +5014,8 @@ class WalkVerdict(tuple[str, str, int]):
 def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
     """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
     calls the fault a wrong shape, except a virtual table's missing module, which is an object
-    another tool left rather than another version's schema; ``damaged`` for a TEXT value SQLite
-    could not decode; else ``sqlite``."""
+    another tool left rather than another version's schema; ``damaged`` for a TEXT value Python's
+    sqlite3 module could not decode; else ``sqlite``."""
     text = str(exc)
     if is_schema_step_error(exc) and "no such module" not in text:
         return "sqlite_schema"
