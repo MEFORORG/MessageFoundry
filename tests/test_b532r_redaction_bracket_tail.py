@@ -10,6 +10,7 @@ stands, on the four entry points the tests name. The comment on
 
 from __future__ import annotations
 
+import difflib
 import random
 import re
 from collections.abc import Callable
@@ -72,30 +73,34 @@ def test_a_second_redaction_leaves_the_tail_rules_output_as_it_is(line: str) -> 
     assert redact_log_line(chain) == chain.replace(CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
 
 
-def test_a_camelcase_labelled_dsn_keeps_its_host_and_reads_as_origin_main() -> None:
-    """Review round 3: the union joined the label pass's reading and the tail's into
-    ``dbPassword=<redacted>db``, losing the host's "@", and a second pass hid the host too. The
-    reading before now leaves the tail out, so the line is written as ``origin/main`` wrote it,
-    host kept, and a second pass leaves it as it is. Its ``;w`` prints, as on ``origin/main``."""
-    line = "dbPassword=postgres://svc:Kv9x@Zq7;w@db failed"
-    expected = f"dbPassword={CREDENTIAL_PLACEHOLDER};w@db failed"
-    assert scrub_credentials(line) == expected
-    assert scrub_credentials(expected) == expected
-    chain = scrub_log_text(line)
-    assert chain == expected and scrub_log_text(chain) == chain
-    bundle = redact_log_line(chain)
-    assert bundle == expected.replace(CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
-    assert redact_log_line(bundle) == bundle
+#: A camelCase label before the DSN, after it, or several, each of which sent the line to the
+#: union's reading before, which left the tail out, so the tail printed (the Lander's hold on PR
+#: 3142, comment 7100710066, item 1).
+_CAMEL_LABELLED = (
+    "dbPassword=postgres://svc:Kv9x@Zq7;w@db failed",
+    "userPwd='a;PWD=b' connect postgres://svc:Kv9x@Zq7;w@db failed",
+    "connect postgres://svc:Kv9x@Zq7;w@h,userPwd='Sec;PWD=' failed",
+    "accessToken=a userPwd='a;PWD=b' connect postgres://svc:Kv9x@Zq7;w@db dbPassword=c failed",
+    "accessToken=postgres://svc:[9]@;w@;Zq7@;;@mail.local:587 failed",
+)
+
+
+@pytest.mark.parametrize("line", _CAMEL_LABELLED)
+def test_a_camelcase_label_anywhere_on_the_line_keeps_the_tail_hidden(line: str) -> None:
+    """Every entry point but ``redact_log_line`` on a raw line, whose own reading the hold left
+    to another row, hides the password's ";"-split tail. A second scrub may hide the host too,
+    where a label's value took the DSN; it never prints what the first hid."""
+    for call in (scrub_credentials, scrub_log_text):
+        out = call(line)
+        assert "Zq7" not in out and ";w" not in out, out
+        assert "Zq7" not in call(out) and ";w" not in call(out), out
 
 
 def test_known_residual_a_labelled_dsn_tail_prints() -> None:
-    """Pinned as printed, as on ``origin/main``: a credential label before the DSN takes the DSN
-    up to the ";" in its own pass, so the tail rule never sees it. A red means the reading changed."""
-    for line in (
-        "password: postgres://svc:Kv9x@Zq7;w@db failed",
-        "dbPassword=postgres://svc:Kv9x@Zq7;w@db failed",
-    ):
-        assert ";w@db failed" in scrub_credentials(line), line
+    """Pinned as printed: a credential label that is no camelCase label, before the DSN, takes the
+    DSN up to the ";" in its own pass, so the tail rule never sees it. A red means the reading
+    changed."""
+    assert ";w@db failed" in scrub_credentials("password: postgres://svc:Kv9x@Zq7;w@db failed")
 
 
 _CORPUS_PIECES = ("Kv9", "a", "Zq7", ";", ";", "@", "@", ".", ":", "=", "w", "x.y", "587", "[9]")
@@ -142,10 +147,22 @@ def _reading(line: str) -> _Reading:
     )
 
 
+def _hides_only_more(once: str, twice: str, placeholder: str) -> bool:
+    """Whether ``twice`` is ``once`` with some of its text replaced by ``placeholder`` or removed,
+    and nothing else written."""
+    opcodes = difflib.SequenceMatcher(None, once, twice, autojunk=False).get_opcodes()
+    return all(
+        op == "equal" or twice[j1:j2] in ("", placeholder) for op, _i1, _i2, j1, j2 in opcodes
+    )
+
+
 def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Over a seeded corpus, every line a second scrub, or a second bundle read of a chain line,
     leaves unchanged with the tail left out of the widened pattern, it leaves unchanged with the
-    tail too. The control drops the tail on both callers."""
+    tail too, but for a DSN a camelCase label's value takes. There both readings of the union
+    hide the tail, and a second scrub then hides the host too, so it may only hide more (the
+    Lander's hold on PR 3142, comment 7100710066, item 1). The control drops the tail on both
+    callers."""
     import messagefoundry.support.redact as redact_mod
 
     lines = _corpus()
@@ -164,12 +181,18 @@ def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.Monke
     # not show the stability comparison below can come out non-empty.
     assert sum(a.scrub != b.scrub for a, b in zip(shipped, without, strict=True)) >= 10
     assert sum(a.bundle != b.bundle for a, b in zip(shipped, without, strict=True)) >= 10
+    monkeypatch.undo()
     worse = [
-        line
+        (line, a)
         for line, a, b in zip(lines, shipped, without, strict=True)
         if (b.scrub_stable and not a.scrub_stable) or (b.chain_stable and not a.chain_stable)
     ]
-    assert not worse, worse[:5]
+    labelled = tuple(label for label in _CORPUS_LABELS if label[:1].islower() and "=" in label)
+    for line, a in worse:
+        assert line.startswith(labelled), line
+        assert _hides_only_more(a.scrub, scrub_credentials(a.scrub), CREDENTIAL_PLACEHOLDER), line
+        chain = redact_log_line(scrub_log_text(line))
+        assert _hides_only_more(chain, redact_log_line(chain), REDACTION_PLACEHOLDER), line
 
 
 @pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)

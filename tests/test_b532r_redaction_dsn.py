@@ -185,10 +185,10 @@ def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     assert match is not None and match.end() == len(tail) - 1, (match, tail)
 
 
-def test_the_reading_before_differs_only_by_the_tail() -> None:
-    """``_run``'s docstring rests on this: ``_pre_camel`` changes the widened pattern only by
-    leaving out the tail after a user's placeholder."""
+def test_both_readings_apply_the_same_widened_pattern() -> None:
+    """``_run``'s docstring rests on this: ``_pre_camel`` leaves the widened pattern unchanged,
+    its tail after a user's placeholder included, so a line the union returns its reading before
+    for still takes the tail (the Lander's hold on PR 3142, comment 7100710066, item 1)."""
     wide = scrub_mod._WIDE_DSN_PASSWORD
     assert scrub_mod._DSN_TAIL in wide.pattern
-    before = scrub_mod._pre_camel(wide).pattern
-    assert before == wide.pattern.replace(scrub_mod._DSN_TAIL, "")
+    assert scrub_mod._pre_camel(wide).pattern == wide.pattern
