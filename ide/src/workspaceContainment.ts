@@ -9,6 +9,7 @@
 // link cases are caught too. It is vscode-free so the node-side unit suite can drive it.
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isPathWithin } from "./pathFold";
 
 function realpath(p: string): string {
   try {
@@ -244,9 +245,10 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
   );
 }
 
+// ASCII-only case fold on Windows ({@link isPathWithin}): path.relative folded with toLowerCase(),
+// so a sibling named with U+212A KELVIN SIGN for "k" read as the workspace (BACKLOG #5832).
 function isWithin(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
+  return isPathWithin(root, target);
 }
 
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.

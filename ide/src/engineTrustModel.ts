@@ -28,6 +28,7 @@
 import * as path from "node:path";
 
 import { isLocalEngine } from "./engineTarget";
+import { foldAsciiCase } from "./pathFold";
 
 /** The `api_tls` object of `messagefoundry cert inventory --service-config … --json`. */
 export interface ApiTlsFacts {
@@ -493,9 +494,10 @@ export function trustPinsFor(
     const file = flavour.normalize(caFile);
     const earlier = byKey.get(key);
     if (earlier !== undefined) {
-      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file.
+      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file. ASCII
+      // A-Z only: toLowerCase() maps U+212A KELVIN SIGN onto "k", which names another file.
       const same =
-        flavour.sep === "\\" ? earlier.toLowerCase() === file.toLowerCase() : earlier === file;
+        flavour.sep === "\\" ? foldAsciiCase(earlier) === foldAsciiCase(file) : earlier === file;
       if (!same) {
         out.push({
           kind: "refused",

@@ -12,6 +12,7 @@ import { logChecks, showChecks } from "./checksChannel";
 import { baselineBypassRecord } from "./checksLog";
 import { configDir, run, workspaceDir, writerPathSetting } from "./cli";
 import { committedRelativePath } from "./workspaceContainment";
+import { foldAsciiCase } from "./pathFold";
 import { findGit, getHooksPath, getRemoteUrl, git, isRepo } from "./git";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { sourceControlScript } from "./sourceControlWebview";
@@ -294,7 +295,7 @@ function isUncSpelling(p: string): boolean {
 }
 
 /**
- * Whether `ours` and `theirs` name one directory, compared by real path (case-folded on Windows).
+ * Whether `ours` and `theirs` name one directory, compared by real path (ASCII case folded on Windows).
  *
  * Asynchronous, so a slow or unreachable share cannot block the extension host (BACKLOG #5404 item
  * 1); the synchronous realpath did. `ours` is a path the extension derives from the workspace
@@ -307,7 +308,8 @@ function isUncSpelling(p: string): boolean {
  * own thread. Setup runs only in a trusted window, where the repository's code runs.
  */
 async function sameDir(ours: string, theirs: string): Promise<boolean> {
-  const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
+  // ASCII A-Z only: toLowerCase() maps U+212A KELVIN SIGN onto "k", so another folder would match.
+  const fold = (p: string): string => (process.platform === "win32" ? foldAsciiCase(p) : p);
   const real = async (p: string): Promise<string> => {
     try {
       return fold(await fs.promises.realpath(p));
