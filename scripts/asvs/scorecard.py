@@ -2612,12 +2612,10 @@ _PASSTHROUGH_DECORATORS: Final = frozenset(
 )
 #: Decorators that may be called first, the call returning the decorator itself.
 _CALLED_DECORATORS: Final = frozenset({"functools.wraps", "functools.lru_cache", "pytest.fixture"})
-#: Shape decorators whose result may call an implementation registered on it in place of what they
-#: wrap, chosen by an argument's type. ``singledispatch`` returns a plain function, the kind
-#: of object a bare def makes. ``singledispatchmethod`` returns a ``singledispatchmethod``
-#: descriptor, which is not callable, so a module-level one cannot be called at all; read through a
-#: class or an instance, it gives a callable that dispatches that way. :attr:`_Reading.outer` reads
-#: both as :data:`_UNNAMED`.
+#: Shape decorators :attr:`_Reading.outer` reads as :data:`_UNNAMED`. ``singledispatch`` returns a
+#: function that may call an implementation registered on it in place of what it wraps, chosen by
+#: an argument's type. ``singledispatchmethod`` returns a descriptor that is not itself callable;
+#: read through a class or an instance, it gives a callable that dispatches that way.
 _DELEGATING_DECORATORS: Final = frozenset(
     {"functools.singledispatch", "functools.singledispatchmethod"}
 )
@@ -3175,8 +3173,9 @@ def _signature(
     what a CALL SITE can observe, and some things no call sees, at least the names of the ``*args``
     and ``**kwargs`` parameters.
 
-    Parameter NAMES are included, not just counts -- a rename breaks every keyword call, which is the
-    same wrecking-ball failure as a wrong count and is invisible to an arity-only comparison. Default
+    Parameter NAMES are included, not just counts -- renaming a parameter a call can pass by keyword
+    breaks every keyword call that names it, which is the same wrecking-ball failure as a wrong
+    count and is invisible to an arity-only comparison. The other names are compared too. Default
     values are compared by PRESENCE and never by value: a mutation legitimately changes what a default
     IS (that can be the whole reintroduction), while changing which parameters carry one moves the
     arity. Positional defaults always trail, so their count fixes which parameters carry one;
@@ -3228,18 +3227,29 @@ def _signature_clause(
 
 #: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
 _OUTER_BINDS: Final = {
-    "builtins.property": "a property, which is not callable",
+    "builtins.property": (
+        "a property, which is not callable, and which, read through an instance, runs its getter "
+        "on each read"
+    ),
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
     "builtins.classmethod": (
         "a classmethod, which a call through a class passes the class first, and which outside "
         "a class is not callable"
     ),
-    "functools.cache": "a cache wrapper if what it wraps is callable, whose call results are cached",
-    "functools.lru_cache": (
-        "a cache wrapper if what it wraps is callable, which caches call results up to its "
-        "maxsize, and none at maxsize=0"
+    "functools.cache": (
+        "a cache wrapper whose call results are cached (over something not callable, the "
+        "decoration raises TypeError)"
     ),
-    "functools.cached_property": "a cached_property, which is not callable",
+    "functools.lru_cache": (
+        "a cache wrapper that caches call results up to its maxsize, and none at a maxsize of 0 "
+        "or less (over something not callable, the decoration raises TypeError, except that a "
+        "bare lru_cache over None or an int returns a decorator)"
+    ),
+    "functools.cached_property": (
+        "a cached_property, which is not callable, and which, read through an instance with a "
+        "__dict__, stores its function's result there on a read that finds none, later reads "
+        "returning what is stored"
+    ),
     "contextlib.contextmanager": (
         "a function whose call passes its arguments to what it wraps and returns a context "
         "manager over the result, raising where that call raises"
@@ -3272,7 +3282,8 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
         for o in outer
     ]
     clause.tail = (
-        f"Applied, the name is bound to {binds[0]}. {path} binds it to {binds[1]}. So the "
+        f"Applied, the name is bound to {binds[0]}. The {path} definition it was compared with "
+        f"binds it to {binds[1]}. So the "
         "observable may go red for that change and not for the reintroduction. Copy the live "
         "decorators; the mutation lives in a different repository from the symbol it shadows, so "
         "nothing else keeps the two in step"
@@ -3430,10 +3441,12 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     if mismatch is not None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
-            "A difference of this kind can change what a call of the name gets -- a TypeError, a "
-            "coroutine, generator or other object where a value was expected, or, where the shape "
-            "decorators differ, a different binding, such as results no longer cached -- so the "
-            "observable may go red for that change and not for the reintroduction — a wrecking "
+            "Applied, the name is bound to an object whose kind, signature or decorators differ from "
+            "those of the definition it was compared with. Code that inspects the name can see "
+            "that, and for many such differences so can a call -- a TypeError, a coroutine, "
+            "generator or other object where a value was expected, or, where the shape decorators "
+            "differ, a different binding, such as results no longer cached -- so the observable "
+            "may go red for that change and not for the reintroduction — a wrecking "
             "ball wearing the shape of a surgical proof. Copy the live signature and decorators; "
             "the mutation lives in a different repository from the symbol it shadows, so nothing "
             "else keeps the two in step"
