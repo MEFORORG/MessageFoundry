@@ -123,6 +123,7 @@ __all__ = [
     "safe_text_bound",
     "safe_traceback",
     "sqlite_errorname_of",
+    "sqlstate_text",
 ]
 
 _REDACTED = "[redacted]"
@@ -3112,8 +3113,8 @@ def args_hold_a_message(exc: BaseException) -> bool:
     """Whether ``exc``'s class, or a class it inherits, is from a package in
     :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
     the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
-    connector's ``_shown_state`` returns no object read from it, only the error's own
-    ``sqlstate`` attribute, an exact ``str`` equal to it. The connector still CLASSIFIES such an
+    connector's ``_shown_state`` names a state for it only from the error's own ``sqlstate``
+    attribute, an exact ``str``, and only when that equals the state it was asked about. The connector still CLASSIFIES such an
     error by the shape of ``args[0]``, and the store's ``driver_sqlstate`` does not call this, so
     it still reads and prints that ``args[0]``. A class that cannot be read answers ``False``, so
     it is read by shape, as any other error is; that does not raise, so this runs on every link of
@@ -3157,17 +3158,30 @@ def is_a_sqlite_error(exc: BaseException) -> bool:
 def reads_as_a_sqlstate(value: object) -> TypeGuard[str]:
     """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters.
     Exactly ``str``: a subclass's ``__str__`` can print anything, such as a value from the
-    message, however its data matches (engine PR 3163). A ``TypeGuard``, not a ``TypeIs``: a
+    message, however its data matches (engine PR 3163); :func:`sqlstate_text` reads a subclass by
+    its data. A ``TypeGuard``, not a ``TypeIs``: a
     ``False`` answer does not say ``value`` is no ``str``."""
     return type(value) is str and _DRIVER_SQLSTATE.fullmatch(value) is not None
+
+
+def sqlstate_text(value: object) -> str | None:
+    """``value`` as an exact ``str`` copy of its data when that data has a SQLSTATE's shape, else
+    None. A ``str`` subclass is read by its data, as before, so it classifies an error as it did,
+    but what is returned is ``str``'s own copy, so no reader prints the subclass's ``__str__``
+    (engine PR 3163). ``str.__str__`` is called on ``str`` itself, which a subclass cannot
+    override."""
+    if not isinstance(value, str):
+        return None
+    text = str.__str__(value)
+    return text if reads_as_a_sqlstate(text) else None
 
 
 def driver_sqlstate_of(
     exc: BaseException, *, attribute: bool = True, past_attribute: bool = False
 ) -> str | None:
     """The SQLSTATE a known driver's own error (:func:`known_driver_error`) names, read in this
-    order. When ``attribute`` is true, the ``sqlstate`` attribute of any such driver's error, if it
-    :func:`reads_as_a_sqlstate`; an attribute that is set but is no SQLSTATE then ends the read
+    order, each as :func:`sqlstate_text` returns it. When ``attribute`` is true, the ``sqlstate``
+    attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set but is no SQLSTATE then ends the read
     with None unless ``past_attribute`` is true. Then None for an error from a package in
     :func:`args_hold_a_message`, at least asyncpg, whose ``args[0]`` is its message. Otherwise
     ``args[0]``, if it reads as a SQLSTATE, as pyodbc's does. None for any error that is no known
@@ -3183,15 +3197,15 @@ def driver_sqlstate_of(
         return None
     if attribute:
         state = getattr(exc, "sqlstate", None)
-        if reads_as_a_sqlstate(state):
-            return state
+        text = sqlstate_text(state)
+        if text is not None:
+            return text
         if state is not None and not past_attribute:
             return None
     if args_hold_a_message(exc):
         return None
     args = getattr(exc, "args", ())
-    first = args[0] if isinstance(args, tuple) and args else None
-    return first if reads_as_a_sqlstate(first) else None
+    return sqlstate_text(args[0] if isinstance(args, tuple) and args else None)
 
 
 def sqlite_errorname_of(exc: BaseException) -> str | None:

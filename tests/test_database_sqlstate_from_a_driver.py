@@ -472,7 +472,7 @@ def test_a_sqlstate_text_subclass_cannot_name_an_asyncpg_message() -> None:
 
 
 class _Loud(str):
-    """SQLSTATE-shaped data, ``23505``, whose ``__str__`` prints a value instead."""
+    """SQLSTATE-shaped data whose ``__str__`` prints a value instead."""
 
     def __str__(self) -> str:
         return _VALUE
@@ -493,19 +493,20 @@ def _asyncpg_error(message: object, sqlstate: object) -> _AsyncpgMessage:
     return exc
 
 
-def test_the_shown_state_is_the_vetted_attribute_not_the_callers_state() -> None:
+def test_the_shown_state_is_an_exact_copy_never_the_callers_object() -> None:
     """Hold item 1 on engine PR 3163: red on 05ee5958ff9, whose ``_shown_state`` returned the
     caller's ``state``, a ``str`` subclass from ``args[0]`` that prints ``MRN42``, once it equalled
-    the vetted attribute. Another driver's state is returned only as exactly ``str``."""
-    shown = database._shown_state(_Loud("23505"), _asyncpg_error(_Loud("23505"), "23505"))
-    assert type(shown) is str and shown == "23505"
-    assert _VALUE not in f"[{shown}]"
-    assert database._shown_state(_Loud("23505"), DriverError(_Loud("23505"), "x")) is None
+    the vetted attribute. What it returns now is an exact ``str`` copy, for any driver."""
+    for exc in (_asyncpg_error(_Loud("23505"), "23505"), DriverError(_Loud("23505"), "x")):
+        shown = database._shown_state(_Loud("23505"), exc)
+        assert type(shown) is str and shown == "23505"
+        assert _VALUE not in f"[{shown}]"
 
 
 def test_the_shown_state_compares_by_strs_own_method() -> None:
-    """Hold item 6: the mutant ``type(attribute) is str and attribute == state`` names a state for
-    a ``str`` subclass from ``args[0]`` whose reflected ``__eq__`` says yes to anything."""
+    """Hold item 6: the mutant ``attribute is not None and attribute == state`` names a state for
+    a ``str`` subclass from ``args[0]`` whose reflected ``__eq__`` says yes to anything, since
+    ``==`` runs the right operand's ``__eq__`` first when its class is a subclass of the left's."""
     exc = _asyncpg_error(_Permissive(_VALUE), "23505")
     assert database._shown_state(_Permissive(_VALUE), exc) is None
 
@@ -523,33 +524,84 @@ def test_a_classified_error_prints_the_shown_state_never_its_sqlstate() -> None:
     assert type(refused.code) is str and refused.code == "23505"
 
 
-def test_a_sqlstate_subclass_is_no_sqlstate() -> None:
-    """Hold item 3: red on 05ee5958ff9, whose ``isinstance`` test let a ``str`` subclass in the
-    ``sqlstate`` attribute be printed by the traceback line as ``[MRN42]``. The one exact-type test
-    closes the attribute read and the ``args[0]`` read of every reader."""
-    from messagefoundry.redaction import driver_sqlstate_of, reads_as_a_sqlstate
+def test_a_sqlstate_subclass_is_read_as_an_exact_copy() -> None:
+    """Hold item 3: red on 05ee5958ff9, whose readers returned a ``str`` subclass in the
+    ``sqlstate`` attribute or ``args[0]`` as it was, so the traceback line printed ``[MRN42]``
+    through its ``__str__``. The readers now return an exact copy of its data, so the error is
+    classified as on origin/main and no reader hands the subclass on."""
+    from messagefoundry import redaction
+    from messagefoundry.redaction import driver_sqlstate_of
 
-    assert not reads_as_a_sqlstate(_Loud("23505"))
     exc = _raised(_asyncpg_error(_VALUE, _Loud("23505")))
     assert _VALUE not in safe_traceback((type(exc), exc, None))
-    assert driver_sqlstate_of(exc) is None
-    assert database._shown_state(database._log_sqlstate(exc), exc) is None
+    assert "[23505] [driver message withheld]" in safe_traceback((type(exc), exc, None))
+    for state in (driver_sqlstate_of(exc), database._log_sqlstate(exc)):
+        assert type(state) is str and state == "23505"
+    assert database._safe_db_error(exc) == "_AsyncpgMessage [23505]"
     shaped = DriverError(_Loud("23505"), "x")
-    assert database._sqlstate(shaped) is None and database._log_sqlstate(shaped) is None
-    assert driver_sqlstate_of(shaped) is None
-    assert _VALUE not in database._safe_db_error(shaped)
+    for state in (
+        database._sqlstate(shaped),
+        database._log_sqlstate(shaped),
+        driver_sqlstate_of(shaped),
+    ):
+        assert type(state) is str and state == "23505"
+    assert database._safe_db_error(shaped) == "DriverError [23505]"
+    assert not redaction.reads_as_a_sqlstate(_Loud("23505"))
+    assert type(redaction.sqlstate_text(_Loud("23505"))) is str
 
 
 async def test_a_probe_prints_no_sqlstate_subclass() -> None:
     """Hold item 2, the probe's caller: red on 05ee5958ff9, whose ``test_connection`` error read
-    ``database rejected the statement [MRN42]`` for this asyncpg error."""
+    ``database rejected the statement [MRN42]`` for this asyncpg error. Still a permanent
+    rejection, as there."""
     dest = _dest()
     dest._pool = _FakePool(_FakeConn(_FakeCursor(_asyncpg_error(_Loud("23505"), "23505"))))
-    with pytest.raises(DeliveryError) as failed:
+    with pytest.raises(NegativeAckError) as failed:
         await dest.test_connection()
-    assert _VALUE not in str(failed.value)
-    assert _VALUE not in str(getattr(failed.value, "code", ""))
+    assert str(failed.value) == "database rejected the statement [23505]"
+    assert type(failed.value.code) is str and failed.value.code == "23505"
     assert _VALUE not in safe_exc(failed.value)
+
+
+_SUBCLASS_DUP = "Cannot insert duplicate key. The duplicate key value is (900123456). (2627) (X)"
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _asyncpg_error(_Loud("23505"), "23505"),
+        DriverError(_Loud("23505"), _SUBCLASS_DUP),
+    ],
+    ids=["asyncpg", "pyodbc"],
+)
+async def test_a_send_classifies_a_sqlstate_subclass_and_prints_a_copy(exc: Exception) -> None:
+    """Review of the hold's fix: a ``str`` subclass state is still classified by its data, a
+    dead-lettered rejection after a rollback, as on origin/main, never re-raised to the internal-
+    error arm, whose stored text would print the driver's message or the subclass's value."""
+    conn = _FakeConn(_FakeCursor(exc))
+    dest = _dest()
+    dest._pool = _FakePool(conn)
+    with pytest.raises(NegativeAckError) as refused:
+        await dest.send('{"mrn": "1", "val": "x"}')
+    assert str(refused.value).startswith("database rejected the statement [23505]")
+    assert refused.value.permanent and refused.value.code == "23505"
+    assert _VALUE not in safe_exc(refused.value)
+    assert "900123456" not in safe_exc(refused.value)
+    assert conn.rolledback
+
+
+async def test_a_connect_refusal_with_a_sqlstate_subclass_keeps_its_disposition() -> None:
+    """Review of the hold's fix: a refused login whose state is a ``str`` subclass is still a
+    credential fault that stops the lane, as on origin/main, and prints a copy of its state."""
+
+    async def refuse() -> Any:
+        raise DriverError(_Loud("28000"), "login failed")
+
+    with pytest.raises(NegativeAckError) as raised:
+        await database._connect(refuse, 1.0)
+    assert raised.value.credential_fault
+    assert str(raised.value) == "database refused the login [28000]"
+    assert _VALUE not in safe_exc(raised.value)
 
 
 async def test_an_asyncpg_message_in_a_send_is_dead_lettered_naming_no_state(

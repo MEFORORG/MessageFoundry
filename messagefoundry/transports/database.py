@@ -127,10 +127,10 @@ from messagefoundry.redaction import (
     known_driver_error,
     prints_a_codec_error,
     raised_by_a_driver,
-    reads_as_a_sqlstate,
     safe_exc,
     safe_text,
     sqlite_errorname_of,
+    sqlstate_text,
 )
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
@@ -2769,14 +2769,14 @@ def _classify_db_error(
     ``shown`` is what the text and ``code`` name, :func:`_shown_state`'s answer for the error;
     ``sqlstate`` classifies the error and is never printed, since a caller's state can be a ``str``
     subclass read from an argument whose text is a value (vault BACKLOG #1661, engine PR 3163).
-    ``None`` says the error is no driver's, or its state was read from asyncpg's message: the
-    error is classified all the same, but the text and ``code`` name neither a state nor a native
+    ``None`` or empty says the error is no driver's, or its state was read from asyncpg's message:
+    the error is classified all the same, but the text and ``code`` name neither a state nor a native
     number read from ``message``."""
-    code = _driver_code(message) if shown is not None else None
-    detail = (f"[{shown}]" if shown is not None else "[SQLSTATE withheld]") + (
+    code = _driver_code(message) if shown else None
+    detail = (f"[{shown}]" if shown else "[SQLSTATE withheld]") + (
         f" driver error {code}" if code else ""
     )
-    sqlstate_code = shown if shown is not None else "db"
+    sqlstate_code = shown or "db"
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
     if connecting:
@@ -2811,9 +2811,9 @@ def _sqlstate(exc: BaseException) -> str | None:
     (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
     ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
     ``args[0]`` is its message. An asyncpg error is classified by the same shape, though its
-    ``args[0]`` is its message; for one, :func:`_shown_state` returns no object read from
-    ``args[0]``, only the error's own ``sqlstate`` attribute, an exact ``str`` equal to it. It
-    reads no attribute but ``args``, with ``getattr`` and a default, so an error arm can call it
+    ``args[0]`` is its message; for one, :func:`_shown_state` names a state only from the error's
+    own ``sqlstate`` attribute, and only when that equals the state read. What it returns is an
+    exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but ``args``, with ``getattr`` and a default, so an error arm can call it
     before its cleanup."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
         return None
@@ -2825,20 +2825,21 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     for the arms that classify an error a PostgreSQL store's driver may raise. Past an attribute
     that is absent, None or no SQLSTATE it reads ``args[0]`` by shape, as :func:`_sqlstate` does,
     an asyncpg error's included, whose ``args[0]`` is its message; for one, :func:`_shown_state`
-    returns no object read from ``args[0]``, only the error's own ``sqlstate`` attribute, an exact
-    ``str`` equal to it. Never for a ``UnicodeError`` or an exception that holds one,
+    names a state only from the error's own ``sqlstate`` attribute, and only when that equals the
+    state read. What it returns is an exact ``str`` copy
+    (:func:`~messagefoundry.redaction.sqlstate_text`), the attribute's or ``args[0]``'s. Never for a ``UnicodeError`` or an exception that holds one,
     whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it classifies;
     :func:`_shown_state` says what text names."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
-    state = getattr(exc, "sqlstate", None)
-    return state if reads_as_a_sqlstate(state) else _shaped_state(getattr(exc, "args", ()))
+    state = sqlstate_text(getattr(exc, "sqlstate", None))
+    return state if state is not None else _shaped_state(getattr(exc, "args", ()))
 
 
 def _shaped_state(args: object) -> str | None:
-    """``args[0]`` when ``args`` is a tuple whose first item reads like a SQLSTATE."""
-    first = args[0] if isinstance(args, tuple) and args else None
-    return first if reads_as_a_sqlstate(first) else None
+    """``args[0]`` as :func:`~messagefoundry.redaction.sqlstate_text` returns it, when ``args`` is
+    a tuple whose first item reads like a SQLSTATE."""
+    return sqlstate_text(args[0] if isinstance(args, tuple) and args else None)
 
 
 def _shown_state(state: str | None, exc: BaseException) -> str | None:
@@ -2851,19 +2852,20 @@ def _shown_state(state: str | None, exc: BaseException) -> str | None:
     (:func:`~messagefoundry.redaction.args_hold_a_message`). An attribute that raises when read or
     compared names nothing.
 
-    What it returns is exactly ``str``, never the caller's object: for an asyncpg error, the
-    ``sqlstate`` attribute it vetted, and for any other driver's, ``state`` only when it
-    :func:`~messagefoundry.redaction.reads_as_a_sqlstate`. A ``str`` subclass equal to
-    ``'23505'`` could print a value through its ``__str__`` (engine PR 3163)."""
+    What it returns is an exact ``str`` copy of a SQLSTATE's data
+    (:func:`~messagefoundry.redaction.sqlstate_text`), never a ``str`` subclass, whose
+    ``__str__`` could print a value however its data reads (engine PR 3163): for an asyncpg
+    error, a copy of the ``sqlstate`` attribute it vetted, and for any other driver's, a copy of
+    ``state``."""
     if state is None or not known_driver_error(exc):
         return None
     if not args_hold_a_message(exc):
-        return state if reads_as_a_sqlstate(state) else None
+        return sqlstate_text(state)
     try:
-        attribute = getattr(exc, "sqlstate", None)
-        # Exactly str, compared by str's own method: a subclass's __eq__ could say yes, and so
-        # could a subclass's reflected __eq__ in ``state``, which ``==`` would run first.
-        if type(attribute) is str and str.__eq__(attribute, state) is True:
+        attribute = sqlstate_text(getattr(exc, "sqlstate", None))
+        # Compared by str's own method on the exact copy: ``==`` would run a str subclass's
+        # reflected __eq__ in ``state`` first, and that could say yes to anything.
+        if attribute is not None and str.__eq__(attribute, state) is True:
             return attribute
     except Exception:  # noqa: BLE001 - an unreadable attribute names nothing, as the docstring says
         return None
@@ -2950,14 +2952,15 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
-        if _shown_state(state, exc) is None:  # its arguments may carry a value: name no state
+        shown = _shown_state(state, exc)
+        if shown is None:  # its arguments may carry a value: name no state
             return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
         )
-    return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
+    return f"{type(exc).__name__} [{shown}]" + (f" driver error {code}" if code else "")
 
 
 class RedactedDbError(Exception):
