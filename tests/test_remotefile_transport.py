@@ -2955,6 +2955,9 @@ class _NlstOnlyFtp:
     def nlst(self, path: str) -> list[str]:
         return list(self._names)
 
+    def voidcmd(self, command: str) -> str:
+        return "200 ok"
+
     def size(self, path: str) -> int:
         self.sized.append(path)
         return 7
