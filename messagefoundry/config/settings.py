@@ -4029,7 +4029,7 @@ class AuthSettings(_Section):
         default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
-    # Per-actor pacing on the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
+    # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
     # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
     # admission by require_monitoring_read. The default's measured basis and multiplier are written
     # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
@@ -9878,13 +9878,13 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         )
 
     # --- the monitoring-read limiter (vault BACKLOG #1191, ASVS 15.2.2): per actor, on the six
-    # cost-bearing monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
+    # paced monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
     # all-users count ships OFF (0), so neither has an off value to name.
     if not auth.monitoring_read_rate_limit_enabled:
         out.append(
             (
                 "monitoring_read_rate_limit_enabled",
-                "the cost-bearing monitoring reads (the wiring graph, status, stats, metrics and "
+                "the six paced monitoring reads (the wiring graph, status, stats, metrics and "
                 "the connections dashboard) have NO pace -- one signed-in account may make the "
                 "engine rebuild the graph and scan the store as fast as it answers",
             )
@@ -9901,7 +9901,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             auth.monitoring_read_rate_limit_per_actor,
             what="the per-account monitoring-read limit",
             so=(
-                "one signed-in account may make that many cost-bearing monitoring reads per "
+                "one signed-in account may make that many paced monitoring reads per "
                 "window before it is refused"
             ),
             off=(

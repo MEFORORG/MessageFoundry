@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Per-actor pacing on the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2).
+"""Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2).
 
 Driven through the real routes, so a route that drops back to plain ``require`` goes red here. The
 six paced routes, their key and the default's basis are stated in docs/SECURITY.md,
@@ -170,3 +170,54 @@ async def test_disabled_knob_means_no_pacing(engine: Engine) -> None:
         h = await _bearer(c, "vw")
         for _ in range(5):
             assert (await c.get("/status", headers=h)).status_code == 200
+
+
+async def test_retry_after_is_the_whole_window_while_the_global_count_is_spent(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the all-accounts count spent, the value is the whole window, not the refused actor's
+    own wait: that wait depends on other accounts' reads, which a caller must not read."""
+    clock = [1000.0]
+    monkeypatch.setattr(
+        "messagefoundry.auth.ratelimit.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    service = await _service(
+        engine,
+        monitoring_read_rate_limit_per_actor=100,
+        monitoring_read_rate_limit_global=1,
+        monitoring_read_rate_limit_window_seconds=37.5,
+    )
+    async with _client(engine, service) as c:
+        h_vw = await _bearer(c, "vw")
+        h_other = await _bearer(c, "other")
+        assert (await c.get("/stats", headers=h_vw)).status_code == 200  # t=1000, global full
+        clock[0] = 1020.0
+        # "other" has no reads of its own; the global read leaves at 1037.5 (17.5 s away), but
+        # the header names the whole window.
+        refused = await c.get("/stats", headers=h_other)
+        assert (refused.status_code, refused.headers["Retry-After"]) == (429, "38")
+
+
+async def test_the_web_console_reads_are_not_charged(engine: Engine) -> None:
+    """The console calls the paced handlers in process through ``require_ui``, so the route's own
+    dependency never runs and the account's budget is untouched (docs/SECURITY.md, *Monitoring-read
+    pacing*, *What it does not charge*)."""
+    service = await _service(engine, monitoring_read_rate_limit_per_actor=1)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True), client=("127.0.0.1", 123)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post(
+            "/ui/login",
+            data={"username": "vw", "password": PW},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code in (200, 303), r.status_code
+        for path in ("/ui/nav-status", "/ui/connections", "/ui/monitoring/live"):
+            for _ in range(3):
+                assert (await c.get(path)).status_code == 200, path
+        # The same account's budget of 1 is still whole: one bearer read is admitted, the next
+        # is refused, so the pace itself is live.
+        h = await _bearer(c, "vw")
+        assert (await c.get("/status", headers=h)).status_code == 200
+        assert (await c.get("/status", headers=h)).status_code == 429

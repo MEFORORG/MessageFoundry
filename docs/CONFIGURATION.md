@@ -829,7 +829,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `phi_read_rate_limit_per_actor` | int | 120 | max PHI reads per user per window (generous — clears console/human use; `0` disables this dimension) |
 | `phi_read_rate_limit_global` | int | 0 | max PHI reads across all users per window (`0` = off) |
 | `phi_read_rate_limit_window_seconds` | float | 60 | sliding-window length |
-| `monitoring_read_rate_limit_enabled` | bool | `true` | per-actor pace on the six cost-bearing `monitoring:read` GETs (vault BACKLOG #1191, ASVS 15.2.2), charged at admission by `require_monitoring_read`; the routes, the key and the measured basis of the default are in [SECURITY.md](SECURITY.md), *Monitoring-read pacing* |
+| `monitoring_read_rate_limit_enabled` | bool | `true` | per-actor pace on six `monitoring:read` GETs, one budget per account per API process (vault BACKLOG #1191, ASVS 15.2.2), charged at admission by `require_monitoring_read`; the routes, the key and the measured basis of the default are in [SECURITY.md](SECURITY.md), *Monitoring-read pacing* |
 | `monitoring_read_rate_limit_per_actor` | int | 600 | max monitoring reads per user per window (`0` disables this dimension) |
 | `monitoring_read_rate_limit_global` | int | 0 | max monitoring reads across all users per window (`0` = off) |
 | `monitoring_read_rate_limit_window_seconds` | float | 60 | sliding-window length; must be above `0` |

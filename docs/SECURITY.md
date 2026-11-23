@@ -7684,41 +7684,58 @@ IP is a backlog follow-up).
 
 #### Monitoring-read pacing
 
-Vault BACKLOG #1191 (ASVS 15.2.2). Six `monitoring:read` GETs cost work that grows per call:
-`GET /graph/edges` rebuilds the wiring graph, and `GET /status`, `/stats`, `/metrics` and
-`/connections` read aggregates whose cost grows with the store. `GET /metrics/history` copies the
-in-memory metrics ring and reads no store; it is paced with them because the console reads it beside
-`/graph/edges`. They are
-gated by `require_monitoring_read`, which charges a per-actor sliding window at admission, before
-the route's own work. The other `monitoring:read` routes stay on plain `require`.
+Vault BACKLOG #1191 (ASVS 15.2.2). `require_monitoring_read` gates six `monitoring:read` GETs:
+`GET /graph/edges`, `/status`, `/stats`, `/metrics`, `/metrics/history` and `/connections`. Five of
+them cost work per call: `/graph/edges` rebuilds the wiring graph, and `/status`, `/stats`,
+`/metrics` and `/connections` read aggregates whose cost grows with the store. `/metrics/history`
+copies the in-memory metrics ring and reads no store; it is paced with them because the console's
+Flow and trends page reads it beside `/graph/edges`. The gate charges a per-actor sliding window at
+admission, before the route's own work. The six routes share ONE budget per account: a read of any
+of them spends it. The budget is in-process, per API process, so N engine shards multiply it by N
+(*Business-logic limits* above).
+
+Other `monitoring:read` reads that cost work are **not** charged. At least `GET /events`,
+`GET /connections/{name}/events` and `GET /config/provenance` stay on plain `require`, and the
+`/ws/stats` socket runs the connections-dashboard read (`_dashboard_rows`, the work behind
+`GET /connections`) once per frame, a frame a second, with no charge here. The socket cap of 64 is
+per API process, not per account, so one account may hold all 64: about 3,840 such reads a minute,
+with no 429.
 
 **Key.** `identity.user_id` of the bearer session the request presents. A Prometheus-style scraper
 on `/metrics` authenticates the same way, so it draws the bucket of the account its token belongs
-to, shared with that account's other API reads. A verified mTLS client certificate does not reach
-these routes: the certificate plane is `require_service_cert` alone, and these six use the bearer
-ladder. With `allow_no_auth` there is no actor, so nothing is charged.
+to, shared with that account's reads of the other five paced routes. A verified mTLS client
+certificate does not reach these routes: the certificate plane is `require_service_cert` alone, and
+these six use the bearer ladder. With `allow_no_auth` there is no actor, so nothing is charged.
 
-**How the default was set, measured from the console at this release.** One console tab shows one
-page. Its timers, read from `messagefoundry_webconsole/static/app.js` and the pages that set them:
-the nav poll of `/ui/nav-status` every 15 s, on every page, which calls the `GET /status` handler;
-the Connections page's poll of `/ui/connections` every 5 s, which calls the `GET /connections`
-handler (paused while `/ws/stats` is open; the measurement counts it running); and the Flow and
-trends page's `/ui/monitoring/live` every 5 s, which calls the `GET /graph/edges` and
-`GET /metrics/history` handlers. The worst page is Flow and trends: 24 + 4 = 28 handler calls per
-minute per tab. A scraper on `/metrics` every 15 s adds 4 per minute. The rule is at least 4 times
-(tabs x 28 + 4), rounded up, and never below 600 per 60 s. For five tabs that is 4 x 144 = 576, so
-the floor of 600 applies. 600 per minute is 21 such tabs at 1x, or 5 tabs at the 4x margin. The
-tab count of five is a judgment, not a measurement. The global count ships off, as
-`phi_read_rate_limit_global` does. That measurement is of the console, which this pace does not
-charge (below). The in-repo load harness's poller makes 3 charged reads per sample as one account,
-720 per minute at the 0.25 s interval two of its profiles use, so the engines it spawns run with the
-pace off (`harness/load/failover.py`, `EngineNode`). An engine it attaches to by URL keeps the pace.
+**Who is charged, and how the default was set.** The web console is not charged (below). The
+charged clients in this repository are at least:
+
+- the standalone test harness's monitor (`harness/monitor.py`), which reads `GET /stats` and
+  `GET /connections` every 1.5 s (`_POLL_INTERVAL_MS`), at most 80 charged reads per minute per open
+  monitor window. Its dead-letter read is not paced;
+- a scraper on `/metrics`, 4 per minute at a 15 s scrape;
+- the load harness's poller, 3 charged reads per sample as one account, 720 per minute at the
+  0.25 s interval two of its profiles use. The engines it spawns therefore run with the pace off
+  (`harness/load/failover.py`, `EngineNode`); an engine it attaches to by URL keeps the pace.
+
+The 600 per 60 s default was sized from the console's own polling, measured at this release from
+`messagefoundry_webconsole/static/app.js` and the pages that set its timers, as the bound a future
+charge on the console path would need. The console is not charged today, so this sizing is of an
+uncharged path. One console tab shows one page: the nav poll of `/ui/nav-status` every 15 s, on
+every page, calls the `GET /status` handler; the Connections page's poll of `/ui/connections` every
+5 s calls the `GET /connections` handler (paused while `/ws/stats` is open; the measurement counts
+it running); and the Flow and trends page's `/ui/monitoring/live` every 5 s calls the
+`GET /graph/edges` and `GET /metrics/history` handlers. The worst page is Flow and trends: 24 + 4 =
+28 handler calls per minute per tab. Five tabs plus a 15 s `/metrics` scrape is 144 per minute;
+four times that is 576, and 600 is a round figure chosen above it. The tab count of five and the
+margin of four are judgments, not measurements. Against the charged clients above, 600 per minute
+admits seven harness monitor windows (560) on one account, plus a `/metrics` scrape. The global
+count ships off, as `phi_read_rate_limit_global` does.
 
 **What it does not charge.** The console calls these handlers in process, through `require_ui`,
-so the route's own dependency does not run and a console tab spends none of this budget. Measured
-the other way, a console tab makes no HTTP request to the six routes, so the console's rate above
-bounds a future charge on that path rather than this one. A value looser than the default is
-named by `security_loosenings()`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) has its row.
+so the route's own dependency does not run and a console tab spends none of this budget; a console
+tab makes no HTTP request to the six routes. A value looser than the default is named by
+`security_loosenings()`; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) has its row.
 
 ## Audit
 

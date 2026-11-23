@@ -4296,7 +4296,7 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
-        # Per-actor pacing for the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS
+        # Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
         # 15.2.2), consulted by require_monitoring_read. Its own bucket, so dashboard polling never
         # spends the PHI-read budget.
         self._monitoring_read_limiter: SlidingWindowRateLimiter | None = (
@@ -4799,7 +4799,7 @@ class AuthService:
         return _retry_after_seconds(self._phi_read_limiter, actor)
 
     def allow_monitoring_read(self, actor: str) -> bool:
-        """Per-actor pacing for the cost-bearing monitoring:read GETs (vault BACKLOG #1191, ASVS
+        """Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
         15.2.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
         if self._monitoring_read_limiter is None:
             return True

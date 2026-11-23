@@ -1175,7 +1175,7 @@ count is above `0` (vault BACKLOG #2613).
 > `0` or less (the load refuses it). With the limiter off, its parts are not named again.
 > `monitoring_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the
 > default and it is never named.
-- **What you lose:** the per-account pace on the cost-bearing `monitoring:read` GETs
+- **What you lose:** the per-account pace on six `monitoring:read` GETs
   ([SECURITY.md](SECURITY.md), *Monitoring-read pacing*, names them). One signed-in account can make
   the engine rebuild the wiring graph and scan the store faster, up to as fast as it answers.
 - **When acceptable:** a monitoring tool on one known account that polls faster than the default
