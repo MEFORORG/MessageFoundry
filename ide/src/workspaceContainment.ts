@@ -9,7 +9,9 @@
 // link cases are caught too. It is vscode-free so the node-side unit suite can drive it.
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { isPathWithin } from "./pathFold";
+// ASCII-only case fold on Windows: path.relative folded with toLowerCase(), so a sibling named with
+// U+212A KELVIN SIGN for "k" read as the workspace (BACKLOG #5832).
+import { isPathWithin as isWithin } from "./pathFold";
 
 function realpath(p: string): string {
   try {
@@ -243,12 +245,6 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     "also take the target of a link, named with an absolute path in user settings, once any value " +
     "for the setting in workspace settings is removed, since a workspace value wins over a user value."
   );
-}
-
-// ASCII-only case fold on Windows ({@link isPathWithin}): path.relative folded with toLowerCase(),
-// so a sibling named with U+212A KELVIN SIGN for "k" read as the workspace (BACKLOG #5832).
-function isWithin(root: string, target: string): boolean {
-  return isPathWithin(root, target);
 }
 
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.

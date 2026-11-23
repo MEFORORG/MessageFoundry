@@ -8,7 +8,6 @@
 // differ in case. These helpers resolve against the folder the CLI ran in and compare case-insensitively
 // on Windows. They are vscode-free so the node-side unit suite can drive them.
 import * as path from "node:path";
-import { foldAsciiCase } from "./pathFold";
 
 /** Whether this host is Windows: the default for every `win32` parameter here. */
 export const IS_WIN32 = path.sep === "\\";
@@ -20,12 +19,13 @@ export function resolveAgainst(base: string, p: string, win32: boolean = IS_WIN3
 
 /**
  * A comparison key for the file `p` names, resolved against `base` first. On Windows (by default, when
- * running there) its ASCII letters are lower-cased, because the file system ignores case and the two
- * sides spell the drive letter differently. Only A-Z is folded: toLowerCase() maps at least U+212A
- * KELVIN SIGN onto "k", which would key two different files alike (BACKLOG #5832). Two paths name
- * the same file when their keys are equal.
+ * running there) it is lower-cased, because the file system ignores case and the two sides spell the
+ * drive letter differently. Two paths name the same file when their keys are equal. It folds with
+ * toLowerCase(), as VS Code's own resource comparison does on a case-insensitive file system, so the
+ * keys group diagnostics the way a DiagnosticCollection does; it is not a containment check, which
+ * folds ASCII only (pathFold.ts, BACKLOG #5832).
  */
 export function fileKey(base: string, p: string, win32: boolean = IS_WIN32): string {
   const resolved = resolveAgainst(base, p, win32);
-  return win32 ? foldAsciiCase(resolved) : resolved;
+  return win32 ? resolved.toLowerCase() : resolved;
 }

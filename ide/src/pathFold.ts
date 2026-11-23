@@ -5,9 +5,11 @@
 // toLowerCase() folds more than ASCII: at least U+212A KELVIN SIGN becomes "k", a name NTFS keeps
 // apart from "k". path.win32.relative calls toLowerCase() on both sides, so a directory whose name
 // differs from the workspace's only by such a character read as inside it. These helpers fold only
-// A-Z, so a non-ASCII case difference reads as a different path: the fail-closed reading. This misses
-// at least a non-ASCII name NTFS does fold, which now reads as outside or as another file. A leaf
-// module, so every caller can import it without a cycle; it is vscode-free for the unit suite.
+// A-Z, so a non-ASCII case difference reads as a different path. That refuses at least a non-ASCII
+// name NTFS does fold, which now reads as outside. It still reads as one path at least two names a
+// case-sensitive directory keeps apart (fsutil setCaseSensitiveInfo, or one WSL created) that differ
+// in ASCII case. A leaf module, so every caller can import it without a cycle; it is vscode-free for
+// the unit suite.
 import * as path from "node:path";
 
 /** `s` with ASCII A-Z lower-cased and every other character, non-ASCII letters included, unchanged. */

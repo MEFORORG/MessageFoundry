@@ -8,9 +8,8 @@
 import * as assert from "assert";
 import * as path from "node:path";
 import { foldAsciiCase, isPathWithin } from "../../pathFold";
-import { fileKey } from "../../pathIdentity";
 import { trustPinsFor } from "../../engineTrustModel";
-import { containedPathSetting, resolveInsideWorkspace } from "../../workspaceContainment";
+import { committedRelativePath, containedPathSetting, resolveInsideWorkspace } from "../../workspaceContainment";
 
 const KELVIN = "\u212A";
 
@@ -52,11 +51,6 @@ suite("isPathWithin folds ASCII case only on win32 (BACKLOG #5832)", () => {
 });
 
 suite("the sibling sites use the ASCII-only fold (BACKLOG #5832)", () => {
-  test("fileKey keys a KELVIN SIGN path apart from its k twin, and an ASCII case pair alike", () => {
-    assert.notStrictEqual(fileKey("C:\\ws", "kit\\a.py", true), fileKey("C:\\ws", `${KELVIN}it\\a.py`, true));
-    assert.strictEqual(fileKey("C:\\ws", "Kit\\A.py", true), fileKey("c:\\WS", "kit\\a.py", true));
-  });
-
   test("a second caFile differing only by KELVIN SIGN is refused, an ASCII case twin is not", () => {
     const url = "https://prod:8765";
     const kelvin = trustPinsFor(
@@ -91,8 +85,15 @@ suite("the sibling sites use the ASCII-only fold (BACKLOG #5832)", () => {
         "samples/config",
       );
       assert.strictEqual(escape.source === "workspace", false, `contained: ${JSON.stringify(escape)}`);
+      assert.strictEqual(escape.dropped, "workspace");
       const control = containedPathSetting({ workspaceValue: "C:\\WS\\KIT\\config" }, ws, "samples/config");
       assert.strictEqual(control.source, "workspace");
+      assert.strictEqual(control.dropped, false);
+    });
+
+    test("committedRelativePath refuses the KELVIN SIGN sibling; an ASCII case twin is relative", () => {
+      assert.strictEqual(committedRelativePath("C:\\ws\\kit", `C:\\ws\\${KELVIN}it\\hook.py`), undefined);
+      assert.strictEqual(committedRelativePath("C:\\ws\\kit", "C:\\WS\\KIT\\scripts\\hook.py"), "scripts/hook.py");
     });
 
     test("resolveInsideWorkspace refuses the KELVIN SIGN sibling by spelling", () => {
