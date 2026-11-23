@@ -7,9 +7,15 @@ call on the bounded Transit pool. Two rules keep that from costing availability:
 
 * a blank event ``detail`` has nothing to encrypt, so its statement makes no pool call, and a
   shut-down pool cannot roll back an event write that needs no cipher;
-* a statement built for a transaction that takes the per-message finalize applock is built before
-  the lock, so the transaction-owned lock never waits in the pool's queue, where a sibling
-  finalizer would time out on it.
+* in the transactions tested below, the message-event statement, and a startup sweep's sealed
+  ``last_error``, are built before the per-message finalize applock. The lock is transaction-owned,
+  so a build after it would hold it in the pool's queue, where a sibling finalizer times out.
+
+That second rule does not cover every seal under the lock. At least ``complete_with_response``
+still seals the reply body, detail, headers and re-ingress reference after taking the lock, since
+their associated data holds the response sequence read under it; ``claim_fifo_heads`` builds an
+idempotent-skip event after an earlier head's finalize; and an audit append seals its MAC under
+the locks ``cancel_queued`` takes.
 
 Driven offline, against the recording cursors of :mod:`tests.adr0075_batch_harness`, with a stub
 cipher that says it blocks on I/O.
@@ -182,3 +188,9 @@ async def test_no_event_statement_is_built_under_a_finalize_applock(case: str) -
     if method.startswith("dead_letter_missing_"):
         # A sweep's sealed last_error is built with its event, before the locks too.
         assert not any(held for _thread, _aad, held in cipher.sealed)
+    # Built early, still executed late: each event INSERT runs after the first finalize applock.
+    statements = [sql for sql, _params in _statements(cur)]
+    first_lock = next(i for i, sql in enumerate(statements) if "sp_getapplock" in sql)
+    inserts = [i for i, sql in enumerate(statements) if sql == ss._SQL_INSERT_EVENT]
+    assert len(inserts) == len(events), (inserts, len(events))
+    assert all(i > first_lock for i in inserts), statements

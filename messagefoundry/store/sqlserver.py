@@ -6961,7 +6961,7 @@ class SqlServerStore:
         for row in orphans:
             last_error = await self._aenc(error, aad=cell_aad("queue", "last_error", row[0]))
 
-            # The defaults bind this row's values. Why a call, not the bound method: see _event.
+            # Run at once by _prepare_event; the defaults only satisfy ruff B023. Why a call: see _event.
             def build(
                 mid: str = row[1], dest: str | None = row[2] if by_destination else None
             ) -> tuple[str, tuple[Any, ...]]:
