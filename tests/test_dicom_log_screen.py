@@ -38,6 +38,7 @@ from tests import _dicom_log_census as census  # noqa: E402
 _PLANTED = "DOE^JANE^PLANTED"
 #: A refused UID, which the engine's general redaction does not recognise.
 _UID = "1.02.999.PLANTED"
+_REFUSAL = f"Invalid 'Affected SOP Instance UID' value '{_UID}' - must not exceed 64 characters"
 _WITHHELD = "line withheld: it matches no pinned template"
 _FORMAT = "%(name)s|%(levelname)s|%(message)s"
 
@@ -800,22 +801,19 @@ def test_notes_that_read_as_false_are_not_written() -> None:
     assert _PLANTED not in written
 
 
-@pytest.mark.parametrize(
-    "fault",
-    [
-        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"),
-        # The CONTROL: the engine's log chain already withholds what is printed under a driver error.
-        sqlite3.OperationalError("database is locked"),
-    ],
-    ids=["store-acquire-timeout", "driver-error"],
-)
-async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
-    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The real delivery arm: the send fails, the arm's write of that failure to the store raises,
-    # so the new error's context is the DeliveryError, and the worker's fault log prints the chain.
-    from pynetdicom.association import Association
+def _raiser(exc: BaseException) -> Callable[..., Any]:
+    def fail(*args: Any, **kwargs: Any) -> Any:
+        raise exc
 
+    return fail
+
+
+async def _worker_fault_text(
+    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """One object sent through the real delivery arm with every write of its failure to the store
+    raising ``fault``, and what the worker's fault log then writes through the engine's
+    ``RedactionFilter``. The caller patches the library failure; this undoes it."""
     from messagefoundry.config.models import RetryPolicy
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.config.wiring import Registry
@@ -825,15 +823,9 @@ async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
     from tests._dicom_sample import make_sr_part10
     from tests.test_dicom_scu import _carry, _scu, _storage_scp
 
-    refusal = f"Invalid 'Affected SOP Instance UID' value '{_UID}' - must not exceed 64 characters"
-
-    def refuse(self: Any, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(refusal)
-
     async def locked(*args: Any, **kwargs: Any) -> Any:
         raise fault
 
-    monkeypatch.setattr(Association, "send_c_store", refuse)
     store = await MessageStore.open(tmp_path / "chain.db")
     try:
         payload = _carry(make_sr_part10())
@@ -848,6 +840,7 @@ async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
             runner._retry["OB_SCU"] = RetryPolicy()
             runner._simulate["OB_SCU"] = False
             monkeypatch.setattr(store, "mark_failed", locked)
+            monkeypatch.setattr(store, "dead_letter_now", locked)
             with pytest.raises(type(fault)) as raised:
                 await runner._process_delivery_item("OB_SCU", item)
     finally:
@@ -866,10 +859,98 @@ async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
         )
     finally:
         log.removeHandler(handler)
-    written = stream.getvalue()
+    return stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"),
+        # The CONTROL: the engine's log chain already withholds what is printed under a driver error.
+        sqlite3.OperationalError("database is locked"),
+    ],
+    ids=["store-acquire-timeout", "driver-error"],
+)
+async def test_a_store_fault_on_a_failed_delivery_logs_no_library_text(
+    fault: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The real delivery arm: the send fails, the arm's write of that failure to the store raises,
+    # so the new error's context is the DeliveryError, and the worker's fault log prints the chain.
+    from pynetdicom.association import Association
+
+    monkeypatch.setattr(Association, "send_c_store", _raiser(RuntimeError(_REFUSAL)))
+    written = await _worker_fault_text(fault, tmp_path, monkeypatch)
     assert type(fault).__name__ in written and "DeliveryError" in written  # CONTROL
     assert "RuntimeError" in written  # the cause is still named, by its class
     assert _UID not in written, written
+
+
+def _release_that_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The peer's association still ends; only the library's call raises afterwards."""
+    from pynetdicom.association import Association
+
+    real_release = Association.release
+
+    def release(self: Any) -> None:
+        real_release(self)
+        raise RuntimeError(_REFUSAL)
+
+    monkeypatch.setattr(Association, "release", release)
+
+
+@pytest.mark.parametrize("send_raises", [True, False], ids=["send-raised", "peer-answered"])
+async def test_a_failed_release_puts_no_library_text_in_the_worker_fault_log(
+    send_raises: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The release raises in the store's finally. Its error must not replace the delivery error,
+    # whose chain is the one the SCU scrubs, or the fault log prints the refused UID.
+    from pynetdicom.association import Association
+
+    _release_that_raises(monkeypatch)
+    if send_raises:
+        monkeypatch.setattr(Association, "send_c_store", _raiser(RuntimeError(_REFUSAL)))
+    written = await _worker_fault_text(
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"), tmp_path, monkeypatch
+    )
+    assert "StoreAcquireTimeout" in written and "DeliveryError" in written  # CONTROL
+    assert _UID not in written, written
+
+
+@pytest.mark.parametrize(
+    ("status", "kind", "says"),
+    [
+        (0x0000, "DeliveryError", "release"),
+        (0xB007, "DeliveryError", "release"),
+        (0xA700, "DeliveryError", "out-of-resources"),
+        (0xC000, "NegativeAckError", "0xC000"),
+    ],
+    ids=["success", "warning", "out-of-resources", "hard-refusal"],
+)
+async def test_a_failed_release_keeps_the_peers_answer_and_is_never_a_send(
+    status: int,
+    kind: str,
+    says: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from messagefoundry.transports.base import DeliveryError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    _release_that_raises(monkeypatch)
+    with (
+        caplog.at_level(logging.INFO, logger="messagefoundry.transports.dicom"),
+        _storage_scp(status=status) as port,
+        pytest.raises(DeliveryError) as raised,
+    ):
+        await _scu(port).send(_carry(make_sr_part10()))
+    assert type(raised.value).__name__ == kind
+    assert says in str(raised.value) and _UID not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
+    assert not [line for line in logged if "delivered" in line or "stored with" in line]
+    assert [line for line in logged if "release failed" in line and "RuntimeError" in line]
+    assert _UID not in caplog.text
 
 
 async def test_each_refusal_the_scu_raises_carries_no_library_text_on_its_chain(
