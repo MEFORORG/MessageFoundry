@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import EgressSettings, SecretRotationSettings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
@@ -293,6 +293,29 @@ async def test_a_stop_during_a_clustered_first_load_starts_nothing(
     assert eng._registry_runner is None
     assert eng._graph_supervisor is None
     await eng.stop()
+
+
+@pytest.mark.parametrize("gate", ["enforce_store_key_expiry", "enforce_secret_expiry"])
+async def test_an_expiry_refusal_comes_before_the_graph_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gate: str
+) -> None:
+    """BACKLOG #5615: a single node would otherwise bind listeners, then refuse."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, secret_rotation_settings=SecretRotationSettings())
+    eng.add_registry(load_config(cfg))
+    calls = _record_starts(monkeypatch)
+
+    def refuse(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("refused by the expiry gate")
+
+    monkeypatch.setattr(f"messagefoundry.pipeline.engine.{gate}", refuse)
+    try:
+        with pytest.raises(RuntimeError, match="refused by the expiry gate"):
+            await eng.start()
+        assert calls == []
+    finally:
+        await eng.stop()
 
 
 async def test_a_cancelled_clustered_first_load_leaves_a_kept_runner_supervised(
