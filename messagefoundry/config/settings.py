@@ -7851,22 +7851,23 @@ class DrSettings(_Section):
             )
         return self
 
-    @model_validator(mode="after")
-    def _activate_only_through_the_endpoint(self) -> DrSettings:
+    @field_validator("activate")
+    @classmethod
+    def _activate_only_through_the_endpoint(cls, value: bool) -> bool:
         # BACKLOG #5965. A boot-time activation skipped what POST /dr/activate runs: the cold-seed
         # verify, the server-DB seed gate, the takeover hook and the dr.activate audit row. Routing
         # it through DrCoordinator.activate is not contained (a server-DB activation needs a
         # per-activation DBA attestation no boot has, and a failed boot activation has no owner),
         # so the latch is refused. Without enabled it was silently ignored, so it is refused there
         # too; the message names no configured value.
-        if self.activate:
+        if value:
             raise ValueError(
                 "[dr].activate = true is not supported: a DR box boots passive and is promoted only "
                 "by POST /dr/activate (dr:operate), which verifies the cold seed, runs the takeover "
                 "hook and writes the dr.activate audit row that a boot-time activation skipped. "
                 "Remove [dr].activate, keep [dr].enabled = true, and activate with POST /dr/activate"
             )
-        return self
+        return value
 
     @model_validator(mode="after")
     def _enabled_names_a_seed(self) -> DrSettings:

@@ -169,5 +169,8 @@ def test_store_timeouts_refuse_a_negative_and_keep_zero(field: str) -> None:
 def test_api_refuses_a_port_out_of_range(value: int) -> None:
     with pytest.raises(ValidationError):
         ApiSettings(port=value)
-    assert ApiSettings(port=0).port == 0
-    assert ApiSettings(port=65535).port == 65535
+
+
+@pytest.mark.parametrize("value", [0, 65535])
+def test_api_loads_a_port_at_either_end_of_the_range(value: int) -> None:
+    assert ApiSettings(port=value).port == value
