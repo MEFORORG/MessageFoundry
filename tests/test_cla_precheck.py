@@ -88,9 +88,14 @@ def _no_signatures() -> frozenset[int]:
     return frozenset()
 
 
+def _no_sleep(_seconds: float) -> None:
+    raise AssertionError("the pre-check waited to re-read where no re-read was expected")
+
+
 def _run(env: Mapping[str, str], transport: cla_precheck.Transport) -> int:
-    """`run` with the network replaced: GraphQL by `transport`, the signature file by an empty one."""
-    return run(env, transport, _no_signatures)
+    """`run` with the network replaced: GraphQL by `transport`, the signature file by an empty one,
+    and the clock by one that refuses to wait."""
+    return run(env, transport, _no_signatures, _no_sleep)
 
 
 def _verdict(scenario: str) -> tuple[str, ...]:
@@ -265,21 +270,27 @@ def _serve(pages: list[Mapping[str, Any]]) -> cla_precheck.Transport:
     return lambda _q, _v: next(replies)
 
 
-def _page(commits: list[Mapping[str, Any]], total: int, more: bool) -> Mapping[str, Any]:
+def _page(
+    commits: list[Mapping[str, Any]], total: int, more: bool, head: str = _HEAD
+) -> Mapping[str, Any]:
     nodes = [{"commit": c} for c in commits]
     info = {"endCursor": "Y3Vyc29yOjI=" if more else None, "hasNextPage": more}
     connection = {"totalCount": total, "pageInfo": info, "nodes": nodes}
-    return {"data": {"repository": {"pullRequest": {"headRefOid": _HEAD, "commits": connection}}}}
+    return {"data": {"repository": {"pullRequest": {"headRefOid": head, "commits": connection}}}}
 
 
 def _commit(
-    oid: int, name: str, login: str | None = None, db_id: int | None = None
+    oid: int | str, name: str, login: str | None = None, db_id: int | None = None
 ) -> Mapping[str, Any]:
     person = {
         "name": name,
         "user": None if login is None else {"databaseId": db_id, "login": login},
     }
-    return {"oid": f"{oid:040x}", "author": person, "committer": person}
+    return {
+        "oid": oid if isinstance(oid, str) else f"{oid:040x}",
+        "author": person,
+        "committer": person,
+    }
 
 
 def test_a_linked_signed_author_does_not_cover_an_unlinked_commit_sharing_its_name() -> None:
@@ -612,34 +623,23 @@ def test_run_exit_codes_and_annotations(capsys: pytest.CaptureFixture[str]) -> N
 
 
 def test_a_stale_head_is_a_fault(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _run({**_ENV, "CLA_HEAD_SHA": _HEAD}, _Replay("linked_on_page_two")) == EXIT_PASS
+    on_head = _page([_commit(_HEAD, "Octo", "octo-contributor", 90000001)], 1, False)
+    assert _run({**_ENV, "CLA_HEAD_SHA": _HEAD}, _serve([on_head])) == EXIT_PASS
     waits: list[float] = []
-    # Every read reports _HEAD and proves a refusal, which a read of another head must not keep.
-    transport = _always([_page([_commit(1, "wshallwshall")], 1, False)])
+    # Every read reports _HEAD and would prove a refusal, which a read of another head must not
+    # keep. Each read stops at its first page.
+    calls: list[object] = []
+
+    def transport(_q: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
+        calls.append(variables["cursor"])
+        return _page([_commit(1, "wshallwshall")], 2, True)
+
     env = {**_ENV, "CLA_HEAD_SHA": "cd" * 20}
     assert run(env, transport, _no_signatures, waits.append) == EXIT_FAULT
     out = capsys.readouterr().out
     assert "stale" in out and "refused::" not in out
     assert waits == list(cla_precheck.HEAD_RETRY_DELAYS)
-
-
-def _always(pages: list[Mapping[str, Any]]) -> cla_precheck.Transport:
-    """Serve `pages` in order, starting over each time a read asks for the first page."""
-    state = {"next": 0}
-
-    def call(_query: str, variables: Mapping[str, object]) -> Mapping[str, Any]:
-        if variables["cursor"] is None:
-            state["next"] = 0
-        page = pages[state["next"]]
-        state["next"] += 1
-        return page
-
-    return call
-
-
-def _with_head(page: Mapping[str, Any], head: str) -> Mapping[str, Any]:
-    pull_request = dict(page["data"]["repository"]["pullRequest"], headRefOid=head)
-    return {**page, "data": {"repository": {"pullRequest": pull_request}}}
+    assert calls == [None] * (len(cla_precheck.HEAD_RETRY_DELAYS) + 1)
 
 
 def _node_error(index: int, *rest: str | int) -> Mapping[str, Any]:
@@ -658,14 +658,14 @@ def test_a_partial_graphql_error_keeps_the_refusals_its_other_commits_prove(
         **_page([_commit(1, "wshallwshall"), nulled_user], 2, False),
         "errors": [_node_error(1, "commit", "author", "user")],
     }
-    assert run(_ENV, _serve([page]), _no_signatures) == EXIT_REFUSED
+    assert _run(_ENV, _serve([page])) == EXIT_REFUSED
     out = capsys.readouterr().out
     refused = [line for line in out.splitlines() if "refused::" in line]
     assert len(refused) == 1 and f"{1:040x}" in refused[0]
     assert "GraphQL reported an error inside it" in out
     # The neighbour: the errored commit alone proves nothing, so the run is a fault.
     page = {**_page([nulled_user], 1, False), "errors": [_node_error(0, "commit", "author")]}
-    assert run(_ENV, _serve([page]), _no_signatures) == EXIT_FAULT
+    assert _run(_ENV, _serve([page])) == EXIT_FAULT
     assert "refused::" not in capsys.readouterr().out
 
 
@@ -681,6 +681,15 @@ def test_a_partial_error_that_nulls_a_whole_node_keeps_the_others() -> None:
     assert verdict.fault is not None and "distinct" not in verdict.fault
 
 
+def test_an_errored_commit_that_repeats_another_still_trips_the_count() -> None:
+    page = {
+        **_page([_commit(1, "Octo", "octo-contributor", 90000001), _commit(1, "x")], 2, False),
+        "errors": [_node_error(1, "commit", "author", "user")],
+    }
+    verdict = evaluate(fetch_commits(_serve([page]), "MEFORORG", "MessageFoundry", 7), _ALLOWLIST)
+    assert verdict.fault is not None and "read 1 distinct commits" in verdict.fault
+
+
 def test_a_partial_error_on_page_two_is_indexed_past_page_one() -> None:
     pages = [
         _page([_commit(1, "Octo", "octo-contributor", 90000001)], 3, True),
@@ -693,6 +702,25 @@ def test_a_partial_error_on_page_two_is_indexed_past_page_one() -> None:
     assert read.tainted == frozenset({1})
     refusals = evaluate(read, _ALLOWLIST).refusals
     assert len(refusals) == 1 and f"{3:040x}" in refusals[0]
+
+
+def test_an_errored_first_page_commit_leaves_rule_two_unjudged() -> None:
+    """Its key is unknown, so an unsigned author past page one may be that commit's author, whom
+    the action would then see: a fault, not a refusal saying they appear on no first-page commit.
+    """
+    octo = _commit(1, "Octo", "octo-contributor", 90000001)
+    pages = [
+        {**_page([octo], 2, True), "errors": [_node_error(0, "commit", "committer", "user")]},
+        _page([_commit(2, "Octo", "octo-contributor", 90000001)], 2, False),
+    ]
+    read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.refusals == ()
+    assert verdict.fault is not None and "rule 2 cannot be judged" in verdict.fault
+    # The neighbour: with page one readable, the same author is on it, so nothing is owed.
+    pages = [_page([octo], 2, True), pages[1]]
+    read = fetch_commits(_serve(pages), "MEFORORG", "MessageFoundry", 7)
+    assert evaluate(read, _ALLOWLIST, _no_signatures) == cla_precheck.Verdict(())
 
 
 @pytest.mark.parametrize(
@@ -719,11 +747,11 @@ def test_an_error_that_names_no_commit_node_still_faults_the_page(errors: object
 
 
 def test_a_head_that_lags_the_push_event_is_re_read(capsys: pytest.CaptureFixture[str]) -> None:
-    """BACKLOG #5645 item 1: GitHub's view of the head can trail the push that started the run.
+    """BACKLOG #5645 item 1: GitHub's view of the head may trail the push that started the run.
     The read is repeated until it reaches CLA_HEAD_SHA, and a refusal there stands."""
     new_head = "cd" * 20
-    lagging = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
-    caught_up = _with_head(_page([_commit(1, "wshallwshall")], 1, False), new_head)
+    lagging = _page([_commit(_HEAD, "Octo", "octo-contributor", 90000001)], 1, False)
+    caught_up = _page([_commit(new_head, "wshallwshall")], 1, False, head=new_head)
     replies = [lagging, lagging, caught_up]
     waits: list[float] = []
     env = {**_ENV, "CLA_HEAD_SHA": new_head}
@@ -732,31 +760,49 @@ def test_a_head_that_lags_the_push_event_is_re_read(capsys: pytest.CaptureFixtur
     assert "refused::" in capsys.readouterr().out
 
 
-def test_a_head_that_moves_partway_is_re_read_without_a_head_to_judge() -> None:
-    """With no CLA_HEAD_SHA (a comment event) a read whose head moved partway is repeated, so
-    the run judges one head's whole list rather than half of the old one."""
-    new_head = "cd" * 20
-    first = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
-    moved = _with_head(
-        _page([_commit(2, "Octo", "octo-contributor", 90000001)], 2, False), new_head
-    )
-    whole = _with_head(_page([_commit(1, "Octo"), _commit(2, "wshallwshall")], 2, False), new_head)
-    replies = [first, moved, whole]
+def test_a_commit_list_that_lags_its_head_is_re_read_then_judged_with_a_fault(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """headRefOid is CLA_HEAD_SHA but the commits are the previous push's: re-read, and once the
+    waits run out, judged with a fault, so a refusal it proves stands and a pass is not silent."""
+    env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
+    linked = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 1, False)
     waits: list[float] = []
-    assert run(_ENV, lambda _q, _v: replies.pop(0), _no_signatures, waits.append) == EXIT_REFUSED
-    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]] and replies == []
+    assert run(env, lambda _q, _v: linked, _no_signatures, waits.append) == EXIT_FAULT
+    assert "do not include CLA_HEAD_SHA" in capsys.readouterr().out
+    assert waits == list(cla_precheck.HEAD_RETRY_DELAYS)
+    unlinked = _page([_commit(1, "wshallwshall")], 1, False)
+    assert run(env, lambda _q, _v: unlinked, _no_signatures, lambda _s: None) == EXIT_REFUSED
+    caught_up = _page([_commit(_HEAD, "Octo", "octo-contributor", 90000001)], 1, False)
+    replies = [linked, caught_up]
+    waits = []
+    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, waits.append) == EXIT_PASS
+    assert waits == [cla_precheck.HEAD_RETRY_DELAYS[0]]
+
+
+def test_without_a_head_to_judge_nothing_is_re_read() -> None:
+    """A comment event sets no CLA_HEAD_SHA. A head that moves partway is judged as far as the
+    read got, as before this change, with no wait."""
+    first = _page([_commit(1, "wshallwshall")], 2, True)
+    moved = _page([_commit(2, "x")], 2, False, head="cd" * 20)
+    replies = [first, moved]
+    assert run(_ENV, lambda _q, _v: replies.pop(0), _no_signatures, _no_sleep) == EXIT_REFUSED
 
 
 def test_a_move_away_from_the_judged_head_keeps_the_pages_of_that_head() -> None:
     """The pages read before the head moved are of CLA_HEAD_SHA, so they are judged at once, as
     before this change, with no wait."""
     first = _page([_commit(1, "wshallwshall")], 2, True)
-    moved = _with_head(_page([_commit(2, "x")], 2, False), "cd" * 20)
+    moved = _page([_commit(2, "x")], 2, False, head="cd" * 20)
     replies = [first, moved]
-    waits: list[float] = []
     env = {**_ENV, "CLA_HEAD_SHA": _HEAD}
-    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, waits.append) == EXIT_REFUSED
-    assert waits == []
+    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, _no_sleep) == EXIT_REFUSED
+
+
+def test_a_re_read_that_faults_outright_is_a_fault() -> None:
+    env = {**_ENV, "CLA_HEAD_SHA": "cd" * 20}
+    replies = [_page([_commit(1, "wshallwshall")], 1, False), {"errors": [{}]}]
+    assert run(env, lambda _q, _v: replies.pop(0), _no_signatures, lambda _s: None) == EXIT_FAULT
 
 
 @pytest.mark.parametrize(
