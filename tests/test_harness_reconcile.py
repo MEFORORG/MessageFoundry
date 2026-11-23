@@ -962,7 +962,7 @@ def test_estate_reconcile_dead_letters_from_before_the_baseline_do_not_count() -
 
 
 def test_estate_reconcile_dead_count_that_fell_is_inconclusive() -> None:
-    # A purge or replay lowers the count, and could hide new dead-letters: 7 removed, 2 new.
+    # A replay or a stats reset lowers the count, and could hide new dead-letters: 7 removed, 2 new.
     base = replace(_BASE, out_dead=7)
     final = replace(_RIG_FINAL, out_dead=2)
     result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)

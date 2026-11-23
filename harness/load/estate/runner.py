@@ -549,7 +549,8 @@ def _reconcile(
     # a simple feed's shortfall. A clear floor therefore says NOTHING about at least ingress or
     # routed dead-letters and cancelled rows when hubs exist; seeing them takes a figure this check
     # does not have, such as an expected-written count or an all-stage dead count.
-    # A message the listener NAKed is recorded as a row, so it counts in `read` and fails this floor.
+    # A message the listener NAKed is recorded as a row, so it counts in `read`: it fails this floor
+    # unless a hub's surplus absorbs it, as with any other shortfall.
     # Only a completed drain is judged: before it, a row still in the pipeline reads as a shortfall.
     write_short = read - written
     write_lost = write_short > 0 and drained and drain_seconds is not None
