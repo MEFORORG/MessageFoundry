@@ -457,6 +457,36 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
         assert webhook.calls == 1  # the control: the webhook did run and fail
         assert "alert transport webhook failed" in caplog.text
         assert "did not drain" not in caplog.text
+        assert "not confirmed delivered" not in caplog.text
+
+
+class _SlowToCloseSink(NotifierAlertSink):
+    """A sink whose close stalls after its drain has delivered everything, so the unwind's wait
+    cuts a close that has no send running."""
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        await asyncio.Event().wait()
+
+
+async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5907 step 4: the unwind logged its ERROR on every cut, so a cut that reached no
+    running send and left nothing counted read as a loss. It stays silent, as on main."""
+    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
+    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
+    email = _HealthyEmail()
+    sink = _SlowToCloseSink([email])
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    store: Any = _ClosingStore()
+    caplog.set_level(logging.WARNING)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: delivered
+    assert sink.undelivered == 0
+    assert "did not drain" not in caplog.text
+    assert "not confirmed delivered" not in caplog.text
+    assert sink.sends_cut == 0
 
 
 class _CancelIgnoringEmail(_HealthyEmail):
@@ -477,10 +507,43 @@ class _CancelIgnoringEmail(_HealthyEmail):
         await super().send(event)
 
 
-async def test_a_send_left_past_the_cut_takes_the_alert_off_when_it_takes_it() -> None:
+class _CancelSwallowingWebhook:
+    """A send that hangs, then swallows the cancel that reaches it and returns, sending nothing."""
+
+    name = "webhook"
+
+    def __init__(self) -> None:
+        self.entered = asyncio.Event()
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+
+async def test_a_send_that_swallows_the_cut_and_returns_does_not_count_as_delivered() -> None:
+    """BACKLOG #5907 step 4: a send that returned counted as delivered even when the drain's
+    cancel had reached it and it swallowed the cancel, though it sent nothing. It stays counted."""
+    webhook = _CancelSwallowingWebhook()
+    sink = NotifierAlertSink([webhook])
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(webhook.entered.wait(), 5.0)
+    task = sink._task
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+    assert not sink._left_sends  # the control: the send returned within the grace
+    assert sink.undelivered == 1
+    assert sink.sends_cut == 1
+
+
+async def test_a_send_left_past_the_cut_does_not_count_when_it_returns() -> None:
     """BACKLOG #5907 step 4: the same rule for a send the drain's cancel left running past its
-    grace. The alert stays counted while no transport has taken it, and leaves the count when
-    the left send takes it."""
+    grace. The cancel reached it, so the alert stays counted, even once the send returns."""
     email = _CancelIgnoringEmail()
     sink = NotifierAlertSink([email])
     sink.start()
@@ -496,12 +559,10 @@ async def test_a_send_left_past_the_cut_takes_the_alert_off_when_it_takes_it() -
         assert len(sink._left_sends) == 1  # the control: the send was left running
     finally:
         email.release.set()  # a send that swallows every cancel must not outlive the test
-    for _ in range(20):
-        if not sink._left_sends:
-            break
-        await asyncio.sleep(0)
-    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
-    assert sink.undelivered == 0
+    await asyncio.wait_for(asyncio.gather(*sink._left_sends), 5.0)
+    assert not sink._left_sends  # released by the send's done callback
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: it returned
+    assert sink.undelivered == 1
 
 
 class _FailingTransport:

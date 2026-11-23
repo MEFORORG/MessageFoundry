@@ -1367,6 +1367,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._control_tasks: set[asyncio.Task[None]] = set()
         # BACKLOG #5907: send tasks a cut drain left still running past its grace.
         self._left_sends: set[asyncio.Task[None]] = set()
+        # BACKLOG #5907: how many sends were still running when a drain cancel reached them, over
+        # the sink's life (sends_cut).
+        self._sends_cut = 0
         # BACKLOG #5909: set by stop_control, so a rule firing after the shutdown clear logs why.
         self._control_stopped = False
         # Vault BACKLOG #3849: told (transport name, event) after each send that returned without
@@ -2676,15 +2679,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             # connection) must never break alerting or delivery. Swallow + log metadata only (no PHI).
             log.warning("alert control_action %s for %r failed", action, target, exc_info=True)
 
+    @property
+    def sends_cut(self) -> int:
+        """How many sends were still running when a drain cancel reached them, over the sink's
+        life (BACKLOG #5907): a count only, read at least by api.app's startup unwind."""
+        return self._sends_cut
+
     async def _handle(self, event: dict[str, Any], delivered: Callable[[], None]) -> None:
         """Send the event to each transport its rule selected (BACKLOG #5907).
 
-        The rule for :attr:`undelivered` (step 4): the alert leaves it when the first selected
-        transport's send returns, the point at which the delivery observer is told, whatever its
-        siblings do or when. A sibling that failed fast and one the drain's cancel cut count alike,
-        and a send left running past the cut's grace that then returns takes the alert off then.
-        A send the cut ended before it returned does not count, even if its channel took the
-        alert: a send through ``asyncio.to_thread``, as at least :class:`WebhookTransport`'s and
+        The rule for :attr:`undelivered` (step 4): the alert leaves it when a selected transport's
+        send returns before the drain's cancel reaches that send, at the first such return in
+        time, the point at which the delivery observer is told, whatever its siblings do or when.
+        A sibling that failed fast and one the drain's cancel cut count alike. A send the cancel
+        reached does not count, whether it then raised or swallowed the cancel and returned,
+        since nothing tells a send that took the alert from one that gave up. So a send left
+        running past the cut's grace never takes the alert off, and a send through
+        ``asyncio.to_thread``, as at least :class:`WebhookTransport`'s and
         :class:`EmailTransport`'s are, ends at once on the cancel while its worker thread runs on,
         and a delivery that thread then makes is not counted."""
         targets = event.pop("_transports", None)  # a rule's transport subset (None = all)
@@ -2762,6 +2773,17 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                         exc_info=True,
                     )
                 return
+            me = asyncio.current_task()
+            if drain_cancelled() and me is not None and me.cancelling():
+                # The drain's cancel reached this send, which swallowed it and returned: whether
+                # its channel took the alert is unknown, so it does not count. A transport name
+                # only, as on the cut's own line.
+                log.warning(
+                    "alert transport %s returned after the drain's cancel reached it; "
+                    "not counted as delivered",
+                    transport.name,
+                )
+                return
             # Here rather than from each child's outcome, since a send that cancels its own task
             # leaves the child cancelled whether or not it returned.
             delivered()
@@ -2818,6 +2840,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         WARNING, which says nothing of how each send then ends, and a send still running after the
         grace is left, held and counted in another."""
         running = [task.get_name() for task in sends if not task.done()]  # named by _handle
+        self._sends_cut += len(running)
         if running:
             # Transport names only, nothing of the alert, as the left-send line below is a count.
             log.warning(
