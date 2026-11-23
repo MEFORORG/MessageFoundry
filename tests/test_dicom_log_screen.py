@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import io
 import logging
 import re
@@ -21,6 +22,7 @@ import textwrap
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -527,7 +529,7 @@ async def test_each_c_store_puts_a_replaced_record_factory_back() -> None:
                 _scu_cstore, scp.sockport, make_sr_part10()
             )
             assert established and status == 0x0000
-            assert getattr(logging.getLogRecordFactory(), "_screens_dicom_logs", False)
+            assert isinstance(logging.getLogRecordFactory(), dicom_module._ScreeningRecordFactory)
     finally:
         logging.setLogRecordFactory(original)
 
@@ -755,3 +757,23 @@ def test_a_held_line_is_still_held_and_screened_once_written() -> None:
     written = _written(log, emit)
     assert "value '[redacted]' - must not exceed 64 characters" in written
     assert _PLANTED not in written
+
+
+def test_a_host_factory_that_copied_the_marker_is_not_taken_for_the_screen() -> None:
+    original = logging.getLogRecordFactory()
+
+    @functools.wraps(original)
+    def hosts(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        return logging.LogRecord(*args, **kwargs)
+
+    logging.setLogRecordFactory(hosts)
+    try:
+        dicom_module._install_record_screen()
+        assert logging.getLogRecordFactory() is not hosts
+        written = _written(
+            logging.getLogger("pynetdicom.new_under_a_wrapped_factory"),
+            lambda log: log.error("value %s", _PLANTED),
+        )
+    finally:
+        logging.setLogRecordFactory(original)
+    assert _PLANTED not in written and _WITHHELD in written

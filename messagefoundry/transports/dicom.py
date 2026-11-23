@@ -517,7 +517,7 @@ _LIBRARY_ROOTS = frozenset({"pynetdicom", "pydicom"})
 #: The loggers the filter sits on by name: each module logger in pynetdicom 3.0.4, and pydicom's.
 #: The hold in :func:`_logs_held` needs a filter, since a record factory cannot drop a record. A test
 #: pins this against the libraries' own ``getLogger`` calls. A logger outside this list is still
-#: screened, by :func:`_screening_record_factory`.
+#: screened, by :class:`_ScreeningRecordFactory`.
 _FILTERED_LOGGERS = (
     "pydicom",
     "pydicom.pixels.decoders.base",
@@ -734,23 +734,28 @@ class _PeerValueFilter(logging.Filter):
 _PEER_VALUE_FILTER = _PeerValueFilter()
 
 
-def _screening_record_factory(previous: Callable[..., logging.LogRecord]) -> Any:
+class _ScreeningRecordFactory:
     """A log record factory that screens each record of a library logger as it is made and leaves
     every other logger's alone. This is what covers a logger no filter is on, such as one created
     after the install, one that does not propagate, and a host with its own handlers. A record
     inside :func:`_logs_held` is screened here too, so a logger whose filter a host removed writes
-    no raw line; the filter still holds the record where it is on."""
+    no raw line; the filter still holds the record where it is on.
 
-    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-        record = previous(*args, **kwargs)
+    A class, so :func:`_install_record_screen` can tell it by type: ``functools.wraps`` copies a
+    function's attributes, so a host's wrapper could otherwise read as this factory."""
+
+    __slots__ = ("_previous",)
+
+    def __init__(self, previous: Callable[..., logging.LogRecord]) -> None:
+        self._previous = previous
+
+    def __call__(self, *args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = self._previous(*args, **kwargs)
         name = str(record.name)
         # startswith first: this runs on every record of every logger in the process.
         if name.startswith(("pynetdicom", "pydicom")) and name.partition(".")[0] in _LIBRARY_ROOTS:
             _screen_record(record)
         return record
-
-    factory._screens_dicom_logs = True  # type: ignore[attr-defined]
-    return factory
 
 
 def _install_record_screen() -> None:
@@ -759,8 +764,8 @@ def _install_record_screen() -> None:
     the next SCP start, C-STORE or SCU association puts it back; the named loggers keep their
     filter through that gap."""
     current = logging.getLogRecordFactory()
-    if not getattr(current, "_screens_dicom_logs", False):
-        logging.setLogRecordFactory(_screening_record_factory(current))
+    if not isinstance(current, _ScreeningRecordFactory):
+        logging.setLogRecordFactory(_ScreeningRecordFactory(current))
 
 
 def _redact_flagged_peer_values() -> None:
