@@ -409,6 +409,35 @@ def test_the_other_provider_refusal_keeps_its_text_through_the_key_seams(
         assert "leave it where it is" in text, (seam.__name__, text)
 
 
+def test_the_stores_own_key_file_beside_it_is_not_taken_for_a_host_blob(tmp_path: Path) -> None:
+    """The beside-store directory is read whatever is set, so a store's own key file there named
+    master.key is passed over; the control is the same file with no key file setting."""
+    secrets = _own_custody_directory(tmp_path / "secrets")
+    own = tmp_path / "master.key"
+    own.write_bytes(b"not read")
+    environ = {"MEFOR_SECRETS_DIRECTORY": str(secrets)}
+    settings = _settings(tmp_path, key_provider="auto", encryption_key_file=str(own))
+    assert foreign_custody_refusal(settings, environ=environ) is None
+    other = _settings(tmp_path, key_provider="auto", encryption_key_file=str(tmp_path / "k.bin"))
+    assert foreign_custody_refusal(other, environ=environ) is not None
+
+
+def test_the_left_behind_refusal_gives_a_way_on_that_leaves_another_stores_file(
+    tmp_path: Path,
+) -> None:
+    """The move is offered only for a file that is this store's; otherwise the way on leaves it."""
+    custody_dir = _own_custody_directory(tmp_path / "custody")
+    (tmp_path / "handoff.key").write_bytes(b"not read")
+    with pytest.raises(HostCustodyRefused) as refused:
+        load_host_custody(
+            _settings(tmp_path),
+            enforcing=True,
+            environ={"MEFOR_CUSTODY_DIRECTORY": str(custody_dir)},
+        )
+    text = str(refused.value)
+    assert "If none is this store's" in text and "leave it where it is" in text, text
+
+
 def test_a_relative_secrets_variable_counts_as_unset_for_the_search(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

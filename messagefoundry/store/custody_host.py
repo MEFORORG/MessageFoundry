@@ -290,6 +290,11 @@ def foreign_custody_refusal(
     :data:`_LEAVE_KEY_FILES_STEP`, then :func:`keep_the_key_step`."""
     environ = os.environ if environ is None else environ
     found = _key_files_outside(settings, None, environ)
+    if settings.encryption_key_file:
+        # The store's own key file, whatever it is named, is not a host blob: the directory beside
+        # the store is read whatever is set, and a key file named master.key may sit there.
+        own = Path(settings.encryption_key_file).resolve()
+        found = [p for p in found if p.resolve() != own]
     if not found:
         return None
     # One clause per file, so two files in two directories each name their own.
@@ -693,7 +698,7 @@ def _left_outside_the_custody_directory(
         f"({named}), where a mint run with other variables writes it. If one holds this store's "
         f"key, move that file into {directory} with an account that may write there, on the same "
         "volume so it keeps its own access list, and try again; a key minted now would not open "
-        "a store that key made"
+        f"a store that key made. If none is this store's: {_LEAVE_KEY_FILES_STEP}"
     )
 
 

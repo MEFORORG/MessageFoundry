@@ -3189,7 +3189,9 @@ if ($HostCustody) {
         if ($custodyHeld.Count -ne 0) {
             throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: it holds " +
                 "$($custodyHeld.Count) item(s) the installer did not put there, such as " +
-                "'$($custodyHeld[0].Name)'. Remove the directory, check who wrote them, and re-run the installer.")
+                "'$($custodyHeld[0].Name)'. Check who wrote them. A master.key or handoff.key there " +
+                "may be a store's only key: do not delete it; follow docs/SERVICE.md 'Reinstalling " +
+                "over a kept custody directory'.")
         }
     }
 }

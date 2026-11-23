@@ -411,7 +411,7 @@ function Get-UninstallResidueNotice {
             if ($CustodyAceRemoved) {
                 $lines += "  Custody entry    REMOVED - '$ServiceAccount' no longer has an entry on $CustodyDir."
             } else {
-                $lines += "  Custody entry    '$ServiceAccount' still has read and add-file on $CustodyDir."
+                $lines += "  Custody entry    '$ServiceAccount' still has an entry on $CustodyDir."
                 $lines += "                   Remove it with:"
                 $lines += "                     icacls `"$CustodyDir`" /remove:g `"$acePrincipal`""
             }
