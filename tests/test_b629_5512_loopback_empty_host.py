@@ -74,7 +74,6 @@ from messagefoundry.transports.database import (
     DatabaseSource,
 )
 from messagefoundry.transports.mllp import InsecureHopGuard
-from messagefoundry.transports.strict_requests import _stays_on_the_box
 from messagefoundry.transports.tcp import TcpDestination
 from tests.test_hop_refusal_db_inbound import _GENERIC_CONNECTORS, _generic_dest, _generic_source
 from tests.test_hop_refusal_rawtcp import tcp_cfg
@@ -469,6 +468,10 @@ def test_a_trust_anchor_on_an_empty_host_keeps_the_ca_and_the_crl() -> None:
 
 
 def test_a_vault_hop_with_a_blank_host_does_not_stay_on_the_box() -> None:
+    # strict_requests imports requests at module level and the harness leg lacks it.
+    pytest.importorskip("requests")
+    from messagefoundry.transports.strict_requests import _stays_on_the_box
+
     assert _stays_on_the_box("", None) is False
     assert _stays_on_the_box(LOOPBACK, None) is True
 
