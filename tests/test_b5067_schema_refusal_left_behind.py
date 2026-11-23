@@ -1266,7 +1266,9 @@ def _after_full_open(kind: str) -> Exception:
 def test_a_refusal_raised_after_a_full_open_says_so_with_certainty(kind: str) -> None:
     """Each of the three is raised only after a full open, so the text says the open may already
     have changed the database, never that it may or may not have reached its writing steps. A
-    keyed ``_UnauditableWrite`` names the salt and genesis records; the keyless two name neither.
+    keyed ``_UnauditableWrite`` names the salt record; the keyless two name neither. None names
+    the genesis record: a keyed open that wrote one holds that chain's key, so the audit row's
+    check passes after it, and a keyless open writes none.
 
     Mutation: word these three as ``returned=False`` again, or pass ``keyed=False`` for
     ``_UnauditableWrite``."""
@@ -1276,16 +1278,17 @@ def test_a_refusal_raised_after_a_full_open_says_so_with_certainty(kind: str) ->
     store = StoreSettings(path="synthetic.db")
     left = _opened_left_behind(_after_full_open(kind), store, keyed=True)
     assert _CERTAIN in left and _MAY_OR_MAY_NOT not in left, left
-    keyed = kind == "unauditable"
-    assert (_SALT in left) is keyed and (_GENESIS in left) is keyed, left
+    assert (_SALT in left) is (kind == "unauditable"), left
+    assert _GENESIS not in left, left
 
 
 @pytest.mark.parametrize("command", sorted(_ADMIN_ARGV))
-def test_a_keyed_unauditable_write_names_the_salt_and_genesis_records(
+def test_a_keyed_unauditable_write_names_the_salt_record(
     command: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """At each admin command's could-not-start arm, an ``_UnauditableWrite`` after a keyed open
-    names the salt and genesis records that open may have written, with the certain wording.
+    names the salt record that open may have bound, with the certain wording. The open is
+    replaced, so the refusal is raised from it; the text is what is under test.
 
     Mutation: classify ``_UnauditableWrite`` as keyless again."""
     from messagefoundry import __main__ as cli
@@ -1296,14 +1299,14 @@ def test_a_keyed_unauditable_write_names_the_salt_and_genesis_records(
     out = _run([*_ADMIN_ARGV[command], "--service-config", str(settings)], capsys)
     assert "synthetic unauditable write" in out, out
     assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
-    assert _SALT in out and _GENESIS in out, out
+    assert _SALT in out and _GENESIS not in out, out
 
 
-def test_provision_admin_keyed_unauditable_write_at_the_write_names_salt_and_genesis(
+def test_provision_admin_keyed_unauditable_write_at_the_write_names_the_salt_record(
     shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``provision-admin``'s arm for the three after-open refusals passed ``keyed=False`` for all
-    of them, so a keyed ``_UnauditableWrite`` omitted the salt and genesis records.
+    of them, so a keyed ``_UnauditableWrite`` omitted the salt record.
 
     Mutation: pass ``keyed=False`` from that arm again."""
     from messagefoundry import __main__ as cli
@@ -1313,7 +1316,7 @@ def test_provision_admin_keyed_unauditable_write_at_the_write_names_salt_and_gen
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "synthetic unauditable write" in out, out
     assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
-    assert _SALT in out and _GENESIS in out, out
+    assert _SALT in out and _GENESIS not in out, out
 
 
 def test_admin_unlock_keyless_chain_refusal_says_so_with_certainty(

@@ -1151,7 +1151,7 @@ def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_ch
     """BACKLOG #5067: the first open returned, and may have written, before the second open
     fails, so that failure does not say nothing was written.
 
-    Mutation: clear ``store_returned`` before the second open again."""
+    Mutation: drop ``after_check=True`` from the swap's ``open_refused`` call."""
     monkeypatch.chdir(tmp_path)
     db = tmp_path / "second-open-fails.db"
     _seed(db)
@@ -1183,19 +1183,21 @@ def test_a_store_failure_at_the_second_open_says_what_the_first_open_may_have_ch
 _EARLIER_OPEN = "This command's earlier open, which checked the account before the key was shown,"
 
 
-@pytest.mark.parametrize("refusal", ["busy", "cipher"])
+@pytest.mark.parametrize(("refusal", "exit_code"), [("busy", 2), ("cipher", 1), ("unauditable", 2)])
 def test_a_refusal_at_the_second_open_names_the_earlier_open(
     refusal: str,
+    exit_code: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """PR 3162 hold finding 2 (BACKLOG #5067): a refusal at the swap's open said "the open may
     already have changed the database", which reads as the open just refused. What may have
-    written is check()'s earlier open, which returned, so the text names that one. A cipher
-    refusal keeps its own text about the open it came from, then names the earlier open too.
+    written is check()'s earlier open, which returned, so the text names that one, and names the
+    swap's own open as "the replacement's own open" wherever it describes it.
 
     Mutation: drop ``after_check=True`` from the swap's ``open_refused`` call."""
+    from messagefoundry.__main__ import _UnauditableWrite
     from messagefoundry.store import base
     from messagefoundry.store.crypto import CipherError
 
@@ -1211,6 +1213,8 @@ def test_a_refusal_at_the_second_open_names_the_earlier_open(
         if prompted:
             if refusal == "cipher":
                 raise CipherError("synthetic cipher refusal at the second open")
+            if refusal == "unauditable":
+                raise _UnauditableWrite("synthetic unauditable write at the second open")
             raise RuntimeError("synthetic busy store at the second open")
         return await real_open_store(*a, **k)
 
@@ -1222,13 +1226,15 @@ def test_a_refusal_at_the_second_open_names_the_earlier_open(
     monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
     code = main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
     error = _error(capsys)
-    assert code in (1, 2), error
+    assert code == exit_code, error
     assert _EARLIER_OPEN in error, error
-    assert "but the open may already have changed" not in error, error
+    # No bare "the open": each open the text describes is named.
+    assert "the open may" not in error.lower() and "the open's" not in error.lower(), error
     assert "this command makes did not land" in error and "delete it" in error, error
     assert "nothing was written" not in error.lower(), error
-    if refusal == "cipher":
-        assert "synthetic cipher refusal at the second open" in error, error
+    assert "the replacement's own open may" in error.lower(), error
+    # A busy store's text is printed as its class only; the other two print their own text.
+    assert ("at the second open" in error) is (refusal != "busy"), error
 
 
 def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(

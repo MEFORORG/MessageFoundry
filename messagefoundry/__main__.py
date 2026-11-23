@@ -9962,7 +9962,7 @@ _NOTHING_PROVISIONED = "Refusing to provision; nothing was written"
 
 
 def _open_refusal_left_behind(
-    exc: BaseException, store: StoreSettings, *, keyed: bool
+    exc: BaseException, store: StoreSettings, *, keyed: bool, opener: str = "the open"
 ) -> str | None:
     """What a refused store open left behind, when that is more than "nothing was written"
     (BACKLOG #5067), or ``None`` when nothing was.
@@ -9981,52 +9981,76 @@ def _open_refusal_left_behind(
     it.
 
     A key or cipher refusal (``StoreKeylessError``, ``CipherError``), raised itself or as such a
-    cause, can come before the open reached its own writing steps or after them. For those it says
-    the change this command makes did not land and names, at least, what the open may have
-    changed, only as a possibility (:func:`_open_steps_left_behind`).
+    cause, can come before the open reached its own writing steps, after them, or from a read
+    after a full open; this does not know which. For those it says the change this command makes
+    did not land and names, at least, what the open may have changed, only as a possibility
+    (:func:`_open_steps_left_behind`).
 
-    Three refusals are raised only after a full open, so for them it says the open may already
-    have changed the database and names, at least, what (BACKLOG #5067): a keyless-chain refusal
-    (``KeylessAuditChainRefused``) and a keyless open the settings refuse
-    (``_KeylessProvisionRefused``), each after a keyless open, which binds no salt and writes no
-    genesis record; and the check that this command's audit row could not be written
-    (``_UnauditableWrite``, raised before any write of the command's own), after an open that is
-    keyed as ``keyed`` says, so a keyed one names the salt and genesis records too.
+    Three refusals are raised only after a full open (:func:`_raised_after_a_full_open`), so for
+    them it says the open may already have changed the database and names, at least, what
+    (BACKLOG #5067): a keyless-chain refusal (``KeylessAuditChainRefused``) and a keyless open the
+    settings refuse (``_KeylessProvisionRefused``), each after a keyless open, which binds no salt
+    and writes no genesis record; and the check that this command's audit row could not be
+    written (``_UnauditableWrite``, raised before any write of the command's own), after an open
+    keyed as ``keyed`` says. A keyed one names the salt record where the cipher binds one, and no
+    genesis record: an open that wrote one to an empty chain holds that chain's key, so the
+    check does not refuse after it.
+
+    ``opener`` names the open the text describes, "the open" unless a caller ran more than one.
 
     Not every refusal it returns ``None`` for comes before the database is touched: at least a
     store pin refusal under the host key provider can come after the schema step, and this does
     not describe that."""
-    from messagefoundry.store.base import KeylessAuditChainRefused
     from messagefoundry.store.crypto import CipherError, StoreKeylessError
     from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
 
     raised = (exc, exc.__cause__)
     if not any(isinstance(e, ServerSchemaMismatchError) for e in raised):
-        # Raised only after a full open, so the open's own steps have run: the certain wording.
-        after_a_keyless_open = (KeylessAuditChainRefused, _KeylessProvisionRefused)
-        if any(isinstance(e, after_a_keyless_open) for e in raised):
-            # Keyless: the open binds no salt and writes no genesis record.
-            return _open_steps_left_behind(store, keyed=False, returned=True)
-        if any(isinstance(e, _UnauditableWrite) for e in raised):
-            # A keyed open may have bound a salt and written a genesis record before the check.
-            return _open_steps_left_behind(store, keyed=keyed, returned=True)
+        if _raised_after_a_full_open(exc):
+            # The open's own steps have run: the certain wording. A keyless open binds no salt
+            # and writes no genesis record. A keyed open that wrote a genesis record holds that
+            # chain's key, so `_UnauditableWrite` cannot follow it: no genesis record there.
+            unauditable = any(isinstance(e, _UnauditableWrite) for e in raised)
+            return _open_steps_left_behind(
+                store,
+                keyed=keyed and unauditable,
+                returned=True,
+                genesis=False,
+                opener=opener,
+            )
         if any(isinstance(e, CipherError) for e in raised):
-            return _open_steps_left_behind(store, keyed=True)
+            return _open_steps_left_behind(store, keyed=True, opener=opener)
         if any(isinstance(e, StoreKeylessError) for e in raised):
             # Keyless: the open binds no salt and writes no genesis record.
-            return _open_steps_left_behind(store, keyed=False)
+            return _open_steps_left_behind(store, keyed=False, opener=opener)
         return None
     left = (
-        "The open rolled its schema batch back and wrote no schema marker, and this command wrote "
-        "no row"
+        f"{_capitalized(opener)} rolled its schema batch back and wrote no schema marker, and "
+        "this command wrote no row"
     )
     if _open_switches_snapshot_options(store):
         left += (
-            ". Under [store].schema_management = auto the open may already have switched the "
+            f". Under [store].schema_management = auto {opener} may already have switched the "
             "database's READ_COMMITTED_SNAPSHOT and ALLOW_SNAPSHOT_ISOLATION options on, before "
             "that batch; the refusal does not switch them back"
         )
     return left
+
+
+def _raised_after_a_full_open(exc: BaseException) -> bool:
+    """Whether ``exc``, raised itself or as a cause, is a refusal raised only after a full store
+    open (BACKLOG #5067): a keyless-chain refusal (``KeylessAuditChainRefused``), a keyless open
+    the settings refuse (``_KeylessProvisionRefused``), or the check that this command's audit
+    row could not be written (``_UnauditableWrite``)."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+
+    after = (KeylessAuditChainRefused, _KeylessProvisionRefused, _UnauditableWrite)
+    return any(isinstance(e, after) for e in (exc, exc.__cause__))
+
+
+def _capitalized(text: str) -> str:
+    """``text`` with its first character upper-cased, for a phrase that opens a sentence."""
+    return text[:1].upper() + text[1:]
 
 
 def _open_switches_snapshot_options(store: StoreSettings) -> bool:
@@ -10077,38 +10101,57 @@ def _binds_salt(store: StoreSettings) -> bool:
     return store.cipher_provider == "aesgcm" and store.aad_bind
 
 
-def _open_steps_left_behind(store: StoreSettings, *, keyed: bool, returned: bool = False) -> str:
+def _keyed_open_changes(store: StoreSettings, *, keyed: bool, genesis: bool | None = None) -> str:
+    """:func:`_open_changes` for an open keyed as ``keyed`` says: a keyed open may bind a salt
+    (:func:`_binds_salt`) and write an empty chain's genesis record, and a keyless one does
+    neither. ``genesis`` overrides the genesis half where the caller knows better."""
+    return _open_changes(
+        store,
+        salt=keyed and _binds_salt(store),
+        genesis=keyed if genesis is None else keyed and genesis,
+    )
+
+
+def _open_steps_left_behind(
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    returned: bool = False,
+    genesis: bool | None = None,
+    opener: str = "the open",
+) -> str:
     """What a refusal left behind when it can follow the open's own writing steps (BACKLOG
     #5067): sentences, the last with no full stop, as :func:`_open_refusal_left_behind` returns
     them. Never "nothing was written", since an open ran. ``keyed`` is whether the open was
-    keyed, as far as the caller knows: a keyed open may bind a salt (:func:`_binds_salt`) and
-    write an empty chain's genesis record, and a keyless one does neither. Where
+    keyed, as far as the caller knows, and ``genesis`` as for :func:`_keyed_open_changes`. Where
     :func:`_open_changes` names nothing, it says the open may have written all the same.
+    ``opener`` names the open, as for :func:`_open_refusal_left_behind`.
 
     ``returned`` says the caller knows the open had returned before the refusal. Otherwise the
     refusal may have come before the open reached its writing steps, at least from the cipher
     build, which runs before the open connects, so the text names what it may have changed only
     as a possibility and asserts no write."""
-    listed = _open_changes(store, salt=keyed and _binds_salt(store), genesis=keyed)
+    listed = _keyed_open_changes(store, keyed=keyed, genesis=genesis)
     if not returned:
         if not listed:
             return (
-                "The change this command makes did not land. The open may or may not have reached "
-                "its own writing steps before this refusal, so the database may or may not have "
-                "changed"
+                f"The change this command makes did not land. {_capitalized(opener)} may or may "
+                "not have reached its own writing steps before this refusal, so the database may "
+                "or may not have changed"
             )
         return (
-            "The change this command makes did not land. The open may or may not have reached "
-            f"its own writing steps before this refusal; if it did, it may have changed at least "
-            f"{listed}"
+            f"The change this command makes did not land. {_capitalized(opener)} may or may not "
+            "have reached its own writing steps before this refusal; if it did, it may have "
+            f"changed at least {listed}"
         )
     if not listed:
+        steps = "the open's own steps" if opener == "the open" else opener
         return (
-            "The change this command makes did not land, but the open's own steps may already "
-            "have written to the database before this refusal"
+            f"The change this command makes did not land, but {steps} may already have written "
+            "to the database before this refusal"
         )
     return (
-        "The change this command makes did not land, but the open may already have changed the "
+        f"The change this command makes did not land, but {opener} may already have changed the "
         f"database before this refusal: at least {listed}"
     )
 
@@ -10128,24 +10171,6 @@ def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool
     return _open_refusal_left_behind(exc, store, keyed=keyed) or _open_steps_left_behind(
         store, keyed=keyed, returned=True
     )
-
-
-#: ``admin-reset-totp``'s name for its first open, in ``check()``, for a refusal at the swap's.
-_RESET_TOTP_CHECK_OPEN = (
-    "This command's earlier open, which checked the account before the key was shown,"
-)
-
-
-def _earlier_open_left_behind(store: StoreSettings, *, keyed: bool, which: str) -> str:
-    """What an earlier open of this command, which returned, may have changed, for a refusal
-    raised at a later open or after it (BACKLOG #5067): one sentence with no full stop, naming
-    the earlier open as ``which`` says, so a reader does not take it for the open just refused.
-    ``keyed`` is as for :func:`_open_steps_left_behind`. It says "at least": the later open's own
-    steps may have changed the database too."""
-    listed = _open_changes(store, salt=keyed and _binds_salt(store), genesis=keyed)
-    if not listed:
-        return f"{which} may already have written to the database"
-    return f"{which} may already have changed the database: at least {listed}"
 
 
 def _kept_key_sentence(kept: Path) -> str:
@@ -11214,13 +11239,13 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # refusal can follow a grant that may have landed (#5067 leaves these as they are).
         return _emit_error(str(exc), as_json=args.json)
     except (_KeylessProvisionRefused, KeylessAuditChainRefused, _UnauditableWrite) as exc:
-        # #1905, #1916: could not start -- exit 2 whichever of the three keyless checks caught it.
-        # Each is raised before the write, so the shown key's entry has no seed (#5067). Each
-        # follows a full open, which may have changed the database, so the text says so (#5067).
-        # Keyed as the settings say, for `_UnauditableWrite`; the two keyless refusals follow a
-        # keyless open whatever this passes.
-        keyless_left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {keyless_left}"), as_json=args.json)
+        # #1905, #1916: could not start -- exit 2 whichever of the three checks caught it: the
+        # two keyless ones, or the audit row's check. Each is raised before the write, so the
+        # shown key's entry has no seed (#5067). Each follows a full open, which may have changed
+        # the database, so the text says so (#5067). Keyed as the settings say, for
+        # `_UnauditableWrite`; the two keyless refusals follow a keyless open whatever this passes.
+        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {left}"), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
         # Refused before the prompt already; one that changed since is refused the same way. A
@@ -11825,16 +11850,26 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         refusal say what the open may have changed before them (BACKLOG #5067). So does any refusal
         raised once an open returned (``store_returned``), never "nothing was written".
         ``after_check`` says the refusal came from the swap's open or a read after it, so check()'s
-        open had returned before it: the text names that earlier open, not "the open", which would
-        read as the one just refused."""
+        open had returned before it: the text names each open, never a bare "the open", which
+        would read as the one just refused."""
         keyed = _open_is_keyed(settings)
         if after_check:
-            this_open = _open_refusal_left_behind(exc, settings.store, keyed=keyed)
-            earlier = _earlier_open_left_behind(
-                settings.store, keyed=keyed, which=_RESET_TOTP_CHECK_OPEN
+            swap_open = "the replacement's own open"
+            this_open = _open_refusal_left_behind(
+                exc, settings.store, keyed=keyed, opener=swap_open
+            )
+            listed = _keyed_open_changes(settings.store, keyed=keyed)
+            earlier = (
+                "This command's earlier open, which checked the account before the key was shown, "
+                + (
+                    f"may already have changed the database: at least {listed}"
+                    if listed
+                    else "may already have written to the database"
+                )
             )
             left = (
-                f"The change this command makes did not land. {earlier}"
+                f"The change this command makes did not land. {earlier}. "
+                f"{_capitalized(swap_open)} may also have written to it before this refusal"
                 if this_open is None
                 else f"{_sentence(this_open)} {earlier}"
             )
@@ -12043,8 +12078,8 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
 
     async def run() -> str | None:
         """The swap, its session sweep and its audit row in one transaction, or why not."""
-        # store_returned stays set from check(): that open returned, and may have written,
-        # before this one (BACKLOG #5067).
+        # check()'s open returned, and may have written, before this one (BACKLOG #5067), so a
+        # refusal from here is reported with after_check=True, which names both opens.
         store = await opened()
         try:
             user = await store.get_user_by_username(wanted)
