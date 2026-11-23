@@ -33,10 +33,10 @@ already-pseudonymized field is never re-flagged:
   §5). A name, an undashed number or a date in an unmapped field
   is NOT detected; the coverage report is the only record of it (BACKLOG #1710). The dashed SSN,
   punctuated phone and routable IPv6 detectors also scan the part past component 1 of a field a
-  retarget of a default field points at a different kind (:func:`retarget_residue_hits`, BACKLOG
-  #3493), and of a field an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites, which on the
-  anonymizer's output holds the components the rule keeps as captured
-  (:func:`kept_component_hits`, BACKLOG #5533, #5534), a header field from MSH-3 on included.
+  retarget of a default field points at a different kind, and of a field an ``id``, ``mrn``,
+  ``ssn`` or ``dln`` rule rewrites, which on the anonymizer's output holds the components the
+  rule keeps as captured, a header field from MSH-3 on included (:func:`retarget_residue_hits`
+  and :func:`kept_component_hits`, BACKLOG #3493, #5533, #5534).
   In the header, that part is all the SSN and phone detectors read. The shape detectors that read
   one field, and the token scan, read a value decoded from its HL7 escape sequences as well as as
   written, when the message has a parseable MSH that declares an escape character, so a shape or
@@ -1173,7 +1173,8 @@ def kept_component_hits(
     text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
 ) -> list[str]:
     """The hits of :func:`past_first_component_hits` in the components an ``id``, ``mrn``,
-    ``ssn`` or ``dln`` rule kept, on a field no retarget names (BACKLOG #5533, #5534)."""
+    ``ssn`` or ``dln`` rule kept, and in what a retarget of a default of one of those kinds left,
+    which is the same components (BACKLOG #5533, #5534)."""
     hits = past_first_component_hits(text, rules, version=version)
     return [hit for hit in hits if mapped_field_label(hit) == KEPT_COMPONENT]
 
@@ -1458,11 +1459,11 @@ UNMAPPED_SCOPE_NOTE = (
     "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
     "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
     "routable IPv6 address. A name, an undashed number or a date in one of these fields passes, "
-    "so review this list before you share the dataset. Outside these fields it also looks for a "
-    "routable IPv6 address in the MSH header fields no rule rewrites, MSH-2 past its encoding "
-    "characters included, and for a dashed SSN, a punctuated phone number and a routable IPv6 "
-    "address past component 1 of a field an id, mrn, ssn or dln rule or a retarget of a default "
-    "field rewrites, header fields included."
+    "so review this list before you share the dataset. The MSH header's fields are not on this "
+    "list: in the ones no rule rewrites, MSH-2 past its encoding characters included, it looks "
+    "for a routable IPv6 address alone, so review them too. It also looks for a dashed SSN, a "
+    "punctuated phone number and a routable IPv6 address past component 1 of a field an id, "
+    "mrn, ssn or dln rule or a retarget of a default field rewrites, header fields included."
 )
 
 

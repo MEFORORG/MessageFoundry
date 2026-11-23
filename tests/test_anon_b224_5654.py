@@ -530,6 +530,9 @@ _GLOBAL_FULLWIDTH = "".join(chr(ord(c) + 0xFEE0) for c in _GLOBAL)
         f"x:1.2.{_GLOBAL}",
         _GLOBAL_FULLWIDTH,
         _GLOBAL.replace(":", "\uff1a"),
+        "a:b.c.d::1",
+        "fe80::1.bead::",
+        "\uff46e80::1",
     ],
     ids=[
         "after-link-local",
@@ -542,6 +545,9 @@ _GLOBAL_FULLWIDTH = "".join(chr(ord(c) + 0xFEE0) for c in _GLOBAL)
         "one-colon-label-and-groups",
         "fullwidth",
         "fullwidth-colons",
+        "dot-cut-reserved",
+        "dot-cut-hex-word",
+        "written-reading-of-a-folded-allowed",
     ],
 )
 def test_an_address_joined_by_a_dot_or_written_fullwidth_is_a_hit(
@@ -549,7 +555,8 @@ def test_an_address_joined_by_a_dot_or_written_fullwidth_is_a_hit(
 ) -> None:
     """Closing steps 3 (c) and 7 (c): the run parsed whole to the allowed address before the dot,
     so the routable one after it was never read; and the run pattern is ASCII, so a fullwidth
-    address held no run at all."""
+    address held no run at all. The last three are docs/PHI.md section 9's examples of a piece a
+    dot cuts and of a written reading that refuses though its folded reading is allowed."""
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
     assert f"unmapped {leak.IPV6_REASON} in ZPD-4" in report.structural_hits, report.hits
 
@@ -558,41 +565,33 @@ def test_an_address_joined_by_a_dot_or_written_fullwidth_is_a_hit(
 @_LEAKS
 @pytest.mark.parametrize(
     "written",
-    ["fe80::1.fd00::5", "fe80::1.2", "1.2.3::a", "fe80\uff1a\uff1a1", "::ffff:10.0.0.1"],
-    ids=["two-allowed", "version-after", "version-before", "fullwidth-allowed", "mapped-private"],
-)
-def test_allowed_addresses_joined_by_a_dot_are_no_hit(leak: ModuleType, written: str) -> None:
-    """Near-miss controls: the pieces are judged as any run is, so allowed ones stay allowed."""
-    report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
-    assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
-
-
-@_NO_SCANNER
-@_LEAKS
-@pytest.mark.parametrize(
-    ("written", "refused"),
     [
-        ("a:b.c.d::1", True),
-        ("fe80::1.bead::", True),
-        ("ｆe80::1", True),
-        ("::①", False),
-        (_GLOBAL.replace(":", "\\XEFBC9A\\"), False),
+        "fe80::1.fd00::5",
+        "fe80::1.2",
+        "1.2.3::a",
+        "fe80\uff1a\uff1a1",
+        "::ffff:10.0.0.1",
+        "::\u2460",
+        _GLOBAL.replace(":", "\\XEFBC9A\\"),
+        _GLOBAL.replace(":", "\\MFF1A\\"),
     ],
     ids=[
-        "dot-cut-d",
-        "dot-cut-hex-word",
-        "written-reading",
+        "two-allowed",
+        "version-after",
+        "version-before",
+        "fullwidth-allowed",
+        "mapped-private",
         "circled-loopback",
-        "escaped-fw-colon",
+        "hex-escaped-fullwidth-colon",
+        "multibyte-escaped-fullwidth-colon",
     ],
 )
-def test_the_ipv6_examples_phi_md_names_hold(leak: ModuleType, written: str, refused: bool) -> None:
-    """docs/PHI.md section 9 names these: pieces a dot cuts that refuse, a value refused for its
-    written reading though its folded one is allowed, a circled digit that folds to loopback, and
-    fullwidth colons written as hex escapes, which no reading makes a colon."""
+def test_allowed_addresses_joined_by_a_dot_are_no_hit(leak: ModuleType, written: str) -> None:
+    """Near-miss controls: the pieces are judged as any run is, so allowed ones stay allowed. The
+    last three are docs/PHI.md section 9's passes: a circled digit that folds to loopback, and a
+    fullwidth colon written as a hex or multi-byte escape, which no reading makes a colon."""
     report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
-    hit = f"unmapped {leak.IPV6_REASON} in ZPD-4" in report.structural_hits
-    assert hit is refused, report.hits
+    assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
 
 
 @_LEAKS
