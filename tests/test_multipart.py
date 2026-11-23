@@ -839,9 +839,9 @@ _CLOSE_TAIL_REFUSAL = (
     "tabs"
 )
 _DELIM_TAIL_REFUSAL = (
-    "multipart line that starts with a boundary delimiter has text after it that is neither spaces "
-    "or tabs nor two dashes and then spaces or tabs; a body built with a longer boundary than its "
-    "Content-Type names can be refused this way"
+    "multipart line that starts with a boundary delimiter has other text on it: only spaces or "
+    "tabs, or two dashes and then spaces or tabs, may follow the delimiter before the line end; a "
+    "body built with a longer boundary than its Content-Type names can be refused this way"
 )
 
 #: The rows #5787's second half moves: delimiter text in the middle of a line after the first
@@ -911,9 +911,9 @@ def test_the_same_body_without_its_close_marker_is_refused(
     case: str, content_type: str, body: bytes
 ) -> None:
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
-    origin/main parsed is refused for the missing terminator, except two: wk-epilogue-delims for the
-    part cap, since the walk now runs on into the delimiter text that sat after the close marker, and
-    close-then-epilogue as said below. A body
+    origin/main parsed is refused for the missing terminator, except at least wk-epilogue-delims,
+    for the part cap, since the walk now runs on into the delimiter text that sat after the close
+    marker, and the rows #5787 moved, as said below. A body
     main refused keeps main's refusal from ``parse_multipart_form``, class and all, because the
     terminator check runs last. (``parse_single_file_upload`` refuses a no-file or two-file body
     after the walk, so an unterminated one of those now gets the terminator refusal there.) A row
@@ -1194,7 +1194,7 @@ def test_a_long_padding_run_after_a_delimiter_is_read_in_one_scan() -> None:
 def test_a_close_marker_followed_by_other_text_is_refused(tail: bytes) -> None:
     """``--<boundary>--`` followed by anything but padding and a line end is no close, and the
     body is refused with a 400 (design item a). A file line ``--B--note`` no longer closes
-    the body mid-file, so the rest of the file is not dropped."""
+    the body mid-file, so the file is not stored cut short there; the upload is refused."""
     body = b"--B\r\n" + _FP + b"line1\n--B--" + tail + b"\nline3\r\n--B--\r\n"
     for parse in (parse_multipart_form, parse_single_file_upload):
         with pytest.raises(MultipartError) as c:
@@ -1212,6 +1212,52 @@ def test_a_close_marker_with_padding_and_a_line_end_still_closes(tail: bytes) ->
     later line is ignored, whatever it holds."""
     body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--" + tail
     assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+
+@pytest.mark.parametrize(
+    "epilogue",
+    [b"--Bnote\r\n", b"--B--note\r\n", b"--BX\r\n" + _FP + b"y\r\n--BX--"],
+    ids=["bad-tail", "bad-close", "longer-boundary"],
+)
+def test_delimiter_lines_in_the_epilogue_are_not_read(epilogue: bytes) -> None:
+    """The walk stops at the close, so delimiter lines after it, whatever their tail, are not
+    checked and the body parses."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n" + epilogue
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+
+@pytest.mark.parametrize(
+    "preamble",
+    [
+        b"",
+        b"x" * (multipart._MAX_FIELD_BYTES + 10),
+        b"X-Pad: " + b"a" * _MAX_PART_HEADER_BYTES + b"\r\n\r\n",
+    ],
+    ids=["part-cap", "no-header-size", "header-size"],
+)
+def test_the_segment_after_a_mid_line_first_delimiter_gets_the_first_delimiter_refusal(
+    preamble: bytes,
+) -> None:
+    """The text from a mid-line first ``--<boundary>`` to the next delimiter is a part only because
+    of that text, so it is not counted toward the part cap, and a size refusal on it gives way to
+    the first-delimiter refusal. Here the body holds exactly the part cap of real parts."""
+    real = [_FP + b"MSH|x"] + [_field(f"f{i}", b"v") for i in range(multipart._MAX_PARTS - 1)]
+    body = (
+        b"Boundary is --B\r\n"
+        + preamble
+        + b"".join(b"\r\n--B\r\n" + p for p in real)
+        + b"\r\n--B--\r\n"
+    )
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError) as c:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert (type(c.value), str(c.value)) == (MultipartError, _PREAMBLE_REFUSAL)
+    # Positive control: the same body without the mid-line text parses, all parts kept.
+    form = parse_multipart_form(
+        _CT_B, body.replace(b"Boundary is --B", b"Boundary"), max_file_bytes=1024
+    )
+    assert [f.data for f in form.files] == [b"MSH|x"]
+    assert len(form.fields) == multipart._MAX_PARTS - 1
 
 
 def test_a_long_padding_run_after_the_close_is_read_in_one_scan() -> None:
