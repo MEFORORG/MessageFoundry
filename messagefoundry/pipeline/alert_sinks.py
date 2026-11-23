@@ -2713,18 +2713,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         }
 
         # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
-        # passes the cancel on: none of them counts as delivered, whatever it then does.
+        # passes the cancel on: none of them counts as delivered, whatever it then does. A cancel
+        # a send meets outside this set is its own (a transport can cancel its child task with
+        # current_task().cancel()), even in the loop pass the drain's cancel is requested in.
         reached: set[asyncio.Task[None]] = set()
-
-        # The task handling this event, and its cancel count on entry. Each send runs in a child
-        # task made below, and a transport can cancel that child itself with
-        # current_task().cancel(), so only a rise in the drain's own count marks the drain's cancel.
-        drain = asyncio.current_task()
-        assert drain is not None  # _handle runs only on the drain task
-        baseline = drain.cancelling()
-
-        def drain_cancelled() -> bool:
-            return drain.cancelling() > baseline
 
         async def deliver(transport: AlertTransport) -> None:
             # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
@@ -2734,7 +2726,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             try:
                 await transport.send(sent, recipients=recipients, context=context)
             except asyncio.CancelledError:
-                if drain_cancelled():
+                if asyncio.current_task() in reached:
                     raise  # the drain's own cancel, which must reach every send
                 # The send ended cancelled on its own: that transport lost the alert, so say so at
                 # once, and leave the siblings and the drain running. No exc_info: a cancel's

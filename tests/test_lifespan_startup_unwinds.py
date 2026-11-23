@@ -562,6 +562,45 @@ async def test_a_send_that_swallows_the_cut_and_returns_does_not_count_as_delive
     assert sink.sends_cut == 1
 
 
+class _SelfCancelledOnReleaseEmail:
+    """Waits for a release, then raises its own CancelledError, sending nothing."""
+
+    name = "email"
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        await self.release.wait()
+        raise asyncio.CancelledError
+
+
+async def test_a_send_cancelled_on_its_own_in_the_drain_cancels_pass_is_logged_and_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5907 step 4: a send that raised its own CancelledError in the loop pass the
+    drain's cancel was requested in, before _cut_sends ran, was taken for the drain's cancel and
+    re-raised, so its loss was logged nowhere. It is now logged, and the alert stays counted, which
+    is what the startup unwind's ERROR reads."""
+    email = _SelfCancelledOnReleaseEmail()
+    sink = NotifierAlertSink([email])
+    caplog.set_level(logging.WARNING)
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(email.entered.wait(), 5.0)
+    task = sink._task
+    assert task is not None
+    email.release.set()  # the send resumes ahead of the drain, in the same pass as its cancel
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5.0)
+    assert "alert transport email was cancelled" in caplog.text
+    assert sink.sends_cut == 0  # the control: the send had ended before the cut reached it
+    assert sink.undelivered == 1
+
+
 class _TakeThenSelfCancelEmail(_HealthyEmail):
     """Waits for a release, takes the alert, cancels its own task and returns."""
 
