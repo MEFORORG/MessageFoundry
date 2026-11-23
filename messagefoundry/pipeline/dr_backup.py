@@ -6359,9 +6359,9 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
 #: on every host it can fire on. The ':' one fires on every host; the other two only on Windows.
 _COLON_TO_REFUSAL = (
     "refusing --to {path}: its file name holds a ':'. It is refused on every host, so one --to means "
-    "the same everywhere: on Windows, or on an NTFS volume another host reaches, a ':' names an "
-    "alternate data stream, where the never-overwrite check could miss the store's real -wal, -shm "
-    "and -journal — choose a --to whose file name holds no ':'"
+    "the same everywhere: on Windows, and on some NTFS volumes reached from other systems, a ':' "
+    "names an alternate data stream, where the never-overwrite check could miss the store's real "
+    "-wal, -shm and -journal — choose a --to whose file name holds no ':'"
 )
 _TRAILING_TO_REFUSAL = (
     "refusing --to {path}: its file name ends in a {what}, which Windows does not keep as part of "
@@ -6387,17 +6387,19 @@ def _rewritten_to_refusal(path: Path) -> str:
     """The refusal for a ``--to`` that :func:`_refuse_existing_destination` refuses by its spelling."""
     if ":" in path.name:
         return _COLON_TO_REFUSAL.format(path=path)
-    if path.name.endswith((".", " ")):
+    if path.name.endswith((".", " ")) and path.name not in (".", ".."):
         what = "dot" if path.name.endswith(".") else "space"
         return _TRAILING_TO_REFUSAL.format(path=path, what=what)
     return _DEVICE_TO_REFUSAL.format(path=path)
 
 
 def _occupied(path: Path) -> bool:
-    """Whether anything has the name ``path``, a link included, dangling or not, read without
-    following a link. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
+    """Whether anything has the name ``path``, a link included, dangling or not. Read without
+    following a link, so a dangling ``store.db-wal`` symlink, which SQLite would write through,
+    counts as taken. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
     ``FileNotFoundError`` also covers at least network, invalid-drive, bad-path and too-long-path
-    errors (WinError 53, 67, 15, 161 and 206). Any other fault is a refusal, where ``os.path.lexists`` would answer ``False``."""
+    errors (WinError 53, 67, 15, 161 and 206). Any other fault is a refusal, where
+    ``os.path.lexists`` would answer ``False``."""
     try:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):

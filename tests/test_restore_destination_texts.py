@@ -65,7 +65,7 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
         "(a file, a directory or a link, a dangling one included), is refused",
         "the store and sidecar names are read again just before the write",
         "Not caught, at least: a sidecar created after that re-read",
-        "a dangling link planted at the store name after it, which is followed",
+        "a dangling link planted at the store name after that re-read, which is followed",
         "a name holding ':', and on Windows a name ending in a dot or a space",
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
     ):
@@ -87,6 +87,7 @@ def test_the_overwrite_refusal_gives_the_safe_remedy() -> None:
         ("store.db.", "its file name ends in a dot,", ("':'", "device")),
         ("store.db ", "its file name ends in a space,", ("':'", "device")),
         ("NUL", "would not open that name as a file of its own", ("':'", "ends in a")),
+        ("..", "would not open that name as a file of its own", ("':'", "ends in a")),
     ],
 )
 def test_each_to_refusal_names_only_its_own_trigger(
@@ -103,7 +104,7 @@ def test_each_to_refusal_names_only_its_own_trigger(
 def test_the_colon_refusal_gives_its_cross_host_reason() -> None:
     text = _flat(dr_backup._COLON_TO_REFUSAL)
     assert "It is refused on every host, so one --to means the same everywhere" in text
-    assert "on Windows, or on an NTFS volume another host reaches, a ':' names an alternate" in text
+    assert "on Windows, and on some NTFS volumes reached from other systems, a ':' names" in text
 
 
 def test_the_fault_refusals_give_their_own_remedies() -> None:
