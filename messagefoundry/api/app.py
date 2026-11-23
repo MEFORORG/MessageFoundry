@@ -5195,13 +5195,10 @@ def create_app(
     ) -> None:
         """Run ``inner`` on an admitted HTTP request, holding the body it delivers to the cap.
 
-        ``_body_refusal`` judges what the request declares, and a host need not deliver that: at
-        least HTTP/2, HTTP/3 and an in-process ASGI call can carry a body no header announced, or
-        more than its Content-Length. So every chunk is counted as the route pulls it. Under
-        ``serve`` llhttp ends a body at its Content-Length and frames a request with neither header
-        as empty, so the count cannot pass the cap there. The body is not read ahead of the route:
-        that would buffer a body for a caller the route's own gate refuses before reading
-        (AuthenticatedBeforeBodyRoute).
+        ``_body_refusal`` judges what the request declares, and a host need not deliver that, so
+        every chunk is counted as the route pulls it; docs/SECURITY.md control 5 says on which hosts
+        the count can fire. The body is not read ahead of the route: that would buffer a body for a
+        caller the route's own gate refuses before reading (AuthenticatedBeforeBodyRoute).
 
         At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
         so it never holds a partial body as if it were whole, and no later read pulls anything. The
@@ -5228,7 +5225,7 @@ def create_app(
                 _log.warning(
                     "oversized request body on %s from %s after a response started: "
                     "no 413 was sent, and the route's read got a disconnect",
-                    request.url.path,
+                    scrub_log_argument(request.url.path),
                     client_ip(request),
                 )
             else:
@@ -5240,7 +5237,7 @@ def create_app(
                 except OSError as exc:  # the client went away; the route still gets its disconnect
                     _log.warning(
                         "could not send the 413 for an oversized request body on %s from %s: %s",
-                        request.url.path,
+                        scrub_log_argument(request.url.path),
                         client_ip(request),
                         type(exc).__name__,
                     )
@@ -5250,7 +5247,7 @@ def create_app(
             nonlocal started
             # Past the cap with no response started, the 413 is the response.
             if started or not over_cap:
-                started = True
+                started = started or message["type"] == "http.response.start"
                 await send(message)
 
         try:

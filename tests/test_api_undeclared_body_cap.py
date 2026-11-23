@@ -309,6 +309,19 @@ async def test_a_read_past_the_cap_after_the_response_started_ends_quietly(
     assert not any(m.startswith("rejected oversized request body") for m in messages)
 
 
+async def test_a_message_that_is_not_a_response_start_does_not_forfeit_the_413() -> None:
+    app = create_app(allow_no_auth=True)
+
+    class _SendsDebugThenReads:
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            await send({"type": "http.response.debug", "info": {}})
+            await Request(scope, receive).body()
+
+    app.router.routes.insert(0, Route("/probe", _SendsDebugThenReads()))
+    run = await _drive(app, [b"x" * (_MAX_REQUEST_BODY_BYTES + 1)])
+    assert run.status == 413
+
+
 async def test_a_413_that_cannot_be_sent_does_not_escape_into_the_routes_read(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
