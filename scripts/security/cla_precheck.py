@@ -37,7 +37,8 @@ It faults in at least these cases: the pull request's head moved while it read, 
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
 not be read.
 
-TWO CASES BACKLOG #5645 item 1 names, where a fault used to discard every refusal:
+TWO CASES BACKLOG #5645 item 1 names, where a fault used to discard refusals the read had proved
+(the errored page's own, or the whole read's for a head that lagged):
 
   * A GraphQL reply carrying ``errors`` beside its ``data`` (a partial error). An error whose
     ``path`` points inside one commit node leaves that commit unjudged, a fault, because GraphQL
@@ -104,8 +105,9 @@ so a workflow step can pass event data through ``env:`` (zizmor's template-injec
   CLA_SIGNATURES_BRANCH the action's ``branch``
 
 EXIT CODES: 0 nothing refused; 1 refused, with a ``CLA pre-check refused`` annotation; 3 a fault
-caught by this script (bad input, network, a reply in the wrong shape, a short read, or an exception
-raised inside ``run``). At least one other path exits 1 with no refusal annotation: an error before
+caught by this script, at least: bad input, network, a reply in the wrong shape, a short read, a
+head still stale after the re-reads, a commit list without ``CLA_HEAD_SHA``, a commit GraphQL
+reported an error inside, or an exception raised inside ``run``. At least one other path exits 1 with no refusal annotation: an error before
 ``main`` runs, such as at import. The interpreter itself exits 2 when it cannot open the script.
 The workflow tells these apart by the annotation, not the code alone.
 """
