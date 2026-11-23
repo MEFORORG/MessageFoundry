@@ -596,7 +596,51 @@ async def test_a_send_cancelled_on_its_own_in_the_drain_cancels_pass_is_logged_a
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, 5.0)
-    assert "alert transport email was cancelled" in caplog.text
+    assert caplog.text.count("alert transport email was cancelled") == 1
+    assert "ended cancelled after its send" not in caplog.text
+    assert sink.sends_cut == 0  # the control: the send had ended before the cut reached it
+    assert sink.undelivered == 1
+
+
+async def test_a_send_cancelled_on_its_own_outside_a_cut_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5907 step 4: a send whose own CancelledError now ends its child task cancelled,
+    with no drain cancel, is named by one line, not also by the loop after the wait."""
+    email = _SelfCancelledOnReleaseEmail()
+    sink = NotifierAlertSink([email])
+    caplog.set_level(logging.WARNING)
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    email.release.set()
+    await asyncio.wait_for(sink.aclose(), 5.0)
+    assert caplog.text.count("alert transport email was cancelled") == 1
+    assert "ended cancelled after its send" not in caplog.text
+    assert sink.undelivered == 1
+
+
+async def test_an_external_cancel_in_the_drain_cancels_pass_still_ends_the_send_cancelled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5907 step 4: a cancel another canceller (asyncio's cancel-all at loop shutdown,
+    say) requested on a send in the loop pass the drain's cancel was requested in, before
+    _cut_sends ran, was logged as the transport's loss and swallowed, so the send's task ended
+    normally. The cancel goes on now, as on main, and the loss is still logged and counted."""
+    webhook = _BlackholedTransport()
+    sink = NotifierAlertSink([webhook])
+    caplog.set_level(logging.WARNING)
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(webhook.entered.wait(), 5.0)
+    drain = sink._task
+    assert drain is not None
+    (child,) = [t for t in asyncio.all_tasks() if t.get_name() == "webhook" and not t.done()]
+    child.cancel()  # the external canceller, ahead of the drain in the same pass
+    drain.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(drain, 5.0)
+    assert child.cancelled()
+    assert caplog.text.count("alert transport webhook was cancelled") == 1
     assert sink.sends_cut == 0  # the control: the send had ended before the cut reached it
     assert sink.undelivered == 1
 

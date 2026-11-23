@@ -447,8 +447,8 @@ class AlertTransport(Protocol):
     :meth:`NotifierAlertSink._handle` counts a send that returned before a drain cancel reached it
     as delivered (BACKLOG #5907 step 4): a send that swallows its own failure reads as delivered.
     A send that raises ``CancelledError`` before a drain cancel reached it, as
-    :meth:`NotifierAlertSink._handle` decides that, loses that transport's alert, logged, and its
-    cancel goes no further. A send must end promptly once cancelled: on a drain
+    :meth:`NotifierAlertSink._handle` decides that, loses that transport's alert, logged, and the
+    cancel ends that send's child task, not its siblings or the drain. A send must end promptly once cancelled: on a drain
     cancel, one still running past :data:`_DRAIN_CANCEL_GRACE_SECONDS` is left running, past
     ``aclose()``. A send the drain's cancel reached never counts as delivered, whether it raises
     or returns.
@@ -2715,11 +2715,13 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
 
         # The sends the drain's cancel reached while they ran, filled by _cut_sends before it
         # passes the cancel on: none of them counts as delivered, whatever it then does. A cancel
-        # a send meets before _cut_sends has put it here is logged as that transport's loss and
-        # goes no further, whoever requested it: at least the transport itself, or another
+        # a send meets before _cut_sends has put it here is logged as that transport's loss,
+        # whoever requested it, and still ends the send: at least the transport itself, or another
         # canceller in the loop pass the drain's cancel is requested in. A cancel delivered to the
         # send after _cut_sends ran, a current_task().cancel() included, reads as the drain's.
         reached: set[asyncio.Task[None]] = set()
+        # The sends whose own cancel deliver has already logged.
+        logged_cancel: set[asyncio.Task[None] | None] = set()
 
         async def deliver(transport: AlertTransport) -> None:
             # A shallow copy per send: the sends run at once, some in worker threads, so a top-level
@@ -2729,20 +2731,23 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             try:
                 await transport.send(sent, recipients=recipients, context=context)
             except asyncio.CancelledError:
-                if asyncio.current_task() in reached:
-                    raise  # the drain's own cancel, which must reach every send
-                # The send ended cancelled on its own: that transport lost the alert, so say so at
-                # once, and leave the siblings and the drain running. No exc_info: a cancel's
-                # message is whatever its caller passed, and the traceback prints the chain it was
-                # raised in, so either can carry alert text this line keeps out (CLAUDE.md
-                # section 9).
-                log.warning(
-                    "alert transport %s was cancelled for %s/%r",
-                    transport.name,
-                    event.get("type"),
-                    event.get("connection"),
-                )
-                return
+                me = asyncio.current_task()
+                if me not in reached:
+                    # A cancel the drain's cut did not pass on: that transport lost the alert, so
+                    # say so at once, once (the loop after the wait skips a send named here). The
+                    # cancel still goes on, as every cancel must: the child ends cancelled, which
+                    # leaves its siblings and the drain running. No exc_info: a cancel's message
+                    # is whatever its caller passed, and the traceback prints the chain it was
+                    # raised in, so either can carry alert text this line keeps out (CLAUDE.md
+                    # section 9).
+                    logged_cancel.add(me)
+                    log.warning(
+                        "alert transport %s was cancelled for %s/%r",
+                        transport.name,
+                        event.get("type"),
+                        event.get("connection"),
+                    )
+                raise
             except Exception as exc:
                 # Best-effort: a failing transport must not drop the event for the others, nor
                 # ever propagate into the engine. The line names the event's type and connection,
@@ -2817,10 +2822,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         escaped: list[BaseException] = []
         for transport, task in zip(chosen, sends, strict=True):
             if task.cancelled():
-                # The drain was not cancelled, so this is a child that ended cancelled outside the
-                # send's own handler: at least a send that cancelled its own task and returned
-                # before the cancel landed, or an observer that raised CancelledError. Say so
-                # rather than drop it; the drain goes on.
+                if task in logged_cancel:
+                    continue  # deliver named this cancel already
+                # The drain was not cancelled, and deliver did not log this cancel: at least a
+                # send that cancelled its own task and returned before the cancel landed, or an
+                # observer that raised CancelledError. Say so rather than drop it; the drain goes
+                # on.
                 log.warning(
                     "alert transport %s ended cancelled after its send for %s/%r",
                     transport.name,
