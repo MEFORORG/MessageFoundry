@@ -11,6 +11,7 @@ synthetic."""
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 from collections.abc import Callable, Iterator
@@ -55,8 +56,15 @@ def _through_the_chain(text: str) -> str:
 @contextmanager
 def _main() -> Iterator[None]:
     """The redactor as it stood before the root fix: every bound note ignored by the end-of-text
-    rules, and :func:`redaction.safe_text` redacting its head with no note after it."""
+    rules, only the last trailing note set aside, :func:`redaction._glued_value` as main had it
+    (vendored, so a value before a space-joined note is judged on the whole text, as main judged
+    it), and :func:`redaction.safe_text` redacting its head with no note after it."""
     maskable, end_tag = redaction._maskable_rest, redaction._end_tag_rest
+    glued_end_tag = redaction._glued_end_tag_rest
+    # On the code before the root fix the arm takes no `noted`; on it, `noted=False` is main's.
+    end_tag_kwargs = (
+        {"noted": False} if "noted" in inspect.signature(glued_end_tag).parameters else {}
+    )
 
     def maskable_off(*args: Any, noted: bool = False, **kwargs: Any) -> str | None:
         return maskable(*args, **kwargs)
@@ -64,10 +72,38 @@ def _main() -> Iterator[None]:
     def end_tag_off(*args: Any, noted: bool = False, **kwargs: Any) -> str:
         return end_tag(*args, **kwargs)
 
+    def main_glued_value(
+        text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+    ) -> str | None:
+        token, end = run.group(), run.end()
+        note_follows = len(body) < len(text) and text.startswith("\n", len(body))
+        stop = redaction._glued_phi_value_end(text, body, token, end)
+        if stop is not None:
+            judged = body if note_follows and stop == len(body) else text
+            rest = maskable(judged, end, stop, field_run, credential=False)
+            if rest is not None:
+                return rest
+        rest = glued_end_tag(body, token, end, field_run, **end_tag_kwargs)
+        if rest is not None:
+            return rest
+        if not redaction._ends_in_credential_label(token):
+            return None
+        bare = redaction._GLUED_BARE_VALUE.match(body, end)
+        if bare is None:
+            return None
+        judged = body if note_follows and bare.end() == len(body) else text
+        return maskable(judged, end, bare.end(), field_run, credential=True)
+
     def before_notes_off(head: str, notes: str) -> str:
         return redact(head)
 
+    def last_note_only(text: str) -> str:
+        note = redaction._TRAILING_NOTES.search(text)
+        return text if note is None else text[: note.start()]
+
     with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(redaction, "_without_trailing_note", last_note_only)
+        patch.setattr(redaction, "_glued_value", main_glued_value)
         patch.setattr(redaction, "_maskable_rest", maskable_off)
         patch.setattr(redaction, "_end_tag_rest", end_tag_off)
         patch.setattr(redaction, "_redact_before_notes", before_notes_off, raising=False)
@@ -159,6 +195,8 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
         "safe_text": lambda t: safe_text(t, limit=4096),
         "safe_text padded": lambda t: safe_text(t + " " + "q" * 70_000, limit=4096),
         "chain padded": lambda t: _through_the_chain(t + " " + "q" * 70_000),
+        "safe_text note= padded": lambda t: safe_text(t + " " + "q" * 70_000, note=" " + _NOTE),
+        "untrusted stacked": lambda t: redaction.redact_untrusted(f"{t}\n{_NOTE} " + "q" * 70_000),
     }
     for route, call in routes.items():
         with _main():
@@ -168,12 +206,64 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
 
 
 @pytest.mark.parametrize("joiner", list(_JOINERS.values()), ids=list(_JOINERS))
-def test_a_rest_ending_in_an_unbounded_word_still_prints_before_a_note(joiner: str) -> None:
-    """The residual the changelog names: behind a note the last word is held to the rule for a
-    rest the tag's ``>`` ends, which keeps a last word ending in a word some pass reads with no
-    boundary before it."""
-    out = redact(f"<family>Smith</family ZqMSH{joiner}{_NOTE}")
-    assert "ZqMSH" in out
+def test_a_rest_ending_in_a_boundary_free_word_is_masked_before_a_note(joiner: str) -> None:
+    """Code review round 1: behind a note the walk kept a last word ending in ``MSH`` where the
+    field-run arm masked it. ``MSH`` needs a non-space separator after it, and the note's joiner is
+    whitespace, so both arms mask it."""
+    assert "ZqMSH" not in redact(f"<family>Smith</family ZqMSH{joiner}{_NOTE}")
+    assert "ZqMSH" not in redact(f"a|b|mrn: ZqMSH{joiner}{_NOTE}")
+
+
+def test_safe_text_reads_its_own_note_and_a_passed_one_together() -> None:
+    """Code review round 1, a regression the first head shipped: text over the window with
+    ``note=`` reads two notes, and only the last was set aside, so a rest main masked printed. The
+    audit tee's ``_bounded_detail`` takes this path when its scrub lengthens a detail."""
+    passed = " " + redaction._clamp_marker(5)
+    for text, value in (
+        ("<family>Smith</family zqxdoe " + "q" * 70_000, "zqxdoe"),
+        ("a|b|</family zqxdoe " + "q" * 70_000, "zqxdoe"),
+        ("a|b|mrn: 12345 " + "q" * 70_000, "12345"),
+    ):
+        out = safe_text(text, note=passed)
+        assert value not in out, out
+        assert out.endswith(passed)
+
+
+def test_a_value_before_an_earlier_of_stacked_notes() -> None:
+    """A text that already ends in a note, bounded again. ``safe_text`` reads the head alone, whose
+    last note is set aside, so the value is masked. ``redact_untrusted`` stacks a second note on the
+    text, the passes set aside only the last, and the value still prints, as on main: setting the
+    run aside whole made a differential print a credential main masked, so it is a residual the
+    changelog names."""
+    text = f"a|b|mrn: 12345\n{_NOTE} " + "q" * 70_000
+    assert "12345" not in safe_text(text)
+    with _main():
+        main = redaction.redact_untrusted(text)
+    assert "12345" in main
+    assert redaction.redact_untrusted(text) == main
+
+
+def test_a_note_argument_that_is_not_a_bound_note_is_not_read() -> None:
+    """Code review round 1: a suffix glued to the head's last token could make the head less
+    redacted than ``redact(head)``. Such a ``note`` is appended but not read."""
+    out = safe_text("a|b|mrn: zqxdoe", note="|y")
+    assert "zqxdoe" not in out
+    assert out == f"{redact('a|b|mrn: zqxdoe')}|y"
+
+
+def test_a_note_argument_is_read_only_when_it_is_wholly_bound_notes() -> None:
+    """The walk back reads each note once, so many notes cost a linear pass, and anything that is
+    not a whole note, at either end or between, refuses the suffix."""
+    notes = (" " + redaction._clamp_marker(7)) * 1_000
+    assert redaction._is_bound_notes(notes)
+    assert redaction._is_bound_notes("\n" + _NOTE)
+    assert not redaction._is_bound_notes("")
+    assert not redaction._is_bound_notes(_NOTE)  # no joiner
+    assert not redaction._is_bound_notes("x" + notes)
+    assert not redaction._is_bound_notes(notes + " x")
+    assert not redaction._is_bound_notes(
+        notes + " [redaction bound: dropped x more chars unscanned]"
+    )
 
 
 def test_a_rest_with_no_note_after_it_keeps_the_end_of_text_rules() -> None:
