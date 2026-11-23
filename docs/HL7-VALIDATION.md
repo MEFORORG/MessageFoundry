@@ -88,9 +88,10 @@ refused, and so is a dropped bare defined ID with no field separator (a lone `OR
 `MFN_M01`); a bare line `hl7apy` placed is not. A dropped `MSH`, `DSC`, `MSA`, `ERR`, `QAK` or
 `MFA` line is refused too. A batch or file envelope line (`BHS`, `BTS`, `FHS`, `FTS`) is exempted like any other
 defined segment, because batch splitting can leave one on a message. Every dropped segment is refused where MSH-9.3
-borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`); a structure
-borrowed under the same message code (`MFN^M02^MFN_M01`) still gets the exemption, since MSH-9.2
-is not compared. Where the slot is required and its group is present, `hl7apy`'s own check
+borrows a slot-bearing structure under another message code (`ADT^A01^MFN_M01`), and where it
+borrows one under the same code for a trigger event in MSH-9.2 that has a structure of its own in
+`hl7apy`'s tables (`MFN^M02^MFN_M01`, since `MFN_M02` is one). A same-code borrow for a trigger
+event with no structure of its own there (`PGL^PC7^PGL_PC6`) keeps the exemption. Where the slot is required and its group is present, `hl7apy`'s own check
 refuses at least some such messages, since the slot is never filled (`Missing required child ...
 ANYHL7SEGMENT`; `MFN_M03` for one), but not where the slot is one alternative of a choice: a
 `PRR_PC5` order with its `OBR` passes. Where the slot sits inside a nested group (at least the

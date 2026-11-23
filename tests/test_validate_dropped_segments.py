@@ -195,13 +195,29 @@ def test_batch_envelope_lines_on_a_split_member_keep_the_exemption() -> None:
     assert result.unvalidated_segments == (("BTS", 4), ("BHS", 5), ("FTS", 6), ("FHS", 7))
 
 
-def test_a_structure_borrowed_under_the_same_message_code_keeps_the_exemption() -> None:
-    """MSH-9.2 is not compared, so ``MFN^M02^MFN_M01`` is exempted as ``MFN^M01`` is.
-
-    This pins the current behaviour the module docstring states: only a borrow under another
-    message code (``ADT^A01^MFN_M01``) loses the exemption."""
-    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", "MFN^M02^MFN_M01")
+@pytest.mark.parametrize("msh_9", ["MFN^M02^MFN_M01", "MFN^M05^MFN_M01", "MFN^^MFN_M01"])
+def test_a_same_code_borrow_for_an_event_with_its_own_structure_gets_no_exemption(
+    msh_9: str,
+) -> None:
+    """MSH-9.2 is compared (BACKLOG #5920 step 1): MFN_M02 and MFN_M05 are structures of their
+    own, so borrowing MFN_M01's slot for either is refused, as is a borrow with no trigger event."""
+    borrowed = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
     result = validate(borrowed + "\rORC|NW|ORD1\r" + _PV1)
+    assert not result.ok
+    assert result.errors == [
+        "segment ORC at line 4 has no place in this message's structure (and 1 more)"
+    ]
+    assert result.unvalidated_segments == ()
+
+
+@pytest.mark.parametrize("msh_9", ["MFN^M01^MFN_M01", "MFN^M01", "MFN^M14^MFN_M01"])
+def test_the_own_structure_or_one_for_an_event_without_one_keeps_the_exemption(
+    msh_9: str,
+) -> None:
+    """Control for the test above: the structure MSH-9.1 and MSH-9.2 name keeps it, and so does
+    a same-code borrow for an event hl7apy's tables give no structure of its own (no MFN_M14)."""
+    message = _MFN_M01.replace("MFN^M01^MFN_M01", msh_9)
+    result = validate(message + "\rORC|NW|ORD1\r" + _PV1)
     assert result.ok, result.errors
     assert result.unvalidated_segments == (("ORC", 4), ("PV1", 5))
 
