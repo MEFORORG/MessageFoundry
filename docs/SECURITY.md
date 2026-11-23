@@ -1691,32 +1691,30 @@ tuple: they act only on the caller's own account.
 **What an admin user read reports (BACKLOG #5520).** At least these read each account with its whole
 record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/permissions`,
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
-and, in the web console (BACKLOG #5559), at least the pages the next sentences name. `GET /ui/users`
-answers 200 and lists a failing account by its id alone; to a caller holding `users:manage` it
-offers that account's delete, through a confirmation page that names the id alone.
-`GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
+and in the web console (BACKLOG #5559) at least these. `GET /ui/users` answers 200 and lists a
+failing account by its id alone; to a caller holding `users:manage` it links that account's
+delete to `GET /ui/users/{user_id}/delete-confirm`, which, for a record its checked read refuses
+with 423, shows a confirmation naming the id alone rather than answering 423.
+`GET /ui/users/{user_id}`,
+`GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way; when the record fails its seal at that read, made after the action
-returned, they name the account by its id and still show what was issued, rather than answering
-423. What those pages show and log when that read fails is stated in the docstring of
-`_shown_name` in [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-A factor reset whose action returns has already stood, the account's factors cleared; if it issued neither
-an enrolment code nor a generated credential, it redirects to `GET /ui/users/{user_id}`, which
-answers 423 for a failing record. At least the password reset, factor reset and enrolment-code
-actions answer a record that already fails its seal with 404 "no such user", though its row is still there. A
-failure is reported and rate-limited per report key, the record's part and the account's id, in
-each engine process: only the first refusal under a key in each report interval
-(`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's WARNING, writes the
-`integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A later
-refusal under that key inside the interval, from any reader in that process, adds no row and no
-alert; the record is still refused, never served. Each engine
-process sharing the store keeps its own interval. The
+account's name the same way; when the record fails its seal, they name the account by its id and
+still show what was issued, rather than answering 423. What those pages show and log when that
+read fails is stated in the docstring of `_shown_name` in
+[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
+A failure is reported
+per account and rate-limited, in each engine process: only the first refusal of an account in
+each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
+the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
+inside that interval, from any of these routes or any other reader of the same account in that
+process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
 record is refused only after two failing reads that name the same account, or when it fails
-closed as this paragraph says below. At least one exception: a `users` row with a timestamp or counter cell
+closed as this paragraph says below. One exception: a `users` row with a timestamp or counter cell
 that does not parse is refused on the first read, with no re-read, on a store with or without an
 integrity key, and a list read lists it as failing even when the row is restored before its check,
 or leaves it out when its id cell is empty or not text (BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as
@@ -1740,17 +1738,10 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-refused at the first check that cannot verify it, with no further read, but reported under
+answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
-its own. Except where a console page catches the refusal, as at least the next two sentences
-state, a Vault transit Outage on any account these reads check answers 503 with `Retry-After`
-and lists nothing; it pages
-`authority-seal-transit` and writes no audit row of its own.
-At least the pages that read the name through `_shown_name` catch a 423 or a 503 from that read
-and answer 200, and `GET /ui/users/{user_id}/delete-confirm` does the same for a 423. When
-the delete that `POST /ui/users/{user_id}/delete` runs refuses with a status other than 404, and
-the user page the route then re-renders is refused with a 423 or a 503, the route answers 400
-with the delete's own refusal and no `Retry-After`.
+its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
+lists nothing, pages `authority-seal-transit` and writes no audit row.
 
 A custom role save checks the role name (BACKLOG #5785) after its gate. Where
 `[auth].require_action_step_up` is on, the default, and the save would end the caller's own

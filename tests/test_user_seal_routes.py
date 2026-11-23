@@ -469,6 +469,7 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     for fact in (
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
+        "only the first refusal of an account in each report interval",
         "adds no row and no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
@@ -479,19 +480,8 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
-        # The five narrowings of decision d20261123T002710908-1491b3: each claim is scoped to the
-        # routes the code answers that way, and the console's own answers are the last sentences'.
-        "logs the report's WARNING",
-        "refused at the first check that cannot verify it, with no further read",
-        "Except where a console page catches the refusal, as at least the next two sentences state",
-        "writes no audit row of its own",
     ):
         assert fact in body, fact
-    for overclaim in (
-        "answers 423 or lists the account as failed",
-        "answered the same way, a 423 or listed as failed",
-    ):
-        assert overclaim not in body, overclaim
     rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
     assert len(rows) == 5, rows
     for row in rows:
@@ -499,75 +489,37 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
 
 
-def _statement_body() -> str:
+#: The console sentences this PR's code change needs in that statement (Lander hold 7090810151):
+#: the users list's delete goes through the confirmation page, gated to ``users:manage``, which
+#: answers a record its checked read refuses with 423 rather than the 423; and the post-action
+#: pages' fallback is stated once, in ``_shown_name``'s docstring, which this statement points at.
+#: Case-insensitive regexes over the whitespace-normalised statement.
+_CONSOLE_SENTENCES = {
+    "the list's delete is the confirmation's, for users:manage": (
+        r"to a caller holding `users:manage` it links that account's delete to "
+        r"`GET /ui/users/\{user_id\}/delete-confirm`"
+    ),
+    "the confirmation answers a refused record rather than the 423": (
+        r"delete-confirm`, which, for a record its checked read refuses with 423, shows a "
+        r"confirmation naming the id alone rather than answering 423"
+    ),
+    "the post-action fallback points at _shown_name": (
+        r"rather than answering 423\. What those pages show and log when that read fails is "
+        r"stated in the docstring of `_shown_name`"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CONSOLE_SENTENCES))
+def test_the_security_doc_states_the_console_sentences(name: str) -> None:
     text = _SECURITY_MD.read_text("utf-8")
-    assert text.count(_STATEMENT) == 1
-    return " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert re.search(_CONSOLE_SENTENCES[name], body, re.IGNORECASE), name
 
 
-#: Lander hold 7089872291: each claim's SHAPE, as a case-insensitive regex over the statement's
-#: whitespace-normalised body. ``_KEPT`` must match; ``_REMOVED`` is an overclaim that must not.
-_KEPT = {
-    "throttle keyed by part and id": (
-        r"rate-limited per report key, the record's part and the account's id"
-    ),
-    "first refusal under a key": r"only the first refusal under a key in each report interval",
-    "a later refusal adds nothing, and the record is still refused": (
-        r"later refusal under that key inside the interval, from any reader in that process, "
-        r"adds no row and no alert; the record is still refused, never served"
-    ),
-    "404 for an already-failing record, as a floor": (
-        r"\bat least the password reset, factor reset and enrolment-code actions answer a record "
-        r"that already fails its seal with 404 \"no such user\""
-    ),
-    "the redirecting reset has stood": r"factor reset whose action returns has already stood",
-    "the redirect": (
-        r"if it issued neither an enrolment code nor a generated credential, it redirects to "
-        r"`GET /ui/users/\{user_id\}`, which answers 423 for a failing record"
-    ),
-    "exceptions as a floor": r"\bat least one exception: a `users` row",
-    "returned, not landed": r"at that read, made after the action returned\b",
-}
-_REMOVED = {
-    "per-account throttle": r"first refusal of an account in each report interval",
-    "any reader of the same account": r"other reader of the same account",
-    "every refusal it catches": r"every refusal it catches",
-    "uncounted exceptions with no floor": r"\bamong the exceptions:",
-    "a counted exception": r"(?<!at least )\bone exception\b",
-    "landed": r"\bthe action landed\b|\bthat lands\b",
-    # Repair Manager round on findings 1, 2, 6 and 11 of the hold-7089872291 review.
-    "a closed three-name 404 list": (
-        r"(?<!at least )\bthe password reset, factor reset and enrolment-code actions answer"
-    ),
-    "a refusal that is still refused": r"\brefusal\b[^.;]*\bis still refused",
-    "a count of reports per process": r"may report the same (key|account) once",
-    "an unverifiable record answered as a failing one": (
-        r"cannot verify[^.]*answered as a record that fails its seal"
-    ),
-}
-
-
-@pytest.mark.parametrize("name", sorted(_KEPT))
-def test_the_security_doc_keeps_the_shrunk_claim(name: str) -> None:
-    """Each claim the hold-7089872291 round kept, by its shape (Lander hold 7089872291, under
-    decision d20261123T002710908-1491b3)."""
-    assert re.search(_KEPT[name], _statement_body(), re.IGNORECASE), name
-
-
-@pytest.mark.parametrize("name", sorted(_REMOVED))
-def test_the_security_doc_drops_the_overclaim(name: str) -> None:
-    """Each overclaim the hold-7089872291 round removed stays removed, by its shape: the throttle
-    keys on the record's part and the account's id (``AuthService._user_seal_failed``), not the
-    account; not every console catch logs; the single-read exceptions are a floor; and the
-    redirect's condition is that the action returned."""
-    assert not re.search(_REMOVED[name], _statement_body(), re.IGNORECASE), name
-
-
-def test_the_security_doc_keeps_the_pointer_after_the_post_action_sentence() -> None:
-    """The ``_shown_name`` pointer's "those pages" still follows the post-action sentence it names
-    (Lander hold 7089092213)."""
-    assert re.search(
-        r"rather than answering 423\. What those pages show and log when that read fails",
-        _statement_body(),
-        re.IGNORECASE,
-    )
+def test_the_security_doc_no_longer_offers_the_delete_on_the_list_itself() -> None:
+    """Main's "with its delete" described a delete form on the users list; this PR moved it behind
+    the confirmation page (Lander hold 7090810151)."""
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(r"by its id alone, with its delete\b", body, re.IGNORECASE)
