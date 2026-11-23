@@ -323,24 +323,21 @@ async def test_reload_a_drops_reload_b_restores_leaves_no_stopped_lane(
 async def test_repeated_reloads_terminate_and_the_row_completes(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    gate = _Gate(holds=8)
+    passes = RegistryRunner._INGRESS_RELOAD_REPASSES + 1
+    gate = _Gate(holds=passes)
     route = _gated(gate)
     runner = await _start(_graph(tmp_path, route), store)
     try:
         mid = await _enqueue(runner, store, "REPEAT1")
-        passes = 0
-        while passes < 8 and await _status(store, mid) not in _TERMINAL:
-            try:
-                await asyncio.wait_for(gate.reached(), 2.0)
-            except TimeoutError:
-                break  # the row stopped re-entering, so no Router call is waiting
+        for _ in range(passes):
+            await gate.reached()
             await runner.reload(_graph(tmp_path, route))
             gate.release()
-            passes += 1
         assert await _settled(store, mid) == MessageStatus.PROCESSED.value
-        assert gate.calls == RegistryRunner._INGRESS_RELOAD_REPASSES + 1
+        # An uncapped restart would make one more, unheld, Router call after the last reload.
+        assert gate.calls == passes
     finally:
-        for _ in range(8):
+        for _ in range(passes):
             gate.release()
         await runner.stop()
 

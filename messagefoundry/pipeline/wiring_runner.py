@@ -12789,12 +12789,9 @@ class RegistryRunner:
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
             # BACKLOG #5707: those gates describe `registry`, and a reload may have replaced it
             # during the Router, so such a row commits nothing here and starts again below.
-            restart = (
-                inline
-                and len(names) == 1
-                and self._ingress_row_restarts(name, item, registry, repass)
-            )
-            if inline and len(names) == 1 and not restart:
+            single_inline = inline and len(names) == 1
+            restart = single_inline and self._ingress_row_restarts(name, item, registry, repass)
+            if single_inline and not restart:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
