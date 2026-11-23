@@ -186,26 +186,16 @@ def test_engine_shards_on_different_stores_still_add_up(monkeypatch: pytest.Monk
     ``--shard-engine`` and ``connscale-remote`` take URLs from the operator, and nothing makes those
     engines share a store. A plain max there could hide a new dead letter: store A at 5 and store B
     going 0 to 1 reads 5 both times, a delta of 0. Mutation: take a plain max. Red."""
-    before = _poller_over(
-        [
-            [_shard(dead=5, store_path="srv/a")],
-            [_shard(dead=0, store_path="srv/b")],
-            [_shard(dead=5, store_path="srv/a")],
-        ],
-        monkeypatch,
-    )
-    after = _poller_over(
-        [
-            [_shard(dead=5, store_path="srv/a")],
-            [_shard(dead=1, store_path="srv/b")],
-            [_shard(dead=5, store_path="srv/a")],
-        ],
-        monkeypatch,
-    )
-    first = asyncio.run(before.sample_once())
-    second = asyncio.run(after.sample_once())
-    assert first is not None and second is not None
-    assert (first.dead, second.dead) == (5, 6)  # A counted once, B added
+
+    def dead_with(store_b_dead: int) -> int:
+        store_a = _shard(dead=5, store_path="srv/a")
+        store_b = _shard(dead=store_b_dead, store_path="srv/b")
+        poller = _poller_over([[store_a], [store_b], [store_a]], monkeypatch)
+        sample = asyncio.run(poller.sample_once())
+        assert sample is not None
+        return sample.dead
+
+    assert (dead_with(0), dead_with(1)) == (5, 6)  # A counted once, B added
 
 
 def test_the_one_store_premise_is_enforced_for_engine_shards() -> None:

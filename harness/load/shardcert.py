@@ -1597,9 +1597,7 @@ async def _sample_in_pipeline_peak(
             sample = await poller.sample_once()
             if sample is not None:
                 # Already a single store view (BACKLOG #5950), so it is not divided again.
-                depth = sample.in_pipeline
-                if depth > out[0]:
-                    out[0] = depth
+                out[0] = max(out[0], sample.in_pipeline)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=interval)
     finally:

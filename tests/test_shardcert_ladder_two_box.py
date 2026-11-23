@@ -1207,7 +1207,7 @@ def test_claim_timing_flows_to_rung_json() -> None:
 # --- D4: the unified-store in_pipeline is de-duped (single store view) so its slope is not N× ----------
 
 
-def test_in_pipeline_trace_dedups_unified_store_sum(monkeypatch) -> None:
+def test_in_pipeline_trace_records_the_store_view_undivided(monkeypatch) -> None:
     import asyncio
     from types import SimpleNamespace
 
@@ -1245,7 +1245,7 @@ def test_in_pipeline_trace_dedups_unified_store_sum(monkeypatch) -> None:
     assert slope is not None and slope > 0
 
 
-def test_peak_sampler_dedups(monkeypatch) -> None:
+def test_peak_sampler_keeps_a_residual_below_the_engine_shard_count(monkeypatch) -> None:
     import asyncio
     from types import SimpleNamespace
 
