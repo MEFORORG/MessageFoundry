@@ -6,8 +6,9 @@
 narrow TLS 1.3 too. These tests drive the REAL override over a connected socket pair against a TLS
 server thread, so each claim is a handshake rather than an attribute read:
 
-* the anchored CA verifies, a foreign CA is refused, and ldap3's own host name check still runs
-  after the handshake (and still does not run with verification off, as in ldap3);
+* the anchored CA verifies, a foreign CA is refused, and the host name is checked by OpenSSL in
+  the handshake, by RFC 6125, where ldap3's own check, the control, uses its backport of the
+  Python 3.4 matcher (BACKLOG #5623); with verification off no name is checked, as in ldap3;
 * a host name refusal closes the TLS socket it wrapped, where ldap3's own ``Tls``, the control,
   leaves it open while the refusal's traceback is held (BACKLOG #3017);
 * the copy of ldap3's wrap step is pinned to the ldap3 source it was taken from;
@@ -23,8 +24,10 @@ The per-hop CBC, AES-128 and suite-order handshakes live with every other hop, i
 from __future__ import annotations
 
 import contextlib
+import datetime
 import hashlib
 import inspect
+import ipaddress
 import socket
 import ssl
 import threading
@@ -34,6 +37,10 @@ from typing import Any, cast
 
 import ldap3
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from ldap3.core.exceptions import LDAPCertificateError, LDAPSocketOpenError
 
 from messagefoundry.auth import ldap as ldap_auth
@@ -176,18 +183,135 @@ def test_a_verifying_bind_completes_against_a_dc_the_anchor_signed(pki: _Pki) ->
     assert suite in tls_policy._APPROVED_TLS_SUITES
 
 
-def test_ldap3s_host_name_check_still_runs_after_the_handshake(pki: _Pki) -> None:
-    """The engine's context leaves ``check_hostname`` off, as ldap3's does, because ldap3 checks the
-    name itself after the handshake. The override must still call that check. Same server as the
-    control above; only the name ldap3 checks against differs."""
-    with pytest.raises(LDAPCertificateError):
+def test_the_host_name_is_checked_in_the_handshake(pki: _Pki) -> None:
+    """Same server as the positive control above; only the dialled name differs. OpenSSL refuses it
+    during the handshake (BACKLOG #5623), so the refusal is a certificate verification error."""
+    with pytest.raises(ssl.SSLCertVerificationError):
         _bind(_tls(Path(pki.ca).read_text()), _server(pki), host="dc1.example.test")
+
+
+def _leaf_pki(tmp_path: Path, *, cn: str, san: list[x509.GeneralName] | None) -> _Pki:
+    """A CA and one leaf it signs, named by ``cn`` and, when given, by ``san``. The extensions
+    ``VERIFY_X509_STRICT`` needs are present, so a refusal is the name and nothing else."""
+    nb = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    na = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "BACKLOG 5623 test CA")])
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(nb)
+        .not_valid_after(na)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=True,
+                crl_sign=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]))
+        .issuer_name(ca_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(nb)
+        .not_valid_after(na)
+        .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), False
+        )
+    )
+    if san is not None:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san), False)
+    leaf = builder.sign(ca_key, hashes.SHA256())
+    ca_path, cert_path, key_path = (tmp_path / n for n in ("ca.pem", "leaf.pem", "key.pem"))
+    ca_path.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+    cert_path.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        leaf_key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    return _Pki(ca=str(ca_path), cert=str(cert_path), key=str(key_path))
+
+
+def test_a_common_name_only_leaf_is_refused(tmp_path: Path) -> None:
+    """RFC 6125 section 6.4.4: a client that has a SAN-capable verifier does not fall back to the
+    subject common name. ldap3's own ``Tls``, the control, accepts the leaf, so the refusal is the
+    name check and not the chain (BACKLOG #5623)."""
+    pki = _leaf_pki(tmp_path, cn="localhost", san=None)
+    ca = Path(pki.ca).read_text()
+    _bind(ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca), _server(pki))
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _bind(_tls(ca), _server(pki))
+
+
+def test_a_partial_wildcard_leaf_is_refused(tmp_path: Path) -> None:
+    """``l*.example.test`` is a partial-label wildcard RFC 6125 section 7.2 tells a client not to
+    match. ldap3's own ``Tls``, the control, matches it to ``localhost.example.test``."""
+    pki = _leaf_pki(tmp_path, cn="dc", san=[x509.DNSName("l*.example.test")])
+    ca = Path(pki.ca).read_text()
+    _bind(
+        ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca),
+        _server(pki),
+        host="localhost.example.test",
+    )
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _bind(_tls(ca), _server(pki), host="localhost.example.test")
+
+
+def test_an_ip_address_san_leaf_verifies_when_the_dc_is_dialled_by_address(
+    tmp_path: Path,
+) -> None:
+    """A DC dialled as ``127.0.0.1`` whose leaf names that address in an IP address SAN verifies.
+    ldap3's own ``Tls``, the control, refuses it: its matcher never compares IP SANs."""
+    pki = _leaf_pki(tmp_path, cn="dc", san=[x509.IPAddress(ipaddress.ip_address("127.0.0.1"))])
+    ca = Path(pki.ca).read_text()
+    with pytest.raises(LDAPCertificateError):
+        _bind(
+            ldap3.Tls(validate=ssl.CERT_REQUIRED, ca_certs_data=ca), _server(pki), host="127.0.0.1"
+        )
+    suite, _protocol = _bind(_tls(ca), _server(pki), host="127.0.0.1")
+    assert suite in tls_policy._APPROVED_TLS_SUITES
+    # The address is the name checked: another address against the same leaf is refused.
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _bind(_tls(ca), _server(pki), host="127.0.0.2")
+
+
+def test_the_verifying_context_checks_names_without_the_common_name(pki: _Pki) -> None:
+    """The context a bind handshakes on: OpenSSL's name check on, the common-name fallback off."""
+    ctx = _tls(Path(pki.ca).read_text())._context_factory()
+    assert ctx.check_hostname is True
+    assert ctx.hostname_checks_common_name is False
 
 
 def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) -> bool:
     """Run ``tls.wrap_socket`` against a TLS listener on localhost whose leaf names ``localhost``
-    while the bind checks ``dc1.example.test``, so the handshake completes and the host name check
-    refuses. With the refusal still held, its traceback keeps every frame alive. Returns whether
+    while the bind checks ``dc1.example.test``, so the host name check refuses: after the handshake
+    for ldap3's own ``Tls``, during it for the engine's (BACKLOG #5623). With the refusal still held, its traceback keeps every frame alive. Returns whether
     the listener saw the connection end within ``wait`` seconds."""
     listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(10)
@@ -212,11 +336,11 @@ def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) ->
     thread.start()
     client = socket.create_connection(listener.getsockname(), timeout=10)
     conn = SimpleNamespace(socket=client, server=SimpleNamespace(host="dc1.example.test"))
-    held: LDAPCertificateError | None = None
+    held: Exception | None = None
     try:
         try:
             tls.wrap_socket(conn, do_handshake=True)
-        except LDAPCertificateError as refused:
+        except (LDAPCertificateError, ssl.SSLCertVerificationError) as refused:
             held = refused
         assert held is not None, "the host name check did not refuse"
         return ended.wait(timeout=wait)
@@ -237,8 +361,8 @@ def _dc_sees_the_end_of_a_host_name_refusal(tls: Any, pki: _Pki, wait: float) ->
 
 
 def test_a_host_name_refusal_closes_the_tls_socket_it_wrapped(pki: _Pki) -> None:
-    """A real host name mismatch after a completed handshake: the engine's ``Tls`` closes the TLS
-    socket it wrapped, so the domain controller sees the end while the refusal is still held.
+    """A real host name mismatch: ``ssl`` closes the TLS socket the engine's ``Tls`` wrapped when
+    the handshake's name check fails, so the domain controller sees the end while the refusal is still held.
     ldap3's own ``Tls`` is the control: it leaves that socket open while the refusal is held, so
     the same instrument sees no end. The rule this pins is stated once, in
     :func:`messagefoundry.auth.ldap._close_without_sending` (BACKLOG #3017)."""

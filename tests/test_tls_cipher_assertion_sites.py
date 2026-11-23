@@ -573,7 +573,9 @@ def test_every_ldaps_connection_wraps_with_a_context_the_assertion_ran_on(
     checked = [ctx for label, ctx in asserted_contexts if label == "ldaps identity probe"]
     assert len(checked) == 3, "construction plus one per connection"
     assert first is checked[1] and second is checked[2] and first is not second
-    assert first.verify_mode == validate == tls.validate and first.check_hostname is False
+    assert first.verify_mode == validate == tls.validate
+    # BACKLOG #5623: a verifying bind has OpenSSL check the name; ldap3's matcher is not used.
+    assert first.check_hostname is (validate != ssl.CERT_NONE)
     assert first.minimum_version == ssl.TLSVersion.TLSv1_2
     assert _tls12_names(first) == list(tls_policy.APPROVED_TLS12_SUITES)
 

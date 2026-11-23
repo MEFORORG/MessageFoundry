@@ -2072,8 +2072,14 @@ def assert_ldap3_tls_suites(
     * ``ssl.create_default_context(Purpose.SERVER_AUTH, cadata=...)``, the call ldap3 makes, so CA
       loading is the same: the checked bytes when a CA is configured, else the OS trust store. The
       bytes, never a path (BACKLOG #2034), so no bind reads the anchor again after its check;
-    * ``check_hostname = False`` before ``verify_mode = validate``, because ldap3 checks the host
-      name itself after the handshake, and ``NarrowedTls`` still calls ldap3's own check.
+    * ``check_hostname = False`` before ``verify_mode = validate``, the order ldap3 needs to reach
+      ``CERT_NONE``.
+
+    **The host name is OpenSSL's check, not ldap3's (BACKLOG #5623).** On a verifying context the
+    factory turns ``check_hostname`` back on, with ``hostname_checks_common_name`` off, and
+    ``NarrowedTls`` hands the dialled host to the handshake as ``server_hostname``. ldap3's own
+    check falls back on Python 3.12 and later to its backport of the 3.4 matcher, which accepts a
+    subject common name and partial wildcards and refuses an IP address SAN.
 
     It then adds the engine posture every other seam carries: a TLS 1.2 floor, strict X.509 flags
     when it verifies, the approved key-exchange groups (:func:`harden_kex_groups`), and
@@ -2097,6 +2103,10 @@ def assert_ldap3_tls_suites(
         ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH, cadata=ca_certs_data)
         ctx.check_hostname = False  # ldap3's order: before CERT_NONE, or setting it raises
         ctx.verify_mode = validate
+        if validate != ssl.CERT_NONE:
+            # BACKLOG #5623: OpenSSL matches the name (RFC 6125, IP SANs), never the subject CN.
+            ctx.hostname_checks_common_name = False
+            ctx.check_hostname = True
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         if validate != ssl.CERT_NONE:
             harden_verify_flags(ctx)

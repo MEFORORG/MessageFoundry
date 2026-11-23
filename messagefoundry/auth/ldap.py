@@ -1157,10 +1157,9 @@ def _close_without_sending(conn: Any, why: str) -> None:
       ``NarrowedTls`` could not build, and a receive timeout ``settimeout`` or ``setsockopt``
       could not set.
     * Once ``ssl`` has taken it over, ``conn.socket`` holds only the detached socket. A failed
-      handshake is closed by ``ssl`` itself. A host name refusal after a completed handshake is
-      closed by ``NarrowedTls.wrap_socket`` before it re-raises, for every LDAPS bind.
-      Through ldap3's ``open`` that socket was already freed promptly, because ``open`` re-raises a
-      copy of the error without its traceback; the close removes the reliance on that."""
+      handshake is closed by ``ssl`` itself. Since BACKLOG #5623 a host name refusal is one of
+      those: OpenSSL checks the name during the handshake, so ``NarrowedTls.wrap_socket`` runs no
+      check after it that could leave a wrapped socket behind."""
     import ldap3
 
     try:

@@ -1355,6 +1355,9 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             "key_cert:via messagefoundry.pki",
             "tls_context:.check_hostname =",
             "tls_context:.check_hostname = False",
+            # BACKLOG #5623: the LDAPS factory has OpenSSL check the DC's name, never the subject CN.
+            "tls_context:.check_hostname = True",
+            "tls_context:.hostname_checks_common_name = False",
             "tls_context:.load_verify_locations()",
             "tls_context:.minimum_version = TLSv1_2",
             "tls_context:.post_handshake_auth = True",
