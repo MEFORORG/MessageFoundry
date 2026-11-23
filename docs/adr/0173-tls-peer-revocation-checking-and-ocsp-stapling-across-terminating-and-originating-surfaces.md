@@ -868,10 +868,14 @@ The Status paragraph and the two §7.1 rows that called #2188 and #2169 open def
 correction dated 2026-10-04.
 
 Pinned by `tests/test_token_hop_revocation_guard_with_ech_sidecar.py` for the token hop, and by
-`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. Two
-cases there carry the ECH claim, `test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
-`test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused`. Each pairs its refusal with a control in
-which the same CRL relaxes the same hop without a sidecar.
+`tests/test_http_destination_revocation_guard_reads_its_opener.py` for the four destinations. The
+cases that carry the ECH claim are `test_which_opener_the_token_hop_guard_is_handed` and
+`test_the_rest_ech_arm_hands_the_guard_no_opener`: each records the opener the guard is handed and
+asserts it is none on an ECH hop. *(Corrected 2026-11-22, vault BACKLOG #2977: this named
+`test_an_ech_sidecar_and_a_crl_still_refuse_the_token_hop` and
+`test_rest_with_an_ech_sidecar_and_a_crl_is_still_refused`. Those pin the refusal, each with a
+control in which the same CRL relaxes the same hop without a sidecar. Since items 5 and 7 of that
+row, neither ECH opener loads a CRL, so they would pass whichever of those openers the guard read.)*
 
 ## 5. Consequences
 
