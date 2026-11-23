@@ -5,9 +5,10 @@
 A ``supervise`` cluster spreads inbounds across several engine shard APIs over one store; the poller
 must poll EVERY engine shard, sum the per-engine-shard counters and read the store-wide gauges once
 (BACKLOG #5950), so the no-loss reconcile + drain see true cluster totals. These drive the poller
-with FAKE per-shard samples (no live engine) and assert: (1) a cluster sample aggregates each field
-that way; (2) one shard being briefly unreachable skips the whole sample (no too-low aggregate);
-(3) ``await_drain`` only completes once ALL shards report ``in_pipeline == 0`` and an empty backlog.
+with FAKE per-engine-shard samples (no live engine) and assert: (1) a cluster sample aggregates each
+field that way; (2) one engine shard being briefly unreachable skips the whole sample (no too-low
+aggregate); (3) ``await_drain`` only completes once ALL engine shards report ``in_pipeline == 0`` and
+an empty backlog.
 
 The real :meth:`EnginePoller._sample_sync` aggregation is exercised end-to-end — only the per-shard
 read (``_sample_shard``, the one method that touches the HTTP client) is faked, by scripting each fake
@@ -67,10 +68,10 @@ def _shard(
     committed_txns: int = 0,
     claim_lock_timeouts: int = 0,
     claim_head_skips: int = 0,
-    store_path: str = "srv/unified",
+    store_key: str = "srv/unified",
 ) -> _ShardSample:
     return _ShardSample(
-        store_path=store_path,
+        store_key=store_key,
         pending=pending,
         inflight=inflight,
         done=done,
@@ -188,8 +189,8 @@ def test_engine_shards_on_different_stores_still_add_up(monkeypatch: pytest.Monk
     going 0 to 1 reads 5 both times, a delta of 0. Mutation: take a plain max. Red."""
 
     def dead_with(store_b_dead: int) -> int:
-        store_a = _shard(dead=5, store_path="srv/a")
-        store_b = _shard(dead=store_b_dead, store_path="srv/b")
+        store_a = _shard(dead=5, store_key="srv/a")
+        store_b = _shard(dead=store_b_dead, store_key="srv/b")
         poller = _poller_over([[store_a], [store_b], [store_a]], monkeypatch)
         sample = asyncio.run(poller.sample_once())
         assert sample is not None
@@ -198,12 +199,12 @@ def test_engine_shards_on_different_stores_still_add_up(monkeypatch: pytest.Monk
     assert (dead_with(0), dead_with(1)) == (5, 6)  # A counted once, B added
 
 
-def test_the_one_store_premise_is_enforced_for_engine_shards() -> None:
-    """ADR 0063, the premise the max rests on: more than one engine shard needs a server store that
-    they all share, and a single-file store is refused."""
+def test_a_single_file_store_is_refused_for_several_engine_shards() -> None:
+    """ADR 0063. This checks the backend type only. It does not prove that engine shards share one
+    database, which is why the poller keys its gauges by store rather than assuming so."""
     with pytest.raises(ValueError, match="ONE"):
         require_unified_store(StoreBackend.SQLITE, ["a", "b"])
-    require_unified_store(StoreBackend.POSTGRES, ["a", "b"])
+    require_unified_store(StoreBackend.POSTGRES, ["a", "b"])  # control: a server store is allowed
 
 
 async def test_connection_rows_are_per_engine_shard_over_one_store(tmp_path: Path) -> None:
@@ -335,7 +336,7 @@ def _stats(
     )
 
 
-def _status(path: str = ":memory:") -> SystemStatus:
+def _status(path: str = ":memory:", synchronous: str | None = "normal") -> SystemStatus:
     return SystemStatus(
         engine=EngineInfo(
             version="0",
@@ -356,6 +357,7 @@ def _status(path: str = ":memory:") -> SystemStatus:
             messages=0,
             events=0,
             audit=0,
+            synchronous=synchronous,
         ),
     )
 
@@ -363,9 +365,15 @@ def _status(path: str = ":memory:") -> SystemStatus:
 class _StatsClient:
     """A stand-in for an opened ``EngineClient``: the three reads ``_sample_shard`` performs."""
 
-    def __init__(self, stats: StatsResponse, store_path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        stats: StatsResponse,
+        store_path: str = ":memory:",
+        synchronous: str | None = "normal",
+    ) -> None:
         self._stats = stats
         self._store_path = store_path
+        self._synchronous = synchronous
 
     def stats(self) -> StatsResponse:
         return self._stats
@@ -374,26 +382,37 @@ class _StatsClient:
         return []
 
     def status(self) -> SystemStatus:
-        return _status(self._store_path)
+        return _status(self._store_path, self._synchronous)
 
 
 @pytest.mark.parametrize(
-    ("paths", "done", "size"),
-    [(("srv/one", "srv/one"), 40, 4096), (("srv/one", "srv/two"), 80, 8192)],
+    ("hosts", "paths", "synchronous", "stores"),
+    [
+        pytest.param(("h", "h"), ("srv/one", "srv/one"), None, 1, id="one-server-store"),
+        pytest.param(("h", "h"), ("srv/one", "srv/two"), None, 2, id="two-server-stores"),
+        pytest.param(("h", "k"), ("localhost/db", "localhost/db"), None, 2, id="localhost-2-boxes"),
+        pytest.param(("h", "h"), ("/data/a.db", "/data/a.db"), "normal", 1, id="one-sqlite-file"),
+        pytest.param(("h", "h"), ("C:\\d\\a.db", "C:\\d\\a.db"), "normal", 1, id="windows-file"),
+        pytest.param(("h", "k"), ("/data/a.db", "/data/a.db"), "normal", 2, id="sqlite-2-boxes"),
+        pytest.param(("h", "h"), ("./a.db", "./a.db"), "normal", 2, id="relative-sqlite"),
+        pytest.param(("h", "h"), (":memory:", ":memory:"), "normal", 2, id="memory-sqlite"),
+    ],
 )
 def test_store_identity_is_read_off_the_status_body(
-    paths: tuple[str, str], done: int, size: int
+    hosts: tuple[str, str], paths: tuple[str, str], synchronous: str | None, stores: int
 ) -> None:
-    """BACKLOG #5950: the real ``_sample_shard`` carries ``/status`` ``db.path`` into the aggregate.
+    """BACKLOG #5950: the real ``_sample_shard`` decides which readings are one store.
 
-    Every other arm here fakes that read. Mutation: stop passing ``store_path``. Red on the
-    two-store row, which would then read one store's figures."""
-    poller = EnginePoller(["http://a", "http://b"], None, origin=time.perf_counter())
+    A name that cannot identify a store must add, as it did before the max. Mutation: key on
+    ``db.path`` alone. Red on the two-box and relative rows, which would hide a store."""
+    urls = [f"http://{host}:{8000 + i}" for i, host in enumerate(hosts)]
+    poller = EnginePoller(urls, None, origin=time.perf_counter())
     stats = _stats(claim_lock_timeouts=0, in_pipeline=0, committed_txns=0)
-    poller._clients = [_StatsClient(stats, path) for path in paths]  # type: ignore[misc]
+    clients: list[Any] = [_StatsClient(stats, path, synchronous) for path in paths]
+    poller._clients = clients
     sample = asyncio.run(poller.sample_once())
     assert sample is not None
-    assert (sample.done, sample.db_size_bytes) == (done, size)
+    assert (sample.done, sample.db_size_bytes) == (40 * stores, 4096 * stores)
 
 
 def test_sample_shard_reads_claim_lock_timeouts_off_the_stats_body() -> None:

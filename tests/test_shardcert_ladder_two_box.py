@@ -1204,7 +1204,7 @@ def test_claim_timing_flows_to_rung_json() -> None:
     assert out2.to_json_dict()["claim_timing"]["claims"] == 0
 
 
-# --- D4: the unified-store in_pipeline is de-duped (single store view) so its slope is not N× ----------
+# --- D4: the samplers record the poller's single store view undivided (BACKLOG #5950) ------------------
 
 
 def test_in_pipeline_trace_records_the_store_view_undivided(monkeypatch) -> None:
