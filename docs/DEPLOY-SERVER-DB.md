@@ -179,11 +179,12 @@ messagefoundry check-privileges --service-config <instance dir>\messagefoundry.t
   and an `UPDATE` granted on one column, which outranks the table-level `DENY`. So is
   `VIEW DEFINITION` reaching its default schema or `dbo` by any route, at least a grant on the
   schema, the database or the server, schema ownership, or a role or group membership. A named
-  membership hides the lines for rights it carries, which the gMSA must never hold either: at
-  least `db_owner`, `sysadmin`, database `CONTROL` or `CONTROL SERVER` hides the schema-DDL,
-  `audit_log` and `VIEW DEFINITION` lines, `db_securityadmin` the `VIEW DEFINITION` line, and
-  `db_ddladmin` the schema-DDL lines and `ALTER` on `audit_log`. The output can also list grants
-  it could not read. Remove each grant it names and run the check again, until it exits 0.
+  role or `CONTROL` grant hides the lines for rights it carries, which the gMSA must never hold
+  either: at least `db_owner`, `sysadmin`, database `CONTROL` or `CONTROL SERVER` hides the
+  schema-DDL, `audit_log` and `VIEW DEFINITION` lines, `db_securityadmin` the `VIEW DEFINITION`
+  line, and `db_ddladmin` the schema-DDL lines and `ALTER` on `audit_log`. The output can also
+  list grants it could not read. Remove each grant it names and run the check again; once nothing
+  over-granted is left, a grant it still could not read makes it exit 4.
 - It **exits 4** when the probe could not read the login at all, for example on a failed connection
   or a permission read that came back NULL, or as a value that is not 0 or 1. That is not a clean
   result.

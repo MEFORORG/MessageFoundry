@@ -5212,7 +5212,8 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            # QUOTENAME: the securable is parsed as a name, as the VIEW DEFINITION columns below say.
+            # QUOTENAME (#6015 item 4), as the VIEW DEFINITION columns below and the proc-deploy
+            # guard pass their schema, so the schema probes quote one way.
             " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema,"
             # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
             # provision-admin needs it, so under external the runtime login holding it is excess.

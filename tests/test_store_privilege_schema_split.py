@@ -481,6 +481,8 @@ async def test_postgres_probe_with_no_current_schema_is_unobserved_under_externa
     report = await store.probe_principal_privileges()
     assert report.status is StorePrivilegeStatus.UNOBSERVABLE
     assert "not read" in report.detail
+    # BACKLOG #6015 item 2: the structured field names it as well.
+    assert report.unread == ("CREATE on the store's schema",)
 
 
 # --- the Postgres open path, through a fake connection -----------------------------------------

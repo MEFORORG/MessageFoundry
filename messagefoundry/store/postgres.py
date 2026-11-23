@@ -3134,6 +3134,7 @@ class PostgresStore:
                 status=StorePrivilegeStatus.UNOBSERVABLE,
                 principal=str(scalar["principal"] or ""),
                 database=database,
+                unread=("CREATE on the store's schema",),
                 detail=(
                     "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "

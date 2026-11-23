@@ -5680,8 +5680,8 @@ class LoginRoleReading:
 def classify_login_roles(row: Sequence[Any]) -> LoginRoleReading:
     """Judge one row of the role probe (BACKLOG #2617). Pure, so every verdict is unit-testable.
 
-    Read three ways by :func:`~messagefoundry.sqlserver_roles.probed_grant`, the one function the
-    store preflight reads its own login with (BACKLOG #6015): ``1`` held, ``0`` not held, NULL
+    Read three ways by :func:`~messagefoundry.sqlserver_roles.probed_grant`, the function the SQL
+    Server store preflight reads its own login with (BACKLOG #6015): ``1`` held, ``0`` not held, NULL
     **not read**. Only an int or a bool that is 0 or 1 reads, so any other value, such as the text
     ``"1"``, ``1.0`` or ``2``, is not read either. Not even a ``1`` of another type reads as held,
     because a held ``db_denydatawriter`` takes a finding away.

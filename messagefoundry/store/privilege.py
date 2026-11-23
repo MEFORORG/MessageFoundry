@@ -481,10 +481,11 @@ class StorePrivilegeReport:
     database_roles: tuple[str, ...] = ()
     excess: tuple[str, ...] = ()
     detail: str = ""
-    #: Grants the probe could NOT read (BACKLOG #6015 item 2), on an UNOBSERVABLE report and on an
-    #: OBSERVED one that already found an over-grant. There the report stays OBSERVED, since what
-    #: WAS read already refuses, and the summary names them, so the log line and the alert do not
-    #: imply the rest was read.
+    #: Grants the probe could NOT read and named (BACKLOG #6015 item 2). An OBSERVED report carries
+    #: them only beside an over-grant it found, since what WAS read already refuses, and the summary
+    #: names them, so the log line and the alert do not imply the rest was read. Some UNOBSERVABLE
+    #: reports carry them too. An empty tuple does not mean every grant was read: at least a probe
+    #: that raised or returned no row reads nothing and names nothing here.
     unread: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -569,9 +570,9 @@ class PrivilegeProbeStore(Protocol):
         ``OBSERVED`` with an empty ``excess`` is a clean read; ``UNOBSERVABLE`` is the absence of
         one; ``NOT_APPLICABLE`` is SQLite's, which has no principal. ``unread`` names grants the
         backend could not read; :class:`StorePrivilegeReport` refuses an ``OBSERVED`` report that
-        carries them with an empty ``excess``. A backend may also leave a read out of ``unread``:
-        the SQL Server probe notes a failed best-effort enumeration of user-defined roles in
-        ``detail`` only. Which grants a backend reads, how it reads each, and what it does with one
+        carries them with an empty ``excess``. A read can be left out of ``unread``: at least a
+        probe that raised or returned no row, and the SQL Server probe's failed best-effort
+        enumeration of user-defined roles, which it notes in ``detail`` only. Which grants a backend reads, how it reads each, and what it does with one
         it could not read differ by backend; each backend's method says so."""
         ...
 

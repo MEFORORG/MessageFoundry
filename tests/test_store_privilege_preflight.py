@@ -949,8 +949,8 @@ async def test_an_over_grant_summary_names_the_external_grants_it_could_not_read
 async def test_an_unobserved_report_carries_its_unread_grants_too(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The structured field is not empty exactly when grants went unread: an UNOBSERVABLE report
-    fills it as well, on the external-only path and on the fixed-role path."""
+    """An UNOBSERVABLE report names its unread grants in the structured field as well, on the
+    external-only path and on the fixed-role path."""
     row = _probe_row(database_roles=("db_datareader", "db_datawriter"))
     row["create_table"] = None
     report = await _sqlserver_probe(monkeypatch, row).probe_principal_privileges()
