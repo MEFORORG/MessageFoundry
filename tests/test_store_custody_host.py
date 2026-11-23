@@ -190,7 +190,7 @@ def test_the_custody_directory_is_the_secrets_directory_or_the_data_directory(
     assert custody_host.custody_directory(memory, environ={}) is None
     server = settings.model_copy(update={"backend": StoreBackend.POSTGRES})
     assert custody_host.custody_directory(server, environ={}) is None
-    with pytest.raises(HostCustodyRefused, match="MEFOR_SECRETS_DIRECTORY"):
+    with pytest.raises(HostCustodyRefused, match="MEFOR_CUSTODY_DIRECTORY"):
         load_host_custody(server, enforcing=True, environ={})
 
 
@@ -509,6 +509,12 @@ def test_each_key_file_refusal_points_at_one_service_md_procedure_and_states_no_
     section = " ".join(_service_md_section(title).split())
     for needed in ("-DataDir", "-SecretsDir", "-CustodyDir", "Delete nothing", "Across volumes"):
         assert needed in section, (needed, section)
+    # Manager decision 2026-11-22: a new data directory takes everything the engine keeps there
+    # but the key files; a key file original a copy replaced is kept in an administrator-only
+    # folder, never deleted; and a second copy is read by whoever its access list names.
+    for needed in ("the log spool", "the generated API certificate", "Never delete it"):
+        assert needed in section, (needed, section)
+    assert "delete each original" not in section and "by any account" not in section, section
 
 
 def test_the_custody_and_secrets_overlap_is_compared_where_each_resolves(tmp_path: Path) -> None:
@@ -610,7 +616,7 @@ def test_the_way_on_names_the_custody_directory_of_its_own(tmp_path: Path) -> No
     # No other secret lives there, so none is to be copied, and the secrets directory is not named.
     assert "Copy into it" not in step and "MEFOR_SECRETS_DIRECTORY" not in step, step
     secrets = custody_host.keep_the_key_step(_settings(tmp_path), new_store=False, environ={})
-    assert "named by MEFOR_SECRETS_DIRECTORY here" in secrets, secrets
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in secrets, secrets
 
 
 @windows_only
@@ -2085,7 +2091,9 @@ def test_provision_admin_refuses_a_mint_over_a_server_store_it_cannot_show_absen
         assert "run with the custody directory that holds the store's host blob" in flat, err
         # A server backend: the other secret files are carried over, and the external schema is
         # provisioned first.
-        assert "new, empty" not in flat and "Copy into it every secret file" in flat, err
+        assert (
+            "new, empty" not in flat and "When a refusal names master.key or handoff.key" in flat
+        ), err
         assert "a new database, whose schema a DDL-capable login provisions first" in flat, err
     assert driver_text not in err
     assert list(secrets.iterdir()) == []  # no host blob, no handoff
@@ -2194,10 +2202,10 @@ def _advises_changing(text: str, *, allowed: tuple[str, ...] = ()) -> bool:
 def test_the_keep_the_key_step_names_the_variable_the_engine_reads(tmp_path: Path) -> None:
     # The step writes the variable's name as a literal (CodeQL alert 315), so pin it to the
     # constant the engine reads.
-    from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
+    from messagefoundry.engine_secrets import CUSTODY_DIRECTORY_VARIABLE
 
     step = custody_host.keep_the_key_step(_settings(tmp_path), new_store=True)
-    assert f"named by {SECRETS_DIRECTORY_VARIABLE} here" in step
+    assert f"named by {CUSTODY_DIRECTORY_VARIABLE} here" in step
 
 
 @pytest.mark.parametrize("backend", [StoreBackend.SQLITE, StoreBackend.POSTGRES])
@@ -2213,7 +2221,7 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
         settings, new_store=True, service_account="NT SERVICE\\MessageFoundry"
     )
     assert "empty directory" not in step and "new, empty" not in step
-    assert "Copy into it every secret file" in step, step
+    assert "When a refusal names master.key or handoff.key" in step, step
     # Quoted, since a service account name can hold a space.
     command = (
         "run `messagefoundry provision-admin` again to mint this store's key in the new custody "
@@ -2221,9 +2229,9 @@ def test_the_fallback_step_fits_the_backend_and_the_command(
         '\\MessageFoundry" among them'
     )
     assert command in step, step
-    assert "restricted and writable by the service as a secrets directory must be" in step, step
+    assert "writable by the service" not in step, step
     assert "The new store starts empty" in step, step
-    assert "other than master.key and handoff.key" in step, step
+    assert "MEFOR_SECRETS_DIRECTORY" not in step, step
     assert "recovery key shown when an existing key file was minted goes with that file" in step
     schema = "whose schema a DDL-capable login provisions first"
     assert (schema in step) is (backend is StoreBackend.POSTGRES), step
@@ -2608,7 +2616,7 @@ def test_a_shared_secrets_directory_never_names_another_stores_key_for_removal(
     assert code == 2
     err = capsys.readouterr().err
     assert not _advises_changing(err) and "leaves it and the store in place" in err, err
-    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(err.split()), err
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in " ".join(err.split()), err
     assert kept.exists()
     # B's pre-check was refused before its first write, so nothing was bound under A's key.
     import sqlite3
@@ -2644,7 +2652,7 @@ def test_the_way_on_a_never_started_refusal_names_lets_the_mint_go_ahead(
     _mint(settings)
     kept = tmp_path / custody_host.HOST_FILE_NAME
     assert _run_provision_admin(tmp_path, monkeypatch, store_path) == 2
-    assert "named by MEFOR_SECRETS_DIRECTORY here" in " ".join(capsys.readouterr().err.split())
+    assert "named by MEFOR_CUSTODY_DIRECTORY here" in " ".join(capsys.readouterr().err.split())
     left = {path: path.read_bytes() for path in (kept, store_path)}
     secrets = tmp_path / "new-secrets"
     secrets.mkdir()
@@ -2764,7 +2772,7 @@ def test_a_minted_key_that_cannot_be_removed_is_named_as_this_runs_own(
     assert _advises_changing(cli._REMOVE_THE_VOID_KEY) and _advises_changing(warning), warning
     assert not _advises_changing(warning, allowed=(cli._REMOVE_THE_VOID_KEY,)), warning
     assert "cannot tell whose key" not in warning, warning
-    assert "Copy into it every secret file" in " ".join(warning.split()), warning
+    assert "When a refusal names master.key or handoff.key" in " ".join(warning.split()), warning
 
 
 @pytest.mark.parametrize("service_account", [None, "NT SERVICE\\MessageFoundry"])

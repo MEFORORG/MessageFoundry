@@ -329,8 +329,8 @@ directory the service does not name, as after an uninstall. Neither the engine n
 tell whose key a file holds, and either file may be the only copy of a store's key on this host.
 
 1. **Delete nothing, and leave every key file where it is**, in every directory the refusal names,
-   unless step 3 sends you to move one; then move it only as step 5 says, which also says when an
-   original may go.
+   unless step 3 sends you to move one; then move it only as step 5 says, which also says how to
+   keep an original that a copy replaced.
 2. **Stop the service** (`Stop-Service <ServiceName>`) if it is installed, and work from an
    elevated shell.
 3. **If the file holds this store's key**, as when this store was set up under
@@ -363,8 +363,10 @@ tell whose key a file holds, and either file may be the only copy of a store's k
      `AppEnvironmentExtra` list, keeping the other entries.
 
    A new data directory starts a new, empty store. Never copy another store's database, or any
-   key file, into it. To keep this store's own data, move its database file, and the `-wal` and
-   `-shm` files beside it when they are there, into the new data directory as step 5 says.
+   key file, into it. To keep this store's own data, move everything the engine keeps in the old
+   data directory into the new one as step 5 says, at least the database with its `-wal` and
+   `-shm` files, the log spool and the generated API certificate, except `master.key` and
+   `handoff.key`, which stay where they are or follow step 3.
 5. **Moving a file.** Within one volume, move it as an administrator
    (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
    access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
@@ -374,10 +376,12 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    `icacls <file>` prints the same entries for the copy as for the original, and that
    `(Get-Acl -LiteralPath <file>).Owner` prints the same owner, and keep the original where it is
    until the service has started and opened its store from the copy. Copy the database files
-   across volumes the same way, and keep their originals until then too. Once it has, delete each
-   original as an administrator: a second copy of a key file is a second place the key can be
-   read from, a `handoff.key` on this machine by any account, and the database originals may
-   hold PHI, disposed of as [PHI.md](PHI.md) describes.
+   across volumes the same way, and keep their originals until then too. Once it has, retire each
+   key file original rather than delete it: move it, within its volume, into a folder only
+   administrators can read, and keep it there. Never delete it. A second copy of a key file is
+   read by whoever its access list names, SYSTEM, Administrators and the service; a
+   `handoff.key` is machine-scope DPAPI, so anyone who already has its bytes can unwrap it. The
+   database originals may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
 6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
 
 **Without the install scripts**, as on Linux or in a container, the same steps hold with the
@@ -388,7 +392,8 @@ variable that names the file's directory, `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CU
 to a new directory owned by the account the engine runs as, mode 0700, in a folder only that
 account or root may write, and add the engine's other secret files to a new secrets directory. A move
 within one file system keeps the file's owner and mode; across file systems, copy it keeping them
-(`cp -p`, as root), and keep the original until the engine has opened its store from the copy.
+(`cp -p`, as root). Once the engine has opened its store from the copy, move the original, within
+its file system, into a folder only root can read, and keep it there; never delete it.
 
 ## Update to a new build (restart vs reinstall)
 
