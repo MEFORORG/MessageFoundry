@@ -14,9 +14,11 @@ call on the bounded Transit pool. Two rules keep that from costing availability:
 That second rule does not cover every seal under the lock. At least ``complete_with_response``
 still seals the reply body, detail, headers and re-ingress reference after taking the lock, since
 each cell's associated data, or the reference's own text, holds the response sequence read under
-it; ``claim_fifo_heads`` builds an
-idempotent-skip event after an earlier head's finalize; and an audit append seals its MAC under
-the locks ``cancel_queued`` takes.
+it; ``claim_fifo_heads`` builds an idempotent-skip event after an earlier head's finalize; and an
+audit append seals its MAC under the locks ``cancel_queued`` takes.
+
+The startup sweeps read their orphans with no lock, so the last tests also pin that a sweep's DEAD
+update touches only a row still in a status its read selected (Lander hold 7091043913).
 
 Driven offline, against the recording cursors of :mod:`tests.adr0075_batch_harness`, with a stub
 cipher that says it blocks on I/O.
@@ -117,9 +119,10 @@ class _OrphanCursor(h.AsyncRecCursor):
     ``at_lock`` runs once, when the first applock is taken: after the sweep read and sealed its rows,
     before it writes, which is where another writer can move a row."""
 
-    def __init__(self, at_lock: Any = None) -> None:
+    def __init__(self, at_lock: Any = None, names: tuple[Any, Any] = ("GONE_A", "GONE_B")) -> None:
         super().__init__()
         self.status: dict[str, str] = {"q-1": "pending", "q-2": "pending"}
+        self.names = names
         self.at_lock = at_lock
         self._matched: list[tuple[str]] = []
 
@@ -139,7 +142,7 @@ class _OrphanCursor(h.AsyncRecCursor):
 
     async def fetchall(self) -> Any:
         if self._last.startswith("SELECT id, message_id,"):
-            return [("q-1", "m-1", "GONE_A"), ("q-2", "m-2", "GONE_B")]
+            return [("q-1", "m-1", self.names[0]), ("q-2", "m-2", self.names[1])]
         if self._last.startswith("UPDATE queue SET status=?"):
             return self._matched
         return await super().fetchall()
@@ -293,3 +296,45 @@ async def test_a_sweep_leaves_a_row_that_moved_after_its_read(sweep: str, move: 
     assert for_message(ss._SQL_FINALIZE_COUNT, "m-1") == [], "the moved row's message was finalized"
     assert [p[2] for p in for_message(ss._SQL_INSERT_EVENT, "m-2")] == ["dead"]
     assert for_message(ss._SQL_FINALIZE_COUNT, "m-2") != []
+
+
+def _move_both(status: dict[str, str]) -> None:
+    status["q-1"] = "cancelled"
+    del status["q-2"]
+
+
+@pytest.mark.parametrize("sweep", _SWEEPS)
+async def test_a_sweep_whose_every_row_moved_writes_and_counts_nothing(
+    sweep: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every orphan moved before the lock: nothing is dead-lettered, the sweep returns 0 and logs no
+    warning, and its commit is a read-only release that A1 does not count."""
+    store = h.bare_store()
+    store._leader_epoch = None
+    cur = _OrphanCursor(at_lock=_move_both)
+    conn = h.RecConn()
+    with caplog.at_level("WARNING", logger=ss.__name__):
+        dead = await h.drive_async(store, sweep, cursor=cur, conn=conn, **_SWEEP)
+    assert dead == 0
+    assert cur.status == {"q-1": "cancelled"}
+    assert not [s for s, _p in cur.calls if s in (ss._SQL_INSERT_EVENT, ss._SQL_FINALIZE_COUNT)]
+    assert not [r for r in caplog.records if "dead-lettered" in r.getMessage()]
+    assert conn.commits == 1 and store.committed_txns == 0
+
+
+@pytest.mark.parametrize("sweep", _SWEEPS)
+async def test_a_sweep_logs_only_what_it_dead_lettered(
+    sweep: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning counts and names the rows written, not the rows read, and survives a NULL lane
+    name (both nullable columns on this backend)."""
+    store = h.bare_store()
+    store._leader_epoch = None
+    cur = _OrphanCursor(at_lock=_cancel_q1, names=("GONE_A", None))
+    with caplog.at_level("WARNING", logger=ss.__name__):
+        dead = await h.drive_async(store, sweep, cursor=cur, conn=h.RecConn(), **_SWEEP)
+    assert dead == 1
+    (message,) = [r.getMessage() for r in caplog.records if "dead-lettered" in r.getMessage()]
+    assert message.startswith("dead-lettered 1 ")
+    assert message.endswith(": None") and "GONE_A" not in message, message
+    assert store.committed_txns == 1

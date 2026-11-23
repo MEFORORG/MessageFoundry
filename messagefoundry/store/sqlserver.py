@@ -1855,9 +1855,10 @@ _EPOCH_GUARD_RESOLVE = (
 
 #: Spliced between a fenced resolve's SET list and its WHERE, so the rows the UPDATE touched come back
 #: as a rowset. The fence reads THAT, never ``cursor.rowcount``, which a session-wide
-#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Present with the epoch guard,
-#: and on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), which is NOT a
-#: fence. So the clause alone does not mean a fence is armed.
+#: ``SET NOCOUNT ON`` suppresses (see ``SqlServerStore._exec_terminal``). Present at least with the
+#: epoch guard, on ``mark_failed``'s retry branch with its status term (ADR 0157 Amendment A), and on
+#: the three startup orphan sweeps' status-termed DEAD update; neither of the last two is a fence.
+#: So the clause alone does not mean a fence is armed.
 _RESOLVE_OUTPUT = " OUTPUT inserted.id"
 
 
@@ -10266,9 +10267,9 @@ class SqlServerStore:
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
                 dead: list[Any] = []
                 for row, last_error, built in prepared:
-                    # The rows were read with no lock, and sealing them took a pool hop each, so a
-                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
-                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # The SELECT took no lock, so a row may have left its statuses since (cancelled,
+                    # purged, completed); sealing first, on the pool, only widens that window. The
+                    # status term leaves such a row as it is, and the OUTPUT rowset says so: never
                     # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
@@ -10290,7 +10291,8 @@ class SqlServerStore:
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                # Every orphan may have moved, leaving nothing written: then a read-only release (A1).
+                await (self._commit if dead else self._commit_read)(conn)
             except Exception:
                 await conn.rollback()
                 raise
@@ -10298,7 +10300,7 @@ class SqlServerStore:
             log.warning(
                 "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
                 len(dead),
-                ", ".join(sorted({r[2] for r in dead})),
+                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
             )
         return len(dead)
 
@@ -10340,9 +10342,9 @@ class SqlServerStore:
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
                 dead: list[Any] = []
                 for row, last_error, built in prepared:
-                    # The rows were read with no lock, and sealing them took a pool hop each, so a
-                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
-                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # The SELECT took no lock, so a row may have left its statuses since (cancelled,
+                    # purged, completed); sealing first, on the pool, only widens that window. The
+                    # status term leaves such a row as it is, and the OUTPUT rowset says so: never
                     # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
@@ -10364,7 +10366,8 @@ class SqlServerStore:
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                # Every orphan may have moved, leaving nothing written: then a read-only release (A1).
+                await (self._commit if dead else self._commit_read)(conn)
             except Exception:
                 await conn.rollback()
                 raise
@@ -10373,7 +10376,7 @@ class SqlServerStore:
                 "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
                 " inbound(s): %s",
                 len(dead),
-                ", ".join(sorted({r[2] for r in dead})),
+                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
             )
         return len(dead)
 
@@ -13391,9 +13394,9 @@ class SqlServerStore:
                 await self._lock_finalize_batch(cur, {r[1] for r in orphans})
                 dead: list[Any] = []
                 for row, last_error, built in prepared:
-                    # The rows were read with no lock, and sealing them took a pool hop each, so a
-                    # row may have left the SELECT's statuses since (cancelled, purged, completed).
-                    # The status term leaves such a row as it is, and the OUTPUT rowset says so: never
+                    # The SELECT took no lock, so a row may have left its statuses since (cancelled,
+                    # purged, completed); sealing first, on the pool, only widens that window. The
+                    # status term leaves such a row as it is, and the OUTPUT rowset says so: never
                     # cursor.rowcount, for the reason _exec_terminal gives.
                     await cur.execute(
                         "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?,"
@@ -13415,7 +13418,8 @@ class SqlServerStore:
                     if built is not None:
                         await cur.execute(*built)
                     await self._maybe_finalize(cur, row[1], now)
-                await self._commit(conn)
+                # Every orphan may have moved, leaving nothing written: then a read-only release (A1).
+                await (self._commit if dead else self._commit_read)(conn)
             except Exception:
                 await conn.rollback()
                 raise
@@ -13423,7 +13427,7 @@ class SqlServerStore:
             log.warning(
                 "dead-lettered %d orphaned outbound row(s) at startup for missing destination(s): %s",
                 len(dead),
-                ", ".join(sorted({r[2] for r in dead})),
+                ", ".join(sorted({str(r[2]) for r in dead})),  # a lane name may be NULL
             )
         return len(dead)
 
