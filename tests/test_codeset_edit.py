@@ -12,6 +12,7 @@ and the read paths (list/show, including a read-only TOML code set).
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -589,6 +590,594 @@ def test_rename_missing_args(tmp_path: Path) -> None:
         codeset_edit.rename_code_set(tmp_path, "x", "", validate=_validate)
 
 
+# --- the #162 policy sidecar travels with its table (BACKLOG #5776) -----------
+
+
+def _with_policy(config_dir: Path, name: str) -> Path:
+    codeset_edit.upsert_code_set(
+        config_dir, name, ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    sidecar = _codesets(config_dir) / f"{name}.policy.toml"
+    sidecar.write_text('kind = "passthrough"\n', encoding="utf-8")
+    return sidecar
+
+
+def test_rename_moves_the_policy_sidecar_with_the_table(tmp_path: Path) -> None:
+    """A rename that left ``diets.policy.toml`` behind dropped the renamed table to the NONE policy
+    and left the sidecar loading as a standalone code set named ``diets.policy``."""
+    _with_policy(tmp_path, "diets")
+    codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["meals.csv", "meals.policy.toml"]
+    sets = load_code_sets(cs_dir)
+    assert sorted(sets) == ["meals"]
+    assert sets["meals"].policy.kind.value == "passthrough"
+
+
+def test_rename_refuses_a_target_whose_policy_sidecar_name_is_taken(tmp_path: Path) -> None:
+    """A ``meals.policy.toml`` with no ``meals`` table is a standalone code set; a rename to
+    ``meals`` would silently turn it into the renamed table's policy, or overwrite it with the
+    moving sidecar. Refused, with nothing moved."""
+    _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    taken = cs_dir / "meals.policy.toml"
+    taken.write_text('A = "Apple"\n', encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in cs_dir.iterdir()}
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert {p.name: p.read_bytes() for p in cs_dir.iterdir()} == before
+
+
+def test_rename_refuses_a_taken_sidecar_name_even_when_the_source_has_no_policy(
+    tmp_path: Path,
+) -> None:
+    """Without a sidecar of its own the renamed table would still adopt the standalone
+    ``meals.policy.toml`` as its policy, and that code set would vanish."""
+    codeset_edit.upsert_code_set(
+        tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    cs_dir = _codesets(tmp_path)
+    (cs_dir / "meals.policy.toml").write_text('A = "Apple"\n', encoding="utf-8")
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "meals.policy.toml"]
+
+
+def test_rename_validates_the_table_before_moving_it(tmp_path: Path) -> None:
+    """The injected ``validate`` is the loader's word on the table and its policy, and a refusal
+    moves nothing (BACKLOG #5776, S10-52: the callback was accepted and never called)."""
+    _with_policy(tmp_path, "diets")
+    seen: list[Path] = []
+
+    def refuse(path: Path) -> None:
+        seen.append(path)
+        raise WiringError("refused by validate")
+
+    cs_dir = _codesets(tmp_path)
+    with pytest.raises(WiringError, match="refused by validate"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=refuse)
+    assert [p.name for p in seen] == ["diets.csv"]
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moves_the_sidecar_back_when_the_referent_rewrite_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollback after a failed referent write puts the table AND its sidecar back."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch)
+    with pytest.raises(WiringError, match="moved back"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moves_the_table_back_when_the_sidecar_move_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table and its policy never end up under different names."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def refuse_sidecar(staged: Path, live: Path) -> None:
+        if staged.name.endswith(".policy.toml"):
+            raise PermissionError(13, "denied")
+        real(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", refuse_sidecar)
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moves_the_table_back_when_the_sidecar_move_is_interrupted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C between the table move and the sidecar move does not leave the pair split."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def interrupt_sidecar(staged: Path, live: Path) -> None:
+        if staged.name.endswith(".policy.toml"):
+            raise KeyboardInterrupt
+        real(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", interrupt_sidecar)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_split_pair_error_says_where_each_file_is_and_where_they_belong(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar move and the table's move back both fail: the error names the layout and the
+    old name the unrewritten references still read."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+
+    def refuse_all_but_first(staged: Path, live: Path) -> None:
+        if staged.name == "diets.csv":
+            real(staged, live)
+            return
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(restricted_file, "replace_generated", refuse_all_but_first)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    message = str(err.value)
+    assert "the table is codesets/meals.csv and its policy codesets/diets.policy.toml" in message
+    assert (
+        "put the table back as codesets/diets.csv, and any policy as codesets/diets.policy.toml"
+        in message
+    )
+
+
+def test_rename_reads_what_moved_when_interrupted_after_the_sidecar_replace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An interrupt that lands after the sidecar's replace finished moves both files back, not
+    the table alone."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.replace_generated
+    fired: list[str] = []
+
+    def interrupt_after_sidecar(staged: Path, live: Path) -> None:
+        real(staged, live)
+        if staged.name == "diets.policy.toml" and not fired:
+            fired.append(staged.name)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(restricted_file, "replace_generated", interrupt_after_sidecar)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert fired == ["diets.policy.toml"]
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_interrupted_in_the_referent_write_moves_the_sidecar_back_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename's interrupt rollback (no reference left rewritten) puts table and policy back."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch, interrupt=True)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_refuses_a_folder_at_the_target_sidecar_name(tmp_path: Path) -> None:
+    _with_policy(tmp_path, "diets")
+    (_codesets(tmp_path) / "meals.policy.toml").mkdir()
+    with pytest.raises(WiringError, match=r"meals\.policy\.toml already exists"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert (_codesets(tmp_path) / "diets.csv").is_file()
+
+
+@pytest.mark.parametrize("taken", ["meals.csv", "meals.toml"])
+def test_rename_refuses_a_folder_at_a_target_table_name(tmp_path: Path, taken: str) -> None:
+    """A folder named like the new table is not a file, so the table check missed it: the move
+    then failed with a misleading access error, or left ``meals.csv`` beside a ``meals.toml``
+    folder."""
+    _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    (cs_dir / taken).mkdir()
+    with pytest.raises(WiringError, match=rf"codesets/{taken} already exists and is not a code"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.csv", "diets.policy.toml", taken]
+
+
+def _case_sensitive(directory: Path) -> bool:
+    """Whether ``directory`` keeps two names that differ only in case apart, measured there."""
+    probe = directory / "case-probe.txt"
+    probe.write_bytes(b"")
+    try:
+        return not (directory / "CASE-PROBE.TXT").exists()
+    finally:
+        probe.unlink()
+
+
+def _table_files(cs_dir: Path, *names: str) -> None:
+    """Write each table ``names`` under its exact spelling (``meals.CSV``), and check the listing
+    spells it so: a case-insensitive file system would answer a probe of either spelling."""
+    for name in names:
+        body = "code,value\nA,Apple\n" if name.lower().endswith(".csv") else 'A = "Apple"\n'
+        (cs_dir / name).write_text(body, encoding="utf-8")
+    listed = os.listdir(cs_dir)
+    assert all(name in listed for name in names), listed
+
+
+def _codesets_on(tmp_path: Path, *, case_sensitive: bool) -> Path:
+    """The codesets directory, made; the test skips unless its file system is ``case_sensitive``:
+    only a case-sensitive one holds a case-variant table beside another, and only a
+    case-insensitive one opens ``meals.CSV`` as ``meals.csv``."""
+    cs_dir = _codesets(tmp_path)
+    cs_dir.mkdir(exist_ok=True)
+    if _case_sensitive(cs_dir) != case_sensitive:
+        pytest.skip(f"needs a file system with case_sensitive={case_sensitive}")
+    return cs_dir
+
+
+def test_rename_refuses_a_table_whose_extension_differs_only_in_case(tmp_path: Path) -> None:
+    """The loader reads ``meals.CSV`` as table ``meals``; a case-sensitive file system keeps it
+    apart from ``meals.csv``, so the exact-name probe alone missed it."""
+    cs_dir = _codesets_on(tmp_path, case_sensitive=True)
+    _with_policy(tmp_path, "diets")
+    _table_files(cs_dir, "meals.CSV")
+    with pytest.raises(WiringError, match=r"duplicate code set name 'meals'"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["diets.csv", "diets.policy.toml", "meals.CSV"]
+
+
+@pytest.mark.parametrize("variant", ["meals.TOML", "meals.CSV"])
+def test_upsert_refuses_a_table_whose_extension_differs_only_in_case(
+    tmp_path: Path, variant: str
+) -> None:
+    """An edit beside ``meals.TOML``, or beside ``meals.CSV`` as a second file, would write a
+    duplicate stem the loader refuses."""
+    cs_dir = _codesets_on(tmp_path, case_sensitive=True)
+    _table_files(cs_dir, variant)
+    with pytest.raises(WiringError, match=r"duplicate code set name 'meals'"):
+        codeset_edit.upsert_code_set(
+            tmp_path, "meals", ["code", "value"], [["B", "Banana"]], validate=_validate
+        )
+    assert sorted(os.listdir(cs_dir)) == [variant]
+
+
+@pytest.mark.parametrize("survivor", ["diets.TOML", "diets.CSV"])
+def test_remove_keeps_a_sidecar_a_case_variant_table_still_reads(
+    tmp_path: Path, survivor: str
+) -> None:
+    """Clearing a duplicate stem whose survivor is ``diets.TOML`` or ``diets.CSV`` keeps its
+    policy."""
+    cs_dir = _codesets_on(tmp_path, case_sensitive=True)
+    _with_policy(tmp_path, "diets")
+    _table_files(cs_dir, survivor)
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == sorted([survivor, "diets.policy.toml"])
+
+
+def test_remove_of_a_lone_upper_case_table_removes_its_sidecar(tmp_path: Path) -> None:
+    """On a case-insensitive file system ``meals.CSV`` is the table removed, not a second one
+    beside it: its sidecar must go with it, or it loads as code set ``meals.policy``."""
+    cs_dir = _codesets_on(tmp_path, case_sensitive=False)
+    _table_files(cs_dir, "meals.CSV")
+    (cs_dir / "meals.policy.toml").write_text('kind = "passthrough"\n', encoding="utf-8")
+    assert sorted(os.listdir(cs_dir)) == ["meals.CSV", "meals.policy.toml"]
+    codeset_edit.remove_code_set(tmp_path, "meals", validate=_validate)
+    assert os.listdir(cs_dir) == []
+
+
+def test_edit_of_a_lone_upper_case_table_overwrites_it(tmp_path: Path) -> None:
+    """On a case-insensitive file system an edit of ``meals`` writes ``meals.CSV`` itself, which
+    is no duplicate of the table edited."""
+    cs_dir = _codesets_on(tmp_path, case_sensitive=False)
+    _table_files(cs_dir, "meals.CSV")
+    codeset_edit.upsert_code_set(
+        tmp_path, "meals", ["code", "value"], [["B", "Banana"]], validate=_validate
+    )
+    listed = os.listdir(cs_dir)
+    assert [name.lower() for name in listed] == ["meals.csv"]
+    table = load_code_sets(cs_dir)["meals"]
+    assert list(table) == ["B"] and table["B"] == "Banana"
+
+
+def _refuse_back(
+    monkeypatch: pytest.MonkeyPatch, refused: str, *, interrupt: bool = False
+) -> list[str]:
+    """Let every move succeed until ``refused`` is moved back from its new name; that one is
+    refused (or interrupted). Returns the moves made, by source name."""
+    from messagefoundry import restricted_file
+
+    real = restricted_file.replace_generated
+    moves: list[str] = []
+
+    def replace(staged: Path, live: Path) -> None:
+        moves.append(staged.name)
+        if staged.name == refused:
+            if interrupt:
+                raise KeyboardInterrupt
+            raise PermissionError(13, "denied")
+        real(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", replace)
+    return moves
+
+
+def _fail_referent_write(monkeypatch: pytest.MonkeyPatch, *, interrupt: bool = False) -> None:
+    from messagefoundry.config import impact
+
+    def fail(_prepared: object) -> list[object]:
+        if interrupt:
+            raise KeyboardInterrupt
+        raise impact.RenameWriteError("write failed", [])
+
+    monkeypatch.setattr(impact, "write_rename", fail)
+
+
+def test_rename_move_back_with_a_refused_table_is_not_undone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The move back after a failed referent write moves the sidecar first and is never itself
+    undone: with its table half refused, the policy stays under the name the references read and
+    the error says where each file is. The reused forward move's undo used to carry what had moved
+    back to the NEW name again. The layout left fails to load rather than running with the wrong
+    policy."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch)
+    moves = _refuse_back(monkeypatch, "meals.csv")
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert moves == ["diets.csv", "diets.policy.toml", "meals.policy.toml", "meals.csv"]
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "meals.csv"]
+    message = str(err.value)
+    assert "the table is codesets/meals.csv and its policy codesets/diets.policy.toml" in message
+    assert message.count("the table is") == 1
+    assert "put it back as codesets/diets.csv and codesets/diets.policy.toml" in message
+    assert "diets" not in load_code_sets(cs_dir)
+
+
+def test_rename_move_back_with_a_refused_sidecar_keeps_the_pair_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move back whose sidecar half, the first, fails moves no table: the pair stays together
+    under the new name, never a table under the old name without its policy."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch)
+    moves = _refuse_back(monkeypatch, "meals.policy.toml")
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert moves == ["diets.csv", "diets.policy.toml", "meals.policy.toml"]
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["meals.csv", "meals.policy.toml"]
+    assert "the table is codesets/meals.csv and its policy codesets/meals.policy.toml" in str(
+        err.value
+    )
+
+
+def _referrer_module(n: str) -> str:
+    """A config module whose handler names code set ``diets``, with its own connection names."""
+    return (
+        "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n"
+        "\n"
+        f'inbound("IB_{n}", MLLP(port={2700 + ord(n)}), router="r_{n}")\n'
+        f'outbound("OB_{n}", MLLP(host="127.0.0.1", port={6300 + ord(n)}))\n'
+        "\n"
+        "\n"
+        f'@router("r_{n}")\n'
+        f"def r_{n}(msg):\n"
+        f'    return ["h_{n}"]\n'
+        "\n"
+        "\n"
+        f'@handler("h_{n}")\n'
+        f"def h_{n}(msg):\n"
+        '    label = code_set("diets").get("A")\n'
+        f'    return Send("OB_{n}", msg)\n'
+    )
+
+
+def _unrestored_write(monkeypatch: pytest.MonkeyPatch, *, rewrite: bool) -> None:
+    """A referent write that leaves ``mod_a.py`` unrestored: rewritten to the new name with
+    ``rewrite``, else still holding what the plan read."""
+    from messagefoundry.config import impact
+
+    def fail(prepared: impact.PreparedRename) -> list[object]:
+        (file,) = [f for f, _raw, _new in prepared.files if f.endswith("mod_a.py")]
+        if rewrite:
+            Path(file).write_bytes(next(new for f, _raw, new in prepared.files if f == file))
+        # The wording write_rename uses, which says the file still holds the new name.
+        raise impact.RenameWriteError(
+            f"cannot apply the rename of code_set 'diets': writing {file} failed "
+            f"(PermissionError), so the files already written were restored; these still hold "
+            f"the new name: {file}",
+            [file],
+        )
+
+    monkeypatch.setattr(impact, "write_rename", fail)
+
+
+def _with_referrers(tmp_path: Path) -> Path:
+    _with_policy(tmp_path, "diets")
+    for n in ("a", "b"):
+        (tmp_path / f"mod_{n}.py").write_text(_referrer_module(n), encoding="utf-8", newline="")
+    return _codesets(tmp_path)
+
+
+def test_rename_write_with_an_unrestored_reference_keeps_the_code_set_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reference the failed write could not restore still names the new table, so moving the
+    pair back would take the table from under it: it stays, and the error says which reference
+    reads which name, and where the pair belongs under the old name, config-relative."""
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=True)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["meals.csv", "meals.policy.toml"]
+    assert 'code_set("meals")' in (tmp_path / "mod_a.py").read_text(encoding="utf-8")
+    message = str(err.value)
+    assert "may still name 'meals': mod_a.py." in message
+    assert "these name 'diets': mod_b.py." in message
+    assert "stays as codesets/meals.csv and codesets/meals.policy.toml" in message
+    assert "put it back as codesets/diets.csv and codesets/diets.policy.toml" in message
+    assert str(tmp_path) not in message
+
+
+def test_rename_write_with_an_unrestored_but_unchanged_reference_moves_the_code_set_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file the write reports unrestored that still reads as the plan read it, such as one whose
+    own write failed before it changed, names the old table: the pair moves back to it."""
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=False)
+    with pytest.raises(WiringError, match="moved back to codesets/diets.csv"):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["diets.csv", "diets.policy.toml"]
+
+
+def test_rename_moved_back_after_a_reread_does_not_say_a_file_holds_the_new_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the re-read finds the reported file unchanged, the write's own text, which says it
+    still holds the new name and carries its host path, is false: the error says the file names
+    the old table, config-relative, and that the pair moved back."""
+    _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=False)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    message = str(err.value)
+    assert "still hold the new name" not in message
+    assert str(tmp_path) not in message
+    assert "still read as before the rename and name 'diets': mod_a.py." in message
+    assert message.endswith("moved back to codesets/diets.csv and codesets/diets.policy.toml")
+
+
+def test_rename_interrupted_while_rereading_an_unrestored_reference_logs_and_keeps_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupt during the re-read cannot tell which name the reference holds, so the pair
+    stays under the new name and the ERROR log says where each file is, config-relative."""
+    from messagefoundry.config import impact
+
+    cs_dir = _with_referrers(tmp_path)
+    _unrestored_write(monkeypatch, rewrite=True)
+
+    def interrupt(_prepared: object) -> list[str]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(impact, "rewritten_files", interrupt)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.config.codeset_edit"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert sorted(os.listdir(cs_dir)) == ["meals.csv", "meals.policy.toml"]
+    assert "stays as codesets/meals.csv and codesets/meals.policy.toml" in caplog.text
+    assert "may name 'meals': mod_a.py; these name 'diets': mod_b.py" in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_rename_move_back_names_the_sidecar_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch)
+    with pytest.raises(WiringError) as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert str(err.value).endswith(
+        "moved back to codesets/diets.csv and codesets/diets.policy.toml"
+    )
+
+
+def test_rename_interrupted_with_a_refused_table_move_back_logs_where_each_file_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupt's move back that fails half way stays half way, and the ERROR log names each
+    file relative to the config dir, never with the host path."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch, interrupt=True)
+    _refuse_back(monkeypatch, "meals.csv")
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.config.codeset_edit"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "meals.csv"]
+    assert "the table is codesets/meals.csv and its policy codesets/diets.policy.toml" in (
+        caplog.text
+    )
+    assert "moving the code set back failed (PermissionError)" in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_rename_second_interrupt_during_the_move_back_does_not_undo_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A second Ctrl-C while the table and policy move back after a failed referent write does
+    not carry what moved back to the new name again, and logs where each file is."""
+    _with_policy(tmp_path, "diets")
+    _fail_referent_write(monkeypatch)
+    _refuse_back(monkeypatch, "meals.csv", interrupt=True)
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.config.codeset_edit"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "meals.csv"]
+    assert "the table is codesets/meals.csv and its policy codesets/diets.policy.toml" in (
+        caplog.text
+    )
+    assert "they belong as codesets/diets.csv and codesets/diets.policy.toml" in caplog.text
+    assert str(tmp_path) not in caplog.text
+
+
+def test_rename_rollback_fails_closed_on_an_unreadable_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollback after a refused sidecar move reads a stat that fails as unknown, not absent:
+    it moves nothing over a file it cannot see and says where the files may be."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real_replace = restricted_file.replace_generated
+
+    def refuse_sidecar(staged: Path, live: Path) -> None:
+        if staged.name.endswith(".policy.toml"):
+            raise PermissionError(13, "denied")
+        real_replace(staged, live)
+
+    monkeypatch.setattr(restricted_file, "replace_generated", refuse_sidecar)
+    real_lstat = Path.lstat
+
+    def lstat(self: Path) -> object:
+        if self.name == "diets.csv":
+            raise PermissionError(13, "denied")
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    with pytest.raises(WiringError, match="No reference was rewritten") as err:
+        codeset_edit.rename_code_set(tmp_path, "diets", "meals", validate=_validate)
+    assert "could not be read" in str(err.value)
+    monkeypatch.undo()
+    cs_dir = _codesets(tmp_path)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "meals.csv"]
+
+
 # --- remove ------------------------------------------------------------------
 
 
@@ -599,6 +1188,149 @@ def test_remove_deletes_file(tmp_path: Path) -> None:
     result = codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
     assert result == {"op": "remove", "name": "diets"}
     assert not (_codesets(tmp_path) / "diets.csv").exists()
+
+
+def test_remove_deletes_the_policy_sidecar_with_the_table(tmp_path: Path) -> None:
+    """A remove that left ``diets.policy.toml`` behind turned it into a standalone code set
+    ``diets.policy`` (a policy file is not a table) the next load would read (BACKLOG #5776)."""
+    _with_policy(tmp_path, "diets")
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert list(_codesets(tmp_path).iterdir()) == []
+
+
+def test_remove_takes_a_sidecar_already_gone_as_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sidecar another tool deleted between the decision and the unlink is not a failure."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+
+    def gone_first(path: Path) -> None:
+        if path.name == "diets.policy.toml":
+            real(path)
+        real(path)
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", gone_first)
+    assert codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)["op"] == "remove"
+    assert list(_codesets(tmp_path).iterdir()) == []
+
+
+def test_remove_keeps_a_sidecar_a_second_same_stem_table_still_reads(tmp_path: Path) -> None:
+    """Clearing a duplicate stem removes one table; the survivor keeps its policy."""
+    sidecar = _with_policy(tmp_path, "diets")
+    cs_dir = _codesets(tmp_path)
+    (cs_dir / "diets.toml").write_text('A = "Apple"\n', encoding="utf-8")
+    codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert sorted(p.name for p in cs_dir.iterdir()) == ["diets.policy.toml", "diets.toml"]
+    assert sidecar.is_file()
+    assert load_code_sets(cs_dir)["diets"].policy.kind.value == "passthrough"
+
+
+def test_remove_names_a_sidecar_it_could_not_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The table is gone and the orphan sidecar is reported by name, as a WiringError."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+
+    def refuse_sidecar(path: Path) -> None:
+        if path.name.endswith(".policy.toml"):
+            raise OSError(5, "I/O error")
+        real(path)
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", refuse_sidecar)
+    with pytest.raises(
+        WiringError, match=r"was removed, but its policy sidecar diets\.policy\.toml"
+    ):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert [p.name for p in _codesets(tmp_path).iterdir()] == ["diets.policy.toml"]
+
+
+def test_remove_interrupted_after_the_table_unlink_still_drops_the_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+
+    def interrupt_after_table(path: Path) -> None:
+        real(path)
+        if path.name == "diets.csv":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", interrupt_after_table)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert list(_codesets(tmp_path).iterdir()) == []
+
+
+def test_remove_interrupted_in_the_sidecar_unlink_still_drops_the_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Ctrl-C that cuts off the sidecar's own unlink does not leave it loading as a code set."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+    fired: list[str] = []
+
+    def interrupt_sidecar_once(path: Path) -> None:
+        if path.name == "diets.policy.toml" and not fired:
+            fired.append(path.name)
+            raise KeyboardInterrupt
+        real(path)
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", interrupt_sidecar_once)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert fired == ["diets.policy.toml"]
+    assert list(_codesets(tmp_path).iterdir()) == []
+
+
+@pytest.mark.parametrize("cut", ["diets.csv", "diets.policy.toml"])
+def test_remove_interrupted_with_an_undeletable_sidecar_logs_config_relative_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cut: str,
+) -> None:
+    """The sidecar left behind after an interrupt is logged as ``codesets/<name>``; an error text
+    that carries the host path never reaches the log."""
+    from messagefoundry import restricted_file
+
+    _with_policy(tmp_path, "diets")
+    real = restricted_file.unlink_generated
+    fired: list[str] = []
+
+    def unlink(path: Path) -> None:
+        if path.name == "diets.policy.toml" and fired:
+            raise OSError(5, "I/O error", str(path))
+        if path.name == "diets.csv":
+            real(path)
+        if path.name == cut:
+            fired.append(path.name)
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(restricted_file, "unlink_generated", unlink)
+    monkeypatch.setattr(
+        codeset_edit,
+        "_code_set_referrers",
+        lambda _config, _name: [{"referrer_kind": "router", "referrer": "r_adt"}],
+    )
+    with (
+        caplog.at_level("ERROR", logger="messagefoundry.config.codeset_edit"),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        codeset_edit.remove_code_set(tmp_path, "diets", validate=_validate)
+    assert [p.name for p in _codesets(tmp_path).iterdir()] == ["diets.policy.toml"]
+    assert "codesets/diets.policy.toml" in caplog.text
+    assert "these still reference it: router 'r_adt'" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 def test_remove_missing_raises(tmp_path: Path) -> None:
