@@ -250,6 +250,8 @@ def _has_routable_ipv6(text: str, ipv4_is_routable: Callable[[str], bool]) -> bo
     folded_text = folded(text)
     for form in (text,) if folded_text == text else (text, folded_text):
         for match in _IPV6_RUN.finditer(form):
+            if match.group().count(":") < 2:
+                continue  # neither the run nor a piece of it can hold an address
             for run in (match.group(), *_dot_joined_pieces(match.group())):
                 if run.count(":") >= 2 and _judge_ipv6_run(run, ipv4_is_routable):
                     return True

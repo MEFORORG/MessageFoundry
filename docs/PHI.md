@@ -2762,10 +2762,11 @@ still pass:
   the character alone. A code a vertical tab or file separator interrupts there is found, and a
   carriage return or line feed there ends the line, so the message is refused as holding a line
   no rule can reach.
-- The IPv6 check misses some routable addresses. At least this passes: an IPv4-mapped or
+- The IPv6 check misses some routable addresses. At least these pass: one after two or more
+  dotted groups with no colon among them, such as `1.2.4000::5`, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
   last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
-  (BACKLOG #5654).
+  (BACKLOG #5654). It reads text folded too, so an address in fullwidth digits or colons counts.
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
   An invisible character written that way still hides a dashed SSN, a punctuated phone number or
@@ -2780,7 +2781,8 @@ allowed link-local address.
 
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
-phone shapes, so every IPv6 address there passes, and `1::1234` refuses nothing (BACKLOG #5654).
+phone shapes, so every IPv6 address written with ASCII colons there passes, and `1::1234`
+refuses nothing (BACKLOG #5654).
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2797,8 +2799,9 @@ these still get through, on both anonymizers:
   such a rest too.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
-- A cut shape in the header line, which this check skips whole. Of the shape checks, only the
-  IPv6 one reads the header.
+- A cut shape in the header line, which this check skips whole. Of the shape checks, the IPv6
+  one reads the header's unmapped fields, and the SSN and phone ones read there only the
+  components an `id`, `mrn`, `ssn` or `dln` rule keeps.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
 fields that carry the rest of the shape. A `keep` on each of them would let it through. That

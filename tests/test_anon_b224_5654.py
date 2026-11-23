@@ -576,7 +576,9 @@ def test_a_dot_joined_run_is_cut_in_linear_time(leak: ModuleType) -> None:
         assert not leak._has_routable_ipv6(payload, lambda ip: True)
         return time.perf_counter() - started
 
-    small, large = seconds(2_000), seconds(8_000)
+    # Large enough that a quadratic cut, sixteen times slower at four times the input, exceeds
+    # the floor.
+    small, large = seconds(20_000), seconds(80_000)
     assert large < max(small * 10, 0.25)
 
 
