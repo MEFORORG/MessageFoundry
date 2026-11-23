@@ -87,9 +87,12 @@ class CampaignResult:
     #: Reply frames by MSA-1 code, plus ``closed`` (no reply) and ``bad-reply`` exchanges.
     replies: Counter[str] = field(default_factory=Counter)
     layers: Counter[str] = field(default_factory=Counter)
-    #: Positive acknowledgements whose stored row was found by control id. Zero means the
-    #: per-message store invariant never ran, which proves nothing.
+    #: Positive acknowledgements matched to a new stored row against a pre-send count. Zero means
+    #: the per-message store invariant never proved a new row, which proves nothing.
     stored_checked: int = 0
+    #: Positive acknowledgements echoing an id with no pre-send count. Their check runs, but any
+    #: older row of that id satisfies it, so they do not count toward :attr:`stored_checked`.
+    stored_presence_only: int = 0
     failures: list[Failure] = field(default_factory=list)
     #: What a result must have checked to pass: a stored row for a campaign; for a replay, only a
     #: case judged, since a kept case is often one the engine NAKs or owes no reply at all.
@@ -102,6 +105,12 @@ class CampaignResult:
         if self.cases == 0:
             return "no case was sent, so no invariant was checked"
         if self.require_stored and self.stored_checked == 0:
+            if self.stored_presence_only:
+                return (
+                    f"no positive acknowledgement was matched to a new stored row: "
+                    f"{self.stored_presence_only} echoed a control id with no pre-send count, "
+                    "which an older row of that id satisfies"
+                )
             return (
                 "no positive acknowledgement was matched to a stored row, so the per-message "
                 "store invariant never ran"
@@ -212,11 +221,16 @@ class _Session:
         sent: list[Case] = []
         acknowledgements = 0
         try:
-            # Every frame's id, not only the first's: each positive ACK is checked against the
-            # rows its own id had before the batch.
-            predicted = {cid for c in cases for f in frames(c.data) if (cid := control_id_of(f))}
-            before = {cid: rows_for(self.client, cid) for cid in predicted if queryable(cid)}
             for case in cases:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                # Every frame's id, not only the first's, read just before this case goes out: a
+                # count from the start of the batch would let an earlier case's row, a NAK's
+                # included, satisfy this case's positive ACK (BACKLOG #5567). Read before the case
+                # joins ``sent``, so a fault here does not report an unsent case as a suspect.
+                predicted = {cid for f in frames(case.data) if (cid := control_id_of(f))}
+                before = {cid: rows_for(self.client, cid) for cid in predicted if queryable(cid)}
+                # Again, because that read can wait out a rate limit past the budget.
                 if deadline is not None and time.monotonic() >= deadline:
                     break
                 sent.append(case)
@@ -261,6 +275,8 @@ class _Session:
         if not verdict.acks:
             self.result.replies["closed"] += 1
         problems: list[str] = []
+        # Taken first: the owed count written below for a second frame is not a pre-send count.
+        baselined = frozenset(before)
         # judge held the count to one acknowledgement per frame, answered in the order sent.
         for ack, payload in zip(verdict.acks, sent_frames, strict=True):
             if not ack.positive:
@@ -280,9 +296,12 @@ class _Session:
             if problem:
                 problems.append(problem)
             else:
-                self.result.stored_checked += 1
-                # The next positive ACK for this id, a second frame of the case or a later case
-                # of the batch, owes a row of its own rather than reusing this one.
+                if stored[0] in baselined:
+                    self.result.stored_checked += 1
+                else:
+                    self.result.stored_presence_only += 1
+                # A second frame of this case owes a row of its own rather than reusing this one.
+                # A later case needs no increment: its re-read already holds this row.
                 before[stored[0]] = stored[1] + 1
         return len(verdict.acks), problems
 
@@ -357,13 +376,14 @@ class _Session:
         elapsed = time.monotonic() - self.started
         self.emit(
             f"{verdict} seed={r.seed} cases={r.cases} replies[{replies}] layers[{layers}] "
-            f"stored_checked={r.stored_checked} elapsed={elapsed:.1f}s"
+            f"stored_checked={r.stored_checked} stored_presence_only={r.stored_presence_only} "
+            f"elapsed={elapsed:.1f}s"
         )
         if r.vacuous and not r.failures:
             # Recorded as a failure, with no case and no file, so every reader of the result
             # sees why it did not pass.
             r.failures.append(Failure(r.vacuous, None, ()))
             self.emit(
-                f"FAIL seed={r.seed} reason={r.vacuous}; a run that checked nothing is not a pass"
+                f"FAIL seed={r.seed} reason={r.vacuous}; a run that proved nothing is not a pass"
             )
         return r
