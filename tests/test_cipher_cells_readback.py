@@ -2140,7 +2140,8 @@ def test_the_misread_rationale_follows_the_walks_kind(
 
 def test_a_sqlite_fault_is_a_schema_kind_only_when_the_schema_could_not_answer() -> None:
     """A fault the store's schema classifier calls a wrong shape is ``sqlite_schema``; a TEXT value
-    SQLite cannot decode is the cell's own content; a malformed image or a lock is neither."""
+    Python's sqlite3 module cannot decode is the cell's own content; a malformed image or a lock
+    is neither."""
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute("CREATE TABLE t (a TEXT)")
@@ -2178,7 +2179,8 @@ def test_a_walk_verdict_keeps_its_kind_through_copy_and_pickle() -> None:
 
 def test_a_shown_locator_is_bounded_and_cut_on_a_whole_escape() -> None:
     """A locator value is shown at most 64 characters and the elision mark, escaped character by
-    character, so no escape is split and a huge value is never escaped whole."""
+    character when its shown head holds a non-printable character, so no escape is split and a huge
+    value is never escaped whole."""
     from messagefoundry.store.cipher_cells import _LOCATOR_LIMIT, _shown
 
     for value in (chr(0xE0001) * 70, "\\" * 40 + "\x00", "a" * 65, chr(0xE0001) * 10**6):

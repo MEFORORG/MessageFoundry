@@ -152,9 +152,9 @@ def _shown(value: object) -> str:
     # `str(value)` renders the whole value first; only its head is then shown. An escape makes one
     # character up to ten (`\U000e0001`), so a head with a non-printable character is escaped
     # character by character, its backslashes included, and cut at the last whole escape that
-    # fits. A shown value is then
-    # at most the limit plus the elision mark, whatever it holds (BACKLOG #1719). A printable head
-    # is shown as it is, so a value that spells an escape reads the same as one that holds it.
+    # fits. A shown value is then at most the limit plus the elision mark, whatever it holds
+    # (BACKLOG #1719). A printable head is shown as it is, so a value that spells an escape reads
+    # the same as one that holds it.
     text = str(value)
     head = text[:_LOCATOR_LIMIT]
     more = "..." if len(text) > _LOCATOR_LIMIT else ""
