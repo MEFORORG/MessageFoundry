@@ -177,7 +177,8 @@ against one case that matters, described under
   default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
   pair alone, and which host port publishes the pair's MLLP, and when.
   Build the `runtime-postgres` variant first, beside the slim default and from the same checkout
-  (see *Image variants*): the `ha` engines and `schema-provision` run `messagefoundry:postgres`,
+  (see *Image variants*): at least the `ha` engines, `schema-provision` and
+  `revocation-attestation-check-ha` run `messagefoundry:postgres`,
   and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
@@ -192,10 +193,10 @@ against one case that matters, described under
   every substituted value, at least this one and the Postgres password, in the file substitution
   reads; the `ha` engines still read their own store password from `secrets.env`). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
-  `docker compose up` and `docker compose --profile ha up` run that check before they start any
-  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. The
-  `ha` engines run the `postgres` image, so they wait instead on `revocation-attestation-check-ha`,
-  the same check in that image; read its logs for them. Not
+  `docker compose up` and `docker compose --profile ha up` run that check before they start the
+  default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
+  `ha` engines run `messagefoundry:postgres`, so they wait instead on
+  `revocation-attestation-check-ha`, the same check in that image; read its logs for them. Not
   every command runs the check: at least `docker compose up --no-deps <engine>` and
   `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
   comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;

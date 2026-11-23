@@ -163,6 +163,9 @@ def test_each_check_reads_the_same_required_value_and_never_restarts(name: str) 
     assert str(check.get("restart")) == "no"
     assert check.get("network_mode") == "none"
     assert check.get("healthcheck") == {"disable": True}
+    assert check.get("read_only") is True
+    assert check.get("cap_drop") == ["ALL"]
+    assert "no-new-privileges:true" in (check.get("security_opt") or [])
     # The command test below runs only the default check's text; every variant must run that text.
     assert check.get("entrypoint") == _all_services()[_CHECK]["entrypoint"], name
 
@@ -177,17 +180,37 @@ def test_the_default_check_has_no_profile() -> None:
 def test_the_check_runs_the_engines_image(service: str) -> None:
     # A check in another image would read the value with another version's parser, or fail to
     # pull an image the operator never built. So every check an engine waits on runs its image,
-    # and runs under every profile the engine does.
+    # and is active whenever the engine is: unprofiled, or under every profile the engine has.
     svc = _serving_engines()[service]
     checks = _gating_checks(svc)
     if not checks:
         pytest.skip(f"{service} waits on no attestation check")
+    engine_profiles = set(svc.get("profiles") or [])
     for name, check in checks.items():
         assert check["image"] == svc["image"], (
             f"{service} runs {svc['image']!r}, the check {name} {check['image']!r}"
         )
-        missing = set(check.get("profiles") or []) - set(svc.get("profiles") or [])
-        assert not missing, f"{name} needs profiles {sorted(missing)} that {service} does not"
+        check_profiles = set(check.get("profiles") or [])
+        assert not check_profiles or (engine_profiles and engine_profiles <= check_profiles), (
+            f"{service} is active under {sorted(engine_profiles) or 'every profile'}, "
+            f"{name} only under {sorted(check_profiles)}"
+        )
+
+
+@pytest.mark.parametrize("name", sorted(_checks()))
+def test_each_check_is_active_only_where_an_engine_it_gates_is(name: str) -> None:
+    # A check active more widely than the engines that wait on it pulls their image for nobody:
+    # an unprofiled check in the postgres image would fail a plain `up` for a default-only user.
+    check_profiles = set(_checks()[name].get("profiles") or [])
+    gated = [s for s in _serving_engines().values() if name in _gating_checks(s)]
+    assert gated, f"no engine waits on {name}"
+    if not check_profiles:
+        assert any(not s.get("profiles") for s in gated), (
+            f"{name} has no profile, but every engine waiting on it does"
+        )
+    else:
+        wider = check_profiles - {p for s in gated for p in s.get("profiles") or []}
+        assert not wider, f"{name} runs under {sorted(wider)}, where no engine waits on it"
 
 
 @pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])
