@@ -29,9 +29,9 @@ KEEP = (
 )
 
 #: The add-back step as origin/main prints it, where a refused name outside the key class
-#: is listed, no value runs on, and no line of any string in the lists sets
-#: MEFOR_SECRETS_DIRECTORY (the Lander's holds on PR 3142, comments 7085002242, 7088663896
-#: and 7089064404).
+#: is listed, no value runs on, and no string in the lists sets MEFOR_SECRETS_DIRECTORY on
+#: its first non-blank line (the Lander's holds on PR 3142, comments 7085002242, 7088663896
+#: and 7089400537).
 ADD_BACK_STEP = (
     "The service's lists set no MEFOR_SECRETS_DIRECTORY. Where install-service.ps1 already "
     "made the secrets directory, add MEFOR_SECRETS_DIRECTORY naming that existing path back to "
@@ -42,19 +42,21 @@ ADD_BACK_STEP = (
     'docs/SERVICE.md, "Start / stop / status"'
 )
 
-#: Its opener, which the step leaves out wherever a line of a string in the lists sets the
-#: directory (the Lander's holds on PR 3142, comments 7088102723, 7088663896 and 7089064404).
+#: Its opener, which the step leaves out wherever a string in the lists sets the directory on
+#: its first non-blank line (the Lander's holds on PR 3142, comments 7088102723 and
+#: 7088663896).
 SET_NO = "The service's lists set no MEFOR_SECRETS_DIRECTORY"
 
 #: Main's wider pass-back exclusion, from its joined-directory step.
 WIDER = "and the strings this step and any step above say to remove"
 
-#: Main's clause from that step, printed wherever a line of a string sets the directory, so
-#: the entry the operator adds is the only one (the Lander's hold on PR 3142, comment
-#: 7089064404).
-REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY"
+#: Main's clause from that step, narrowed by "and nothing else", printed wherever a string
+#: sets the directory and nothing else, so the entry the operator adds is the only one and a
+#: string that sets another variable too is never removed whole (the Lander's holds on PR
+#: 3142, comments 7089064404 and 7089400537).
+REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and nothing else"
 
-#: The step where a value runs on and no line of any string sets the directory: the opener,
+#: The step where a value runs on and no string sets the directory: the opener,
 #: and the wider exclusion, since the strings the run-on step removes may hold the refused
 #: value (the Lander's hold on PR 3142, comment 7088663896).
 ADD_BACK_RUN_ON = (
@@ -68,20 +70,20 @@ ADD_BACK_RUN_ON = (
     'status"'
 )
 
-#: The step where a line of a string in the lists sets the directory, joined to a value or as
-#: its own item, and for a store key alone: no opener, main's clause, and main's wider
-#: exclusion, which then leaves out every other entry that sets the directory (the Lander's
-#: holds on PR 3142, comments 7088102723, 7088663896 and 7089064404; the Lander's rulings on
-#: handback 7085947392, F1, and comment 7087145957).
+#: The step where a string in the lists sets the directory and nothing else, joined to a
+#: value or as its own item, and for a store key alone: no opener, main's clause narrowed,
+#: and main's wider exclusion, which then leaves out every other such string (the Lander's
+#: holds on PR 3142, comments 7088102723, 7088663896, 7089064404 and 7089400537; the
+#: Lander's rulings on handback 7085947392, F1, and comment 7087145957).
 ADD_BACK_JOINED = (
     "Where install-service.ps1 already made the secrets directory, add MEFOR_SECRETS_DIRECTORY "
     "naming that existing path back to the service's AppEnvironmentExtra, beside its other "
-    "entries, and remove any other entry that sets MEFOR_SECRETS_DIRECTORY, before any re-run "
-    "of the installer, which refuses an existing directory the service does not name. `nssm "
-    "set` replaces that whole list, so read it first with `nssm get`, running the service's "
-    "own nssm.exe by its full path, and pass back every entry but those refused above and the "
-    'strings this step and any step above say to remove: see docs/SERVICE.md, "Start / stop / '
-    'status"'
+    "entries, and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and nothing else, "
+    "before any re-run of the installer, which refuses an existing directory the service does "
+    "not name. `nssm set` replaces that whole list, so read it first with `nssm get`, running "
+    "the service's own nssm.exe by its full path, and pass back every entry but those refused "
+    "above and the strings this step and any step above say to remove: see docs/SERVICE.md, "
+    '"Start / stop / status"'
 )
 
 #: Text every form of the step carries, so a negative arm sees any.

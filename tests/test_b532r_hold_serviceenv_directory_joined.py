@@ -25,6 +25,7 @@ from messagefoundry.serviceenv import (
     service_env_refusal,
 )
 from tests._serviceenv_remedy import (
+    ADD_BACK,
     ADD_BACK_CREATE,
     ADD_BACK_JOINED,
     ADD_BACK_RUN_ON,
@@ -379,14 +380,30 @@ def test_a_value_that_runs_on_is_not_passed_back() -> None:
     assert "synthetic-run-on" not in refusal
 
 
-def test_no_opener_while_a_later_line_sets_the_directory() -> None:
-    """The Lander's hold on PR 3142, comment 7089064404, B: the directory is set on the second
-    line of a string, which NSSM may read as its own variable, so the step never says the lists
-    set none, and says to remove every other entry that sets it."""
+def test_a_later_line_directory_in_a_mixed_string_keeps_the_step_it_had() -> None:
+    """The Lander's hold on PR 3142, comment 7089400537: the directory is set on the second
+    line of a string whose first line sets MEFOR_VALUE_A, so the string sets something else too.
+    Removing it whole would remove that too, so no clause says to, and the step is the one
+    32a50eb printed, origin/main's. Its opener is the residual that hold left (comment
+    7089064404, B)."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"]))
     assert refusal is not None
-    assert SET_NO not in refusal and ADD_BACK_STEP not in refusal
-    assert refusal.count(ADD_BACK_JOINED) == 1
+    assert refusal.count(ADD_BACK) == 1
+    assert REMOVE_OTHER not in refusal and WIDER not in refusal
+
+
+def test_a_string_that_also_sets_another_variable_is_not_removed_whole() -> None:
+    """The Lander's hold on PR 3142, comment 7089400537, finding 5: ``PATH=C:\\x`` and a
+    directory line share one string. The clause covers only strings that set the directory and
+    nothing else, so nothing says to remove this one, and the step is the one 32a50eb printed,
+    origin/main's."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_VALUE_A=x", "PATH=C:\\x\nMEFOR_SECRETS_DIRECTORY=C:\\d"])
+    )
+    assert refusal is not None
+    assert refusal.count(ADD_BACK) == 1
+    assert REMOVE_OTHER not in refusal and WIDER not in refusal
+    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK)
 
 
 def test_a_blank_directory_item_is_not_passed_back() -> None:

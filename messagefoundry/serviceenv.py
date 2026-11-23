@@ -180,12 +180,17 @@ class ServiceEnvPosture:
     #: to. The remedy alone reads this: its add-back step then says to pass back none of the
     #: strings the steps above it say to remove.
     directory_joined: bool = False
-    #: Whether any line of any string in the lists sets ``MEFOR_SECRETS_DIRECTORY``, each line
-    #: read as :func:`_sets_directory` reads one, as its own item or joined to a value. The
-    #: remedy alone reads this, and then never says the lists set no secrets directory, and
-    #: says to remove every other entry that sets it (the Lander's holds on PR 3142, comments
-    #: 7088663896 and 7089064404).
+    #: Whether any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` on its first non-blank
+    #: line (:func:`_sets_directory`), as its own item or joined to a value. The remedy alone
+    #: reads this, and then never says the lists set no secrets directory (the Lander's hold on
+    #: PR 3142, comment 7088663896).
     directory_in_lists: bool = False
+    #: Whether any string in the lists sets ``MEFOR_SECRETS_DIRECTORY`` and nothing else
+    #: (:func:`_sets_only_directory`). The remedy alone reads this, and then says to remove
+    #: every other such string and not to pass one back. A string that sets something else too
+    #: is not removed whole for its directory line (the Lander's holds on PR 3142, comments
+    #: 7089064404 and 7089400537).
+    directory_only_in_lists: bool = False
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -964,6 +969,14 @@ def _sets_directory(entry: str) -> bool:
     return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
 
 
+def _sets_only_directory(entry: str) -> bool:
+    """Whether ``entry`` has a non-blank line and every non-blank line of it sets
+    ``MEFOR_SECRETS_DIRECTORY``, each read as :func:`_sets_directory` reads one, so removing the
+    whole string removes nothing but the directory, however NSSM reads its lines."""
+    lines = [line for line in _LINE_BREAK.split(entry) if line.strip()]
+    return bool(lines) and all(_sets_directory(line) for line in lines)
+
+
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
     only blanks or line breaks after it and no blank around the name, the name is ASCII, and the
@@ -1113,10 +1126,8 @@ def read_service_env_posture(
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
-        # Every line, since NSSM may read a later line of a string as its own variable.
-        directory_in_lists=any(
-            _sets_directory(line) for _where, entry in entries for line in _LINE_BREAK.split(entry)
-        ),
+        directory_in_lists=any(_sets_directory(entry) for _where, entry in entries),
+        directory_only_in_lists=any(_sets_only_directory(entry) for _where, entry in entries),
     )
 
 
@@ -1343,28 +1354,32 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # Two routes, because install-service.ps1 refuses an existing directory the service
         # does not name: an operator whose later `nssm set` dropped the variable must not be
         # sent to the installer, which would say to remove the directory holding the files.
-        # The step says the lists set no directory only where no line of any string in them
-        # sets one (directory_in_lists). Where one does, it says to remove every other entry
-        # that sets it, in origin/main's words, so the entry the operator adds is the only one.
-        # Where a value runs on, or a line sets the directory, the entries it says to pass back
-        # leave out the strings this step and the steps above say to remove, which may hold the
-        # refused value or set the directory (the Lander's holds on PR 3142, comments
-        # 7088102723, 7088663896 and 7089064404).
+        # The step says the lists set no directory only where no string in them sets one on
+        # its first non-blank line (directory_in_lists). Where a string sets the directory and
+        # nothing else, it says to remove every other such string, in origin/main's words
+        # narrowed to "and nothing else", so the entry the operator adds is the only one and a
+        # string that also sets another variable is never removed whole. Where a value runs on,
+        # or such a string exists, the entries it says to pass back leave out the strings this
+        # step and the steps above say to remove, which may hold the refused value or set the
+        # directory (the Lander's holds on PR 3142, comments 7088102723, 7088663896,
+        # 7089064404 and 7089400537).
         none_set = (others or values) and not posture.directory_in_lists
         add_back = (f"The service's lists set no {_DIRECTORY_VARIABLE}. " if none_set else "") + (
             f"Where install-service.ps1 already made the secrets directory, add "
             f"{_DIRECTORY_VARIABLE} naming that existing path back to the service's "
             "AppEnvironmentExtra, beside its other entries, "
         )
-        if posture.directory_in_lists:
-            add_back += f"and remove any other entry that sets {_DIRECTORY_VARIABLE}, "
+        if posture.directory_only_in_lists:
+            add_back += (
+                f"and remove any other entry that sets {_DIRECTORY_VARIABLE} and nothing else, "
+            )
         add_back += (
             "before any re-run of the installer, which refuses an existing directory the "
             "service does not name. `nssm set` replaces that whole list, so read it first with "
             "`nssm get`, running the service's own nssm.exe by its full path, and pass back "
             "every entry but those refused above"
         )
-        if posture.value_runs_on or posture.directory_joined or posture.directory_in_lists:
+        if posture.value_runs_on or posture.directory_joined or posture.directory_only_in_lists:
             add_back += " and the strings this step and any step above say to remove"
         add_back += ': see docs/SERVICE.md, "Start / stop / status"'
         # Only where a setting moves, as the create step reads: a store key alone goes to a
