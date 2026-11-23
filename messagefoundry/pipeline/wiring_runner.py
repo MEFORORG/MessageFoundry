@@ -12644,9 +12644,39 @@ class RegistryRunner:
         await self.store.dead_letter_now(item.id, f"handler error: {safe_exc(exc)}")
         return _ItemOutcome.PROCESSED, None
 
+    #: How many times one ingress row may start again because a reload replaced the graph during its
+    #: Router (BACKLOG #5707). Past this the row finishes on the served graph without a recheck, so
+    #: a run of reloads cannot hold it, or the lane behind it, indefinitely.
+    _INGRESS_RELOAD_REPASSES = 3
+
+    def _ingress_row_restarts(
+        self, name: str, item: OutboxItem, read: Registry, repass: int
+    ) -> bool:
+        """Whether an inline row whose Router selected one handler must start again, because a reload
+        replaced ``read``, the graph its inline gates describe (BACKLOG #5707). The restart follows
+        with no await, so the next pass finds the inbound this saw.
+
+        Not when the reload removed this inbound: a restart would reach the missing-inbound STOP, and
+        nothing re-arms a worker that stops while a later reload restores the inbound. That row
+        continues on the served graph, whose ``transform_one`` still refuses a handler or an outbound
+        the reload removed, so no outbound row is committed to a lane nobody drains."""
+        if self.registry is read or name not in self.registry.inbound:
+            return False
+        if repass >= self._INGRESS_RELOAD_REPASSES:
+            log.warning(
+                "router worker %r: %s met a reload on %d Router passes; finishing on the served "
+                "graph",
+                name,
+                item.id,
+                repass + 1,
+            )
+            return False
+        log.info("router worker %r: a reload replaced the graph; re-running %s", name, item.id)
+        return True
+
     @_records_worker_death("router")
     async def _process_ingress_item(
-        self, name: str, item: OutboxItem
+        self, name: str, item: OutboxItem, *, repass: int = 0
     ) -> tuple[_ItemOutcome, float | None]:
         """Route one claimed ingress row — the per-item body of :meth:`_router_worker`, extracted
         verbatim (ADR 0066, pure code motion) so the loop and the pooled dispatcher share it. Returns
@@ -12654,8 +12684,9 @@ class RegistryRunner:
         always ``None`` (``(PROCESSED, None)`` where the loop advanced, ``(STOPPED, None)`` on a missing
         inbound or the STOP internal-error policy — the body already ``mark_failed``'d / dead-lettered
         the head per policy). The per_lane loop reads only ``outcome[0]``. Store errors propagate to the
-        caller's backoff."""
-        ic = self.registry.inbound.get(name)
+        caller's backoff. ``repass`` counts restarts after a reload (:meth:`_ingress_row_restarts`)."""
+        registry = self.registry  # the graph `inline` below describes (BACKLOG #5707)
+        ic = registry.inbound.get(name)
         if ic is None:
             # The inbound was removed from the registry but residual ingress rows remain.
             # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
@@ -12714,6 +12745,7 @@ class RegistryRunner:
         # route_only and transform_one have both returned and every per-message gate held. The
         # handoff that commits them runs AFTER the try (ADR 0057 G1 as amended 2026-10-07).
         fused: list[tuple[str, str]] | None = None
+        restart = False
         try:
             # Publish the live graph's run-scoped views (code sets / reference snapshots /
             # active environment) so a call-time code_set(...)/reference(...)/
@@ -12755,7 +12787,14 @@ class RegistryRunner:
             # and as the fused path's handoff_exc does (ADR 0071). Eligible iff the inbound opted in
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
-            if inline and len(names) == 1:
+            # BACKLOG #5707: those gates describe `registry`, and a reload may have replaced it
+            # during the Router, so such a row commits nothing here and starts again below.
+            restart = (
+                inline
+                and len(names) == 1
+                and self._ingress_row_restarts(name, item, registry, repass)
+            )
+            if inline and len(names) == 1 and not restart:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
@@ -12833,6 +12872,12 @@ class RegistryRunner:
             # policy decides (factored into _apply_router_internal_error, the single source of
             # truth shared with the fused route branch; byte-identical).
             return await self._apply_router_internal_error(name, item, exc)
+        if restart:
+            # Outside the try, so a store fault in the next pass reaches the caller's fault arm and
+            # is not read as a Router error. The undecorated body, so a worker death counts once.
+            body: Callable[..., Awaitable[tuple[_ItemOutcome, float | None]]]
+            body = RegistryRunner._process_ingress_item.__wrapped__  # type: ignore[attr-defined]
+            return await body(self, name, item, repass=repass + 1)
         # `inline and` is redundant with how `fused` is set; it keeps the fused commit visibly
         # gated on the inline cache (tests/test_crit2_inline_doc_drift.py reads that link).
         if inline and fused is not None:
