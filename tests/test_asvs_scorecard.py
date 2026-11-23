@@ -3146,7 +3146,7 @@ def test_prove_absences_screen_outer_rule_passes_an_unnamed_outermost_decorator(
     a shape decorator, unless it hands back what it is given, as ``functools.wraps(g)`` does."""
     target = "w = WRAP\n\n" + _decorated(("property", "w"), method=False)
     assert _screen(_decorated(("w",), method=False), target, tmp_path) == []
-    assert not _differs_under_every_w(target, _decorated(("w",), method=False), method=False)
+    assert _differs_under_every_w(target, _decorated(("w",), method=False), method=False) is False
     swapped_from = "w = WRAP\n\n" + _decorated(("staticmethod",), method=True)
     assert _screen(_decorated(("w", "classmethod"), method=True), swapped_from, tmp_path) == []
     # A resolved decorator that may hand back anything: `abstractproperty` is a property.
@@ -3161,6 +3161,31 @@ def test_prove_absences_screen_outer_rule_passes_an_unnamed_outermost_decorator(
     over = _decorated(("functools.wraps(g)",), method=False)
     assert _refused(over, wraps, tmp_path)
     assert _differs_under_every_w(wraps, over, method=False)
+
+
+def test_prove_absences_screen_outer_rule_reads_only_a_shape_that_is_fixed_and_live(
+    tmp_path: Path,
+) -> None:
+    """The rule tells nothing where the outermost shape decorator hands each call on to what it
+    wraps (``singledispatch``), where a decorator is called that is not used that way, where
+    ``functools.wraps`` is left uncalled, or where the target's def is not the live binding; each
+    of these is accepted, as without the rule. A ``typing_extensions`` passthrough is passed over
+    like the ``typing`` one."""
+    head = "import functools\nimport typing_extensions\n\ndef g(): ...\n\nw = WRAP\n\n"
+    plain = _decorated((), method=False)
+    for live in (
+        ("functools.singledispatch", "w"),
+        ("staticmethod(w)", "w"),
+        ("functools.wraps", "functools.cache", "w"),
+    ):
+        assert _screen(plain, head + _decorated(live, method=False), tmp_path) == [], live
+    rebound = head + _decorated(("functools.cache", "w"), method=False) + "f = f.__wrapped__\n"
+    assert _screen(plain, rebound, tmp_path) == []
+    override = head + _decorated(("typing_extensions.override", "property", "w"), method=True)
+    assert _refused(_decorated((), method=True), override, tmp_path)
+    # The refusal names the decorator as the source spells its origin, not as `_SAME_SHAPE` reads it.
+    cached = head + _decorated(("functools.cache", "w"), method=False)
+    assert any("functools.cache" in p for p in _screen(plain, cached, tmp_path))
 
 
 def test_signature_fields_name_every_signature_value() -> None:
