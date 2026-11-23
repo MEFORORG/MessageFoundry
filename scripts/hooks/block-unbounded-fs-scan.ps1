@@ -716,9 +716,12 @@ function Hide-PowerShellSpans([string]$Text) {
 # as data. It does not match bash for at least a `$((` site holding a `#`, whose end bash finds by
 # matching parens, so the re-read can run past it and add a false deny; nor for a word-start `((`
 # site holding a heredoc, whose body's lines bash runs and which stays allowed, as on main.
-# Single-quoted text outside arithmetic, `$'...'` and heredoc
-# bodies hold no site. It still does not read at least these: a case pattern's `)`, a `((` glued to
-# a keyword, and a substitution in a heredoc body. Past its step budget it returns $null, and the
+# Outside arithmetic, single-quoted text, `$'...'` text and the body of a heredoc whose delimiter is
+# quoted hold no site in bash. This pass reads every heredoc body as data, whatever its delimiter.
+# It still does not read at least these: a case pattern's `)`, a `((` glued to a keyword, a `$'...'`
+# inside arithmetic, where bash reads the `$` and the quote as literal text and a substitution
+# inside it still runs, and a substitution in the body of a heredoc whose delimiter is unquoted,
+# which bash runs. Past its step budget it returns $null, and the
 # caller then adds nothing. With -From, it reads a command from that offset inside an open `(` and
 # returns where that `(` closes.
 function Get-SiteTexts([string]$Text, [int]$From = -1) {
