@@ -1326,12 +1326,125 @@ def test_a_slot_on_a_library_exception_cannot_carry_text_onto_the_chain() -> Non
 def test_the_chain_scrub_reads_the_class_name_with_no_library_code() -> None:
     from messagefoundry.transports.base import DeliveryError
 
-    meta = type("Meta", (type,), {"__name__": property(_raiser(RuntimeError(_REFUSAL)))})
-    named: Any = meta("Named", (Exception,), {})
     error = DeliveryError("the screened line")
-    error.__cause__ = named(_REFUSAL)
+    error.__cause__ = _named_by_a_raising_metaclass()(_REFUSAL)
     dicom_module._drop_library_text_from_chain(error)
     _assert_stands_for(error.__cause__, "Named")
+
+
+def _named_by_a_raising_metaclass(base: type[Exception] = Exception) -> Any:
+    """A class called ``Named`` whose ``__name__``, read the ordinary way, raises the refusal."""
+    meta = type("Meta", (type,), {"__name__": property(_raiser(RuntimeError(_REFUSAL)))})
+    return meta("Named", (base,), {})
+
+
+class _NameThatRaisesWhenFormatted(str):
+    __slots__ = ()
+
+    def __format__(self, format_spec: str) -> str:
+        raise RuntimeError(_REFUSAL)
+
+
+#: Library exceptions whose class name cannot be read the ordinary way, each reaching a different
+#: arm of ``_safe_library_exc``.
+_UNNAMEABLE: dict[str, Callable[[], Exception]] = {
+    "pinned-text": lambda: _named_by_a_raising_metaclass()(_REFUSAL),
+    "unpinned-text": lambda: _named_by_a_raising_metaclass()(f"value {_UID}"),
+    "holds-a-codec-error": lambda: _named_by_a_raising_metaclass()(
+        UnicodeDecodeError("ascii", _UID.encode(), 0, 1, "bad")
+    ),
+    "is-a-codec-error": lambda: _named_by_a_raising_metaclass(UnicodeError)(_UID),
+    "attribute-reads-raise": lambda: type(
+        "Named", (Exception,), {"__getattribute__": _raiser(RuntimeError(_REFUSAL))}
+    )(f"value {_UID}"),
+    "name-is-a-str-subclass": lambda: type(_NameThatRaisesWhenFormatted("Named"), (Exception,), {})(
+        f"value {_UID}"
+    ),
+}
+
+
+@pytest.mark.parametrize("make", _UNNAMEABLE.values(), ids=_UNNAMEABLE.keys())
+async def test_an_unnameable_class_on_a_failed_send_lets_no_text_out_of_send(
+    make: Callable[[], Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pynetdicom.association import Association
+
+    from messagefoundry.transports.base import DeliveryError, NegativeAckError
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    library = make()
+    monkeypatch.setattr(Association, "send_c_store", _raiser(library))
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
+        await _scu(port).send(_carry(make_sr_part10()))
+    if issubclass(type(library), ValueError):  # a UnicodeError is one: the unsendable arm
+        assert isinstance(raised.value, NegativeAckError)
+        assert raised.value.code == "cstore-unsendable"
+    else:  # CONTROL: the transient arm, which quotes the class
+        assert not isinstance(raised.value, NegativeAckError)
+        assert "Named" in str(raised.value)
+    assert _UID not in "".join(traceback.format_exception(raised.value))
+    _assert_stands_for(raised.value.__cause__, "Named")
+
+
+@pytest.mark.parametrize("abort_raises", [False, True], ids=["abort-works", "abort-raises"])
+@pytest.mark.parametrize("make", _UNNAMEABLE.values(), ids=_UNNAMEABLE.keys())
+async def test_an_unnameable_class_on_a_failed_release_keeps_the_success_and_the_abort(
+    make: Callable[[], Exception],
+    abort_raises: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from pynetdicom.acse import ACSE
+    from pynetdicom.association import Association
+
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scu import _carry, _scu, _storage_scp
+
+    aborted: list[bool] = []
+    real_abort = Association._abort_blocking
+
+    def abort(self: Any, block: bool = True) -> None:
+        real_abort(self, block)
+        if self.is_requestor:
+            aborted.append(True)
+            if abort_raises:
+                raise make()
+
+    monkeypatch.setattr(ACSE, "negotiate_release", _raiser(make()))
+    monkeypatch.setattr(Association, "_abort_blocking", abort)
+    received: list[bytes] = []
+    before = _live_associations()
+    with (
+        caplog.at_level(logging.INFO, logger="messagefoundry.transports.dicom"),
+        _storage_scp(received=received) as port,
+    ):
+        assert await _scu(port).send(_carry(make_sr_part10())) is None  # the Success stands
+        left = await _associations_left(before)
+    assert aborted == [True] and not left
+    assert len(received) == 1
+    logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
+    assert [entry for entry in logged if "delivered" in entry]
+    assert [entry for entry in logged if "release failed" in entry and "Named" in entry]
+    assert not abort_raises or [e for e in logged if "abort failed" in e and "Named" in e]
+    assert _UID not in caplog.text
+
+
+@pytest.mark.parametrize("make", _UNNAMEABLE.values(), ids=_UNNAMEABLE.keys())
+async def test_an_unnameable_class_prints_no_text_in_the_worker_fault_log(
+    make: Callable[[], Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pynetdicom.association import Association
+
+    library = make()
+    monkeypatch.setattr(Association, "send_c_store", _raiser(library))
+    written = await _worker_fault_text(
+        StoreAcquireTimeout("sqlite: store pool acquire timed out after 5s"), tmp_path, monkeypatch
+    )
+    refusal = "NegativeAckError" if issubclass(type(library), ValueError) else "DeliveryError"
+    assert "StoreAcquireTimeout" in written and refusal in written  # CONTROL
+    assert "_LibraryCause[Named]" in written
+    assert _UID not in written, written
 
 
 def test_a_delivery_error_with_no_chain_keeps_none() -> None:

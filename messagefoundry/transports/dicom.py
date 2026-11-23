@@ -102,6 +102,7 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
     skips_validity_period,
 )
+from messagefoundry.config.wiring import _type_name
 from messagefoundry.keywrap import load_connection_cert_chain
 from messagefoundry.netaddr import ALLOWLIST_RULE_TEXT, allowlist_restricts, allowlist_shortfall
 from messagefoundry.parsing.binary import BinaryCarriageError
@@ -806,17 +807,22 @@ def _safe_library_exc(exc: BaseException) -> str:
     """An exception pydicom or pynetdicom raised, for the engine's own log and error text: its class,
     and its message only where :func:`_screened_line` keeps it. ``redact()`` does not recognise a
     UID, so a refused one would survive it. A codec error's ``str()`` is never read here: it names
-    a byte."""
-    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
-        return safe_exc(exc)
+    a byte.
+
+    The callers build a delivery error or a log line from this while handling a library failure, so
+    a raise here would carry that failure's text past them. The class name is read by
+    :func:`~messagefoundry.config.wiring._type_name`, since ``type(exc).__name__`` runs a metaclass's
+    code, and anything else that fails on such a class withholds the message."""
+    name = _type_name(exc)
     try:
+        if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+            return safe_exc(exc)
         line = _screened_line(str(exc))
-    except Exception as failed:  # noqa: BLE001 - a third-party exception's str()
-        logger.debug("A DICOM exception's text was withheld: %s", type(failed).__name__)
-        line = None
-    if line is None:
-        return f"{type(exc).__name__}: {_MESSAGE_WITHHELD} (raised at {_raised_at(exc)})"
-    return f"{type(exc).__name__}: {safe_text(line)}" if line else type(exc).__name__
+        if line is not None:
+            return f"{name}: {safe_text(line)}" if line else name
+    except Exception as failed:  # noqa: BLE001 - a third-party exception's str() or class
+        logger.debug("A DICOM exception's text was withheld: %s", _type_name(failed))
+    return f"{name}: {_MESSAGE_WITHHELD} (raised at {_raised_at(exc)})"
 
 
 class _LibraryCause(Exception):
@@ -826,10 +832,6 @@ class _LibraryCause(Exception):
     prints its class, so this way the name survives there too."""
 
     library_class: ClassVar[str] = ""
-
-
-#: Reads a class's name past any ``__name__`` its metaclass defines, so no library code runs.
-_class_name: Callable[[type], str] = type.__dict__["__name__"].__get__
 
 
 @functools.lru_cache(maxsize=64)
@@ -856,13 +858,17 @@ def _drop_library_text_from_chain(exc: BaseException) -> None:
     link = exc.__cause__ if exc.__cause__ is not None else exc.__context__
     exc.__context__ = None
     # Setting __cause__ also sets __suppress_context__.
-    exc.__cause__ = None if link is None else _library_cause_class(_class_name(type(link)))()
+    exc.__cause__ = None if link is None else _library_cause_class(_type_name(link))()
+
+
+_TRACEBACK_OF: Any = BaseException.__dict__["__traceback__"]
 
 
 def _raised_at(exc: BaseException) -> str:
     """Where ``exc`` was raised, as file, line and function. These are code, so they say where an
-    engine fault is when :func:`_safe_library_exc` has withheld its message."""
-    frame = exc.__traceback__
+    engine fault is when :func:`_safe_library_exc` has withheld its message. The traceback is read
+    by the builtin descriptor, so a class's own ``__getattribute__`` does not run."""
+    frame = _TRACEBACK_OF.__get__(exc)
     if frame is None:
         return "an unknown place"
     while frame.tb_next is not None:
@@ -3165,7 +3171,8 @@ class DicomScuDestination(DestinationConnector):
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
-            if isinstance(exc, AttributeError) and "SOPInstanceUID" not in dataset:
+            # By its type: isinstance can read the exception's __class__, which runs its class's code.
+            if issubclass(type(exc), AttributeError) and "SOPInstanceUID" not in dataset:
                 # pynetdicom reads the UID before it sends anything; a retry repeats this.
                 raise NegativeAckError(
                     "DICOM C-STORE client (SCU): outgoing object has no SOP Instance UID (no retry)",
