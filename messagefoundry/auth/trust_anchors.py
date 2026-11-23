@@ -251,18 +251,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
     device at the path among them, or an ACL or path that could not be read, since whoever
     swapped the file can make its ACL unreadable. Some file read faults set nothing
-    (:func:`_transient_read_fault`, which lists at least which): a file not there, as between the
-    steps of some renewals, any ``PermissionError``, as while a scanner holds the file, and some
-    network or I/O faults, such as a share whose network name went away. Since every
-    ``PermissionError`` counts, a sharing violation among them, a party who can deny the engine
-    reads of the pin file can keep the hold from being set; that function names this and the
-    other known residuals. Any other ``OSError`` sets the hold. A pin whose path verdict is
-    indeterminate, as on a share, never reaches such a read at ``enforce``: the SQL Server store
-    open refuses that verdict, so ``serve`` fails at the open whatever the network does. The
-    network-fault exemption therefore takes effect at ``enforce`` only for a pin whose path passes,
-    at least block-level network storage formatted with a trusted file system, such as iSCSI,
-    NBD or RBD under ext4 or xfs, which can see a network fault as ``EIO``, and a pin location
-    that becomes networked after the open. What it refuses: at least the new connects the
+    (:func:`_transient_read_fault`, which lists at least which and names the known residuals,
+    and says which of them reach a read at ``enforce``). Any other ``OSError`` sets the hold.
+    What it refuses: at least the new connects the
     SQL Server store's pool makes, those of its claim holders and sync handoff pools, and the
     store open's own database-options connects
     (:func:`~messagefoundry.store.sqlserver.refuse_connect_after_pin_refusal`). A store call that
@@ -2937,10 +2928,12 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     a Windows error code; at least some failures of the open and of the read itself carry none,
     so a share lost at those steps can still set the hold.
 
-    **A pin whose path verdict is indeterminate never reaches this read at** ``enforce``. The
-    SQL Server store open refuses that verdict
+    **A pin whose path verdict is indeterminate or insecure never reaches this read at**
+    ``enforce``. The SQL Server store open refuses both verdicts
     (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
-    open whatever the network does. On POSIX at least a share, a local disk of a type outside
+    open whatever the network does. A share can read as either: at least CIFS or NFS with a
+    foreign uid, or a group or other write bit, reads as ``path_insecure``, and otherwise as
+    indeterminate. On POSIX at least a local disk of a type outside
     :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
     host without ``/proc/self/mountinfo`` read as indeterminate. So at ``enforce`` this exemption
     takes effect only for a pin whose path passes, such as on a trusted local file system or on
