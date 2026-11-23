@@ -89,6 +89,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     bool_setting,
+    flag_from_settings,
     hop_attestation_from_settings,
     remote_file_protocol,
 )
@@ -791,6 +792,9 @@ def _ftps_ssl_context(
     is stated once, in docs/SECURITY-LOOSENING.md, *No escape sends a credential to an unverified
     peer*."""
     verify = bool_setting(settings, "tls_verify", default=True)
+    # Read strictly, before the branch, so a non-bool is refused on a verify-off hop too:
+    # bool("false") is True (vault BACKLOG #3234 added step 8).
+    allow_expired = flag_from_settings(settings, "tls_allow_expired")
     # Keyed on either half, as the plain-ftp credential guard is. Checked BEFORE the escape arm, so a
     # credentialed hop is never told to set an escape that cannot unlock it.
     has_credential = bool(settings.get("username") or settings.get("password"))
@@ -877,7 +881,7 @@ def _ftps_ssl_context(
         # tls_check_hostname=false. At least the intermediates' and the trust anchor's validity periods,
         # and a CRL's own window, go unchecked too (vault BACKLOG #5089). Verify path only; default off
         # = byte-identical.
-        if settings.get("tls_allow_expired"):
+        if allow_expired:
             relax_verify_expiry(ctx, host=str(settings.get("host", "")))
     return ctx
 
@@ -2339,23 +2343,24 @@ def _guard_ftps_revocation(
     ``relax_verify_expiry`` sets ``X509_V_FLAG_NO_CHECK_TIME``, which OpenSSL applies to a CRL's
     validity window as well as the certificate's, so a CRL past ``nextUpdate`` would still be
     accepted. The REST family reads the same setting for the same
-    reason (``refuse_unrevoked_verified_hop``, vault BACKLOG #2188); the truthiness here is the
-    one ``_ftps_ssl_context`` relaxes on."""
+    reason (``refuse_unrevoked_verified_hop``, vault BACKLOG #2188). It is read strictly, as
+    ``_ftps_ssl_context`` reads it, so the two agree (vault BACKLOG #3234)."""
     if context is None or context.verify_mode is ssl.CERT_NONE:
         return
+    expiry_relaxed = flag_from_settings(s, "tls_allow_expired")
     RevocationHopGuard.capture(
         host=str(s["host"]),
         cell=f"REMOTEFILE ftps {direction}",
         # The relaxed record says itself what the hop lacks; see the MLLP destination.
         description=(
             f"verified FTPS {'upload' if direction == 'destination' else 'poll'}"
-            + ("" if s.get("tls_allow_expired") else " (no revocation check)")
+            + ("" if expiry_relaxed else " (no revocation check)")
         ),
         attested=attested,
         attested_reason=attested_reason,
         connection=connection,
         context=context,
-        expiry_relaxed=bool(s.get("tls_allow_expired")),
+        expiry_relaxed=expiry_relaxed,
     ).enforce_construction()
 
 

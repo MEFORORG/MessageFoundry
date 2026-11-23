@@ -1014,6 +1014,14 @@ class BatchCipher(Protocol):
     def encrypt_many(self, items: Sequence[CipherItem]) -> list[str]: ...
 
 
+def cipher_blocks_on_io(cipher: object) -> bool:
+    """Whether ``cipher``'s calls wait on a network round trip (BACKLOG #3929).
+
+    A cipher says so with a ``blocks_on_io`` attribute, which :class:`TransitCipher` sets True. A
+    cipher without the attribute is read as False, so its calls stay on the caller's thread."""
+    return getattr(cipher, "blocks_on_io", False) is True
+
+
 def gave_no_verdict(error: CipherError) -> bool:
     """Whether a failed decrypt was the key service failing rather than the value (BACKLOG #6706).
 
@@ -1682,6 +1690,7 @@ class IdentityCipher:
     """No-op cipher: values are stored as-is (the default when no key is configured)."""
 
     encrypts = False
+    blocks_on_io = False
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         return plaintext  # identity: no encryption, so nothing to bind (aad ignored)
@@ -1734,6 +1743,8 @@ class AesGcmCipher(_UnmarkedPolicy):
     from when that writer emitted v2; since ADR 0196 it emits v4, sealed under the store data sub-key."""
 
     encrypts = True
+    #: In-process AES-GCM: no network call, so ``row_seal.cipher_call`` runs it inline (BACKLOG #3929).
+    blocks_on_io = False
 
     def __init__(
         self,

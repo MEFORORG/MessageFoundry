@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -486,3 +487,71 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     for row in rows:
         assert "*What an admin user read reports* below this table" in row, row
         assert "audit row and alert" not in row and "audited and alerted" not in row, row
+
+
+#: The console sentences this PR's code change needs in that statement (Lander hold 7090810151,
+#: narrowed by decision d20261123T104714846-26b436 to main's text plus these): the users list
+#: links a failing account's delete, for a ``users:manage`` holder only, to the confirmation page,
+#: which shows a page in place of the 423 its checked read answers for that record; the page's
+#: own-account case; and the interval sentence, which main had answering every refusal 423 or
+#: listed as failed, names the confirmation's page. Case-insensitive regexes over the
+#: whitespace-normalised statement.
+_CONSOLE_SENTENCES = {
+    "the list's delete is the confirmation's, for users:manage": (
+        r"to a caller holding `users:manage` it links that account's delete to "
+        r"`GET /ui/users/\{user_id\}/delete-confirm`"
+    ),
+    "the confirmation answers a refused record rather than the 423": (
+        r"delete-confirm`, which, for a record its checked read refuses with 423, shows a "
+        r"confirmation naming the id alone rather than the 423 this paragraph gives a failing "
+        r"record"
+    ),
+    # Lander hold 7091484059: the confirmation catches the 423 and answers 200, so the sentence
+    # that said every refusal inside the interval answers 423 or is listed as failed names it.
+    "the interval sentence names the confirmation's page": (
+        r"answers 423, lists the account as failed or, on the delete confirmation, shows its page"
+    ),
+    "the confirmation for the caller's own account has no form": (
+        r"Where the id in its path is the caller's own, that page shows a note that the caller "
+        r"cannot delete their own account, and no delete form"
+    ),
+}
+
+#: Main's wording of the interval and Vault transit sentences (Lander hold 7091484059), each
+#: regex beside the sentence it was written against: it must match that sentence, its positive
+#: control, and must not match the statement, since the confirmation answers 200 rather than
+#: either.
+_UNSCOPED = {
+    r"answers 423 or lists the account as failed": (
+        "A refusal inside that interval, from any of these routes or any other reader of the same "
+        "account in that process, answers 423 or lists the account as failed and adds no row and "
+        "no alert."
+    ),
+    r"answered the same way, a 423 or listed as failed": (
+        "a record Vault transit cannot verify is answered the same way, a 423 or listed as "
+        "failed, but reported under `integrity.authority_seal_unverifiable`"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_CONSOLE_SENTENCES))
+def test_the_security_doc_states_the_console_sentences(name: str) -> None:
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert re.search(_CONSOLE_SENTENCES[name], body, re.IGNORECASE), name
+
+
+def test_the_security_doc_no_longer_offers_the_delete_on_the_list_itself() -> None:
+    """Main's "with its delete" described a delete form on the users list; this PR moved it behind
+    the confirmation page (Lander hold 7090810151)."""
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(r"by its id alone, with its delete\b", body, re.IGNORECASE)
+
+
+@pytest.mark.parametrize("overclaim", sorted(_UNSCOPED))
+def test_the_security_doc_does_not_state_the_423_without_the_confirmation(overclaim: str) -> None:
+    assert re.search(overclaim, _UNSCOPED[overclaim], re.IGNORECASE), overclaim
+    text = _SECURITY_MD.read_text("utf-8")
+    body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
+    assert not re.search(overclaim, body, re.IGNORECASE), overclaim

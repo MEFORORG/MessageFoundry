@@ -334,7 +334,11 @@ def _counters(*, sent=100, acked=98, sink_received=300) -> Counters:
     return Counters(sent=sent, acked=acked, sink_received=sink_received, timeouts=sent - acked)
 
 
-def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None):
+def _stats(*, done: int = 0, dead: int = 0, in_pipeline: int = 0) -> NodeStats:
+    return NodeStats(done=done, dead=dead, pending=in_pipeline, inflight=0, in_pipeline=in_pipeline)
+
+
+def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None, done_at_start=0):
     fo = _profile().failover
     assert fo is not None
     return _build_report(
@@ -343,8 +347,8 @@ def _report(*, tracker: FailoverTracker, outcome=None, final=None, counters=None
         counters or _counters(),
         tracker,
         outcome or _outcome(),
-        final or NodeStats(done=294, dead=0, pending=0, inflight=0, in_pipeline=0),
-        done_at_start=0,
+        final or _stats(done=294),
+        done_at_start=done_at_start,
         fo=fo,
         notes=[],
     )
@@ -450,6 +454,149 @@ def test_build_report_single_leader_passes_with_samples() -> None:
     rep = _report(tracker=_full_tracker(), outcome=_outcome(leaders=1, leader_samples=12))
     assert rep.leader_samples == 12
     assert any(s.name == "single_leader" and s.ok for s in rep.slos)
+
+
+def test_any_dead_row_at_the_end_fails_the_run() -> None:
+    # The counters cannot separate carried-over dead rows from new ones, so the check stays absolute.
+    rep = _report(tracker=_full_tracker(), done_at_start=5000, final=_stats(done=5294, dead=3))
+    assert rep.dead_final == 3
+    assert rep.result_ok is False
+    assert any(s.name == "no_acknowledged_loss" and not s.ok for s in rep.slos)
+
+
+def test_duplicates_are_measured_against_the_opening_done_count() -> None:
+    # 5000 prior done rows and 200 duplicates: 1000 delivered this run, 1200 reached the sink.
+    rep = _report(
+        tracker=_full_tracker(),
+        counters=_counters(sink_received=1200),
+        done_at_start=5000,
+        final=_stats(done=6000),
+    )
+    assert rep.engine_delivered == 1000
+    assert rep.duplicates == 200
+    assert rep.result_ok is False
+    assert any(s.name == "max_dup_rate" and not s.ok for s in rep.slos)
+
+
+class _StatsNode:
+    """Answers ``stats`` from a script; the last answer repeats."""
+
+    node_id = "fo-x"
+
+    def __init__(self, answers: list[NodeStats | None]) -> None:
+        self._answers = answers
+        self.reads = 0
+
+    async def stats(self, client: object) -> NodeStats | None:
+        answer = self._answers[min(self.reads, len(self._answers) - 1)]
+        self.reads += 1
+        return answer
+
+
+def test_opening_stats_retries_a_failed_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(failover, "_OPENING_STATS_RETRY_S", 0.0)
+    good = _stats(done=7, dead=2)
+    node = _StatsNode([None, None, good])
+    got = asyncio.run(failover._opening_stats([node], object()))  # type: ignore[list-item,arg-type]
+    assert got == good
+    assert node.reads == 3
+
+
+def test_opening_stats_gives_up_after_its_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(failover, "_OPENING_STATS_RETRY_S", 0.0)
+    node = _StatsNode([None])
+    with pytest.raises(FailoverError, match="opening"):
+        asyncio.run(failover._opening_stats([node], object()))  # type: ignore[list-item,arg-type]
+    assert node.reads == failover._OPENING_STATS_ATTEMPTS
+
+
+@pytest.mark.parametrize("body", [{}, {"outbox_by_status": None}, {"outbox_by_status": []}])
+def test_a_stats_answer_with_no_status_map_is_no_reading(
+    body: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = failover.EngineNode.__new__(failover.EngineNode)
+
+    async def answer(_client: object, _path: str) -> dict[str, object]:
+        return body
+
+    monkeypatch.setattr(node, "_signed_in_json", answer)
+    assert asyncio.run(node.stats(object())) is None  # type: ignore[arg-type]
+
+
+def test_a_stats_answer_with_an_empty_status_map_reads_as_zeros(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = failover.EngineNode.__new__(failover.EngineNode)
+
+    async def answer(_client: object, _path: str) -> dict[str, object]:
+        return {"outbox_by_status": {}, "in_pipeline": 0}
+
+    monkeypatch.setattr(node, "_signed_in_json", answer)
+    assert asyncio.run(node.stats(object())) == _stats()  # type: ignore[arg-type]
+
+
+def test_a_run_whose_opening_stats_never_read_offers_no_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The refusal comes before the dispatcher starts, and the teardown still runs."""
+    events: list[str] = []
+
+    class _Node:
+        def __init__(self, node_id: str, *_a: object, **_k: object) -> None:
+            self.node_id = node_id
+
+        async def start(self, *, provision: bool) -> None:
+            return None
+
+        async def stats(self, client: object) -> None:
+            return None
+
+        async def stop(self) -> None:
+            events.append("node-stop")
+
+    class _Sink:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            events.append("sink-stop")
+
+    class _Dispatcher:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise AssertionError("load was offered with no opening baseline")
+
+        async def stop(self, _grace: float) -> None:
+            events.append("dispatcher-stop")
+
+    async def _noop(*_a: object, **_k: object) -> None:
+        return None
+
+    async def _leader(nodes: list[_Node], *_a: object, **_k: object) -> _Node:
+        return nodes[0]
+
+    monkeypatch.setattr(failover, "_OPENING_STATS_RETRY_S", 0.0)
+    monkeypatch.setattr(failover, "EngineNode", _Node)
+    monkeypatch.setattr(failover, "CorrelationSink", _Sink)
+    monkeypatch.setattr(failover, "Dispatcher", _Dispatcher)
+    monkeypatch.setattr(failover, "ConnectionPool", lambda *_a, **_k: object())
+    monkeypatch.setattr(failover, "build_corpus", lambda *_a, **_k: object())
+    monkeypatch.setattr(failover, "harness_ssl_context", lambda: True)
+    monkeypatch.setattr(failover, "_await_all_healthy", _noop)
+    monkeypatch.setattr(failover, "_await_single_leader", _leader)
+    monkeypatch.setattr(failover, "_await_port", _noop)
+
+    ports = FailoverPorts(
+        api_a=1, api_b=2, inbound_adt=3, inbound_results=4, inbound_other=5, sink=6, sink_count=1
+    )
+    with pytest.raises(FailoverError, match="opening"):
+        asyncio.run(failover.run_failover_load(_profile(), ports=ports, base_env={}))
+    assert {"dispatcher-stop", "sink-stop", "node-stop"} <= set(events)
 
 
 def test_report_json_and_console_smoke() -> None:

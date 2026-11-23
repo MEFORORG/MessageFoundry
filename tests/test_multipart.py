@@ -663,13 +663,13 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
 
 # --- BACKLOG #5787: a body with no closing delimiter is refused -----------------------------------
 #
-# The fix is deliberately narrow: it refuses a body in which ``--<boundary>--`` appears nowhere, and
-# changes nothing about how delimiters are found. The differential arm below pins that: every body
-# in the corpus that carries a close marker must parse exactly as origin/main parsed it, outcome for
-# outcome. The outcomes were recorded by running origin/main's parser (at ec75a5f61bf) over this same
-# corpus, so a change that moves any of them, accept or refuse, shows here. The record says what
-# main did, not that each outcome is right: the mid-line rows are delimiters not anchored to a line
-# start, the other half of #5787, which is not built here and would move those rows when it is.
+# The first half refuses a body with no closing delimiter. The second half counts a delimiter after
+# the first only at a line start (multipart._LineStartDelimiters). The differential arm below pins
+# what both halves leave alone: every body in the corpus that carries close-marker text must parse
+# exactly as origin/main parsed it, outcome for outcome, except the rows _ANCHORED_OUTCOMES names.
+# The outcomes were recorded by running origin/main's parser (at ec75a5f61bf) over this same corpus,
+# so a change that moves any other row, accept or refuse, shows here. The record says what main did,
+# not that each outcome is right.
 
 _CT_B = "multipart/form-data; boundary=B"
 _CT_WK = f"multipart/form-data; boundary={_B}"
@@ -677,7 +677,8 @@ _FP = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n'
 
 
 def _corpus() -> list[tuple[str, str, bytes]]:
-    """(id, Content-Type, body). Shapes the narrow fix must not move, then the test_multipart bodies."""
+    """(id, Content-Type, body). Edge shapes, then the test_multipart bodies. Only the rows
+    _ANCHORED_OUTCOMES names may move from origin/main's outcome."""
     cap = multipart._MAX_FIELD_BYTES
     return [
         ("plain", _CT_B, b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"),
@@ -741,8 +742,8 @@ def _digest(value: bytes) -> bytes | tuple[int, str]:
     return value if len(value) <= 64 else (len(value), hashlib.sha256(value).hexdigest())
 
 
-#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries a close
-#: marker, so the #5787 fix must leave each one exactly as it was.
+#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries
+#: close-marker text; #5787 leaves each one as it was, except the rows _ANCHORED_OUTCOMES names.
 _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "plain": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
     "delim-cr-run": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
@@ -826,6 +827,19 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-epilogue-delims": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
 }
 
+#: The rows the line-start anchor moves (the second half of #5787): each holds delimiter text in the
+#: middle of a line, which is now part content rather than a delimiter.
+_ANCHORED_OUTCOMES: dict[str, tuple[Any, ...]] = {
+    # The mid-line ``--B`` stays inside the one file instead of splitting it in two.
+    "mid-line-delim": ("parsed", [("file", "a.hl7", _digest(b"MSH|x--B\r\n" + _FP + b"y"))], []),
+    # The only close marker is mid-line, so the body has none.
+    "mid-line-close": (
+        "refused",
+        "MultipartError",
+        "multipart body has no closing boundary delimiter; the upload may be truncated",
+    ),
+}
+
 
 _CORPUS = _corpus()
 _MULTIPART_CORPUS = [c for c in _CORPUS if c[1] != "application/json"]
@@ -837,20 +851,27 @@ def _close_marker(content_type: str) -> bytes:
 
 
 @pytest.mark.parametrize(("case", "content_type", "body"), _CORPUS, ids=[c[0] for c in _CORPUS])
-def test_a_body_with_a_close_marker_parses_exactly_as_main_did(
+def test_a_body_with_a_close_marker_parses_as_main_did_unless_listed(
     case: str, content_type: str, body: bytes
 ) -> None:
-    """#5787 differential arm: the refusal of an unterminated body moves no body that carries a
-    close marker, whatever its shape (a CR run after a delimiter, a close marker after a bare CR,
-    anything after the close marker, a delimiter not at a line start). It pins
-    ``parse_multipart_form``; ``parse_single_file_upload`` shares the same walk and terminator check."""
-    assert _close_marker(content_type) in body, "the corpus holds terminated bodies only"
-    assert _outcome(content_type, body) == _MAIN_OUTCOMES[case]
+    """#5787 differential arm: neither half moves a corpus body, whatever its shape (a CR run after a
+    delimiter, a close marker after a bare CR, anything after the close marker, a preamble ending
+    mid-line), except the rows holding delimiter text mid-line after the first delimiter. Those
+    move to _ANCHORED_OUTCOMES, and each of those differs from main. It pins ``parse_multipart_form``; ``parse_single_file_upload``
+    shares the same walk and terminator check."""
+    # Close-marker text, not a line-start close: the rows _ANCHORED_OUTCOMES names hold it mid-line.
+    assert _close_marker(content_type) in body, "every corpus body holds close-marker text"
+    if case in _ANCHORED_OUTCOMES:
+        assert _ANCHORED_OUTCOMES[case] != _MAIN_OUTCOMES[case]
+        assert _outcome(content_type, body) == _ANCHORED_OUTCOMES[case]
+    else:
+        assert _outcome(content_type, body) == _MAIN_OUTCOMES[case]
 
 
 def test_the_recorded_outcomes_cover_the_whole_corpus() -> None:
     """The record and the corpus must name the same bodies, or a body could go uncompared."""
     assert [case for case, _, _ in _CORPUS] == list(_MAIN_OUTCOMES)
+    assert set(_ANCHORED_OUTCOMES) <= set(_MAIN_OUTCOMES)
 
 
 @pytest.mark.parametrize(
@@ -866,13 +887,15 @@ def test_the_same_body_without_its_close_marker_is_refused(
     cap, since the walk now runs on into the delimiter text that sat after the close marker). A body
     main refused keeps main's refusal from ``parse_multipart_form``, class and all, because the
     terminator check runs last. (``parse_single_file_upload`` refuses a no-file or two-file body
-    after the walk, so an unterminated one of those now gets the terminator refusal there.)"""
+    after the walk, so an unterminated one of those now gets the terminator refusal there.) A row
+    the line-start anchor moved to a refusal keeps that refusal; for those rows this arm is no
+    control of the terminator check, since the terminated body is refused the same way."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
-    main = _MAIN_OUTCOMES[case]
+    main = _ANCHORED_OUTCOMES.get(case, _MAIN_OUTCOMES[case])
     if main[0] == "refused":
         assert (type(caught.value).__name__, str(caught.value)) == main[1:]
     elif case == "wk-epilogue-delims":
@@ -928,3 +951,132 @@ def test_a_cut_that_leaves_the_close_marker_whole_still_parses(cut: int) -> None
     body = _body([_FILE_PART + b"\r\nPID|1||MRN"])
     file = parse_single_file_upload(_CT_WK, body[:-cut], max_file_bytes=1024)
     assert file.data == b"MSH|body\r\nPID|1||MRN"
+
+
+# --- BACKLOG #5787, second half: a delimiter counts only at a line start --------------------------
+
+
+@pytest.mark.parametrize("cut", [1, 5, 12])
+def test_a_truncated_upload_whose_content_holds_the_close_marker_mid_line_is_refused(
+    cut: int,
+) -> None:
+    """A cut-short body whose file content holds ``--<boundary>--`` in the middle of a line was taken
+    as complete before #5787 (at ec75a5f61bf), ending at that text. It is refused now, by both
+    entry points."""
+    marker = f"--{_B}--".encode()
+    body = _body([_FILE_PART + b"\r\nOBX|1|TX|||quoted " + marker + b" text\r\nPID|1||MRN"])
+    truncated = body[: -(_TAIL + cut)]
+    assert marker in truncated
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+            parse(_CT_WK, truncated, max_file_bytes=1024)
+    # Positive control: the whole body parses, and the mid-line text stays in the file.
+    whole = parse_single_file_upload(_CT_WK, body, max_file_bytes=1024).data
+    assert marker in whole
+    assert whole.endswith(b"PID|1||MRN")
+
+
+def test_delimiter_text_mid_line_stays_inside_the_file() -> None:
+    """``--<boundary>`` in the middle of a content line is content. Before #5787 the file was split there
+    and returned only its first piece."""
+    content = b"MSH|body\r\nNTE|1||see --" + _B.encode() + b"\r\nPID|1||MRN"
+    got = parse_single_file_upload(
+        _CT_WK, _body([_FILE_PART[: -len(b"MSH|body")] + content]), max_file_bytes=1024
+    )
+    assert got.data == content
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [b"", b"pre\r\n", b"pre\n", b"pre\r", b"\n", b"\r", b" ", b"\xef\xbb\xbf", b"pre"],
+    ids=["start", "crlf", "lf", "bare-cr", "lone-lf", "lone-cr", "space", "bom", "mid-line"],
+)
+def test_the_first_delimiter_counts_wherever_it_sits(prefix: bytes) -> None:
+    """The first delimiter is the first ``--<boundary>`` anywhere, as before #5787, so a stray
+    byte or a preamble ending mid-line before it does not turn the first part into preamble."""
+    body = prefix + b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == b"MSH|x"
+
+
+def test_a_preamble_ending_mid_line_keeps_both_file_parts() -> None:
+    """Before #5787 this body was refused for its two file parts; it still is, rather than dropping
+    the first one as preamble."""
+    body = b"pre--B\r\n" + _FP + b"A\r\n--B\r\n" + _FP + b"B\r\n--B--"
+    with pytest.raises(MultipartError, match="2 file parts"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+
+
+@pytest.mark.parametrize(("body", "at", "expected"), [(b"x\n--B", 2, 2), (b"x\r--B", 2, 2)])
+def test_a_later_delimiter_right_at_the_search_offset_is_found(
+    body: bytes, at: int, expected: int
+) -> None:
+    """The cursor search starts one byte before ``at``, where the line end of a delimiter at ``at``
+    sits."""
+    assert multipart._LineStartDelimiters(body, b"--B").find(at) == expected
+
+
+def test_the_delimiter_search_refuses_to_go_back() -> None:
+    """The cursors keep state, so a smaller offset than the last one would skip delimiters."""
+    delims = multipart._LineStartDelimiters(b"--B\r\nx\r\n--B\r\ny\r\n--B--", b"--B")
+    assert delims.find(5) == 8
+    with pytest.raises(RuntimeError):
+        delims.find(4)
+
+
+def test_delimiters_after_mixed_line_ends_are_each_found_in_order() -> None:
+    """Delimiters after CR and after LF, interleaved, with mid-line delimiter text between them:
+    each cursor keeps a hit the other one beat and hands it back on a later call."""
+    fields = [
+        b"--B\r\n" + _field("a", b"1 --B mid") + b"\r",
+        b"--B\r\n" + _field("b", b"2") + b"\n",
+        b"--B\r\n" + _field("c", b"3 --B--") + b"\r",
+        b"--B\r\n" + _field("d", b"4") + b"\r\n",
+        b"--B--\r\n",
+    ]
+    form = parse_multipart_form(_CT_B, b"".join(fields), max_file_bytes=1024)
+    # The line end before a delimiter stays in the content unless it is a CRLF, as before #5787.
+    assert form.fields == {"a": "1 --B mid\r", "b": "2\n", "c": "3 --B--\r", "d": "4"}
+
+
+def _python_lines(run: Callable[[], object]) -> int:
+    """How many Python lines ``run`` executes, in any file, by ``sys.settrace``. Every file, so a
+    per-occurrence loop counts wherever it is written."""
+    count = 0
+
+    def trace(frame: Any, event: str, arg: Any) -> Any:
+        nonlocal count
+        if event == "line":
+            count += 1
+        return trace
+
+    # A collection during the run would trace any Python finalizer it calls; keep it out.
+    gc.collect()
+    gc.disable()
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        run()
+    finally:
+        sys.settrace(previous)
+        gc.enable()
+    return count
+
+
+def test_mid_line_delimiter_text_is_skipped_without_a_python_step_per_occurrence() -> None:
+    """A file holding the delimiter text mid-line many times costs the walk no more Python lines
+    than a file holding it once: each cursor moves forward only, so the skip runs in C."""
+
+    def lines(occurrences: int) -> int:
+        content = b"x--B" * occurrences
+        body = b"--B\r\n" + _FP + content + b"\r\n--B--\r\n"
+
+        def run() -> None:
+            assert (
+                parse_single_file_upload(_CT_B, body, max_file_bytes=len(content)).data == content
+            )
+
+        return _python_lines(run)
+
+    once, many = lines(1), lines(100_000)
+    assert once > 0  # the instrument sees the parse at all
+    assert many == once, (once, many)

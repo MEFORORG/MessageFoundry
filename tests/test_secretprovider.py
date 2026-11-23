@@ -408,7 +408,14 @@ def test_notifier_webhook_refusal_is_not_hidden_by_a_secret_store_outage() -> No
         return _smtp_settings(email_password_secret="mefor/smtp#password", webhook_url=url)
 
     provider = _FakeProvider({})
-    cleartext = settings("http://hooks.example/x")
+    # Settings load refuses this URL first (item 14), so the section is built with model_construct
+    # to reach the notifier's own refusal, before the SMTP secret read.
+    cleartext = AlertsSettings.model_construct(
+        **{
+            **settings("https://hooks.example/x").model_dump(),
+            "webhook_url": "http://hooks.example/x",
+        }
+    )
     with pytest.raises(ValueError, match="cleartext http"):
         notifier_from_settings(cleartext, secret_provider=provider, posture=_NOT_ENFORCING)
     assert provider.calls == []

@@ -78,7 +78,13 @@ from io import BytesIO
 from typing import Any, ClassVar, NamedTuple, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import ConnectorType, Destination, Source, bool_setting
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    Source,
+    bool_setting,
+    flag_from_settings,
+)
 from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchorPolicy,
@@ -1785,8 +1791,11 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     default) loads an unencrypted key exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    # Read strictly, before the pin check reads tls by truthiness, so a non-bool is refused as
+    # itself rather than as an unread pin: bool("false") is True (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
     refuse_an_unread_ca_pin(s, inbound=True, connector="DICOM listener")
-    if not s.get("tls"):
+    if not tls:
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
     if not cert:
@@ -1981,7 +1990,7 @@ class DicomScpSource(SourceConnector):
         # #1182 and #316. Read at vault origin/main the same day, #316 is closed (shipped
         # 2026-07-30, the AE-title half) and #1182 is about backend-hop credentials, so no open row
         # yet names this half; #2622 holds it until one does.
-        mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
+        mtls_on = flag_from_settings(s, "tls") and bool(s.get("tls_ca_file"))
         allowlist_on = allowlist_restricts(self._source_ip_allowlist)
         if self._host not in _LOOPBACK_HOSTS and not (allowlist_on or mtls_on):
             unpaired = (
@@ -2670,8 +2679,11 @@ def _client_ssl_context(
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
     ``create_default_context(cafile=…)`` trust store. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
+    # Both read strictly and first, as the listener's tls is (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
+    allow_expired = flag_from_settings(s, "tls_allow_expired")
     refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
-    if not s.get("tls"):
+    if not tls:
         return None
     ca = s.get("tls_ca_file")
     # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
@@ -2701,7 +2713,7 @@ def _client_ssl_context(
     # while STILL validating the chain's signatures, the hostname and key usage. At least the
     # intermediates' and the trust anchor's validity periods, and a CRL's own window, go unchecked too
     # (vault BACKLOG #5089). Verification stays ON; default off = byte-identical.
-    if s.get("tls_allow_expired"):
+    if allow_expired:
         relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx
 
