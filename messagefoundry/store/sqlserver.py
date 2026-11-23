@@ -7901,8 +7901,7 @@ class SqlServerStore:
                 # so conditionally OMIT the batch member. The messages.status UPDATE above is unaffected
                 # (count-and-log is separate).
                 if should_record_event(event, self._message_events):
-                    # Built here so the lambda holds the string, not the handlers. A lambda, not the
-                    # bound method: the PHI logging inventory reads each _event_stmt call site.
+                    # Built on the loop, as the bound-method form built it. Why a lambda: see _event.
                     routed_detail = f"{len(handlers)} handler(s)"
                     acc.add(
                         *(
@@ -8211,8 +8210,7 @@ class SqlServerStore:
                 # event detail to the unbatched path (which adds len(pt_deliveries)==0). #63 verbosity
                 # gate: conditionally omit the batch member (can't no-op inside _event_stmt).
                 if should_record_event("transformed", self._message_events):
-                    # Built here so the lambda holds the string, not the deliveries. A lambda, not the
-                    # bound method: the PHI logging inventory reads each _event_stmt call site.
+                    # Built on the loop, as the bound-method form built it. Why a lambda: see _event.
                     transformed_detail = f"{len(deliveries)} destination(s)"
                     acc.add(
                         *(

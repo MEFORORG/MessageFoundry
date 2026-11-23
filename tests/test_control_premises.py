@@ -183,8 +183,9 @@ async def test_every_audit_append_takes_the_database_applock_before_it_reads_the
     store = SqlServerStore.__new__(SqlServerStore)
     store._settings = types.SimpleNamespace(command_timeout=0)  # type: ignore[assignment]
     store._audit_append_mac = lambda: (None, None)  # type: ignore[method-assign]
-    # The append routes its seal through cipher_call on this (BACKLOG #3929). None, which every store
-    # but a vault_transit one holds, runs the seal inline; the Transit hop is not exercised here.
+    # The append routes its seal through cipher_call on this (BACKLOG #3929). None, which at least a
+    # store opened with an aesgcm or identity cipher holds, runs the seal inline; the Transit hop is
+    # not exercised here.
     store._audit_mac_fn = None
     cur = _RecordingCursor()
     await store._append_audit_row(
