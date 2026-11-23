@@ -21,14 +21,16 @@ import pytest
 from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
     ServiceEnvPosture,
+    _sets_directory,
     read_service_env_posture,
     service_env_refusal,
 )
 from tests._serviceenv_remedy import (
-    ADD_BACK_ANY,
     ADD_BACK_BARE,
     ADD_BACK_CREATE,
     ADD_BACK_JOINED,
+    ADD_BACK_JOINED_MIXED,
+    ADD_BACK_MIXED,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
@@ -37,6 +39,7 @@ from tests._serviceenv_remedy import (
     REMOVE_OTHER,
     RUNS_ON,
     SET_NO,
+    TAKE_LINE,
     WIDER,
 )
 
@@ -384,27 +387,29 @@ def test_a_value_that_runs_on_is_not_passed_back() -> None:
 def test_no_opener_while_a_later_line_sets_the_directory() -> None:
     """The Lander's hold on PR 3142, comment 7089064404, B: the directory is set on the second
     line of a string, which NSSM may read as its own variable, so the step never says the lists
-    set none. The string's first line sets MEFOR_VALUE_A, so the string sets something else too,
-    and no clause says to remove it whole (comment 7089400537)."""
+    set none. The string's first line sets MEFOR_VALUE_A, so the string sets something else too:
+    no clause says to remove it whole (comment 7089400537), and one says to take its directory
+    line out (comment 7090314503)."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"]))
     assert refusal is not None
     assert SET_NO not in refusal
     assert REMOVE_OTHER not in refusal and WIDER not in refusal
-    assert refusal.count(ADD_BACK_BARE + ADD_BACK_CREATE) == 1
+    assert refusal.count(ADD_BACK_MIXED + ADD_BACK_CREATE) == 1
 
 
 def test_a_string_that_also_sets_another_variable_is_not_removed_whole() -> None:
     """The Lander's hold on PR 3142, comment 7089400537, finding 5: ``PATH=C:\\x`` and a
     directory line share one string. The clause covers only strings that set the directory and
     nothing else, so nothing says to remove this one; its directory line still means the step
-    never says the lists set none (comment 7089064404, B)."""
+    never says the lists set none (comment 7089064404, B), and the step says to take that line
+    out and keep PATH (comment 7090314503)."""
     refusal = service_env_refusal(
         _read(["MEFOR_VALUE_A=x", "PATH=C:\\x\nMEFOR_SECRETS_DIRECTORY=C:\\d"])
     )
     assert refusal is not None
     assert SET_NO not in refusal
     assert REMOVE_OTHER not in refusal and WIDER not in refusal
-    step = ADD_BACK_BARE + ADD_BACK_CREATE
+    step = ADD_BACK_MIXED + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
 
@@ -413,13 +418,72 @@ def test_a_string_whose_first_line_sets_the_directory_and_a_later_line_more_stay
     """The Lander's hold on PR 3142, comment 7089400537, the review's finding 6: the string's
     first line sets the directory and its second sets PATH, so it sets something else too, and
     the removal clause, which covers only strings that set the directory on every non-blank line,
-    does not say to remove it. A reader of the first line alone would."""
+    does not say to remove it. A reader of the first line alone would. The Lander's hold on PR
+    3142, comment 7090314503, items 1 and 5: the step says to take the directory line out and
+    keep PATH."""
     refusal = service_env_refusal(
         _read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
-    assert ADD_BACK_ANY in refusal
-    assert SET_NO not in refusal and REMOVE_OTHER not in refusal
+    assert SET_NO not in refusal and REMOVE_OTHER not in refusal and WIDER not in refusal
+    assert refusal.count(TAKE_LINE) == 1
+    step = ADD_BACK_MIXED + ADD_BACK_CREATE
+    assert refusal.count(step) == 1
+    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
+
+
+@pytest.mark.parametrize(
+    "mixed",
+    ["MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x", "PATH=C:\\x\nMEFOR_SECRETS_DIRECTORY=C:\\d"],
+    ids=["directory-line-first", "directory-line-later"],
+)
+def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_out(
+    mixed: str,
+) -> None:
+    """The Lander's hold on PR 3142, comment 7090314503, item 1: the store password runs on
+    into a string that sets only the directory, and a string sets the directory along with
+    PATH. The step
+    says to remove the first and to take only the directory line out of the second, so, read
+    line by line, the entry the operator adds is the only one in the list."""
+    refusal = service_env_refusal(
+        _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1", mixed])
+    )
+    assert refusal is not None
+    assert SET_NO not in refusal
+    assert refusal.count(REMOVE_OTHER) == 1 and refusal.count(TAKE_LINE) == 1
+    assert refusal.count(WIDER) == 1
+    step = ADD_BACK_JOINED_MIXED + ADD_BACK_CREATE
+    assert refusal.count(step) == 1
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
+
+
+def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause() -> None:
+    """The Lander's hold on PR 3142, comment 7090314503, item 3: the step's clauses act
+    inside AppEnvironmentExtra, the list it says to read and pass back, so a blank directory
+    entry in AppEnvironment gets
+    neither. The lists still set the directory, so the step never says they set none."""
+    refusal = service_env_refusal(
+        _read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (_PLAIN, "MEFOR_SECRETS_DIRECTORY=")])
+    )
+    assert refusal is not None
+    assert SET_NO not in refusal
+    assert REMOVE_OTHER not in refusal and TAKE_LINE not in refusal and WIDER not in refusal
+    assert refusal.count(ADD_BACK_BARE + ADD_BACK_CREATE) == 1
+
+
+@pytest.mark.parametrize("name", ["MEFOR_\u017fECRETS_DIRECTORY", "MEFOR_SECRETS_D\u0131RECTORY"])
+def test_a_non_ascii_name_does_not_set_the_directory(name: str) -> None:
+    """The Lander's hold on PR 3142, comment 7090314503, item 4: ``str.upper`` maps U+017F
+    onto S and U+0131 onto I, so without an ASCII check these names would read as
+    MEFOR_SECRETS_DIRECTORY, drop the opener
+    and print the removal clause. The ASCII spelling, the control, does both."""
+    assert not _sets_directory(f"{name}=") and _sets_directory("MEFOR_SECRETS_DIRECTORY=")
+    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{name}="]))
+    assert refusal is not None
+    assert SET_NO in refusal and REMOVE_OTHER not in refusal
+    control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
+    assert control is not None
+    assert SET_NO not in control and REMOVE_OTHER in control
 
 
 def test_a_blank_directory_item_is_not_passed_back() -> None:

@@ -47,20 +47,33 @@ ADD_BACK_STEP = (
 #: B).
 SET_NO = "The service's lists set no MEFOR_SECRETS_DIRECTORY"
 
-#: The step where a line of a string sets the directory but no string sets it and nothing
-#: else, and no value runs on: no opener, no removal clause, and no wider exclusion, as a
-#: string that sets another variable too is not removed whole (the Lander's holds on PR 3142,
-#: comments 7089064404, B, and 7089400537).
+#: The step with no opener and no clause, the base the forms below are built from.
 ADD_BACK_BARE = ADD_BACK_STEP.removeprefix(f"{SET_NO}. ")
 
 #: Main's wider pass-back exclusion, from its joined-directory step.
 WIDER = "and the strings this step and any step above say to remove"
 
-#: Main's clause from that step, narrowed by "and nothing else", printed wherever a string
-#: sets the directory and nothing else, so the entry the operator adds is the only one and a
-#: string that sets another variable too is never removed whole (the Lander's holds on PR
-#: 3142, comments 7089064404 and 7089400537).
+#: Main's clause from that step, narrowed by "and nothing else", printed wherever a string in
+#: AppEnvironmentExtra sets the directory and nothing else (the Lander's holds on PR 3142,
+#: comments 7089064404, 7089400537 and 7090314503).
 REMOVE_OTHER = "and remove any other entry that sets MEFOR_SECRETS_DIRECTORY and nothing else"
+
+#: The clause printed wherever a string in AppEnvironmentExtra sets the directory on one line
+#: and something else on another. With REMOVE_OTHER it makes the entry the operator adds the
+#: only one in that list, read line by line, and it removes no such string whole (the
+#: Lander's hold on PR 3142, comment 7090314503).
+TAKE_LINE = (
+    "and take the line that sets MEFOR_SECRETS_DIRECTORY out of any other entry that sets it "
+    "along with another variable, keeping that entry's other lines"
+)
+
+#: The step where a string in AppEnvironmentExtra sets the directory and something else, no
+#: string there sets only the directory, and no value runs on: no opener, the take-line
+#: clause, and no wider exclusion (the Lander's holds on PR 3142, comments 7089064404, B,
+#: 7089400537 and 7090314503).
+ADD_BACK_MIXED = ADD_BACK_BARE.replace(
+    "beside its other entries, ", f"beside its other entries, {TAKE_LINE}, ", 1
+)
 
 #: The step where a value runs on and no line of any string sets the directory: the opener,
 #: and the wider exclusion, since the strings the run-on step removes may hold the refused
@@ -90,6 +103,13 @@ ADD_BACK_JOINED = (
     "the service's own nssm.exe by its full path, and pass back every entry but those refused "
     "above and the strings this step and any step above say to remove: see docs/SERVICE.md, "
     '"Start / stop / status"'
+)
+
+#: The step where, in AppEnvironmentExtra, one string sets only the directory and another
+#: sets it beside something else: both clauses, and the wider exclusion (the Lander's hold on
+#: PR 3142, comment 7090314503).
+ADD_BACK_JOINED_MIXED = ADD_BACK_JOINED.replace(
+    f"{REMOVE_OTHER}, ", f"{REMOVE_OTHER}, {TAKE_LINE}, ", 1
 )
 
 #: Text every form of the step carries, so a negative arm sees any.
