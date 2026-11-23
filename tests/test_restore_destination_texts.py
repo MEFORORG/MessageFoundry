@@ -66,8 +66,12 @@ def test_the_to_help_says_what_is_refused_and_gives_the_safe_remedy() -> None:
         "the store and sidecar names are read again just before the write",
         "Not caught, at least: a sidecar created after that re-read",
         "a dangling link planted at the store name after that re-read, which is followed",
-        "Nor a taken name whose share or drive is unreachable during that re-read but back by the write",
-        "at least on Windows, an unreachable share, which reads as free",
+        "Nor a taken -wal, -shm or -journal name whose share is unreachable during that re-read but "
+        "back by the write",
+        "at least on Windows, an unreachable share, which reads as free (WinError 53 or 67; at least "
+        "WinError 51, 59, 64, 1222, 1231 and 1232 are refused)",
+        "A taken store name is still refused then, by the write itself, except a dangling link there "
+        "when the store is copied rather than hard-linked into place on Windows, which is followed",
         "a name holding ':', and on Windows a name ending in a dot or a space",
         "stop the engine and move the old store aside with its -wal, -shm and -journal as one set",
     ):
