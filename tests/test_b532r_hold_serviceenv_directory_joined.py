@@ -21,6 +21,7 @@ import pytest
 from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
     ServiceEnvPosture,
+    _directory_entry_value,
     _sets_directory,
     read_service_env_posture,
     service_env_refusal,
@@ -495,23 +496,26 @@ def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause(
 
 
 @pytest.mark.parametrize(
-    "name",
+    ("name", "counts"),
     [
-        "MEFOR_\u017fECRETS_DIRECTORY",
-        "MEFOR_SECRETS_D\u0131RECTORY",
-        "\u00a0MEFOR_SECRETS_DIRECTORY",
+        ("MEFOR_\u017fECRETS_DIRECTORY", True),
+        ("MEFOR_SECRETS_D\u0131RECTORY", True),
+        ("\u00a0MEFOR_SECRETS_DIRECTORY", False),
     ],
+    ids=["U+017F", "U+0131", "U+00A0"],
 )
-def test_a_non_ascii_name_does_not_set_the_directory(name: str) -> None:
-    """The Lander's hold on PR 3142, comment 7090314503, item 4: ``str.upper`` maps U+017F
-    onto S and U+0131 onto I, so without an ASCII check these names would read as
-    MEFOR_SECRETS_DIRECTORY, drop the opener
-    and print the removal clause; ``str.strip`` would do the same for a U+00A0 blank. The ASCII
-    spelling, the control, does both."""
-    assert not _sets_directory(f"{name}=") and _sets_directory("MEFOR_SECRETS_DIRECTORY=")
+def test_a_directory_name_folds_as_os_environ_folds_it(name: str, counts: bool) -> None:
+    """The Lander's hold on PR 3142, comment 7091598959, which supersedes item 4 of comment
+    7090314503: the engine reads its directory through ``os.environ``, which on Windows folds
+    a key with ``str.upper``. U+017F folds onto S and U+0131 onto I, so those names set the
+    directory, the step drops the opener and prints the removal clause, as for the ASCII
+    spelling. A U+00A0 blank is no ASCII space or tab, so it stays in the name and the name does
+    not count. The ASCII spelling, the control, always counts."""
+    assert _sets_directory(f"{name}=") is counts and _sets_directory("MEFOR_SECRETS_DIRECTORY=")
+    assert (_directory_entry_value(f"{name}=C:\\d") is not None) is counts
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{name}="]))
     assert refusal is not None
-    assert SET_NO in refusal and REMOVE_OTHER not in refusal
+    assert (SET_NO in refusal) is not counts and (REMOVE_OTHER in refusal) is counts
     control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
     assert control is not None
     assert SET_NO not in control and REMOVE_OTHER in control

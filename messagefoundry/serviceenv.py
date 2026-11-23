@@ -979,13 +979,13 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
 def _sets_directory(entry: str) -> bool:
     """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names. What is written before the ``=``, blanks
-    around the name included, must be ASCII, as :func:`_directory_entry_value` requires, since
-    ``str.upper`` maps a name such as one with U+017F or U+0131 onto it and ``str.strip``
-    removes a blank such as U+00A0 (the Lander's hold on PR 3142, comment 7090314503)."""
+    regard to case. The name is folded with ``str.upper``, as ``os.environ`` folds a key on
+    Windows, so a name with U+017F or U+0131 counts, and only ASCII spaces and tabs around it
+    are stripped, so a blank such as U+00A0 stays in it and the name does not count (the
+    Lander's hold on PR 3142, comment 7091598959)."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
     written, equals, _rest = first.partition("=")
-    return bool(equals) and written.isascii() and written.strip().upper() == _DIRECTORY_VARIABLE
+    return bool(equals) and written.strip(" \t").upper() == _DIRECTORY_VARIABLE
 
 
 def _sets_only_directory(entry: str) -> bool:
@@ -1008,16 +1008,17 @@ def _sets_directory_beside_more(entry: str) -> bool:
 
 def _directory_entry_value(entry: str) -> str | None:
     """The value ``entry`` sets ``MEFOR_SECRETS_DIRECTORY`` to, when it is that one line, with
-    only blanks or line breaks after it and no blank around the name, the name is ASCII, and the
-    value is blank or plainly a path (:data:`_PLAIN_PATH`) with no key run in it
-    (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips the value it
-    reads, so what trails it does not matter. The remedy alone reads it, to tell a joined
-    directory path from key material."""
+    only blanks or line breaks after it and no blank around the name, the name folding to it
+    with ``str.upper`` as ``os.environ`` folds a key on Windows (the Lander's hold on PR 3142,
+    comment 7091598959), and the value is blank or plainly a path (:data:`_PLAIN_PATH`) with no
+    key run in it (:data:`_EITHER_KEY_RUN`); else None, as for key material. The engine strips
+    the value it reads, so what trails it does not matter. The remedy alone reads it, to tell a
+    joined directory path from key material."""
     line = entry.rstrip()
     if _LINE_BREAK.search(line):
         return None
     written, equals, value = line.partition("=")
-    if not equals or not written.isascii() or written.upper() != _DIRECTORY_VARIABLE:
+    if not equals or written.upper() != _DIRECTORY_VARIABLE:
         return None
     if _still_blank(value):
         return value  # nothing in it, so no key and no path to keep
