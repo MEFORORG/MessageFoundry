@@ -270,12 +270,13 @@ def test_the_settings_hops_are_reported_with_their_classification() -> None:
     )
     assert hops["settings:vault.store_key"].compliant_kind is False
     assert hops["settings:vault.secrets"].compliant_kind is False
-    # The webhook sink declares no credential field of any kind: a "none" hop with no compliant kind.
+    # The webhook URL's path can carry a token (vault BACKLOG #3533 item 24): a "static" hop, and
+    # the sink offers no compliant kind.
     assert (
         hops["settings:alerts.webhook"].credential,
         hops["settings:alerts.webhook"].compliant_kind,
     ) == (
-        "none",
+        "static",
         False,
     )
     assert hops["settings:alerts.smtp"].credential == "static"

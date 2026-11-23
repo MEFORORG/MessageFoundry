@@ -9,7 +9,8 @@ both legs that share ``_complete_ad_login``: the Kerberos mint and the OIDC (fed
 - a write in between is what the sign-in replaces: the audit row, the revoke and the
   Administrator-loss report are computed from it, not from the stale read;
 - a write in between that already holds the sign-in's directory roles is success: the sign-in
-  writes nothing more, but still ends the other sessions, as main did;
+  writes nothing more, but still ends the other sessions when the set it first read differs, as
+  the plain write did;
 - two lost compare-and-sets refuse the sign-in closed, with a ``role_sync_contended`` row, and
   leave what the other writer wrote.
 
@@ -171,8 +172,8 @@ async def test_a_write_in_between_that_holds_the_directory_roles_is_success(
 ) -> None:
     """The other writer already wrote the directory's ``viewer``. The sign-in's compare-and-set on
     ``operator`` loses, reads ``viewer`` back, and writes nothing more and no row. It still ends
-    the other sessions, as main did, computed from the ``operator`` it first read, so a revoke
-    the other writer failed cannot leave stale sessions live (Manager ruling on #3085).
+    the other sessions, as the plain write did, computed from the ``operator`` it first read, so a
+    revoke the other writer failed cannot leave stale sessions live (Manager ruling on #3085).
 
     RED on main: the sign-in wrote ``viewer`` again and recorded ``operator`` to ``viewer`` for a
     change it did not make."""
@@ -244,8 +245,20 @@ async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
     out = await _sign_in(service, leg)
     monkeypatch.undo()
     assert not out.ok and out.reason == ACCOUNT_REFUSED
+    assert out.error == "invalid credentials", out.error
     assert len(seen) == 1 and len(reads) == 2
     assert await store.get_user_role_ids(user_id) == [ADMIN]
+    # The row's shape, pinned per leg (vault BACKLOG #3085 item 20): both legs write it through
+    # ``_refuse_directory_row``, so neither carries a ``mech``.
+    refusals = [
+        r for r in await _rows(store, "auth.login_failed") if r.get("reason") == ACCOUNT_REFUSED
+    ]
+    assert len(refusals) == 1, refusals
+    assert {k: refusals[0].get(k) for k in ("provider", "reason")} == {
+        "provider": "ad",
+        "reason": ACCOUNT_REFUSED,
+    }, refusals
+    assert "mech" not in refusals[0] and "error" not in refusals[0], refusals
     assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
     assert await service.identity_for_token(first) is not None
 

@@ -318,14 +318,16 @@ class _EndedUnread:
 
 @dataclass(frozen=True, slots=True)
 class _SignInRoleSync:
-    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). Everything after
-    the write is computed from this, never from the roles the sign-in first read."""
+    """What :meth:`AuthService._sync_sign_in_roles` wrote (vault BACKLOG #3085). The sign-in's
+    revoke, notice and Administrator checks read ``previous``: the set the write replaced, except
+    when the roles were found already at the target, where it is the set the sign-in first read."""
 
     #: The roles the write replaced; or, found already at the target, the roles first read.
     previous: frozenset[str]
     held: Exception | None  #: raise once the sign-in's own steps have run
-    #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`, or
-    #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again.
+    #: Why the sign-in is refused, with nothing written: :data:`ROLE_SYNC_CONTENDED`;
+    #: :data:`ACCOUNT_REFUSED` for a record gone or failing its seal when read again; or the
+    #: :func:`_directory_login_refusal` reason for a record read again as ineligible to sign in.
     refusal: str | None = None
 
 
@@ -8623,8 +8625,10 @@ class AuthService:
         role_ids = sorted(await self._ad_roles_for_groups(principal.groups))
         # Vault BACKLOG #3085: the write is a compare-and-set on the roles this sign-in read, so a
         # reconciler or another sign-in that wrote in between is never overwritten with a stale
-        # set. Every step below reads what the write did, never the roles first read: the revoke,
-        # the notice, the Administrator alerts and the audit row.
+        # set. The revoke, the notice and the Administrator alerts below read ``sync.previous``:
+        # the set the write replaced, or, for roles found already at the target, the set this
+        # sign-in first read (see ``_SignInRoleSync``). A change's audit row is written by the
+        # sync itself (``_write_sign_in_change`` says when it is written apart from the roles).
         sync = await self._sync_sign_in_roles(user, role_ids, federated=federated, client=client)
         if sync.refusal is not None:
             # The SIGN-IN is refused, and this sign-in wrote no role: what the other writer left
@@ -8785,7 +8789,10 @@ class AuthService:
             # #5624), not reported as a binding change. NOT THE SAME AS THAT CHECK IN ONE WAY:
             # the role, scope and profile sync above already ran, so a directory role change this
             # sign-in wrote in this window is applied and audited, and it ends the account's
-            # other sessions.
+            # other sessions. When another writer had already moved the roles to this sign-in's
+            # set, and the set this sign-in first read was a different one, those sessions were
+            # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
+            # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif federated:
@@ -9046,9 +9053,11 @@ class AuthService:
                 #
                 # NOT CLOSED HERE: both sign-ins then run the caller's role resync on one new row.
                 # Its write is a compare-and-set on the roles each read (vault BACKLOG #3085), so
-                # only the first writes and revokes; the second finds the roles at its own set
-                # and changes nothing, or writes once more against what it read. The first's
-                # revoke can still end a session the second minted between that write and that
+                # the second either finds the roles at its own set or writes once more against what
+                # it read. Found at its set, it writes no role, but when the set it first read
+                # differs it still revokes and notifies as if it had written them (see
+                # ``_SignInRoleSync``), so it can end the session the first minted. The first's
+                # revoke can likewise end a session the second minted between that write and that
                 # revoke. Two concurrent sign-ins of an existing account meet the same race, so it
                 # belongs to the resync.
                 if winner.auth_provider != AuthProvider.AD.value:

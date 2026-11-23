@@ -2755,7 +2755,8 @@ the DSN or a credential.
 ASVS 13.2.1 asks that every backend hop authenticate with an individual service account, a short-term
 token or a certificate, not with an unchanging credential. The engine keeps one list of the hops it
 dials that do not (BACKLOG #1182). A hop is on the list when it presents a static credential (a
-password, API key, static bearer token or Vault token) or no credential at all. A hop that presents
+password, API key, static bearer token or Vault token; the alert webhook counts as one, since its
+URL path can carry a token) or no credential at all. A hop that presents
 only a compliant credential is never on it.
 
 Three surfaces read that one list, so they cannot disagree:
@@ -2773,7 +2774,7 @@ then refuses to start while any listed hop has no opt-out. To keep a hop, name i
 ```toml
 [security]
 require_nonstatic_credentials = true
-static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "no credential field exists" }
+static_credential_accepted = { "OB_ACME_REST" = "partner offers HTTP Basic only", "settings:alerts.webhook" = "the hook service offers only a URL token" }
 ```
 
 Each opt-out is logged at start with the hop's name and your reason, never a secret, and
@@ -2806,7 +2807,7 @@ opt-out. That is expected, and the table says which they are.
 | the four database factories | see the table below | yes: `auth="integrated"` or `"entra"` on the SQL Server preset; on `dialect="generic"`, which only `Database` and `DatabasePoll` take, a client certificate (`SSLCERT` and `SSLKEY`, on a driver that reads them) or the service's own account |
 | `[store]` on SQL Server or Postgres | `settings:store` | SQL Server yes; Postgres **no** |
 | Vault token (store key, Transit, secrets) | `settings:vault.store_key`, `settings:vault.store_transit`, `settings:vault.secrets` | **no** |
-| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink has no credential field) |
+| `[alerts]` webhook | `settings:alerts.webhook` | **no** (the sink takes no credential but its URL, whose path can carry a token) |
 | `[alerts]` SMTP | `settings:alerts.smtp` | **no** |
 | `[ai]` broker key | `settings:ai.broker` | **no** |
 | `[auth]` OIDC client secret | `settings:auth.oidc` | yes: `oidc_token_endpoint_auth_method = "private_key_jwt"` (BACKLOG #296) |
