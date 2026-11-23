@@ -15,6 +15,7 @@ required, non-optional reference for the same reason."""
 
 from __future__ import annotations
 
+import copy
 import functools
 import os
 import re
@@ -131,7 +132,7 @@ def _gating_checks(svc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {
         n: c
         for n, c in _checks().items()
-        if deps.get(n) == {"condition": "service_completed_successfully"}
+        if (deps.get(n) or {}).get("condition") == "service_completed_successfully"
     }
 
 
@@ -211,6 +212,57 @@ def test_each_check_is_active_only_where_an_engine_it_gates_is(name: str) -> Non
     else:
         wider = check_profiles - {p for s in gated for p in s.get("profiles") or []}
         assert not wider, f"{name} runs under {sorted(wider)}, where no engine waits on it"
+
+
+def _mutated(edit: Any) -> dict[str, dict[str, Any]]:
+    services = copy.deepcopy(_all_services())
+    edit(services)
+    return services
+
+
+@pytest.mark.parametrize(
+    ("case", "edit", "guard"),
+    [
+        (
+            "ha engines on the default check",
+            # The two engines alias one depends_on mapping, so each gets a rebuilt copy.
+            lambda s: [
+                s[e].update(
+                    depends_on={
+                        (_CHECK if k == _CHECK_HA else k): v for k, v in s[e]["depends_on"].items()
+                    }
+                )
+                for e in ("engine-ha", "engine-standby")
+            ],
+            "image",
+        ),
+        ("ha check in the default image", lambda s: s[_CHECK_HA].update(image="x:latest"), "image"),
+        ("ha check with no profile", lambda s: s[_CHECK_HA].pop("profiles"), "active"),
+        ("default check profiled", lambda s: s[_CHECK].update(profiles=["ha"]), "image"),
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_the_image_and_profile_guards_fail_on_a_broken_wiring(
+    monkeypatch: pytest.MonkeyPatch, case: str, edit: Any, guard: str
+) -> None:
+    # Negative controls: each wiring below is one a guard above must refuse. Run the guard on a
+    # mutated copy of the services and require it to fail for at least one service.
+    services = _mutated(edit)
+    monkeypatch.setattr(sys.modules[__name__], "_all_services", lambda: services)
+    failures = 0
+    if guard == "image":
+        for name in sorted(_serving_engines()):
+            try:
+                test_the_check_runs_the_engines_image(name)
+            except AssertionError:
+                failures += 1
+    else:
+        for name in sorted(_checks()):
+            try:
+                test_each_check_is_active_only_where_an_engine_it_gates_is(name)
+            except AssertionError:
+                failures += 1
+    assert failures, f"no guard refused: {case}"
 
 
 @pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])

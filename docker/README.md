@@ -197,7 +197,7 @@ against one case that matters, described under
   default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
   `ha` engines run `messagefoundry:postgres`, so they wait instead on
   `revocation-attestation-check-ha`, the same check in that image; read its logs for them. Not
-  every command runs the check: at least `docker compose up --no-deps <engine>` and
+  every command runs either check: at least `docker compose up --no-deps <engine>` and
   `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
   comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;
   the file never sets it for you.

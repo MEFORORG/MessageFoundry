@@ -306,10 +306,11 @@ services:
     # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
 
   # One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or without
-  # the ha profile, runs it before it starts the default engine, and runs revocation-attestation-check-ha
-  # below before it starts an `ha` engine; at least the commands listed below skip them. The required substitution above refuses only an unset or empty value, and a value the
-  # engine reads as false, such as 0, would otherwise start an engine that exits 2 at the
-  # revocation gate and restarts forever. This reads the value with serve's own parser
+  # the ha profile, runs it before it starts the default engine, and runs
+  # revocation-attestation-check-ha below before it starts an `ha` engine; at least the commands
+  # listed below skip them. The required substitution above refuses only an unset or empty value,
+  # and a value the engine reads as false, such as 0, would otherwise start an engine that exits 2
+  # at the revocation gate and restarts forever. This reads the value with serve's own parser
   # (tls_revocation_attested), in the same image, exits 1 naming the gate when it does not read as
   # true, and an `up` without `--no-deps` stops there. It does not read the bind, so it refuses a
   # false value even where serve's gate would not apply. It has no profile, so it runs for the
@@ -327,7 +328,8 @@ services:
 
   # The same one-shot check in the `ha` engines' image, so they read the attestation with their own
   # parser and the ha pair alone never needs the default image built. Its profile keeps a plain `up`
-  # from pulling an image a default-only user never built. The notes above apply to it too.
+  # from pulling an image a default-only user never built. The notes above on the commands that
+  # skip a check, and on down and logs, apply to it too.
   revocation-attestation-check-ha:
     <<: *revocation-attestation-check
     profiles: ["ha"]
