@@ -1698,27 +1698,25 @@ offers that account's delete, through a confirmation page that names the id alon
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
 account's name the same way; when the record fails its seal at that read, made after the action
-landed, they name the account by its id and still show what was issued, rather than answering
-423. What those pages show and log when that
-read fails is stated in the docstring of `_shown_name` in
-[`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
-A factor reset whose action returns but issues neither an enrolment code nor a generated
-credential shows no such page: it redirects to `GET /ui/users/{user_id}`, which answers 423 for a failing record.
-A failure is reported
-per account and rate-limited, in each engine process: only the first refusal of an account in
-each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's
-WARNING, writes the `integrity.authority_seal_failed` audit row and raises the `integrity_drift`
-alert. A console route may log a WARNING of its own on every refusal it catches: at least the
-pages that read the name through `_shown_name` do, as its docstring says, and so does the refused
-delete in the case this paragraph's last sentence names. A refusal inside that interval, from any
-of these routes or any other reader of the same account in that process, adds no row and no
-alert; the interval decides only whether the report runs. Each engine
-process sharing the store keeps its own interval, so each may report the same account once. The
+returned, they name the account by its id and still show what was issued, rather than answering
+423. What those pages show and log when that read fails is stated in the docstring of
+`_shown_name` in [`messagefoundry_webconsole/routes/admin.py`](../messagefoundry_webconsole/routes/admin.py).
+A factor reset whose action returns has already stood, the account's factors cleared; if it issued neither
+an enrolment code nor a generated credential, it redirects to `GET /ui/users/{user_id}`, which
+answers 423 for a failing record. The password reset, factor reset and enrolment-code actions answer a
+record that already fails its seal with 404 "no such user", though its row is still there. A
+failure is reported and rate-limited per report key, the record's part and the account's id, in
+each engine process: only the first refusal under a key in each report interval
+(`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs the report's WARNING, writes the
+`integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A later
+refusal under that key inside the interval, from any reader in that process, is still refused,
+never served, and adds no row and no alert. Each engine
+process sharing the store keeps its own interval, so each may report the same key once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
 so an account it forgot is reported again on its next refusal. A
 record is refused only after two failing reads that name the same account, or when it fails
-closed as this paragraph says below. Among the exceptions: a `users` row with a timestamp or counter cell
+closed as this paragraph says below. At least one exception: a `users` row with a timestamp or counter cell
 that does not parse is refused on the first read, with no re-read, on a store with or without an
 integrity key, and a list read lists it as failing even when the row is restored before its check,
 or leaves it out when its id cell is empty or not text (BACKLOG #5505). A `totp_recovery_codes` cell that does not parse as a JSON list reads as

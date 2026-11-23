@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -468,7 +469,6 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
     body = " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
     for fact in (
         "`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`",
-        "only the first refusal of an account in each report interval",
         "adds no row and no alert",
         "one absent on a re-read reads as gone",
         "A row still there after every check raced fails closed",
@@ -481,11 +481,7 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
         # The five narrowings of decision d20261123T002710908-1491b3: each claim is scoped to the
         # routes the code answers that way, and the console's own answers are the last sentences'.
-        "when the record fails its seal at that read, made after the action landed",
         "logs the report's WARNING",
-        "at least the pages that read the name through `_shown_name` do",
-        "the interval decides only whether the report runs",
-        "and so does the refused delete in the case this paragraph's last sentence names",
         "refused at the first check that cannot verify it, with no further read",
         "answered as a record that fails its seal is",
         "Except where a console page catches the refusal, as at least the next two sentences state",
@@ -506,35 +502,64 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
 
 def _statement_body() -> str:
     text = _SECURITY_MD.read_text("utf-8")
+    assert text.count(_STATEMENT) == 1
     return " ".join(text.split(_STATEMENT, 1)[1].split("\n\n", 1)[0].split())
 
 
-def test_the_security_doc_counts_no_single_read_exceptions() -> None:
-    """The two-failing-reads rule has more than one single-read exception: a ``users`` row whose
-    timestamp or counter cell does not parse, and a record Vault transit cannot verify, which
-    ``AuthService._checked_by_id`` refuses at the first check that cannot verify it. So the
-    statement names the exceptions without counting them (Lander hold 7089092213)."""
-    body = _statement_body()
-    assert "One exception" not in body
-    assert "Among the exceptions: a `users` row with a timestamp or counter cell" in body
+#: Lander hold 7089872291: each claim's SHAPE, as a case-insensitive regex over the statement's
+#: whitespace-normalised body. ``_KEPT`` must match; ``_REMOVED`` is an overclaim that must not.
+_KEPT = {
+    "throttle keyed by part and id": (
+        r"rate-limited per report key, the record's part and the account's id"
+    ),
+    "first refusal under a key": r"only the first refusal under a key in each report interval",
+    "a later refusal is still refused": (
+        r"later refusal under that key inside the interval, from any reader in that process, "
+        r"is still refused, never served,? and adds no row and no alert"
+    ),
+    "404 for an already-failing record": (
+        r"password reset, factor reset and enrolment-code actions answer a record that already "
+        r"fails its seal with 404 \"no such user\""
+    ),
+    "the redirecting reset has stood": r"factor reset whose action returns has already stood",
+    "the redirect": (
+        r"if it issued neither an enrolment code nor a generated credential, it redirects to "
+        r"`GET /ui/users/\{user_id\}`, which answers 423 for a failing record"
+    ),
+    "exceptions as a floor": r"\bat least one exception: a `users` row",
+    "returned, not landed": r"at that read, made after the action returned\b",
+}
+_REMOVED = {
+    "per-account throttle": r"first refusal of an account in each report interval",
+    "any reader of the same account": r"other reader of the same account",
+    "every refusal it catches": r"every refusal it catches",
+    "uncounted exceptions with no floor": r"\bamong the exceptions:",
+    "a counted exception": r"(?<!at least )\bone exception\b",
+    "landed": r"\bthe action landed\b|\bthat lands\b",
+}
 
 
-def test_the_security_doc_says_where_a_factor_reset_that_issues_nothing_goes() -> None:
-    """``ui_user_reset_mfa`` shows no post-action page when the reset landed (its JSON handler
-    returned) but issued neither an enrolment code nor a generated credential: it redirects to the
-    account's detail page, whose checked read answers 423 for a failing record. The sentence
-    follows the ``_shown_name`` pointer, so that pointer's "those pages" still names the
-    post-action pages (Lander hold 7089092213)."""
-    body = _statement_body()
-    pointer = "What those pages show and log when that read fails is stated in the docstring"
-    reset = (
-        "A factor reset whose action returns but issues neither an enrolment code nor a "
-        "generated credential shows no such page: it redirects to `GET /ui/users/{user_id}`, "
-        "which answers 423 for a failing record."
+@pytest.mark.parametrize("name", sorted(_KEPT))
+def test_the_security_doc_keeps_the_shrunk_claim(name: str) -> None:
+    """Each claim the hold-7089872291 round kept, by its shape (Lander hold 7089872291, under
+    decision d20261123T002710908-1491b3)."""
+    assert re.search(_KEPT[name], _statement_body(), re.IGNORECASE), name
+
+
+@pytest.mark.parametrize("name", sorted(_REMOVED))
+def test_the_security_doc_drops_the_overclaim(name: str) -> None:
+    """Each overclaim the hold-7089872291 round removed stays removed, by its shape: the throttle
+    keys on the record's part and the account's id (``AuthService._user_seal_failed``), not the
+    account; not every console catch logs; the single-read exceptions are a floor; and the
+    redirect's condition is that the action returned."""
+    assert not re.search(_REMOVED[name], _statement_body(), re.IGNORECASE), name
+
+
+def test_the_security_doc_keeps_the_pointer_after_the_post_action_sentence() -> None:
+    """The ``_shown_name`` pointer's "those pages" still follows the post-action sentence it names
+    (Lander hold 7089092213)."""
+    assert re.search(
+        r"rather than answering 423\. What those pages show and log when that read fails",
+        _statement_body(),
+        re.IGNORECASE,
     )
-    assert reset in body
-    # "Lands" also took a reset whose writes committed and then raised, which answers 400 or 500
-    # rather than redirecting (Lander hold 7089092213, finding 2).
-    assert "that lands but" not in body
-    assert pointer in body and body.index(pointer) < body.index(reset)
-    assert "rather than answering 423. What those pages show and log" in body
