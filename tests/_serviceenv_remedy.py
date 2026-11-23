@@ -137,56 +137,40 @@ CREATE = (
 )
 
 
-#: The path of the directory that holds the files, as the take-out step and the step before
-#: the move name it.
-FILES_PATH = "the path of the directory that holds the secrets directory's files"
+#: The path the take-out step's LEAVE ending and the repoint step name, from ``stray``, the
+#: words for the entry a look-alike or padded name sets, where each such entry's value is blank
+#: or plainly a path.
+def leave_path(stray: str) -> str:
+    return (
+        "the path of the directory that holds the secrets directory's files, which may be the "
+        f"path {stray} named"
+    )
 
 
-def target(stray: str | None, *, plain: bool = True) -> str:
-    """The path the LEAVE ending and the step before the move name. ``stray`` is the words for
-    the entry whose path may be the one, or None where none may be. A value that is not plainly a
-    path is never offered (the Lander's hold on PR 3142, comment 7096232111, item 3)."""
-    if stray is None:
-        return FILES_PATH
-    if plain:
-        return f"{FILES_PATH}, which may be the path {stray} named"
-    return f"{FILES_PATH}, not the value of {stray}, which is not plainly a path"
+#: The same path where a look-alike or padded entry's value is not plainly a path, so it is not
+#: offered (the Lander's hold on PR 3142, comment 7096232111, item 3).
+def leave_path_unplain(stray: str) -> str:
+    return (
+        "the path of the directory that holds the secrets directory's files, not the value of "
+        f"{stray}, which is not plainly a path"
+    )
 
 
-#: The take-out step's ending where the one ASCII entry the engine receives names the directory,
-#: a look-alike it receives beside it, and no Put step prints, so it adds none.
+#: The take-out step's ending where an entry spelled in ASCII that the engine receives already
+#: names the directory, listed or kept, and no Put step prints, so it adds none.
 LOOKALIKE_LEAVE = (
     ", and leave the entry spelled in ASCII as the one that names it, first setting it to "
-    f"{target('a look-alike spelling this step takes out')}"
+    f"{leave_path('an entry this step takes out')}"
 )
 
+#: The step printed just before the Put step where LEAVE applies, so the files go where the
+#: final entry points (comment 7096232111, item 6).
+REPOINT = (
+    "Before moving anything into the secrets directory, set the entry spelled in ASCII that sets "
+    f"MEFOR_SECRETS_DIRECTORY to {leave_path('an entry a later step says to take out')}"
+)
 
-def repoint(stray: str | None = "a look-alike spelling a later step says to take out") -> str:
-    """The step printed just before the Put step where LEAVE applies, so the files go where the
-    final entry points (item 6)."""
-    return (
-        "Before moving anything into the secrets directory, set the entry spelled in ASCII that "
-        f"sets MEFOR_SECRETS_DIRECTORY to {target(stray)}"
-    )
-
-
-REPOINT = repoint()
-
-
-def choose(*, plain: bool = True) -> str:
-    """The step printed just before the Put step where the take-out step prints and LEAVE does
-    not: it fixes the path a later step names, so the files go there (item 6)."""
-    return (
-        "Before moving anything into the secrets directory, choose its path: "
-        f"{target('an entry a later step says to take out', plain=plain)}. A later step names that "
-        "path under the ASCII spelling MEFOR_SECRETS_DIRECTORY, so move the files there, whatever "
-        "MEFOR_SECRETS_DIRECTORY names now"
-    )
-
-
-CHOOSE = choose()
-
-#: The LEAVE ending where the step before the move printed.
+#: The LEAVE ending where the repoint step printed before the Put step.
 LOOKALIKE_LEAVE_MOVED = (
     ", and leave the entry spelled in ASCII as the one that names it, set to the path the step "
     "before the move into the secrets directory gave it"
@@ -196,28 +180,22 @@ LOOKALIKE_LEAVE_MOVED = (
 COPIED = "the path that entry named"
 
 #: The same where one is not (item 3).
-COPIED_UNPLAIN = f"{FILES_PATH}, not that entry's value, which is not plainly a path"
-
-#: The same where the step before the move chose the path. The NEXT and ADD endings then name
-#: it whether or not a stray entry was meant to name the directory, since the files are there.
-CHOSEN = "the path the step before the move into the secrets directory chose"
-
-#: The NEXT and ADD endings' opener where no step before the move chose the path.
-_MEANT = ". Where an entry this step takes out was meant to name the secrets directory, "
+COPIED_UNPLAIN = (
+    "the path of the directory that holds the secrets directory's files, not that entry's value, "
+    "which is not plainly a path"
+)
 
 
 def lookalike_next(copied: str = COPIED) -> str:
     """The ending where the add-back step prints next. It says to follow that step whether or not
-    install-service.ps1 made the directory, which path to name, not to pass back what this step
-    takes out, and to read the list first (item 8)."""
-    follow = ". Follow" if copied == CHOSEN else f"{_MEANT}follow"
+    install-service.ps1 made the directory, which path to name, and to read the list first
+    (item 8)."""
     return (
-        f"{follow} the "
+        ". Where an entry this step takes out was meant to name the secrets directory, follow the "
         f"next step even where install-service.ps1 did not make that directory, and name {copied}, "
-        "in place of the path that step names, leaving out of what it passes back each entry and "
-        "line this step takes out. As it says, `nssm set` replaces that whole list, so read "
-        "AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by its full "
-        "path"
+        "in place of the path that step names. As it says, `nssm set` replaces that whole list, so "
+        "read AppEnvironmentExtra first with `nssm get`, running the service's own nssm.exe by its "
+        "full path"
     )
 
 
@@ -229,9 +207,8 @@ def lookalike_add(
 ) -> str:
     """The ending where nothing else names the path under the ASCII spelling: the add-back step's
     clauses, gated as there, and its warning about the installer (items 2 and 7)."""
-    add = ". Add" if copied == CHOSEN else f"{_MEANT}add"
     return (
-        f"{add} "
+        ". Where an entry this step takes out was meant to name the secrets directory, add "
         "MEFOR_SECRETS_DIRECTORY, spelled in ASCII, to the service's AppEnvironmentExtra, the list "
         f"install-service.ps1 reads, naming {copied}, as the only entry there that sets it, "
         + (f"{REMOVE_OTHER}, " if remove_other else "")
@@ -254,9 +231,9 @@ _LOOKALIKE_SAID = (
 #: What the step says of a padded name (comment 7096232111, item 1).
 PADDED = (
     "At least one entry spells MEFOR_SECRETS_DIRECTORY with a blank before or after the name, "
-    "such as a space, a tab, a line break or U+00A0. Python's os.environ keeps that blank in the "
-    "name, so the engine does not read it as the secrets directory, and install-service.ps1, "
-    "which matches the name followed at once by an equals sign, does not see it either"
+    "such as a space, a tab or U+00A0. Python's os.environ keeps that blank in the name, so the "
+    "engine does not read it as the secrets directory, and install-service.ps1, which matches "
+    "the name followed at once by an equals sign, does not see it either"
 )
 
 #: The take-out instruction itself, with item 5's qualifier.
@@ -280,9 +257,8 @@ def lookalike_step(*named: str, ending: str, padded: bool = False) -> str:
             f"{_LOOKALIKE_SAID}{', '.join(named)}. Windows was measured keeping a name with "
             "U+017F apart from the ASCII one, but the engine reads its environment through "
             "Python's os.environ, which folds such a name to MEFOR_SECRETS_DIRECTORY, so the "
-            "engine may read such an entry, in a list it receives, as the secrets directory. "
-            "install-service.ps1 does not match it, so a re-run of the installer may add a second "
-            "entry beside it"
+            "engine may read it as the secrets directory. install-service.ps1 does not match it, "
+            "so a re-run of the installer may add a second entry beside it"
         )
     if padded:
         said.append(PADDED)
