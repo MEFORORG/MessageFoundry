@@ -3550,9 +3550,13 @@ def requests_verify_from_anchor(anchor: TrustAnchor, *, cell: str) -> str | None
       so instead.
 
     Worth stating plainly, because the direction is counter-intuitive: this hop is not one of the
-    broadly-trusting ones. ``requests`` defaults to the PUBLIC certifi bundle, not the OS store, so an
-    internal-CA Vault fails closed today rather than being widely trusted. What was missing here is
-    the ability to reach such a Vault at all.
+    broadly-trusting ones by default. With no anchor passed, hvac and ``requests`` choose the CA
+    from the process environment, and only when it names none do they fall back to ``requests``'
+    PUBLIC certifi bundle, not the OS store; which variables they read is recorded once, at
+    ``store/keyprovider_vault.py``'s ``_ENV_CA_FILE``. So an internal-CA Vault fails closed unless
+    one of those variables names a bundle holding its CA, and then that bundle, whatever else it
+    holds, is what the hop trusts. What was missing here is the ability to name this hop's CA in
+    the engine's own setting.
 
     A ``crl_file`` on the anchor is **refused** for the same reason ``augment`` is (BACKLOG #299):
     ``verify=`` names one bundle and cannot carry a revocation flag, so honouring the CA while dropping

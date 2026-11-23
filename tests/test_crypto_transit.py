@@ -37,6 +37,7 @@ from messagefoundry.store.crypto_transit import TransitCipher, build_transit_cip
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.store import MessageStore
 from tests._vault_hop_env import STORE, supply_vault_hop
+from tests.test_keyprovider_vault import _MALFORMED_KEK_NAMES
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 _KEY_NAME = "mefor-store"
@@ -358,7 +359,9 @@ def test_unreachable_transit_fails_closed_type_only(monkeypatch: pytest.MonkeyPa
 
 # --- both key names are checked before they reach a Transit path (BACKLOG #6010) ------------------
 
-_BAD_KEY_NAMES = ["a/../../../sys/x", "..", "mefor/store", "mefor-store/"]
+#: The KEK test's cases (BACKLOG #6010 item 12): every Transit key name goes through one check, so
+#: one list covers both modules, plus the two path-shaped names this module's tests began with.
+_BAD_KEY_NAMES = [*_MALFORMED_KEK_NAMES, "mefor/store", "mefor-store/"]
 
 
 @pytest.mark.parametrize("bad", _BAD_KEY_NAMES)
@@ -391,6 +394,57 @@ def test_a_dotted_hyphenated_key_name_still_builds(monkeypatch: pytest.MonkeyPat
     assert cipher.transit_key_name == "mefor.store-v2"
     assert transit.read_calls == ["mefor.store-v2", "mefor_audit.v1"]
     assert "transit/hmac/mefor_audit.v1" in crypto_transit.transit_cipher_required_capabilities()
+
+
+@pytest.mark.parametrize("data_key", ["a/../../../sys/x", None])
+def test_one_refusal_names_every_bad_key_variable(
+    monkeypatch: pytest.MonkeyPatch, data_key: str | None
+) -> None:
+    """BACKLOG #6010 item 7: both names are read before either refuses, as ``store_vault_hop``
+    reads the address and token, so one refusal names each variable to fix: a malformed data key
+    or an unset one, beside a malformed audit key."""
+    _use_fake(monkeypatch)
+    if data_key is None:
+        monkeypatch.delenv("MEFOR_STORE_TRANSIT_KEY")
+    else:
+        monkeypatch.setenv("MEFOR_STORE_TRANSIT_KEY", data_key)
+    monkeypatch.setenv("MEFOR_STORE_TRANSIT_AUDIT_KEY", "..")
+    for call in (
+        lambda: build_transit_cipher(StoreSettings()),
+        crypto_transit.transit_cipher_required_capabilities,
+    ):
+        with pytest.raises(KeyProviderError) as excinfo:
+            call()
+        text = str(excinfo.value)
+        assert "MEFOR_STORE_TRANSIT_KEY " in text
+        assert "MEFOR_STORE_TRANSIT_AUDIT_KEY is not a Vault transit key name" in text
+
+
+@pytest.mark.parametrize("bad", _BAD_KEY_NAMES)
+@pytest.mark.parametrize("which", ["data", "audit"])
+def test_the_cipher_itself_refuses_a_malformed_key_name(which: str, bad: str) -> None:
+    """BACKLOG #6010 item 9: the cipher puts both names into request paths, so its constructor
+    checks them too, not only the environment read."""
+    names = ("mefor-store", bad) if which == "audit" else (bad, None)
+    with pytest.raises(KeyProviderError, match="is not a Vault transit key name"):
+        TransitCipher(_FakeClient(_FakeTransit()), names[0], audit_key=names[1])
+
+
+@pytest.mark.parametrize("selector", ["MEFOR_STORE_TRANSIT_KEY", "MEFOR_STORE_TRANSIT_AUDIT_KEY"])
+def test_a_malformed_key_name_keeps_its_text_through_build_store_cipher(
+    monkeypatch: pytest.MonkeyPatch, selector: str
+) -> None:
+    """BACKLOG #6010 items 3 and 13: ``build_store_cipher`` replaces a build error with fixed text
+    unless the engine recorded the refusal's own. The name refusal is recorded, so the text that
+    reaches the operator still names the variable, including ``MEFOR_STORE_TRANSIT_AUDIT_KEY``,
+    which the fixed text does not mention."""
+    _use_fake(monkeypatch)
+    monkeypatch.setenv(selector, "a/../../../sys/x")
+    with pytest.raises(KeyProviderError) as excinfo:
+        build_store_cipher(StoreSettings(cipher_provider="vault_transit"))
+    text = str(excinfo.value)
+    assert f"{selector} is not a Vault transit key name" in text
+    assert "a/../../../sys/x" not in text
 
 
 # --- the operator-chosen key TYPE is checked at startup (BACKLOG #1166, ASVS 11.2.3) --------------
