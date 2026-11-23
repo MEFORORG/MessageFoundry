@@ -416,8 +416,8 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert webhook.entered.is_set()  # the control: the webhook did hang
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
-    # Both are counted: the webhook had not finished the first when the email took it.
-    assert sink.undelivered == 2
+    # Only the queued one is counted: the email took the first while the webhook still hung.
+    assert sink.undelivered == 1
 
 
 class _FailingTransport:
@@ -427,6 +427,23 @@ class _FailingTransport:
 
     async def send(self, event: dict[str, Any], **_kw: Any) -> None:
         raise OSError("synthetic refusal")
+
+
+class _ClosingStore:
+    """A store whose close does nothing, for an unwind run without one."""
+
+    async def close(self) -> None:
+        return None
+
+
+class _SelfCancellingFailingWebhook(_FailingTransport):
+    """Cancels its own task, then fails before the cancel lands, so the alert never left."""
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+        await super().send(event)
 
 
 class _SelfCancellingEmail(_HealthyEmail):
@@ -446,6 +463,7 @@ class _SelfCancellingEmail(_HealthyEmail):
         pytest.param(lambda: [_FailingTransport()], 2, id="every-send-failed"),
         pytest.param(lambda: [_FailingTransport(), _HealthyEmail()], 0, id="one-transport-took-it"),
         pytest.param(lambda: [_SelfCancellingEmail()], 0, id="ended-cancelled-after-its-send"),
+        pytest.param(lambda: [_SelfCancellingFailingWebhook()], 2, id="self-cancelled-then-failed"),
         pytest.param(lambda: [], 2, id="no-transport-selected"),
     ],
 )
@@ -469,12 +487,7 @@ async def test_the_unwind_reports_alerts_no_transport_took_when_the_drain_ends_i
     """BACKLOG #5907 step 4: the unwind read the count only once its drain wait timed out, so an
     alert whose sends all failed fast was lost with no count. A drain that ends in time now logs
     the count when it is not zero, and nothing when every alert was taken."""
-
-    class _Store:
-        async def close(self) -> None:
-            return None
-
-    store: Any = _Store()
+    store: Any = _ClosingStore()
     with caplog.at_level(logging.ERROR, logger=appmod._log.name):
         sink = NotifierAlertSink([_HealthyEmail()])
         sink.connection_stopped("IB_TEST_ADT", detail="probe")

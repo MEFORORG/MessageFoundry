@@ -1834,11 +1834,11 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
     before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered,
-    which also holds an alert no transport took before the cut; a drain that ends in time logs that
-    count too, when it is not zero.
+    which also holds an alert whose sends all failed before the cut; a drain that ends in time logs
+    that count too, when it is not zero.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut does not
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). An alert one
+    transport took counts as delivered, whether or not another had finished. The cut does not
     end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
     which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
@@ -1848,26 +1848,22 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
         async def _close_notifier(bound: float) -> None:
             notifier.start()
             wait = bound * _INNER_SHARE
+            cut = ""
             try:
                 async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
                 if not deadline.expired():
                     raise
-                if not notifier.undelivered:
-                    return  # the last send ended at the deadline: nothing was lost
-                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
-                _log.error(
-                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
-                    "not confirmed delivered",
-                    wait,
-                    notifier.undelivered,
-                )
-                return
+                cut = f"the alert notifier did not drain within {wait:.2f}s; "
+            # Read on a drain that ended in time too: an alert whose sends all failed stays
+            # counted (BACKLOG #5907). A count only: an alert's content can carry a partner's
+            # text (docs/PHI.md).
             if notifier.undelivered:
-                # The drain ended in time, so these are alerts no transport took (BACKLOG #5907).
                 _log.error(
-                    "startup unwind: %d alert(s) not confirmed delivered", notifier.undelivered
+                    "startup unwind: %s%d alert(s) not confirmed delivered",
+                    cut,
+                    notifier.undelivered,
                 )
 
         steps.append(
