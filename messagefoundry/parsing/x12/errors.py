@@ -32,8 +32,10 @@ class X12FrameError(X12Error):
 
 class X12ValidationError(X12Error):
     """The opt-in strict validator (``pyx12``, ADR 0012) could not finish a structural validation
-    pass: at least when the bytes are not a parseable X12 data file, and when pyx12 raises partway
-    through a walk, as a non-numeric GE01 makes it do. The X12 analog of
+    pass over this interchange: at least when the bytes are not a parseable X12 data file, when it
+    names a version pyx12 has no map for, and when pyx12 raises partway through a walk, as a
+    non-numeric GE01 makes it do. A damaged pyx12 install raises :class:`RuntimeError` instead, so
+    ``except ValueError`` does not dead-letter a good message over it. The X12 analog of
     :class:`~messagefoundry.parsing.fhir.errors.FhirValidationError`. A *failed validation* (a pass
     that finishes with violations of the implementation guide) is **not** this — it is reported as
     data on :class:`~messagefoundry.parsing.x12.validate.X12ValidationResult` (``valid=False`` +

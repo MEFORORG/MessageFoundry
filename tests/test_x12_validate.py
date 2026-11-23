@@ -25,6 +25,7 @@ import pytest
 
 pytest.importorskip("pyx12")
 
+from messagefoundry._vendor.defusedxml.ElementTree import ParseError  # noqa: E402
 from messagefoundry.parsing.x12 import (  # noqa: E402 - after importorskip
     X12SegmentError,
     X12ValidationError,
@@ -35,6 +36,7 @@ from messagefoundry.parsing.x12._deps import (  # noqa: E402
     _read_map_segment_ids,
     load_x12_code_resolver,
     load_x12_map_segment_ids,
+    x12_install_loads,
 )
 from messagefoundry.redaction import safe_traceback  # noqa: E402
 from tests._content_free import assert_chain_severed  # noqa: E402
@@ -683,12 +685,7 @@ def test_a_refused_interchange_chains_no_pyx12_text(
     assert all(plant in str(seen[0]) for plant in plants)
 
     exc = caught.value
-    assert_chain_severed(exc)
-    for text in (
-        safe_traceback((type(exc), exc, exc.__traceback__)),
-        "".join(traceback.format_exception(exc)),
-    ):
-        assert not any(plant in text for plant in plants)
+    _assert_no_plant(exc, plants)
     # What is kept of the pyx12 error is its class name, so a refusal can still be told apart.
     assert type(seen[0]).__name__ in str(exc)
 
@@ -877,6 +874,134 @@ def test_only_a_segment_id_the_maps_define_is_kept(seg_id: Any, kept: str | None
     shown = kept or "?"
     assert (seg_err.segment_id, seg_err.message) == (kept, f"segment {shown}: error 1")
     assert (ele_err.segment_id, ele_err.message) == (kept, f"element {shown}02: error 8")
+
+
+# --- An install fault is not a parse fault, and a failed map read cannot cost a finished pass. ---
+
+
+def _walk_raising(
+    fault: Callable[[], Exception],
+) -> Callable[[], tuple[Any, Callable[[], Any]]]:
+    """A ``load_x12_validator`` whose walk raises ``fault()``."""
+
+    def document(*_args: Any) -> bool:
+        raise fault()
+
+    return lambda: (document, object)
+
+
+def _assert_no_plant(exc: BaseException, plants: tuple[str, ...] = (_PLANT,)) -> None:
+    assert_chain_severed(exc)
+    for text in (
+        safe_traceback((type(exc), exc, exc.__traceback__)),
+        "".join(traceback.format_exception(exc)),  # holds str(exc) too
+    ):
+        assert not any(plant in text for plant in plants)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        lambda: FileNotFoundError(2, "no such map", _PLANT),
+        lambda: PermissionError(13, "denied", _PLANT),
+        lambda: ImportError(_PLANT),
+        lambda: ModuleNotFoundError(_PLANT),
+        lambda: ParseError(_PLANT),
+    ],
+    ids=["missing-map", "denied-map", "import", "module", "damaged-xml"],
+)
+def test_a_damaged_install_is_not_reported_as_a_data_fault(
+    fault: Callable[[], Exception], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", _walk_raising(fault))
+    with pytest.raises(RuntimeError) as caught:
+        validate(_conformant_270())
+    exc = caught.value
+    # Exactly RuntimeError: a Handler's `except ValueError` must not dead-letter a good message.
+    assert type(exc) is RuntimeError
+    assert type(fault()).__name__ in str(exc)
+    assert "messagefoundry[x12]" in str(exc)
+    _assert_no_plant(exc)
+
+
+def test_a_map_file_gone_from_the_real_walk_is_an_install_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pyx12.map_if
+
+    def gone(*_args: Any, **_kwargs: Any) -> Any:
+        raise FileNotFoundError(2, "no such map", _PLANT)
+
+    monkeypatch.setattr(pyx12.map_if, "load_map_file", gone)
+    with pytest.raises(RuntimeError, match="FileNotFoundError") as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is RuntimeError
+    _assert_no_plant(caught.value)
+
+
+def test_any_walk_failure_is_an_install_fault_while_the_install_cannot_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # AttributeError is a class X12_INSTALL_FAULTS does not name.
+    walk = _walk_raising(lambda: AttributeError(_PLANT))
+    monkeypatch.setattr(_X12_VALIDATE, "load_x12_validator", walk)
+    # Control: with a loading install the same class is a refusal of this interchange.
+    monkeypatch.setattr(_X12_VALIDATE, "x12_install_loads", lambda: True)
+    with pytest.raises(X12ValidationError) as refused:
+        validate(_conformant_270())
+    _assert_no_plant(refused.value)
+
+    monkeypatch.setattr(_X12_VALIDATE, "x12_install_loads", lambda: False)
+    with pytest.raises(RuntimeError) as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is RuntimeError
+    _assert_no_plant(caught.value)
+
+
+def test_a_table_that_parses_but_is_damaged_is_an_install_fault(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # What a bad value in dataele.xml does: the map build raises a class no install-fault list
+    # names, on the real walk and on the probe alike, while the segment id read still succeeds.
+    import pyx12.map_if
+
+    def damaged(*_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError(_PLANT)
+
+    monkeypatch.setattr(pyx12.map_if, "load_map_file", damaged)
+    with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError) as caught:
+        validate(_conformant_270())
+    assert type(caught.value) is RuntimeError
+    _assert_no_plant(caught.value)
+    assert "ValueError" in caplog.text and _PLANT not in caplog.text
+
+
+def test_the_install_probe_passes_on_a_good_install_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pyx12.map_index
+
+    assert x12_install_loads() is True
+
+    def broken(*_args: Any) -> Any:
+        raise MemoryError
+
+    monkeypatch.setattr(pyx12.map_index, "map_index", broken)
+    assert x12_install_loads() is False
+    monkeypatch.setattr(pyx12.map_index, "map_index", lambda: SimpleNamespace(maps=[]))
+    assert x12_install_loads() is False
+
+
+def test_an_unknown_gs08_is_named_as_no_map_and_stays_a_data_error() -> None:
+    with pytest.raises(X12ValidationError, match="no map"):
+        validate(_RAISING_INTERCHANGES["gs08"][0])
+
+
+@pytest.mark.parametrize("name", ["isa17", "ge01"])
+def test_a_refusal_with_a_map_does_not_claim_there_is_none(name: str) -> None:
+    with pytest.raises(X12ValidationError) as caught:
+        validate(_RAISING_INTERCHANGES[name][0])
+    assert "no map" not in str(caught.value)
 
 
 @pytest.mark.parametrize(

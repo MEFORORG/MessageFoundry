@@ -44,9 +44,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from messagefoundry.parsing.x12._deps import (
+    X12_INSTALL_FAULTS,
     load_x12_code_resolver,
     load_x12_map_segment_ids,
     load_x12_validator,
+    x12_install_loads,
 )
 from messagefoundry.parsing.x12.errors import X12ValidationError
 from messagefoundry.redaction import json_loads_or_refusal
@@ -297,6 +299,24 @@ def _flatten_errors(
     return out
 
 
+def _walk_refusal(failure: str, *, install_fault: bool, no_map: bool) -> Exception:
+    """The exception for a walk that raised, holding only that exception's class name. An install
+    fault is a :class:`RuntimeError`, so a Handler's ``except ValueError`` does not dead-letter a
+    good message on a damaged install. An interchange naming a version pyx12 has no map for is a
+    fault of that interchange, so it stays an :class:`X12ValidationError`."""
+    if install_fault:
+        return RuntimeError(
+            f"strict X12 validation could not run: pyx12's maps or modules could not be loaded "
+            f"({failure}); reinstall the optional 'x12' extra: pip install 'messagefoundry[x12]'"
+        )
+    reason = (
+        "pyx12 has no map for this interchange's ISA12, GS01 and GS08"
+        if no_map
+        else "pyx12 stopped partway through this interchange"
+    )
+    return X12ValidationError(f"strict X12 validation could not run: {reason} ({failure})")
+
+
 def validate(raw: str | bytes) -> X12ValidationResult:
     """Strictly validate an X12 interchange against pyx12's bundled implementation-guide maps.
 
@@ -305,12 +325,17 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     the structural error list, and the generated 997/999 acknowledgment.
 
     Raises :class:`~messagefoundry.parsing.x12.errors.X12ValidationError` when pyx12 could not finish
-    a pass: at least when the bytes are not a parseable X12 data file, and when pyx12 raises partway
-    through a walk, as a non-numeric GE01 makes it do. It chains no pyx12 exception. A pass that
-    finishes with violations is returned as data (``valid=False``), not raised, so a Handler can still
-    emit the negative ack. Raises
-    :class:`RuntimeError` if the ``[x12]`` extra is absent (a deploy/config error, distinct from the
-    ``ValueError``-rooted data errors)."""
+    a pass over this interchange: at least when the bytes are not a parseable X12 data file, when it
+    names a version pyx12 has no map for, and when pyx12 raises partway through a walk, as a
+    non-numeric GE01 makes it do. It chains no pyx12 exception. A pass that finishes with violations
+    is returned as data (``valid=False``), not raised, so a Handler can still emit the negative ack.
+
+    Raises :class:`RuntimeError`, a deploy/config error distinct from the ``ValueError``-rooted data
+    errors and chaining nothing from pyx12, if the ``[x12]`` extra is absent or a walk fails on a
+    damaged install: one of :data:`~messagefoundry.parsing.x12._deps.X12_INSTALL_FAULTS`, or any
+    failure while :func:`~messagefoundry.parsing.x12._deps.x12_install_loads` is false. A transaction
+    map that still parses but is wrong can raise some other class, which reads as a refusal of the
+    interchange, and an index that has lost a map's entry reads as having no map for it."""
     if isinstance(raw, (bytes, bytearray)):  # noqa: SIM108
         text = bytes(raw).decode("utf-8", "replace")
     else:
@@ -324,17 +349,23 @@ def validate(raw: str | bytes) -> X12ValidationResult:
 
     _mute_pyx12_logger()
     walk_failure: str | None = None
+    install_fault = no_map = False
     try:
         valid = bool(x12n_document(params, io.StringIO(text), fd_ack, None, None, fd_json))
     except Exception as exc:  # pyx12 raises bare Exception/EngineError on unwalkable input
         walk_failure = type(exc).__name__
+        install_fault = isinstance(exc, X12_INSTALL_FAULTS)
+        # By name, because an import here could raise and chain this exception. The text is compared
+        # with pyx12's own fixed prefix and not kept.
+        no_map = walk_failure == "EngineError" and str(exc).startswith("Map not found")
     # Raised out here, because pyx12's messages quote the interchange (a whole ISA, GS08, GE01):
     # `from exc` puts that on __cause__, and `from None` still leaves it on __context__ (BACKLOG
     # #5370, the pattern of json_loads_or_refusal, #2085). Only the class name is kept.
     if walk_failure is not None:
-        raise X12ValidationError(
-            "strict X12 validation could not run: the bytes are not a parseable X12 interchange "
-            f"({walk_failure})"
+        raise _walk_refusal(
+            walk_failure,
+            install_fault=install_fault or not x12_install_loads(),
+            no_map=no_map,
         )
 
     raw_json = fd_json.getvalue()
