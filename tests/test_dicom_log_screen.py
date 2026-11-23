@@ -11,6 +11,7 @@ included, since that is what reaches a log file.
 from __future__ import annotations
 
 import ast
+import asyncio
 import io
 import logging
 import re
@@ -375,16 +376,105 @@ def test_matching_stays_linear_on_a_long_peer_value(head: str, value: str) -> No
     assert time.monotonic() - started < 1.0
 
 
-def test_no_template_has_two_unbounded_runs() -> None:
-    def unbounded(template: str) -> int:
-        return sum(
-            1
-            for kind in re.findall(r"\{([a-z_]+)\}", template)
-            if lines._SLOT_PATTERNS[kind] == r".*"
-        )
+def test_no_template_has_two_unbounded_runs_that_can_overlap() -> None:
+    def unbounded(template: str) -> list[str]:
+        return [
+            kind
+            for kind in lines._SLOT.findall(template)
+            # quoted_uid stops at the quote that follows it.
+            if kind != "quoted_uid" and re.search(r"[*+]", lines._SLOT_PATTERNS[kind])
+        ]
 
-    assert unbounded("A {value} B {uid}") == 2  # CONTROL
-    assert not [t for t in lines.TEMPLATES if unbounded(t) > 1]
+    assert len(unbounded("A {value} B {uid}")) == 2  # CONTROL
+    over = [t for t in lines.TEMPLATES if len(unbounded(t)) > 1]
+    # An indent of spaces and a dump of hex digits, which share no character.
+    assert over == ["{indent}{hex_dump}"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Affected SOP Class UID        : 1.2.3\r",
+        "Affected SOP Class UID        : 1.2.3\x0b",
+        "Affected SOP Class UID        : 1.2.3\u2028",
+        "Affected SOP Class UID        : \x1c1.2.3",
+        "Affected SOP Instance UID     : 1.2.3 ",
+        "No presentation context for '1.2.3\n' has been accepted by the peer for the SCU role",
+    ],
+)
+def test_a_uid_with_a_control_character_around_it_is_not_kept(line: str) -> None:
+    screened = dicom_module._screened_line(line)
+    assert screened is None or "1.2.3" not in screened, screened
+
+
+@pytest.mark.parametrize(
+    ("line", "kept"),
+    [
+        ("Invalid 'DOE JANE' value - must not be an empty str", "Invalid '[redacted]' value"),
+        (
+            "Non-conformant VM 2 for 'DOEJANE', taking the first value",
+            "Non-conformant VM 2 for '[redacted]'",
+        ),
+        ("The DOE JANE 'x' is non-conformant", "The [redacted] '[redacted]'"),
+        ("Unable to decode 'x' using the DOE JANE codec(s)", "using the [redacted] codec(s)"),
+    ],
+)
+def test_a_library_word_outside_its_closed_list_is_redacted(line: str, kept: str) -> None:
+    screened = dicom_module._screened_line(line)
+    assert screened is not None and kept in screened and "DOE" not in screened
+
+
+def test_the_element_names_are_the_ones_pynetdicom_passes() -> None:
+    passed: set[str] = set()
+    for module, _logger, source in census.library_sources():
+        if not module.startswith("pynetdicom"):
+            continue
+        for node in ast.walk(ast.parse(source)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("set_uid", "set_ae")
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+            ):
+                passed.add(str(node.args[1].value))
+    assert "Affected SOP Class UID" in passed  # CONTROL
+    assert passed <= lines.ELEMENT_NAMES
+
+
+@pytest.mark.parametrize("exc", [TimeoutError(), ConnectionResetError(), RuntimeError("")])
+def test_an_exception_with_no_message_reads_as_its_class(exc: BaseException) -> None:
+    assert dicom_module._safe_library_exc(exc) == type(exc).__name__
+
+
+def test_where_an_engine_fault_was_raised_is_named_without_its_message() -> None:
+    try:
+        raise OSError(f"failed on {_PLANTED}")
+    except OSError as exc:
+        where = dicom_module._raised_at(exc)
+        text = dicom_module._safe_library_exc(exc)
+    assert where.startswith("test_dicom_log_screen.py:")
+    assert where.endswith("in test_where_an_engine_fault_was_raised_is_named_without_its_message")
+    assert text == "OSError: [message withheld]"
+    assert dicom_module._raised_at(OSError()) == "an unknown place"
+
+
+async def test_each_c_store_puts_a_replaced_record_factory_back() -> None:
+    from tests._dicom_sample import make_sr_part10
+    from tests.test_dicom_scp import _scu_cstore
+    from tests.test_dicom_scp_admission import _running_scp
+
+    original = logging.getLogRecordFactory()
+    try:
+        async with _running_scp({"timeout_seconds": 5.0}) as scp:
+            logging.setLogRecordFactory(logging.LogRecord)
+            established, status = await asyncio.to_thread(
+                _scu_cstore, scp.sockport, make_sr_part10()
+            )
+            assert established and status == 0x0000
+            assert getattr(logging.getLogRecordFactory(), "_screens_dicom_logs", False)
+    finally:
+        logging.setLogRecordFactory(original)
 
 
 # --- The guard: a library upgrade that changes a line fails here ---------------------------------
@@ -411,6 +501,7 @@ def test_the_census_is_the_installed_libraries() -> None:
         'LOGGER.warning(msg + " refused")',
         'warn_and_log(f"Patient {name} refused")',
         'logger.exception(f"Patient {name} refused")',
+        'msg = "Patient value refused"\n    LOGGER.error(msg)',
     ],
 )
 def test_the_guard_sees_a_planted_library_line(planted: str) -> None:
@@ -452,6 +543,9 @@ def test_each_slot_kind_is_defined_and_used() -> None:
         "uid",
         "quoted_uid",
         "instance",
+        "name",
+        "keyword",
+        "codecs",
         *dicom_module._TITLE_KINDS,
     } == lines.PEER_VALUE_KINDS - lines.ALWAYS_REDACTED_KINDS
 

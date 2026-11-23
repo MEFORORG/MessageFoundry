@@ -76,6 +76,7 @@ import warnings
 import zlib
 from collections.abc import Callable, Coroutine, Iterator, Mapping
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from encodings.aliases import aliases
 from io import BytesIO
 from typing import Any, ClassVar, assert_never, cast
 
@@ -118,6 +119,7 @@ from messagefoundry.redaction import _REDACTED, prints_a_codec_error, safe_exc, 
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports._dicom_log_lines import (
     ALWAYS_REDACTED_KINDS,
+    ELEMENT_NAMES,
     PEER_VALUE_KINDS,
     VALUE_FREE_LINES,
     compiled_templates,
@@ -575,6 +577,15 @@ def _kept(kind: str, value: str) -> bool:
     redacted: ``set_uid`` takes any 1 to 64 characters unless ``ENFORCE_UID_CONFORMANCE`` is set,
     so a peer can send ``unknown`` itself, and the line cannot say which it is."""
     try:
+        if kind == "name":
+            return value in ELEMENT_NAMES
+        if kind == "keyword":
+            from pydicom.datadict import tag_for_keyword
+
+            return tag_for_keyword(value) is not None
+        if kind == "codecs":
+            names = [name.lower().replace("-", "_") for name in value.split(", ")]
+            return all(name in aliases or name in aliases.values() for name in names)
         if kind in _TITLE_KINDS:
             from pynetdicom import _config as netdicom_config
 
@@ -600,8 +611,12 @@ def _loggable_uid(value: Any) -> str:
     from pydicom.uid import UID
 
     text = str(value or "")
-    # IGNORE: building the UID must not write pydicom's own line for it again.
-    return text if not text or UID(text, validation_mode=IGNORE).is_valid else _REDACTED
+    if not text:
+        return text
+    # IGNORE: building the UID must not write pydicom's own line for it again. pydicom strips what
+    # it reads, so a value with whitespace or a control character around it is compared as well.
+    uid = UID(text, validation_mode=IGNORE)
+    return text if uid.is_valid and str(uid) == text else _REDACTED
 
 
 @functools.cache
@@ -754,7 +769,8 @@ def _screening_record_factory(previous: Callable[..., logging.LogRecord]) -> Any
 def _install_record_screen() -> None:
     """Put the screening factory in force, over whatever factory is there now, unless it already is.
     A host that replaces the factory later and does not call this one takes it out of force, until
-    the next association puts it back; the named loggers keep their filter through that gap."""
+    the next SCP start, C-STORE or SCU association puts it back; the named loggers keep their
+    filter through that gap."""
     current = logging.getLogRecordFactory()
     if not getattr(current, "_screens_dicom_logs", False):
         logging.setLogRecordFactory(_screening_record_factory(current))
@@ -807,7 +823,19 @@ def _safe_library_exc(exc: BaseException) -> str:
         line = None
     if line is None:
         return f"{type(exc).__name__}: {_MESSAGE_WITHHELD}"
-    return f"{type(exc).__name__}: {safe_text(line)}"
+    return f"{type(exc).__name__}: {safe_text(line)}" if line else type(exc).__name__
+
+
+def _raised_at(exc: BaseException) -> str:
+    """Where ``exc`` was raised, as file, line and function. These are code, so they say where an
+    engine fault is when :func:`_safe_library_exc` has withheld its message."""
+    frame = exc.__traceback__
+    if frame is None:
+        return "an unknown place"
+    while frame.tb_next is not None:
+        frame = frame.tb_next
+    code = frame.tb_frame.f_code
+    return f"{code.co_filename.replace(chr(92), '/').rpartition('/')[2]}:{frame.tb_lineno} in {code.co_name}"
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
@@ -2508,6 +2536,7 @@ class DicomScpSource(SourceConnector):
         DIMSE status int. Any failure is caught and returned as a failure status; it must never raise
         (that would break the association). Logs carry only routing-safe identifiers."""
         try:
+            _install_record_screen()  # a host may have replaced the record factory
             _ignore_pydicom_value_warnings()  # a filter changed since the start would bring them back
             requestor = event.assoc.requestor
             peer_ip = str(getattr(requestor, "address", "") or "")
@@ -2578,7 +2607,11 @@ class DicomScpSource(SourceConnector):
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
-            logger.error("DICOM C-STORE failed unexpectedly: %s", _safe_library_exc(exc))
+            logger.error(
+                "DICOM C-STORE failed unexpectedly: %s (raised at %s)",
+                _safe_library_exc(exc),
+                _raised_at(exc),
+            )
             return _STATUS_CANNOT_UNDERSTAND
 
     def _raw_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:

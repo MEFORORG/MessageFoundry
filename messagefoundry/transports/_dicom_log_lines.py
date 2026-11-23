@@ -13,13 +13,17 @@ with fields, written with ``{kind}`` slots. A slot's kind decides what happens t
 * ``uid``, ``quoted_uid``, ``instance``, ``title``, ``version``, ``move``: the value a peer sent. It
   stays only where the engine's check on that kind of value passes, and otherwise reads
   ``[redacted]``.
+* ``name``, ``keyword``, ``codecs``: a word the library supplies, which stays only if it is in a
+  closed list: :data:`ELEMENT_NAMES`, pydicom's keyword dictionary, or Python's codec names. Anything
+  else reads ``[redacted]``.
 * ``value``, ``hex_dump``: a value the library is refusing or flagging, or bytes it dumps. It always
   reads ``[redacted]``.
 * Every other kind matches only a number or a word from the library's own fixed vocabulary, so what
   it matches stays. A field outside its pattern makes the line match no template, and so withholds it.
 
-Matching stays linear on a peer's text: each template has at most one unbounded run, and any other
-slot is bounded or stops at a quote.
+Matching stays linear on a peer's text: a template has at most one unbounded run that can overlap
+what follows it. ``quoted_uid`` stops at a quote, and ``{indent}{hex_dump}`` is two runs over
+characters neither shares.
 """
 
 from __future__ import annotations
@@ -28,16 +32,19 @@ import functools
 import re
 from typing import NamedTuple
 
-#: The text each kind of slot may match. ``.`` stops at a line break, so a value holding one matches
-#: no template and its line is withheld.
+#: An unbounded run. It stops at a line break, so a value holding one matches no template and its
+#: line is withheld.
+_TO_LINE_END = r"[^\r\n]*"
+
+#: The text each kind of slot may match.
 _SLOT_PATTERNS = {
-    "uid": r".*",
-    "instance": r".*",
-    "title": r".*",
-    "version": r".*",
-    "move": r".*",
-    "value": r".*",
-    "quoted_uid": r"[^']*",
+    "uid": _TO_LINE_END,
+    "instance": _TO_LINE_END,
+    "title": _TO_LINE_END,
+    "version": _TO_LINE_END,
+    "move": _TO_LINE_END,
+    "value": _TO_LINE_END,
+    "quoted_uid": r"[^'\r\n]*",
     "int": r"\d{1,10}",
     "number": r"\d{1,10}|None",
     "hex": r"[0-9A-Fa-f]{1,8}",
@@ -98,7 +105,37 @@ PEER_VALUE_KINDS = ALWAYS_REDACTED_KINDS | {
     "title",
     "version",
     "move",
+    "name",
+    "keyword",
+    "codecs",
 }
+
+#: The element names pynetdicom passes to ``set_uid`` and ``set_ae``, and the two it names in its own
+#: non-conformant lines. A test pins them against the library.
+ELEMENT_NAMES = frozenset(
+    {
+        "Abstract Syntax Name",
+        "Affected SOP Class UID",
+        "Affected SOP Instance UID",
+        "Application Context Name",
+        "Called AE Title",
+        "Calling AE Title",
+        "Implementation Class UID",
+        "Implementation Version Name",
+        "Move Destination",
+        "Move Originator AE Title",
+        "Related General SOP Class UID",
+        "Requested SOP Instance UID",
+        "SOP Class UID",
+        "Service Class UID",
+        "Transfer Syntax Name",
+        "abstract_syntax",
+        "ae_title",
+        "implementation_class_uid",
+        "implementation_version_name",
+        "require_calling_aet",
+    }
+)
 
 _SLOT = re.compile(r"\{([a-z_]+)\}")
 
@@ -291,8 +328,11 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "# DICOM Dataset",
         "# Request Identifier",
         "# Response Identifier",
+        "'A_ASSOCIATE.called_presentation_address' must be an AddressInformation instance or None",
         "'datetime.datetime' doesn't allow a value of '60' for the seconds component, changing to '59'",
         "'datetime.time' doesn't allow a value of '60' for the seconds component, changing to '59'",
+        "'dtype_corrected_for_endianness' is deprecated and will be removed in v4.0",
+        "'pydicom.dataelem.DataElement_from_raw' is deprecated and will be removed in v4.0, please use 'pydicom.dataelem.convert_raw_data_element' instead",
         "'sop_class_uid' must be set prior to Association",
         "'transfer_syntax' contains an invalid UID",
         "'write_like_original' is deprecated and will be removed in v4.0, please use 'enforce_file_format' instead",
@@ -350,6 +390,7 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Attempted to set A_ASSOCIATE.presentation_context_definition_list to a list which includes an invalid items",
         "Attempted to set A_ASSOCIATE.presentation_context_definition_results_list to a list which includes one or more invalid items",
         "Attempted to set A_ASSOCIATE.user_information to a list which includes an unsupported item",
+        "Attempted to set A_P_ABORT.provider_reason to an invalid value",
         "Attempted to set Priority parameter to an invalid value",
         "C-STORE sub-operation failed.",
         "Call to dcmread()",
@@ -376,6 +417,9 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Failed encoding the response 'Event Reply' dataset",
         "Failed encoding the response 'Identifier' dataset",
         "Failed to decode the received Identifier dataset",
+        "Failed to encode the supplied 'Action Information' dataset",
+        "Failed to encode the supplied 'Attribute List' dataset",
+        "Failed to encode the supplied 'Modification List' dataset",
         "Failed to encode the supplied Dataset",
         "Failed to encode the supplied Identifier dataset",
         "Failed to encode the supplied dataset",
@@ -388,10 +432,14 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Hash not found in hashes.json. File will be updated.",
         "Implementation Class UID has not been set",
         "Invalid 'Move Originator AE Title' in C-STORE request",
+        "Invalid element tag value used with the 'in' operator: tags have a maximum value of (0xFFFF, 0xFFFF)",
         "Invalid status returned by callback",
         "Invalid status returned by the EVT_C_STORE handler",
         "Invalid type returned by handler bound to 'evt.EVT_SOP_COMMON'",
         "Invalid type returned by handler bound to 'evt.EVT_SOP_EXTENDED'",
+        "Invalid value in Reason field in A-ASSOCIATE-RJ PDU",
+        "Invalid value in Result field in A-ASSOCIATE-RJ PDU",
+        "Invalid value in Source field in A-ASSOCIATE-RJ PDU",
         "Maximum Length Received must be greater than 0",
         "Maximum Length Received must be numerical",
         "Maximum Number Operations Invoked must be an int",
@@ -423,6 +471,7 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Network timeout reached",
         "No accepted presentation contexts",
         "No exact matching context found for 'Unified Procedure Step - Push SOP Class', checking accepted contexts for other UPS SOP classes",
+        "No supported Presentation Contexts have been defined",
         "None of the records in the DICOMDIR dataset contain all the query elements, consider using the 'load' parameter to expand the search to the corresponding SOP instances",
         "One or more download failures occurred, the list of matching file paths may be incomplete",
         "One or more requested presentation contexts must be set prior to association negotiation",
@@ -444,6 +493,8 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Received invalid dataset from callback",
         "Reject Parameters:",
         "Rejecting Association",
+        "Related General SOP Class Identification contains an invalid UID",
+        "Related General SOP Class Identification must be a list of pydicom.uid.UID, str or bytes",
         "Releasing Association",
         "Request Parameters:",
         "Requested Asynchronous Operations Window Negotiation:",
@@ -460,6 +511,7 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "SOP Class UID and Service Class Application Information must be set prior to Association negotiation",
         "SOP Class UID and Service Class UID must be set prior to Association negotiation",
         "Secondary Field must be bytes if requesting Association with User Identity Type equal to 2, None otherwise",
+        "Secondary Field must be set when User Identity is 2",
         "Sending C-CANCEL request",
         "Server Response must be bytes or None",
         "Service Class Application Information should be a bytes object",
@@ -469,7 +521,10 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "The Implementation Class UID must be set prior to requesting Association",
         "The N-CREATE-RQ has no 'Affected SOP Instance UID' value and the 'evt.EVT_N_CREATE' handler doesn't include one in the 'Attribute List' dataset",
         "The end of the encapsulated pixel data has been reached but fewer frames than expected have been found",
+        "The end of the encapsulated pixel data has been reached but fewer frames than expected have been found. Please confirm that the generated frame data is correct",
+        "The end of the encapsulated pixel data has been reached but no JPEG EOI/EOC marker was found, the final frame may be be invalid",
         "The end of the encapsulated pixel data has been reached but no JPEG EOI/EOC marker was found, the returned frame data may be invalid",
+        "The following presentation contexts have inconsistent scu_role/scp_role values (if one is None, both must be):\n  ",
         "The number of bytes of compressed pixel data matches the expected number for uncompressed data - check that the transfer syntax has been set correctly",
         "The number of items in (7FE0,0001) 'Extended Offset Table' and (7FE0,0002) 'Extended Offset Table Lengths' don't match - the extended offset table will be ignored",
         "The odd length pixel data is missing a trailing padding byte",
@@ -478,18 +533,21 @@ VALUE_FREE_LINES: frozenset[str] = frozenset(
         "Unable to decode the received 'Attribute List' dataset",
         "Unable to decode the received 'Event Reply' dataset",
         "Unable to decode the received PDU data",
+        "Unable to encode the supplied 'Event Information' dataset",
         "Unable to return an ndarray that's a view on the original buffer for 8-bit pixel data encoded as OW with 'Explicit VR Big Endian'",
         "Unable to return an ndarray that's a view on the original buffer for bit-packed pixel data",
         "Unable to return an ndarray that's a view on the original buffer for uncompressed pixel data with a photometric interpretation of 'YBR_FULL_422'",
         "Unable to return an ndarray that's a view on the original buffer if applying a color space conversion",
         "Unable to return an ndarray that's a view on the original buffer when (0028,0101) 'Bits Stored' doesn't equal (0028,0100) 'Bits Allocated' and 'correct_unused_bits=True'. In most cases you can pass 'correct_unused_bits=False' instead to get a view if the uncorrected array is equivalent to the corrected one.",
         "Unable to set the User Identity Negotiation's 'server_response'",
+        "User Identity Type and Primary Field must be set prior to Association negotiation",
         "User Identity Type must be 1, 2, 3, 4 or 5 if requesting Association, None otherwise",
         "User Identity Type must be an int or None",
         "User callback returned a `Dataset` without a Status element",
         "User identity failed verification",
         "User's C-GET generator yielded further (status, dataset) results but these will be ignored as the sub-operations are complete",
         "Using Presentation Context:",
+        "Values for elements with a VR of 'DS' values must be <= 16 characters long. Use a smaller string, set 'config.settings.reading_validation_mode' to 'WARN' to override the length check, use 'Decimal.quantize()' and initialize with a 'Decimal' instance, or explicitly construct a DS instance with 'auto_format' set to True",
         "connection_timeout set to None",
         "dimse_timeout set to 30 s",
         "maximum_associations set to 1",

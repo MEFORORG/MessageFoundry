@@ -355,22 +355,25 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
 
   **What an operator still reads and what is lost.** Association requested, accepted, rejected with its result
   and reason, released and aborted, the send and receive lines for C-STORE and C-ECHO with their status, and the
-  library's fixed protocol error lines all stay. Lost, at least: the C-FIND, C-GET and C-MOVE progress lines and
+  library's fixed protocol error lines stay. Lost, at least: the C-FIND, C-GET and C-MOVE progress lines and
   identifier dumps, which this engine does not serve; the text of a library exception that matches no template,
   including an operating system's socket error text, where the log and a delivery error keep the exception class
-  and read `[message withheld]`; every note and group member of an exception; and any line a library upgrade adds,
+  and read `[message withheld]`, and the C-STORE last-resort line adds the file, line and function that raised
+  it; every note and group member of an exception; and any line a library upgrade adds,
   until it is pinned.
 
   **How far it reaches.** A filter on each logger the libraries create, and a log record factory for any other
   logger under those names, so a logger created later, one that does not propagate, and a host with no
   `logging_setup` handler are all covered. A host that replaces the record factory without calling the one it
-  found leaves a logger outside the named list unscreened until the next SCP start or SCU association puts the
-  factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
+  found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
+  the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
   `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
   they are code. A failure inside the screen withholds the line. Matching is linear in the line's length.
 
   `tests/_dicom_log_census.py` scans both installed libraries' log and `warn_and_log` calls against a pinned
-  census, so a line a library adds or rewords fails a test until it is read. That test and the pin tests in
+  census, so a call it can read that a library adds or rewords fails a test until it is read: at least a
+  literal, an f-string, and text assigned to a local variable it then logs. A line built some other way, such as
+  a dataset dump's loop variable, is in the census only by that variable's name. That test and the pin tests in
   `tests/test_dicom_peer_value_logs.py` fail when either library's version changes in the environment they
   run in. They do not reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom
   resolve to any release from 3.0.2 below 3.1. On another release a changed line is withheld rather than leaked,

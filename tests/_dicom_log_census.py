@@ -128,10 +128,49 @@ def _read_sources() -> Iterator[tuple[str, str, str]]:
             yield module, module if by_module else "pydicom", source
 
 
+def _is_text(node: ast.expr) -> bool:
+    if isinstance(node, ast.BinOp):
+        return isinstance(node.op, ast.Add)
+    return isinstance(node, ast.JoinedStr) or (
+        isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+
+
+def _assigned_text(tree: ast.AST) -> dict[int, set[str]]:
+    """For each variable read inside a function, by node id, the text assigned to that name there,
+    so a line logged through ``msg`` is in the census by its words. ``+=`` is marked, since what it
+    adds is not a whole line."""
+    assigned: dict[int, set[str]] = {}
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        values: dict[str, set[str]] = {}
+        for node in ast.walk(function):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _is_text(node.value)
+            ):
+                values.setdefault(node.targets[0].id, set()).add(skeleton(node.value))
+            elif (
+                isinstance(node, ast.AugAssign)
+                and isinstance(node.target, ast.Name)
+                and _is_text(node.value)
+            ):
+                values.setdefault(node.target.id, set()).add(f"<+= {skeleton(node.value)}>")
+        for node in ast.walk(function):
+            if isinstance(node, ast.Name) and node.id in values:
+                assigned.setdefault(id(node), set()).update(values[node.id])
+    return assigned
+
+
 def rows_in(module: str, logger: str, source: str) -> set[str]:
     """The census rows of one module's source."""
     found: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    assigned = _assigned_text(tree)
+    for node in ast.walk(tree):
         if module == "pynetdicom._handlers":
             for text in _strings_in(node):
                 found.add(_row(logger, "DEBUG", text))
@@ -139,6 +178,8 @@ def rows_in(module: str, logger: str, source: str) -> set[str]:
             level = _level(node)
             if level is not None:
                 found.add(_row(logger, level, skeleton(node.args[0])))
+                for text in assigned.get(id(node.args[0]), ()):
+                    found.add(_row(logger, level, text))
     return found
 
 

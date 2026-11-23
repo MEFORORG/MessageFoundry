@@ -6,5 +6,5 @@
   also needs `timeout_seconds` raised. It is refused on an outbound connection. pynetdicom's and pydicom's logs are now
   default-deny: a line that matches no pinned template is withheld and names only its logger, level
   and exception class, so a C-FIND, C-GET or C-MOVE line or an unrecognised exception's text no
-  longer reaches the log. The the C-STORE client also dead-letters an object it can never propose instead of
+  longer reaches the log. The C-STORE client also dead-letters an object it can never propose instead of
   retrying it. (`BACKLOG #6637`)
