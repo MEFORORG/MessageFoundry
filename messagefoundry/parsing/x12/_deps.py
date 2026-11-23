@@ -25,7 +25,7 @@ import threading
 import time
 from collections.abc import Callable
 from importlib.resources import files
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from messagefoundry._vendor.defusedxml.ElementTree import ParseError, parse
 
@@ -61,6 +61,15 @@ def load_x12_validator() -> tuple[Any, Any]:
     return pyx12.x12n_document.x12n_document, pyx12.params.params
 
 
+def _parse_map_xml(source: IO[bytes]) -> Any:
+    """THE XML parse surface of this module: the vendored defusedxml with every hardening flag on.
+
+    pyx12's bundled maps carry no DTD, so refusing one costs nothing. Isolated so that
+    ``tests/test_xml_parser_consistency.py`` drives this parse directly: the reader below turns a
+    refusal into an empty set, which its hostile corpus could not tell from a document with no ids."""
+    return parse(source, forbid_dtd=True, forbid_entities=True, forbid_external=True)
+
+
 def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
     """The ``xid`` of every ``<segment>`` in the maps that ``maps.xml`` under ``map_dir`` lists.
 
@@ -71,10 +80,14 @@ def _read_map_segment_ids(map_dir: Traversable) -> frozenset[str]:
     ids: set[str] = set()
     try:
         with map_dir.joinpath("maps.xml").open("rb") as fd:
-            map_files = {name for m in parse(fd).iter("map") if (name := (m.text or "").strip())}
+            index = _parse_map_xml(fd)
+        map_files = {name for m in index.iter("map") if (name := (m.text or "").strip())}
         for map_file in map_files:
             with map_dir.joinpath(map_file).open("rb") as fd:
-                ids.update(xid for seg in parse(fd).iter("segment") if (xid := seg.get("xid")))
+                # Inside the `with`, unbound, so one map's tree is freed before the next is parsed.
+                ids.update(
+                    xid for seg in _parse_map_xml(fd).iter("segment") if (xid := seg.get("xid"))
+                )
     # ValueError covers defusedxml's refusals and a multi-byte encoding declaration; LookupError an
     # unknown one.
     except (OSError, ParseError, ValueError, LookupError) as exc:
