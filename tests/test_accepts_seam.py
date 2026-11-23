@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import re
+import threading
 from collections.abc import AsyncIterator, Generator, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -1074,16 +1075,12 @@ def test_a_shared_generator_is_still_usable_after_the_refusal(tmp_path: Path) ->
     shared.close()
 
 
-async def _await(coro: Any) -> Any:
-    return await coro
-
-
 def test_a_shared_coroutine_can_still_be_awaited_after_the_refusal(tmp_path: Path) -> None:
     shared = _verdict_coro()
     reg = _reg(tmp_path, accepts={"h": lambda m: shared})
     with pytest.raises(TypeError, match="handler 'h' returned an object of type coroutine"):
         route_only(reg, reg.inbound["IB"], ADT)
-    assert asyncio.run(_await(shared)) is False  # a closed coroutine raises RuntimeError here
+    assert asyncio.run(shared) is False  # a closed coroutine raises RuntimeError here
 
 
 def test_a_started_generator_is_refused_without_running_its_finally(tmp_path: Path) -> None:
@@ -1100,9 +1097,35 @@ def test_a_started_generator_is_refused_without_running_its_finally(tmp_path: Pa
     reg = _reg(tmp_path, accepts={"h": lambda m: g})
     with pytest.raises(TypeError, match="handler 'h' returned an object of type generator"):
         route_only(reg, reg.inbound["IB"], ADT)
-    assert ran == []  # its finally belongs to whoever owns it, not to the refusal
+    assert ran == []  # the test still holds it, so the refusal did not finalize it
     g.close()
     assert ran == ["finally"]
+
+
+def test_an_unshared_refused_generator_is_finalized_before_route_only_returns(
+    tmp_path: Path,
+) -> None:
+    # The refusal keeps no reference to the verdict, so a generator nothing else holds is collected
+    # at once, on the calling thread, not wherever the TypeError dies.
+    ran: list[str] = []
+
+    def gen() -> Generator[bool]:
+        try:
+            yield False
+        finally:
+            ran.append(threading.current_thread().name)
+
+    def pred(msg: Any) -> Any:
+        g = gen()
+        next(g)
+        return g
+
+    reg = _reg(tmp_path, accepts={"h": pred})
+    with pytest.raises(TypeError, match="handler 'h' returned an object of type generator") as exc:
+        route_only(reg, reg.inbound["IB"], ADT)
+    # While the exception, and so its traceback, is still alive.
+    assert ran == [threading.current_thread().name]
+    del exc
 
 
 @pytest.mark.parametrize("pred", _STATIC_PASSING_VERDICTS)

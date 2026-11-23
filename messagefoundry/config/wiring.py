@@ -6176,12 +6176,19 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
     a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
     True, so the handler would accept every message. The static check in
     :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
-    out of ``route_only`` like any predicate raise, into the router-stage error path. The refused
-    object is left as it was, neither consumed nor closed: the predicate may share it, for example a
-    module-level generator, and closing it would end it for every other holder. So a coroutine the
-    predicate made for this call may draw Python's "never awaited" warning when it is collected. The
-    text names the handler and the verdict's type, never its value. Every mode applies this one rule,
-    so ``[sandbox].mode`` does not change the verdict (ADR 0087).
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The text names
+    the handler and the verdict's type, never its value. Every mode applies this one rule, so
+    ``[sandbox].mode`` does not change the verdict (ADR 0087).
+
+    The refusal neither consumes nor closes the object, because the predicate may share it, for
+    example a module-level generator, and closing it would end it for its other holders. It drops its
+    own reference before raising, so the exception's traceback does not keep the object alive. One the
+    predicate made for this call is then collected at once, on the calling thread and inside whatever
+    run context the caller holds, which is when Python finalizes it: a started generator's
+    ``finally`` runs there, a raise from that ``finally`` goes to Python's unraisable-exception hook
+    rather than into this error, and a coroutine draws Python's "never awaited" warning. Its callers,
+    ``dryrun._accepted``, the dry-run tracer and the sandbox worker, pass the verdict straight in
+    rather than binding it to a local, so their frames do not hold it either.
 
     An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
     read by that value as before, iterator or not."""
@@ -6195,9 +6202,11 @@ def accepts_verdict(hname: str, verdict: object) -> bool:
     ):
         # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
         # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
+        type_name = scrub_log_argument(cls.__name__)
+        del verdict, cls  # see the docstring: the traceback must not keep the verdict alive
         raise TypeError(
             f"accepts= predicate for handler {hname!r} returned an object of type "
-            f"{scrub_log_argument(cls.__name__)}, which the router stage cannot await or iterate "
+            f"{type_name}, which the router stage cannot await or iterate "
             "and would read as True; it must return a value whose truth value is the verdict, "
             "such as a bool"
         )
