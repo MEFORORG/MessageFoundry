@@ -13,14 +13,17 @@ while the vault runs the same code against the real posture data.
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import os
+import random
 import re
 import subprocess
 import time
+import types
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
-from typing import Any, get_args
+from typing import Any, Final, get_args
 
 import pytest
 
@@ -2991,6 +2994,156 @@ def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
     # Control: a method's first parameter is still bound, so its name is not part of the shape.
     method = "def deco(f):\n    return f\n\nclass C:\n    @deco\n    def m(self, x): ...\n"
     assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
+
+
+# --- BACKLOG #5590: the outermost shape decorator beside one the screen cannot name ---------------
+#
+# `_Reading.pair` compares no decorators where the two sides' unnamed decorators differ, so a
+# mutation could drop `@property` or swap `@staticmethod` beside an unnamed `@w` unseen.
+# `_Reading.outer_mismatch` refuses where the outermost shape decorator differs and no unnamed one
+# is applied over it on either side. The first two tests below are red on the screen without it.
+
+_DECORATOR_POOL: Final = (
+    "property",
+    "staticmethod",
+    "classmethod",
+    "functools.cache",
+    "contextlib.contextmanager",
+    "w",
+    "functools.wraps(g)",
+)
+#: `w` bound by an assignment, which the screen cannot follow, or by a def it can (PR 3165).
+_W_BINDINGS: Final = ("w = WRAP\n", "def w(f):\n    return WRAP(f)\n")
+
+
+def _decorated(decorators: tuple[str, ...], *, method: bool) -> str:
+    indent = "    " if method else ""
+    lines = "".join(f"{indent}@{d}\n" for d in decorators)
+    params = "self, a" if method else "a"
+    return (
+        f"{'class C:\n' if method else ''}{lines}{indent}def f({params}):\n{indent}    return 1\n"
+    )
+
+
+def _passthrough(fn: Any) -> Any:
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+#: What the oracle sets `w` to in turn: identity, a passthrough wrapper, and `property`.
+_W_VALUES: Final = (lambda fn: fn, _passthrough, property)
+
+
+def _bound_shape(source: str, wrap: Any, *, method: bool) -> tuple[str, str] | None:
+    """The type of what `source` binds `f` to, and for a plain function the type of what a call
+    returns, since ``contextmanager`` hands back a plain function too; ``None`` if `source` raises."""
+    namespace: dict[str, Any] = {"WRAP": wrap}
+    try:
+        exec(compile(source, "<oracle>", "exec"), namespace)
+    except Exception:
+        return None
+    bound = namespace["C"].__dict__["f"] if method else namespace["f"]
+    returned = ""
+    if isinstance(bound, types.FunctionType):
+        try:
+            returned = type(bound(None, 1) if method else bound(1)).__name__
+        except Exception as exc:
+            returned = f"raises {type(exc).__name__}"
+    return type(bound).__name__, returned
+
+
+def _differs_under_every_w(target: str, mutation: str, *, method: bool) -> bool | None:
+    """Whether the mutation binds `f` to another kind of object than the target does under every
+    `w` the oracle tries. A `w` the target itself fails under is not one the live code can have,
+    and ``None`` means the target fails under every one, so it is no live code at all."""
+    seen = False
+    for wrap in _W_VALUES:
+        live = _bound_shape(target, wrap, method=method)
+        if live is None:
+            continue
+        seen = True
+        if _bound_shape(target + mutation, wrap, method=method) == live:
+            return False
+    return True if seen else None
+
+
+def _decorator_pairs() -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    short = [c for n in range(3) for c in itertools.product(_DECORATOR_POOL, repeat=n)]
+    every = short + list(itertools.product(_DECORATOR_POOL, repeat=3))
+    rng = random.Random(5590)
+    return list(itertools.product(short, short)) + [
+        (rng.choice(every), rng.choice(every)) for _ in range(1500)
+    ]
+
+
+def test_prove_absences_screen_outer_rule_only_adds_sound_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over the same def, at module level and as a method: everything the screen refused without
+    the rule it still refuses, and each refusal the rule adds holds under every `w` the oracle
+    tries; a target that fails to run under every one is no live code, and is not counted. The count
+    of added refusals is a positive control: a rule that adds none passes vacuously.
+    """
+    added = 0
+    for binding, method, (live, mut) in itertools.product(
+        _W_BINDINGS, (False, True), _decorator_pairs()
+    ):
+        target = "import functools\nimport contextlib\n\ndef g(): ...\n\n" + binding + "\n"
+        target += _decorated(live, method=method)
+        mutation = _decorated(mut, method=method)
+        refused = _refused(mutation, target, tmp_path)
+        with monkeypatch.context() as patch:
+            patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_: None)
+            refused_before = _refused(mutation, target, tmp_path)
+        assert refused or not refused_before, (live, mut, method, binding)
+        if refused and not refused_before:
+            sound = _differs_under_every_w(target, mutation, method=method)
+            assert sound is not False, (live, mut, method, binding)
+            added += sound is True
+    assert added > 100
+
+
+@pytest.mark.parametrize("method", [False, True])
+def test_prove_absences_screen_refuses_a_dropped_or_swapped_outer_shape_decorator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: bool
+) -> None:
+    """``@property @w`` dropped to a bare def, and ``@staticmethod`` swapped for
+    ``@classmethod @w``: the outermost shape decorator differs and nothing unnamed is applied over
+    it, so the name is bound to another kind of object whatever `w` is."""
+    target = "w = WRAP\n\n" + _decorated(("property", "w"), method=method)
+    dropped = _decorated((), method=method)
+    swapped_from = "w = WRAP\n\n" + _decorated(("staticmethod",), method=method)
+    swapped = _decorated(("classmethod", "w"), method=method)
+    with monkeypatch.context() as patch:
+        patch.setattr(scorecard_module._Reading, "outer_mismatch", lambda *_: None)
+        assert not _refused(dropped, target, tmp_path)
+        assert not _refused(swapped, swapped_from, tmp_path)
+    assert _refused(dropped, target, tmp_path)
+    assert _refused(swapped, swapped_from, tmp_path)
+    assert _differs_under_every_w(target, dropped, method=method)
+    assert _differs_under_every_w(swapped_from, swapped, method=method)
+
+
+def test_prove_absences_screen_outer_rule_passes_an_unnamed_outermost_decorator(
+    tmp_path: Path,
+) -> None:
+    """An unnamed decorator applied over the shape decorator on either side may bind the name to
+    anything, so the rule tells nothing and the screen accepts as before: ``@property @w`` dropped
+    to ``@w`` is a property again when `w` is ``property``. A resolved decorator that is not a shape
+    decorator, such as ``functools.wraps(g)``, is passed over."""
+    target = "w = WRAP\n\n" + _decorated(("property", "w"), method=False)
+    assert _screen(_decorated(("w",), method=False), target, tmp_path) == []
+    assert not _differs_under_every_w(target, _decorated(("w",), method=False), method=False)
+    swapped_from = "w = WRAP\n\n" + _decorated(("staticmethod",), method=True)
+    assert _screen(_decorated(("w", "classmethod"), method=True), swapped_from, tmp_path) == []
+    wraps = "import functools\n\ndef g(): ...\n\n" + _decorated(("property",), method=False)
+    over = _decorated(("functools.wraps(g)",), method=False)
+    assert _refused(over, wraps, tmp_path)
+    assert (
+        _screen(_decorated(("functools.wraps(g)", "property"), method=False), wraps, tmp_path) == []
+    )
 
 
 def test_signature_fields_name_every_signature_value() -> None:
