@@ -479,8 +479,21 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
+        # The five narrowings of decision d20261123T002710908-1491b3: each claim is scoped to the
+        # routes the code answers that way, and the console's own answers are the last sentences'.
+        "when the record fails its seal at that read, made after the action landed",
+        "logs the report's WARNING",
+        "at least the pages that read the name through `_shown_name` do",
+        "the interval does not change how it is answered",
+        "answered as a record that fails its seal is",
+        "Apart from the answers the next two sentences state, a Vault transit Outage",
     ):
         assert fact in body, fact
+    for overclaim in (
+        "answers 423 or lists the account as failed",
+        "answered the same way, a 423 or listed as failed",
+    ):
+        assert overclaim not in body, overclaim
     rows = [line for line in text.splitlines() if line.startswith("|") and "#5520" in line]
     assert len(rows) == 5, rows
     for row in rows:
