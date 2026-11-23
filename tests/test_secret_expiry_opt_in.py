@@ -40,6 +40,7 @@ from messagefoundry.config.settings import (
     EgressSettings,
     SecretRotationSettings,
 )
+from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import secret_rotation as sr
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.secret_rotation import (
@@ -48,9 +49,11 @@ from messagefoundry.pipeline.secret_rotation import (
     StoreKeyRotationOverdueError,
     enforce_secret_expiry,
 )
+from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store.crypto import generate_key, make_cipher, seal_rotation_fingerprint
 from messagefoundry.store.store import MessageStore
 from tests._ast_sites import call_sites
+from tests.test_cluster_graph_gating import _minimal_graph
 
 _UTC = datetime.UTC
 _REF = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)
@@ -370,6 +373,57 @@ async def test_an_undetermined_opted_in_class_aborts_Engine_start(
     assert exc.value.refused[0].last_rotated == "unknown"
     # And the DEK refusal is a different type, so this is not that gate firing under another name.
     assert not isinstance(exc.value, StoreKeyRotationOverdueError)
+
+
+@pytest.mark.parametrize(
+    ("settings", "refusal"),
+    [
+        (SecretRotationSettings(store_key_last_rotated="2020-01-01"), StoreKeyRotationOverdueError),
+        (SecretRotationSettings(enforce_secret_expiry_classes=[_AD]), SecretRotationOverdueError),
+    ],
+    ids=["store-key", "secret"],
+)
+async def test_a_refused_single_node_start_brings_up_no_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: SecretRotationSettings,
+    refusal: type[Exception],
+) -> None:
+    """BACKLOG #5615: the refusal comes before the runner starts, so no listener binds first."""
+    value = "test-only-bind-password"  # nosec B105 - a test value, never a real credential
+    monkeypatch.setenv(_AD, value)
+    cfg = tmp_path / "cfg"
+    _minimal_graph(cfg, tmp_path)
+    store = await MessageStore.open(tmp_path / "order.db", cipher=make_cipher(generate_key()))
+    cipher = store.secret_rotation_cipher()
+    assert cipher is not None, "premise: a keyed store fingerprints secrets"
+    await store.upsert_secret_rotation_meta(
+        _AD,
+        fingerprint=seal_rotation_fingerprint(cipher, _AD, sr._fingerprint_cell(_AD, value)),
+        tracked_since="2020-01-01",
+        last_rotated="2020-01-01",
+    )
+    engine = Engine(
+        store,
+        secret_rotation_settings=settings,
+        security_enforcement=SecurityEnforcement.ENFORCE,
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(load_config(cfg))
+    starts: list[RegistryRunner] = []
+    real_start = RegistryRunner.start
+
+    async def recording_start(self: RegistryRunner, **kwargs: Any) -> None:
+        starts.append(self)
+        await real_start(self, **kwargs)
+
+    monkeypatch.setattr(RegistryRunner, "start", recording_start)
+    try:
+        with pytest.raises(refusal):
+            await engine.start()
+        assert starts == []
+    finally:
+        await engine.stop()
 
 
 async def test_a_keyless_engine_with_an_opt_in_starts(

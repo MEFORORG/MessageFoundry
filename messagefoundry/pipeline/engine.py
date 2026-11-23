@@ -2332,6 +2332,78 @@ class Engine:
             # clear, which resolves a pause alert an earlier run left open (slice 3).
             await self._intake_monitor.check_once()
             self._intake_monitor.start()
+        # BACKLOG #5615: before the graph block, so a single node refuses an expired key or
+        # secret under enforce before any listener binds or worker runs.
+        if self._secret_rotation_settings is not None:  # noqa: SIM102 - the moved block is verbatim
+            # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
+            # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
+            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
+            # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
+            # here (at restart) for a DEK past max_age + grace.
+            # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
+            # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
+            # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
+            # runs; a backend that did NOT would degrade to the operator-configured dates without
+            # persistence — never an error.
+            if isinstance(self.store, SecretRotationMetaStore):
+                try:
+                    self._secret_rotation_stamps = await reconcile_rotation_meta(
+                        self.store,
+                        self._secret_rotation_settings,
+                        dek_key_id=self.store.cipher_info().active_key_id,
+                        enforcement=self._security_enforcement,
+                        alert_sink=self._alert_sink,
+                        # Per-Connection env() connector credentials resolved from the live graph, so
+                        # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
+                        # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
+                        extra_values=self._connector_secret_env_values(),
+                        # BACKLOG #4942: a changed key the keyed audit chain has not rolled to is
+                        # held, not stamped. The open already settled the chain; no I/O here.
+                        audit_rolled=audit_chain_rolled(self.store),
+                    )
+                except SecretsDirectoryError:
+                    # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
+                    # engine must not use. Refused as what it is, naming the file: logged and stepped
+                    # over by the arm below, it would leave the stamps empty and resurface as an
+                    # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
+                    raise
+                except Exception:
+                    # A reconcile failure must never take the engine down — the runner still works off the
+                    # operator-configured dates (empty stamps). Logged, not raised.
+                    log.exception(
+                        "secret-rotation stamp reconcile failed; continuing with config dates"
+                    )
+                # ASVS 13.3.4 / BACKLOG #1004 — the DEK's CALENDAR expiry refusal, and its placement is
+                # the control. It sits OUTSIDE the `except Exception` directly above ON PURPOSE: that
+                # handler's entire body is a log call, so a refusal raised beneath it would be logged
+                # and stepped over, and the engine would start normally on an expired key. A gate a
+                # handler swallows is a traceback, not a control. From here it propagates out of
+                # Engine.start() and aborts the ASGI lifespan.
+                #
+                # It also covers the SECOND-ORDER swallow: when the reconcile above fails, the stamps
+                # stay empty, so a gate written to read them would silently not fire. An undetermined
+                # age REFUSES rather than reading as a young one (the item's ruling). `cipher_info()`
+                # is re-read rather than hoisted so the reconcile's own guarded call keeps its
+                # behaviour; if it were to fail here the engine refuses to start, which is the
+                # fail-closed direction.
+                enforce_store_key_expiry(
+                    self._secret_rotation_settings,
+                    self._secret_rotation_stamps,
+                    enforcement=self._security_enforcement,
+                    dek_key_id=self.store.cipher_info().active_key_id,
+                    alert_sink=self._alert_sink,
+                )
+                # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
+                # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
+                # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
+                # computes nothing in that case, so a default config's start is unchanged.
+                enforce_secret_expiry(
+                    self._secret_rotation_settings,
+                    self._secret_rotation_stamps,
+                    enforcement=self._security_enforcement,
+                    held=await self._expiry_enforced_held_ids(),
+                    alert_sink=self._alert_sink,
+                )
         if self._registry_runner is not None:
             # Fail loud (not at the first received message) if the configured store can't run the
             # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
@@ -2504,75 +2576,6 @@ class Engine:
         # no-op when warn_days=0 or nothing is tracked. NOT leader-gated: it reads node-local config +
         # fingerprints and the per-secret realert throttle bounds any alert spam, so each node may run it.
         if self._secret_rotation_settings is not None:
-            # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
-            # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
-            # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
-            # (BACKLOG #3472) so a change auto-detects a rotation; and the ENFORCE escalation fires
-            # here (at restart) for a DEK past max_age + grace.
-            # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
-            # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
-            # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
-            # runs; a backend that did NOT would degrade to the operator-configured dates without
-            # persistence — never an error.
-            if isinstance(self.store, SecretRotationMetaStore):
-                try:
-                    self._secret_rotation_stamps = await reconcile_rotation_meta(
-                        self.store,
-                        self._secret_rotation_settings,
-                        dek_key_id=self.store.cipher_info().active_key_id,
-                        enforcement=self._security_enforcement,
-                        alert_sink=self._alert_sink,
-                        # Per-Connection env() connector credentials resolved from the live graph, so
-                        # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
-                        # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
-                        extra_values=self._connector_secret_env_values(),
-                        # BACKLOG #4942: a changed key the keyed audit chain has not rolled to is
-                        # held, not stamped. The open already settled the chain; no I/O here.
-                        audit_rolled=audit_chain_rolled(self.store),
-                    )
-                except SecretsDirectoryError:
-                    # Vault BACKLOG #2595: not a reconcile fault but a secrets directory or file the
-                    # engine must not use. Refused as what it is, naming the file: logged and stepped
-                    # over by the arm below, it would leave the stamps empty and resurface as an
-                    # undetermined DEK age under ENFORCE, pointing the operator at the wrong key.
-                    raise
-                except Exception:
-                    # A reconcile failure must never take the engine down — the runner still works off the
-                    # operator-configured dates (empty stamps). Logged, not raised.
-                    log.exception(
-                        "secret-rotation stamp reconcile failed; continuing with config dates"
-                    )
-                # ASVS 13.3.4 / BACKLOG #1004 — the DEK's CALENDAR expiry refusal, and its placement is
-                # the control. It sits OUTSIDE the `except Exception` directly above ON PURPOSE: that
-                # handler's entire body is a log call, so a refusal raised beneath it would be logged
-                # and stepped over, and the engine would start normally on an expired key. A gate a
-                # handler swallows is a traceback, not a control. From here it propagates out of
-                # Engine.start() and aborts the ASGI lifespan.
-                #
-                # It also covers the SECOND-ORDER swallow: when the reconcile above fails, the stamps
-                # stay empty, so a gate written to read them would silently not fire. An undetermined
-                # age REFUSES rather than reading as a young one (the item's ruling). `cipher_info()`
-                # is re-read rather than hoisted so the reconcile's own guarded call keeps its
-                # behaviour; if it were to fail here the engine refuses to start, which is the
-                # fail-closed direction.
-                enforce_store_key_expiry(
-                    self._secret_rotation_settings,
-                    self._secret_rotation_stamps,
-                    enforcement=self._security_enforcement,
-                    dek_key_id=self.store.cipher_info().active_key_id,
-                    alert_sink=self._alert_sink,
-                )
-                # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
-                # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
-                # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
-                # computes nothing in that case, so a default config's start is unchanged.
-                enforce_secret_expiry(
-                    self._secret_rotation_settings,
-                    self._secret_rotation_stamps,
-                    enforcement=self._security_enforcement,
-                    held=await self._expiry_enforced_held_ids(),
-                    alert_sink=self._alert_sink,
-                )
             self._secret_rotation_runner = SecretRotationRunner(
                 self._tracked_secrets,
                 self._secret_rotation_settings,
