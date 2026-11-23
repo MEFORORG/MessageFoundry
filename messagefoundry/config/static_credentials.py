@@ -86,8 +86,7 @@ resolves ``env()`` with an operator ``cast`` as the build does (BACKLOG #5526 it
 ``_is_https``, which logs at debug a proxy target that does not parse. A caller inherits its
 callee's effect: at least :func:`static_credential_hops` and :func:`run_static_credential_gate`
 can run an operator ``cast`` and log, and :func:`http_hop_credentials` logs through ``_digest``
-and, through it, resolves an ``env()`` ``http_auth`` against its ``default=``, which can run an
-operator ``cast`` too.
+and, through it, resolves an ``env()`` ``http_auth`` to its ``default=``, which is never cast.
 
 **A detail cannot carry a secret, by construction.** Every detail is fixed text chosen from a closed
 set, plus at most one peer label. The peer label (:func:`~messagefoundry.config.wiring._peer_label`) is built from parsed parts, so it holds
@@ -196,17 +195,18 @@ def _digest(
     ``env_values``, else its literal ``default=`` (``config.wiring._resolved_setting``), as
     :func:`_http_literal_static` reads ``headers``. One this reading cannot resolve may resolve to
     ``digest``, so it reads as Digest, except beside a minted bearer (``token``) whose SMART and
-    OAuth2 flags and token URLs are not themselves ``env()`` references: the build refuses Digest
-    beside a bearer provider, so none crosses there. Where such a flag or token URL is an
-    ``env()`` reference, the provider may resolve off (a flag off, or a token URL empty), so the
-    mode still reads as Digest."""
+    OAuth2 flags, and SMART token URL, are not themselves ``env()`` references: the build refuses
+    Digest beside a bearer provider, so none crosses there. Where one of them is an ``env()``
+    reference, the provider may resolve off, so the mode still reads as Digest. An ``env()``
+    OAuth2 token URL does not count: one that resolves blank refuses the build
+    (``http_auth.refuse_oauth2_settings``) rather than turning the provider off."""
     from messagefoundry.transports.http_auth import HttpAuthError, http_digest_selected
 
     mode = _resolved_setting(settings, "http_auth", None, env_values or {})
     if mode is _UNRESOLVED:
-        # Round 3 finding 1: a token URL from env() may resolve empty, which also leaves the
+        # BACKLOG #5526 item 9: an env() SMART token URL may resolve empty, which leaves that
         # provider off, so it counts as an env() flag does.
-        keys = ("oauth2_enabled", "smart_enabled", "oauth2_token_url", "smart_token_url")
+        keys = ("oauth2_enabled", "smart_enabled", "smart_token_url")
         return not token or any(isinstance(settings.get(key), EnvRef) for key in keys)
     if mode is not settings.get("http_auth"):
         settings = {**settings, "http_auth": mode}

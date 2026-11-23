@@ -203,22 +203,35 @@ def test_the_census_reads_digest_beside_a_bearer_whose_flag_is_from_env() -> Non
     assert "HTTP Digest" in http_hop_credentials(ConnectorType.REST, settings)
 
 
-@pytest.mark.parametrize(
-    "token_url_key", ["smart_token_url", "oauth2_token_url"], ids=["smart", "oauth2"]
-)
-def test_the_census_reads_digest_beside_a_bearer_whose_token_url_is_from_env(
-    token_url_key: str,
-) -> None:
-    """Item 9, review round 3 finding 1: an ``env()`` token URL may resolve empty, which leaves
-    the provider off at build, so Digest crosses; an unresolved ``http_auth`` there still reads
-    as Digest. Control: a literal token URL with literal flags lists none (the test above)."""
+def test_the_census_reads_digest_beside_a_smart_token_url_from_env() -> None:
+    """Item 9: an ``env()`` SMART token URL may resolve empty, which leaves the provider off at
+    build, so Digest crosses; an unresolved ``http_auth`` there still reads as Digest. Control:
+    ``test_the_census_reads_no_digest_beside_a_literal_smart_token_url`` below."""
     settings: dict[str, Any] = {
         "url": URL,
         "http_auth": EnvRef("MF_HTTP_AUTH_SYNTHETIC"),
-        token_url_key: EnvRef("MF_TOKEN_URL_SYNTHETIC"),
+        "smart_token_url": EnvRef("MF_TOKEN_URL_SYNTHETIC"),
     }
     assert "HTTP Digest" in http_hop_credentials(ConnectorType.FHIR, settings)
     assert _http_hop("OB_FHIR", ConnectorType.FHIR, settings, "peer") is not None
+
+
+def test_the_census_reads_no_digest_beside_a_literal_smart_token_url() -> None:
+    settings: dict[str, Any] = {
+        "url": URL,
+        "http_auth": EnvRef("MF_HTTP_AUTH_SYNTHETIC"),
+        "smart_token_url": "https://auth.example.com/token",
+    }
+    assert "HTTP Digest" not in http_hop_credentials(ConnectorType.FHIR, settings)
+
+
+def test_the_census_reads_no_digest_beside_an_oauth2_token_url_from_env() -> None:
+    """Item 9: an ``env()`` OAuth2 token URL that resolves blank refuses the build rather than
+    turning the provider off, so Digest cannot cross there and none is listed, as on main."""
+    settings = _oauth(Rest(url=URL)).settings
+    settings["http_auth"] = EnvRef("MF_HTTP_AUTH_SYNTHETIC")
+    settings["oauth2_token_url"] = EnvRef("MF_TOKEN_URL_SYNTHETIC")
+    assert "HTTP Digest" not in http_hop_credentials(ConnectorType.REST, settings)
 
 
 def test_the_census_honours_an_env_default_for_http_auth() -> None:
