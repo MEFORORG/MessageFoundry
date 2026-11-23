@@ -273,7 +273,7 @@ def test_restore_refuses_existing_wal_sidecar(tmp_path, key_b64, capsys) -> None
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing to overwrite" in err and "-wal" in err
+    assert "refusing to overwrite" in err and str(sidecar) in err
     assert not dest.exists()  # nothing was written next to the sidecar
 
 
@@ -292,7 +292,7 @@ def test_restore_refuses_a_dangling_wal_symlink(tmp_path, key_b64, capsys) -> No
     rc = main(["restore", archive, "--to", str(dr / "restored.db"), "--service-config", toml])
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing to overwrite" in err and "-wal" in err
+    assert "refusing to overwrite" in err and str(link) in err
     assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
     assert link.is_symlink() and not (dr / "nowhere").exists()  # the link is left as it was
 
@@ -327,7 +327,7 @@ def test_restore_refuses_a_to_that_windows_opens_as_another_name(
     )
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing --to" in err and "plain file name" in err
+    assert "refusing --to" in err and "holds no ':'" in err
     assert sorted(p.name for p in dr.iterdir()) == ["restored.db-wal"]  # nothing written
     assert stale.read_bytes() == b"stale wal"
 
@@ -355,10 +355,42 @@ def test_restore_refuses_a_sidecar_planted_before_the_placement(
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1
     err = _refusal(capsys)
-    assert "refusing to overwrite" in err and sidecar in err
+    assert "refusing to overwrite" in err and str(planted) in err
     # nothing placed, and the staging directory is gone
     assert sorted(p.name for p in dr.iterdir()) == [planted.name]
     assert planted.read_bytes() == b"planted sidecar"
+
+
+def test_restore_refuses_a_store_name_link_planted_before_the_placement(
+    tmp_path, key_b64, capsys, monkeypatch
+) -> None:
+    # On Windows the copy fallback's exclusive create follows a dangling link and writes the whole
+    # store to the link's target, so the second read covers the store's own name too.
+    archive, toml = _make_archive(tmp_path, key_b64, capsys)
+    dr = tmp_path / "dr"
+    dr.mkdir()
+    dest = dr / "restored.db"
+    target = tmp_path / "elsewhere.db"
+    try:
+        os.symlink(target, tmp_path / "probe-link")
+    except OSError as exc:  # Windows without the symlink privilege or developer mode
+        pytest.skip(f"this platform cannot create a symlink here: {exc}")
+    real_verify = dr_backup._verify_extracted_store
+
+    def _plant_a_link(snap, manifest):
+        counts = real_verify(snap, manifest)
+        os.symlink(target, dest)
+        return counts
+
+    monkeypatch.setattr(os, "link", _no_hard_links)
+    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_link)
+
+    rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
+    assert rc == 1
+    err = _refusal(capsys)
+    assert "refusing to overwrite" in err and str(dest) in err
+    assert sorted(p.name for p in dr.iterdir()) == ["restored.db"]  # nothing placed
+    assert dest.is_symlink() and not target.exists()  # nothing written through the link
 
 
 def test_a_fault_reading_a_sidecar_name_is_a_refusal_not_a_free_name(tmp_path, monkeypatch) -> None:
@@ -487,17 +519,16 @@ def test_restore_does_not_delete_the_winner_of_a_create_race(
     # it would turn the refusal into the unrecoverable overwrite the refusal exists to prevent.
     archive, toml = _make_archive(tmp_path, key_b64, capsys)
     dest = tmp_path / "restored.db"
-    real_verify = dr_backup._verify_extracted_store
+    real_before_copy = dr_backup._unspare_before_copy
 
-    def _plant_a_rival(snap, manifest):
-        # The rival's file must appear AFTER the up-front destination check and before the create --
-        # the only window in which the create race can be lost.
-        counts = real_verify(snap, manifest)
+    def _plant_a_rival(item):
+        # The rival's file must appear AFTER both reads of the destination's names and before the
+        # create -- the only window in which the create race can be lost.
+        real_before_copy(item)
         dest.write_bytes(b"the winner's store")
-        return counts
 
     monkeypatch.setattr(os, "link", _no_hard_links)
-    monkeypatch.setattr(dr_backup, "_verify_extracted_store", _plant_a_rival)
+    monkeypatch.setattr(dr_backup, "_unspare_before_copy", _plant_a_rival)
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])
     assert rc == 1

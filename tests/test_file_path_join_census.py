@@ -838,7 +838,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/pipeline/dr_backup.py::_staging_root_for": Site(
         1, INTERNAL, "A fixed directory name under the operator's destination."
     ),
-    "messagefoundry/pipeline/dr_backup.py::_store_sidecars": Site(
+    "messagefoundry/pipeline/dr_backup.py::_store_names": Site(
         1, REVIEWED, "Fixed sidecar suffixes on the operator's --to path, tested for existence."
     ),
     "messagefoundry/pipeline/dr_backup.py::_sweep_owned": Site(

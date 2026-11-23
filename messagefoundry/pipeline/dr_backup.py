@@ -54,7 +54,7 @@ import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, BinaryIO, NamedTuple, cast
@@ -5152,7 +5152,7 @@ def _safe_segment(value: str) -> str:
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
 #: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so a taken
 #: sidecar name is refused too, not just the main file: a file, a directory or a link, a dangling one
-#: included. When the names are read, and what that misses, is :func:`_refuse_existing_sidecars`.
+#: included. When the names are read, and what that misses, is :func:`_refuse_taken_store_names`.
 #: ``-journal`` is here for the same reason: SQLite replays a hot rollback journal on first open, even
 #: into a WAL-mode store (measured).
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
@@ -5726,6 +5726,9 @@ def _restore_blocking(
             except sqlite3.Error as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
+            # The second read of the store's names, while nothing is placed; its docstring says why
+            # and what it misses.
+            _refuse_taken_store_names(dest_store_path)
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -5737,9 +5740,6 @@ def _restore_blocking(
             # refuses the placement while nothing is placed yet. `published` flips the moment the
             # link or the copy lands, so a placement that raises after that is rolled back like any
             # later failure, and the staged store stays spared while it is a name for that file.
-            #
-            # The second sidecar read, while nothing is placed; its docstring says why and what it misses.
-            _refuse_existing_sidecars(dest_store_path)
 
             def _placed() -> None:
                 nonlocal published
@@ -6358,8 +6358,8 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
 _REWRITTEN_TO_REFUSAL = (
     "refusing --to {path}: its file name holds a ':', which names an alternate data stream on an NTFS "
     "volume, or Windows would open it as a different name, such as one ending in a dot or a space; "
-    "the never-overwrite check could then miss the store's real -wal, -shm and -journal — spell --to "
-    "as the plain file name"
+    "the never-overwrite check could then miss the store's real -wal, -shm and -journal — choose a "
+    "--to whose file name holds no ':' and does not end in a dot or a space"
 )
 
 
@@ -6372,7 +6372,7 @@ def _occupied(path: Path) -> bool:
         os.lstat(path)
     except (FileNotFoundError, NotADirectoryError):
         return False
-    except OSError as exc:
+    except (OSError, ValueError) as exc:  # ValueError: an embedded NUL, from a programmatic caller
         raise BackupError(
             "destination",
             f"cannot tell whether {path} is free: {safe_exc(exc)} — choose another --to path, or "
@@ -6381,27 +6381,28 @@ def _occupied(path: Path) -> bool:
     return True
 
 
-def _refuse_taken(paths: Iterable[Path]) -> None:
-    """Refuse the first of ``paths`` that is taken, by a file, a directory or a link (:func:`_occupied`)."""
-    for path in paths:
+def _store_names(dest_store_path: Path) -> tuple[Path, ...]:
+    """The store's name, then the ``-wal``, ``-shm`` and ``-journal`` names SQLite derives from it."""
+    return (
+        dest_store_path,
+        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+    )
+
+
+def _refuse_taken_store_names(dest_store_path: Path) -> None:
+    """Refuse a ``--to`` whose store name or any sidecar name is taken, by a file, a directory or a link
+    (:func:`_occupied`), naming the first one taken.
+
+    Run up front by :func:`_refuse_existing_destination` and again just before the placement in
+    :func:`_restore_blocking`, because the decrypt between them can take minutes. A sidecar planted
+    then would be replayed over the verified pages on first open. A dangling link planted at the
+    store's own name would be followed by the copy fallback's exclusive create on Windows, which
+    writes the store to the link's target (measured), so the store name is read again too. A name
+    taken after the second read is not caught, including one taken while a volume with no hard links
+    copies the store into place."""
+    for path in _store_names(dest_store_path):
         if _occupied(path):
             raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
-
-
-def _store_sidecars(dest_store_path: Path) -> Iterator[Path]:
-    """The ``-wal``, ``-shm`` and ``-journal`` names SQLite derives from ``dest_store_path``."""
-    return (dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES)
-
-
-def _refuse_existing_sidecars(dest_store_path: Path) -> None:
-    """Refuse a ``--to`` with any sidecar name taken. Run up front by
-    :func:`_refuse_existing_destination` and again just before the placement in
-    :func:`_restore_blocking`, because the decrypt between them can take minutes and a sidecar planted
-    then would be replayed over the verified pages on first open. The store's own name needs no second
-    read: its placement is an exclusive create, which refuses a name taken in that window. A sidecar
-    created after the second read is not caught, including one created while a volume with no hard
-    links copies the store into place."""
-    _refuse_taken(_store_sidecars(dest_store_path))
 
 
 def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path | None) -> None:
@@ -6415,8 +6416,8 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
     as another name, such as one ending in a dot or a space (:func:`_win_rewritten`). On Windows those
     spellings derive sidecar names SQLite never uses, so the sidecar check would read the wrong files.
     The ``:`` is refused on every host, so one ``--to`` means the same everywhere; a POSIX host can
-    reach an NTFS volume, where a ``:`` can name a stream. The sidecars are read again just before
-    the placement (:func:`_refuse_existing_sidecars`).
+    reach an NTFS volume, where a ``:`` can name a stream. The names are read again just before the
+    placement (:func:`_refuse_taken_store_names`).
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
@@ -6427,8 +6428,7 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
     if dest_store_path is not None:
         if ":" in dest_store_path.name or _win_rewritten(dest_store_path):
             raise BackupError("destination", _REWRITTEN_TO_REFUSAL.format(path=dest_store_path))
-        _refuse_taken((dest_store_path,))
-        _refuse_existing_sidecars(dest_store_path)
+        _refuse_taken_store_names(dest_store_path)
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
         # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
