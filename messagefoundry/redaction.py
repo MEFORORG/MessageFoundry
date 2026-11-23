@@ -3114,11 +3114,11 @@ def args_hold_a_message(exc: BaseException) -> bool:
     :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
     the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
     connector's ``_shown_state`` names a state for it only from the error's own ``sqlstate``
-    attribute, an exact ``str``, and only when that equals the state it was asked about. The connector still CLASSIFIES such an
-    error by the shape of ``args[0]``, and the store's ``driver_sqlstate`` does not call this, so
-    it still reads and prints that ``args[0]``. A class that cannot be read answers ``False``, so
-    it is read by shape, as any other error is; that does not raise, so this runs on every link of
-    a traceback."""
+    attribute, as a copy of its data (:func:`sqlstate_text`), and only when that equals the state
+    it was asked about. The connector still CLASSIFIES such an error by the shape of ``args[0]``,
+    and the store's ``driver_sqlstate`` does not call this, so it still reads and prints that
+    ``args[0]``. A class that cannot be read answers ``False``, so it is read by shape, as any other
+    error is; that does not raise, so this runs on every link of a traceback."""
     try:
         return any(
             isinstance(kind.__module__, str)
@@ -3169,8 +3169,10 @@ def sqlstate_text(value: object) -> str | None:
     None. A ``str`` subclass is read by its data, as before, so it classifies an error as it did,
     but what is returned is ``str``'s own copy, so no reader prints the subclass's ``__str__``
     (engine PR 3163). ``str.__str__`` is called on ``str`` itself, which a subclass cannot
-    override."""
-    if not isinstance(value, str):
+    override. The type is read with ``type()``, not ``isinstance``, which an object faking
+    ``__class__`` would pass; and the length is read first, so a long message is never copied.
+    It does not raise for any value."""
+    if not issubclass(type(value), str) or str.__len__(value) != 5:  # type: ignore[arg-type]
         return None
     text = str.__str__(value)
     return text if reads_as_a_sqlstate(text) else None
@@ -3181,10 +3183,10 @@ def driver_sqlstate_of(
 ) -> str | None:
     """The SQLSTATE a known driver's own error (:func:`known_driver_error`) names, read in this
     order, each as :func:`sqlstate_text` returns it. When ``attribute`` is true, the ``sqlstate``
-    attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set but is no SQLSTATE then ends the read
-    with None unless ``past_attribute`` is true. Then None for an error from a package in
-    :func:`args_hold_a_message`, at least asyncpg, whose ``args[0]`` is its message. Otherwise
-    ``args[0]``, if it reads as a SQLSTATE, as pyodbc's does. None for any error that is no known
+    attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set
+    but is no SQLSTATE then ends the read with None unless ``past_attribute`` is true. Then None
+    for an error from a package in :func:`args_hold_a_message`, at least asyncpg, whose
+    ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's does. None for any error that is no known
     driver's, so a ``KeyError('MRN42')`` is never read as one, and None for a SQLite error, whose
     ``args[0]`` is its message (vault BACKLOG #1661). :func:`safe_traceback` names a driver error's
     SQLSTATE by it. The DATABASE connector reads its own state, which can differ from this one.

@@ -2766,12 +2766,11 @@ def _classify_db_error(
     it would carry a partner's identifier into all three on a first deployment. The same rule the
     ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows.
 
-    ``shown`` is what the text and ``code`` name, :func:`_shown_state`'s answer for the error;
-    ``sqlstate`` classifies the error and is never printed, since a caller's state can be a ``str``
-    subclass read from an argument whose text is a value (vault BACKLOG #1661, engine PR 3163).
-    ``None`` or empty says the error is no driver's, or its state was read from asyncpg's message:
-    the error is classified all the same, but the text and ``code`` name neither a state nor a native
-    number read from ``message``."""
+    ``shown`` is what the text and ``code`` name, :func:`_shown_state`'s answer for the error,
+    which says when a state may be named; ``sqlstate`` classifies the error and is not printed
+    (vault BACKLOG #1661, engine PR 3163). ``None`` or empty, at least for an error that is no
+    driver's or whose state was read from asyncpg's message, still classifies the error, but the
+    text and ``code`` name neither a state nor a native number read from ``message``."""
     code = _driver_code(message) if shown else None
     detail = (f"[{shown}]" if shown else "[SQLSTATE withheld]") + (
         f" driver error {code}" if code else ""
@@ -2812,9 +2811,9 @@ def _sqlstate(exc: BaseException) -> str | None:
     ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
     ``args[0]`` is its message. An asyncpg error is classified by the same shape, though its
     ``args[0]`` is its message; for one, :func:`_shown_state` names a state only from the error's
-    own ``sqlstate`` attribute, and only when that equals the state read. What it returns is an
-    exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but ``args``, with ``getattr`` and a default, so an error arm can call it
-    before its cleanup."""
+    own ``sqlstate`` attribute, and only when that equals the state read. What this returns is an
+    exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but
+    ``args``, with ``getattr`` and a default, so an error arm can call it before its cleanup."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc):
         return None
     return _shaped_state(getattr(exc, "args", ()))
@@ -2826,10 +2825,11 @@ def _log_sqlstate(exc: BaseException) -> str | None:
     that is absent, None or no SQLSTATE it reads ``args[0]`` by shape, as :func:`_sqlstate` does,
     an asyncpg error's included, whose ``args[0]`` is its message; for one, :func:`_shown_state`
     names a state only from the error's own ``sqlstate`` attribute, and only when that equals the
-    state read. What it returns is an exact ``str`` copy
-    (:func:`~messagefoundry.redaction.sqlstate_text`), the attribute's or ``args[0]``'s. Never for a ``UnicodeError`` or an exception that holds one,
-    whose text a codec name can make read like a SQLSTATE. Like :func:`_sqlstate`, it classifies;
-    :func:`_shown_state` says what text names."""
+    state read. What this returns is an exact ``str`` copy
+    (:func:`~messagefoundry.redaction.sqlstate_text`), the attribute's or ``args[0]``'s. Never
+    for a ``UnicodeError`` or an exception that holds one, whose text a codec name can make read
+    like a SQLSTATE. Like :func:`_sqlstate`, it classifies; :func:`_shown_state` says what text
+    names."""
     if isinstance(exc, UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
     state = sqlstate_text(getattr(exc, "sqlstate", None))

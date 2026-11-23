@@ -478,15 +478,6 @@ class _Loud(str):
         return _VALUE
 
 
-class _Permissive(str):
-    """Text whose ``==`` says yes to anything, so it answers first as ``==``'s right operand."""
-
-    def __eq__(self, other: object) -> bool:
-        return True
-
-    __hash__ = str.__hash__
-
-
 def _asyncpg_error(message: object, sqlstate: object) -> _AsyncpgMessage:
     exc = _AsyncpgMessage(message)
     exc.sqlstate = sqlstate  # type: ignore[assignment]  # the fake's attribute is typed str
@@ -507,8 +498,8 @@ def test_the_shown_state_compares_by_strs_own_method() -> None:
     """Hold item 6: the mutant ``attribute is not None and attribute == state`` names a state for
     a ``str`` subclass from ``args[0]`` whose reflected ``__eq__`` says yes to anything, since
     ``==`` runs the right operand's ``__eq__`` first when its class is a subclass of the left's."""
-    exc = _asyncpg_error(_Permissive(_VALUE), "23505")
-    assert database._shown_state(_Permissive(_VALUE), exc) is None
+    exc = _asyncpg_error(_AgreeingText(_VALUE), "23505")
+    assert database._shown_state(_AgreeingText(_VALUE), exc) is None
 
 
 def test_a_classified_error_prints_the_shown_state_never_its_sqlstate() -> None:
@@ -588,6 +579,40 @@ async def test_a_send_classifies_a_sqlstate_subclass_and_prints_a_copy(exc: Exce
     assert _VALUE not in safe_exc(refused.value)
     assert "900123456" not in safe_exc(refused.value)
     assert conn.rolledback
+
+
+class _FakesStr:
+    """Not text, though ``isinstance(x, str)`` says it is: its ``__class__`` reads as ``str``."""
+
+    __class__ = property(lambda self: str)
+
+
+def test_an_object_faking_str_reads_as_no_sqlstate() -> None:
+    """Review of the hold's fix: an ``isinstance`` gate would let this through to
+    ``str.__str__``, which raises, and ``_sqlstate`` runs in the send's error arm before its
+    rollback. The readers answer None instead."""
+    from messagefoundry.redaction import driver_sqlstate_of, sqlstate_text
+
+    exc = DriverError(_FakesStr(), "x")
+    assert isinstance(_FakesStr(), str)
+    assert sqlstate_text(_FakesStr()) is None
+    assert database._sqlstate(exc) is None and database._log_sqlstate(exc) is None
+    assert driver_sqlstate_of(exc) is None
+
+
+async def test_a_fetch_deadlock_with_a_sqlstate_subclass_still_propagates() -> None:
+    """Review of the hold's fix: a deadlock from a fetch, its state a ``str`` subclass, is the
+    statement's own failure and propagates so the write rolls back, as on origin/main; a reader
+    that rejected the subclass would make it an unreadable result and the write would commit."""
+
+    class _Cursor:
+        description = (("id",),)
+
+        async def fetchall(self) -> list[Any]:
+            raise DriverError(_Loud("40001"), "deadlock")
+
+    with pytest.raises(DriverError):
+        await database._fetch_result_set(_Cursor())
 
 
 async def test_a_connect_refusal_with_a_sqlstate_subclass_keeps_its_disposition() -> None:
