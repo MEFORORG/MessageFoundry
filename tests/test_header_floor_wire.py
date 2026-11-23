@@ -529,7 +529,12 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     """What uvicorn's Server.shutdown does to each connection still in its set: call
     ``shutdown()``. On the bare sans-I/O class that sends a 500 on a conn that has already ended
     its stream, and websockets asserts, which is the control. On the floored class the connection
-    was answered and marked so, nothing more is written, and the call returns."""
+    was answered and marked so, nothing more is written, and the call returns.
+
+    On a parser rejection it also checks that uvicorn's handle_connect never ran, that a later
+    ``data_received`` does not call the floor's step again, and that clearing ``close_sent`` makes
+    the closing ``shutdown`` raise. That closing call is what ``protocol_headers`` cites as the
+    coverage of uvicorn's ``shutdown`` reading ``close_sent``: keep it last and unguarded."""
     bare, bare_transport = await _fed_and_still_open(WebSocketsSansIOProtocol, request_bytes)
     assert bool(bare_transport.written) is bare_answers
     with pytest.raises(AssertionError) as stopped:
@@ -555,7 +560,7 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
     # handle_connect's first act is to set ``request``, which uvicorn's __init__ does not.
     ran_handle_connect = {"request" in vars(p) for p in (bare, floored)}
     if bare_answers:
-        # The control for the check below: here uvicorn did run handle_connect.
+        # Here uvicorn did run handle_connect, on both instances.
         assert ran_handle_connect == {True} and bare.handshake_initiated
     else:
         # uvicorn never ran handle_connect on either instance, so the parser-rejection step set
