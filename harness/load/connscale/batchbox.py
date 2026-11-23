@@ -72,6 +72,8 @@ from messagefoundry.terminal_text import escape_for_terminal
 log = logging.getLogger(__name__)
 
 _RESET_ERROR_CHARS = 4000  # the engine log tail's own limit, which carried this refusal before
+_RESET_ERROR_WRAP = len("engine did not start: ")  # the cell error's prefix counts toward the cap
+_RESET_CUT_MARK = "[earlier text cut] "
 _HEALTH_TIMEOUT = 30.0
 _PORTS_READY_TIMEOUT = 60.0
 _STOP_GRACE = 5.0
@@ -1012,7 +1014,7 @@ async def run_batch_engine(
                 log.warning("batch cell %s: wait for DONE failed: %s", cell.cell_id, kind)
                 report.notes.append(
                     f"CELL {cell.cell_id}: wait for the driver's DONE failed ({kind}) after the "
-                    "engine did not start; moving to the next cell"
+                    "cell's startup failed; moving to the next cell"
                 )
             await _stop_cell_node(node, cell.cell_id, report)
             continue
@@ -1063,10 +1065,28 @@ def _store_reset_failure(exc: Exception) -> str:
 
     The redactor masks credentials, not every connection detail: a host, login or database name can
     remain, in the READY file and the report. It also over-redacts, so a database name of several
-    words can come out masked inside the remedy, and text past the cap is cut."""
-    detail = redact_log_text(str(exc))[:_RESET_ERROR_CHARS]
+    words can come out masked inside the remedy. Past the cap the START is cut, because the store
+    puts a driver's diagnostics before the remedy."""
+    prefix = f"store reset failed: {type(exc).__name__}: "
+    room = _RESET_ERROR_CHARS - _RESET_ERROR_WRAP - len(prefix)
+    detail = redact_log_text(str(exc))
     text = escape_for_terminal(detail, single_line=True)
-    return f"store reset failed: {type(exc).__name__}: {text}"
+    if len(text) > room:
+        text = _RESET_CUT_MARK + _escaped_tail(detail, room - len(_RESET_CUT_MARK))
+    return prefix + text
+
+
+def _escaped_tail(text: str, limit: int) -> str:
+    """The longest tail of ``text`` whose one-line escaped form fits ``limit``. It cuts the text
+    before escaping, so the cut cannot land inside an escape sequence."""
+    low, high = max(0, len(text) - limit), len(text)  # a character escapes to at least one
+    while low < high:
+        mid = (low + high) // 2
+        if len(escape_for_terminal(text[mid:], single_line=True)) <= limit:
+            high = mid
+        else:
+            low = mid + 1
+    return escape_for_terminal(text[high:], single_line=True)
 
 
 async def _stop_cell_node(node: EngineNode, cell_id: str, report: BatchEngineReport) -> None:
