@@ -179,10 +179,12 @@ class ServiceEnvPosture:
     #: plainly a path (:func:`_directory_entry_value`). The remedy alone reads this, never the
     #: refusal itself.
     nothing_to_move_names: tuple[str, ...] = field(default=(), repr=False)
-    #: Whether such an entry, run on into, sets the directory to a path, and no value that runs on
-    #: and no later line of a string sets it to anything else, so the remedy says to leave one
-    #: directory entry, written as the path, spares the directory lines from its removal steps, and
-    #: says to add none back. The remedy alone reads this, never the refusal itself.
+    #: Whether such an entry, run on into, sets the directory to a path, every refused value that
+    #: runs on takes only blank or plain-path directory entries (``directory_only``), and no later
+    #: line of a refused value sets the directory to anything else. Any of those may be key
+    #: material, so where this is False the remedy prints no keep-one step and no clause sparing
+    #: directory lines from its removal steps; where it is True, it prints both and no add-back
+    #: step. The remedy alone reads this, never the refusal itself.
     directory_path_joined: bool = False
     #: Whether a refused value runs on into a string whose first non-blank line sets
     #: ``MEFOR_SECRETS_DIRECTORY``, so the run-on step removes it. The remedy alone reads this.
@@ -1153,17 +1155,15 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
-        # Fail closed: one run-on value that takes anything but a blank or plain-path directory
-        # entry may hold key material, and so may a later line of a string that sets the
-        # directory to anything else, so this is False then. The remedy prints its keep-one
-        # step, and the clause sparing directory lines from the removal and run-on steps, only
-        # where this is True (sixth hold, H1; the Lander's hold on PR 3142, comment 7104660861).
+        # Fail closed, as the field's doc says (sixth hold, H1; the Lander's hold on PR 3142,
+        # comment 7104660861, item 1).
         directory_path_joined=any(v.keeps_directory and _names([v]) for v in variables)
         and all(v.directory_only for v in variables if v.runs_on and _names([v]))
         and not any(
             _sets_directory(line) and _directory_entry_value(line) is None
-            for _where, entry in entries
-            for line in _LINE_BREAK.split(entry)[1:]
+            for v in variables
+            if _names([v])
+            for line in _LINE_BREAK.split(v.value)[1:]
         ),
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
@@ -1403,14 +1403,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         and _DIRECTORY_VARIABLE not in posture.listed
         and not posture.directory_path_joined
     )
-    # Where a directory entry joined to a refused value is plainly a path, one directory entry is
-    # kept, the one the engine reads, and every other removed, as origin/main's joined-directory
-    # step said; the removal steps then spare each directory line, so no step removes an entry a
-    # later one keeps (code review on PR 3142). Only then, as at b1d44693cae: a joined entry
-    # whose value is not plainly a path may hold key material, so no step spares or keeps it,
-    # and the removal and run-on steps take it out with the value (the Lander's hold on PR 3142,
-    # comment 7104660861, item 1). ``directory_path_joined`` already rules out the add-back step,
-    # and needs a refused value that runs on, so ``value_runs_on`` holds too.
+    # One directory entry is kept, the one the engine reads, and every other removed, as
+    # origin/main's joined-directory step said; the removal steps then spare each directory
+    # line, so no step removes an entry a later one keeps (code review on PR 3142). When, as at
+    # b1d44693cae, is ``directory_path_joined``'s to say (the Lander's hold on PR 3142, comment
+    # 7104660861, item 1). It needs a refused value that runs on, so the run-on step prints too.
     keep_one = posture.directory_path_joined
     spare = f", but for each line that sets {_DIRECTORY_VARIABLE}, which a step below covers"
     # Last, so protect-key and the secrets directory take each value before its entry goes. It

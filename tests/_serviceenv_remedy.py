@@ -28,11 +28,10 @@ RUNS_ON = (
     "runs on into with it, or the value stays in the registry key"
 )
 
-#: Printed last, only where a directory entry joined to a refused value is plainly a path and
-#: nothing else joined or on a later line of a string may hold key material
-#: (``directory_path_joined``): one entry stays, in AppEnvironmentExtra, rewritten to the path,
-#: and every other directory line goes (the Lander's holds on PR 3142, comment 7100710066, items 5
-#: and 8, and comment 7104660861, item 1).
+#: Printed last, only where ``ServiceEnvPosture.directory_path_joined`` holds, as its doc says:
+#: one entry stays, in AppEnvironmentExtra, rewritten to the path, and every other directory line
+#: goes (the Lander's holds on PR 3142, comment 7100710066, items 5 and 8, and comment
+#: 7104660861, item 1).
 KEEP = (
     "Leave exactly one entry that sets MEFOR_SECRETS_DIRECTORY in the service's lists: one in "
     "AppEnvironmentExtra, which NSSM applies last, added there where that list has none, written "

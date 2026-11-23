@@ -672,3 +672,32 @@ def test_a_later_line_setting_the_directory_to_key_text_keeps_no_entry() -> None
     control = read("MEFOR_SECRETS_DIRECTORY=C:\\d")
     assert control is not None and control.endswith(f"{KEEP}{_END}"), control
     assert REMOVE_SPARING in control
+
+
+@pytest.mark.parametrize(
+    "string",
+    [
+        pytest.param(f"\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="blank-led-directory-string"),
+        pytest.param(f"TZ=UTC\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="ordinary-variable-string"),
+    ],
+)
+def test_a_key_text_directory_line_outside_a_refused_value_is_taken_out_by_the_keep_step(
+    string: str,
+) -> None:
+    """Code review round two on the same repair: the later-line rule reads refused values only.
+    A key-text directory line in a string no refused variable owns is not that value's, so the
+    keep-one step still prints, and it is the step that takes every other directory line out."""
+    refusal = service_env_refusal(
+        read_service_env_posture(
+            probe=_Probe(
+                [
+                    (_PLAIN, "MEFOR_STORE_PASSWORD="),
+                    (_PLAIN, "mefor_secrets_directory=C:\\d"),
+                    (_EXTRA, string),
+                ]
+            ),
+            environ={},
+        )
+    )
+    assert refusal is not None and refusal.endswith(f"{KEEP}{_END}"), refusal
+    assert _KEY_B64 not in refusal
