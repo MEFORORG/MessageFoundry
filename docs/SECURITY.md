@@ -5348,7 +5348,8 @@ flowchart TB
   `_record_route_refusal` in `messagefoundry/api/security.py` says what it records. The
   monitoring-read 429 that `require_monitoring_read` holds on a `GET /connections` reveal with a
   valid value is raised
-  by the route body after its scope and permission checks; its gate wrote no grant row, and
+  by the route body after its scope, permission, serve-hop and new-address checks; its gate wrote
+  no grant row, and
   `raise_deferred_monitoring_refusal` writes the `auth.gate_refused` row the gate would have. Other
   refusals a route body makes after its gate has passed write no `auth.gate_refused` row.
 - Routes that act on a Connection also check the identity's connection scope. That scope starts
@@ -7697,9 +7698,12 @@ copies the in-memory metrics ring and reads no store; it was put in the set beca
 Flow and trends page reads it beside `/graph/edges`, but the console is not charged (below), so
 its pace bounds only JSON clients. The gate charges a per-actor sliding window at
 admission, before the route's own work. On `GET /connections` with a valid `reveal` value, a
-429 is held until the route has run its channel-scope check and the reveal's
-`messages:view_summary` check, so with the budget spent those refusals still answer 403 and write
-their `auth.channel_denied` or `auth.permission_denied` row, as the pre-pacing route did. Unlike
+429 is held until the route has run its channel-scope check and the reveal's own refusals: its
+`messages:view_summary` check, the PHI-read serve-hop refusal and the new-address refusal (vault
+BACKLOG #2620). So with the budget spent those refusals still answer with their own status and
+record what the pre-pacing route recorded: an `auth.channel_denied` or `auth.permission_denied`
+row, or the new-address refusal's deduped `auth.new_address_reverify_required` row; the serve-hop
+refusal writes none. Unlike
 that route, they then write no `monitoring:read` grant row. A held 429 the route never
 raises, at least because one of those checks refused first, writes no throttled row or log line. A
 reveal value that will fail validation is charged and refused at the gate like any other read.
@@ -7752,7 +7756,8 @@ tab makes no HTTP request to the six routes. So a signed-in console session that
 
 Other `monitoring:read` reads that cost work are not charged either. At least `GET /events`,
 `GET /connections/{name}/events` and `GET /config/provenance` stay on plain `require`, and the
-`/ws/stats` socket, a frame a second, runs the `/stats` store aggregate on every frame and, where
+`/ws/stats` socket, a frame a second, runs `store.stats()` (the outbox counts by status, not the
+whole `/stats` aggregate) on every frame and, where
 the web console is served, the connections-dashboard read (`_dashboard_rows`, the work behind
 `GET /connections`) too, with no charge here. The socket cap of 64 is per API process, not per
 account, so one account may hold all 64: about 3,840 of each such read a minute, with no 429.

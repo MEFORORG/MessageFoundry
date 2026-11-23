@@ -2073,7 +2073,10 @@ async def raise_deferred_monitoring_refusal(request: Request) -> None:
     A no-op where nothing is held, at least: the budget had room, the no-auth path, a request
     without the deferring parameter, and the web console's in-process call, whose own request
     carries nothing held. A route that defers must call this on every path that does the paced
-    work; nothing checks that it does, so a missed call serves a throttled caller."""
+    work, or it serves a throttled caller. No runtime check enforces that. For the one deferring
+    route, ``GET /connections``, a test in ``tests/test_monitoring_read_pacing.py`` pins the raise:
+    ``test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spent``. A new deferring
+    route needs its own such test."""
     held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
     if not isinstance(held, _DeferredRefusal):
         return

@@ -1178,8 +1178,9 @@ count is above `0` (vault BACKLOG #2613).
 - **What you lose:** the per-account pace on six `monitoring:read` GETs of the JSON API
   ([SECURITY.md](SECURITY.md), *Monitoring-read pacing*, names them). One signed-in account can make
   the engine rebuild the wiring graph and scan the store through those routes faster, up to as fast
-  as it answers. With the pace on, the same work stays reachable unpaced through the web console's
-  in-process reads and the `/ws/stats` socket; that section, *What it does not charge*, says how.
+  as it answers. With the pace on, the same work stays reachable unpaced through the `/ws/stats`
+  socket and, where the web console is served (`[api].serve_ui` on), through its in-process reads;
+  that section, *What it does not charge*, says how.
 - **When acceptable:** a monitoring tool on one known account that polls faster than the default
   allows, on a host no untrusted client can reach. Prefer a modest raise to turning it off.
 - **Compensating controls:** keep sessions short, and restrict who reaches the API with

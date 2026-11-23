@@ -69,9 +69,11 @@ async def _service(engine: Engine, **overrides: object) -> AuthService:
     return service
 
 
-def _client(engine: Engine, service: AuthService, *, serve_ui: bool = False) -> httpx.AsyncClient:
+def _client(
+    engine: Engine, service: AuthService, *, serve_ui: bool = False, ip: str = "127.0.0.1"
+) -> httpx.AsyncClient:
     transport = httpx.ASGITransport(
-        app=create_app(engine, auth=service, serve_ui=serve_ui), client=("127.0.0.1", 123)
+        app=create_app(engine, auth=service, serve_ui=serve_ui), client=(ip, 123)
     )
     return httpx.AsyncClient(transport=transport, base_url="http://t")
 
@@ -284,6 +286,28 @@ async def test_a_reveal_without_view_summary_is_denied_with_the_budget_spent(
         d.get("permission") == "messages:view_summary"
         for d in _actions(rows, "auth.permission_denied")
     )
+
+
+async def test_a_reveal_from_a_new_address_is_refused_for_it_with_the_budget_spent(
+    engine: Engine,
+) -> None:
+    """With the budget spent, an in-scope reveal on a token replayed from a host the session has
+    not verified from gets the new-address refusal (403 + ``X-Step-Up-Required``) and its
+    ``auth.new_address_reverify_required`` row, not a 429 that hides it (vault BACKLOG #2620)."""
+    service = await _scoped_service(
+        engine, monitoring_read_rate_limit_per_actor=1, admin_new_ip_step_up=True
+    )
+    async with _client(engine, service, ip="10.0.0.1") as a:
+        h = await _bearer(a, "op")
+        assert (await a.get("/status", headers=h)).status_code == 200
+        assert (await a.get("/status", headers=h)).status_code == 429  # the budget is spent
+    async with _client(engine, service, ip="10.9.9.9") as b:
+        r = await b.get("/connections", params={"reveal": "IB_MINE"}, headers=h)
+        assert (r.status_code, r.headers.get("X-Step-Up-Required")) == (403, "1"), r.text
+    rows = await engine.store.list_audit(limit=1000)
+    assert [d.get("seen_ip") for d in _actions(rows, "auth.new_address_reverify_required")] == [
+        "10.9.9.9"
+    ]
 
 
 async def test_an_invalid_reveal_over_the_budget_writes_a_decision_row(engine: Engine) -> None:

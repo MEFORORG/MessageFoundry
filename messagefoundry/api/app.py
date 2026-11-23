@@ -5723,14 +5723,17 @@ def create_app(
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
         # behind a 429. For that reason the gate holds a monitoring-read 429 on a valid reveal, and
-        # it is raised here, after this check and the reveal's permission check, so both refusals
-        # are answered and recorded as before pacing (vault BACKLOG #1191). A scoped caller's dashboard carries no
-        # outbound rows at all.
+        # it is raised here, after this check and the reveal's own refusals (its permission, the
+        # serve hop and the new address). Each of those is answered and recorded as before pacing
+        # (the hop refusal writes no row), except that with the budget spent no monitoring:read
+        # grant row is written (owner ruling 2026-11-23; vault BACKLOG #1191). A scoped caller's
+        # dashboard carries no outbound rows at all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
-            await _refuse_reveal_without_view_summary(request, identity)
+            await _refuse_reveal(request, identity)
         await raise_deferred_monitoring_refusal(request)
-        await _admit_reveal(request, identity, reveal)
+        if reveal is not None:
+            _charge_reveal(request, identity)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:
             # The audit records what the response carried, not what was asked for: an in-scope
@@ -6798,12 +6801,27 @@ def create_app(
         route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
         if reveal is None:
             return
+        await _refuse_reveal(request, identity)
+        _charge_reveal(request, identity)
+
+    def _reveal_over_http(request: Request) -> bool:
+        """Whether a reveal came over HTTP rather than from a ``/ui`` route calling in process,
+        which took the hop, new-address and budget checks in ``require_ui(..., phi=True)``."""
+        return not (_matched_route_path(request) or "").startswith("/ui/")
+
+    async def _refuse_reveal(request: Request, identity: Identity) -> None:
+        """The refusals of :func:`_admit_reveal`, without its PHI-read charge, for a route that
+        must answer them before a held monitoring-read 429 (``GET /connections``)."""
         await _refuse_reveal_without_view_summary(request, identity)
-        if not (_matched_route_path(request) or "").startswith("/ui/"):
+        if _reveal_over_http(request):
             enforce_phi_read_hop(request)
             # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
             # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
             await refuse_from_new_address(request)
+
+    def _charge_reveal(request: Request, identity: Identity) -> None:
+        """The PHI-read charge of :func:`_admit_reveal`, run after :func:`_refuse_reveal`."""
+        if _reveal_over_http(request):
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
