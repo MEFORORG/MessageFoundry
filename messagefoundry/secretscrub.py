@@ -1124,11 +1124,12 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
 # A quoted scheme token after an EARLIER label's plain value, as in
 # ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
-# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A
-# tail or a key body prints as before on a line the camelCase union returns its reading before for, whole: a line
-# where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``, and
-# an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
-# reading, so on such a line none of them runs.
+# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail or a
+# key body prints as before in a text the camelCase union returns its reading before for, whole: a
+# text where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
+# and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
+# reading, so in such a text none of them runs. The fallback covers the whole text, not one line,
+# so a member-key label on one line leaves a PEM body on a later line unmasked.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.

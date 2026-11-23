@@ -41,8 +41,9 @@ invariants can't silently regress.
   all 25 console route patterns are scanned; only its own ``re.compile(pattern)`` is unresolvable, by
   construction. None of the five is a catastrophic shape by inspection. A constant **imported from
   another module** would land in the same set: the scan is per-file, so it resolves module-,
-  function- and class-scope constants and string collections in the file it is reading, but never
-  across an import.
+  function- and class-scope constants and string collections in the file it is reading, and
+  crosses an import only for a module named in :data:`_IMPORTED_CONSTANT_MODULES`, whose string
+  attributes it reads from the imported module itself.
 * **Catastrophic shapes the matcher does not model.** It detects an unbounded quantifier (``+``,
   ``*``, ``{n,}``) applied to a group that contains an unbounded quantifier at **any** nesting depth.
   It does **not** detect overlapping alternation (``(a|a)*``), nor a catastrophic interaction spread
@@ -304,6 +305,38 @@ def _assign_targets(node: ast.AST) -> tuple[ast.Name, ast.expr] | None:
     return target, value
 
 
+#: First-party modules whose string constants the scan reads across a ``from <module> import``.
+#: ``support/redact.py`` imports the masked tails (``_BEARER_TAILS``, ``_KV_TAILS``,
+#: ``_MEFOR_TAILS``) and ``_BYTES_PROBE`` from ``secretscrub`` and splices them into four of its
+#: patterns (BACKLOG #5546 to #5548). Read per file, those four did not resolve, so a greedy nested
+#: quantifier added to a tail would have passed the scan there. Some tails are built at import time
+#: (``_NO_LABEL_BEFORE`` is a ``"".join`` over the label words), so no static reading of
+#: ``secretscrub.py`` resolves them: the scan reads each imported name's value from the imported
+#: module instead, which is the value the importing module splices. Only a ``str`` value is read;
+#: anything else stays unresolved. A module is named here rather than every first-party module,
+#: so that the scan imports nothing it was not told to and the pin reads the same on every
+#: platform.
+_IMPORTED_CONSTANT_MODULES = frozenset({"messagefoundry.secretscrub"})
+
+
+def _imported_constants(tree: ast.Module) -> dict[str, str]:
+    """``{local name: value}`` for each ``str`` a file imports from :data:`_IMPORTED_CONSTANT_MODULES`."""
+    names: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.ImportFrom)
+            and node.level == 0
+            and node.module in _IMPORTED_CONSTANT_MODULES
+        ):
+            continue
+        module = importlib.import_module(node.module)
+        for alias in node.names:
+            value = getattr(module, alias.name, None)
+            if isinstance(value, str):
+                names[alias.asname or alias.name] = value
+    return names
+
+
 def _string_constants(tree: ast.Module) -> dict[str, str]:
     """Pass 1: ``NAME = "literal"`` string constants **in every scope** (composed ones included).
 
@@ -311,9 +344,11 @@ def _string_constants(tree: ast.Module) -> dict[str, str]:
     exactly as invisible to an inline-literal scanner as a module-level one, and dropping it silently
     is how a catastrophic pattern would pass. A name bound to two different literals in the same file
     is discarded as ambiguous rather than resolved to whichever won — reporting the wrong literal
-    would be a fabricated finding.
+    would be a fabricated finding. The map starts from :func:`_imported_constants`, so a name the
+    file imports from a module that list names resolves, and a local binding of the same name to
+    other text makes it ambiguous like any other.
     """
-    names: dict[str, str] = {}
+    names: dict[str, str] = _imported_constants(tree)
     ambiguous: set[str] = set()
     for node in ast.walk(tree):
         assignment = _assign_targets(node)
@@ -666,8 +701,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``_GUARDED_BRACED_VALUE``. That is why ``_AUTH_SCHEME`` joins this list. Every repetition they
     # add is possessive (``++``, ``*+``, ``\s*+``) or bounded (``{1,6}``), and none sits under an
     # unbounded greedy quantifier. ``support/redact.py`` spells the same fragments with literal
-    # keywords, so ITS copies stay resolvable, and this scanner reads them there; that is the scanned
-    # twin of every expression below. ``_KV_QUOTED_VALUE`` (``_CREDENTIAL_KV``'s quoted value, which
+    # keywords, and takes the masked tails and the bytes probe from ``secretscrub`` by import, which
+    # :data:`_IMPORTED_CONSTANT_MODULES` lets this scanner read. So ITS copies stay resolvable, and
+    # this scanner reads them there; that is the scanned twin of every expression below. ``_KV_QUOTED_VALUE`` (``_CREDENTIAL_KV``'s quoted value, which
     # runs on past a later label's opening quote) is written as plain concatenation in both files for
     # that reason: built by a helper, the bundle copy fell out of this scan.
     #
@@ -686,7 +722,9 @@ _UNSCANNABLE_RE_PATTERNS = {
     # Two more since BACKLOG #5545's union. ``_CAMEL_PROBE`` compiles ``_CAMEL_START``'s builder
     # with a separator after the label word, which holds no repetition outside a lookaround and the
     # possessive ``\s*+``. ``_pre_camel`` compiles each shipped pattern with its
-    # camelCase fragments swapped back for what ``origin/main`` held there before #5545. That is the
+    # camelCase fragments swapped back for what ``origin/main`` held there before #5545, with the
+    # masked tails and the bytes probe stripped, and ``_PRIVATE_KEY_BLOCK`` compiled as a pattern
+    # that never matches. Apart from the tails and the key block, that is the
     # shipped pattern with each fragment replaced by text this file scanned then, not the whole of a
     # pattern scanned then: a pattern changed since #5545 comes back with its later change, and one
     # added since, such as ``_WIDE_DSN_PASSWORD``, holds no fragment and comes back as it ships.
@@ -726,10 +764,12 @@ _UNSCANNABLE_RE_PATTERNS = {
     # fragment, and ``_BEARER`` also ``_MARKED_SCHEME_WORDS``; the query filter in ``logging_setup``
     # splices the probe and ``_KV_TAILS``. ``support/redact.py`` imports the probe and the tails from
     # ``messagefoundry/secretscrub.py`` rather than spelling them, so that the tails' contract is
-    # stated once there, and its copies of those four patterns no longer resolve either: they have
-    # their own entry below. So the scanned twin named above covers redact.py's patterns that take no
-    # tail, at least ``_AUTH_SCHEME``, and not these four. By inspection every repetition the tails
-    # add is possessive or a fixed count, the label stops in ``_NO_LABEL_BEFORE`` are fixed-width
+    # stated once there. This scanner reads those imported values from ``secretscrub`` itself
+    # (:data:`_IMPORTED_CONSTANT_MODULES`), so redact.py's copies of the four patterns resolve, with
+    # the tails in them, and are scanned there. ``secretscrub.py``'s own copies stay unresolved,
+    # below: at least ``_alternation(...)``, ``re.escape(...)`` and the join that builds
+    # ``_NO_LABEL_BEFORE`` are runtime composition, which a reading of that file does not resolve. By inspection every
+    # repetition the tails add is possessive or bounded, the label stops in ``_NO_LABEL_BEFORE`` are fixed-width
     # lookbehinds with no repetition, and each tail group is optional and possessive after the whole
     # old match. BACKLOG #5550's ``_PRIVATE_KEY_BLOCK`` splices ``_KEY_LINE``, which holds those label
     # stops; why it is linear is on the pattern. The two ``source`` entries are ``_pre_camel``'s and
@@ -745,12 +785,6 @@ _UNSCANNABLE_RE_PATTERNS = {
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
         "source",
-    ),
-    "messagefoundry/support/redact.py": (
-        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:bearer|authorization|token|session|api[_-]?key))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*' + _MARKED_SCHEME_WORDS + _BYTES_PROBE + '(?:' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + ')' + _BEARER_TAILS",
-        "'\\\\b(MEFOR_[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)' + _MEFOR_TAILS",
-        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:pass(?:word|wd|phrase)?|pwd|secret|credential))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')' + _KV_TAILS",
-        "_LABEL_START + '(' + _LABEL_PREFIX + '(?i:encryption_key(?:s_retired)?|private_key|intake_api_key_next))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*' + _BYTES_PROBE + '(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_KEY_VALUE + ')' + _KV_TAILS",
     ),
     "messagefoundry/parsing/_builtin_hl7.py": ("f'{e}\\\\.({prefixes})(?!{e})'",),  # ASVS 1.3.3
     # ADR 0030 §4h: the site-code prefix is no longer a literal in the anonymizer — it is EXTERNALIZED
@@ -854,6 +888,28 @@ def test_no_catastrophic_regex_in_source() -> None:
         if _has_nested_quantifier(pat)
     ]
     assert not offenders, "nested-quantifier (ReDoS) regex(es) found:\n" + "\n".join(offenders)
+
+
+@pytest.mark.parametrize("name", ["_BEARER_TAILS", "_KV_TAILS", "_MEFOR_TAILS", "_BYTES_PROBE"])
+def test_a_nested_quantifier_in_an_imported_tail_is_caught_in_redact(
+    monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """``support/redact.py`` splices the tails it imports from ``secretscrub``; the scan reads them.
+
+    A greedy nested quantifier added to one of them must red the scan of redact.py, where the
+    tail is spliced, not pass because the import hid it (BACKLOG #5546 to #5548).
+    """
+    import messagefoundry.secretscrub as secretscrub
+
+    source = (_REPO / "messagefoundry" / "support" / "redact.py").read_text(encoding="utf-8")
+    resolved, unresolved = _regex_scan(source)
+    assert len(resolved) == 9
+    assert len(unresolved) == 0
+    assert find_nested_quantifiers(source) == []
+    monkeypatch.setattr(secretscrub, name, getattr(secretscrub, name) + r"(?:x+)*")
+    offenders = find_nested_quantifiers(source)
+    assert offenders
+    assert all(r"(?:x+)*" in pattern for pattern in offenders)
 
 
 # The MANY-STARTS shape (BACKLOG #4036): an unanchored pattern that opens with a literal prefix,
