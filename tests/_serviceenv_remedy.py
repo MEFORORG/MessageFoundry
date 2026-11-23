@@ -139,12 +139,15 @@ CREATE = (
 
 #: The look-alike step's ending where an entry spelled in ASCII already names the directory,
 #: listed or kept, so it adds none.
-LOOKALIKE_LEAVE = ", and leave the entry spelled in ASCII as the one that names it"
+LOOKALIKE_LEAVE = (
+    ", and leave the entry spelled in ASCII as the one that names it, first setting it to the "
+    "path that holds the secrets directory's files, which may be the one a look-alike named"
+)
 
-#: Its ending where the add-back step prints next and names the path under the ASCII spelling.
+#: Its ending where the add-back step prints next, which says how to add the ASCII entry.
 LOOKALIKE_NEXT = (
-    ". Where one named the secrets directory, the next step names that path under the ASCII "
-    "spelling"
+    ". Where one named the secrets directory, name that same path under the ASCII spelling "
+    "MEFOR_SECRETS_DIRECTORY in the service's AppEnvironmentExtra; the next step says how"
 )
 
 #: Its ending where nothing else names the path under the ASCII spelling.
@@ -153,7 +156,7 @@ LOOKALIKE_ADD = (
     "naming that path to the service's AppEnvironmentExtra, the list install-service.ps1 reads. "
     "`nssm set` replaces that whole list, so read it first with `nssm get`, running the "
     "service's own nssm.exe by its full path, and pass back every entry but those this remedy "
-    "says to remove"
+    "says to remove, leaving out the lines this step says to take out"
 )
 
 
@@ -166,18 +169,21 @@ def lookalike_step(*named: str, ending: str) -> str:
     return (
         "At least one entry spells MEFOR_SECRETS_DIRECTORY with a character outside ASCII, "
         "written here with each such character as its code point: "
-        f"{', '.join(named)}. Windows folds such a name to MEFOR_SECRETS_DIRECTORY, so the engine "
-        "may read it as the secrets directory, but install-service.ps1 does not match it, so a "
-        "re-run of the installer may add a second entry beside it, and the engine may then read "
-        "either. Take each such entry out of the service's environment, whether its value is "
-        "blank or not, taking only its own line out of an entry that holds other lines too"
-        f"{ending}"
+        f"{', '.join(named)}. Windows keeps such a name apart from the ASCII one, but the engine "
+        "reads its environment through Python's os.environ, which folds it to "
+        "MEFOR_SECRETS_DIRECTORY, so the engine may read it as the secrets directory. "
+        "install-service.ps1 does not match it, so a re-run of the installer may add a second "
+        "entry beside it. Take each such entry out of the service's environment, whether its "
+        "value is blank or not, taking only its own line out of an entry that holds other lines "
+        f"too{ending}"
     )
 
 
-#: The KEEP sentence wherever a look-alike is also present, so it never reads as keeping one.
-KEEP_ASCII = KEEP.replace(
-    "sets MEFOR_SECRETS_DIRECTORY to", "sets MEFOR_SECRETS_DIRECTORY, spelled in ASCII, to", 1
+#: The KEEP sentence wherever a look-alike is also present: it names its own antecedent, since
+#: the look-alike step sits between, and keeps the ASCII spelling only.
+KEEP_ASCII = (
+    "Keep any entry a refused value runs on into that sets MEFOR_SECRETS_DIRECTORY, spelled in "
+    "ASCII, to a path and nothing else, as its own entry"
 )
 
 
