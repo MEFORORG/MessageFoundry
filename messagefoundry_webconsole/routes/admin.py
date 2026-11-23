@@ -53,6 +53,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     AuthService,
 )
+from messagefoundry.auth.usernames import username_refusal
 from messagefoundry.controlchars import scrub_log_argument
 
 from .. import pages
@@ -450,6 +451,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             )
         except (ValidationError, HTTPException) as exc:
             detail = "invalid input" if isinstance(exc, ValidationError) else str(exc.detail)
+            if isinstance(exc, ValidationError):
+                # BACKLOG #5520 items 7 and 16: the username rule's reason is fixed text that never
+                # echoes the value, so the form can say why; any other field keeps "invalid input".
+                detail = username_refusal(form.get("username", "").strip()) or detail
             all_roles = await admin.list_roles(service=service, _=identity)
             return HTMLResponse(
                 pages.user_new_page(

@@ -284,6 +284,31 @@ async def test_the_console_create_refuses_a_reserved_or_control_username(engine:
         assert ok.status_code == 200 and "Account created" in ok.text
 
 
+async def test_the_console_create_shows_why_the_username_rule_refused(engine: Engine) -> None:
+    """BACKLOG #5520 items 7 and 16: the form shows the rule's own fixed reason rather than
+    "invalid input" for every refused name. A refusal of another field keeps "invalid input"
+    (control), since only the username rule's reasons are known to carry no input."""
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        reserved = await _post_pairs(
+            c, "/ui/users", [("username", "system"), ("email", "x@example.test")]
+        )
+        control = await _post_pairs(
+            c, "/ui/users", [("username", "a\x07b"), ("email", "x@example.test")]
+        )
+        other = await _post_pairs(
+            c,
+            "/ui/users",
+            [("username", "fine"), ("email", "x@example.test"), ("display_name", "x" * 10_000)],
+        )
+    assert reserved.status_code == 400
+    assert "reserved for the audit trail" in html.unescape(reserved.text)
+    assert "invalid input" not in reserved.text
+    assert control.status_code == 400
+    assert "control, format, invisible or line separator" in html.unescape(control.text)
+    assert other.status_code == 400 and "invalid input" in other.text
+
+
 async def test_create_user_duplicate_rerenders_without_password(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
