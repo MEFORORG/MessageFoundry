@@ -58,7 +58,7 @@ from messagefoundry.controlchars import (
     strip_control_chars,
 )
 from messagefoundry.parsing.peek import HL7PeekError, Peek
-from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
+from messagefoundry.parsing.sniff import _looks_like_hl7, _sniff_head, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.path_reach import is_absent, is_name_absent, is_unreachable
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
@@ -1363,7 +1363,7 @@ def validate_upload_content(display: str, data: bytes) -> None:
         raise UploadContentError(
             display, "is not HL7 (no MSH/FHS/BHS header) despite its extension"
         )
-    if ctype == "xml" and not _lstrip_bom_ws(data).startswith(b"<"):
+    if ctype == "xml" and not _sniff_head(data).startswith(b"<"):
         raise UploadContentError(display, "is not XML (no leading '<') despite its extension")
 
 

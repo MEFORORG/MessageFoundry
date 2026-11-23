@@ -98,6 +98,8 @@ LOOKALIKE_DELIMITERS = [
     "\u02c2directory\u02c3",  # MODIFIER LETTER LEFT/RIGHT ARROWHEAD
     "\u27e8oidc\u27e9",  # MATHEMATICAL LEFT/RIGHT ANGLE BRACKET
     "\u2039oidc>",
+    "cli" + chr(0x0903) + "root",  # DEVANAGARI SIGN VISARGA
+    "cli" + chr(0x0A83) + "root",  # GUJARATI SIGN VISARGA
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
@@ -122,6 +124,9 @@ ACCEPTED = [
     "sys\u2236tem",
     "\u2039bob",
     "bob\u203a",
+    # Letters the confusables data lists for "<" and ">", left out of the table: a Canadian
+    # syllabics name that starts with PA and ends with PO is not a "<...>" form.
+    chr(0x1438) + chr(0x140A) + chr(0x1433),
 ]
 
 

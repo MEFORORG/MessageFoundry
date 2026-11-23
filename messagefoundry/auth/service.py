@@ -13468,7 +13468,10 @@ class AuthService:
     async def checked_user(self, user_id: str) -> VerifiedUser | None:
         """The account ``user_id`` names, its whole record checked against its seal, for a caller
         outside this service that SHOWS it (BACKLOG #5520), and for :meth:`change_password`, which
-        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too.
+        decides on it (BACKLOG #5902), so its raise-or-``None`` contract binds that control too, as
+        it binds at least the admin role, channel-scope and password-reset routes, which answer
+        404 or 423 on it and, for the role write, decide the directory refusal and the
+        administrator-granted alert on what it returns (BACKLOG #5520 items 2 and 13).
         ``None`` when no row is there. Raises :class:`UserSealRefused` only when
         :meth:`_verified` established that the record fails,
         or :meth:`_checked_by_id` failed closed, and handed that to the seal-failure report, so

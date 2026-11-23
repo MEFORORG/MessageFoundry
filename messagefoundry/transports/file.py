@@ -2667,7 +2667,7 @@ def _win_delete_aged(path: Path, older_than: float) -> bool:
 
 
 # --- helpers -----------------------------------------------------------------
-# The pure magic-byte sniffers (_looks_like_hl7 / _lstrip_bom_ws / _content_matches_declared) were hoisted
+# The pure magic-byte sniffers (_looks_like_hl7 / _sniff_head / _content_matches_declared) were hoisted
 # to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py can reuse them without importing a transport;
 # they are re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
 # existing tests that import them from here are unchanged.
