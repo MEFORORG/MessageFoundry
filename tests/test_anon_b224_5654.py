@@ -567,6 +567,34 @@ def test_allowed_addresses_joined_by_a_dot_are_no_hit(leak: ModuleType, written:
     assert not any(leak.IPV6_REASON in hit for hit in report.hits), report.hits
 
 
+@_NO_SCANNER
+@_LEAKS
+@pytest.mark.parametrize(
+    ("written", "refused"),
+    [
+        ("a:b.c.d::1", True),
+        ("fe80::1.bead::", True),
+        ("ｆe80::1", True),
+        ("::①", False),
+        (_GLOBAL.replace(":", "\\XEFBC9A\\"), False),
+    ],
+    ids=[
+        "dot-cut-d",
+        "dot-cut-hex-word",
+        "written-reading",
+        "circled-loopback",
+        "escaped-fw-colon",
+    ],
+)
+def test_the_ipv6_examples_phi_md_names_hold(leak: ModuleType, written: str, refused: bool) -> None:
+    """docs/PHI.md section 9 names these: pieces a dot cuts that refuse, a value refused for its
+    written reading though its folded one is allowed, a circled digit that folds to loopback, and
+    fullwidth colons written as hex escapes, which no reading makes a colon."""
+    report = leak.leak_report(_zpd(written), rules=DEFAULT_RULES)
+    hit = f"unmapped {leak.IPV6_REASON} in ZPD-4" in report.structural_hits
+    assert hit is refused, report.hits
+
+
 @_LEAKS
 def test_a_dot_joined_run_is_cut_in_linear_time(leak: ModuleType) -> None:
     """Each group of a run is visited once, so many dot-joined allowed addresses stay cheap."""

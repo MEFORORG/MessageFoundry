@@ -26,14 +26,15 @@ structural PHI-shape detectors + unmapped-field coverage report below (BACKLOG #
 they are held byte-for-byte identical with the toolkit copy so the two agree on every input. They
 look for a dashed SSN, a punctuated phone, an ``MR``/``MRN`` id type and a routable IPv6 address
 (BACKLOG #5654) in the fields no rule rewrote; the IPv6 detector also reads the MSH header, MSH-2
-past its encoding characters and the fields from MSH-3 on that no rule rewrites. In a header field
-an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites, the SSN, phone and IPv6 checks read only the
-components past component 1 that the rule keeps. The dashed SSN and punctuated phone detectors
-also refuse such a shape that the message's own field
-separator cut across fields, when at least one of them is unmapped (BACKLOG #3465), and scan what
-a retarget of a default field left past its first component (:func:`retarget_residue_hits`,
-BACKLOG #3493), and the components an ``id``, ``mrn``, ``ssn`` or ``dln`` rule keeps as captured
-past its first (:func:`kept_component_hits`, BACKLOG #5533, #5534). The shape detectors that read one field, and the token scan, read a value
+past its encoding characters and the fields from MSH-3 on that no rule rewrites. The dashed SSN and
+punctuated phone detectors also refuse such a shape that the message's own field separator cut
+across fields, when at least one of them is unmapped (BACKLOG #3465). The dashed SSN, punctuated
+phone and routable IPv6 detectors also scan the part past component 1 of a field a retarget of a
+default field points at a different kind (:func:`retarget_residue_hits`, BACKLOG #3493), and of a
+field an ``id``, ``mrn``, ``ssn`` or ``dln`` rule rewrites, which on the anonymizer's output holds
+the components the rule keeps as captured (:func:`kept_component_hits`, BACKLOG #5533, #5534), a
+header field from MSH-3 on included. In the header, that part is all the SSN and phone detectors
+read. The shape detectors that read one field, and the token scan, read a value
 decoded from its HL7 escape sequences as well as as written, when the message has a parseable
 MSH that declares an escape character (BACKLOG #5532); docs/PHI.md section
 9, *An escaped value is read decoded too*, lists at least the escaped forms each check still
@@ -1497,11 +1498,12 @@ def refusal_advice(
 UNMAPPED_SCOPE_NOTE = (
     "Beyond the partner-token and IPv4 scan of the whole message, the leak-check looks in these "
     "fields only for a dashed SSN, a punctuated phone number, an MR/MRN-typed identifier and a "
-    "routable IPv6 address. In the MSH header past its encoding characters, it looks for a "
-    "routable IPv6 address in the fields no rule rewrites, and for a dashed SSN, a punctuated phone number and a routable IPv6 "
-    "address in the components past the first that an id, mrn, ssn or dln rule keeps. A "
-    "name, an undashed number or a date in one of them passes, so review this list before you "
-    "share the dataset."
+    "routable IPv6 address. A name, an undashed number or a date in one of these fields passes, "
+    "so review this list before you share the dataset. Outside these fields it also looks for a "
+    "routable IPv6 address in the MSH header fields no rule rewrites, MSH-2 past its encoding "
+    "characters included, and for a dashed SSN, a punctuated phone number and a routable IPv6 "
+    "address past component 1 of a field an id, mrn, ssn or dln rule or a retarget of a default "
+    "field rewrites, header fields included."
 )
 
 
