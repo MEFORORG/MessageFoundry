@@ -99,7 +99,7 @@ class IntakeHandler[R]:
     __slots__ = ("_handler",)
 
     def __init__(self, handler: Callable[..., Awaitable[R]]) -> None:
-        param = inspect.signature(handler).parameters.get("intake")
+        param = inspect.signature(handler, follow_wrapped=False).parameters.get("intake")
         if (
             param is None
             or param.kind not in (param.POSITIONAL_OR_KEYWORD, param.KEYWORD_ONLY)

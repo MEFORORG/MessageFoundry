@@ -137,7 +137,14 @@ async def test_an_intake_handler_always_gets_the_keyword_and_a_wrong_one_fails_w
     async def required_intake(raw: bytes, intake: IntakeContext) -> str:
         return "no"
 
-    for wrong in (one_argument, required_intake):
+    import functools
+
+    @functools.wraps(keyword_only)
+    async def wraps_one_argument(raw: bytes) -> str:
+        return await keyword_only(raw)
+
+    # The check reads the wrapper's own signature, not the __wrapped__ one it copied.
+    for wrong in (one_argument, required_intake, wraps_one_argument):
         with pytest.raises(TypeError, match="optional intake= keyword"):
             intake_handler(wrong)
 
