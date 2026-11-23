@@ -168,7 +168,8 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   handoff in this directory or beside a SQLite store refuses a read and a mint, so one made
   without the variable is not taken for no key; and the check that refuses another key provider
   beside a host file or handoff looks in at least the custody directory, this directory and the
-  place beside a SQLite store, whatever is set; its way on leaves every file it finds in place.
+  place beside a SQLite store, whatever is set. Its refusal deletes no file it finds and moves
+  none, and points at the one procedure in docs/SERVICE.md that says when a key file may move.
   `install-service.ps1` makes the custody directory only when it reads that provider, and names
   it to the service as `MEFOR_CUSTODY_DIRECTORY`. docs/SERVICE.md, *The custody directory under
   the host key provider*, states its location, its access list and the rest, and is the record

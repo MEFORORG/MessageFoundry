@@ -356,7 +356,10 @@ function Get-UninstallResidueNotice {
         $lines += "  Secrets dir      $SecretsDir"
         $lines += "                   The secrets directory the service read: any file in it holds"
         $lines += "                   a secret in plain text. This script leaves it and its files."
-        $lines += "                   Delete them once nothing needs them."
+        $lines += "                   Delete them once nothing needs them, except master.key and"
+        $lines += "                   handoff.key: either may be a store's only key on this host,"
+        $lines += "                   so never delete either. See docs/SERVICE.md 'When a refusal"
+        $lines += "                   names master.key or handoff.key'."
     }
 
     if ($CustodyDir) {

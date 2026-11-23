@@ -344,11 +344,13 @@ def test_the_installer_makes_and_names_the_custody_directory_under_the_host_prov
     flat = " ".join(text.split())
     refusal = flat.index('throw ("Could not name the custody directory')
     assert "Disable-RefusedService" in flat[refusal : refusal + 600], flat[refusal : refusal + 600]
-    # A refusal while it is made disables the service too, and "made here" is read before the
-    # create, which succeeds on a folder already there.
-    made = flat.index("$CustodyDirMadeHere = -not (Test-Path -LiteralPath $CustodyDir)")
+    # A refusal while it is made disables the service too. Whether it was there is read before the
+    # create, which succeeds on a folder already there, and "made here" is set only after the
+    # create's read-back, so a folder someone made in between is never removed as this run's.
+    made = flat.index("$custodyExisted = Test-Path -LiteralPath $CustodyDir")
     create = flat.index('New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"')
-    assert made < create, (made, create)
+    marked = flat.index("$CustodyDirMadeHere = -not $custodyExisted")
+    assert made < create < marked, (made, create, marked)
     window = flat[create : flat.index("Set-CustodyDirAcl -Path $CustodyDir", create)]
     assert "Disable-RefusedService" in window and "Remove-CustodyDirMadeHere" in window, window
     # Each custody refusal after registration removes only a directory this run made; none
@@ -434,7 +436,7 @@ def test_the_uninstall_notice_says_what_the_custody_directory_keeps(tmp_path: Pa
     )
     assert "entry for ''" not in nobody and "the account the service ran as" in nobody, nobody
     without = " ".join(_notice(tmp_path, {**_FULL_FACTS, "CustodyDir": ""}).split())
-    assert "handoff.key" not in without and "Custody" not in without, without
+    assert "handoff.key holds" not in without and "Custody" not in without, without
 
 
 @_windows_only
@@ -495,3 +497,25 @@ def test_the_custody_directory_check_accepts_a_named_one_and_never_says_remove(
     assert not made.exists() and "was removed" in got["made"], got
     assert (full / "master.key").exists() and got["full"] == "", got
     assert other.exists() and got["other"] == "", got
+
+
+def test_the_secrets_directory_texts_never_send_a_key_file_to_be_deleted(tmp_path: Path) -> None:
+    """Review round-0c8608ba47 item 1: docs/SERVICE.md's key-file procedure sends an operator to a
+    new -SecretsDir, and the custody files may sit in the secrets directory, so each installer and
+    uninstaller text that says to delete or remove the secrets directory or its files carves out
+    master.key and handoff.key and points at that procedure."""
+    from tests.test_service_install_manifest import _FULL_FACTS, _notice
+
+    # The script's string pieces joined, so a sentence split over `" +` lines reads whole.
+    joined = re.sub(r'"\s*\+\s*"', "", " ".join(_script_text().split()))
+    title = "When a refusal names master.key or handoff.key"
+    for start in (
+        "Then delete the old files you copied",
+        "it already exists and the service does not name it. Remove it, check who made it",
+        "Remove it, check who made it, and re-run the installer. If it holds master.key",
+    ):
+        window = joined[joined.index(start) : joined.index(start) + 500]
+        assert "handoff.key" in window and title in window, window
+    notice = " ".join(_notice(tmp_path, {**_FULL_FACTS, "CustodyDir": ""}).split())
+    assert "except master.key and handoff.key" in notice, notice
+    assert "never delete either" in notice, notice

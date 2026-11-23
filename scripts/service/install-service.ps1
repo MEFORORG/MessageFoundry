@@ -984,7 +984,11 @@ function New-RestrictedDirectory {
             "Check who made it. Leave every key file in it where it is, and delete nothing: a " +
                 "master.key or handoff.key there may be the only copy of a store's key on this " +
                 "host. Then follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'."
-        } else { "Remove it, check who made it, and re-run the installer." }
+        } else {
+            "Remove it, check who made it, and re-run the installer. If it holds master.key or " +
+                "handoff.key, do not remove it or delete either file: follow docs/SERVICE.md 'When " +
+                "a refusal names master.key or handoff.key'."
+        }
         throw ("'$Path' was there before this install made it (its owner is $owner), so it is not " +
             "the restricted folder the install asked for. $remedy")
     }
@@ -3021,7 +3025,10 @@ $SecretsDirNamed = [bool]$RegisteredSecretsDir -and ($RegisteredSecretsDir.TrimE
 if (-not $secretsProblem -and (Test-Path -LiteralPath $SecretsDir)) {
     if (-not $SecretsDirNamed) {
         $secretsProblem = ("it already exists and the service does not name it. Remove it, check who " +
-            "made it, and re-run the installer, which then makes it restricted")
+            "made it, and re-run the installer, which then makes it restricted. If it holds " +
+            "master.key or handoff.key, which may be the only copy of a store's key on this host, " +
+            "do not remove it or delete either file: pass -SecretsDir naming a new folder, and " +
+            "follow docs/SERVICE.md 'When a refusal names master.key or handoff.key'")
     } else {
         $owner = (Get-Acl -LiteralPath $SecretsDir).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -ne "S-1-5-32-544" -and $owner -ne "S-1-5-18") {
@@ -3589,7 +3596,10 @@ try {
         Write-Warning ("The service's MEFOR_SECRETS_DIRECTORY named '$replacedSecretsDir' and now names " +
             "'$SecretsDir', as -SecretsDir asked. Copy each file from the old directory, never move " +
             "it: a moved file keeps its old access list, not the new directory's. Then delete the old " +
-            "files, and remove the service account's grant there.")
+            "files you copied, and remove the service account's grant there. Leave a master.key or " +
+            "handoff.key there where it is, and delete neither: either may be the only copy of a " +
+            "store's key on this host, and docs/SERVICE.md 'When a refusal names master.key or " +
+            "handoff.key' says how to go on.")
     }
     Write-Host "  Secrets: '$SecretsDir', named to the service as MEFOR_SECRETS_DIRECTORY (docs/SERVICE.md)."
 } catch {
@@ -3612,9 +3622,12 @@ if ($HostCustody) {
         $CustodyParent = Split-Path -Parent $CustodyDir
         if (-not (Test-Path -LiteralPath $CustodyParent)) { New-AdminOnlyFolder -Path $CustodyParent }
         if (-not $CustodyDirNamed -or -not (Test-Path -LiteralPath $CustodyDir)) {
-            # Read before the call: CreateDirectory succeeds on a folder that is already there.
-            $CustodyDirMadeHere = -not (Test-Path -LiteralPath $CustodyDir)
+            # Read before the call, since CreateDirectory succeeds on a folder that is already
+            # there, and set only once the call has read back the owner it asked for: a folder
+            # someone made in between fails that read-back, and is not this run's to remove.
+            $custodyExisted = Test-Path -LiteralPath $CustodyDir
             New-RestrictedDirectory -Path $CustodyDir -What "the custody directory"
+            $CustodyDirMadeHere = -not $custodyExisted
             $custodyHeld = @(Get-ChildItem -LiteralPath $CustodyDir -Force -ErrorAction Stop)
             if ($custodyHeld.Count -ne 0) {
                 throw ("-CustodyDir '$CustodyDir' cannot be the custody directory: it holds " +

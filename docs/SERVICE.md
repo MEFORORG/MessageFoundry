@@ -246,6 +246,21 @@ Administrator from an elevated shell on the host:
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
 ```
 
+If the service started first, at the shipped posture it refuses to start. Once the earlier start
+checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
+log; run the command, then restart the service. In the data directory the install script hardens,
+the service account and the operator can both open the store, in either order. The rules are in
+[SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632).
+
+> **Migration note (ADR 0050, `--project-root`).** `serve`/`supervise --project-root R` now anchors the
+> **whole** config bundle under `R` — the `--config` graph, `environments/<env>.toml`, `messagefoundry.toml`,
+> **and** a relative `[store].path` / `--db` (and each shard's `<stem>_<shard>.db`). Previously only
+> `environments/` was anchored; a relative DB resolved against the process CWD. If you already run with
+> `--project-root` **and** a relative DB path, the DB will now be found/created under `R` — pass an
+> **absolute** `[store].path` / `--db` to keep it in place (absolute paths bypass the root), or accept the
+> new location. The startup CWD-mismatch WARNING names the resolved paths so any move is visible. Deployments
+> without `--project-root`, or with an absolute DB path, are unchanged.
+
 Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
 LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
 install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
@@ -303,21 +318,6 @@ to the same path, so the handoff lands where the service looks:
 $env:MEFOR_CUSTODY_DIRECTORY = 'C:\ProgramData\MessageFoundry-custody'
 ```
 
-If the service started first, at the shipped posture it refuses to start. Once the earlier start
-checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
-log; run the command, then restart the service. In the data directory the install script hardens,
-the service account and the operator can both open the store, in either order. The rules are in
-[SECURITY.md](SECURITY.md#provisioning-the-first-administrator-asvs-632).
-
-> **Migration note (ADR 0050, `--project-root`).** `serve`/`supervise --project-root R` now anchors the
-> **whole** config bundle under `R` — the `--config` graph, `environments/<env>.toml`, `messagefoundry.toml`,
-> **and** a relative `[store].path` / `--db` (and each shard's `<stem>_<shard>.db`). Previously only
-> `environments/` was anchored; a relative DB resolved against the process CWD. If you already run with
-> `--project-root` **and** a relative DB path, the DB will now be found/created under `R` — pass an
-> **absolute** `[store].path` / `--db` to keep it in place (absolute paths bypass the root), or accept the
-> new location. The startup CWD-mismatch WARNING names the resolved paths so any move is visible. Deployments
-> without `--project-root`, or with an absolute DB path, are unchanged.
-
 #### When a refusal names master.key or handoff.key
 
 This is the one procedure for going on past a refusal that names `master.key` or `handoff.key`, the
@@ -329,13 +329,19 @@ directory the service does not name, as after an uninstall. Neither the engine n
 tell whose key a file holds, and either file may be the only copy of a store's key on this host.
 
 1. **Delete nothing, and leave every key file where it is**, in every directory the refusal names,
-   unless step 3 sends you to move one; then move it only as step 5 says.
+   unless step 3 sends you to move one; then move it only as step 5 says, which also says when an
+   original may go.
 2. **Stop the service** (`Stop-Service <ServiceName>`) if it is installed, and work from an
    elevated shell.
 3. **If the file holds this store's key**, as when this store was set up under
    `[store].key_provider = 'host'`:
    - When the refusal says `[store].key_provider` is another provider, make the settings change
-     the refusal names. No file moves.
+     the refusal names. That provider reads the file only from the custody directory
+     `MEFOR_CUSTODY_DIRECTORY` names, else the one `MEFOR_SECRETS_DIRECTORY` names, else beside a
+     SQLite store, and needs to add a file there. So, under the install script, re-run it once the
+     settings name that provider, which makes the custody directory and names it to the service
+     ([The custody directory](#the-custody-directory-under-the-host-key-provider)), and move the
+     file into it as step 5 says.
    - When the file sits outside the custody directory the service names, move it into that
      directory as step 5 says.
    - When the install script refuses a kept custody directory, re-run it with `-CustodyDir` naming
@@ -368,8 +374,21 @@ tell whose key a file holds, and either file may be the only copy of a store's k
    `icacls <file>` prints the same entries for the copy as for the original, and that
    `(Get-Acl -LiteralPath <file>).Owner` prints the same owner, and keep the original where it is
    until the service has started and opened its store from the copy. Copy the database files
-   across volumes the same way, and keep their originals until then too.
+   across volumes the same way, and keep their originals until then too. Once it has, delete each
+   original as an administrator: a second copy of a key file is a second place the key can be
+   read from, a `handoff.key` on this machine by any account, and the database originals may
+   hold PHI, disposed of as [PHI.md](PHI.md) describes.
 6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
+
+**Without the install scripts**, as on Linux or in a container, the same steps hold with the
+engine stopped in place of the service: leave every key file and delete nothing; for a file that
+is this store's, make the settings change and put the file where the host provider reads it; for
+one that is not, run the store from a new, empty data directory for a file beside it, or set the
+variable that names the file's directory, `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`,
+to a new directory owned by the account the engine runs as, mode 0700, in a folder only that
+account or root may write, and add the engine's other secret files to a new secrets directory. A move
+within one file system keeps the file's owner and mode; across file systems, copy it keeping them
+(`cp -p`, as root), and keep the original until the engine has opened its store from the copy.
 
 ## Update to a new build (restart vs reinstall)
 

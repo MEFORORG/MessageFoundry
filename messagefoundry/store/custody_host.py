@@ -325,8 +325,9 @@ def foreign_custody_refusal(
     the blob minted for it. A directory setting that is not an absolute path is passed over here,
     and the directories the other setting names are still looked in.
 
-    The way on changes no file it found (PR 2804 fifth hold; Manager ruling 2026-11-22): after the
-    settings change for a blob that holds this store's key, :data:`_LEAVE_KEY_FILES_STEP`."""
+    The way on deletes no file it found and moves none itself (PR 2804 fifth hold; Manager ruling
+    2026-11-22): after the settings change for a blob that holds this store's key,
+    :data:`_LEAVE_KEY_FILES_STEP`."""
     environ = os.environ if environ is None else environ
     found = _key_files_outside(settings, None, environ)
     if settings.encryption_key_file:
@@ -356,12 +357,14 @@ def foreign_custody_refusal(
 _SERVICE_PROCEDURE_TITLE = "When a refusal names master.key or handoff.key"
 
 #: The way on from a refusal that found a key file it cannot tie to this store
-#: (:func:`foreign_custody_refusal`, :func:`_left_outside_the_custody_directory`). It changes no
-#: file: each may be another store's only key.
+#: (:func:`foreign_custody_refusal`, :func:`_left_outside_the_custody_directory`). It deletes no
+#: file and moves none itself, since each may be another store's only key: the procedure it names
+#: says when a file may move, whether or not it is this store's, and covers a host without the
+#: install scripts too.
 _LEAVE_KEY_FILES_STEP = (
     "Leave each key file named here where it is, and delete nothing: each may be the only copy of "
-    "a store's key on this host. To go on, follow docs/SERVICE.md, "
-    f"'{_SERVICE_PROCEDURE_TITLE}'"
+    "a store's key on this host. To go on, whether or not it is this store's, follow "
+    f"docs/SERVICE.md, '{_SERVICE_PROCEDURE_TITLE}', and change a key file only as it says"
 )
 
 
