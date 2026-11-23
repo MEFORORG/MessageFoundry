@@ -1240,6 +1240,102 @@ def test_a_refusal_at_the_second_open_names_the_earlier_open(
     assert ("at the second open" in error) is named, error
 
 
+def _refused_at_the_second_open(
+    exc: Exception,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> str:
+    """Run the command over a keyed-looking store whose swap open raises ``exc``; the error text."""
+    from messagefoundry.store import base
+
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "second-open.db"
+    _seed(db)
+    _live_terminal(monkeypatch)
+    monkeypatch.setattr(cli, "_open_is_keyed", lambda _settings: True)
+    prompted: list[bool] = []
+    real_open_store = base.open_store
+    real_enrol = cli._enrol_totp_at_terminal
+
+    async def open_or_fail(*a: Any, **k: Any) -> Any:
+        if prompted:
+            raise exc
+        return await real_open_store(*a, **k)
+
+    def enrol(**k: Any) -> tuple[str, str, float]:
+        prompted.append(True)
+        return real_enrol(**k)
+
+    monkeypatch.setattr(base, "open_store", open_or_fail)
+    monkeypatch.setattr(cli, "_enrol_totp_at_terminal", enrol)
+    main([_CMD, "--username", _ADMIN, "--db", str(db), "--json"])
+    return _error(capsys)
+
+
+_SALT = "the store's salt record"
+_GENESIS = "the audit chain's genesis record"
+_SCHEMA = "the schema, which the open creates or migrates"
+
+
+@pytest.mark.parametrize("refusal", ["keyless-chain", "keyless-key"])
+def test_a_keyless_refusal_at_the_second_open_names_no_keyed_step_for_the_earlier_open(
+    refusal: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """PR 3162 hold 3 item 1 (BACKLOG #5067): after a keyless-class refusal at the swap's open,
+    the earlier-open sentence named the salt record and the genesis record from the settings'
+    keyedness. The refused class says the store opens keyless, so neither is named.
+
+    Mutation: build the earlier-open sentence from ``_open_is_keyed`` again."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    exc: Exception = (
+        KeylessAuditChainRefused("mefor", "[store].synthetic")
+        if refusal == "keyless-chain"
+        else StoreKeylessError("synthetic keyless store at the second open")
+    )
+    error = _refused_at_the_second_open(exc, tmp_path, monkeypatch, capsys)
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    assert _SALT not in error and _GENESIS not in error, error
+
+
+def test_a_cipher_refusal_at_the_second_open_names_each_one_time_step_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 2 (BACKLOG #5067): only one open can write the genesis record, to an
+    empty chain, and check()'s open had returned, so the swap's open finds the one-time steps
+    done. The text named the schema, the salt record and the genesis record for both opens.
+
+    Mutation: list the one-time steps in the replacement-open sentence again."""
+    error = _refused_at_the_second_open(
+        CipherError("synthetic cipher refusal at the second open"), tmp_path, monkeypatch, capsys
+    )
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+    assert error.count(_GENESIS) == 1 and error.count(_SALT) == 1, error
+    assert error.count(_SCHEMA) == 1, error
+    assert "the replacement's own open may" in error.lower(), error
+
+
+def test_a_short_schema_at_the_second_open_claims_no_row_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 3 (BACKLOG #5067): "and this command wrote no row" described the
+    replacement's open as this command's only one. check()'s open ran first, so the text drops it.
+
+    Mutation: append "and this command wrote no row" whatever the opener."""
+    from messagefoundry.store.server_schema_verify import ServerSchemaMismatchError
+
+    exc = ServerSchemaMismatchError("sqlserver", None, ["synthetic: table 'queue' is short"])
+    error = _refused_at_the_second_open(exc, tmp_path, monkeypatch, capsys)
+    assert "the replacement's own open rolled its schema batch back" in error.lower(), error
+    assert "wrote no row" not in error, error
+    assert _EARLIER_OPEN.lower() in error.lower(), error
+
+
 def test_an_unnamed_os_user_after_the_first_open_says_what_it_may_have_changed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
