@@ -1195,6 +1195,15 @@ IDE_SITES: dict[str, Site] = {
         "joined onto a config directory workspaceContainment.ts has held inside the workspace.",
         'ide/src/newRoute.ts::.replace(/[^A-Za-z0-9_-]/g, "_")}.py`',
     ),
+    "ide/src/pathFold.ts": Site(
+        1,
+        REVIEWED,
+        "nonAsciiCaseVariant joins the target's own root and its first segments, as the target spells "
+        "them, to name the folder at the workspace's depth, with no I/O. Its callers, "
+        "escapesUnderCaseVariant in workspaceContainment.ts and isWorkspaceFolder in "
+        "securityEditorModel.ts, only read that folder's real path, file id or lstat to compare it "
+        "with the workspace folder; nothing is opened, read, written, moved or deleted through it.",
+    ),
     "ide/src/pathIdentity.ts": Site(
         2,
         OPERATOR,
@@ -1203,12 +1212,13 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/promote.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/securityEditorModel.ts": Site(
-        5,
+        4,
         OPERATOR,
         "Every join runs only after securityConfigTarget has refused an untrusted workspace, so each "
-        "part is the workspace folder or its realpath, the messagefoundry.serviceConfig setting from "
-        "user settings or from a workspace the operator has trusted, or a component of the path "
-        "those two resolve to. Not guarded: the containment and link checks run on the joined path. "
+        "part is the workspace folder, the messagefoundry.serviceConfig setting from user settings "
+        "or from a workspace the operator has trusted, or a component of the path those two "
+        "resolve to, a user value spelled with a non-ASCII case variant of the folder included. "
+        "Not guarded: the containment and link checks run on the joined path. "
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
     "ide/src/sourceControl.ts": Site(
@@ -1247,14 +1257,19 @@ IDE_SITES: dict[str, Site] = {
         "storage root for a log line and opens nothing (BACKLOG #5409).",
     ),
     "ide/src/workspaceContainment.ts": Site(
-        8,
+        11,
         GUARDED,
         "The containment checks themselves. resolveInsideWorkspace refuses a setting whose spelling, "
         "and then whose real path, relative to the workspace climbs out or is absolute. "
         "containedPathSetting resolves a workspace value only to compare its spelling with the "
         "folder, and drops it when it is outside. committedRelativePath resolves a value only to "
-        "return it relative to the folder, and refuses one outside it by spelling. None opens a file.",
-        "ide/src/workspaceContainment.ts::path.relative(root, target)",
+        "return it relative to the folder, and refuses one outside it by spelling. "
+        "escapesUnderCaseVariant resolves a value spelled outside only by a non-ASCII case, reads "
+        "real paths and file ids to compare the folder it names with the workspace, and joins the "
+        "rest of the value onto the workspace only to run escapesByLink on it again, which ends in "
+        "resolveInsideWorkspace's real-path check. realpathOfNearestExisting appends missing "
+        "components to an existing ancestor's real path. None opens a file.",
+        "ide/src/workspaceContainment.ts::return isWithin(root, target) ? logical : undefined",
     ),
 }
 
