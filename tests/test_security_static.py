@@ -815,6 +815,13 @@ _UNSCANNABLE_RE_PATTERNS = {
     # it, a tchar, so each character is read once; the optional tail is one ``.*`` with nothing
     # after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
+    # BACKLOG #6637 -- the ignores for pydicom's UserWarning copies of a refused value. ``message``
+    # iterates ``reversed(_PYDICOM_VALUE_WARNINGS)``, which is derived from the ``warning`` field of
+    # each ``_REFUSALS`` shape that sets one, and this scanner reads neither. None has a nested
+    # quantifier. One, ``Value "(?s:.*)" ...``, has the many-starts shape; ``warnings`` applies it
+    # with ``.match``, from the start of the text, so it has one start. That was read in
+    # ``_py_warnings`` and measured through the C ``_warnings.warn`` on CPython 3.14.7.
+    "messagefoundry/transports/dicom.py": ("message",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
