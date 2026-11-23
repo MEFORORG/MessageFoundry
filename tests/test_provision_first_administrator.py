@@ -894,7 +894,8 @@ def test_a_store_the_probe_cannot_open_is_could_not_start(
     argv = ["provision-admin", "--username", "site-admin", "--email", "ops@example.invalid"]
     assert main([*argv, "--db", str(db), "--json"]) == 2
     message = json.loads(capsys.readouterr().out)["error"]
-    assert "a row this open cannot read" in message and "Nothing was written" in message
+    # What the open may have changed before it, never "nothing was written" (BACKLOG #5067).
+    assert "a row this open cannot read" in message and "this command makes did not land" in message
 
 
 def test_a_store_sealed_under_another_key_is_could_not_start(
@@ -932,7 +933,7 @@ def test_a_store_sealed_under_another_key_is_could_not_start(
     message = json.loads(capsys.readouterr().out)["error"]
     assert rc == 2, message
     # The CipherError arm's text, not another could-not-start refusal that also exits 2.
-    assert "no configured key decrypts" in message and message.endswith("Nothing was written")
+    assert "no configured key decrypts" in message and "this command makes did not land" in message
 
 
 # --- BACKLOG #2034: the trust-anchor enforcement dial reaches this command -----------------------
@@ -3244,7 +3245,8 @@ def test_a_wrong_code_at_the_prompt_writes_nothing(
         != 0
     )
     assert terminal.asked == 5
-    assert "nothing was written" in capsys.readouterr().err
+    # No store exists yet, so the pre-check opened nothing (BACKLOG #5067).
+    assert "nothing was written" in capsys.readouterr().err.lower()
     assert not db.exists()
 
 
@@ -3913,7 +3915,7 @@ def test_a_console_lost_at_the_code_prompt_refuses_and_writes_nothing(
         != 0
     )
     err = capsys.readouterr().err
-    assert "console went away" in err and "nothing was written" in err
+    assert "console went away" in err and "nothing was written" in err.lower()
     assert terminal.asked == 0
     assert not db.exists()
 
