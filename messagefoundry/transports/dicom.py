@@ -3346,7 +3346,7 @@ class DicomScuDestination(DestinationConnector):
         try:
             status_ds = assoc.send_c_echo()
         finally:
-            assoc.release()
+            self._release(assoc)
         status = getattr(status_ds, "Status", None)
         if status is None or int(status) != _STATUS_SUCCESS:
             shown = "none" if status is None else f"0x{int(status):04X}"

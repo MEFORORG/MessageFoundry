@@ -1077,6 +1077,45 @@ async def test_a_failed_release_keeps_any_answer_that_is_not_a_confirmed_store(
     assert _UID not in caplog.text
 
 
+async def test_a_failed_release_after_a_good_c_echo_passes_the_test_and_aborts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from tests.test_dicom_scu import _scu, _storage_scp
+
+    _release_that_raises(monkeypatch)
+    before = _live_associations()
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.transports.dicom"),
+        _storage_scp() as port,
+    ):
+        await _scu(port).test_connection()  # the peer answered Success, so the test passes
+        left = await _associations_left(before)
+    assert not left
+    logged = [r.getMessage() for r in caplog.records if r.name == dicom_module.__name__]
+    assert [entry for entry in logged if "release failed" in entry and "RuntimeError" in entry]
+    assert _UID not in caplog.text
+
+
+async def test_a_failed_release_does_not_replace_a_failed_c_echo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pydicom.dataset import Dataset
+    from pynetdicom.association import Association
+
+    from messagefoundry.redaction import safe_exc
+    from messagefoundry.transports.base import DeliveryError
+    from tests.test_dicom_scu import _scu, _storage_scp
+
+    refused = Dataset()
+    refused.Status = 0x0110
+    _release_that_raises(monkeypatch)
+    monkeypatch.setattr(Association, "send_c_echo", lambda *a, **k: refused)
+    with _storage_scp() as port, pytest.raises(DeliveryError) as raised:
+        await _scu(port).test_connection()
+    assert "0x0110" in str(raised.value)  # CONTROL: the peer's answer, not the release's error
+    assert _UID not in safe_exc(raised.value)  # what the Test Connection result would carry
+
+
 def _assert_stands_for(cause: BaseException | None, name: str) -> None:
     """``cause`` is the engine's stand-in for a library class ``name``, and holds nothing else."""
     assert isinstance(cause, dicom_module._LibraryCause)
