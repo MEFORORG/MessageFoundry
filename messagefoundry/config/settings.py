@@ -6434,6 +6434,22 @@ class AlertsSettings(_Section):
         return v
 
     @model_validator(mode="after")
+    def _webhook_url_is_buildable(self) -> AlertsSettings:
+        """Vault BACKLOG #3533 item 14: refuse at load a webhook URL the notifier build would refuse.
+
+        It runs the build's own posture-free checks, ``refuse_unbuildable_webhook_url``, so settings
+        load, ``check`` and the serve pre-flight refuse what the build refuses on them; that
+        function's docstring lists them. The value is kept as written. The revocation guard reads
+        the posture and stays at the build. An empty value stays "not configured", as every
+        consumer reads it."""
+        if self.webhook_url:
+            # Lazy, to keep the edit local; the module imports no transports package.
+            from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
+
+            refuse_unbuildable_webhook_url(self.webhook_url, self.webhook_allowed_hosts)
+        return self
+
+    @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
         """Vault BACKLOG #3533 item 3: a login never crosses a hop that does not authenticate the relay.
 

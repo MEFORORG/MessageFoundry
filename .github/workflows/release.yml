@@ -65,10 +65,12 @@
 # a blank environment accepts a token from any job in this workflow.
 # A job naming an environment that does not exist creates it with no rules, which would publish
 # exactly as before while reading as a control that is not there. Keep the name `pypi`.
-# Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository variables only. A
-# job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
-# the environment would let two gates read different values. So each is read three times, the
-# same way for both (vault BACKLOG #2975). Its build job (`release-harness`, `release-webconsole`)
+# Keep PUBLISH_HARNESS and PUBLISH_WEBCONSOLE off the environment, as repository or organization
+# variables. An organization variable limited to selected repositories that exclude this one reads
+# as unset here, so the upload step is skipped.
+# A job's `if:` is read before its environment applies, and a step's inside it after, so a copy on
+# the environment would let two gates read different values. So each is read three times, the same
+# way for both (vault BACKLOG #2975). Its build job (`release-harness`, `release-webconsole`)
 # reads it outside the environment and hands it in as a job output. The upload step runs only when
 # that output AND its own read are 'true': the output keeps an environment copy from turning the
 # upload on, and the fresh read keeps an unset made after the build job ran from being ignored by
@@ -127,12 +129,12 @@
 # SECOND distribution — `messagefoundry-harness` (the synthetic test/load/failover harness,
 # packaging/messagefoundry-harness/) — is built by the `release-harness` job and published by the
 # last step of `publish-pypi`, after the engine it pins, in lockstep (same version, same tag). That
-# step is GATED on the `PUBLISH_HARNESS` repo variable so it
+# step is GATED on the `PUBLISH_HARNESS` variable (repository or organization) so it
 # stays a no-op until the OWNER (one-time): (1) configures a `messagefoundry-harness` PyPI Trusted
 # Publisher — a PENDING publisher for repo MEFORORG/MessageFoundry + workflow `release.yml` (environment
-# `pypi`, as every publisher here should be) — then (2) sets repo variable PUBLISH_HARNESS=true. Until
-# then the job still BUILDS + version-checks the harness wheel each release and attaches it to the draft
-# GitHub release.
+# `pypi`, as every publisher here should be) — then (2) sets the PUBLISH_HARNESS variable to true on the
+# repository or organization. Until then the job still BUILDS + version-checks the harness wheel
+# each release and attaches it to the draft GitHub release.
 #
 # THIRD distribution — `messagefoundry-toolkit` (the authoring and development commands, ADR 0201,
 # packaging/messagefoundry-toolkit/) — is built, gated and smoked INSIDE the `release` job, in
@@ -1514,9 +1516,10 @@ jobs:
       # THE RULE ABOVE the way the toolkit's order does: if this upload fails, the engine is on PyPI
       # and the GitHub release stays a draft; `skip-existing` lets a re-run finish it. GATED: a
       # no-op until the owner configures the messagefoundry-harness PyPI Trusted Publisher AND sets
-      # repo variable PUBLISH_HARNESS=true. The build + version-check in release-harness still run
-      # every release. The variable is read through release-harness's output and again here; the
-      # header says why both, and why publish-github-release reads it a third time.
+      # the PUBLISH_HARNESS variable (repository or organization) to true. The build + version-check
+      # in release-harness still run every release. The variable is read through release-harness's
+      # output and again here; the header says why both, and why publish-github-release reads it a
+      # third time.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         id: harness-upload
         if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && needs.release-harness.outputs.publish-harness == 'true' && vars.PUBLISH_HARNESS == 'true' }}
@@ -1976,9 +1979,10 @@ jobs:
           fi
           echo "verified $(grep -c . "$manifest") file(s) against the build job's digests"
 
-      # GATED on repo variable PUBLISH_WEBCONSOLE=true, and that gate is armed: the owner set the
-      # variable on 2026-07-29 (read with `gh variable list`, 2026-09-28), and the first
-      # webconsole-v* release through this step claimed the PyPI name that day (BACKLOG #1944).
+      # GATED on the PUBLISH_WEBCONSOLE variable (repository or organization) reading true, and that
+      # gate is armed: the owner set the repository variable on 2026-07-29 (read with
+      # `gh variable list` on 2026-09-28), and the first webconsole-v* release through this step
+      # claimed the PyPI name that day (BACKLOG #1944).
       # Unset the variable and this step is skipped, while the build + version-check above still run
       # on every console tag, and the console's release still goes public. The variable is read
       # through release-webconsole's output and again here; the header says why both, and why
@@ -2050,7 +2054,8 @@ jobs:
     # (vault BACKLOG #2975). `needs: release` so the engine is built (and its draft GitHub release
     # exists) first. It holds
     # contents:write only; its PyPI publish is the last step of `publish-pypi`, which waits on this job
-    # (vault BACKLOG #2631, limb 1; #2975). That publish is GATED on the `PUBLISH_HARNESS` repo variable:
+    # (vault BACKLOG #2631, limb 1; #2975). That publish is GATED on the `PUBLISH_HARNESS` variable
+    # (repository or organization):
     # until the owner sets up the harness Trusted Publisher AND PUBLISH_HARNESS=true (see the header note),
     # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but nothing
     # publishes it — so a missing harness PyPI project can never red a release.

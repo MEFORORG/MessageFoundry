@@ -23,7 +23,8 @@ present the credential, and only when the engine would actually open it (a conne
 ``deployed=False`` is never built, so it is not a hop). Two shapes are reported:
 
 * ``credential="static"``: the hop presents an unchanging credential (a password, API key, static
-  bearer token, or a Vault token read from the environment).
+  bearer token, or a Vault token read from the environment). The alert webhook is listed as one
+  whatever its URL holds, because a webhook service can put its token in the URL path.
 * ``credential="none"``: the hop presents no credential at all. It is reported because a gate that
   refused a static password but passed the same hop with the password deleted would reward making the
   hop weaker.
@@ -713,8 +714,10 @@ def _settings_hops(settings: ServiceSettings) -> list[StaticCredentialHop]:
     alerts = settings.alerts
     if settings.secrets.provider == "vault" and resolved_secret_refs(settings):
         add("vault.secrets", "static", "Vault token from MEFOR_SECRETS_VAULT_TOKEN", False)
+    # Vault BACKLOG #3533 item 24: a webhook service can put its token in the URL path, which every
+    # POST to that URL carries; the sink offers no other credential kind.
     if alerts.webhook_url:
-        add("alerts.webhook", "none", "the alert webhook sink has no credential field", False)
+        add("alerts.webhook", "static", "alert webhook URL, whose path can carry a token", False)
     # Both SMTP consumers (the alert sinks and the security notifier) need a host and a sender.
     if alerts.email_smtp_host and alerts.email_from:
         if alerts.email_username or alerts.email_password or alerts.email_password_secret:
