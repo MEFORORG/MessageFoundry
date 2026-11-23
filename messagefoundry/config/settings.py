@@ -2230,7 +2230,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the

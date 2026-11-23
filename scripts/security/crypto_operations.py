@@ -967,9 +967,11 @@ def _value_labels(value: ast.expr | None, m: ParsedModule) -> list[str]:
         and len(value.args) == 1
         and not value.keywords
     ):
-        # ``~int(FLAG)`` clears FLAG alone where ``~FLAG`` would clear every bit the IntFlag
-        # does not name (vault BACKLOG #5511), so ``int()`` names the flag it wraps.
-        return _value_labels(value.args[0], m)
+        # ``~int(FLAG)`` clears FLAG alone where ``~FLAG`` also clears every bit the IntFlag does
+        # not name (vault BACKLOG #5511), so the two keep distinct tokens, each naming the flag.
+        return [
+            f" int({inner.strip()})" if inner else "" for inner in _value_labels(value.args[0], m)
+        ]
     labels = [f" {q.rpartition('.')[2]}" for q in m.resolve(value)]
     return list(dict.fromkeys(labels)) or [""]
 

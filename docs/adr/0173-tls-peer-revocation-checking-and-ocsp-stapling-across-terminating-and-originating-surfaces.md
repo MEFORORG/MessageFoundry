@@ -1825,7 +1825,8 @@ one whose CA file is a connection's `tls_ca_file`, `[alerts].email_tls_ca_file` 
 `VERIFY_X509_PARTIAL_CHAIN`, refuses a CA file that loads a CA with no path through that file to a
 self-signed root also in it, and applies section 14's start rule, worded for a server chain. An
 intermediate beside its root is admitted: the chain runs on through it to the root, and the start
-rule then asks for the intermediate's own CRL too. The
+rule then asks for the intermediate's own CRL too. A REST connection's ECH sidecar hop checks no
+`[tls]` CRL against its partner, leaf or chain, since the sidecar verifies the partner. The
 running-hop reload applies the same rule. On the `system` and `augment` arms it refuses the build,
 since no CRL file covers the OS roots. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.

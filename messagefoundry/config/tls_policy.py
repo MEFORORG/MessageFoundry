@@ -3313,7 +3313,8 @@ class TrustAnchor:
 
     cafile: str | None
     load_system_roots: bool
-    #: A CRL to load onto this hop's context, turning on ``VERIFY_CRL_CHECK_LEAF`` (BACKLOG #299).
+    #: A CRL to load onto this hop's context, turning on ``VERIFY_CRL_CHECK_LEAF`` (BACKLOG #299),
+    #: or with :attr:`crl_check_chain` the whole-chain check.
     #: ``None`` — no revocation checking on this hop, the pre-#299 behaviour. Resolved per hop by
     #: :func:`resolve_trust_anchor`, so a loopback hop carries ``None`` even when the instance
     #: configures one.
