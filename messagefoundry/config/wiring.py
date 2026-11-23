@@ -7858,9 +7858,9 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
     # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
     # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
-    # read listed. A Registry build refuses a non-bool literal, but its settings dict stays mutable
-    # afterwards, and a Destination built directly passes no load or build refusal; MLLP reads the
-    # key only with tls and tls_verify on, so such an MLLP hop with tls_verify=False builds with it.
+    # read listed. That is a deliberate second reading beside bool_setting's: the connectors refuse
+    # a non-bool where they read the key, and a Registry build refuses one, but the settings dict
+    # stays mutable after the build, so this reader can still meet one and must not raise on it.
     value = settings.get("tls_check_hostname")
     if isinstance(value, EnvRef):
         return True
