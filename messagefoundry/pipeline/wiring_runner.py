@@ -9764,8 +9764,9 @@ class RegistryRunner:
                 self.registry = new_registry
                 # Rebuild the live-lookup executor from the new graph, with no await since the swap, so
                 # no worker that reads them after the swap pairs the new graph with the old graph's
-                # lookups or inline cache. (A worker that read _inline_ok BEFORE the swap and then
-                # awaited still pairs it with the new registry; that race predates this ordering.)
+                # lookups or inline cache. A router worker that read _inline_ok BEFORE the swap and
+                # then awaited the Router rechecks the registry it read it with, and takes the split
+                # path if this swap replaced it (_process_ingress_item, BACKLOG #5707).
                 # build_check already validated the new specs, so this can't fail on a bad spec here.
                 # The OLD executor is closed only once the swap commits, below the except, since a
                 # rollback puts it back, pools and all.
@@ -12653,7 +12654,10 @@ class RegistryRunner:
         inbound or the STOP internal-error policy — the body already ``mark_failed``'d / dead-lettered
         the head per policy). The per_lane loop reads only ``outcome[0]``. Store errors propagate to the
         caller's backoff."""
-        ic = self.registry.inbound.get(name)
+        # The graph `inline` below was computed for. Read with `ic` and `inline`, no await between
+        # them on the path that continues, so the inline branch can check it is still served.
+        registry = self.registry
+        ic = registry.inbound.get(name)
         if ic is None:
             # The inbound was removed from the registry but residual ingress rows remain.
             # Revert this just-claimed row to pending and EXIT the worker — there is nothing to
@@ -12721,7 +12725,7 @@ class RegistryRunner:
             # cleanly after each run (no leak). The set of providers is the run_context
             # registry (router phase) — features add one provider there, never edit this call.
             router_rc = RunContext(
-                code_sets=self.registry.code_sets,
+                code_sets=registry.code_sets,
                 reference_view=self.store.reference_view(),
                 active_environment=self._active_environment,
                 ingest_time=item.created_at,
@@ -12741,7 +12745,7 @@ class RegistryRunner:
                 names = await self._off_loop_sandboxed(
                     name,
                     route_only,
-                    self.registry,
+                    registry,
                     ic,
                     item.payload,
                     run_context=router_rc,
@@ -12753,7 +12757,10 @@ class RegistryRunner:
             # and as the fused path's handoff_exc does (ADR 0071). Eligible iff the inbound opted in
             # AND the graph has no live lookup AND ack_after=ingest AND not LOOPBACK
             # (graph-level gates, cached in self._inline_ok) — plus the per-message gates here.
-            if inline and len(names) == 1:
+            # BACKLOG #5707: those gates describe `registry`. A reload during the Router's await
+            # may have swapped in a graph they say nothing about, so such a row takes the split
+            # path, whose transform worker reads the served graph and its lookups afresh.
+            if inline and len(names) == 1 and self.registry is registry:
                 # M-single held. Run the single handler's transform OFF the loop (G4: keep the
                 # to_thread hop — SEC-013), mirroring _transform_worker. No lookup ExitStack:
                 # self._inline_ok already guaranteed no live lookup runner (INV-7), so a
@@ -12761,7 +12768,7 @@ class RegistryRunner:
                 hname = names[0]
                 content_type = ic.content_type.value
                 inline_rc = RunContext(
-                    code_sets=self.registry.code_sets,
+                    code_sets=registry.code_sets,
                     reference_view=self.store.reference_view(),
                     state_view=self.store.state_view(),
                     response_view=None,
@@ -12781,7 +12788,7 @@ class RegistryRunner:
                     ) = await self._off_loop_sandboxed(
                         name,
                         transform_one,
-                        self.registry,
+                        registry,
                         hname,
                         item.payload,
                         content_type,

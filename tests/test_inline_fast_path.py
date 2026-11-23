@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.config.db_lookup import db_lookup
 from messagefoundry.config.models import ConnectorType, InternalErrorPolicy, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -37,8 +38,9 @@ from messagefoundry.config.wiring import (
     SetState,
 )
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline.dryrun import route_only
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, OutboxStatus, Stage
 
 ADT = (
     "MSH|^~\\&|SENDINGAPP|SENDINGFAC|RECV|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\r"
@@ -662,3 +664,88 @@ async def test_inline_g6_dead_letters_at_finite_attempts_ceiling(
     )
     assert len(msgs) == 1  # dead-lettered at the ceiling, not looping
     assert not (outdir / "MSG1.hl7").exists()
+
+
+# --- BACKLOG #5707: a reload that lands while the Router is awaited ---------------------------
+
+
+def _reload_during_router(runner: RegistryRunner, *swaps: Registry) -> None:
+    """Assign each registry in turn, on the loop, as the Router's await returns. The worker read
+    ``_inline_ok`` before that await and does not read it again, so only the registry is swapped."""
+    real = runner._off_loop_sandboxed
+
+    async def racing(name: str, fn: Any, registry: Registry, /, *a: Any, **k: Any) -> Any:
+        result = await real(name, fn, registry, *a, **k)
+        if fn is route_only:
+            for new_registry in swaps:
+                runner.registry = new_registry
+        return result
+
+    runner._off_loop_sandboxed = racing  # type: ignore[method-assign]
+
+
+async def _claimed_ingress(store: MessageStore) -> OutboxItem:
+    await store.enqueue_ingress(
+        channel_id="file_in", raw=ADT, control_id="MSG1", message_type="ADT^A01"
+    )
+    item = await store.claim_next_fifo("file_in", stage=Stage.INGRESS.value)
+    assert item is not None
+    return item
+
+
+async def test_reload_during_router_takes_the_split_path_not_the_new_lookup_handler(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The in-flight row read inline eligibility from the old graph. The new graph's handler uses a
+    lookup, so running it inline would raise and dead-letter the row. It goes to the routed stage."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+
+    def uses_lookup(msg: Message) -> Send:
+        db_lookup("clarity", "select 1", {})
+        return Send("file_out", str(msg))
+
+    old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    new = _registry(
+        inbox, outdir, _route_arch, {"arch": uses_lookup}, inline=True, with_lookup=True
+    )
+    runner = RegistryRunner(old, store, egress=EgressSettings(deny_by_default=False))
+    runner._recompute_inline_ok()
+    assert runner._inline_ok["file_in"] is True
+    spy = _HandoffSpy(store)
+    spy.install()
+    _reload_during_router(runner, new)
+
+    item = await _claimed_ingress(store)
+    await runner._process_ingress_item("file_in", item)
+
+    fetched = await store.get_message(item.message_id)
+    assert fetched is not None
+    assert fetched["status"] == MessageStatus.ROUTED.value
+    assert (spy.handoff_calls, spy.route_handoff_calls) == (0, 1)
+    cur = await store._db.execute(
+        "SELECT handler_name FROM queue WHERE message_id=? AND stage=?",
+        (item.message_id, Stage.ROUTED.value),
+    )
+    assert [row["handler_name"] for row in await cur.fetchall()] == ["arch"]
+
+
+async def test_reload_rolled_back_during_router_stays_inline(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """A swap the reload rolled back leaves the captured graph served, and rollback restores that
+    graph's eligibility, so the check compares identity and the row stays inline."""
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    old = _registry(inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True)
+    new = _registry(
+        inbox, outdir, _route_arch, {"arch": _handle_deliver}, inline=True, with_lookup=True
+    )
+    runner = RegistryRunner(old, store, egress=EgressSettings(deny_by_default=False))
+    runner._recompute_inline_ok()
+    spy = _HandoffSpy(store)
+    spy.install()
+    _reload_during_router(runner, new, old)
+
+    item = await _claimed_ingress(store)
+    await runner._process_ingress_item("file_in", item)
+
+    assert (spy.handoff_calls, spy.route_handoff_calls) == (1, 0)
