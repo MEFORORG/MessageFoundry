@@ -416,31 +416,85 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert webhook.entered.is_set()  # the control: the webhook did hang
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
-    # Both are counted: the webhook had not finished the first when the cut came, though the
-    # email took it.
-    assert sink.undelivered == 2
+    # The email took the first, so only the second, which no transport took, is counted.
+    assert sink.undelivered == 1
 
 
-async def test_an_alert_the_email_took_while_the_webhook_was_cut_is_still_counted(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("webhook_first", [True, False], ids=["webhook-first", "email-first"])
+@pytest.mark.parametrize("webhook_kind", ["fails-fast", "hangs-until-cut"])
+async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_timing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    webhook_kind: str,
+    webhook_first: bool,
 ) -> None:
-    """BACKLOG #5907 step 4: a rule selects [webhook, email], the webhook is blackholed and the
-    email takes the one alert. The cut ends the alert's handling, so it stays counted and the
-    unwind logs it, though a transport took it: a count that dropped it there would leave the
-    cut webhook send reported nowhere."""
+    """BACKLOG #5907 step 4, Lander hold finding 1 on PR 3191: whether an alert counted as
+    delivered depended on timing. A webhook that failed fast beside an email that took the alert
+    read delivered, and the same webhook hanging until the unwind cut the drain read undelivered.
+    One rule now holds in both: an alert one selected transport took counts as delivered. The cut
+    still logs its line, so the webhook send it ended shows."""
     monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", 1.5)
     monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
-    webhook, email = _BlackholedTransport(), _HealthyEmail()
-    sink = NotifierAlertSink([webhook, email])
+    webhook: Any = (
+        _BlackholedTransport() if webhook_kind == "hangs-until-cut" else _FailingTransport()
+    )
+    email = _HealthyEmail()
+    sink = NotifierAlertSink([webhook, email] if webhook_first else [email, webhook])
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     store: Any = _ClosingStore()
     with caplog.at_level(logging.ERROR, logger=appmod._log.name):
         await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
-    assert webhook.entered.is_set()  # the control: the webhook did hang
-    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # and the email took it
-    assert sink.undelivered == 1
-    assert "did not drain" in caplog.text
-    assert "1 alert(s) not confirmed delivered" in caplog.text
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the email took it
+    assert sink.undelivered == 0
+    if webhook_kind == "hangs-until-cut":
+        assert webhook.entered.is_set()  # the control: the webhook did hang
+        assert "did not drain" in caplog.text
+        assert "0 alert(s) not confirmed delivered" in caplog.text
+    else:
+        assert "not confirmed delivered" not in caplog.text
+
+
+class _CancelIgnoringEmail(_HealthyEmail):
+    """An email send that takes no notice of a cancel and takes the alert once released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+        self.entered.set()
+        while not self.release.is_set():
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                continue  # the defect this stands for: a send that will not end on a cancel
+        await super().send(event)
+
+
+async def test_a_send_left_past_the_cut_takes_the_alert_off_when_it_takes_it() -> None:
+    """BACKLOG #5907 step 4: the same rule for a send the drain's cancel left running past its
+    grace. The alert stays counted while no transport has taken it, and leaves the count when
+    the left send takes it."""
+    email = _CancelIgnoringEmail()
+    sink = NotifierAlertSink([email])
+    sink.start()
+    sink.connection_stopped("IB_TEST_ADT", detail="probe")
+    await asyncio.wait_for(email.entered.wait(), 5.0)
+    task = sink._task
+    assert task is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert sink.undelivered == 1  # cut, and nothing had taken it
+    assert len(sink._left_sends) == 1  # the control: the send was left running
+    email.release.set()
+    for _ in range(20):
+        if not sink._left_sends:
+            break
+        await asyncio.sleep(0)
+    assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
+    assert sink.undelivered == 0
 
 
 class _FailingTransport:
