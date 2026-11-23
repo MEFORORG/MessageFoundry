@@ -538,34 +538,70 @@ async def test_shutdown_of_an_answered_still_open_connection_does_not_raise(
 
     floored_class = floored_ws_protocol_class(base=WebSocketsSansIOProtocol)
     assert floored_class is not None
+    calls: list[Any] = []
+    step = protocol_headers._answer_a_parser_rejection
+
+    def _counted(protocol: Any) -> None:
+        calls.append(protocol)
+        step(protocol)
+
+    monkeypatch.setattr(protocol_headers, "_answer_a_parser_rejection", _counted)
     floored, transport = await _fed_and_still_open(floored_class, request_bytes)
+    # The spy's positive control: the first data_received reaches the step on both paths.
+    assert calls == [floored]
     written = bytes(transport.written)
     assert written.startswith(f"HTTP/1.1 {status} ".encode()), written[:40]
     assert b"nosniff" in written and transport.closing
-    if not bare_answers:
-        # uvicorn never ran handle_connect on either instance: its first act is to set
-        # ``request``, which uvicorn's __init__ does not. So the parser-rejection step set these
-        # three itself.
-        assert "request" not in vars(bare) and not bare.handshake_initiated
-        assert "request" not in vars(floored)
+    # handle_connect's first act is to set ``request``, which uvicorn's __init__ does not.
+    ran_handle_connect = {"request" in vars(p) for p in (bare, floored)}
+    if bare_answers:
+        # The control for the check below: here uvicorn did run handle_connect.
+        assert ran_handle_connect == {True} and bare.handshake_initiated
+    else:
+        # uvicorn never ran handle_connect on either instance, so the parser-rejection step set
+        # these three itself.
+        assert ran_handle_connect == {False} and not bare.handshake_initiated
         assert (floored.handshake_initiated, floored.handshake_complete, floored.close_sent) == (
             True,
             True,
             True,
         )
-        passes: list[Any] = []
-        step = protocol_headers._answer_a_parser_rejection
-
-        def _counted(protocol: Any) -> None:
-            passes.append(protocol)
-            step(protocol)
-
-        monkeypatch.setattr(protocol_headers, "_answer_a_parser_rejection", _counted)
         floored.data_received(b"more bytes after the rejection")  # no raise
-        assert passes == [], "the parser-rejection step ran a second pass"
+        assert calls == [floored], "the parser-rejection step was called again"
         assert bytes(transport.written) == written
     floored.shutdown()
     assert bytes(transport.written) == written
+
+
+class _ShutdownSkipsCloseSent(WebSocketsSansIOProtocol):
+    """uvicorn 0.54.0's sans-I/O ``shutdown`` with its ``close_sent`` check removed, so a
+    connection marked closed falls through to the close frame."""
+
+    def shutdown(self) -> None:
+        self.stop_keepalive()
+        if self.handshake_complete:
+            self.queue.put_nowait({"type": "websocket.disconnect", "code": 1012})
+            self.conn.send_close(1012)
+            self.transport.write(b"".join(self.conn.data_to_send()))
+        else:
+            self.send_500_response()
+        self.transport.close()
+
+
+async def test_the_shutdown_test_sees_shutdown_drop_its_close_sent_check() -> None:
+    """The control behind what ``protocol_headers`` says the shutdown test above covers: on a
+    parser-rejected connection the floor marked, a ``shutdown`` that no longer checks
+    ``close_sent`` sends a close frame on a conn that never opened, and websockets raises. It does
+    not cover a ``shutdown`` that stops reading ``close_sent`` and returns early some other way."""
+    from websockets.exceptions import InvalidState
+
+    floored_class = floored_ws_protocol_class(base=_ShutdownSkipsCloseSent)
+    assert floored_class is not None
+    floored, _ = await _fed_and_still_open(floored_class, _LONG_LINE_UPGRADE)
+    assert floored.close_sent
+    with pytest.raises(InvalidState) as stopped:
+        floored.shutdown()
+    _assert_raised_in_websockets(stopped.value)
 
 
 async def test_the_bare_sans_io_protocol_leaves_a_parser_rejection_unanswered() -> None:

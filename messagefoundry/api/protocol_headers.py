@@ -90,9 +90,12 @@ against the server class it is handed. So is every attribute the two sans-I/O st
 or write: a rename there would otherwise turn a step off, or leave it writing a dead name, with no
 error. That check sees a name that is no longer assigned. It cannot see a name the server still
 assigns and has stopped reading, nor tell ``self.<name> = ...`` from the same name assigned on
-another object. A test catches the first case for at least one name: the shutdown test in
-``tests/test_header_floor_wire.py`` fails if uvicorn's ``shutdown`` stops reading ``close_sent``.
-No test covers the second. The checked hooks are: the HTTP protocol's ``send_400_response``, its
+another object. Some reads have a test of their own. For ``close_sent``,
+``test_shutdown_of_an_answered_still_open_connection_does_not_raise`` fails when uvicorn's
+``shutdown`` drops its ``close_sent`` check and sends a close frame on a parser-rejected
+connection; a ``shutdown`` that stops reading it and returns early some other way passes it. The
+other-object case is an open note on BACKLOG #1120. The checked hooks are: the HTTP protocol's
+``send_400_response``, its
 ``cycle`` and ``transport`` attributes, uvicorn's ``RequestResponseCycle`` with its
 ``send_500_response``, ``default_headers``, ``send``, and the ``disconnected``, ``message_event``
 and ``response_complete`` it reads, and the WebSocket protocol's hooks. For the legacy
@@ -400,8 +403,8 @@ def _require_ws_hooks(base: type[Any], *, through_conn: bool) -> None:
         # effect, uvicorn's shutdown sends a close frame on a conn that never opened, which
         # raises InvalidState (measured at uvicorn 0.54.0). This proves each name is still
         # ASSIGNED somewhere in the class chain, which catches a rename. It does not prove
-        # uvicorn still READS them. For close_sent, the shutdown test in
-        # tests/test_header_floor_wire.py does: it fails if uvicorn's shutdown stops reading it.
+        # uvicorn still READS them; the module docstring, "Refuse at startup", says which test
+        # covers a read.
         _require_assigned(base, "handshake_complete", hook="data_received")
         _require_assigned(base, "close_sent", hook="data_received")
         _require_assigned(base, "transport", hook="data_received")
