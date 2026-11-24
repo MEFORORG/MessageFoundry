@@ -287,9 +287,10 @@ the service account itself, such as the write the Vault Agent sink route
 Of the entries the script does not set itself, at least an explicit grant to the service
 account, an explicit Deny entry, and an explicit SYSTEM or Administrators entry with other
 inheritance flags survive: the script turns inheritance off (`/inheritance:r`), which
-drops every inherited entry, and removes at least every other account's plain Allow entry, a
-group's included. A conditional (callback) Allow entry survives that removal, and the read-back
-then refuses the install. The read-back does not check a surviving Deny entry, so one that names
+drops every inherited entry, and tries to remove every other account's Allow entry, a group's
+included, and the read-back refuses the install when any survives. At least a conditional
+(callback) Allow entry, and a plain one for an APPLICATION PACKAGE AUTHORITY principal, survive
+that removal. The read-back does not check a surviving Deny entry, so one that names
 the service account, or a group it belongs to, can leave the service unable to read its secrets.
 So when the install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
@@ -301,11 +302,14 @@ directory's rules, made restricted in one step, and then given this list:
 - SYSTEM and Administrators: full control, inherited by the files in it;
 - the service account: read and add-file on the directory itself, inherited by nothing.
 
-The script replaces any other grant the service account holds there, and removes every other
-account's allow entry and every deny entry, whoever it names. It then reads the list back, and
-refuses, disabling the service, at least when its owner is neither Administrators nor SYSTEM, still inherits, still has an
-allow entry for another account or a deny entry on the directory, or gives the service account
-more or less than that grant. When the script does not read that provider, it refuses
+The script replaces any other grant the service account holds there, and tries to remove every
+other account's allow entry and every deny entry, whoever it names; at least a conditional entry,
+and an entry for an APPLICATION PACKAGE AUTHORITY principal, survive that removal. It then reads
+the list back, and refuses, disabling the service, at least when its owner is neither
+Administrators nor SYSTEM, still inherits, still has an allow entry for another account or a deny
+entry that applies to the directory itself, or gives the service account more or less than that
+grant. An inherit-only deny entry, which applies only to what the directory holds, is not
+refused. When the script does not read that provider, it refuses
 `-CustodyDir`.
 
 **The engine.** When `MEFOR_CUSTODY_DIRECTORY` is set, the host provider reads and writes the two
