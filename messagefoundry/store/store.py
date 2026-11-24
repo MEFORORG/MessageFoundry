@@ -226,7 +226,7 @@ from messagefoundry.store.row_seal import (
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
-    seal_page,
+    seal_chunks,
     seal_row_ref,
     transit_seal_refusals,
 )
@@ -13011,18 +13011,18 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
-                sealed_values = await seal_page(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher, table, column, rows, aad_cols=aad_cols, aad_of=aad_of
-                )
-                await self._update_every_row(
-                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
-                    [
-                        (value, *(r[c] for c in keys))
-                        for value, r in zip(sealed_values, rows, strict=True)
-                    ],
-                    f"{table}.{column}",
-                    exact=True,
-                )
+                ):
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                        [
+                            (value, *(r[c] for c in keys))
+                            for value, r in zip(sealed_values, chunk, strict=True)
+                        ],
+                        f"{table}.{column}",
+                        exact=True,
+                    )
                 sealed += len(rows)
             await self._commit()
         except BaseException as exc:

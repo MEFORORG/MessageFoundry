@@ -217,7 +217,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
-    seal_page,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -3969,15 +3969,15 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                sealed_values = await seal_page(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher, table, column, rows, aad_cols=aad_cols, aad_of=aad_of
-                )
-                for value, r in zip(sealed_values, rows, strict=True):
-                    await conn.execute(
-                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        value,
-                        *(r[c] for c in keys),
-                    )
+                ):
+                    for value, r in zip(sealed_values, chunk, strict=True):
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                            value,
+                            *(r[c] for c in keys),
+                        )
                 sealed += len(rows)
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()

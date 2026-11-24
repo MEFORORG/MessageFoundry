@@ -400,7 +400,7 @@ _ENCRYPT_NAMES = frozenset(
         "_enc",
         "_aenc",
         "_aencrypt",
-        "seal_page",  # the at-open seal's page (BACKLOG #6706)
+        "seal_chunks",  # the at-open seal's page (BACKLOG #6706)
     }
 )
 
@@ -433,7 +433,7 @@ def test_the_encrypt_reader_sees_each_call_shape_and_skips_prose() -> None:
         "x = await self._aenc(v, aad=a)",
         "x = self._reencrypt_value(v)",
         "x = reseal_unless_tag_failure(c, v)",
-        "x = await seal_page(self._cipher, t, c, rows, aad_cols=a)",
+        "async for chunk, vs in seal_chunks(self._cipher, t, c, rows, aad_cols=a):\n        pass",
     )
     for line in seen:
         assert _names_an_encrypt(f"def f(self):\n    {line}\n"), line

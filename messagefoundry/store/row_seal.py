@@ -46,7 +46,7 @@ import hashlib
 import hmac
 import logging
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -54,11 +54,14 @@ from typing import Any, Final, Protocol
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.store.crypto import (
     _KEY_ID_LEN,
+    BATCH_MAX_CHARS,
     BATCH_MAX_ITEMS,
     NO_STORE_ID,
     Cipher,
     CipherError,
     CipherUnavailableError,
+    b64_chars,
+    batch_chars,
     cell_aad,
     cipher_blocks_on_io,
     derive_row_seal_key,
@@ -582,7 +585,7 @@ async def cipher_call[**P, T](
     return call(*args, **kwargs)
 
 
-async def seal_page(
+async def seal_chunks(
     cipher: Cipher,
     table: str,
     column: str,
@@ -590,31 +593,42 @@ async def seal_page(
     *,
     aad_cols: tuple[str, ...],
     aad_of: Callable[[Any], bytes] | None = None,
-) -> list[str]:
-    """Each row's ``v`` sealed under its cell AAD, in row order: the at-open seal's page (BACKLOG
-    #6706), shared by the three stores' ``_seal_surface``.
+) -> AsyncIterator[tuple[Sequence[Any], list[str]]]:
+    """Yield ``(chunk, sealed)``: each chunk of ``rows`` with every row's ``v`` sealed under its
+    cell AAD, in row order. The at-open seal's page (BACKLOG #6706), shared by the three stores'
+    ``_seal_surface``, which write each chunk before the next is sealed.
 
     The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
-    :func:`cell_aad` over ``aad_cols``. Each :data:`BATCH_MAX_ITEMS` rows are one :func:`cipher_call`
-    of :func:`encrypt_many`, so a Transit cipher seals them in few requests while one pool job holds
-    at most that many values: a cancelled seal leaves at most one such call running on, and other
-    pool callers wait behind at most one. Any failure raises, as :func:`encrypt_many` does."""
-    sealed: list[str] = []
-    for start in range(0, len(rows), BATCH_MAX_ITEMS):
-        if start:
+    :func:`cell_aad` over ``aad_cols``. A chunk is cut at :data:`BATCH_MAX_ITEMS` values and
+    :data:`BATCH_MAX_CHARS` of base64, the cost ``TransitCipher.encrypt_many`` cuts its requests
+    by, so a batching Transit cipher seals one chunk in one request, and a value over the character
+    bound is a chunk of its own. Each chunk is one :func:`cipher_call` of :func:`encrypt_many`:
+    while the cipher batches, a cancelled seal leaves at most one request's values running on in
+    the Transit pool. Once it sends values alone, one chunk is up to :data:`BATCH_MAX_ITEMS`
+    requests. Any failure raises, as :func:`encrypt_many` does."""
+    items = [
+        (
+            r["v"],
+            aad_of(r) if aad_of is not None else cell_aad(table, column, *(r[c] for c in aad_cols)),
+        )
+        for r in rows
+    ]
+    first = True
+    start = 0
+    while start < len(items):
+        end, size = start, 0
+        while end < len(items) and end - start < BATCH_MAX_ITEMS:
+            plaintext, aad = items[end]
+            cost = b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+            if end > start and size + cost > BATCH_MAX_CHARS:
+                break
+            size += cost
+            end += 1
+        if not first:
             await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
-        chunk = rows[start : start + BATCH_MAX_ITEMS]
-        items = [
-            (
-                r["v"],
-                aad_of(r)
-                if aad_of is not None
-                else cell_aad(table, column, *(r[c] for c in aad_cols)),
-            )
-            for r in chunk
-        ]
-        sealed.extend(await cipher_call(cipher, encrypt_many, cipher, items))
-    return sealed
+        first = False
+        yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])
+        start = end
 
 
 #: The start check's fixed 32-byte input: a digest of its own label, so it is no row's seal input

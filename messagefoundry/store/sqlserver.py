@@ -209,7 +209,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
-    seal_page,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -4790,14 +4790,14 @@ class SqlServerStore:
                     rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
                     if not rows:
                         break
-                    sealed_values = await seal_page(
+                    async for chunk, sealed_values in seal_chunks(
                         self._cipher, table, column, rows, aad_cols=aad_cols, aad_of=aad_of
-                    )
-                    for value, r in zip(sealed_values, rows, strict=True):
-                        await cur.execute(
-                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
-                            (value, *(r[c] for c in keys)),
-                        )
+                    ):
+                        for value, r in zip(sealed_values, chunk, strict=True):
+                            await cur.execute(
+                                f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                                (value, *(r[c] for c in keys)),
+                            )
                     sealed += len(rows)
                 await self._commit(conn)
             except BaseException:

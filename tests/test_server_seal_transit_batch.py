@@ -23,7 +23,7 @@ pytest.importorskip("hvac", reason="Transit batch tests need the [vault] extra")
 
 from messagefoundry.store.crypto import BATCH_MAX_ITEMS, cell_aad
 from messagefoundry.store.postgres import PostgresStore
-from messagefoundry.store.row_seal import seal_page
+from messagefoundry.store.row_seal import seal_chunks
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests.test_transit_batch import _BatchTransit, _cipher
 
@@ -243,17 +243,35 @@ class _CountingBatchCipher:
         return [f"mfenc:{plaintext}" for plaintext, _aad in items]
 
 
+async def _chunks(cipher: Any, rows: list[dict[str, Any]]) -> list[tuple[int, list[str]]]:
+    return [
+        (len(chunk), sealed)
+        async for chunk, sealed in seal_chunks(
+            cipher, "state", "value", rows, aad_cols=("namespace", "key")
+        )
+    ]
+
+
 async def test_a_page_is_one_cipher_call_per_batch_bound() -> None:
-    """One call carries at most ``BATCH_MAX_ITEMS`` values, so a cancelled seal leaves at most that
-    many running on in the Transit pool, and other pool callers wait behind at most that many."""
+    """One call carries at most ``BATCH_MAX_ITEMS`` values, so while the cipher batches a cancelled
+    seal leaves at most one request's values running on in the Transit pool."""
     cipher = _CountingBatchCipher()
     rows = _pending(_legacy_rows(), _ROWS)
-    sealed = await seal_page(
-        cipher,  # type: ignore[arg-type]
-        "state",
-        "value",
-        rows,
-        aad_cols=("namespace", "key"),
-    )
+    chunks = await _chunks(cipher, rows)
     assert cipher.calls == [BATCH_MAX_ITEMS, _ROWS - BATCH_MAX_ITEMS]
-    assert sealed == [f"mfenc:{r['v']}" for r in rows]
+    assert [n for n, _ in chunks] == cipher.calls
+    assert [v for _, sealed in chunks for v in sealed] == [f"mfenc:{r['v']}" for r in rows]
+
+
+async def test_chunks_cost_no_more_transit_requests_than_one_call_over_the_page() -> None:
+    """Chunks cut by item count alone split the cipher's own character-bound runs twice: 500
+    values of about 3 KB were 4 requests in one call and 7 when cut at 128 items."""
+    rows = [{"namespace": "ns", "key": f"k{i}", "v": f"{i:04d}" + "x" * 3046} for i in range(500)]
+    whole = _BatchTransit()
+    _cipher(whole).encrypt_many(
+        [(r["v"], cell_aad("state", "value", r["namespace"], r["key"])) for r in rows]
+    )
+    chunked = _BatchTransit()
+    chunks = await _chunks(_cipher(chunked), rows)
+    assert sum(n for n, _ in chunks) == len(rows)
+    assert chunked.encrypt_requests == whole.encrypt_requests == len(chunks)
