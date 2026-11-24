@@ -156,7 +156,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     platform. There is deliberately no ``RLIMIT_CPU``, so CPU spent outside a call has no bound (ADR
     0087, amendment of 2026-10-07).
 
-    Where ``/proc/self/status`` gives a ``VmData`` (Linux), ``mem_mb`` is HEADROOM above what the
+    Where ``/proc/self/status`` gives a ``VmData`` and ``uname`` reads Linux 4.7 or later,
+    ``mem_mb`` is HEADROOM above what the
     worker holds once its graph is loaded: the cap is ``RLIMIT_DATA`` at that ``VmData`` plus
     ``mem_mb`` (vault BACKLOG #3133 part 2, owner ruling 2026-10-11). Called right after
     ``load_snapshot``, so a graph larger than ``mem_mb`` does not start the worker over its cap.
@@ -166,7 +167,9 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     writable size does count after its threads exit, which is why the parent also starts this
     process with ``MALLOC_ARENA_MAX=2``. A live thread's stack counts too, and glibc keeps up to
     about 40 MiB of exited threads' stacks mapped for reuse.
-    Elsewhere on POSIX ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so."""
+    In at least these cases ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so:
+    a non-Linux kernel, Linux before 4.7, a release with no readable ``major.minor``, and no
+    ``VmData``."""
     try:
         import resource
     except ImportError:

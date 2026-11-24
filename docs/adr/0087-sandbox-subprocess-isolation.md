@@ -178,6 +178,12 @@ memory rose about 8 MiB.
 3. Elsewhere on POSIX, and on Linux before 4.7, `mem_mb` stays an absolute `RLIMIT_AS` cap, and
    the worker logs a line saying so. Resident memory is never the baseline: it would leave
    out memory the graph holds but has not touched.
+
+   > **Amended (2026-11-24, BACKLOG #6811).** The list above is not closed. The worker keeps the
+   > absolute `RLIMIT_AS` cap in at least these cases: a kernel whose `uname` sysname is not
+   > Linux, Linux before 4.7, a kernel release with no readable leading `major.minor`, and no
+   > `VmData` in `/proc/self/status`. A suffixed two-component release such as `6.12-rc4` now
+   > reads its `major.minor`, where it used to read as unparseable.
 4. A `MemoryError` while the worker runs a call or encodes its result is answered with a `fail`
    frame of kind `memory`, which names the cap. The worker then exits, and the parent reaps it, so
    memory the call left held cannot fail a later message. The parent reports that the call ran
