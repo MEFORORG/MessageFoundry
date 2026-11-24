@@ -903,3 +903,39 @@ def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) 
     rec = next(r for r in made[0].invocations if r.kind == "handler")
     assert _retained_writes(rec) <= _MAX_WRITES
     assert len(_all_writes(inv)) == _MAX_WRITES
+
+
+def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
+    # Two threads tracing at once share the class-level Message._write. The one that finishes first
+    # must not restore the original under the other, which would silently stop recording its writes
+    # (BACKLOG #6825).
+    import threading
+
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    original = Message._write
+    a_entered = threading.Event()
+    b_exited = threading.Event()
+    seen: dict[str, object] = {}
+
+    def run_a() -> None:
+        with dt._patched_message_writes():
+            a_entered.set()
+            b_exited.wait(10)
+            seen["a_during"] = Message._write
+
+    def run_b() -> None:
+        a_entered.wait(10)
+        with dt._patched_message_writes():
+            pass
+        b_exited.set()
+
+    ta = threading.Thread(target=run_a)
+    tb = threading.Thread(target=run_b)
+    ta.start()
+    tb.start()
+    ta.join(20)
+    tb.join(20)
+    assert b_exited.is_set()
+    assert seen["a_during"] is dt._recording_write
+    assert Message._write is original

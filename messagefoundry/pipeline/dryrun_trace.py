@@ -67,6 +67,7 @@ from __future__ import annotations
 import inspect
 import math
 import sys
+import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -544,16 +545,31 @@ def _recording_write(
     _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
+# ``Message._write`` is class-global, so concurrent traces (one per thread) share one patch. A
+# count under a lock installs it on the first entry and restores it on the last exit; without it
+# the first trace to finish restored the original under the others, which then silently recorded
+# no writes (BACKLOG #6825).
+_patch_lock = threading.Lock()
+_patch_holders = 0
+
+
 @contextmanager
 def _patched_message_writes() -> Iterator[None]:
     """Record ``msg.set(...)`` / ``msg[...] = ...`` / ``msg.set_data(...)`` writes for the active
-    recorder, then restore the original method. A no-op passthrough whenever no recorder is active, so
-    it never perturbs the mutation itself."""
-    Message._write = _recording_write  # type: ignore[method-assign]
+    recorder, then restore the original method once no trace still needs it. A no-op passthrough
+    whenever no recorder is active, so it never perturbs the mutation itself."""
+    global _patch_holders
+    with _patch_lock:
+        if _patch_holders == 0:
+            Message._write = _recording_write  # type: ignore[method-assign]
+        _patch_holders += 1
     try:
         yield
     finally:
-        Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
+        with _patch_lock:
+            _patch_holders -= 1
+            if _patch_holders == 0:
+                Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
 
 
 def trace_dry_run(
