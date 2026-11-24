@@ -2601,6 +2601,7 @@ def test_an_end_state_it_cannot_confirm_is_not_counted_as_removed(
     assert d["Outcome"] == "orphaned", d
     assert "not confirmed gone" in d["OutcomeDetail"], d["OutcomeDetail"]
     assert d["BranchOutcome"] == "kept"
+    assert "could not be confirmed" in d["BranchDetail"], "git exited 0: it is not a failed removal"
     assert res["counts"]["removed"] == 0
     assert res["_exit"] == 3
     assert "clean" in _git(fx.primary, "branch", "--list", "clean")
@@ -2850,6 +2851,160 @@ def test_a_claim_held_by_a_pruned_worktree_is_released(fx: Fixture, sleeper: int
     assert res["counts"]["claimsReleased"] == 1
     assert res["counts"]["claimsUnreleased"] == 0
     assert res["_exit"] == 0
+
+
+def _ledger_paths(fx: Fixture) -> list[str]:
+    """The paths in the orphan ledger, forward-slashed; ``[]`` when there is no ledger file."""
+    ledger = fx.primary / ".git" / "prune-merged-orphans.json"
+    if not ledger.exists():
+        return []
+    entries = json.loads(ledger.read_text(encoding="utf-8-sig"))
+    return [str(e["path"]).replace("\\", "/") for e in entries]
+
+
+def _fwd(path: Path) -> str:
+    return str(path).replace("\\", "/")
+
+
+def test_an_unknown_end_state_keeps_the_claim_until_the_tree_is_confirmed_gone(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Red before the fix on the last run: the ledger dropped the entry and the claim stayed, naming
+    a tree that no longer exists, with nothing left that would ever release it."""
+    live_record(fx, sleeper, fx.primary)
+    clean = fx.sibling("clean")
+    _backdate(fx.primary, clean, hours=100)
+    claim = write_claim(fx, "clean-work", clean)
+    living = write_claim(fx, "living-work", fx.sibling("dirty"))
+
+    with _unlistable(fx.primary.parent):
+        first = run(fx, "-Apply", "-Name", "clean")
+        assert by_leaf(first, "clean")["Outcome"] == "orphaned"
+        assert by_leaf(first, "clean")["ClaimsReleased"] == []
+        assert claim.exists(), "an unknown end state released the claim"
+        unconfirmed = run(fx, "-Apply")
+        assert unconfirmed["counts"]["claimsReleased"] == 0
+        assert claim.exists(), "a run that could not confirm the tree gone released the claim"
+        assert _ledger_paths(fx) == [_fwd(clean)]
+
+    preview = run(fx)
+    assert preview["counts"]["claimsReleased"] == 0
+    assert claim.exists(), "a dry run released a claim"
+    assert _ledger_paths(fx) == [_fwd(clean)], "a dry run rewrote the ledger"
+
+    settled = run(fx, "-Apply")
+    assert not claim.exists(), "the tree is confirmed gone and its claim is still held"
+    assert living.exists(), "a claim on a living worktree was released"
+    assert settled["counts"]["claimsReleased"] == 1
+    assert _ledger_paths(fx) == []
+    assert settled["_exit"] == 0
+
+
+@pytest.mark.parametrize("blocked_by", ["claim-file-locked", "unreadable-claim", "parent-gone"])
+def test_a_gone_entry_stays_in_the_ledger_while_its_claim_cannot_be_released(
+    fx: Fixture, sleeper: int, blocked_by: str
+) -> None:
+    """Each block is lifted afterwards, and the same entry then settles. Red before the fix: the
+    ledger dropped the entry on the first run, so nothing could release the claim later."""
+    live_record(fx, sleeper, fx.primary)
+    tree = (
+        fx.root / "wt" / "deleted-parent" / "repo-deleted"
+        if blocked_by == "parent-gone"
+        else fx.sibling("deleted")
+    )
+    _write_orphan_ledger(fx, tree)
+    claim = write_claim(fx, "deleted-work", tree)
+    corrupt = _claims_dir(fx) / "corrupt.json"
+
+    if blocked_by == "claim-file-locked":
+        with claim.open("rb"):
+            blocked = run(fx, "-Apply")
+        assert blocked["counts"]["claimsUnreleased"] == 1
+    else:
+        if blocked_by == "unreadable-claim":
+            corrupt.write_bytes(b"{not json at all")
+        blocked = run(fx, "-Apply")
+    assert blocked["counts"]["claimsReleased"] == 0
+    assert claim.exists()
+    assert _ledger_paths(fx) == [_fwd(tree)], "the entry went while its claim is still held"
+    assert [_fwd(Path(h["path"])) for h in blocked["ledger"]["heldForClaims"]] == [_fwd(tree)]
+    assert blocked["_exit"] == 1
+
+    if blocked_by == "unreadable-claim":
+        corrupt.unlink()
+    elif blocked_by == "parent-gone":
+        tree.parent.mkdir()
+    settled = run(fx, "-Apply")
+    assert not claim.exists()
+    assert settled["counts"]["claimsReleased"] == 1
+    assert settled["ledger"]["heldForClaims"] == []
+    assert _ledger_paths(fx) == []
+    assert settled["_exit"] == 0
+
+
+def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: int) -> None:
+    """The control for the hold above: an entry with nothing to release is not kept."""
+    live_record(fx, sleeper, fx.primary)
+    _write_orphan_ledger(fx, fx.sibling("deleted"))
+    other = write_claim(fx, "other-work", fx.sibling("dirty"))
+    res = run(fx, "-Apply")
+    assert _ledger_paths(fx) == []
+    assert res["ledger"]["heldForClaims"] == []
+    assert res["counts"]["claimsReleased"] == 0
+    assert other.exists()
+    assert res["_exit"] == 0
+
+
+@pytest.mark.parametrize(("git_exit", "surface"), [(1, "json"), (0, "text")])
+def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
+    fx: Fixture, sleeper: int, tmp_path: Path, git_exit: int, surface: str
+) -> None:
+    """Red before the fix: it read ORPHANED, exit 3, and printed a recipe for moving a registered
+    checkout aside. The run established only git's exit code, that git still lists the tree, and
+    that the directory could not be read."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("clean")
+    _backdate(fx.primary, tree, hours=100)
+    who = subprocess.run(
+        ["whoami"], capture_output=True, text=True, check=False, timeout=30
+    ).stdout.strip()
+    assert who
+    shim = _git_shim(
+        tmp_path,
+        "    $left = [string]$args[-1]\n"
+        f"    & icacls $left /deny '{who}:(RA,REA,RD)' | Out-Null\n"
+        f"    exit {git_exit}",
+    )
+    try:
+        with _unlistable(fx.primary.parent):
+            if surface == "json":
+                res = run(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+            else:
+                proc = run_text(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+    finally:
+        subprocess.run(
+            ["icacls", str(tree), "/remove:d", who],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+    assert _ledger_paths(fx) == [], "a tree git still lists is not an orphan to remember"
+    assert "clean" in _git(fx.primary, "branch", "--list", "clean")
+    if surface == "json":
+        d = by_leaf(res, "clean")
+        assert d["Outcome"] == "unknown", d["OutcomeDetail"]
+        assert d["OutcomeDetail"].startswith("END STATE UNKNOWN"), d["OutcomeDetail"]
+        assert "still lists" in d["OutcomeDetail"], d["OutcomeDetail"]
+        assert d["BranchOutcome"] == "kept"
+        assert res["counts"]["orphaned"] == 0
+        assert res["counts"]["failed"] == 1
+        assert res["_exit"] == 1
+    else:
+        assert "END STATE UNKNOWN" in proc.stdout, proc.stdout
+        for wrong in ("ORPHANED", "Move-Item", "FAILED (exit", "not a git repository"):
+            assert wrong not in proc.stdout, f"{wrong!r} in:\n{proc.stdout}"
+        assert proc.returncode == 1
 
 
 def test_a_claim_from_ANOTHER_machine_is_never_reaped_with_the_tree(
