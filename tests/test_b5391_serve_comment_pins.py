@@ -2,23 +2,26 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5391 item 1, S19-73 and S19-74: two comments in ``_serve`` that stated false things.
 
-Each pin reads one block of own-line comments in the one ``def _serve`` in
+The two comment pins read own-line comments in the one ``def _serve`` in
 ``messagefoundry/__main__.py``, lower-cased with comment markers and runs of whitespace
-collapsed, so a revert that reflows a line is still caught; a control below shows that. Each
-block is found by an anchor, so a pin whose comment moved fails rather than reading nothing. A
-pin bans the false wording it names, and a reworded revert can pass it.
+collapsed, so a revert that reflows a line is still caught. Each is found by an anchor, so a
+pin whose comment moved fails rather than reading nothing. A pin bans the wording it names; a
+reworded revert, or one placed outside the text the pin reads, can pass it. The re-import pin
+reads ``_serve``'s import statements, not its comments.
 
-* S19-73, the block above ``_serve``'s ``install_remote_debug_guard()`` call. Before engine PR
-  3019 it said the window before the hook "stays open"; the module-level call (vault BACKLOG
-  #2742) is made ahead of the module's other imports and of argument parsing, and
+* S19-73, the own-line comment block directly above ``_serve``'s ``install_remote_debug_guard()``
+  call. Before engine PR 3019 it said this module's imports and argument parsing come before
+  the hook and "that window stays open"; the module-level call (vault BACKLOG #2742) is made
+  ahead of the module's other imports and of argument parsing, and
   ``messagefoundry.remotedebug``'s module docstring says what start-up still runs before it.
-  PR 3019's wording said the call covers a caller that reached ``_serve`` "some other way";
-  every route imports the module first. The finding's other half, function-local re-imports of
-  ``sys`` and ``Path``, was already gone before PR 3019, so that pin guards a return only; its
-  control shows it can fail.
-* S19-74, the sentence of the posture-B gate's comment that gives the loopback arm's reason.
-  Before PR 3019 it cited upgrade breakage on working deployments, a cost ``CLAUDE.md`` section 0
-  makes vacuous.
+  The pin bans "window stays open" because the false claim was worded that way, so an accurate
+  note about that remaining start-up window needs other words. PR 3019's wording said the call
+  covers a caller that reached ``_serve`` "some other way"; every route imports the module
+  first. The finding's other half, function-local re-imports of ``sys`` and ``Path``, was
+  already gone before PR 3019, so that pin guards a return only; its control shows it can fail.
+* S19-74, the posture-B gate's comment, read from the loopback-arm anchor to the next full stop.
+  Before PR 3019 that text cited upgrade breakage on working deployments, a cost ``CLAUDE.md``
+  section 0 makes vacuous.
 """
 
 from __future__ import annotations
@@ -76,7 +79,8 @@ def _block_above_call(source: str, func: str, callee: str) -> str:
 
 
 def _sentence_holding(source: str, func: str, anchor: str) -> str:
-    """The sentence of ``func``'s comments that holds ``anchor``, up to its full stop."""
+    """The text of ``func``'s comments from ``anchor`` to the next full stop. Text before the
+    anchor in the same sentence is not read."""
     hits = [text for _f, _l, text in _blocks(source, func) if anchor in text]
     assert len(hits) == 1, f"{anchor!r} is in {len(hits)} comment blocks of {func}; re-anchor"
     tail = hits[0][hits[0].index(anchor) :]
