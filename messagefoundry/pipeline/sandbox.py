@@ -524,6 +524,18 @@ _STDERR_NOTICE_SECONDS: Final = 60.0
 #: grandchild can hold the pipes open indefinitely, and this runs under the session lock.
 _STDERR_JOIN_SECONDS: Final = 1.0
 
+#: How long a reap waits for the killed worker to exit before it logs that it has not.
+_REAP_WAIT_SECONDS: Final = 5.0
+
+
+def _close_quietly(stream: Any) -> None:
+    """Close a pipe end this side owns. A close can only fail with ``OSError``, which is not worth
+    a line: the pipe is no longer used either way."""
+    try:  # noqa: SIM105
+        stream.close()
+    except OSError:
+        pass
+
 
 class _StderrRelay:
     """One worker GENERATION's stderr, turned into log records (BACKLOG #343, ADR 0176).
@@ -576,6 +588,9 @@ class _StderrRelay:
             pass  # the pipe died with the worker; the kill path reports that, this thread does not
         finally:
             self.close()
+            # This thread is the stream's only reader, so it closes it once the drain ends, rather
+            # than leave the descriptor to the collector (BACKLOG #6831).
+            _close_quietly(stream)
 
     def feed(self, chunk: bytes) -> None:
         """Accumulate ``chunk`` and emit every complete line (or cap-length run) it completes."""
@@ -1009,6 +1024,9 @@ class SandboxSession:
         # The current generation's drain threads (frames on fd 1, stderr on fd 2), joined ONLY on the
         # shutdown path -- see :meth:`close`.
         self._threads: list[threading.Thread] = []
+        # Workers whose request pipe a lookup helper its dispatch gave up on still holds; that
+        # helper closes it, not :meth:`_reap` (BACKLOG #6831).
+        self._stdin_held: set[subprocess.Popen[bytes]] = set()
         # Monotonic per-session worker counter. Part of a relayed line's identity because a pid is NOT
         # a unique generation id: an OS recycles pids (aggressively on Windows), and a stale relay can
         # still be draining a killed child while the next one runs -- two generations' records would
@@ -1248,6 +1266,10 @@ class SandboxSession:
                     return  # the stream is out of step, so nothing after the header is a frame
         except OSError:
             sink.put(_EOF)
+        finally:
+            # This thread is the stream's only reader, so it closes it on the way out rather than
+            # leave the descriptor to the collector (BACKLOG #6831).
+            _close_quietly(stdout)
 
     def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
         """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
@@ -1304,16 +1326,39 @@ class SandboxSession:
         #
         # The same reap EOFs fd 2, so the stderr relay thread ends on its own here exactly as the frame
         # reader does. Neither thread is joined on THIS path (a respawn must not wait on a grandchild
-        # that holds a pipe open, and this runs under the session lock), and neither pipe is closed:
-        # closing a file object under a mid-read thread raises ``ValueError``, which is not what either
-        # drain's ``except OSError`` catches, so it would escape into ``threading.excepthook``. The
+        # that holds a pipe open, and this runs under the session lock), and neither of their pipes
+        # is closed here: closing a file object under a mid-read thread raises ``ValueError``, which
+        # is not what either drain's ``except OSError`` catches, so it would escape into
+        # ``threading.excepthook``. Each drain closes its own stream as it ends (BACKLOG #6831). The
         # shutdown-only bounded join lives in :meth:`close`.
         _reap_process_tree(proc, self._job, self._inbound)
         self._job = None
-        try:  # noqa: SIM105
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
+        try:
+            proc.wait(timeout=_REAP_WAIT_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Not swallowed (BACKLOG #6831): this engine stops waiting on a worker the tree kill
+            # did not end in time. Identity only, no content.
+            log.warning(
+                "inbound %r: sandbox worker pid %d had not exited %.0fs after its kill, and is "
+                "not waited on further",
+                self._inbound,
+                proc.pid,
+                _REAP_WAIT_SECONDS,
+            )
+        except OSError as exc:
+            log.warning(
+                "inbound %r: could not wait on sandbox worker pid %d (%s)",
+                self._inbound,
+                proc.pid,
+                type(exc).__name__,
+            )
+        # The engine's end of the request pipe, closed here rather than left to the collector
+        # (BACKLOG #6831). Only the thread holding the session lock writes it, except a lookup
+        # helper its dispatch gave up on, which may still be inside a write: that helper closes it
+        # itself when it ends, because a close under another thread's write can free the descriptor
+        # number for reuse before that write reaches the kernel.
+        if proc.stdin is not None and proc not in self._stdin_held:
+            _close_quietly(proc.stdin)
         if proc is self._proc:
             self._proc = None
 
@@ -1609,16 +1654,28 @@ class SandboxSession:
             except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
                 report(exc)
 
+        def serve_then_release() -> None:
+            try:
+                serve()
+            finally:
+                # A helper its dispatch gave up on owns the pipe from then on (see :meth:`_reap`).
+                if abandoned.is_set():
+                    _close_quietly(stdin)
+                    self._stdin_held.discard(proc)
+
         context = contextvars.copy_context()
         helper = threading.Thread(
             target=context.run,
-            args=(serve,),
+            args=(serve_then_release,),
             name=f"mf-sandbox-lookup-{self._inbound}",
             daemon=True,
         )
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
+            # Before ``abandoned`` is set, so the reap never closes the pipe under the helper's
+            # write; the helper closes it when it ends (see :meth:`_reap`).
+            self._stdin_held.add(proc)
             abandoned.set()
             return False
         if fault:
