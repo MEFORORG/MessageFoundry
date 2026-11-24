@@ -2172,11 +2172,12 @@ def cancels_at_entry() -> int:
 
 def _force_failed_open_release(
     force_release: Callable[[], object] | None, *, after: str = "a failed store open"
-) -> None:
+) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
-    None is a caller with nothing it can release without waiting."""
+    None is a caller with nothing it can release without waiting. True only when a release ran
+    and returned, so a caller's log line says the release happened only then (BACKLOG #5720)."""
     if force_release is None:
-        return
+        return False
     try:
         force_release()
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
@@ -2185,6 +2186,37 @@ def _force_failed_open_release(
             after,
             type(failure).__name__,
         )
+        return False
+    return True
+
+
+def _forced_outcome(
+    force_release: Callable[[], object] | None,
+    released: bool,
+    *,
+    built: str = "what it had not closed",
+    left: str = "may still be open",
+) -> str:
+    """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
+    names what was to be released, and ``left`` what follows when nothing released it."""
+    if released:
+        return f"{built} was released without waiting for it"
+    if force_release is None:
+        return f"{built} {left}"
+    return f"forcing its release failed, so {built} {left}"
+
+
+async def close_or_force(
+    close: Callable[[], Awaitable[None]], force_release: Callable[[], object], *, what: str
+) -> None:
+    """Await ``close``. When it ends by raising, a cancel included, call ``force_release``, so
+    what the close had not reached is dropped without waiting, then re-raise (BACKLOG #5720).
+    ``what`` names the close in the WARNING a failed ``force_release`` writes."""
+    try:
+        await close()
+    except BaseException:
+        _force_failed_open_release(force_release, after=what)
+        raise
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
@@ -2322,15 +2354,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release, after=after)
+            released = _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
-                "what the open built was released without waiting for it"
-                if force_release is not None
-                else "it was left to finish on its own",
+                _forced_outcome(
+                    force_release,
+                    released,
+                    built="what the open built",
+                    left="is left to the cleanup, which finishes on its own",
+                ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task, what)
@@ -2366,13 +2401,9 @@ async def cleanup_failed_open(
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
         # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release, after=after)
+        released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
-        left = (
-            "what it had not closed was released without waiting for it"
-            if force_release is not None
-            else "what it had not closed may still be open"
-        )
+        left = _forced_outcome(force_release, released)
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:

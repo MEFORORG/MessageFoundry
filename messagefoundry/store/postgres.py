@@ -354,6 +354,7 @@ from messagefoundry.store.store import (
     check_open_store_pin,
     check_password_generated,
     cleanup_failed_open,
+    close_or_force,
     conditional_way_past,
     create_batch_failure,
     decoded_rows,
@@ -2300,8 +2301,8 @@ class PostgresStore:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
             # AES-GCM invocation block it reserved, and each forfeited block counts toward the
-            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
-            # BACKLOG #3054).
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it
+            # never replaces the open's own error (vault BACKLOG #3054).
             async def _release() -> None:
                 try:
                     await pool.close()
@@ -2394,7 +2395,8 @@ class PostgresStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before, once the
+        forced release has dropped what that close did not reach, a cancel included. Under an
         ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
         async generator may await there; only if it fails or a cancel interrupts it does the
         forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
@@ -2457,7 +2459,10 @@ class PostgresStore:
                 what="a one-connection store's cleanup",
             )
             raise
-        await store.close()
+        # A close cut short, a cancel in its settle included, would leave the pool open.
+        await close_or_force(
+            store.close, lambda: pool.terminate(), what="a one-connection store's close"
+        )
 
     @classmethod
     async def schema_meta_anywhere(

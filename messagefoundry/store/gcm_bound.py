@@ -219,9 +219,8 @@ async def _add_then_grant(
     except Exception as exc:
         if cancelled:
             # The cancellation wins, but the failure is recorded rather than dropped.
-            log.warning(
-                "the AES-GCM invocation bound's add failed after its pass was cancelled",
-                exc_info=True,
+            _log_by_class(
+                exc, "the AES-GCM invocation bound's add failed after its pass was cancelled (%s)"
             )
             raise asyncio.CancelledError from exc
         raise
@@ -230,6 +229,13 @@ async def _add_then_grant(
     bound.grant_invocations(need, total)
     if cancelled:
         raise asyncio.CancelledError
+
+
+def _log_by_class(exc: BaseException, message: str, *args: object) -> None:
+    """``message`` at WARNING with ``exc``'s class as its last argument, the traceback at DEBUG
+    only: a driver's message may carry a path or a value (CLAUDE.md section 9, BACKLOG #5720)."""
+    log.warning(message, *args, type(exc).__name__)
+    log.debug("the invocation bound's add failure", exc_info=exc)
 
 
 async def _account(
@@ -265,11 +271,11 @@ async def _account(
             if INVOCATION_BOUND_NOTE not in getattr(exc, "__notes__", ()):
                 exc.add_note(INVOCATION_BOUND_NOTE)
             raise
-        log.warning(
-            "could not reach the AES-GCM invocation bound for the active key while %s; the "
+        _log_by_class(
+            exc,
+            "could not reach the AES-GCM invocation bound for the active key while %s (%s); the "
             "in-process ceiling still applies and the next pass retries",
             what,
-            exc_info=True,
         )
 
 

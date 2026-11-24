@@ -364,6 +364,7 @@ from messagefoundry.store.store import (
     check_open_store_pin,
     check_password_generated,
     cleanup_failed_open,
+    close_or_force,
     conditional_way_past,
     create_batch_failure,
     decoded_rows,
@@ -4448,9 +4449,10 @@ class SqlServerStore:
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
-            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
-            # complete while the pool is wedged, so releasing the executor only on the success path
-            # would leak its threads in exactly the case this except exists for.
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is
+            # released in a finally, same as close() above: wait_closed() cannot complete while the
+            # pool is wedged, so releasing the executor only on the success path would leak its
+            # threads in exactly the case this except exists for.
             async def _release() -> None:
                 try:
                     try:
@@ -5832,7 +5834,8 @@ class SqlServerStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before, once the
+        forced release has dropped what that close did not reach, a cancel included. Under an
         ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
         async generator may await there; only if it fails or a cancel interrupts it does the
         forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
@@ -5842,6 +5845,14 @@ class SqlServerStore:
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, maxsize=1)
         store: SqlServerStore | None = None
+
+        def _force_release() -> None:
+            # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
+            try:
+                pool.close()
+            finally:
+                executor.shutdown(wait=False)
+
         try:
             store = cls(pool, settings)
             store._pool_executor = executor
@@ -5856,13 +5867,6 @@ class SqlServerStore:
                 try:
                     pool.close()
                     await pool.wait_closed()
-                finally:
-                    executor.shutdown(wait=False)
-
-            def _force_release() -> None:
-                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
-                try:
-                    pool.close()
                 finally:
                     executor.shutdown(wait=False)
 
@@ -5938,7 +5942,9 @@ class SqlServerStore:
                 what="a one-connection store's cleanup",
             )
             raise
-        await store.close()
+        # A close cut short before its pool step, a cancel in its settle included, would leave the
+        # pool and the executor open.
+        await close_or_force(store.close, _force_release, what="a one-connection store's close")
 
     @classmethod
     async def schema_meta_anywhere(
