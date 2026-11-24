@@ -21,6 +21,8 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.__main__ import main
 from messagefoundry.config.db_lookup import db_lookup
 from messagefoundry.config.fhir_lookup import fhir_lookup
@@ -340,6 +342,53 @@ def test_gate_1b_a_generator_invocation_declares_lazy_result() -> None:
     control_inv = _handler_invocation(control)
     assert "lazy_result" not in control_inv  # absent, not False — an eagerly-returning handler
     assert control_inv["sends"] == [{"outbound": "out"}] and control_inv["events"]
+
+
+class _SinglePassSends:
+    """A Handler's single-pass Iterable of ``Send``s: ``__iter__`` returns one stored generator.
+
+    Not an ``Iterator``, so the ``Iterator`` guard alone let ``_sends_from`` walk it, drain it, and
+    hand ``_partition`` an empty iterable (BACKLOG #6823)."""
+
+    def __init__(self, *items: Send) -> None:
+        self._gen = (i for i in items)
+
+    def __iter__(self) -> Iterator[Send]:
+        return self._gen
+
+
+def handle_single_pass(msg: Message) -> _SinglePassSends:
+    return _SinglePassSends(Send("out", msg), Send("out2", msg))
+
+
+def test_gate_1a_a_single_pass_iterable_handler_traces_byte_identically() -> None:
+    """ADR 0072 gate 1a for a Handler returning a single-pass Iterable that is not an Iterator.
+
+    Walking it in the observer exhausted it, so the traced run reported FILTERED with zero
+    deliveries while the untraced run delivered two (BACKLOG #6823). The untraced side is asserted
+    to deliver first, so the test cannot pass by both runs delivering nothing. The under-report on
+    the invocation is declared with ``lazy_result``, as for a generator Handler."""
+    plain = dry_run(_two_out_registry(handle_single_pass), ADT_A01)
+    traced = trace_dry_run(_two_out_registry(handle_single_pass), ADT_A01)
+
+    assert [d.to for d in plain.deliveries] == ["out", "out2"]
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
+    assert traced["disposition"] == plain.disposition.value
+    inv = _handler_invocation(traced)
+    assert inv["sends"] == []
+    assert inv["lazy_result"] is True
+
+
+@pytest.mark.parametrize("make", [list, tuple, set, frozenset])
+def test_handler_invocation_still_traces_re_iterable_containers(make: type) -> None:
+    """Control for the allowlist: re-iterable containers are still walked and not marked lazy."""
+
+    def handle(msg: Message) -> object:
+        return make([Send("out", msg), Send("out2", msg)])
+
+    inv = _handler_invocation(trace_dry_run(_two_out_registry(handle), ADT_A01))
+    assert sorted(s["outbound"] for s in inv["sends"]) == ["out", "out2"]
+    assert "lazy_result" not in inv
 
 
 def test_gate_byte_identical_unrouted_and_filtered() -> None:

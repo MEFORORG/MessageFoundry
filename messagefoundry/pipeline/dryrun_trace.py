@@ -64,7 +64,7 @@ from __future__ import annotations
 import inspect
 import math
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
@@ -80,7 +80,6 @@ from messagefoundry.config.wiring import (
     RouterFn,
     Send,
     accepts_verdict,
-    handler_result_items,
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run
@@ -168,15 +167,33 @@ def _sends_from(result: object) -> list[str]:
     :func:`_routed_from`'s long-standing gap for a generator Router, but on the Handler half **this
     change opened it**: before BACKLOG #341 a generator Handler delivered nothing at all, so reporting
     no sends was exact rather than a degradation. The caller marks the invocation ``lazy_result`` so
-    the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1)."""
+    the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1).
+
+    **"Not an Iterator" is not "safe to walk"** (BACKLOG #6823), the same defect the Router half hit
+    under BACKLOG #1694: an object whose ``__iter__`` hands back a stored generator is single-pass yet
+    no ``Iterator``, and walking it here left ``_partition`` an empty iterable, so a delivering run
+    traced as FILTERED. Only the re-iterable containers in :data:`_ROUTED_CONTAINERS` are walked; any
+    other iterable is reported as no sends and declared by :func:`_handler_return_is_untraceable`."""
     if result is None:
         return []
-    if isinstance(result, Iterator):
+    if isinstance(result, _ROUTED_CONTAINERS):
+        items: Iterable[object] = result
+    elif _handler_return_is_untraceable(result):
         return []
-    items = handler_result_items(result)
-    if items is None:
-        items = [result]
+    else:
+        items = [result]  # a single value, as `handler_result_items` treats a non-iterable
     return [it.to for it in items if isinstance(it, Send)]
+
+
+def _handler_return_is_untraceable(result: object) -> bool:
+    """True when :func:`_sends_from` declines to walk this Handler return, so the record is incomplete.
+
+    Drives ``lazy_result`` for the Handler half. It names exactly the shapes ``_partition``
+    materializes as a container (any ``Iterable`` but ``str``/``bytes``/``bytearray``) that are not
+    known to be re-iterable: a generator, and a custom single-pass iterable."""
+    return isinstance(result, Iterable) and not isinstance(
+        result, (str, bytes, bytearray, *_ROUTED_CONTAINERS)
+    )
 
 
 #: Router-return containers this observer will walk: re-iterable, and walking one consumes nothing.
@@ -331,11 +348,13 @@ class _Recorder:
         if self.kind == "router":
             # Widen the declaration for the Router half: `_routed_from` walks an allowlist, so a
             # single-pass custom iterable or a `__getitem__`-only sequence is equally untraced and
-            # must say so. The Handler half keeps the Iterator test -- `_sends_from` still routes
-            # through `handler_result_items`, which has its own rule.
+            # must say so.
             self.lazy_result = self.lazy_result or _router_return_is_untraceable(result)
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
+            # The Handler half walks the same allowlist, so its declaration widens the same way
+            # (BACKLOG #6823): a single-pass custom iterable is untraced, not "sent nothing".
+            self.lazy_result = self.lazy_result or _handler_return_is_untraceable(result)
             self.sends = _sends_from(result)
         # An "accepts" predicate (ADR 0084) returns a bool — it has neither routed_to nor sends, and its
         # verdict is reported at message level (`accepts_declined`). Named explicitly so it isn't quietly
