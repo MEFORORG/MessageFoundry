@@ -357,13 +357,16 @@ async def test_a_finalizer_failure_leaves_no_unowned_thread(
     def refuse(*_: object) -> None:
         raise MemoryError("no finalizer")
 
-    # Control: unpatched, a check does start a live thread under the name the census below filters
-    # on, so a renamed thread cannot turn that census into a pass over nothing.
+    # Control: the same census, around an unpatched check, finds the worker that check starts. So
+    # the census can see a probe thread, and its empty answer below is not a pass over nothing.
     control = _disk_monitor(tmp_path, IntakeGate())
+    before = set(threading.enumerate())
     await control.check_once()
-    named = [t for t in probe.threads if t.name == "intake-disk-probe"]
-    assert named, "control: the probe ran on a thread named as the census expects"
+    seen = _new_probe_threads(before)
+    assert len(seen) == 1, "control: the census found the worker an unpatched check started"
     await control.stop()
+    await asyncio.to_thread(seen[0].join, 10.0)
+    assert not seen[0].is_alive(), "control: the stopped worker exited"
     measured = probe.started
 
     before = set(threading.enumerate())
@@ -371,11 +374,13 @@ async def test_a_finalizer_failure_leaves_no_unowned_thread(
     with monkeypatch.context() as patch:
         patch.setattr(intake_bound, "weakref", SimpleNamespace(finalize=refuse))
         await monitor.check_once()  # must not raise
-    after = set(threading.enumerate())
-    assert after, "control: the thread census sees the running threads"
-    started = [t for t in after - before if t.name == "intake-disk-probe"]
-    assert not started, "a probe thread started with nothing owning it"
+    assert not _new_probe_threads(before), "a probe thread started with nothing owning it"
     assert probe.started == measured
+
+
+def _new_probe_threads(before: set[threading.Thread]) -> list[threading.Thread]:
+    """The live disk-probe threads that were not running when ``before`` was taken."""
+    return [t for t in set(threading.enumerate()) - before if t.name == "intake-disk-probe"]
 
 
 async def test_a_dead_worker_drops_its_finalizer(tmp_path: Path, probe: _Probe) -> None:
