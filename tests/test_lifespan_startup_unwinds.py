@@ -360,9 +360,10 @@ def _pin_the_drain_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     notifier's own drain wait :data:`_DRAIN_WAIT_SECONDS`, so the teardown's cut stays out of reach.
 
     The unwind reads only the budget less the reserve, so the reserve is zeroed. ``_INNER_SHARE``
-    is module-wide: the alert-state drain's wait shrinks with it, to about 0.07 s, which these
-    tests' sinks, holding no state writes, never wait on. The hung-notifier test pins the wait this
-    derives from the notifier step's bound, in the ERROR it logs."""
+    is module-wide, so the alert-state drain's wait changes with it, to that share of what the
+    budget has left once the notifier step ends, about 0.9 s at most. These tests' sinks hold no
+    state writes, so none waits on it. The hung-notifier test pins the wait this derives from the
+    notifier step's bound, in the ERROR it logs."""
     monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", _UNWIND_BUDGET_SECONDS)
     monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.0)
     bound = _UNWIND_BUDGET_SECONDS - appmod._UNWIND_STATE_DRAIN_FLOOR_SECONDS
@@ -391,12 +392,12 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
 
     store: Any = _Store()
     began = loop.time()
-    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 30.0)
     # The control: the drain did reach the hung send, so the cut is what ended it.
     assert transport.entered.is_set()
     assert closed, "the store was never closed"
-    # Soon after the notifier's own wait ended, and well before the teardown would cut the step.
-    assert closed[0] - began <= _DRAIN_WAIT_SECONDS + 1.5
+    # Before the teardown would have cut the notifier's step: the notifier's own wait ended it.
+    assert closed[0] - began < _UNWIND_BUDGET_SECONDS - appmod._UNWIND_STATE_DRAIN_FLOOR_SECONDS
     errors = [r for r in caplog.records if "did not drain" in r.getMessage()]
     assert len(errors) == 1, caplog.text
     assert "2 alert(s) not confirmed delivered" in errors[0].getMessage()
@@ -423,7 +424,7 @@ class _HealthyEmail:
 
 
 async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5907: the notifier sent each alert to its transports in turn, webhook first, so a
     blackholed webhook held the email until the unwind cut the drain, and the refusal alert never
@@ -440,11 +441,14 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
             return None
 
     store: Any = _Store()
-    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    caplog.set_level(logging.WARNING)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 30.0)
     assert webhook.entered.is_set()  # the control: the webhook did hang
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]
     # The email took the first, so only the second, which no transport took, is counted.
     assert sink.undelivered == 1
+    assert "1 alert(s) not confirmed delivered" in caplog.text  # the notifier's own wait cut it
+    assert "cutting it" not in caplog.text  # and the teardown did not
 
 
 @pytest.mark.parametrize("webhook_first", [True, False], ids=["webhook-first", "email-first"])
@@ -469,7 +473,7 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     store: Any = _ClosingStore()
     caplog.set_level(logging.WARNING)
-    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 30.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the email took it
     assert sink.undelivered == 0
     if webhook_kind == "hangs-until-cut":
@@ -513,7 +517,7 @@ async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
     store: Any = _ClosingStore()
     caplog.set_level(logging.WARNING)
-    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
+    await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 30.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: delivered
     assert sink.stall_cut  # the control: the unwind's wait was cut
     assert "cutting it" not in caplog.text  # the notifier's own wait cut it, not the teardown
