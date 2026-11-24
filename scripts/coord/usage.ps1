@@ -33,9 +33,10 @@
            - a rate from its history rows that projects a run-out, counted from now, before the reset or
              with no reset, which sets CRITICAL.
          Below two samples in the current window there is no rate and no projection, and the percentage
-         bands still grade the reading. Two or more that cannot give a trustworthy rate -- a row dated
-         well after now, a span under the minimum, or rows across a reset the reading cannot name --
-         REFUSE the rate, and the window reads UNKNOWN below the ceiling; Get-Rate says why.
+         bands still grade the reading. History that cannot give a trustworthy rate -- any row dated well
+         after now, two or more rows spanning under the minimum, or rows across a reset the reading
+         cannot name -- REFUSES the rate; a fresh reading then reads UNKNOWN below the ceiling, and
+         Get-Rate says why.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -347,22 +348,24 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
             if ($age -lt -$RateClockSkewMinutes) { $ahead++; continue }
             $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed; Reset = [string]$r.seven_reset }
         }
-    } catch { return $null }
+    } catch { return (New-RateRefusal "the history at $histPath could not be read: $($_.Exception.Message)") }
     # NOT DROPPED AND COMPUTED FROM THE REST: the row may carry the highest level, and losing it
     # understated a real burn. Nothing proves when it was taken, so nothing from these rows is a rate.
     if ($ahead) {
-        return (New-RateRefusal "$ahead history row(s) dated more than $RateClockSkewMinutes min in the FUTURE -- clock skew or a bad timestamp, so no rate from these rows")
+        return (New-RateRefusal "$ahead history row(s) dated more than $RateClockSkewMinutes min in the FUTURE -- clock skew or a bad timestamp, so no rate from these rows. Fixing the clock does not clear a row already written; remove it from $histPath")
     }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
     # WITH NO RESET ON THE READING, THE FILTER ABOVE CANNOT RUN, so the rows are tested for a reset
     # themselves: a change in their reset column, or a fall in their percentage, since usage does not
     # fall inside a window. Rows across a reset are two pools, and their rate is either diluted or a
-    # spike. Which of them belong to the reading is not known, so none is used.
+    # spike. Which of them belong to the reading is not known, so none is used. A fall can also be an
+    # idle session's older number, which the collector publishes when no reset is known, or a row
+    # reordered by a backward clock step; neither leaves a rate to trust, and the reason says so.
     $inTime = @($rows | Sort-Object AgeMin -Descending)
     if (-not $CurrentResetEpoch) {
         for ($i = 1; $i -lt $inTime.Count; $i++) {
             if ($inTime[$i].Reset -ne $inTime[$i - 1].Reset -or $inTime[$i].Pct -lt $inTime[$i - 1].Pct) {
-                return (New-RateRefusal "this reading carries no reset time and its history rows cross a window reset, so no rate from them")
+                return (New-RateRefusal "this reading carries no reset time, and its history rows change reset or fall: a reset, an idle session's older number or a clock step, so no rate from them")
             }
         }
     }
@@ -373,7 +376,8 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
     # Shorter than the minimum the span is mostly rounding, and the result is refused, not a rate.
     $newestRow = $inTime[-1]
     $spanMin = $oldest.AgeMin - $newestRow.AgeMin
-    if ($spanMin -lt $RateMinSpanMinutes) {
+    # Rounded, because a difference of two rounded doubles can land a hair under 1.0.
+    if ([math]::Round($spanMin, 1) -lt $RateMinSpanMinutes) {
         return (New-RateRefusal "the history rows span $([math]::Round($spanMin, 1)) min, under the $RateMinSpanMinutes-min minimum for a rate")
     }
     # THE HIGHEST PERCENTAGE IS THE LEVEL IT REACHED. Usage does not fall inside a window, and a row's date
@@ -744,7 +748,8 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         resets_at        = $w.resets_at
         minutes_to_reset = $minsToReset
         rate_pct_per_hr  = $null
-        # Why the history rows gave no rate though they show a move, or $null. See Get-Rate.
+        # Why the history rows gave no rate on a FRESH reading, or $null. See Get-Rate. A stale reading's
+        # refusal goes in its reason only, so Get-DecisionCostRung can read this as "fresh, level only".
         rate_refused     = $null
         projected_at_reset = $null
         minutes_to_empty = $null
@@ -794,10 +799,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # gate hits on, and its reason says it has passed rather than naming a moment already gone.
         if ($age -gt $MaxAgeMinutes) {
             $rate = Get-Rate -CurrentResetEpoch $resetEpoch -ReadRoot $ReadRoot
-            if ($rate.Refused) {
-                $o.rate_refused = $rate.Refused
-                $o.reason = "$($o.reason); $($rate.Refused)"
-            }
+            if ($rate.Refused) { $o.reason = "$($o.reason); $($rate.Refused)" }
             elseif ($rate -and $rate.PctPerHour -gt 0) {
                 # The tense is chosen on the unrounded value, so a run-out seconds ahead is not "already".
                 $fromNow = (100.0 - $pct) / $rate.PctPerHour * 60.0 - $age
@@ -834,7 +836,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         }
     }
     else {
-        $o.reason = "not enough samples or span in this window for a rate"
+        $o.reason = "fewer than two history rows in this window, so no rate"
     }
 
     # Bands. The question is not "is the number big" but "does it run out before it resets".
@@ -853,9 +855,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
 
     # A REFUSED RATE IS UNKNOWN BELOW THE CEILING, NEVER A BAND. The rows show a move nothing measured, so
     # neither OK nor WARN can come from them, and "no rate" would let the level clear it (BACKLOG #5494).
+    # The number leads the reason, because the spawn hook prints only the reason of an UNKNOWN window.
+    # Get-DecisionCostRung still holds the level as the backstop at its rung on such a reading.
     if ($o.rate_refused -and $o.state -ne "CRITICAL") {
         $o.state = "UNKNOWN"
-        $o.reason = "no trustworthy burn rate: $($o.rate_refused)"
+        $o.reason = "$pct% used, but no trustworthy burn rate: $($o.rate_refused)"
     }
 
     # A READING DATED AFTER NOW CAN STOP WORK AND CANNOT CLEAR IT. Nothing proves when it was taken, so it
@@ -1012,7 +1016,7 @@ if ($dx.state -in $dxUntrusted) {
 # POWERSHELL SOURCE AND NOTHING FRESH (BACKLOG #1459). This state is kept out of $dxUntrusted so a fresh
 # reading on a box that does not use bash survives. Without this arm, a stale one fell through both
 # warnings and the operator saw no cause and no fix.
-elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
+elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and (($seven.state -eq "UNKNOWN" -and -not $seven.rate_refused) -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     Write-Host ""
     Write-Host "  WARNING -- this reading has not been confirmed lately, and the wiring may be why:" -ForegroundColor Yellow
     Write-Host "  $($dx.line)" -ForegroundColor Yellow
@@ -1029,8 +1033,9 @@ elseif ($dx.state -eq "WIRED_POWERSHELL_SOURCE" -and ($seven.state -eq "UNKNOWN"
 # (ownership, an extracted -StateDir matching this directory, and Test-Path on the collector). "nothing
 # fresh" is the window's state. The three CAUSES are offered as alternatives, never asserted, because
 # nothing here can tell them apart.
-# NOT FOR A GONE WINDOW: that reading can be seconds old, so neither cause below is in play.
-elseif ($dx.state -eq "WIRED_HERE" -and ($seven.state -eq "UNKNOWN" -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
+# NOT FOR A GONE WINDOW: that reading can be seconds old, so neither cause below is in play. Nor for a
+# refused rate, which is set only on a fresh reading.
+elseif ($dx.state -eq "WIRED_HERE" -and (($seven.state -eq "UNKNOWN" -and -not $seven.rate_refused) -or $seven.reading_age_min -gt $MaxAgeMinutes) -and -not (Test-WindowResetPassed $doc.seven_day)) {
     # THE COLLECTOR CLAUSE IS CONDITIONAL, because WIRED_HERE does not always mean one was checked: a
     # wired command carrying a -StateDir but no recognisable collector assignment yields a null
     # collector path, which skips the Test-Path guard entirely. Asserting it exists would be asserting

@@ -1038,6 +1038,13 @@ function Get-DecisionCostRung {
         }
         return (New-DecisionRung 'HIT' "weekly at least $floor%, a stale reading whose reset is still ahead, so that level stands; rung $($lv.HoldAt)% with no rate, from $($lv.Source)")
     }
+    # A FRESH READING WHOSE RATE usage.ps1 REFUSED IS UNKNOWN THERE, AND THE LEVEL STILL BACKS IT HERE
+    # (BACKLOG #5494). The refusal means the rows show a move nothing could measure, so it cannot clear;
+    # but at the rung it must still hit, as with no rate. usage.ps1 sets rate_refused on a fresh reading
+    # only, so this does not grade a stale number.
+    if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused') -and [double]$pct -ge $lv.HoldAt) {
+        return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldAt)% with no rate, from $($lv.Source). usage.ps1 refused the burn rate, so the level is the backstop, and it is reached")
+    }
     if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
         $why = [string](Get-DecisionJsonValue $week 'reason')
         if (-not $why) { $why = [string](Get-DecisionJsonValue $j 'reason') }

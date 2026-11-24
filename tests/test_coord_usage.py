@@ -1499,6 +1499,8 @@ def test_a_burn_that_stopped_still_reads_as_a_burn_until_its_rows_age_out(tmp_pa
     [
         pytest.param((4.0, 85.0), (0.1, 86.0), 15.4, id="over-four-minutes"),
         pytest.param((1.2, 85.0), (0.1, 86.0), 54.5, id="just-over-the-minimum-span"),
+        # 1.4 - 0.4 is 0.9999999999999999 in a double, so an unrounded test refused a whole minute.
+        pytest.param((1.4, 85.0), (0.4, 86.0), 60.0, id="exactly-the-minimum-span"),
     ],
 )
 def test_one_tick_is_a_rate_however_close_the_rows(
@@ -1536,6 +1538,8 @@ def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
     assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
     assert d["seven_day"]["rate_pct_per_hr"] is None, d
     assert "minimum" in d["seven_day"]["rate_refused"], d
+    # The number leads the reason, because the spawn hook prints only the reason of an UNKNOWN window.
+    assert d["seven_day"]["reason"].startswith("86% used"), d
 
 
 def test_a_span_under_the_minimum_at_the_ceiling_stays_critical(tmp_path: Path) -> None:
@@ -1573,9 +1577,21 @@ def test_a_history_row_far_ahead_of_now_refuses_the_rate(tmp_path: Path) -> None
     assert code == CRITICAL and d["seven_day"]["rate_refused"] is None, d
 
 
-@pytest.mark.parametrize("stamp_resets", [True, False], ids=["reset-column", "no-reset-column"])
+@pytest.mark.parametrize(
+    ("points", "stamp_resets"),
+    [
+        pytest.param(
+            [(80.0, 60.0), (50.0, 95.0), (30.0, 0.0), (2.0, 60.0)], True, id="reset-column"
+        ),
+        pytest.param([(80.0, 60.0), (50.0, 95.0), (30.0, 0.0), (2.0, 60.0)], False, id="a-fall"),
+        # No fall, so only the reset column shows the two windows.
+        pytest.param(
+            [(80.0, 10.0), (50.0, 20.0), (30.0, 30.0), (2.0, 60.0)], True, id="rise-across"
+        ),
+    ],
+)
 def test_with_no_reset_time_rows_across_a_reset_give_no_rate(
-    tmp_path: Path, stamp_resets: bool
+    tmp_path: Path, points: list[tuple[float, float]], stamp_resets: bool
 ) -> None:
     """BACKLOG #5494. With no reset on the reading, the rows' reset filter was skipped, so the last
     window's 60 to 95 diluted this window's 0 to 60 in 28 minutes, and the reading graded OK. A reset in
@@ -1587,7 +1603,7 @@ def test_with_no_reset_time_rows_across_a_reset_give_no_rate(
     resets = [old_epoch, old_epoch, new_epoch, new_epoch]
     write_history(
         tmp_path,
-        [(80.0, 60.0), (50.0, 95.0), (30.0, 0.0), (2.0, 60.0)],
+        points,
         extra=[{"seven_reset": e} for e in resets] if stamp_resets else None,
     )
     code, d = read(tmp_path)
@@ -1604,6 +1620,24 @@ def test_with_no_reset_time_rows_of_one_window_still_give_a_rate(tmp_path: Path)
     _, d = read(tmp_path)
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(128.6, abs=1), d
     assert d["seven_day"]["rate_refused"] is None, d
+
+
+def test_a_refused_rate_on_a_wired_root_blames_no_wiring(fake_home: Path) -> None:
+    """A refused rate is set only on a fresh reading, so the "not confirmed lately" warning, which names
+    three causes of a stale one, must not fire on it. The control is the same root with a stale reading."""
+    pin = fake_home / ".claude-account-1"
+    assert install("-ConfigDir", str(pin), pin=None, home=fake_home).returncode == 0
+    state = pin / "mefor-usage"
+    epoch = int(time.time()) + 280000
+    publish(state, seven=86.0, seven_epoch=epoch)
+    write_history(state, [(0.5, 85.0), (0.1, 86.0)], epoch)
+    _, _, refused = reader(pin=pin, home=fake_home)
+    assert "no trustworthy burn rate" in refused and "cannot tell them apart" not in refused, (
+        refused
+    )
+    publish(state, seven=86.0, age_min=48, seven_epoch=epoch)
+    _, _, stale = reader(pin=pin, home=fake_home)
+    assert "cannot tell them apart" in stale, stale
 
 
 def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) -> None:

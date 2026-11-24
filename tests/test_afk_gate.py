@@ -872,21 +872,28 @@ def test_a_real_burn_halts_however_the_rows_lie(
     assert code == HALT and "Projected to run out" in why(doc), why(doc)
 
 
-def test_a_tick_seconds_apart_reviews_and_never_reads_clear(sb: Sandbox, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("pct", "expected"),
+    [pytest.param(80, REVIEW, id="below-the-rung"), pytest.param(92, HALT, id="at-the-rung")],
+)
+def test_a_tick_seconds_apart_never_reads_clear(
+    sb: Sandbox, tmp_path: Path, pct: int, expected: int
+) -> None:
     """BACKLOG #5494. A span under the minimum is mostly the rounding of the ages, so usage.ps1 refuses
-    the rate and reads the window UNKNOWN: the gate reviews. It must not fall back to the level, where 80
-    percent below the rung reads clear."""
+    the rate and reads the window UNKNOWN. Below the rung the gate reviews: it must not fall back to the
+    level, where 80 percent reads clear. At the rung the level still hits, as it does with no rate."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
     env = {"CLAUDE_CONFIG_DIR": str(root)}
     _wire(sb, root, tmp_path, env)
     resets = int(ago().timestamp()) + 240 * 60
-    assert _fire(sb, state, {"used_percentage": 80, "resets_at": resets}, env).returncode == 0
-    _set_rows(state, [(ago(minutes=0.5), 79), (ago(minutes=0.02), 80)], resets)
+    assert _fire(sb, state, {"used_percentage": pct, "resets_at": resets}, env).returncode == 0
+    _set_rows(state, [(ago(minutes=0.5), pct - 1), (ago(minutes=0.02), pct)], resets)
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
-    assert code == REVIEW and "minimum" in why(doc), why(doc)
+    want = "refused the burn rate" if expected == HALT else "no trustworthy burn rate"
+    assert code == expected and want in why(doc), why(doc)
 
 
 def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(
