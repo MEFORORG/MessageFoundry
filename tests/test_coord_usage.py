@@ -437,6 +437,31 @@ def test_after_a_real_reset_an_idle_higher_reading_replaces_the_gone_window(tmp_
     assert read(tmp_path)[0] == CRITICAL
 
 
+def test_known_gap_after_a_real_reset_a_no_reset_reading_lets_a_frozen_number_in(
+    tmp_path: Path,
+) -> None:
+    """KNOWN GAP, pinned as the code behaves, not as it should (BACKLOG #5178, open finding). The
+    live-session rule applies only where the reading and the published window both carry a readable
+    reset. Past a gone published reset, an idle reading with no reset is taken, because no published
+    reset is ahead to hold; the published window then has no reset, so the next idle reading, a
+    frozen low number on a new reset, is taken too, and the rung reads OK on it. A fix changes this."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 100.0, "resets_at": now - 300}, "live", 1000)
+    assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
+
+    # CONTROL. Straight from the gone window, the idle frozen number is refused.
+    frozen = {"used_percentage": 5.0, "resets_at": now + 500000}
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+
+    # THE GAP. An idle no-reset reading drops the reset, and the frozen number then passes.
+    _session_fire(tmp_path, {"used_percentage": 100.0}, "bare", 1000)
+    assert latest(tmp_path)["seven_day"].get("resets_at_epoch") is None
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+    assert read(tmp_path)[0] == OK
+
+
 def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
     """BACKLOG #5178: as for a confirmation, the live-session exception needs this root's stamp, or a
     mis-wired session's 5 replaces this root's 100 and the reader refuses the foreign window."""

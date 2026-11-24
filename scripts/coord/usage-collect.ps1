@@ -333,15 +333,15 @@ try {
     # reads as freshly observed. The level only rises inside a window. So against a published window
     # of this root's, a reading is refused when it has the same reset and is not higher, or when its
     # reset is earlier than the published one and has already passed: that is the number an idle
-    # session still holds after a reset. Any other reset is a new window: a higher reading replaces
-    # from any session, and a lower or equal one only from a live session of this root (below). A
+    # session still holds after a reset. Any other reset is a new window, under the live-session rule
+    # below, which applies only where both windows carry a readable reset. A
     # refused reading leaves the published window whole, its own age included, so the
     # staleness guard keeps counting from the last real observation.
     #
     # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
     # reach the history: one on an empty directory, one over a window stamped with another root or with
     # no reset, one higher than the published window for the same gone reset, and one with a later reset
-    # than the published window that is higher than it or comes from a live session of this root.
+    # than the published window that is higher than it or comes from a live session (below).
     # Nothing here reads the clock against a lone reading. The reader reports
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
     # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
@@ -362,22 +362,21 @@ try {
     # live reading could lower until that reset. With no published reset ahead there is nothing to hold
     # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
     #
-    # A LOWER OR EQUAL READING ON ANOTHER RESET OPENS A NEW WINDOW ONLY FROM A LIVE SESSION (BACKLOG
-    # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
-    # frozen number replaced the published one on every fire. So it needs a session that has just
-    # called the API and is stamped with this root by Test-OwnStamp, as a confirmation must be. That
-    # test counts an unpinned session as this root's, so an unpinned session of another root that
-    # publishes here through a mis-wired -StateDir passes it too. A higher reading with a
-    # readable reset that is not an earlier, passed one (refused above, higher or not) is taken from
-    # anyone, before or after the published reset, because refusing it weakens a stop: while
-    # that reset is ahead the lower published number could clear the gate, and past it the gone window
-    # reads UNKNOWN, so the gate would answer REVIEW where the higher number halts it. That reason
-    # does not hold for a session pinned to another root: its reading is taken too, stamped with its
-    # own root, so the reader refuses the window and the next reading meets no floor. That gap
-    # predates BACKLOG #5178 and is still open. Past
-    # the published reset, a lower or equal idle reading is still refused, because its frozen number
-    # for the new window could read OK on a pool since spent; keeping the gone window costs a REVIEW.
-    # A first fire is never live, so such a reading waits for a live session of this root.
+    # THE LIVE-SESSION RULE (BACKLOG #5178), stated once in ADR 0211, "The live-session rule", with its
+    # two open gaps. ONLY WHERE THE READING AND THE PUBLISHED WINDOW BOTH CARRY A READABLE RESET, a
+    # lower or equal reading on another reset opens a new window only from a live session: one that
+    # has just called the API and is stamped with this root by Test-OwnStamp, as a confirmation must
+    # be, so an unpinned session of another root that publishes here passes too. Otherwise, after a
+    # moved reset, an idle session's frozen number replaced the published one on every fire. A higher
+    # reading there is taken from anyone, before or after the published reset, because refusing it
+    # weakens a stop: while that reset is ahead the lower published number could clear the gate, and
+    # past it the gone window reads UNKNOWN, so the gate would answer REVIEW where the higher number
+    # halts it. A first fire is never live, so a lower or equal reading waits for a live session.
+    # Where either side has no readable reset, the else branch below decides and liveness plays no
+    # part: past the published reset an idle no-reset reading is taken and drops the reset, and the
+    # next idle reading of any value is then taken (the no-reset gap). A higher reading from a session
+    # pinned to another root is taken too, stamped with that root, and a window stamped with another
+    # root is no floor (the foreign-root gap, which predates BACKLOG #5178).
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
