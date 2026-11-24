@@ -3295,13 +3295,21 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
             "written under. Set the service's store key here and run again."
         )
     reason = _totp_unusable_reason(secret)
-    if reason is None:
-        return "usable"
-    _log_totp_unusable(user.username, reason)
-    return "unknown" if reason == "malformed" else "refused"
+    if reason is not None:
+        _log_totp_unusable(user.username, reason)
+    return _totp_state_for(reason)
 
 
 _TotpUnusable = Literal["refused", "short_key", "malformed"]
+
+
+def _totp_state_for(reason: _TotpUnusable | None) -> TotpState:
+    """The :data:`TotpState` of an opened secret whose :func:`_totp_unusable_reason` is ``reason``:
+    the one mapping the census and the gates share. A refused marker or a short key is a KNOWN
+    refusal; a value that is not base32 cannot be judged."""
+    if reason is None:
+        return "usable"
+    return "unknown" if reason == "malformed" else "refused"
 
 
 def _totp_unusable_reason(secret: str) -> _TotpUnusable | None:
@@ -3320,6 +3328,8 @@ def _totp_unusable_reason(secret: str) -> _TotpUnusable | None:
         return "short_key"
     except totp.RefusedEnrolment:
         return "refused"
+    except ValueError:  # no other is raised today; one that is cannot be judged, never a 500
+        return "malformed"
     return None
 
 
@@ -3346,10 +3356,7 @@ def _opened_totp_state(secret: str | None) -> TotpState:
         return "refused"
     if secret.startswith(MARKER_PREFIX):
         return "unknown"
-    reason = _totp_unusable_reason(secret)
-    if reason in ("refused", "short_key"):
-        return "refused"
-    return "usable" if reason is None else "unknown"
+    return _totp_state_for(_totp_unusable_reason(secret))
 
 
 def _passkey_counts_nothing(cred: WebAuthnCredential) -> bool:
@@ -19322,8 +19329,9 @@ class AuthService:
         reenrol = False
         # The cell is opened only when this release compiles in a set other than its default, the
         # only way an ACCEPTED enrolment can differ from it, so a status read costs no decrypt
-        # otherwise. A refused marker is not reported here: the census names it at startup and in
-        # verify, and _totp_secret logs it at every code check.
+        # otherwise. A refused marker, or a secret no code is computed from, sets the flag here only
+        # then (totp.needs_reenrolment); the census names it at startup and in verify, and
+        # _totp_secret logs it at every open.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
                 secret = await self._totp_secret(user)

@@ -196,7 +196,8 @@ class RefusedTotpSecret(RefusedEnrolment):
     """A TOTP secret that is no key this release enrols or computes with (BACKLOG #5340): empty,
     not base32 (:class:`UndecodableTotpSecret`), or decoding to fewer than
     :data:`_MIN_SECRET_BYTES` bytes. :func:`new_enrolment` refuses each, and every code computation
-    refuses the last two, so a stored cell holding one computes and matches no code. The floor is
+    refuses each too, an empty one as a zero-length key, so a stored cell holding one computes and
+    matches no code. The floor is
     160 bits, the length RFC 4226 section 4 requirement R6 recommends; R6's MUST is 128 bits. A
     :class:`RefusedEnrolment`, so every caller that refuses a bad marker refuses this too. The
     message names no value."""
@@ -344,8 +345,8 @@ def verify_totp_step(
     ``secret`` is a bare base32 secret or a stored enrolment, checked with the parameters it records
     (BACKLOG #3422). A refused marker (:class:`RefusedEnrolment`), or a secret no code is computed
     from, short or not base32 (:class:`RefusedTotpSecret`, BACKLOG #5340), returns ``None``: no code
-    matches an enrolment this release cannot compute. On the two-step sign-in a recovery code stays the way
-    past it; the combined sign-in takes a TOTP code only, so there it reads as a wrong code.
+    matches an enrolment this release cannot compute. On the two-step sign-in a recovery code stays
+    the way past it; the combined sign-in takes a TOTP code only, so there it reads as a wrong code.
 
     The forward half of the skew window is *accepted* (so a near-boundary fast-clock authenticator can
     still log in) but the returned step is **clamped to the current step** (SEC-014, CWE-287): a

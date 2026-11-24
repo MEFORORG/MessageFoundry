@@ -178,7 +178,7 @@ def test_a_short_stored_key_is_a_known_refusal_to_the_service(stored: str) -> No
 @pytest.mark.parametrize("stored", _UNDECODABLE_STORED)
 def test_an_undecodable_stored_secret_stays_unknown_to_the_service(stored: str) -> None:
     """CONTROL: a value that is not base32 cannot be judged, so the gates keep counting it as the
-    plain enabled-TOTP rule does (BACKLOG #3422). It now computes no code; its state is unchanged."""
+    plain enabled-TOTP rule does (BACKLOG #3422). It now computes no code; its state is the same."""
     assert _opened_totp_state(stored) == "unknown"
 
 
@@ -187,8 +187,10 @@ async def test_the_two_step_verify_fails_closed_on_a_bad_stored_secret(
     stored: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``verify_mfa`` raised ``binascii.Error`` (a 500) on a stored secret that was not base32,
-    before it tried a recovery code. Now the TOTP code is refused, nothing raises, and a recovery
-    code still signs in."""
+    before it tried a recovery code. Now a six-digit code is checked against it without raising and
+    a recovery code still signs in. That no code MATCHES such a secret is pinned by
+    :func:`test_an_undecodable_or_short_stored_secret_computes_and_matches_no_code`; the code here
+    is an arbitrary one, so its refusal proves only that the check did not raise."""
     store = await MessageStore.open(":memory:")
     try:
         service = AuthService(
@@ -207,7 +209,7 @@ async def test_the_two_step_verify_fails_closed_on_a_bad_stored_secret(
         monkeypatch.setattr(store, "open_totp_secret", opener)
         out = await service.login(ADMIN_USERNAME, password)
         assert out.token is not None
-        assert (await service.verify_mfa(out.token, fresh_totp(enroll.secret))).ok is False
+        assert (await service.verify_mfa(out.token, "123456")).ok is False
         assert (await service.verify_mfa(out.token, enrolled.recovery_codes[0])).ok is True
     finally:
         await store.close()

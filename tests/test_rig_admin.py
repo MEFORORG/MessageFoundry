@@ -157,6 +157,12 @@ def test_a_key_that_is_not_base32_or_too_short_is_refused_by_name_and_never_by_v
     assert rigadmin._totp_code(totp.generate_secret(), 0.0).isdigit()
 
 
+def test_the_rigs_key_floor_is_the_engines() -> None:
+    """The rig writes the engine's floor out as characters (BACKLOG #5340); this ties the two, so
+    a moved engine floor cannot leave the rig's refusal naming the wrong length."""
+    assert rigadmin._MIN_KEY_CHARS * 5 == totp._MIN_SECRET_BYTES * 8
+
+
 def test_sign_in_refuses_an_unusable_key_before_any_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

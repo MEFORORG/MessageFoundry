@@ -322,7 +322,7 @@ def _check_key(key: str) -> None:
         raise refusal
     try:
         totp.totp(key, now=0.0)  # the engine's own base32 read
-    except ValueError:  # totp.RefusedTotpSecret, the engine's short or non-base32 refusal
+    except ValueError:  # totp.RefusedEnrolment: a refused marker, or a short or non-base32 key
         raise refusal from None
 
 
