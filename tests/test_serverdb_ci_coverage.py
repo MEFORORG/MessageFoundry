@@ -379,8 +379,10 @@ def _package_only_paths(text: str) -> set[str]:
 def test_the_scan_records_at_least_what_the_package_only_scan_did() -> None:
     """Resolving submodules may only ADD sources to the gate, never drop one.
 
-    The floor is the 62 sources both scans recorded on 2026-11-23. A drop below it means the scan,
-    or the step parsing that feeds it, lost sources.
+    The 62 is a floor: the count both scans recorded on 2026-11-23, not a property of the gate. A
+    drop below it means either the scan or the step parsing that feeds it lost sources, or a suite
+    legitimately stopped importing a module it alone imported. In the second case, lower the floor
+    to the new count in the same change.
     """
     recorded = set(_engine_modules_imported_by_server_db_suites().values())
     before: set[str] = set()
@@ -389,7 +391,11 @@ def test_the_scan_records_at_least_what_the_package_only_scan_did() -> None:
         if source.is_file():
             before |= _package_only_paths(source.read_text(encoding="utf-8"))
     assert before <= recorded, f"dropped: {sorted(before - recorded)}"
-    assert len(recorded) >= 62, f"recorded only {len(recorded)} sources"
+    assert len(recorded) >= 62, (
+        f"the scan recorded {len(recorded)} engine sources, below the floor of 62 measured on "
+        "2026-11-23. If a server-DB suite legitimately stopped importing a module, lower the floor "
+        "to the new count in the same change; otherwise the scan or the step parsing lost sources."
+    )
 
 
 def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
