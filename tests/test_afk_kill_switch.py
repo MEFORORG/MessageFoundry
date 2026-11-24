@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -119,9 +120,9 @@ def _mark(root: Path, seat: str) -> None:
     marker.write_text(seat, encoding="utf-8")
 
 
-def _linked_worktree(sb: Sandbox, name: str = "wt") -> Path:
-    """A linked worktree of the sandbox repository, as git lays one out: _hookinput.ps1 reads it."""
-    gitdir = sb.repo / ".git" / "worktrees" / name
+def _linked_worktree(sb: Sandbox, name: str = "wt", repo: Path | None = None) -> Path:
+    """A linked worktree of ``repo`` (the sandbox's by default), as git lays one out."""
+    gitdir = (repo or sb.repo) / ".git" / "worktrees" / name
     gitdir.mkdir(parents=True)
     (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
@@ -302,6 +303,125 @@ def test_a_cwd_inside_no_checkout_gives_no_instruction_and_says_so(sb: Sandbox) 
     outside.mkdir()
     proc = _seat_run(sb, "off", "builder", cwd=outside)
     assert proc.stdout == "" and "inside no checkout" in proc.stderr, proc.stderr
+
+
+def _foreign_repo(sb: Sandbox, seat: str) -> Path:
+    """A checkout of another repository, with a roster that maps no alias to Special."""
+    foreign = sb.repo.parent / "foreign"
+    foreign.mkdir()
+    subprocess.run(["git", "init", "-q", str(foreign)], check=True, capture_output=True, timeout=60)
+    roles = foreign / "docs" / "roles"
+    roles.mkdir(parents=True)
+    (roles / "seats.json").write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _mark(foreign, seat)
+    (foreign / "src").mkdir()
+    return foreign
+
+
+NOT_OURS = "not shown to be a checkout of this repository"
+
+
+def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
+    """The instruction, its Special-skips sentence and the not-ours note were printed.
+
+    Every instruction carries that sentence, so this alone does not prove the seat was undeclared;
+    the callers set every marker in reach to Special for that.
+    """
+    text = _instruction(proc.stdout)
+    assert "A Special seat skips this" in text, (proc.stdout, proc.stderr)
+    assert NOT_OURS in proc.stderr, proc.stderr
+
+
+# Each undeclared case below sets this repository's own marker to Special too, so reading either
+# marker instead of resolving as undeclared would print nothing and fail the test.
+@pytest.mark.parametrize("seat", ["special", "adhoc", "builder"])
+def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox, seat: str) -> None:
+    # BACKLOG #7559. A cwd in another repository's checkout must not let that checkout's marker, or
+    # its roster missing the Special alias, name the seat: either way it reads as undeclared.
+    foreign = _foreign_repo(sb, seat)
+    _undeclared(_seat_run(sb, "off", "special", cwd=foreign / "src"))
+
+
+@pytest.mark.parametrize("seat", ["special", "adhoc"])
+def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: str) -> None:
+    # The foreign roster maps no alias, so only this script's roster can make 'adhoc' Special.
+    foreign = _foreign_repo(sb, "builder")
+    proc = _seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT=seat)
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+
+
+def test_a_foreign_cwd_with_a_non_special_korus_seat_gets_the_instruction(sb: Sandbox) -> None:
+    # The negative control for the test above.
+    foreign = _foreign_repo(sb, "special")
+    _undeclared(_seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT="builder"))
+
+
+def test_a_linked_worktree_of_another_repository_reads_as_undeclared(sb: Sandbox) -> None:
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "special"))
+    _mark(wt, "special")
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> None:
+    # Its common dir cannot be read, so it cannot be shown to be this repository's.
+    wt = sb.repo.parent / "orphan"
+    wt.mkdir()
+    (wt / ".git").write_text(
+        f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
+    )
+    _mark(wt, "special")
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    if sys.platform == "win32":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_worktree_of_this_repository_spelled_through_a_link_names_its_seat(
+    sb: Sandbox,
+) -> None:
+    # The positive control for the repository check: the script runs through a link to the repo,
+    # while the worktree's gitdir line names the real path, as git writes it. Its Special marker
+    # holds only if the worktree is recognised as ours; read as undeclared it would print.
+    wt = _linked_worktree(sb)
+    _mark(wt, "special")
+    link = sb.repo.parent / "linked-repo"
+    _dir_link(link, sb.repo)
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    roles = sb.repo / "docs" / "roles"
+    roles.mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "docs" / "roles" / "seats.json", roles / "seats.json")
+    payload = {"hook_event_name": "SessionStart", "source": "compact", "cwd": str(wt)}
+    argv = sb.argv(KILL, "-Banner")
+    argv[argv.index("-File") + 1] = str(link / KILL.relative_to(ROOT))
+    proc = subprocess.run(
+        argv,
+        cwd=str(link),
+        env=sb.env(KORUS_SEAT="", KORUS_AGENT=""),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert (proc.stdout, proc.stderr) == ("", "")
+
+
+def test_an_unreadable_own_checkout_reads_as_undeclared(sb: Sandbox) -> None:
+    # The script's own common dir cannot be read, so no cwd can be shown to be this repository's.
+    (sb.repo / ".git" / "HEAD").unlink()
+    _undeclared(_seat_run(sb, "off", "special"))
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])

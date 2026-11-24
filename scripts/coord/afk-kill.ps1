@@ -29,8 +29,11 @@
     WHEN THE SWITCH READS OFF, -Banner may print the skill instruction ADR 0211 describes. Who gets
     it is stated there. The seat is read the way scripts/hooks/role-card-inject.ps1 reads it: the
     worktree the hook input's `cwd` sits in, its `.claude/seat.local.txt`, then $env:KORUS_SEAT,
-    then the roster's aliases. A fault on this path prints no instruction, so it fails toward no
-    instruction rather than a wrong one. It never runs while the switch reads ON.
+    then the roster's aliases. Only a worktree sharing this script's git common dir may name the
+    seat; for a `cwd` in another repository's checkout, or one whose common dir cannot be read, the
+    seat comes from $env:KORUS_SEAT and this script's roster, else it is undeclared. A fault on this path prints no
+    instruction, so it fails toward no instruction rather than a wrong one. It never runs while the
+    switch reads ON.
 
     It writes nothing. Of local state it reads at least the seat marker, the roster and the `.git`
     entries above the hook input's `cwd`, and no coordination state, so it runs in a cloud session
@@ -111,10 +114,11 @@ function Get-SkillInstructionSource {
     . (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
     # The payload's worktree, never this process's: under the desktop app the hook runs in the
     # PRIMARY checkout, whose marker names another session's seat. Walked up from the `cwd` as
-    # role-card-inject.ps1 walks it, NOT through Resolve-CcxHookSession's pin: the two hooks must
-    # name one seat at one SessionStart, or a session holds a Special card beside an instruction
-    # for non-Special seats. The pin would also refuse every /clear in a desktop-app worktree, the
-    # one source whose session has just lost both skills.
+    # role-card-inject.ps1 walks it, NOT through Resolve-CcxHookSession's pin, so within this
+    # repository the two hooks name one seat at one SessionStart. They can differ for a cwd in
+    # another repository's checkout: role-card-inject.ps1 still follows it and reads that marker,
+    # while this hook reads the seat as undeclared (below). The pin would also refuse every /clear
+    # in a desktop-app worktree, the one source whose session has just lost both skills.
     $text = Read-CcxHookInput
     if ($script:CcxHookInputTimedOut) { throw 'the hook input was still open when the read stopped waiting' }
     if ($script:CcxHookInputFault) { throw $script:CcxHookInputFault }
@@ -126,11 +130,27 @@ function Get-SkillInstructionSource {
     if (-not $p.Named) { throw 'the hook input names no cwd' }
     $root = Get-CcxWorktreeRoot $p.Cwd
     if (-not $root) { throw "the hook input's cwd $($p.Cwd) is inside no checkout" }
+    # Only a checkout of this repository may name the seat: another repository's marker, or its
+    # roster with no Special alias, would hand a Special seat the instruction. Such a cwd, or one
+    # whose common dir (or this script's) cannot be read, is read as undeclared instead: its marker
+    # and roster are skipped, $env:KORUS_SEAT is read against this script's own roster, and an
+    # undeclared seat gets the instruction with its Special-skips sentence. Refusing would cost a
+    # non-Special seat whose shell sits in another checkout its reload after a compaction. Compared
+    # through links as well as by text, because the script's path and a worktree's gitdir line may
+    # spell one directory differently.
+    $own = Get-CcxGitCommonDir (Get-CcxWorktreeRoot $PSScriptRoot)
+    $theirs = Get-CcxGitCommonDir $root
+    $ours = $own -and $theirs -and ((Test-CcxSamePath $own $theirs) -or
+        (Test-CcxSamePath (ConvertTo-CcxRealPath $own) (ConvertTo-CcxRealPath $theirs)))
+    if (-not $ours) {
+        [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, so its seat marker is not read")
+        $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    }
     $source = ''
     if ($payload.PSObject.Properties['source']) { $source = ([string]$payload.source).Trim().ToLowerInvariant() }
     $raw = $null
     $marker = Join-Path $root '.claude/seat.local.txt'
-    if (Test-Path -LiteralPath $marker) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
+    if ($ours -and (Test-Path -LiteralPath $marker)) { $raw = Get-Content -LiteralPath $marker -Raw -ErrorAction Stop }
     if ([string]::IsNullOrWhiteSpace($raw)) { $raw = $env:KORUS_SEAT }
     if ([string]::IsNullOrWhiteSpace($raw)) { return $source }  # undeclared
     $label = $raw.Trim().ToLowerInvariant()
