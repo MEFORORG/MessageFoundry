@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -515,6 +516,45 @@ async def test_an_epoch_raised_on_every_attempt_is_contention_not_a_refusal(
         assert contended.value.cause == SESSION_MINT_EPOCH_RAISED
         assert contended.value.attempts == SESSION_MINT_ATTEMPTS
     assert await _live_sessions(engine, user_id) == set()
+
+
+async def test_a_run_that_met_both_kinds_of_contention_names_both(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A run whose first attempts answered busy and whose later ones found the epoch raised names
+    both causes, and its log line counts each kind. RED on the head that named the last attempt's
+    cause alone and logged every attempt as an epoch raise."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import (
+        SESSION_MINT_ATTEMPTS,
+        SESSION_MINT_BUSY_AND_EPOCH_RAISED,
+        session_mint_cause,
+    )
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    busy_times = 2
+    opened = _busy_begin_immediate(monkeypatch, busy_times)
+    _epoch_raised_on_every_seal(monkeypatch, engine.store, user_id)
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.store")
+    with pytest.raises(SessionMintContended) as contended:
+        await _mint(engine, user_id, eligible=True)
+    assert contended.value.cause == SESSION_MINT_BUSY_AND_EPOCH_RAISED
+    assert contended.value.attempts == SESSION_MINT_ATTEMPTS
+    assert len(opened) == SESSION_MINT_ATTEMPTS
+    assert isinstance(contended.value.__cause__, sqlite3.OperationalError)
+    epoch_times = SESSION_MINT_ATTEMPTS - busy_times
+    gave_up = [r.getMessage() for r in caplog.records if "gave up" in r.getMessage()]
+    assert gave_up == [
+        f"sqlite: a session insert gave up after {SESSION_MINT_ATTEMPTS} attempts:"
+        f" {busy_times} met a busy database, {epoch_times} found the session epochs raised"
+    ]
+    assert await _live_sessions(engine, user_id) == set()
+    # The pure naming rule, each arm.
+    assert session_mint_cause(busy=1, epoch_raised=0) == SESSION_MINT_BUSY
+    assert session_mint_cause(busy=0, epoch_raised=1) == SESSION_MINT_EPOCH_RAISED
+    assert session_mint_cause(busy=4, epoch_raised=1) == SESSION_MINT_BUSY_AND_EPOCH_RAISED
 
 
 @pytest.mark.parametrize("cause", [SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED])

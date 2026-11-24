@@ -282,6 +282,12 @@ async def test_a_contended_password_insert_is_not_an_unknown_account(
                 "contention": SESSION_MINT_EPOCH_RAISED,
             }
         ]
+        # Only a right password reaches the insert, so a reader without users:manage reads none
+        # of that row, as the real writer stored it.
+        from messagefoundry.auth.audit_visibility import HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE
+
+        hidden = HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE
+        assert await store.list_audit(action="auth.login_failed", exclude=hidden) == []
         assert await store.list_sessions(user.id) == []
         again = await store.get_user(user.id)
         assert again is not None and again.failed_attempts == 0

@@ -3006,13 +3006,28 @@ SESSION_MINT_BUSY: Final = "busy"
 #: The ``cause`` of a :class:`SessionMintContended` when a revoke raised a session epoch the seal
 #: covers before every locked read the insert ran (BACKLOG #5653).
 SESSION_MINT_EPOCH_RAISED: Final = "session_epoch_raised"
+#: The ``cause`` of a :class:`SessionMintContended` when the SQLite insert's attempts met both: at
+#: least one answered busy and at least one found the session epochs raised (BACKLOG #5653).
+SESSION_MINT_BUSY_AND_EPOCH_RAISED: Final = "busy_and_session_epoch_raised"
+#: Every ``cause`` a :class:`SessionMintContended` carries.
+SESSION_MINT_CAUSES: Final[frozenset[str]] = frozenset(
+    {SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED, SESSION_MINT_BUSY_AND_EPOCH_RAISED}
+)
+
+
+def session_mint_cause(*, busy: int, epoch_raised: int) -> str:
+    """The ``cause`` a contended insert names from how many of its attempts met each kind of
+    contention, so a run that met both says so rather than naming the last one alone."""
+    if busy and epoch_raised:
+        return SESSION_MINT_BUSY_AND_EPOCH_RAISED
+    return SESSION_MINT_BUSY if busy else SESSION_MINT_EPOCH_RAISED
 
 
 class SessionMintContended(RuntimeError):
     """:meth:`~messagefoundry.store.base.AuthStore.create_session` ran its bounded attempts and
     wrote nothing, because each one met contention rather than a refusal (BACKLOG #5653).
-    ``cause`` is :data:`SESSION_MINT_BUSY` or :data:`SESSION_MINT_EPOCH_RAISED`; ``attempts`` is
-    how many ran. Exported from :mod:`messagefoundry.store`.
+    ``cause`` is one of :data:`SESSION_MINT_CAUSES`, as :func:`session_mint_cause` names it from
+    every attempt; ``attempts`` is how many ran. Exported from :mod:`messagefoundry.store`.
 
     **Raised, never returned as ``False``.** ``False`` means the account itself refused the
     session (gone, disabled, locked, or its binding changed), and a caller renders it as that
@@ -22091,6 +22106,8 @@ class MessageStore:
         # engine shard behind Vault. The seal covers the account's and the store's session epochs,
         # so they are read first, unlocked, and the transaction reads them again: if a revoke raised
         # either in between, nothing is written and the record is sealed again over the new values.
+        busy = epoch_raised = 0
+        last_busy: sqlite3.OperationalError | None = None
         for attempt in range(1, SESSION_MINT_ATTEMPTS + 1):
             epochs = await self._session_epochs_unlocked(user_id)
             if epochs is None:
@@ -22125,29 +22142,34 @@ class MessageStore:
                 # ``busy_timeout`` is outlasted, before anything is read or written.
                 if not require_sign_in_eligible or not _is_sqlite_busy(exc):
                     raise
-                if attempt == SESSION_MINT_ATTEMPTS:
-                    # Contention, not a refusal: ``False`` would tell the caller the account refused
-                    # the session. The directory sign-in that asked has already written its roles
-                    # and profile, so it fails as a temporary failure rather than see this escape.
-                    log.warning(
-                        "sqlite: a session insert met a busy database %d times; giving up", attempt
+                busy += 1
+                last_busy = exc
+                if attempt < SESSION_MINT_ATTEMPTS:
+                    log.info(
+                        "sqlite: a session insert met a busy database (attempt %d of %d);"
+                        " running it again",
+                        attempt,
+                        SESSION_MINT_ATTEMPTS,
                     )
-                    raise SessionMintContended(SESSION_MINT_BUSY, attempt) from exc
-                log.info(
-                    "sqlite: a session insert met a busy database (attempt %d of %d);"
-                    " running it again",
-                    attempt,
-                    SESSION_MINT_ATTEMPTS,
-                )
-                await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+                    await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
                 continue
             if inserted is not None:
                 return inserted
+            epoch_raised += 1
+        # Contention, not a refusal: ``False`` would tell the caller the account refused the
+        # session. The directory sign-in that asked has already written its roles and profile, so
+        # it fails as a temporary failure rather than see this escape. The cause and the counts
+        # cover every attempt, not only the last one.
         log.warning(
-            "sqlite: a session insert found the session epochs raised %d times; giving up",
+            "sqlite: a session insert gave up after %d attempts: %d met a busy database,"
+            " %d found the session epochs raised",
             SESSION_MINT_ATTEMPTS,
+            busy,
+            epoch_raised,
         )
-        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
+        raise SessionMintContended(
+            session_mint_cause(busy=busy, epoch_raised=epoch_raised), SESSION_MINT_ATTEMPTS
+        ) from last_busy
 
     async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
         """The account's session epoch and the store's global one, read on a reader connection

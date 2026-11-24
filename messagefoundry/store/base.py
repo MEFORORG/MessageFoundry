@@ -3423,17 +3423,18 @@ class AuthStore(Protocol):
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
 
-        **``False`` is a refusal by the account, and has exactly these causes**, with nothing
+        **``False`` is a refusal by the account, and has at least these causes**, with nothing
         written: no row for ``user_id``; under ``require_federated_subject``, a binding other than
         the one named; under ``require_sign_in_eligible``, a row disabled or holding either lock
         live. Each is described below.
 
         **Contention is not a refusal and is RAISED** as
         :class:`~messagefoundry.store.SessionMintContended`, with nothing written (BACKLOG
-        #5653): a revoke raised a session epoch the seal covers before each of the bounded
-        attempts' locked reads (``cause`` ``session_epoch_raised``, every backend), or SQLite
-        answered busy to each of their ``BEGIN IMMEDIATE`` (``cause`` ``busy``, SQLite under
-        ``require_sign_in_eligible`` only). Any other store error is raised as it arose.
+        #5653), once every bounded attempt met it: a revoke raised a session epoch the seal covers
+        before the attempt's locked read (``cause`` ``session_epoch_raised``, every backend), or
+        SQLite answered busy to its ``BEGIN IMMEDIATE`` (``cause`` ``busy``, SQLite under
+        ``require_sign_in_eligible`` only). A SQLite run whose attempts met both names
+        ``busy_and_session_epoch_raised``. Any other store error is raised as it arose.
 
         ``auth_mechanism`` records how the session was minted (``password``, ``kerberos`` or
         ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and

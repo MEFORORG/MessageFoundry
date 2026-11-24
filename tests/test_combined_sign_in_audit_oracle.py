@@ -54,6 +54,7 @@ from messagefoundry.auth import Role, totp
 from messagefoundry.auth.audit_visibility import (
     DIRECTORY_LOGIN_LOCKED_ACTION,
     HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE,
+    LOCAL_MINT_CONTENDED_DETAILS,
 )
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import AuthService, _opened_totp_state
@@ -668,7 +669,64 @@ async def test_the_hidden_refusal_details_match_what_the_writers_store(
         rows = await world.engine.store.list_audit(actor="probe-directory")
         assert [r["action"] for r in rows] == [DIRECTORY_LOGIN_LOCKED_ACTION]
         assert set(_HIDDEN_LOCK_ACTIONS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.actions
-        assert set(_HIDDEN_LOCKED_REFUSALS) == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        assert (
+            set(_HIDDEN_LOCKED_REFUSALS) | set(_HIDDEN_MINT_CONTENDED)
+            == HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE.rows
+        )
+    finally:
+        await world.engine.stop()
+
+
+#: The local password leg's contended-insert rows (BACKLOG #5653), which only a right password
+#: reaches, so they are hidden like the lock rows.
+_HIDDEN_MINT_CONTENDED = tuple(
+    ("auth.login_failed", detail) for detail in sorted(LOCAL_MINT_CONTENDED_DETAILS)
+)
+
+
+def test_the_hidden_mint_contended_details_are_what_the_local_writer_stores() -> None:
+    """The exclusion matches EXACT detail text, so each one must be the string the local writer
+    stores for that cause, plain and combined, for every cause the store can raise."""
+    from messagefoundry.auth.service import SESSION_MINT_CONTENDED, _local_refusal_detail
+    from messagefoundry.store.store import SESSION_MINT_CAUSES
+
+    written = {
+        _local_refusal_detail(SESSION_MINT_CONTENDED, combined=combined, extra={"contention": c})
+        for c in SESSION_MINT_CAUSES
+        for combined in (False, True)
+    }
+    assert written == LOCAL_MINT_CONTENDED_DETAILS
+    assert len(written) == 2 * len(SESSION_MINT_CAUSES)
+
+
+async def test_a_local_mint_contended_row_is_hidden_from_a_reader_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5653, Manager decision: a local sign-in's ``session_mint_contended`` row says the
+    password was right, so the Auditor reads none of them and an Administrator reads them all. An
+    existing hidden refusal stays hidden, and the controls -- a wrong password and a directory
+    contended row, which share the action -- stay visible. RED on the head that hid no such row."""
+    world = await _open_world(tmp_path, monkeypatch)
+    store = world.engine.store
+    existing_hidden = ("auth.login_failed", '{"provider": "ad", "reason": "locked"}')
+    visible = (
+        ("auth.login_failed", '{"provider": "local", "reason": "bad_credentials"}'),
+        (
+            "auth.login_failed",
+            '{"contention": "busy", "provider": "ad", "reason": "session_mint_contended"}',
+        ),
+    )
+    try:
+        for action, detail in (*_HIDDEN_MINT_CONTENDED, existing_hidden, *visible):
+            await store.record_audit(action, actor="probe-target", detail=detail)
+        everything = {*_HIDDEN_MINT_CONTENDED, existing_hidden, *visible}
+        for read in (_read_trail, _read_export):
+            auditor = {(r[1], r[3]) for r in await read(world, _AUDITOR) if r[0] == "probe-target"}
+            admin = {
+                (r[1], r[3]) for r in await read(world, _SECOND_ADMIN) if r[0] == "probe-target"
+            }
+            assert auditor == set(visible), (read.__name__, auditor)
+            assert admin == everything, (read.__name__, admin)
     finally:
         await world.engine.stop()
 
