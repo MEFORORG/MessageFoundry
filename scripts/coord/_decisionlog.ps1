@@ -96,18 +96,19 @@ function Get-DecisionIdDay([string]$Id) {
 function Invoke-DecisionGh {
     <#
       Runs gh, returning Code, Out and Err; a missing gh is code 127, and a gh failure is its own
-      code. A console that refuses the UTF-8 switch does not throw. A failure writing the --input
-      file, or a console error that is not a console-handle IOException, still throws.
+      code. A console whose UTF-8 switch fails with an IOException does not throw (BACKLOG #7555).
+      At least these still throw: a failure writing the --input file, any other console error, and
+      a gh that is found but cannot start.
 
-      The prompt variable is put back in the finally, because a caller dot-sources this file
-      (BACKLOG #7555); $null restores an unset variable by removing it. The console's UTF-8 output
-      is left set, as before: decision.ps1 and digest.ps1 set none of their own and print records
-      through it, so restoring it here would turn their non-ASCII output into the OEM code page.
+      GH_PROMPT_DISABLED and the console's UTF-8 output are both left set, deliberately, as before.
+      decision.ps1 and digest.ps1 set no UTF-8 output of their own and print records through this
+      switch, so restoring it would turn their non-ASCII output into the OEM code page. And
+      afk-kill.ps1 runs this body in a second runspace of the same process, so a restore of the
+      process-wide prompt variable there could unset it under a gh call running here.
     #>
     param([string[]]$GhArgs, [string]$InputJson = '')
     $ErrorActionPreference = 'Continue'
     $tmp = $null
-    $savedPrompt = $env:GH_PROMPT_DISABLED
     # PowerShell wraps a setter's exception (SetValueInvocationException), so the console-handle
     # IOException is looked for along the inner chain. Local, because afk-kill.ps1 runs this
     # function's body alone in another runspace.
@@ -124,9 +125,9 @@ function Invoke-DecisionGh {
         }
         # A script must never wait on an auth prompt.
         $env:GH_PROMPT_DISABLED = '1'
-        # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host with no
-        # console handle refuses the setter with an IOException; gh still runs, and the refusal is
-        # reported unless the page was UTF-8 already.
+        # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host that
+        # refuses the setter with an IOException (lane-root.ps1 met one, BACKLOG #5486) still runs
+        # gh, and the refusal is reported unless the page was UTF-8 already.
         $before = $null
         try {
             $before = [Console]::OutputEncoding
@@ -147,7 +148,6 @@ function Invoke-DecisionGh {
     } catch [System.Management.Automation.CommandNotFoundException] {
         return [pscustomobject]@{ Code = 127; Out = ''; Err = 'gh is not on PATH' }
     } finally {
-        $env:GH_PROMPT_DISABLED = $savedPrompt
         if ($tmp) { try { [System.IO.File]::Delete($tmp) } catch { $null = $_ } }
     }
 }

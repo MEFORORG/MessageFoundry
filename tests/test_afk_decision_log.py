@@ -468,13 +468,10 @@ def test_an_outcome_record_refers_to_a_decision(sb: Sandbox) -> None:
     assert outcome["ref"] == did and outcome["outcome"] == "reversed"
 
 
-# BACKLOG #7555: Invoke-DecisionGh set $env:GH_PROMPT_DISABLED and never put it back, so a caller
-# that dot-sources _decisionlog.ps1 kept it after every gh call; and on a host with no console, whose
-# OutputEncoding setter throws IOException, the "never throws" function threw. A gh.ps1 stub first on
-# PATH prints the prompt variable gh saw and exits 3, so the tests also prove gh still ran under
-# GH_PROMPT_DISABLED=1 and that its failure still comes back. The console encoding is deliberately
-# left at UTF-8 (the function's own comment says why), so no test sets or asserts a code page, and
-# none leaves the shared console changed.
+# BACKLOG #7555: on a host whose OutputEncoding setter throws IOException, Invoke-DecisionGh threw.
+# A stub stands in for System.Console, so the real console's code page is never set by these tests.
+# A gh.ps1 stub first on PATH prints the prompt variable gh saw and exits 3, so the tests also prove
+# gh still ran under GH_PROMPT_DISABLED=1 and that its failure still comes back as its own code.
 
 _DECISIONLOG = COORD / "_decisionlog.ps1"
 
@@ -503,9 +500,7 @@ _SET_ATTEMPTS = (
 )
 
 
-def _run_decision_gh(
-    tmp_path: Path, prelude: str = "", epilogue: str = "", *, caller_prompt: bool = True
-) -> dict[str, str]:
+def _run_decision_gh(tmp_path: Path, prelude: str, epilogue: str) -> dict[str, str]:
     """Dot-source the library, call Invoke-DecisionGh against the stub, and read KEY=value lines."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -517,13 +512,10 @@ def _run_decision_gh(
     out_line = "[System.Console]::Out.WriteLine"
     script = (
         prelude
-        + ("$env:GH_PROMPT_DISABLED = 'caller-value'\n" if caller_prompt else "")
         + f". {lib}\n"
         + "try { $r = Invoke-DecisionGh @('api', 'x')\n"
         + f'  {out_line}("CODE=$($r.Code)"); {out_line}("GHOUT=$($r.Out)") }}\n'
         + f'catch {{ {out_line}("THREW=$($_.Exception.Message)") }}\n'
-        + f'{out_line}("PROMPT=$env:GH_PROMPT_DISABLED")\n'
-        + f'{out_line}("EXISTS=$(Test-Path Env:GH_PROMPT_DISABLED)")\n'
         + epilogue
     )
     env = dict(os.environ)
@@ -546,39 +538,22 @@ def _run_decision_gh(
     return got
 
 
-def test_invoke_decision_gh_restores_the_callers_prompt_variable(tmp_path: Path) -> None:
-    got = _run_decision_gh(tmp_path)
-    # gh itself ran with prompts disabled, and its failure came back as its own code.
-    assert got.get("CODE") == "3" and got.get("GHOUT") == "SAW=1", got["_raw"]
-    assert got.get("PROMPT") == "caller-value", got["_raw"]
-
-
-def test_invoke_decision_gh_removes_a_prompt_variable_the_caller_never_set(
-    tmp_path: Path,
-) -> None:
-    got = _run_decision_gh(
-        tmp_path, "Remove-Item Env:GH_PROMPT_DISABLED -ErrorAction Ignore\n", caller_prompt=False
-    )
-    assert got.get("GHOUT") == "SAW=1", got["_raw"]
-    assert got.get("EXISTS") == "False", got["_raw"]
-
-
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_invoke_decision_gh_does_not_throw_when_the_encoding_setter_refuses(
     tmp_path: Path,
 ) -> None:
     got = _run_decision_gh(tmp_path, _throwing_console("System.IO.IOException"), _SET_ATTEMPTS)
     assert "THREW" not in got, got["_raw"]
+    # gh itself ran with prompts disabled, and its failure came back as its own code.
     assert got.get("CODE") == "3" and got.get("GHOUT") == "SAW=1", got["_raw"]
-    assert got.get("PROMPT") == "caller-value", got["_raw"]
     # The control: the setter was reached, so the refusal path really ran.
     assert got.get("SETS") == "1", got["_raw"]
 
 
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
 def test_invoke_decision_gh_still_throws_a_console_error_that_is_not_io(tmp_path: Path) -> None:
-    """The negative control: only the console-handle IOException is caught, and the prompt
-    variable is still put back on the way out."""
+    """The negative control: only an IOException from the setter is caught."""
     prelude = _throwing_console("System.InvalidOperationException")
     got = _run_decision_gh(tmp_path, prelude, _SET_ATTEMPTS)
     assert "THREW" in got and "CODE" not in got, got["_raw"]
     assert got.get("SETS") == "1", got["_raw"]
-    assert got.get("PROMPT") == "caller-value", got["_raw"]
