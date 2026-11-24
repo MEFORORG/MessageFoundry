@@ -5564,9 +5564,11 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
     loop's task type). On a task without it nothing can be checked, so the cancel is put off one
-    loop turn, as origin/main's warm-up did, and one WARNING says the check is off. A hand-over
-    already queued in the cancel's turn then finishes first; one that takes more than that turn can
-    still be lost on such a task type.
+    loop turn with ``call_soon(borrow.cancel)``, as the warm-up did before BACKLOG #5686, and one
+    WARNING says the check is off. A borrow whose wake-up is already scheduled when the cancel is
+    made then finishes first. A hand-over resolved after the cancel is scheduled, even later in the
+    same turn, is lost on such a task type, where an immediate cancel would have stopped it at the
+    pool.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5598,7 +5600,8 @@ def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
     with a child done with a value beside a pending child (its cancel discards that value), a shield
     or another combinator, and a future that ignores its cancel; each counts as not in flight. The
     gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour.
-    A nested task without ``_fut_waiter`` cannot be checked and counts as not in flight."""
+    A nested task without ``_fut_waiter`` cannot be checked and counts as not in flight, so the
+    cancel goes in with no deferral, unlike the one-turn deferral for a top-level borrow."""
     if fut.done():
         return not fut.cancelled() and fut.exception() is None
     if isinstance(fut, asyncio.Task):

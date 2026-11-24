@@ -209,7 +209,7 @@ async def test_warm_borrow_landing_after_the_bound_is_released_exactly_once(
 async def test_the_task_exposes_the_waiter_the_borrow_cancel_reads() -> None:
     # _cancel_borrow reads Task._fut_waiter to tell a borrow parked on the pool from one whose
     # hand-over is in flight. Without the attribute it puts every cancel off one turn unchecked, so a
-    # slower hand-over can be lost; a Python that drops it fails here rather than changing unseen.
+    # hand-over resolved after the cancel is scheduled can be lost; a Python that drops it fails here.
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
     async def _parked() -> str:
@@ -345,8 +345,8 @@ class _NoWaiterTask(asyncio.Task):
 async def test_acquire_pooled_still_cancels_on_a_task_type_without_the_waiter(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Without _fut_waiter nothing can be checked, so the borrow is cancelled one turn later, as on
-    # main's warm-up, rather than left waiting on the pool; one WARNING says the check is off.
+    # Without _fut_waiter nothing can be checked, so the borrow is cancelled one turn later, as the
+    # warm-up did before BACKLOG #5686, rather than left waiting; one WARNING says the check is off.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
@@ -412,10 +412,12 @@ async def test_warm_hands_the_borrow_to_the_cleanup_before_the_cancel_runs(
 
 
 @pytest.mark.parametrize("path", ["warm-up", "acquire_pooled"])
-async def test_no_waiter_task_type_hand_over_in_the_cancel_turn_strands_nothing(path: str) -> None:
-    # On a task type without _fut_waiter nothing can be checked, so the cancel is put off one turn,
-    # as origin/main's warm-up did: a borrow whose hand-off resolves in the cancel's turn takes its
-    # queued step first and ends holding the connection, which is then returned.
+async def test_no_waiter_task_type_hand_over_before_the_cancel_strands_nothing(path: str) -> None:
+    # On a task type without _fut_waiter nothing can be checked, so the cancel is put off one turn
+    # with call_soon(borrow.cancel), as the warm-up did before BACKLOG #5686: a borrow whose hand-off
+    # resolved in the cancel's turn before the cancel was scheduled takes its queued step first and
+    # ends holding the connection, which is then returned. A hand-over queued behind the cancel in
+    # that turn is not covered, and is lost.
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
     loop.set_task_factory(lambda lp, coro, **kw: _NoWaiterTask(coro, loop=lp, **kw))
