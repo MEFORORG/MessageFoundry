@@ -641,8 +641,10 @@ foreach ($p in $Path) {
     # the NO-REMOTE and UNVERIFIABLE lines do not leave out a detached checkout's work (BACKLOG #6489
     # item 1). The detached share is the distinct commits no at-risk branch already counts: a HEAD
     # detached on a branch's history would otherwise count that history twice. If that count cannot
-    # be read, each detached HEAD's own count is added instead -- too high, never too low -- and the
-    # failure is a failed scan like any other. Every id goes on stdin, so the command line does not
+    # be read, each detached HEAD's own count is added instead -- too high, not too low -- and the
+    # failure is a failed scan like any other. The figure CAN read low in one case: another session
+    # moves that worktree's HEAD between its count and its rev-parse above, so the id counted here is
+    # not the commit that was measured. Every id goes on stdin, so the command line does not
     # grow with the worktree count, and no blank line is written: rev-list --stdin stops reading there.
     $detachedSum = $detachedUnresolved
     if ($detachedOids.Count -gt 0) {
