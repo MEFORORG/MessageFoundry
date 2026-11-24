@@ -14,6 +14,7 @@ only.
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import Callable
 
 import pytest
@@ -27,7 +28,8 @@ class _HandOffPool:
     ``plain`` returns the future itself; ``deaf`` swallows a cancel and keeps waiting, so a borrow
     stays stuck until the test hands a connection over; ``yield`` takes one bare step after the
     hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a gather;
-    ``nested`` awaits it through an inner task of a type without ``_fut_waiter``."""
+    ``nested`` awaits it through an inner task of a type without ``_fut_waiter``, and
+    ``gather-nested`` through such a task under a gather."""
 
     def __init__(self, *, shape: str = "plain") -> None:
         self.shape = shape
@@ -64,7 +66,17 @@ class _HandOffPool:
         async def _nested() -> str:
             return await _NoWaiterTask(_inner())
 
-        shapes = {"deaf": _deaf, "yield": _yield, "gather": _gather, "nested": _nested}
+        async def _gather_nested() -> str:
+            (conn,) = await asyncio.gather(_NoWaiterTask(_inner()))
+            return conn
+
+        shapes = {
+            "deaf": _deaf,
+            "yield": _yield,
+            "gather": _gather,
+            "nested": _nested,
+            "gather-nested": _gather_nested,
+        }
         return shapes[self.shape]()
 
     def hand_over(self, index: int = 0) -> None:
@@ -348,6 +360,20 @@ class _NoWaiterTask(asyncio.Task):
         return super().__getattribute__(name)
 
 
+class _NoWaiterForeignTask(asyncio.tasks._PyTask):  # type: ignore[name-defined,misc]
+    """A task type that is not an ``asyncio.Task`` subclass (the pure-Python task is not, where the
+    C task is in use) and does not expose ``_fut_waiter`` outside asyncio's own task code, which
+    drives it, as a third-party loop's task might not."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_fut_waiter" and sys._getframe(1).f_globals.get("__name__") != "asyncio.tasks":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+_NO_WAITER_TASK_TYPES = {"subclass": _NoWaiterTask, "foreign": _NoWaiterForeignTask}
+
+
 async def test_acquire_pooled_still_cancels_on_a_task_type_without_the_waiter(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -431,17 +457,30 @@ _NO_WAITER_STRANDS_BEFORE_5686 = {
 }
 
 
+@pytest.mark.parametrize("task_type", sorted(_NO_WAITER_TASK_TYPES))
 @pytest.mark.parametrize(("path", "order"), sorted(_NO_WAITER_STRANDS_BEFORE_5686))
 async def test_no_waiter_task_type_strands_no_more_than_before_5686(
-    path: str, order: str, monkeypatch: pytest.MonkeyPatch
+    path: str,
+    order: str,
+    task_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Nothing can be checked without _fut_waiter, so each path keeps its pre-#5686 cancel: no order
-    # strands a connection that the old code returned. The strand is read before unstick(), which
-    # hands over any hand-off still pending and would otherwise count as one.
+    # strands a connection that the old code returned, whether or not the task type subclasses
+    # asyncio.Task, and one WARNING says the check is off. The strand is read before unstick(),
+    # which hands over any hand-off still pending and would otherwise count as one.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
-    loop.set_task_factory(lambda lp, coro, **kw: _NoWaiterTask(coro, loop=lp, **kw))
+    task_cls = _NO_WAITER_TASK_TYPES[task_type]
+    if task_type == "foreign":
+        # The pure-Python task records itself as current only for the pure-Python current_task;
+        # point it at the C bookkeeping so asyncio.timeout() inside it finds its task.
+        for which in ("enter", "leave"):
+            native = getattr(asyncio.tasks, f"_c_{which}_task")
+            monkeypatch.setattr(asyncio.tasks, f"_py_{which}_task", native)
+    loop.set_task_factory(lambda lp, coro, **kw: task_cls(coro, loop=lp, **kw))
     pool = _HandOffPool()
     task: asyncio.Task[object] | None = None
     try:
@@ -474,21 +513,28 @@ async def test_no_waiter_task_type_strands_no_more_than_before_5686(
         assert stranded == [], f"{path}, {order}: stranded={stranded}, released={released}"
     if not stranded and issued:
         assert released == ["conn-1"], f"{path}, {order}: released={released}"
+    assert "_fut_waiter" in caplog.text
 
 
 @pytest.mark.parametrize("late_turn", [13, 14, 15])
 @pytest.mark.parametrize("path", ["warm-up", "acquire_pooled"])
+@pytest.mark.parametrize("shape", ["nested", "gather-nested"])
 async def test_borrow_on_a_nested_task_without_the_waiter_is_cancelled_by_the_callers_rule(
-    path: str, late_turn: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    shape: str,
+    path: str,
+    late_turn: int,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     # The borrow is an ordinary task, but it waits on an inner task without _fut_waiter, so the
     # check reads unknown. The caller's pre-#5686 rule decides at once (the warm-up one turn later,
     # acquire_pooled at once), as for a borrow without the attribute: the borrow is not held back
     # for the whole deferral bound, where a cancel at the bound lands on the hand-over's wake-up and
     # strands the connection. The hand-over comes late in that bound, after the borrow is cancelled,
-    # so the pool hands nothing over, as before BACKLOG #5686.
+    # so the pool hands nothing over, as before BACKLOG #5686. The same holds where that inner task
+    # sits under a gather with no other pending child.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
-    pool = _HandOffPool(shape="nested")
+    pool = _HandOffPool(shape=shape)
     task: asyncio.Task[object] | None = None
     try:
         if path == "warm-up":

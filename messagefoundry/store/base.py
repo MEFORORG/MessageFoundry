@@ -5563,10 +5563,12 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
     This reads ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the default
-    asyncio task type only). Where the borrow, or a task it waits on directly or through a
-    gather, is an ``asyncio.Task`` with no such attribute, the check reads unknown and one WARNING
-    per process says the check is off; a task that is not an ``asyncio.Task``, or one reached
-    through another combinator such as a shield, reads parked with no WARNING. On unknown, each
+    asyncio task type only). Where the borrow has no such attribute, whatever its type, or a task
+    it waits on directly or through a gather is an ``asyncio.Task`` with no such attribute, the
+    check reads unknown and one WARNING per process says the check is off; a borrow that has the
+    attribute but is not an ``asyncio.Task``, a task it waits on that is not an ``asyncio.Task``,
+    or one reached through another combinator such as a shield, reads parked with no WARNING. On
+    unknown, each
     caller keeps what it did before BACKLOG #5686, on the turn the check first reads unknown: with
     ``defer_unknown`` (the warm-up) the cancel is put off one loop turn with
     ``call_soon(borrow.cancel)``, and without it
@@ -5578,7 +5580,9 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
     if borrow.done():
         return
-    state = _value_in_flight(borrow)
+    # The attribute gate covers a borrow from a task factory whose task type does not subclass
+    # asyncio.Task, which _value_in_flight would otherwise read as parked.
+    state: _Flight = _value_in_flight(borrow) if hasattr(borrow, "_fut_waiter") else "unknown"
     if state == "unknown":
         global _warned_no_waiter
         if not _warned_no_waiter:
