@@ -7,6 +7,6 @@
   the File Meta has no UID. Both UIDs are read before the POST, whatever the partner then answers.
   An object the codec cannot parse is still sent; other faults in that read refuse the message
   before it is sent, as a configuration fault that stops the lane under the default
-  `credential_fault_policy` when an installed extra cannot be used (`dicom-extra-unusable`), else as
+  `credential_fault_policy` when an installed extra does not load (`dicom-extra-unusable`), else as
   a refusal of that message (`sent-uid-unread`). A 200 is not compared. The refusal text names no UID. The rule in full
   is docs/CONNECTIONS.md *DICOMweb*, *Status classification*. (`BACKLOG #5914`)

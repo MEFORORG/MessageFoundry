@@ -4006,10 +4006,9 @@ cleartext-credential refusal, the retry/dead-letter classification, the `[egress
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
-adds the data set's UID to that comparison. **An installed extra that is broken is worse than none:**
-a message is then refused before it is sent, and under the default `credential_fault_policy` the
-lane stops (code `dicom-extra-unusable`), so
-on a host running DICOMweb, fix or remove a broken `pydicom`.
+adds the data set's UID to that comparison. **An installed extra that is broken is worse than
+none:** each message is then refused before it is sent, as *Status classification* says, so on a
+host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4053,14 +4052,17 @@ outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` i
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
 SCU's ignores for `pydicom` warnings that would name a value. An object the codec cannot parse
-is read as no data set UID, and the object is still sent. Other faults in that read refuse the
-message before a byte is sent, whatever status the partner would have answered, naming the
-exception class only. A `RuntimeError`, which the codec raises for an extra that is found but will not import, or is broken, such
-as an installed `pydicom` that lacks a reader the deflate guard replays, is a configuration fault
-(code `dicom-extra-unusable`): every queued row would meet it, so under the default
-`credential_fault_policy` the lane stops and keeps its queue. At least a `TypeError` or a warning
-the filters turn into an error is a permanent refusal of that message alone (code
-`sent-uid-unread`). A `MemoryError` is not caught there. The data set UID is read
+is read as no data set UID, and the object is still sent. Other faults refuse the message before
+a byte is sent, whatever status the partner would have answered, naming the exception class only.
+Before the object is read, the extra is loaded apart from it, as the SCU does: the `dcmread`
+reader and the readers the deflate guard replays. A load that raises, for example from a
+`pydicom` that is found but will not import, or that lacks such a reader, is a configuration
+fault (code `dicom-extra-unusable`): every queued row would meet it, so under the default
+`credential_fault_policy` the lane stops and keeps its queue, and only a restart loads a fixed
+`pydicom`. A fault in the read of the object itself, other than a parse failure, such as a
+`TypeError` or a warning the filters turn into an error, is a permanent refusal of that message
+alone (code `sent-uid-unread`), even when a broken extra caused it. A `MemoryError` is not caught
+there. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
