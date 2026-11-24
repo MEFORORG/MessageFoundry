@@ -394,7 +394,9 @@ roster alias of the Lander.
 > `Get-DecisionRungLevels` holds the two defaults, and `thresholds.json` overrides them through
 > `levels.weekly` and `minutes`. Any other key under `levels`, `5-hour` included, is an unknown window
 > and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
-> Steward's minutes default is (60, 10, 5), though the gate reads only the first.
+> Steward's minutes default is (60, 10, 5), though the gate reads only HOLD: the lowest weekly level
+> and the longest lead time in the triple, so an out-of-order hand edit cannot lift the rung, and the
+> rung's source says so (BACKLOG #5178).
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
 > `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
@@ -433,8 +435,9 @@ roster alias of the Lander.
 > percentage, so no one session's reading is the truth; each is a valid floor. Against a published
 > window of this root's, the collector therefore refuses a reading with the same reset that is not
 > higher, and a reading whose reset is earlier than the published one and has already passed. A refused
-> reading reaches neither `latest.json` nor the history. Any other reset is a new window and replaces
-> the value in either direction. A reading with no readable reset is refused while the published reset
+> reading reaches neither `latest.json` nor the history. Any other reset is a new window: a higher
+> reading replaces the value from any session, and a lower or equal one only from a session of this root
+> that has just called the API, whether or not the published reset has passed (BACKLOG #5178). A reading with no readable reset is refused while the published reset
 > is ahead, higher or not, because it cannot prove which window it belongs to.
 >
 > **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot

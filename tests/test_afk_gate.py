@@ -479,8 +479,8 @@ def test_the_thresholds_file_moves_the_minutes_clause(sb: Sandbox) -> None:
 
 @pytest.mark.parametrize(
     "weekly",
-    [[97, 94, 90], [94, 97, 90], [90, 97, 94]],
-    ids=["descending", "middle-first", "hold-lowest-first"],
+    [[97, 94, 90], [94, 97, 90], [94, 90, 97]],
+    ids=["descending", "middle-first", "lowest-in-the-middle"],
 )
 def test_out_of_order_weekly_levels_never_lift_the_rung(sb: Sandbox, weekly: list[int]) -> None:
     """BACKLOG #5178 item 3. [97, 94, 90] took 97 as HOLD, so 92 read below the rung. The lowest
@@ -491,7 +491,7 @@ def test_out_of_order_weekly_levels_never_lift_the_rung(sb: Sandbox, weekly: lis
     assert gate(sb)[0] == NO_REVIEW, "control: 92 is below an in-order rung of 93"
     _thresholds(sb).write_text(json.dumps({"levels": {"weekly": weekly}}), encoding="utf-8")
     code, doc = gate(sb)
-    assert code == HALT, why(doc)
+    assert code == HALT and "levels.weekly out of order" in why(doc), why(doc)
 
 
 def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
@@ -509,7 +509,7 @@ def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
     assert code == REVIEW and "does not reach the rung" in why(doc), "control: " + why(doc)
     _thresholds(sb).write_text(json.dumps({"minutes": [5, 10, 20]}), encoding="utf-8")
     code, doc = gate(sb)
-    assert code == HALT, why(doc)
+    assert code == HALT and "minutes out of order" in why(doc), why(doc)
 
 
 @pytest.mark.parametrize(

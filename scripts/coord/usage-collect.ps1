@@ -333,8 +333,9 @@ try {
     # reads as freshly observed. The level only rises inside a window. So against a published window
     # of this root's, a reading is refused when it has the same reset and is not higher, or when its
     # reset is earlier than the published one and has already passed: that is the number an idle
-    # session still holds after a reset. Any other reset is a new window and replaces in either
-    # direction. A refused reading leaves the published window whole, its own age included, so the
+    # session still holds after a reset. Any other reset is a new window: a higher reading replaces
+    # from any session, and a lower or equal one only from a live session of this root (below). A
+    # refused reading leaves the published window whole, its own age included, so the
     # staleness guard keeps counting from the last real observation.
     #
     # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
@@ -363,8 +364,11 @@ try {
     # A LOWER OR EQUAL READING ON ANOTHER RESET OPENS A NEW WINDOW ONLY FROM A LIVE SESSION (BACKLOG
     # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
     # frozen number replaced the published one on every fire. So it needs a session that has just
-    # called the API. A higher reading is taken from anyone, because refusing it could clear a stop. A
-    # first fire is never live, so after a real reset the gone window (UNKNOWN) stands until one is.
+    # called the API and is stamped with this root, as a confirmation must be. A higher reading is
+    # taken from anyone, because refusing it could clear a stop. This holds after a real reset too: a
+    # gone window reads UNKNOWN, so keeping it costs a REVIEW, while an idle session's frozen number
+    # for the new window could read OK. A first fire is never live, so the gone window stands until a
+    # live session reports the new one, or any session reports a number above the gone one.
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
@@ -386,7 +390,7 @@ try {
         $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
-            ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not $calledApi)) -or
+            ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not ($calledApi -and $stampOwn))) -or
             ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
@@ -471,8 +475,7 @@ try {
         # zero: so a collector pinned to another root, whose rows the reader skips, appends once rather
         # than on every fire, and an unset and a pinned collector of this root do not both append.
         $prevCounted = Test-OwnStamp ([string]$prev.config_root_env) $ownRoot
-        $rowCounted = $stampOwn
-        $prevForeign = $rowCounted -and -not $prevCounted
+        $prevForeign = $stampOwn -and -not $prevCounted
         if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch -or $prevForeign) {
             # STAMPED WITH THE ROOT THAT OBSERVED IT, as the window is, so usage.ps1's rate can skip a row
             # another root's collector wrote here when it was wired to publish into this directory.

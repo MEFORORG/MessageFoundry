@@ -901,8 +901,8 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       The percentage is the weekly HOLD level of the owner's ruling of 2026-09-17. The Steward has
       later rungs in minutes too; only HOLD is read here.
 
-      The Steward's thresholds.json overrides them the way its watch.py does: `levels.weekly` and
-      `minutes`, each three numbers, HOLD first. Any other key under `levels` is an unknown window,
+      The Steward's thresholds.json overrides them through the keys its watch.py reads:
+      `levels.weekly` and `minutes`, each three numbers, HOLD first in watch.py's order. Any other key under `levels` is an unknown window,
       so a leftover "5-hour" key throws. A missing file keeps the defaults. A file that cannot be read,
       or is malformed in a way watch.py would also refuse, throws: the gate then fails closed rather
       than grade against a guess.
@@ -910,10 +910,13 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       AN OUT-OF-ORDER TRIPLE CANNOT LIFT THE RUNG (BACKLOG #5178). HOLD is the triple's lowest level
       and longest lead time, which in watch.py's order is the first number, so a hand edit such as
       [97, 94, 90] cannot put HOLD at 97. Refusing the triple would answer UNKNOWN even at the ceiling.
+      watch.py keeps the first number and prints a fault instead, so the two can disagree; the rung's
+      source then says the triple was out of order, and a typo such as 9.5 halts early, not late.
     #>
     $holdAt = 90.0
     $holdMin = 60.0
     $source = 'the owner ruling of 2026-10-31 defaults'
+    $disorder = @()
     if (-not [System.IO.File]::Exists($ThresholdsFile)) { return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source } }
     $doc = [System.IO.File]::ReadAllText($ThresholdsFile) | ConvertFrom-Json -ErrorAction Stop
     if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile is not a JSON object" }
@@ -929,12 +932,20 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
         if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
         foreach ($p in $levels.PSObject.Properties) {
             if ($p.Name -cne 'weekly') { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
-            $holdAt = (Get-Triple $p.Value 'levels[weekly]' | Measure-Object -Minimum).Minimum
+            $t = Get-Triple $p.Value 'levels[weekly]'
+            $holdAt = ($t | Measure-Object -Minimum).Minimum
             $source = $ThresholdsFile
+            if ($holdAt -ne $t[0]) { $disorder += 'levels.weekly' }
         }
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
-    if ($null -ne $minutes) { $holdMin = (Get-Triple $minutes 'minutes' | Measure-Object -Maximum).Maximum; $source = $ThresholdsFile }
+    if ($null -ne $minutes) {
+        $t = Get-Triple $minutes 'minutes'
+        $holdMin = ($t | Measure-Object -Maximum).Maximum
+        $source = $ThresholdsFile
+        if ($holdMin -ne $t[0]) { $disorder += 'minutes' }
+    }
+    if ($disorder) { $source = "$source ($($disorder -join ' and ') out of order, so the strictest number holds)" }
     return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source }
 }
 

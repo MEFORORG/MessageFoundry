@@ -306,7 +306,7 @@ def test_a_lower_reading_in_one_reset_period_replaces_nothing(tmp_path: Path) ->
 
 def test_a_new_reset_period_replaces_the_old_value_in_either_direction(tmp_path: Path) -> None:
     """From a session calling the API on every fire: a lower number on a new reset needs one
-    (BACKLOG #5178), and an idle one is refused, as the moved-reset tests above pin."""
+    (BACKLOG #5178), and an idle one is refused, as the moved-reset tests below pin."""
     epoch = int(time.time()) + 3600
     for api_ms, (resets_at, pct) in enumerate(
         ((epoch, 91.0), (epoch + 7 * 86400, 2.0), (epoch + 14 * 86400, 50.0)), start=1
@@ -391,6 +391,64 @@ def test_a_higher_number_on_a_moved_reset_still_replaces_from_an_idle_session(
     _session_fire(tmp_path, {"used_percentage": 5.0, "resets_at": now + 100000}, "live", 1000)
     _session_fire(tmp_path, {"used_percentage": 80.0, "resets_at": now + 500000}, "idle", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(80.0)
+
+
+def test_after_a_real_reset_an_idle_lower_reading_keeps_the_gone_window(tmp_path: Path) -> None:
+    """BACKLOG #5178, past the published reset. The gone window reads UNKNOWN, so keeping it costs a
+    REVIEW; an idle session's frozen number for the new window could read OK on a pool since spent."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 91.0, "resets_at": now - 300}, "live", 1000)
+    new = {"used_percentage": 2.0, "resets_at": now + 500000}
+    _session_fire(tmp_path, new, "idle", 1000)
+    _session_fire(tmp_path, new, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
+    assert read(tmp_path)[0] == UNKNOWN
+
+    # CONTROL. A live session's reading of the new window replaces the gone one.
+    _session_fire(tmp_path, new, "idle", 2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
+    assert read(tmp_path)[0] == OK
+
+
+def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
+    """BACKLOG #5178: as for a confirmation, the live-session exception needs this root's stamp, or a
+    mis-wired session's 5 replaces this root's 100 and the reader refuses the foreign window."""
+    root = tmp_path / "this-root"
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    now = int(time.time())
+    _session_fire(state, {"used_percentage": 100.0, "resets_at": now + 500000}, "live", 1000)
+    low = {"used_percentage": 5.0, "resets_at": now + 100000}
+    for api_ms in (1000, 2000):
+        payload = {
+            "session_id": "S",
+            "cost": {"total_api_duration_ms": api_ms},
+            "rate_limits": {"seven_day": low},
+        }
+        proc = run_single(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-StateDir",
+                str(state),
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=_env(tmp_path / "other-root"),
+        )
+        assert proc.returncode == 0, proc.stderr
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+
+    # CONTROL. The same live reading from an unpinned session of this root is taken.
+    _session_fire(state, low, "T", 1000)
+    _session_fire(state, low, "T", 2000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
 
 
 def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
