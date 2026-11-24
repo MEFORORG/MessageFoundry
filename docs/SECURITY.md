@@ -2349,19 +2349,22 @@ the same permission set on the same method reds CI until it is listed here.
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
-> A name that fails the connection-name rule is never in a scope, and its denial row carries no
-> channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
-> console checks the rule before it calls in. `audit_channel_denied` in
-> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks the name it is given against the rule too; for its own refusal
-> of a bulk selection the console gives it an empty name, never the caller's text. Such a row's
-> detail carries `"malformed_name": true`, so
-> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031). At
-> least some rows that name no channel carry `"operation"` in their detail, naming the operation
-> refused: a channel-scoped caller's config reload is one, and a web console bulk selection whose
-> name fails the rule is another. `DeniedOperation` in the same file lists the values. Some such
-> rows carry none, at least one for a malformed name a core handler such as `dual_role_control`
-> refuses (vault BACKLOG #3748 item 7).
+> A name that fails the connection-name rule is never in a scope. The per-name JSON routes above
+> declare the rule on the path, so they answer such a name with 422 before any scope check and
+> write no audit row for it. The console checks the rule before it calls in. `audit_channel_denied`
+> in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks the name it is given against the rule too, and records a name
+> that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
+> unbounded length. For its own refusal of a channel-scoped actor's bulk selection the console
+> gives it an empty name, never the caller's text. A row written for a name that fails the rule
+> carries `"malformed_name": true` in its detail, so it is told apart from a refusal that names no
+> channel by design (BACKLOG #3031). At least some rows that name no channel carry `"operation"` in
+> their detail, naming the operation refused: a channel-scoped caller's config reload is one, and a
+> channel-scoped actor's web console bulk selection whose name fails the rule is another.
+> `DeniedOperation` in the same file lists the values. A core handler such as `_dual_role_control`
+> in `messagefoundry/api/app.py` passes no operation, so it would write a row with no channel and
+> no operation only if called directly with a malformed name; no shipped route does (vault BACKLOG
+> #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial

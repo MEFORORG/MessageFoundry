@@ -148,9 +148,9 @@ this line.**
   start, stop and restart, the bulk purge and its confirm page write the `auth.channel_denied`
   rows that name no channel with `"operation"` in their detail (`connection_control` or
   `connection_purge`). A row the engine writes for a well-formed name it refuses names that
-  channel and carries no operation. A bulk
-  selection whose name fails the connection-name rule writes a row with no channel, marked
-  `"malformed_name": true`, so it is told apart from the confirm page's refusal. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
+  channel and carries no operation. A channel-scoped actor's bulk selection whose name fails the
+  connection-name rule writes a row with no channel, marked `"malformed_name": true`, so it is
+  told apart from the confirm page's refusal; an all-channels actor's writes none. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
   `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
   carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
   digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
