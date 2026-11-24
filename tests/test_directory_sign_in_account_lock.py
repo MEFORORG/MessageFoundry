@@ -402,3 +402,163 @@ def test_sign_in_state_refused_reads_each_backends_column_shapes() -> None:
     assert sign_in_state_refused(0, None, now + 1, now)
     assert not sign_in_state_refused(0, now - 1, now, now)
     assert not sign_in_state_refused(False, None, None, now)
+
+
+def _sqlite_busy() -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError("database is locked")
+    exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    return exc
+
+
+def _busy_begin_immediate(
+    monkeypatch: pytest.MonkeyPatch,
+    busy_times: int,
+    *,
+    error: Callable[[], Exception] = _sqlite_busy,
+) -> list[bool]:
+    """Make each ``BEGIN IMMEDIATE`` writer transaction answer busy ``busy_times`` times, as it
+    does once ``busy_timeout`` is outlasted, and record each one opened. The deferred one runs."""
+    from messagefoundry.store import store as store_module
+
+    real = store_module._writer_txn
+    opened: list[bool] = []
+    monkeypatch.setattr(store_module, "_ADMIN_GRANT_BUSY_BACKOFF_SECONDS", 0.0)
+
+    @contextlib.asynccontextmanager
+    async def writer_txn(db: Any, lock: asyncio.Lock, *, immediate: bool = False) -> Any:
+        if immediate:
+            opened.append(True)
+            if len(opened) <= busy_times:
+                raise error()
+        async with real(db, lock, immediate=immediate):
+            yield
+
+    monkeypatch.setattr(store_module, "_writer_txn", writer_txn)
+    return opened
+
+
+async def test_a_busy_begin_runs_the_insert_again(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item B: a busy ``BEGIN IMMEDIATE`` is run again, so the re-read decides."""
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    opened = _busy_begin_immediate(monkeypatch, 2)
+    assert await _mint(engine, user_id, eligible=True) is True
+    assert len(opened) == 3
+
+
+async def test_a_busy_that_outlasts_the_bound_refuses_the_sign_in(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item B: a busy past the bound is a refused sign-in, not an ``OperationalError`` escaping
+    ``_complete_ad_login`` after its role and profile writes, and no session is minted."""
+    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    before = await _live_sessions(engine, user_id)
+    opened = _busy_begin_immediate(monkeypatch, 10_000)
+    assert await _mint(engine, user_id, eligible=True) is False
+    assert len(opened) == SESSION_MINT_ATTEMPTS
+    out = await _sign_in(service, _principal())
+    assert not out.ok
+    assert out.token is None
+    assert await _live_sessions(engine, user_id) <= before
+
+
+async def test_an_error_that_is_not_busy_is_raised_at_once(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control for item B: only the busy family is run again or read as a refusal."""
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    opened = _busy_begin_immediate(
+        monkeypatch, 10_000, error=lambda: sqlite3.OperationalError("disk I/O error")
+    )
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        await _mint(engine, user_id, eligible=True)
+    assert len(opened) == 1
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+async def test_the_seal_is_made_with_no_transaction_open(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, eligible: bool
+) -> None:
+    """Item A: under a Vault Transit sealer the seal is an HTTP call, so it must not run while the
+    writer holds its lock: on SQLite under BEGIN IMMEDIATE that would stall every engine shard."""
+    from messagefoundry.store import store as store_module
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    store: Any = engine.store
+    real = store_module.seal_session_async
+    seals: list[tuple[bool, bool]] = []
+
+    async def recording_seal(sealer: Any, record: Any) -> Any:
+        seals.append((store._db.in_transaction, store._lock.locked()))
+        return await real(sealer, record)
+
+    monkeypatch.setattr(store_module, "seal_session_async", recording_seal)
+    assert await _mint(engine, user_id, eligible=eligible) is True
+    assert seals == [(False, False)]
+
+
+async def test_an_epoch_raised_after_the_seal_is_sealed_again(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item A's cost: the seal covers the session epochs read before the transaction. A revoke
+    that raises one before the insert's locked read writes nothing, and the record is sealed again
+    over the new epoch, so the session is not minted dead."""
+    from messagefoundry.store import store as store_module
+    from messagefoundry.store.store import no_audit_row
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    store: Any = engine.store
+    real_seal = store_module.seal_session_async
+    sealed_epochs: list[int] = []
+
+    async def recording_seal(sealer: Any, record: Any) -> Any:
+        sealed_epochs.append(record.user_epoch)
+        if len(sealed_epochs) == 1:
+            await store.revoke_user_sessions(user_id, audit=no_audit_row)
+        return await real_seal(sealer, record)
+
+    monkeypatch.setattr(store_module, "seal_session_async", recording_seal)
+    token_hash = hash_token(uuid.uuid4().hex)
+    assert await store.create_session(
+        token_hash=token_hash,
+        user_id=user_id,
+        expires_at=time.time() + 3600,
+        seed_reauth=False,
+        auth_mechanism="kerberos",
+        require_sign_in_eligible=True,
+    )
+    row = await store.get_user(user_id)
+    session = await store.get_session(token_hash)
+    assert row is not None and session is not None
+    assert sealed_epochs == [row.session_epoch - 1, row.session_epoch]
+    assert session.user_epoch == row.session_epoch
+
+
+async def test_a_lock_that_lapses_while_the_insert_waits_is_judged_at_the_read(
+    engine: Engine,
+) -> None:
+    """Item D: the eligibility read judges a lock's expiry once the writer lock is held, not at the
+    time the insert began to wait for it. Held past a short lock, the insert then mints."""
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    store: Any = engine.store
+    await store.record_login_failure(user_id, failed_attempts=5, locked_until=time.time() + 0.3)
+    async with store._lock:
+        mint = asyncio.ensure_future(_mint(engine, user_id, eligible=True))
+        await asyncio.sleep(0.6)
+        assert not mint.done()  # waiting on the writer lock this test holds
+    assert await mint is True

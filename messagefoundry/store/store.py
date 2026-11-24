@@ -2993,6 +2993,13 @@ class AdminGrant(StrEnum):
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
+#: How many times ``create_session`` runs on every backend before it refuses: once per seal over
+#: the session epochs it read, made again when a revoke raised one before the insert's locked read,
+#: and on SQLite also once per busy ``BEGIN IMMEDIATE`` (BACKLOG #5653), which backs off as the
+#: first-administrator grant does. Both are rare, so a bound that is reached refuses the sign-in
+#: rather than spin.
+SESSION_MINT_ATTEMPTS: Final = _ADMIN_GRANT_BUSY_ATTEMPTS
+
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
@@ -22050,7 +22057,97 @@ class MessageStore:
         mfa_verified: bool = False,
         require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the writer transaction opens. Under a Vault Transit
+        # sealer it is an HTTP call, and under ``require_sign_in_eligible`` the transaction holds
+        # SQLite's write lock from its BEGIN, so sealing inside it would stall every writer on every
+        # engine shard behind Vault. The seal covers the account's and the store's session epochs,
+        # so they are read first, unlocked, and the transaction reads them again: if a revoke raised
+        # either in between, nothing is written and the record is sealed again over the new values.
+        for attempt in range(1, SESSION_MINT_ATTEMPTS + 1):
+            epochs = await self._session_epochs_unlocked(user_id)
+            if epochs is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+                # INSERT's foreign-key error. The locked read refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=epochs[0],
+                    global_epoch=epochs[1],
+                ),
+            )
+            try:
+                inserted = await self._insert_sealed_session(
+                    record,
+                    now=now,
+                    require_federated_subject=require_federated_subject,
+                    require_sign_in_eligible=require_sign_in_eligible,
+                )
+            except sqlite3.OperationalError as exc:
+                # Only the BEGIN IMMEDIATE path is run again: its busy arises at the BEGIN, once
+                # ``busy_timeout`` is outlasted, before anything is read or written.
+                if not require_sign_in_eligible or not _is_sqlite_busy(exc):
+                    raise
+                if attempt == SESSION_MINT_ATTEMPTS:
+                    # A refusal, not an error: the directory sign-in that asked has already written
+                    # its roles and profile, and it reports a refused insert as a refused sign-in.
+                    log.warning(
+                        "sqlite: a session insert met a busy database %d times; refusing it",
+                        attempt,
+                    )
+                    return False
+                log.info(
+                    "sqlite: a session insert met a busy database (attempt %d of %d);"
+                    " running it again",
+                    attempt,
+                    SESSION_MINT_ATTEMPTS,
+                )
+                await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+                continue
+            if inserted is not None:
+                return inserted
+        log.warning(
+            "sqlite: a session insert found the session epochs raised %d times; refusing it",
+            SESSION_MINT_ATTEMPTS,
+        )
+        return False
+
+    async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
+        """The account's session epoch and the store's global one, read on a reader connection
+        with no lock, or ``None`` for no such account. ``create_session`` seals over them and
+        compares them again in its writer transaction (BACKLOG #5653)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["session_epoch"]), global_epoch_or_refuse(row["global_epoch"])
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s writer transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
         # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
         # path's binding check; BACKLOG #5653 for the eligibility check). Within this process the
@@ -22062,13 +22159,16 @@ class MessageStore:
         # refused. Under the deferred BEGIN the same write fails the INSERT as ``database is
         # locked`` instead, an error rather than a refusal (BACKLOG #5653; BACKLOG #3078 F5 is the
         # first-administrator grant's same choice).
-        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
+        # Each refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
+            # Read once the locks are held, so a BEGIN that waited out another writer judges a
+            # lock's expiry at the time of the read, not when this sign-in began to wait.
+            judged_at = time.time() if now is None else now
             cur = await self._db.execute(
                 "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
                 " second_step_locked_until,"
                 f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
-                (user_id,),
+                (record.user_id,),
             )
             row = await cur.fetchone()
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
@@ -22085,26 +22185,19 @@ class MessageStore:
                         row["disabled"],
                         row["locked_until"],
                         row["second_step_locked_until"],
-                        now,
+                        judged_at,
                     )
                 )
             ):
                 await self._db.rollback()
                 return False
-            record = new_session_record(
-                token_hash=token_hash,
-                user_id=user_id,
-                now=now,
-                expires_at=expires_at,
-                client=client,
-                seed_reauth=seed_reauth,
-                auth_mechanism=auth_mechanism,
-                idp_auth_time=idp_auth_time,
-                mfa_verified=mfa_verified,
+            if not session_epochs_current(
+                record,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
-            )
-            record = await seal_session_async(self._row_sealer, record)
+            ):
+                await self._db.rollback()
+                return None
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True

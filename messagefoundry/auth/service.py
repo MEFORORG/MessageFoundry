@@ -8866,10 +8866,12 @@ class AuthService:
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
-                # BACKLOG #5653: the insert also requires the row enabled and unlocked, read under
-                # the lock a disable or a lockout takes, so neither can land between the re-read
-                # above and the insert. A disable's session sweep cannot see a session that does
-                # not exist yet.
+                # BACKLOG #5653: the insert also requires the row enabled and unlocked, judged by
+                # the insert's own read under the lock a disable or a lockout takes. Either can
+                # still commit between the re-read above and that read; the insert's read then
+                # sees it and refuses. What the lock closes is the window from that read to the
+                # INSERT: a disable or lockout arriving there waits until the INSERT commits. A
+                # disable's session sweep cannot see a session that does not exist yet.
                 require_sign_in_eligible=True,
                 idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
