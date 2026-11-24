@@ -985,16 +985,17 @@ def _skip_space(text: str, i: int) -> int:
     return i
 
 
-def _expr_end(ctx: _Ctx, i: int, stops: str = ";,") -> int:
+def _expr_end(ctx: _Ctx, i: int) -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues, a line break held in a
-    block comment included. A statement passes ``stops=";"``: a top-level ``,`` does not end one."""
-    return _read_expr_end(ctx, i, stops)[0]
+    block comment included."""
+    return _read_expr_end(ctx, i, ";,")[0]
 
 
 def _read_expr_end(ctx: _Ctx, i: int, stops: str) -> tuple[int, bool]:
-    """:func:`_expr_end`, and whether that end was read: False where a bracket opened in the
-    expression is never closed, so the end of the file is a guess rather than its end."""
+    """:func:`_expr_end` with its stop set, and whether that end was read: False where a bracket
+    opened in the expression is never closed, so the end of the file is a guess rather than its
+    end. A statement passes ``stops=";"``: a top-level ``,`` does not end one."""
     masked, raw = ctx.masked, ctx.code
     depth = 0
     for j in range(i, len(masked)):
@@ -1281,7 +1282,9 @@ def _statement_end(ctx: _Ctx, i: int) -> tuple[int, bool]:
     can look past it), the enclosing closer, or a line break ASI ends it at -- never at the first
     ``;`` anywhere, which cut a body inside a nested block short and priced the rest once, exact,
     outside the loop. ``if``/``else``, ``try``/``catch``/``finally``, ``switch``, ``with``, a
-    label and a nested loop are read through their parts. Only unbalanced source is a guess.
+    label and a nested loop are read through their parts. An end is a guess only where the
+    source runs out first: an unclosed bracket or block, a head with no ``(``, a ``do`` with no
+    ``while (...)`` tail, or nothing left to read.
     """
     masked = ctx.masked
     n = len(masked)
@@ -1701,8 +1704,9 @@ def workflow_name(source: str) -> str | None:
 
 def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
-    # U+FEFF is whitespace to JavaScript, anywhere, but a token to the lexer: a BOM'd copy of a
-    # file priced differently. Same length, so every offset holds.
+    # U+FEFF is whitespace to JavaScript outside a literal, but a token to the lexer: a BOM'd copy
+    # of a file priced differently. Same length, so every offset holds; one inside a literal
+    # becomes a space too, which changes a snippet and never a count.
     source = source.replace("\ufeff", " ")
     notes = _MaskNotes()
     masked = _mask(source, notes)
