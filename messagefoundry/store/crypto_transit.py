@@ -55,7 +55,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from messagefoundry.logging_guard import _last_resort
 from messagefoundry.redaction import json_loads_or_refusal
@@ -165,6 +165,13 @@ _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bou
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
+#: The reason an audit-MAC 400 is labelled unconfirmed when the probe under the latest version
+#: answered no well-formed MAC (vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238).
+_PROBE_MALFORMED = "the probe under the latest version answered no well-formed MAC"
+#: How :meth:`TransitCipher._refuses_only_version` reads an audit-MAC verify failure: ``""`` for
+#: no version refusal, ``"version"`` for one the probe clears, and ``"malformed"`` for one whose
+#: probe answered no well-formed MAC.
+_ProbeReading = Literal["", "version", "malformed"]
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
 #: label's warning is made and logged (vault BACKLOG #6707): a step short of memory or stack.
 #: Anything else the read raises propagates. No reply is known to cause either: a body past
@@ -1114,16 +1121,22 @@ class TransitCipher(_UnmarkedPolicy):
         is :class:`AuditKeyVersionRefusedError` or :class:`AuditKeyVersionUnverifiedError`, and an
         outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
         handler. Blocking."""
-        if self._refuses_only_version(exc, version):
+        reading = self._refuses_only_version(exc, version)
+        if reading:
             # The same flow, labelled apart (vault BACKLOG #6707). Reading the reply only picks the
             # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
-            # walk, except as _READ_FAULTS says. Any other exception propagates.
+            # walk, except as _READ_FAULTS says. Any other exception propagates. A malformed probe
+            # answer takes the unconfirmed label without reading the reply: it keeps the row's
+            # break and its alert, but it is no evidence that Transit refused the version.
             reason: str | None
             raised = ""  # the read's fault, by its class's existing name, so nothing is built
-            try:
-                reason = _names_no_version_reason(exc)
-            except _READ_FAULTS as read_exc:
-                reason, raised = _READ_RAISED, type(read_exc).__name__
+            if reading == "malformed":
+                reason = _PROBE_MALFORMED
+            else:
+                try:
+                    reason = _names_no_version_reason(exc)
+                except _READ_FAULTS as read_exc:
+                    reason, raised = _READ_RAISED, type(read_exc).__name__
             if reason is None:
                 return AuditKeyVersionRefusedError(version)
             unverified = AuditKeyVersionUnverifiedError(version)
@@ -1242,24 +1255,28 @@ class TransitCipher(_UnmarkedPolicy):
         )
         return probe["data"]["hmac"]
 
-    def _refuses_only_version(self, exc: Exception, key_version: int) -> bool:
-        """Whether ``exc``, raised by an audit-MAC verify at ``key_version``, is Transit refusing
-        that version rather than an outage (BACKLOG #2337).
+    def _refuses_only_version(self, exc: Exception, key_version: int) -> _ProbeReading:
+        """Whether ``exc``, raised by an audit-MAC verify at ``key_version``, reads as Transit
+        refusing that version rather than an outage (BACKLOG #2337), as a :data:`_ProbeReading`.
 
         Transit's ``verify`` answers a version above the latest, or below the key's
         ``min_decryption_version``, with HTTP 400, which hvac raises as ``InvalidRequest``. A
         dropped connection, a rate limit or a sealed node raises another class, so none of those
         reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
-        too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        answer with a MAC :func:`~messagefoundry.store.row_seal.transit_mac_version` accepts, naming
-        a version other than ``key_version`` (vault BACKLOG #6707 item 73): an empty or versionless
-        answer is a service that cannot MAC, not evidence about the row.
+        too. Fixed input keeps a row's own content from deciding the answer. A probe answering a
+        MAC :func:`~messagefoundry.store.row_seal.transit_mac_version` accepts, naming a version
+        other than ``key_version``, reads ``"version"``. A probe answering a string that is no such
+        MAC, at least an empty or versionless one, reads ``"malformed"`` (vault BACKLOG #6707 item
+        73): no evidence that Transit refused the version, but still a break at the row, as on
+        ``main`` before item 73, so a malformed probe reply leaves a planted version a break with
+        its alert rather than a walk that could not run. Any other answer, or a probe that fails,
+        reads ``""``.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
         if not is_vault_bad_request(exc):
-            return False
+            return ""
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
@@ -1273,10 +1290,13 @@ class TransitCipher(_UnmarkedPolicy):
                     text,
                 )
             )
-            return False
-        # A malformed answer is logged by the fixed-input check this failure goes to next.
-        named = transit_mac_version(answered) if isinstance(answered, str) else None
-        return named is not None and named != key_version
+            return ""
+        if not isinstance(answered, str):
+            return ""
+        named = transit_mac_version(answered)
+        if named is None:
+            return "malformed"
+        return "version" if named != key_version else ""
 
     def _is_outage(self, exc: Exception) -> bool:
         """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's

@@ -466,9 +466,10 @@ section 0): this is what the first deployment's first routine rotation would hav
    answer or one naming no version passes too, and a proxy, not Transit, can author the 400
    (corrected 2026-11-11, BACKLOG #6707). **[AMENDED 2026-11-24, vault BACKLOG #6707 item 73: the
    probe answer must now be a MAC `row_seal.transit_mac_version` accepts, naming a version other
-   than the pinned one. Any other answer, at least an empty one or one naming no version, is read
-   as no refused version, and the failure goes to the 2026-11-11 amendment's item 4 recheck, where
-   a later probe may still answer. The words above are kept as decided.]** The walk records a
+   than the pinned one, for the refused label. Any other string, at least an empty one or one
+   naming no version, gives `AuditKeyVersionUnverifiedError` whatever the reply says, so the row
+   is still a break with the alert, as before. A probe that fails, or answers a well-formed MAC
+   naming the pinned version, is no refused version. The words above are kept as decided.]** The walk records a
    break at that row, naming the
    version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
    raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`

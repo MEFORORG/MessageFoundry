@@ -1536,15 +1536,25 @@ def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
         pytest.param("vault:v02:" + base64.b64encode(bytes(32)).decode("ascii"), id="leading-zero"),
     ],
 )
-def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_no_refused_version(
-    answer: str,
+def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_labelled_unconfirmed(
+    answer: str, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Vault BACKLOG #6707 item 73: the probe clears a 400 as a refused version only when it
+    """Vault BACKLOG #6707 item 73: the probe confirms a 400 as a refused version only when it
     answers a well-formed Transit MAC naming another version, the same parse the fixed-input check
-    and the writer apply. An empty or versionless answer is a service that cannot MAC, not
-    evidence about the row, so the check could not run: the plain error, no subclass."""
+    and the writer apply. An empty or versionless answer is no evidence that Transit refused the
+    version, so the 400 takes the unconfirmed label, even under Vault's own refusal wording. It
+    stays a break at the row, as on main before item 73, so whoever controls the probe's reply
+    cannot turn a planted version into a check that could not run (Lander hold 7133673869 on PR
+    3238)."""
+    from messagefoundry.store import crypto_transit
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     refused = _verify_refusal(answer)
-    assert type(refused) is CipherError, refused
+    assert isinstance(refused, AuditKeyVersionUnverifiedError), refused
+    logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
+    expected = f"because {crypto_transit._PROBE_MALFORMED} (key="
+    assert len(logged) == 1 and expected in logged[0], logged
 
 
 @pytest.mark.parametrize(
@@ -2253,6 +2263,86 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
     _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = 1", (_PLANTED,))
     store = await _transit_store(db)
     try:
+        ok, msg = await store.verify_audit_chain()
+    finally:
+        await store.close()
+    assert not ok and "seq=1," in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
+
+
+class _MalformedProbeTransit(_RotatingTransit):
+    """``_RotatingTransit`` whose answer to the cipher's version probe, the ``hmac`` over the fixed
+    probe input, is ``probe_answer`` in place of a MAC. Every other ``hmac`` is Transit's own, so
+    the chain is written as usual."""
+
+    probe_answer = ""
+
+    def generate_hmac(self, *, hash_input: str, **kw: Any) -> dict[str, Any]:
+        from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
+
+        if hash_input == _VERSION_PROBE_INPUT:
+            return {"data": {"hmac": self.probe_answer}}
+        return super().generate_hmac(hash_input=hash_input, **kw)
+
+
+_MALFORMED_PROBE_ANSWERS = [
+    pytest.param("", id="empty"),
+    pytest.param("not a transit mac", id="names-no-version"),
+    pytest.param("vault:v2:AAAA", id="short-digest"),
+]
+
+
+@pytest.mark.parametrize("answer", _MALFORMED_PROBE_ANSWERS)
+async def test_a_planted_version_whose_probe_answers_no_well_formed_mac_is_a_chain_break(
+    answer: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238: a probe answering no
+    well-formed MAC must not turn a planted version into a walk that could not run. The startup
+    walk still reports the break at that row, fires the ``audit-chain`` alert and keeps going."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    _needs_hvac()
+    transit = _MalformedProbeTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "malformed-probe-planted.db"
+    seq = await _chain_with_a_planted_version(db)
+    transit.probe_answer = answer
+    store = await _transit_store(db)
+    try:
+        ok, msg = await store.verify_audit_chain()
+        sink, lines = await _walk_on_start(store, caplog)
+    finally:
+        await store.close()
+    assert not ok and f"seq={seq}," in str(msg), msg
+    assert str(AuditKeyVersionUnverifiedError(_UNHELD_VERSION)) in str(msg), msg
+    assert [name for name, _ in sink.events] == ["audit-chain"], sink.events
+    assert f"seq={seq}," in sink.events[0][1], sink.events
+    assert not any("could not run" in line for line in lines), lines
+
+
+@pytest.mark.parametrize("answer", _MALFORMED_PROBE_ANSWERS)
+async def test_a_planted_genesis_version_whose_probe_answers_no_well_formed_mac_opens(
+    answer: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238: with the genesis row's
+    version planted and a probe answering no well-formed MAC, the store still opens, logs an ERROR
+    naming the genesis row, and the walk reports the break at row 1, as on main."""
+    from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
+
+    _needs_hvac()
+    transit = _MalformedProbeTransit()
+    _use_fake(monkeypatch, transit)
+    db = tmp_path / "malformed-probe-genesis.db"
+    await _chain_with_a_planted_version(db)
+    _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = 1", (_PLANTED,))
+    transit.probe_answer = answer
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
+        store = await _transit_store(db)
+    try:
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert any("genesis row does not verify" in line for line in errors), errors
+        assert store._audit_ranges_trusted is False
         ok, msg = await store.verify_audit_chain()
     finally:
         await store.close()
