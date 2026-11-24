@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import re
 import sys
 import threading
 from dataclasses import replace
@@ -132,13 +133,17 @@ def _proc_status_kib(field: str) -> int | None:
 def _rlimit_data_counts_mmap() -> bool:
     """Whether this kernel counts private writable ``mmap`` memory against ``RLIMIT_DATA``. Linux
     4.7 and later do; earlier kernels count only the ``brk`` heap, which would leave most large
-    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there."""
+    allocations outside the cap, so the caller falls back to ``RLIMIT_AS`` there. Only the leading
+    ``major.minor`` digits are read, so a suffix on the minor, as in ``6.12-rc4`` or ``5.15-aws``,
+    does not make a new kernel read as unknown (BACKLOG #6811)."""
     try:
         release = os.uname().release  # type: ignore[attr-defined,unused-ignore]
-        major, minor = (int(part) for part in release.split(".")[:2])
-    except (AttributeError, ValueError):
+    except AttributeError:
         return False
-    return (major, minor) >= (4, 7)
+    match = re.match(r"(\d+)\.(\d+)", release)
+    if match is None:
+        return False
+    return (int(match[1]), int(match[2])) >= (4, 7)
 
 
 def _apply_resource_caps(mem_mb: int | None) -> str:

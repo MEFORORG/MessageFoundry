@@ -671,9 +671,20 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("6.8.0-1017-azure", True),
         ("5.15.0-91-generic", True),
         ("4.7.0", True),
+        ("4.7", True),
+        ("6.1.0-13-amd64", True),
+        # A two-component release whose minor carries a suffix (BACKLOG #6811).
+        ("6.12-rc4", True),
+        ("5.15-aws", True),
+        ("5.15+", True),
+        ("4.6", False),
+        ("4.6-rc1", False),
         ("4.4.0-210-generic", False),
         ("3.10.0-1160.el7.x86_64", False),
         ("unparseable", False),
+        ("garbage", False),
+        ("6", False),
+        ("", False),
     ],
 )
 def test_rlimit_data_is_trusted_only_from_linux_4_7(
