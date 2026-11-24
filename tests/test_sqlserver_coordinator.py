@@ -170,6 +170,25 @@ async def test_concurrent_acquire_exactly_one_wins(store) -> None:
     assert sum(1 for r in results if r) == 1
 
 
+async def test_concurrent_merges_on_the_other_cluster_tables_do_not_deadlock(store) -> None:
+    """BACKLOG #6793: the claim of a shared-to-exclusive range-lock conversion deadlock (1205) when
+    two nodes run MERGE ... WITH (HOLDLOCK) at once on ``cluster_config`` or ``nodes``, the two
+    tables the acquire race above does not cover. Each MERGE seeks its primary key and reads the
+    target under update range locks, which conflict with each other, so the racers queue rather
+    than convert. Every statement here starts on an empty table, the insert-range case, then races
+    the matched case on the same key. Any 1205 escapes as an exception from gather."""
+    coords = [_coord(store, f"node{i}:{i}:{i:04x}") for i in range(8)]
+    await coords[0]._ensure_tables()
+    # The empty-table seed race, then the matched bump race, on the single cluster_config row.
+    assert set(await asyncio.gather(*[c.config_version() for c in coords])) == {0}
+    bumped = await asyncio.gather(*[c.bump_config_version(digest=None) for c in coords])
+    assert sorted(bumped) == list(range(1, 9)), "each bump must see the one before it"
+    # Distinct nodes inserting into an empty nodes table, then each re-registering its own row.
+    await asyncio.gather(*[c._register() for c in coords])
+    await asyncio.gather(*[c._register() for c in coords])
+    assert len(await coords[0].cluster_members()) == 8
+
+
 async def test_config_version_seed_and_bump(store) -> None:
     c = _coord(store, "nodeA:1:aaaa")
     await c._ensure_tables()
