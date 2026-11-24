@@ -341,30 +341,26 @@ export function wiringMapPayload(g: Graph | undefined, focus: MapFocus | null): 
 
 /**
  * The source location a Wiring Map "open" request may open, or undefined to refuse it (ASVS 5.3.2,
- * BACKLOG #4277). The page posts back a file it was sent, but a page script is not trusted to name
- * one: the file must be one the current graph itself reports for an element, compared as fileKey
- * resolved against `base` (the workspace root openSource resolves a relative path against). What
- * comes back is the GRAPH's spelling of the file, never the page's, so openSource only ever sees a
- * path the CLI printed. The line is only a cursor position; a value that is not a positive safe
- * integer falls back to 1.
+ * BACKLOG #4277). The page posts back a node's `open.file` copied unchanged from the payload it was
+ * sent, but a page script is not trusted to name a file: the string must EQUAL a file the current
+ * graph reports for an element. Exact equality, not a resolved or case-folded key, so nothing about
+ * the workspace root or the platform's case rules can widen the match; a refresh that respells a
+ * file only refuses the stale click until the map re-renders. The line is only a cursor position;
+ * a value that is not a positive safe integer falls back to 1. This checks WHO named the file, not
+ * WHERE it is: a graph that reports a file outside the workspace (a UNC share, say) still opens it.
  */
 export function graphOpenTarget(
   g: Graph | undefined,
   file: unknown,
   line: unknown,
-  base: string,
-  win32: boolean = IS_WIN32,
 ): { file: string; line: number } | undefined {
   if (!g || typeof file !== "string" || file === "") {
     return undefined;
   }
-  const want = fileKey(base, file, win32);
-  const reported = [...g.inbound, ...g.routers, ...g.handlers, ...g.outbound]
-    .map((e) => e.file)
-    .find((f): f is string => typeof f === "string" && f !== "" && fileKey(base, f, win32) === want);
-  if (reported === undefined) {
+  const reports = (e: { file?: string | null }): boolean => e.file === file;
+  if (!(g.inbound.some(reports) || g.routers.some(reports) || g.handlers.some(reports) || g.outbound.some(reports))) {
     return undefined;
   }
   const ln = typeof line === "number" && Number.isSafeInteger(line) && line >= 1 ? line : 1;
-  return { file: reported, line: ln };
+  return { file, line: ln };
 }

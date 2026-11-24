@@ -250,63 +250,62 @@ suite("wiringMapModel — connection-to-connection references (BACKLOG #5966)", 
 
 suite("wiringMapModel — graphOpenTarget refuses a file the graph did not report (BACKLOG #4277)", () => {
   // One code-authored element (absolute path) and one data-authored connection (workspace-relative
-  // path, as the CLI reports a connections.toml entry), on each path flavour.
-  const POSIX: Graph = {
+  // path, as the CLI reports a connections.toml entry).
+  const G: Graph = {
     version: 2,
     inbound: [{ name: "IB_A", type: "mllp", router: "r", file: "/ws/cfg/a.py", line: 3 }],
     outbound: [{ name: "OB_T", type: "file", file: "connections.toml", line: 12 }],
     routers: [{ name: "r", edges: [], file: "/ws/cfg/a.py", line: 10 }],
-    handlers: [{ name: "h", edges: [], file: null, line: null }],
+    handlers: [{ name: "h", edges: [], file: String.raw`C:\ws\cfg\h.py`, line: 4 }],
   };
 
-  test("a file the graph reports opens, at the requested line, under the graph's spelling", () => {
-    assert.deepStrictEqual(graphOpenTarget(POSIX, "/ws/cfg/a.py", 10, "/ws", false), { file: "/ws/cfg/a.py", line: 10 });
-    assert.deepStrictEqual(graphOpenTarget(POSIX, "connections.toml", 12, "/ws", false), {
-      file: "connections.toml",
-      line: 12,
-    });
-    // The same file named another way still resolves to the graph's own string.
-    assert.deepStrictEqual(graphOpenTarget(POSIX, "/ws/connections.toml", 1, "/ws", false), {
-      file: "connections.toml",
-      line: 1,
-    });
+  test("a file the graph reports opens at the requested line", () => {
+    assert.deepStrictEqual(graphOpenTarget(G, "/ws/cfg/a.py", 10), { file: "/ws/cfg/a.py", line: 10 });
+    assert.deepStrictEqual(graphOpenTarget(G, "connections.toml", 12), { file: "connections.toml", line: 12 });
+    assert.deepStrictEqual(graphOpenTarget(G, String.raw`C:\ws\cfg\h.py`, 4), { file: String.raw`C:\ws\cfg\h.py`, line: 4 });
   });
 
-  test("a page-chosen file the graph does not report is refused", () => {
-    for (const bad of ["/etc/passwd", "/ws/cfg/b.py", "../secrets.env", "cfg/../../etc/passwd", "//host/share/x.py"]) {
-      assert.strictEqual(graphOpenTarget(POSIX, bad, 1, "/ws", false), undefined, bad);
+  test("every file the map payload offers to open is one the guard accepts", () => {
+    const offered = buildWiringMap(G, null)
+      .columns.flat()
+      .flatMap((n) => (n.open ? [n.open] : []));
+    assert.ok(offered.length > 0);
+    for (const o of offered) {
+      assert.deepStrictEqual(graphOpenTarget(G, o.file, o.line), o);
+    }
+  });
+
+  test("a page-chosen file the graph does not report is refused, however close to a reported one", () => {
+    const bad = [
+      "/etc/passwd",
+      "/ws/cfg/b.py",
+      "../secrets.env",
+      "/ws/cfg/../cfg/a.py",
+      "/ws/connections.toml",
+      "/WS/cfg/a.py",
+      String.raw`c:\ws\cfg\h.py`,
+      String.raw`\\attacker\share\a.py`,
+    ];
+    for (const f of bad) {
+      assert.strictEqual(graphOpenTarget(G, f, 1), undefined, f);
     }
   });
 
   test("a malformed request, or no graph, is refused", () => {
-    for (const bad of [undefined, null, 7, "", { file: "/ws/cfg/a.py" }]) {
-      assert.strictEqual(graphOpenTarget(POSIX, bad, 1, "/ws", false), undefined, String(bad));
+    for (const f of [undefined, null, 7, "", { file: "/ws/cfg/a.py" }, ["/ws/cfg/a.py"]]) {
+      assert.strictEqual(graphOpenTarget(G, f, 1), undefined, String(f));
     }
-    assert.strictEqual(graphOpenTarget(undefined, "/ws/cfg/a.py", 1, "/ws", false), undefined);
+    assert.strictEqual(graphOpenTarget(undefined, "/ws/cfg/a.py", 1), undefined);
+  });
+
+  test("a location-less element does not make an empty file openable", () => {
+    const g: Graph = { ...G, handlers: [{ name: "h", edges: [], file: null, line: null }] };
+    assert.strictEqual(graphOpenTarget(g, "", 1), undefined);
   });
 
   test("a line that is not a positive safe integer falls back to 1", () => {
     for (const ln of [0, -4, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "9", undefined]) {
-      assert.deepStrictEqual(graphOpenTarget(POSIX, "/ws/cfg/a.py", ln, "/ws", false), { file: "/ws/cfg/a.py", line: 1 }, String(ln));
-    }
-  });
-
-  test("Windows: compared case-insensitively against the workspace root, UNC refused", () => {
-    const WIN: Graph = {
-      version: 2,
-      inbound: [{ name: "IB_A", type: "mllp", router: "r", file: String.raw`C:\ws\cfg\a.py`, line: 3 }],
-      outbound: [{ name: "OB_T", type: "file", file: "connections.toml", line: 12 }],
-      routers: [],
-      handlers: [],
-    };
-    const base = String.raw`c:\ws`;
-    assert.deepStrictEqual(graphOpenTarget(WIN, String.raw`c:\WS\cfg\A.py`, 3, base, true), {
-      file: String.raw`C:\ws\cfg\a.py`,
-      line: 3,
-    });
-    assert.deepStrictEqual(graphOpenTarget(WIN, "connections.toml", 12, base, true), { file: "connections.toml", line: 12 });
-    for (const bad of [String.raw`\\attacker\share\a.py`, String.raw`C:\Windows\win.ini`, String.raw`..\ws2\connections.toml`]) {
-      assert.strictEqual(graphOpenTarget(WIN, bad, 1, base, true), undefined, bad);
+      assert.deepStrictEqual(graphOpenTarget(G, "/ws/cfg/a.py", ln), { file: "/ws/cfg/a.py", line: 1 }, String(ln));
     }
   });
 });

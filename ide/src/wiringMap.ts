@@ -22,7 +22,8 @@ type Incoming =
   | { command: "ready" }
   | { command: "setFocus"; kind: ElementKind; name: string }
   | { command: "refresh" }
-  | { command: "open"; file: string; line: number }
+  // Untrusted: the page names these, so graphOpenTarget checks them (BACKLOG #4277).
+  | { command: "open"; file: unknown; line: unknown }
   | { command: "reveal"; kind: ElementKind; name: string };
 
 export class WiringMapPanel {
@@ -78,14 +79,21 @@ export class WiringMapPanel {
       await this.graph.refresh(); // fires onDidChangeTreeData -> post()
     } else if (m.command === "open") {
       // A page script names the file, so open only a file the current graph reports (BACKLOG #4277).
-      const target = graphOpenTarget(this.graph.getGraph(), m.file, m.line, workspaceDir() ?? "");
+      const target = graphOpenTarget(this.graph.getGraph(), m.file, m.line);
       if (!target) {
         void vscode.window.showWarningMessage(
           "MessageFoundry: the Wiring Map asked to open a file the wiring graph does not report; it was not opened. Refresh the map and try again.",
         );
         return;
       }
-      await vscode.commands.executeCommand("messagefoundry.openSource", target.file, target.line);
+      try {
+        await vscode.commands.executeCommand("messagefoundry.openSource", target.file, target.line);
+      } catch (err) {
+        // A graph file can be gone since the last refresh; say so rather than drop the rejection.
+        void vscode.window.showWarningMessage(
+          `MessageFoundry: could not open the source file: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     } else if (m.command === "reveal") {
       await vscode.commands.executeCommand("messagefoundry.revealElement", m.kind, m.name);
     }
