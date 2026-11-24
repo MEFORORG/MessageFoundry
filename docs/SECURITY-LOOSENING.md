@@ -1093,7 +1093,9 @@ count is above `0` (vault BACKLOG #2613).
 > judged threshold.** Any value looser than the default is named, so a huge count or a tiny window is
 > reported like an off value, with text that says *looser than the default of* rather than *off*. A
 > value at or stricter than the default is not reported. A **negative** count or window does not load
-> (BACKLOG #5318): a negative count refused every attempt after the first. A window that is not a number, or is infinite, does not load
+> (BACKLOG #5318): a negative per-address count refused every attempt after an address's first, a
+> negative all-clients count refused every attempt, the first included, and a negative window aged
+> every attempt out, as `0` does. A window that is not a number, or is infinite, does not load
 > (vault BACKLOG #2466): a `NaN` or `+inf` window never ages an attempt out, so once the count filled
 > the limiter would refuse every sign-in until a restart. A window above `86400` s (one day) does
 > not load either, since a huge finite one does the same in practice. Both rules hold for
