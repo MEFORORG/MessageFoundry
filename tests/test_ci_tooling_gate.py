@@ -132,6 +132,9 @@ _CASES = [
     (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
     # BACKLOG #5472: each file below is read from the repository by a manifest entry, and before
     # that row none matched an arm, so a PR editing only one met the test that reads it on no leg.
+    # NOT CLOSED: a listed test that scans every tracked file, such as
+    # test_defaulted_credential_lint, reads paths no arm names, so a PR touching only those meets
+    # it first on push-to-main.
     ([".gitleaks.toml"], True, "test_merge_gate_controls reads the gitleaks allowlist"),
     ([".semgrep/messagefoundry.yml"], True, "test_required_contexts scans the semgrep rules"),
     ([".codex/config.toml"], True, "test_codex_bridge reads the Codex hook config"),

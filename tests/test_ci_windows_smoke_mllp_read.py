@@ -14,6 +14,18 @@ application of the same name. Each bad case is also run against the pre-fix body
 the control, to show it is one the old step passed. Each bad case leaves the other guards
 satisfied, so it fails only if its own guard fires.
 
+WHAT THE STEP ACCEPTS, stated here rather than in ci.yml, which sits near GitHub's 512,000-byte
+workflow file limit. It fails a non-zero send exit (the step sets
+``$PSNativeCommandUseErrorActionPreference`` off, so rigadmin's exit 1 reads as "not yet" on
+any pwsh) and an ACK without ``MSA|AA`` (send_mllp.py exits 0 on a NAK). It counts only
+``IB_Test_ADT`` messages: at PROCESSED within 30 s on the localsystem leg, and at PROCESSED or
+ROUTED on the virtual-account legs. The sample graph archives to a relative ``./out/adt``; the
+service's working folder is the install root, where those accounts get read and execute only,
+so their delivery cannot finish. ROUTED proves only that the router took the message: the read
+cannot tell a pending delivery from a pending transform. Reads go routed, then processed, after
+the processed wait, so a message that moves forward between two reads is still counted. On a
+miss the step prints the listener's messages, so the real disposition is in the log.
+
 The row's unadjudicated item S31-27 (the smoke installs with uv, not the docs' hash-locked
 ``requirements.lock``) is settled by tests/test_windows_lock_install.py, which pins the Windows
 hash-locked install on every pull request; it is not restated here.
@@ -146,8 +158,8 @@ def test_the_old_step_passed_this_case(scenario: dict[str, object], tmp_path: Pa
     ("scenario", "says"),
     [
         (_BAD[0].values[0], "send_mllp.py exited 1"),
-        (_BAD[1].values[0], "carries no MSA|AA"),
-        (_BAD[2].values[0], "did not reach processed or routed"),
+        (_BAD[1].values[0], "no MSA|AA in the ACK"),
+        (_BAD[2].values[0], "no IB_Test_ADT message at the expected status"),
         (_BAD[3].values[0], "with no count"),
     ],
     ids=["send-failed", "nak", "stuck-at-received", "api-refused-the-filtered-read"],

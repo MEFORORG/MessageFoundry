@@ -3324,9 +3324,7 @@ jobs:
           # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
           # diff degrades a path gate into skipping everything while still reading as path-gated,
           # which is the defect this comment exists to stop hiding.
-          # --no-renames: with rename detection on, a rename lists only its NEW path, so `git mv
-          # LICENSE LICENSE.md` would match no `LICENSE$` arm below. Listing both sides of a rename
-          # can only make an arm fire more often, never less (BACKLOG #5472).
+          # --no-renames: both sides of a rename (BACKLOG #5472)
           changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
@@ -3402,14 +3400,10 @@ jobs:
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
-          # The container image smoke runs on PRs that touch the image (docker/, which holds the
-          # per-profile locks), pyproject.toml or requirements.lock, this workflow, an engine module on
-          # the image's start path, or a rig file its steps run. It does NOT run on a PR that touches
-          # only packaging/. ci/locks/release-tools.lock is in because the image's builder stage
-          # installs from it (BACKLOG #1193), so a bump to it can break the image build. README.md,
-          # LICENSE and NOTICE are in because the builder stage COPYs them beside pyproject.toml and
-          # the engine build reads them, so a rename or a removal fails the image build (BACKLOG
-          # #5472). tests/test_ci_docker_gate.py reads the root files the Dockerfile COPYs.
+          # The container image smoke runs on PRs that touch the image, the per-profile locks, pyproject,
+          # this workflow, an engine module on the image's start path, or a rig file its steps run.
+          # ci/locks/release-tools.lock is in because the image's builder stage installs from it
+          # (BACKLOG #1193), so a bump to it can break the image build. #5472: root COPY sources.
           #
           # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
           # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
@@ -3459,17 +3453,8 @@ jobs:
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
-          # ci/locks/release-tools.lock is listed because the job installs `build`, the frontend it
-          # runs, from it (BACKLOG #5472); the hatchling backend comes from pyproject.toml's
-          # [build-system], which is listed already. README.md, CHANGELOG.md, LICENSE and NOTICE are
-          # the root files the engine build reads by name: the sdist's `only-include`, `readme` and
-          # `license-files` in pyproject.toml, so a rename or a removal of one breaks the build or
-          # drops a licence file from it; so does the vendored defusedxml LICENSE, the third
-          # license-files entry. hatch.toml merges over pyproject's [tool.hatch], and
-          # hatchling applies .gitignore as build exclusions. They rarely change, so listing them
-          # costs little. tests/test_ci_packaging_gate.py reads the pyproject inputs and the job's
-          # locks, and fails if one stops tripping this arm.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore)$|messagefoundry/_vendor/defusedxml/LICENSE$|\.github/workflows/(ci|release)\.yml)'; then
+          # BACKLOG #5472: tests/test_ci_packaging_gate.py
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|((README|CHANGELOG)\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore|messagefoundry/_vendor/defusedxml/LICENSE)$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -3528,7 +3513,6 @@ jobs:
           # asserts while matching no other arm here. This lock is listed rather than uv.lock
           # because it is the file the test READS -- uv.lock moves with it in one re-export, but a
           # uv.lock edit that was never exported has not changed the guard's subject.
-          # requirements.lock is listed too, since BACKLOG #5472, for its own reader (below).
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
           # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
@@ -3537,14 +3521,7 @@ jobs:
           # (BACKLOG #5641): tests/test_new_dependency_check.py, a manifest entry, sweeps every
           # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
           # alone must still run this tier.
-          # `.gitleaks.toml`, `.semgrep/`, `.codex/`, `requirements.lock` and the `ci/`, `docker/`
-          # and `security/` lock folders are that shape again (BACKLOG #5472): a manifest entry reads
-          # each from the repository, and none matched an arm here. tests/test_ci_tooling_gate.py
-          # names the reader of each. `uv.lock` stays out: no manifest entry reads it by name, and
-          # that file pins the choice. NOTICE, `.agents/` and the rest of `packaging/` stay out for
-          # the same reason. NOT CLOSED HERE: a listed test that
-          # scans every tracked file, such as tests/test_defaulted_credential_lint.py, reads paths no
-          # arm names, so a PR that touches only those still meets it first on push-to-main.
+          # BACKLOG #5472: tests/test_ci_tooling_gate.py
           if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|(ci|docker|security)/locks/|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.gitleaks\.toml|\.semgrep/|\.codex/|\.pre-commit-config\.yaml|constraints\.lock|requirements\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
@@ -5886,53 +5863,25 @@ jobs:
           # the always-TLS change does not touch it. The /messages read below IS an API call and does;
           # it pins the same minted certificate as the previous step.
           #
-          # THE READ IS SIGNED IN (vault BACKLOG #2719). Each `rigadmin get` first checks that the
-          # service refuses /messages to a request with no session, then signs in as the
-          # Administrator the install step provisioned and asks again until the count reaches 1 or
-          # its timeout ends. It prints the count. It exits 1 when the count never reached 1 and also
-          # when the API answered non-200 (then it prints no count), and 4 when the rig could not
-          # sign in or the service answered /messages with no session. The engine paces sign-ins
-          # per client address, so the reads below are at most three.
-          #
-          # THE SEND AND THE DISPOSITION ARE BOTH CHECKED (BACKLOG #5473). This step used to run
-          # send_mllp.py with no exit check and count `/messages` total, so a failed send passed on
-          # a message from anywhere, and a NAKed or stuck message passed too. A native command's
-          # non-zero exit does not stop a pwsh step unless $PSNativeCommandUseErrorActionPreference
-          # is on, so the exit is read explicitly. send_mllp.py exits 0 on a NAK, so the ACK's
-          # MSA-1 is read too. The count is then taken only for this listener, IB_Test_ADT, and only
-          # at PROCESSED, or, on the legs that cannot deliver, at ROUTED. ROUTED says only that the
-          # router selected a handler: the read cannot tell a pending delivery from a pending
-          # transform, so on those legs this proves the message got past the router, no further.
-          # Anything else fails. The sample graph archives to a relative ./out/adt, and the
-          # service's working folder is the administrator-only install root: the same graph's
-          # relative inbound folders are refused there at start on the virtual-account legs, so
-          # their delivery may still be retrying when the step reads. The localsystem leg can write
-          # there and must reach PROCESSED. Reads go routed, then processed, after the processed
-          # wait, so a message that moves forward between two reads is still counted.
-          # The loop reads rigadmin's exit 1 as "not yet", so a native non-zero exit must not
-          # throw here whatever the runner's pwsh defaults to.
+          # THE READ IS SIGNED IN (vault BACKLOG #2719). #5473: tests/test_ci_windows_smoke_mllp_read.py
           $PSNativeCommandUseErrorActionPreference = $false
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
           $ack = @(& python samples\send_mllp.py samples\messages\adt_a01.hl7)
           $sent = $LASTEXITCODE
           $ack
-          if ($sent -ne 0) { throw "send_mllp.py exited $sent, so the MLLP send failed" }
-          if (-not @($ack | Where-Object { $_ -match '^MSA\|AA\|' })) { throw "the listener did not accept the message: its ACK carries no MSA|AA" }
+          if ($sent -ne 0) { throw "send_mllp.py exited $sent" }
+          if (-not @($ack | Where-Object { $_ -match '^MSA\|AA\|' })) { throw "no MSA|AA in the ACK" }
           $base = "/messages?channel_id=IB_Test_ADT"
-          # Assigned in each branch: an `if` used as a value unrolls the one-read list into its items.
           if ($env:SMOKE_ACCOUNT -eq "localsystem") { $reads = @(, @("processed", 30)) } else { $reads = @(@("processed", 10), @("routed", 10), @("processed", 0)) }
-          $found = $null
           foreach ($read in $reads) {
             $count = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout $read[1] "$base&status=$($read[0])"
             $rc = $LASTEXITCODE
-            if ($rc -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
             if ($rc -eq 0) { $found = $read[0]; break }
-            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc reading $base&status=$($read[0]) with no count: the API refused the read or answered without an integer total, its own line above says which" }
+            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc with no count (4: could not sign in)" }
           }
           if (-not $found) {
-            # Name the real disposition: this job runs where nobody can rerun it by hand.
             & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert $base
-            throw "the message from IB_Test_ADT did not reach $(($reads | ForEach-Object { $_[0] } | Select-Object -Unique) -join ' or ') ($env:SMOKE_ACCOUNT leg); the listing above shows its status"
+            throw "no IB_Test_ADT message at the expected status"
           }
           "IB_Test_ADT messages $found = $count"
 
