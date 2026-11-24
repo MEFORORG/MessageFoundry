@@ -135,9 +135,12 @@ function Test-StashListed([string]$Id) {
 }
 
 # The command an operator pastes to drop a listed entry. git stash drop takes a POSITION, so the command
-# re-finds it by SHA at the moment it runs, and drops nothing when the SHA is no longer listed.
+# re-finds it by SHA when it runs and checks that position still holds the SHA just before the drop. Like
+# Remove-OwnStashEntry, it cannot close the gap between that check and the drop itself.
 function Get-DropBySha([string]$Id) {
-    "`$n = @(git -C `"$RepoRoot`" stash list --format=%H).IndexOf('$Id'); if (`$n -ge 0) { git -C `"$RepoRoot`" stash drop `"stash@{`$n}`" }"
+    ("`$n = @(git -C `"$RepoRoot`" stash list --format=%H).IndexOf('$Id'); " +
+        "if (`$n -ge 0 -and (git -C `"$RepoRoot`" rev-parse `"stash@{`$n}`") -eq '$Id') { git -C `"$RepoRoot`" stash drop `"stash@{`$n}`" } " +
+        "else { Write-Host 'Not dropped: that SHA is not listed at the position just found; re-run to re-find it.' }")
 }
 
 # Say where this run's entry is after a drop that did not remove it. A shifted position means some other

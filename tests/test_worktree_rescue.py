@@ -363,7 +363,7 @@ def test_a_failed_own_drop_is_reported_with_a_drop_command_that_works(tmp_path: 
     assert f"Stash commit {own} is still on the shared stash list" in out, out
     assert "stays on the stash list as a spare copy" in out, out
     # The printed command re-finds the position by SHA and drops only that entry.
-    found = re.search(r'\$n = @\(git .*?stash drop "stash@\{\$n\}" \}', out)
+    found = re.search(r"\$n = @\(git .*?re-run to re-find it\.' \}", out)
     assert found, out
     command = found.group(0)
     assert own in command, command
