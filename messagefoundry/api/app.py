@@ -67,7 +67,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
-from pydantic import PrivateAttr
+from pydantic import PrivateAttr, TypeAdapter, ValidationError
 from starlette.datastructures import MutableHeaders
 from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -269,11 +269,14 @@ from messagefoundry.api.security import (
     pending_credential_deadline,
     public_route,
     quiet_deliberate_export_stops,
+    raise_deferred_monitoring_refusal,
     recheck_standing,
     recheck_standing_or_refusal,
+    record_deferred_monitoring_refusal,
     refuse_from_new_address,
     refuse_undeclared_route,
     require,
+    require_monitoring_read,
     require_paced,
     require_phi_read,
     require_service_cert,
@@ -619,6 +622,22 @@ _MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
 _WS_FRAME_SECONDS = 1.0  # one /ws/stats frame this often; the caller is re-resolved before each
+
+
+_CONNECTION_NAME_ADAPTER: TypeAdapter[str] = TypeAdapter(ConnectionName)
+
+
+def _valid_connection_name(value: str) -> bool:
+    """Whether ``value`` passes the ``ConnectionName`` rule the ``reveal`` query is validated by.
+    ``GET /connections`` defers its monitoring-read 429 only for a valid reveal, so a request that
+    will fail validation is refused, and recorded, at the gate (vault BACKLOG #1191)."""
+    try:
+        _CONNECTION_NAME_ADAPTER.validate_python(value)
+    except ValidationError:
+        return False
+    return True
+
+
 #: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
 #: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
 #: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
@@ -5798,7 +5817,13 @@ def create_app(
     async def list_connections(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(
+            require_monitoring_read(
+                Permission.MONITORING_READ,
+                defer_when_query="reveal",
+                defer_value_valid=_valid_connection_name,
+            )
+        ),
         # Annotated rather than ``= Query(None)``, for the reason get_message gives: the web console
         # calls this handler in-process, and a call that leaves it out must get None.
         reveal: Annotated[ConnectionName | None, Query()] = None,
@@ -5816,10 +5841,21 @@ def create_app(
         # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
         # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
         # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        # behind a 429. For that reason the gate holds a monitoring-read 429 on a valid reveal, and
+        # it is raised here, after this check and the reveal's own refusals (its permission, the
+        # serve hop and the new address), and each is answered as before pacing. With the budget
+        # spent none of them writes the monitoring:read grant row main wrote: the scope and
+        # permission refusals write only their denial row (owner ruling 2026-11-23). The hop and
+        # new-address refusals also record the held decision, through _refuse_reveal_phi_read,
+        # because the hop refusal writes no row of its own and a repeated new-address row is
+        # deduped (vault BACKLOG #1191). A scoped caller's dashboard carries no outbound rows at
+        # all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
-        await _admit_reveal(request, identity, reveal)
+            await _refuse_reveal(request, identity)
+        await raise_deferred_monitoring_refusal(request)
+        if reveal is not None:
+            _charge_reveal(request, identity)
         out = await _dashboard_rows(engine, identity, reveal=reveal)
         if reveal is not None:
             # The audit records what the response carried, not what was asked for: an in-scope
@@ -5875,7 +5911,8 @@ def create_app(
     ) -> list[ConnectionRow]:
         """The dashboard rows, channel-scoped, with ``error`` gated and masked on every row and
         lifted on the rows of the ONE connection ``reveal`` names (BACKLOG #2443). The caller has
-        already passed :func:`_admit_reveal` for any ``reveal``; the stats socket passes none."""
+        already passed :func:`_refuse_reveal` and :func:`_charge_reveal` for any ``reveal``; the
+        stats socket passes none."""
         rows = await _connection_rows(engine, identity)
         if reveal is None:  # the stats socket, every second, and every bare load
             return [redact_unauthorized(r, identity) for r in rows]
@@ -6856,23 +6893,9 @@ def create_app(
             reason=e.reason,
         )
 
-    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
-        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
-
-        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
-        A reveal hands out one reason or one connection's error whole, which is
-        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
-        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
-        ``GET /connections/{name}/metadata``. A caller without that permission is refused,
-        and the refusal is audited as
-        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
-        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
-        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
-        through ``require_ui(..., phi=True)`` before
-        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
-        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
-        if reveal is None:
-            return
+    async def _refuse_reveal_without_view_summary(request: Request, identity: Identity) -> None:
+        """Refuse a reveal from a caller without ``messages:view_summary``, audited as
+        ``auth.permission_denied`` (the permission half of :func:`_admit_reveal`)."""
         if not identity.has(Permission.MESSAGES_VIEW_SUMMARY):
             auth = get_auth(request)
             if auth is not None:
@@ -6883,11 +6906,64 @@ def create_app(
                     client=client_ip(request),
                 )
             raise HTTPException(403, "a reveal needs messages:view_summary")
-        if not (_matched_route_path(request) or "").startswith("/ui/"):
+
+    async def _admit_reveal(request: Request, identity: Identity, reveal: int | str | None) -> None:
+        """The gate a ``reveal`` request adds on top of its list route's ``monitoring:*`` gate.
+
+        Called at ADMISSION, before the route reads the store, as ``require_phi_read`` would be.
+        A reveal hands out one reason or one connection's error whole, which is
+        ``messages:view_summary`` data (BACKLOG #2443). ``reveal`` is an event or alert id, or a
+        connection name on ``GET /connections`` and, for its ``reveal=true`` flag, on
+        ``GET /connections/{name}/metadata``. ``GET /connections`` does not call this: it calls
+        :func:`_refuse_reveal`, then raises any held monitoring-read 429, then
+        :func:`_charge_reveal`. A caller without that permission is refused,
+        and the refusal is audited as
+        ``auth.permission_denied`` like every other one (ASVS 16.3.2). Over HTTP the reveal is
+        also a PHI read: it takes the serve-hop refusal, the new-address refusal (vault BACKLOG
+        #2620) and the per-actor PHI budget. The web console's reveal routes already took all three
+        through ``require_ui(..., phi=True)`` before
+        calling in-process, so a ``/ui`` route is not charged twice. That skip reads the matched
+        route, so a future ``/ui`` route passing ``reveal`` must carry ``phi=True`` itself."""
+        if reveal is None:
+            return
+        await _refuse_reveal(request, identity)
+        _charge_reveal(request, identity)
+
+    def _reveal_over_http(request: Request) -> bool:
+        """Whether a reveal came over HTTP rather than from a ``/ui`` route calling in process,
+        which took the hop, new-address and budget checks in ``require_ui(..., phi=True)``."""
+        return not (_matched_route_path(request) or "").startswith("/ui/")
+
+    async def _refuse_reveal(request: Request, identity: Identity) -> None:
+        """The refusals of :func:`_admit_reveal`, without its PHI-read charge, so ``GET
+        /connections`` can answer them before a held monitoring-read 429."""
+        await _refuse_reveal_without_view_summary(request, identity)
+        await _refuse_reveal_phi_read(request)
+
+    async def _refuse_reveal_phi_read(request: Request) -> None:
+        """The PHI-read refusals of a reveal over HTTP: the serve hop and the new address.
+
+        Where a monitoring-read 429 is held for the request (``GET /connections``), each refusal
+        calls :func:`record_deferred_monitoring_refusal` before it propagates; that function says
+        what it records and when. Elsewhere the call is a no-op."""
+        if not _reveal_over_http(request):
+            return
+        try:
             enforce_phi_read_hop(request)
-            # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
-            # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused, answered_reason="serve_hop")
+            raise
+        # Vault BACKLOG #2620: a PHI read, so it refuses a new address as require_phi_read
+        # does, before the budget. The /ui twins asked in require_ui's phi=True arm.
+        try:
             await refuse_from_new_address(request)
+        except HTTPException as refused:
+            await record_deferred_monitoring_refusal(request, refused)
+            raise
+
+    def _charge_reveal(request: Request, identity: Identity) -> None:
+        """The PHI-read charge of :func:`_admit_reveal`, run after :func:`_refuse_reveal`."""
+        if _reveal_over_http(request):
             enforce_phi_read_pacing(request, identity)
 
     async def _redact_reasons(
@@ -10509,7 +10585,7 @@ def create_app(
     @app.get("/stats", response_model=StatsResponse)
     async def stats(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> StatsResponse:
         # B11 (read-only, additive): the runner's empty-claim counters (idle-poll vs wake-fanout herd)
         # for the connection-scale harness. Default-zero when no runner is attached (graph-less engine).
@@ -10547,7 +10623,7 @@ def create_app(
     @app.get("/metrics")
     async def metrics_endpoint(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> Response:
         """Prometheus exposition (text/plain). Gated by monitoring:read like /stats — a scraper
         authenticates with a service token. Contains only aggregate counts/latency keyed by
@@ -10557,7 +10633,7 @@ def create_app(
     @app.get("/metrics/history", response_model=MetricsHistoryResponse)
     async def metrics_history(
         request: Request,
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> MetricsHistoryResponse:
         """The in-memory metrics-history ring for the console trend charts (BACKLOG #76, ADR 0065
         amendment). Oldest-first samples of the outbound-row-by-status counts, fed by the ~1s /ws/stats
@@ -10577,7 +10653,7 @@ def create_app(
     @app.get("/graph/edges", response_model=GraphResponse)
     async def graph_edges(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+        identity: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> GraphResponse:
         """The by-name data-flow graph (BACKLOG #76, ADR 0065 amendment): the **static Registry edge
         set** (:func:`messagefoundry.config.graph.build_wiring_graph` — the same inbound → router →
@@ -10842,7 +10918,7 @@ def create_app(
     async def system_status(
         request: Request,
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+        _user: Identity = Depends(require_monitoring_read(Permission.MONITORING_READ)),
     ) -> SystemStatus:
         now = time.time()
         total = running = 0
