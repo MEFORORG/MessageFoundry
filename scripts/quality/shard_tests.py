@@ -16,9 +16,10 @@ The file set is pytest's own: `testpaths` from pyproject.toml, its default `test
 `*_test.py` patterns, and its default `norecursedirs`. tests/test_quality_shard_tests.py holds
 the partition to that set, so a file pytest collects can never fall between two shards.
 
-TOOLING FILES ARE LEFT OUT. The coverage step deselects them with `-m 'not tooling'`, so a shard
-that held one would import and collect it for nothing, and the balance would count files that do
-not run. The list is tests/tooling_manifest.txt, read through its own parser.
+TOOLING FILES ARE LEFT OUT, by every suite but `--suite tooling`. The coverage step deselects them
+with `-m 'not tooling'`, so a shard that held one would import and collect it for nothing, and the
+balance would count files that do not run. The list is tests/tooling_manifest.txt, read through its
+own parser.
 
 `--suite engine` IS ci.yml's ENGINE `Tests (pytest)` STEP, split across the `test` job and the
 `test-shards` job's matrix (BACKLOG #5247). It differs from the coverage split in two ways, both constants
@@ -26,6 +27,16 @@ below. It leaves out the web console package, which that step subtracts with `--
 because the `webconsole` job runs it (BACKLOG #1027), so a shard naming one of its files would run
 it twice. And it holds the connscale smoke in shard 1, because scripts/connscale_harvest.py joins
 the smoke's readings to the `test (...)` jobs, and the herd floor is armed only there.
+
+`--suite tooling` IS ci.yml's `tooling` JOB, THE REPO HARNESS TIER, split across its windows-2025
+legs (owner ruling 2026-11-24). It is the complement of the other two: exactly the files
+tests/tooling_manifest.txt names, and nothing else. Its hash is SALTED, `crc32("<salt>:<path>")`,
+for a measured reason. On the windows-2025 junit of CI run 45415735678 the tier was 263 files of
+uneven cost, the largest about 6 percent of the tier on its own, and the unsalted hash split it
+3997 / 6900 / 4517 seconds of test time, one shard 34 percent over the mean. A salt is still a pure
+function of the path, so it keeps the two properties this docstring opens with: every shard
+computes the same split alone, and no file moves when another is added. `TOOLING_SALT` below says
+how it was chosen and when to choose again.
 
 `--check-collection` IS THE PARTITION GUARD, and it reads pytest's own collection rather than this
 file's re-implementation of it. The arguments after `--` are the step's selection. It runs
@@ -59,6 +70,16 @@ _NORECURSE = ("*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "
 ENGINE_EXCLUDE_GLOB = "*messagefoundry-webconsole*"
 #: Held in shard 1 of the engine suite whatever their hash. The module docstring says why.
 ENGINE_SUITE_SHARD_ONE = frozenset({"tests/test_connscale_smoke.py"})
+
+#: The `--suite tooling` salt. It is the smallest non-negative integer that puts every one of the
+#: 3 shards within 5 percent of the mean on the windows-2025 tooling junit of CI run 45415735678
+#: (job 138521635567): 4883 / 5208 / 5323 seconds of test time against a mean of 5138. About a
+#: quarter of salts land within 15 percent on that junit, so the unsalted split was not unlucky,
+#: only ordinary. A file added later lands by its own hash and moves nothing, so the balance drifts
+#: as the tier grows rather than jumping. RE-PICK IT when a shard's junit test-time sum is observed
+#: more than 15 percent off the mean of the three, by the same search over a fresh junit; a re-pick
+#: moves files between shards, which costs nothing but a cold read of the next run's balance.
+TOOLING_SALT = "9"
 
 #: A node id's file, as `pytest --collect-only -q` prints it. A warnings-summary line is either
 #: indented or reads `path:line`, so neither matches.
@@ -102,7 +123,12 @@ def shard_of(path: str, shards: int) -> int:
 
 
 def assign(path: str, shards: int, suite: str) -> int | None:
-    """The shard `suite` puts `path` in, or `None` when that suite does not run the file."""
+    """The shard `suite` puts `path` in, or `None` when that suite does not run the file.
+
+    Tooling membership is not decided here: `partition` hands a tooling suite only manifest files
+    and every other suite none, so this only places a file the suite already runs."""
+    if suite == "tooling":
+        return shard_of(f"{TOOLING_SALT}:{path}", shards)
     if suite == "engine":
         if fnmatch.fnmatch(path, ENGINE_EXCLUDE_GLOB):
             return None
@@ -112,11 +138,13 @@ def assign(path: str, shards: int, suite: str) -> int | None:
 
 
 def partition(shards: int, suite: str, root: Path = _ROOT) -> dict[int, list[str]]:
-    """Every shard's files, keyed 1..shards, with the tooling files left out."""
+    """Every shard's files, keyed 1..shards: only the tooling files for `--suite tooling`, and the
+    tooling files left out for every other suite."""
     tooling = tooling_files(root)
     split: dict[int, list[str]] = {n: [] for n in range(1, shards + 1)}
     for path in collected_files(root):
-        shard = None if path in tooling else assign(path, shards, suite)
+        runs = (path in tooling) == (suite == "tooling")
+        shard = assign(path, shards, suite) if runs else None
         if shard is not None:
             split[shard].append(path)
     return split
@@ -226,7 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--shard", type=int, help="1-based shard index")
     parser.add_argument("--of", type=int, required=True, dest="shards", help="shard count")
-    parser.add_argument("--suite", choices=("coverage", "engine"), default="coverage")
+    parser.add_argument("--suite", choices=("coverage", "engine", "tooling"), default="coverage")
     parser.add_argument(
         "--check-collection",
         action="store_true",
