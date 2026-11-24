@@ -25,8 +25,10 @@ contract under test is the one Claude Code actually invokes.
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -889,18 +891,177 @@ def _guard_seconds(command: str) -> float:
     return time.monotonic() - started
 
 
+# THE SCALING CHECK TIMES THE SCAN INSIDE pwsh, NOT THE PROCESS AROUND IT. It once timed two whole
+# hook processes, one each at 3,000 and 6,000 sites, against `full < 3 * half + 3`. A hosted
+# windows-2025 runner read 2.45 s and then 22.06 s, about nine times the time for twice the input,
+# on a guard that reads about 4x for 4x in-process. The cause on the runner is inferred, not
+# measured: two single wall-clock samples, each with a cold pwsh start, cannot tell a loaded runner
+# from a quadratic reader. So one driver process calls the guard file in-process,
+# the way `_BATCH_DRIVER` in tests/test_blanket_stage_guard.py does and for its reason, reads the
+# process CPU clock and a Stopwatch around the `&` alone, and returns both. Process start and pipe
+# latency fall outside every sample.
+_TIMING_DRIVER = r"""
+$job = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$script = [string]$job.script
+$realIn = [Console]::In
+$realOut = [Console]::Out
+$self = [Diagnostics.Process]::GetCurrentProcess()
+$readings = New-Object 'System.Collections.Generic.List[object]'
+# The first call compiles the script file, so it is run once untimed.
+foreach ($i in @([int]$job.order[0]) + @($job.order | ForEach-Object { [int]$_ })) {
+    $w = New-Object System.IO.StringWriter
+    [GC]::Collect()
+    [GC]::WaitForPendingFinalizers()
+    [Console]::SetIn((New-Object System.IO.StringReader ([string]$job.payloads[$i])))
+    [Console]::SetOut($w)
+    $cpu = $self.TotalProcessorTime
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try { & $script } finally {
+        $sw.Stop(); $cpu = $self.TotalProcessorTime - $cpu
+        [Console]::SetOut($realOut); [Console]::SetIn($realIn)
+    }
+    if ($LASTEXITCODE -ne 0) { throw "the script exited $LASTEXITCODE" }
+    $readings.Add(@{
+        index = $i; cpu = $cpu.TotalSeconds; wall = $sw.Elapsed.TotalSeconds; output = $w.ToString()
+    })
+}
+$readings.RemoveAt(0)
+[Console]::Out.Write((ConvertTo-Json -InputObject $readings.ToArray() -Compress -Depth 3))
+"""
+
+#: Four times the sites must take under this many times as long. The guard read 3.25 to 5.70 here
+#: locally on the CPU clock under load, and a quadratic reader tends to 16; tests/test_ad_group_dn_only.py uses the same line.
+_MAX_LINEAR_RATIO = 8.0
+
+#: Under this, the large input took barely longer than the small one, so the timed call did not do
+#: the per-site work at all, for example because the payload stopped reaching the masker.
+_MIN_WORKING_RATIO = 2.0
+
+#: The small input's site count; the large one has four times as many. THE SIZE SETS WHICH DEFECT
+#: THE RATIO CAN SEE, so it was not cut to save time. A forward scan from every site to the end of
+#: the command costs about c * 4.5 * k**2 seconds at k nine-character sites, c being its cost per
+#: character, on top of a linear reading of about a * k, so it reads over the line only once that
+#: passes about half the linear time. A ratio check is blind to a quadratic cheaper than that, at
+#: any size it can afford. Measured locally, 2026-11-24, by putting such a scan back into the guard
+#: at its `((` frame: one that takes a one-character substring at every fifth character failed
+#: here, at 11.6x or more on both clocks, and failed the old `3 * half + 3` bound at 3,000 and
+#: 6,000 sites too. One that counts parens per character read 6.98x on the CPU clock and 9.19x or
+#: more on the wall clock, so it sits at this line, and it passed the old bound. A bare compare per
+#: character passed both.
+_SITES = 600
+
+
+def _arithmetic_run(sites: int) -> str:
+    return json.dumps(bash('echo "find"; ' + "(( 1 )); " * sites))
+
+
+def _in_process_readings(
+    script: Path, payloads: list[str], order: list[int]
+) -> list[dict[str, Any]]:
+    """One reading per call of ``script`` on ``payloads[i]``, for each ``i`` in ``order``, timed
+    inside one pwsh process: ``cpu`` and ``wall`` seconds. Every call must allow, as the measured
+    commands walk nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        driver = Path(tmp) / "time.ps1"
+        driver.write_text(_TIMING_DRIVER, encoding="utf-8")
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(driver)],
+            input=json.dumps({"script": str(script), "payloads": payloads, "order": order}),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    assert proc.returncode == 0, f"timing driver exited {proc.returncode}: {proc.stderr}"
+    readings: list[dict[str, Any]] = json.loads(proc.stdout)
+    assert [r["index"] for r in readings] == order
+    assert all(not r["output"].strip() for r in readings), readings[0]["output"]
+    return readings
+
+
+def _attempt_ratio(script: Path, small: str, large: str, *, rounds: int = 2) -> tuple[float, float]:
+    """The cheapest large call over the cheapest small call, from ``rounds`` rounds in one process,
+    on the process CPU clock and then on the wall clock. Which size goes first is drawn per round
+    from an unseeded generator, as :func:`tests._growth._growth_between` says why. Each call here
+    runs for a tenth of a second or more, so the short-window repeats that helper adds are not
+    needed.
+
+    THE VERDICT IS THE CPU READING. On a 32-core machine at 100 percent load, the wall reading of
+    the guard fell to 1.29x for 4x the sites and the control's to 2.03x, and on the CPU clock they
+    read 3.25x to 5.70x and 10.00x or more on the same machine. The cause is inferred, not
+    measured: a host that takes the core away mid-call charges a wall clock and not this one. The
+    wall reading is kept for the failure message only."""
+    draw = random.Random()
+    order = [i for _ in range(rounds) for i in draw.sample((0, 1), 2)]
+    readings = _in_process_readings(script, [small, large], order)
+
+    def ratio(clock: str) -> float:
+        best = [min(r[clock] for r in readings if r["index"] == size) for size in (0, 1)]
+        return float(best[1] / best[0])
+
+    return ratio("cpu"), ratio("wall")
+
+
+def _scaling_ratios(script: Path, k: int) -> tuple[list[float], str]:
+    """One CPU reading of :func:`_attempt_ratio` per attempt, at ``k`` and ``4 * k`` sites, and a
+    record of every attempt on both clocks. A reading at or over the line is taken again, up to
+    three attempts, so one stretch of load cannot fake a curve; the lowest is the verdict. The
+    linear check and its control run this one rule, so a reader fails the check only if every
+    attempt reads over the line, which is what the control must show
+    (tests/test_ad_group_dn_only.py,
+    ``test_the_quadratic_control_passes_only_when_every_attempt_reads_over_the_line``)."""
+    small, large = _arithmetic_run(k), _arithmetic_run(4 * k)
+    readings: list[float] = []
+    record: list[str] = []
+    for _ in range(3):
+        cpu, wall = _attempt_ratio(script, small, large)
+        readings.append(cpu)
+        record.append(f"{cpu:.2f}x cpu / {wall:.2f}x wall")
+        if cpu < _MAX_LINEAR_RATIO:
+            break
+    return readings, "attempts: " + ", ".join(record)
+
+
 def test_many_arithmetic_commands_are_read_in_linear_time() -> None:
-    """Doubling the `(( 1 ))` sites must not quadruple the time.
+    """Four times the `(( 1 ))` sites must not take sixteen times as long.
 
     Every site takes the refined view's `((` frame, because the quote in `"find"` sends the command
     through the masker. An earlier cut scanned forward from every `((`, and a long run took about
-    98 seconds, past the hook timeout, and a timed-out hook lets the command run. The bound allows
-    for the fixed cost of starting pwsh, which both runs pay, and is loose because both runs are
-    wall-clock timings.
-    """
-    half = _guard_seconds('echo "find"; ' + "(( 1 )); " * 3000)
-    full = _guard_seconds('echo "find"; ' + "(( 1 )); " * 6000)
-    assert full < 3 * half + 3
+    98 seconds, past the hook timeout, and a timed-out hook lets the command run. The ratio is of
+    in-process CPU times, as `_TIMING_DRIVER` and `_attempt_ratio` say why, and `_SITES` says which forward scans it
+    catches."""
+    readings, record = _scaling_ratios(GUARD, _SITES)
+    ratio = min(readings)
+    assert ratio < _MAX_LINEAR_RATIO, f"4x the sites took {ratio:.2f}x the time ({record})"
+    assert ratio >= _MIN_WORKING_RATIO, (
+        f"4x the sites took only {ratio:.2f}x the time, so the timed call did no per-site work"
+        f" ({record})"
+    )
+
+
+# The control's subject: it does what the earlier cut did, a walk forward from every `((` site over
+# the rest of the command, and none of the guard's linear reading. So its time grows with the
+# square of the sites, and it reads the same payloads through the same driver.
+_QUADRATIC_STAND_IN = r"""
+$cmd = [string](([Console]::In.ReadToEnd() | ConvertFrom-Json).tool_input.command)
+$walked = 0
+foreach ($site in [regex]::Matches($cmd, '\(\(')) {
+    for ($j = $site.Index + 2; $j -lt $cmd.Length; $j += 3) { if ($cmd[$j] -ceq ')') { $walked++ } }
+}
+exit 0
+"""
+
+
+def test_the_linear_time_check_fails_a_forward_scan_from_every_site() -> None:
+    """Control: the check must fail a quadratic reader, or its pass above proves nothing. It asserts
+    the negation of the linear check's pass condition, over every attempt, at the same sizes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        stand_in = Path(tmp) / "quadratic.ps1"
+        stand_in.write_text(_QUADRATIC_STAND_IN, encoding="utf-8")
+        readings, record = _scaling_ratios(stand_in, _SITES)
+    ratio = min(readings)
+    assert len(readings) == 3 and ratio >= _MAX_LINEAR_RATIO, (
+        f"a quadratic reader scaled by only {ratio:.2f}x ({record})"
+    )
 
 
 def test_deeply_nested_arithmetic_is_read_in_bounded_time() -> None:
