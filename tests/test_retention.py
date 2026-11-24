@@ -1827,13 +1827,20 @@ async def test_app_log_compression_survives_a_racing_rewrite_of_the_staging_file
     assert result.app_logs_compressed == 0  # and it is not reported as compressed
 
 
-_CHANGES = ["append", "replace", "replace_same_size", "rewrite_same_size"]
+_CHANGES = [
+    "append",
+    "replace",
+    "replace_same_size",
+    "rewrite_same_size",
+    "rewrite_same_size_same_mtime",
+]
 
 
 def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> bytes:
     """Change ``old_log`` the way ``change`` names and return what it should then hold. Every case but
-    ``rewrite_same_size`` puts the old mtime back, so the size or the file id must betray it; the
-    ``*_same_size`` cases keep the size, so only the file id (replace) or the mtime (rewrite) can."""
+    ``rewrite_same_size`` puts the old mtime back, so the size, the file id or the ctime must betray it;
+    the ``*_same_size`` cases keep the size, so only the file id (replace), the mtime (rewrite) or the
+    ctime alone (rewrite with the mtime put back) can."""
     body = old_log.read_bytes()
     if change == "append":
         with open(old_log, "ab") as fh:
@@ -1845,11 +1852,14 @@ def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> by
         rotated.write_bytes(expected)
         os.replace(rotated, old_log)
     else:
+        # Past a coarse ctime tick (Linux stamps ctime from a jiffy clock), so the rewrite's ctime is new.
+        time.sleep(0.05)
         expected = b"W" * len(body)
         with open(old_log, "r+b") as fh:
             fh.write(expected)
-        os.utime(old_log, (old + 1, old + 1))
-        return expected
+        if change == "rewrite_same_size":
+            os.utime(old_log, (old + 1, old + 1))
+            return expected
     os.utime(old_log, (old, old))
     return expected
 
@@ -1966,8 +1976,41 @@ async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read
 
     assert old_log.read_bytes() == fresh
     assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))  # rejected before anything was staged
     assert result.app_logs_compressed == 0
-    assert "changed while being read" in caplog.text
+
+
+async def test_app_log_compression_reports_a_source_that_vanished_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A source removed (by a peer compressor, say) after the archive was placed keeps the archive and
+    is reported as vanished, not as kept (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_remove(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp"):
+            old_log.unlink()
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_remove)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
+    assert result.app_logs_compressed == 0
+    assert "vanished after its archive was placed" in caplog.text
 
 
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(
