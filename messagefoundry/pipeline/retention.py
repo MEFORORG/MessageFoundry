@@ -398,9 +398,10 @@ class RetentionRunner:
         # Default to the logging sink so an over-limit store is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
-        # A monotonic clock for the #121 between-phase duration cap — SEPARATE from `clock` (which is the
-        # wall clock feeding the retention *window* cutoffs and is often frozen in tests). Measuring
-        # elapsed pass time against a frozen window clock would never advance; monotonic can't go backwards.
+        # A monotonic clock for the #121 between-phase duration cap and the WAL truncate cadence
+        # (BACKLOG #6526) — SEPARATE from `clock` (which is the wall clock feeding the retention
+        # *window* cutoffs and is often frozen in tests). Measuring elapsed time against a frozen or
+        # stepped window clock would stall or run backward; monotonic can't go backwards.
         self._monotonic = monotonic
         # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
         # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
@@ -408,8 +409,10 @@ class RetentionRunner:
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        # Maintenance cadence state (loop-driven; only read/written on the single task).
-        self._last_wal = 0.0
+        # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
+        # marker is a `monotonic` reading, None until the first truncate, so a wall-clock step
+        # backward cannot hold the truncate past its cadence (BACKLOG #6526).
+        self._last_wal: float | None = None
         self._last_vacuum_day: str | None = None
 
     @property
@@ -777,16 +780,17 @@ class RetentionRunner:
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
         wal_left_untruncated = False
-        if (
-            not _deadline_hit()
-            and self._wal_truncate_applies()
-            and now - self._last_wal >= s.wal_checkpoint_seconds
+        # The cadence reads the monotonic clock, not `now`: `now` is the wall clock (or a caller's
+        # window instant), and a backward step there would hold the truncate past its cadence.
+        wal_at = self._monotonic() if not _deadline_hit() and self._wal_truncate_applies() else None
+        if wal_at is not None and (
+            self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds
         ):
             # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies` skips.
             wal_left_untruncated = await self._store.wal_checkpoint() is False
             # The marker advances either way, so a reader that pins the WAL costs writers one busy
             # timeout per cadence rather than one per pass.
-            self._last_wal = now
+            self._last_wal = wal_at
             wal_checkpointed = True
             if wal_left_untruncated:
                 # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the file

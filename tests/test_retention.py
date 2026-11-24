@@ -830,6 +830,37 @@ async def test_a_purge_pass_with_no_truncate_records_null_not_false(store: Messa
     assert [json.loads(r["detail"])["wal_left_untruncated"] for r in audit] == [None]
 
 
+async def test_wal_cadence_survives_a_backward_wall_clock_step(store: MessageStore) -> None:
+    """The WAL truncate cadence runs on the monotonic clock, not the wall clock (BACKLOG #6526).
+    The wall clock steps back a day between passes while monotonic time moves forward past the
+    cadence, and the second pass still truncates. On the wall clock it would wait out the step
+    plus the cadence. The control is a monotonic advance short of the cadence, which does not."""
+    wall = {"t": 30 * DAY}
+    mono = {"t": 500.0}
+    runner = RetentionRunner(
+        store,
+        RetentionSettings(wal_checkpoint_seconds=3600),
+        clock=lambda: wall["t"],
+        monotonic=lambda: mono["t"],
+    )
+    assert (await runner.run_once()).wal_checkpointed is True  # never run yet, so due at once
+    wall["t"] -= DAY
+    mono["t"] += 3599.0
+    assert (await runner.run_once()).wal_checkpointed is False  # the control: not yet due
+    mono["t"] += 1.0
+    assert (await runner.run_once()).wal_checkpointed is True
+
+
+async def test_wal_cadence_ignores_an_explicit_now(store: MessageStore) -> None:
+    """``run_once(now=...)`` sets the retention windows, not the WAL cadence: two passes at the same
+    monotonic instant truncate once, whatever ``now`` each is handed."""
+    runner = RetentionRunner(
+        store, RetentionSettings(wal_checkpoint_seconds=3600), monotonic=lambda: 10.0
+    )
+    assert (await runner.run_once(now=30 * DAY)).wal_checkpointed is True
+    assert (await runner.run_once(now=40 * DAY)).wal_checkpointed is False
+
+
 # --- RetentionRunner ----------------------------------------------------------
 
 
@@ -1074,7 +1105,7 @@ async def test_run_once_cap_skips_phase_after_deadline(store: MessageStore, monk
     result = await runner.run_once()
 
     assert result.wal_checkpointed is True  # ran before the deadline was hit
-    assert runner._last_wal == now  # the phase that RAN advanced its marker
+    assert runner._last_wal == 0.0  # the phase that RAN advanced its (monotonic) marker
     assert result.capped is True  # the pass hit the cap after WAL
     assert result.vacuumed is False  # the DUE vacuum was skipped by the cap
     assert vacuum_calls == 0  # ...and never even started
