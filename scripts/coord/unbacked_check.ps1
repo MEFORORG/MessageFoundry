@@ -527,6 +527,7 @@ foreach ($p in $Path) {
         [pscustomobject]@{ Oid = $oid; Name = $name }
     })
     $findings = @()
+    $atRiskOids = @()
 
     # DETACHED WORKTREE HEADS. A worktree checked out on a branch is already covered by the ref scan
     # above; one with a detached HEAD is on no branch and no ref scan can reach it. Enumerate the
@@ -541,6 +542,8 @@ foreach ($p in $Path) {
         if ($line -match '^worktree (.+)$') { $wtHeads += $Matches[1] }
     }
     $detached = @()
+    $detachedOids = @()
+    $detachedUnresolved = 0
     $dirty = @()
     foreach ($wp in $wtHeads) {
         $native = $wp -replace '/', '\'
@@ -567,6 +570,8 @@ foreach ($p in $Path) {
         }
         $dn = $res.Lines | Select-Object -First 1
         if ($dn -and [int]$dn -gt 0) {
+            $full = (Invoke-Git -Repo $native -GitArgs @('rev-parse', 'HEAD')).Lines | Select-Object -First 1
+            if ($full -match '^[0-9a-f]{40,64}$') { $detachedOids += $full } else { $detachedUnresolved += [int]$dn }
             $detached += [pscustomobject]@{
                 Worktree = $native
                 Head     = (& $gitExe -C $native rev-parse --short HEAD 2>$null)
@@ -628,11 +633,27 @@ foreach ($p in $Path) {
                 Ref     = $refName
                 Commits = [int]$n
             }
+            $atRiskOids += $ref.Oid
         }
     }
 
-    $sum = ($findings | Measure-Object -Property Commits -Sum).Sum
-    if (-not $sum) { $sum = 0 }
+    # Branch AND detached-HEAD commits, so this repository's figure agrees with CommitsUnbacked and
+    # the NO-REMOTE and UNVERIFIABLE lines do not leave out a detached checkout's work (BACKLOG #6489
+    # item 1). The detached share is the distinct commits no at-risk branch already counts: a HEAD
+    # detached on a branch's history would otherwise count that history twice. If that count cannot
+    # be read, each detached HEAD's own count is added instead -- too high, never too low.
+    $detachedSum = $detachedUnresolved
+    if ($detachedOids.Count -gt 0) {
+        $tipText = $excludeText
+        if ($atRiskOids.Count -gt 0) { $tipText += (($atRiskOids | ForEach-Object { "^$_" }) -join "`n") + "`n" }
+        $res = Invoke-RevList -Repo $p -RevArgs (@('--count') + $detachedOids) -NotArgs $notArgs -ExcludeText $tipText
+        if ($res.Ok -and $res.Lines) {
+            $detachedSum += [int]$res.Lines[0]
+        } else {
+            $detachedSum = [int](($detached | Measure-Object -Property Commits -Sum).Sum)
+        }
+    }
+    $sum = [int](($findings | Measure-Object -Property Commits -Sum).Sum) + $detachedSum
 
     $repos += [pscustomobject]@{
         Repo                = $p
@@ -664,7 +685,6 @@ foreach ($p in $Path) {
     $totalUnbacked += $findings.Count
     $totalCommits += $sum
     $totalDetached += $detached.Count
-    $totalCommits += (($detached | Measure-Object -Property Commits -Sum).Sum)
     $totalDirty += $dirty.Count
 }
 
@@ -723,7 +743,7 @@ foreach ($r in $repos) {
     }
     if (-not $r.HasRemote) {
         Write-Host "NO-REMOTE     $($r.Repo)" -ForegroundColor Red
-        Write-Host "              $($r.Commits) commits across $($r.RefsScanned) refs exist on this disk only." -ForegroundColor Red
+        Write-Host "              $($r.Commits) commits across $($r.RefsScanned) refs$(if ($r.DetachedUnbacked.Count -gt 0) { " and $($r.DetachedUnbacked.Count) detached checkout(s)" }) exist on this disk only." -ForegroundColor Red
         Write-Host "              This repository has no remote at all, so nothing here is a push away from" -ForegroundColor Red
         Write-Host "              safety -- it needs a remote first. A bundle is interim cover, not a remote." -ForegroundColor Red
         continue
@@ -734,7 +754,7 @@ foreach ($r in $repos) {
         if ($r.RemotesEmpty.Count -gt 0) {
             Write-Host "              of those, answered with no refs (an empty store): $($r.RemotesEmpty -join ', ')" -ForegroundColor Red
         }
-        Write-Host "              This check reports $($r.Commits) unbacked across $($r.RefsScanned) refs, and that number" -ForegroundColor Red
+        Write-Host "              This check reports $($r.Commits) unbacked across $($r.RefsScanned) refs$(if ($r.DetachedUnbacked.Count -gt 0) { " and $($r.DetachedUnbacked.Count) detached checkout(s)" }), and that number" -ForegroundColor Red
         Write-Host "              is a FLOOR, not an answer. Everything it counted as backed was excluded by" -ForegroundColor Red
         Write-Host "              refs/remotes/* -- local copies of a store that did not answer. Restore the" -ForegroundColor Red
         Write-Host "              remote, re-point it, or bundle the repository and treat it as unbacked." -ForegroundColor Red
