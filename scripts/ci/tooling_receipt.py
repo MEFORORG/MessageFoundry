@@ -86,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             f"::error::the tooling marker EXECUTED only {executed} tests (floor {floor}) "
             f"-- the partition is not being applied; check tests/tooling_manifest.txt, the parser "
             f"that reads it in tests/_tooling_manifest.py, and the pytest_collection_modifyitems "
-            f"hook in tests/conftest.py that applies the marker"
+            f"hook in tests/conftest.py that applies the marker; on a sharded leg, also the file "
+            f"list scripts/quality/shard_tests.py --suite tooling wrote for this shard"
         )
         return 1
     return 0

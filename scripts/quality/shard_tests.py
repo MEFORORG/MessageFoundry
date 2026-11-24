@@ -31,12 +31,10 @@ the smoke's readings to the `test (...)` jobs, and the herd floor is armed only 
 `--suite tooling` IS ci.yml's `tooling` JOB, THE REPO HARNESS TIER, split across its windows-2025
 legs (owner ruling 2026-11-24). It is the complement of the other two: exactly the files
 tests/tooling_manifest.txt names, and nothing else. Its hash is SALTED, `crc32("<salt>:<path>")`,
-for a measured reason. On the windows-2025 junit of CI run 45415735678 the tier was 263 files of
-uneven cost, the largest about 6 percent of the tier on its own, and the unsalted hash split it
-3997 / 6900 / 4517 seconds of test time, one shard 34 percent over the mean. A salt is still a pure
-function of the path, so it keeps the two properties this docstring opens with: every shard
-computes the same split alone, and no file moves when another is added. `TOOLING_SALT` below says
-how it was chosen and when to choose again.
+because the unsalted hash split the measured tier badly; `TOOLING_SALT` below holds the
+measurement, how the salt was chosen and when to choose again. A salt is still a pure function of
+the path, so it keeps the two properties this docstring opens with: every shard computes the same
+split alone, and no file moves when another is added.
 
 `--check-collection` IS THE PARTITION GUARD, and it reads pytest's own collection rather than this
 file's re-implementation of it. The arguments after `--` are the step's selection. It runs
@@ -71,11 +69,12 @@ ENGINE_EXCLUDE_GLOB = "*messagefoundry-webconsole*"
 #: Held in shard 1 of the engine suite whatever their hash. The module docstring says why.
 ENGINE_SUITE_SHARD_ONE = frozenset({"tests/test_connscale_smoke.py"})
 
-#: The `--suite tooling` salt. It is the smallest non-negative integer that puts every one of the
-#: 3 shards within 5 percent of the mean on the windows-2025 tooling junit of CI run 45415735678
-#: (job 138521635567): 4883 / 5208 / 5323 seconds of test time against a mean of 5138. About a
-#: quarter of salts land within 15 percent on that junit, so the unsalted split was not unlucky,
-#: only ordinary. A file added later lands by its own hash and moves nothing, so the balance drifts
+#: The `--suite tooling` salt. On the windows-2025 tooling junit of CI run 45415735678 (job
+#: 138521635567), 263 files, the largest about 6 percent of the tier's test time, the unsalted hash
+#: split the 3 shards 3997 / 6900 / 4517 seconds, one 34 percent over the mean. This is the smallest
+#: non-negative integer that puts every shard within 5 percent of the mean there: 4883 / 5208 / 5323
+#: against 5138. About a quarter of salts land within 15 percent on that junit, so the unsalted
+#: split was not unlucky, only ordinary. A file added later lands by its own hash and moves nothing, so the balance drifts
 #: as the tier grows rather than jumping. RE-PICK IT when a shard's junit test-time sum is observed
 #: more than 15 percent off the mean of the three, by the same search over a fresh junit; a re-pick
 #: moves files between shards, which costs nothing but a cold read of the next run's balance.
@@ -123,10 +122,10 @@ def shard_of(path: str, shards: int) -> int:
 
 
 def assign(path: str, shards: int, suite: str) -> int | None:
-    """The shard `suite` puts `path` in, or `None` when that suite does not run the file.
+    """The shard `suite` would put `path` in, or `None` when the suite excludes it by path.
 
-    Tooling membership is not decided here: `partition` hands a tooling suite only manifest files
-    and every other suite none, so this only places a file the suite already runs."""
+    Tooling membership is not decided here, so a number is no claim that the suite runs the file:
+    `partition` gives the tooling suite only manifest files and every other suite none of them."""
     if suite == "tooling":
         return shard_of(f"{TOOLING_SALT}:{path}", shards)
     if suite == "engine":

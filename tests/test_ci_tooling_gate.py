@@ -23,6 +23,7 @@ reproduces the defect this file exists to prevent one level up.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -371,22 +372,35 @@ _GUARD_STEP = "Tooling shards partition pytest's collection"
 _RECEIPT_STEP = "Prove the tier actually ran"
 
 
+@functools.cache
+def _tooling_job() -> dict[str, object]:
+    """Parsed once per process: ci.yml does not change under a test run, and nothing mutates it."""
+    job: dict[str, object] = yaml.safe_load(_CI.read_text(encoding="utf-8"))["jobs"]["tooling"]
+    return job
+
+
 def _tooling_step(name: str) -> dict[str, object]:
-    doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    found = [s for s in doc["jobs"]["tooling"]["steps"] if s.get("name") == name]
+    steps = _tooling_job()["steps"]
+    assert isinstance(steps, list)
+    found = [s for s in steps if s.get("name") == name]
     assert len(found) == 1, f"expected one {name!r} step in the tooling job, found {len(found)}"
     return dict(found[0])
 
 
-def _full_matrix(tmp_path: Path) -> list[dict[str, str]]:
-    bash = require_bash(tmp_path)
-    outputs = _run_detector(bash, tmp_path, "push")
+@pytest.fixture(scope="module")
+def full_matrix(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, str]]:
+    """The push arm's `tooling_matrix`, from one run of the real detector step for this module."""
+    work = tmp_path_factory.mktemp("tooling_matrix")
+    bash = require_bash(work)
+    outputs = _run_detector(bash, work, "push")
     return list(json.loads(outputs["tooling_matrix"])["include"])
 
 
-def test_windows_2025_runs_the_tier_in_three_test_shards_and_ubuntu_in_one(tmp_path: Path) -> None:
+def test_windows_2025_runs_the_tier_in_three_test_shards_and_ubuntu_in_one(
+    full_matrix: list[dict[str, str]],
+) -> None:
     """Falsified by dropping `$TW"3"}` from TOOLING_FULL in ci.yml: RED. Restored."""
-    legs = _full_matrix(tmp_path)
+    legs = full_matrix
     assert legs == [
         {"os": "ubuntu-latest", "shard": "1", "of": "1"},
         *({"os": "windows-2025", "of": "3", "shard": str(n)} for n in (1, 2, 3)),
@@ -398,17 +412,18 @@ def test_windows_2025_runs_the_tier_in_three_test_shards_and_ubuntu_in_one(tmp_p
         assert sorted(int(leg["shard"]) for leg in mine) == list(range(1, int(counts.pop()) + 1))
 
 
-def test_every_tooling_leg_has_its_own_check_name_and_junit_artifact(tmp_path: Path) -> None:
-    """The name is the expression ci-gate's CHECK_NAMES shows as `repo harness tests (*)`; this
-    evaluates it per leg. Falsified by naming the job `repo harness tests (${{ matrix.os }})`: RED,
-    three windows legs on one name. Restored."""
-    doc = yaml.safe_load(_CI.read_text(encoding="utf-8"))
-    job = doc["jobs"]["tooling"]
-    assert job["name"] == (
+def test_every_tooling_leg_has_its_own_check_name_and_junit_artifact(
+    full_matrix: list[dict[str, str]],
+) -> None:
+    """The name is the expression ci-gate's CHECK_NAMES shows as `repo harness tests (*)`. THE PIN
+    ON IT IS THE CONTROL: the per-leg names below are this file's own rendering of that expression,
+    so they show what the pinned text produces and cannot catch an edit made to both. Falsified by
+    naming the job `repo harness tests (${{ matrix.os }})`: RED on the pin. Restored."""
+    assert _tooling_job()["name"] == (
         "repo harness tests (${{ matrix.of == '1' && matrix.os || format('{0}, shard {1} of {2}', "
         "matrix.os, matrix.shard, matrix.of) }})"
     )
-    legs = _full_matrix(tmp_path)
+    legs = full_matrix
     names = [
         leg["os"] if leg["of"] == "1" else f"{leg['os']}, shard {leg['shard']} of {leg['of']}"
         for leg in legs
@@ -446,7 +461,9 @@ def test_each_leg_runs_its_own_shard_of_the_tier() -> None:
         assert needle in pytest_line, f"{needle!r} left the harness step: {pytest_line}"
 
 
-def test_the_partition_guard_reads_the_tier_s_selection_on_one_leg(tmp_path: Path) -> None:
+def test_the_partition_guard_reads_the_tier_s_selection_on_one_leg(
+    full_matrix: list[dict[str, str]],
+) -> None:
     """Falsified by `--of 2` on the guard line: RED on the count. Restored."""
     harness = str(_tooling_step(_HARNESS_STEP)["run"])
     pytest_line = next(line for line in harness.splitlines() if line.startswith("pytest "))
@@ -460,7 +477,7 @@ def test_the_partition_guard_reads_the_tier_s_selection_on_one_leg(tmp_path: Pat
         str(guard["run"]).strip(),
     )
     assert match, guard["run"]
-    shard_counts = {leg["of"] for leg in _full_matrix(tmp_path) if leg["of"] != "1"}
+    shard_counts = {leg["of"] for leg in full_matrix if leg["of"] != "1"}
     assert shard_counts == {match.group(1)}, (shard_counts, match.group(1))
     for word in match.group(2).split(" -- ")[0].split():
         assert word in pytest_line, f"the guard selects with {word!r}, the harness step does not"

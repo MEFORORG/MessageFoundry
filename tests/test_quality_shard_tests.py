@@ -236,25 +236,28 @@ def test_check_collection_exits_by_what_pytest_collected(
 # --- the tooling suite (owner ruling 2026-11-24) --------------------------------------------------
 
 
-def _tooling_shards() -> int:
+@pytest.fixture(scope="module")
+def tooling_shards() -> int:
     """ci.yml's tooling shard count, read from its partition guard, which
-    tests/test_ci_tooling_gate.py holds to the windows-2025 legs' `of`."""
+    tests/test_ci_tooling_gate.py holds to the windows-2025 legs' `of`. A fixture, so a drifted
+    guard line fails these tests rather than this module's collection."""
     text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     counts = set(re.findall(r"shard_tests\.py --suite tooling --of (\d+) --check-collection", text))
     assert len(counts) == 1, f"ci.yml's tooling guard reads {sorted(counts)}"
     return int(counts.pop())
 
 
-_TOOLING_SHARDS = _tooling_shards()
-
-
 @pytest.fixture(scope="module")
-def tooling(mod: ModuleType) -> dict[int, list[str]]:
-    return mod.partition(_TOOLING_SHARDS, "tooling")
+def tooling(mod: ModuleType, tooling_shards: int) -> dict[int, list[str]]:
+    return mod.partition(tooling_shards, "tooling")
 
 
 def test_the_tooling_shards_partition_exactly_the_manifest(
-    mod: ModuleType, files: list[str], tooling: dict[int, list[str]], engine: dict[int, list[str]]
+    mod: ModuleType,
+    files: list[str],
+    tooling: dict[int, list[str]],
+    engine: dict[int, list[str]],
+    tooling_shards: int,
 ) -> None:
     """Every manifest file in exactly one tooling shard, no other file in any, and the tooling and
     engine suites disjoint, so no file runs on both tiers or on neither."""
@@ -262,7 +265,7 @@ def test_the_tooling_shards_partition_exactly_the_manifest(
     listed = [f for shard in sorted(tooling) for f in tooling[shard]]
     sizes = ", ".join(f"shard {n} {len(tooling[n])}" for n in sorted(tooling))
     print(f"[shards] tooling: {sizes} files")
-    assert sorted(tooling) == list(range(1, _TOOLING_SHARDS + 1))
+    assert sorted(tooling) == list(range(1, tooling_shards + 1))
     assert len(set(listed)) == len(listed), "a file is in two tooling shards"
     assert set(listed) == manifest & set(files) == manifest
     assert all(tooling.values()), "a tooling shard is empty"
@@ -271,37 +274,44 @@ def test_the_tooling_shards_partition_exactly_the_manifest(
 
 
 def test_the_tooling_split_is_salted_and_the_salt_moves_it(mod: ModuleType) -> None:
-    """The salt is what balanced the split on the measured junit; an unsalted hash put one shard 34
-    percent over the mean. Pinned so a dropped salt reds here rather than as a slow shard. Falsified
-    by returning `shard_of(path, shards)` for the tooling suite: RED on the first assertion. Restored."""
-    path = "tests/test_worktree_finished_claude_removal.py"
-    assert mod.assign(path, 3, "tooling") == mod.shard_of(f"{mod.TOOLING_SALT}:{path}", 3)
+    """The salt is what balanced the split on the measured junit (TOOLING_SALT holds the numbers).
+    Pinned, as the coverage split's value is, so a dropped or changed salt reds here rather than as
+    a slow shard. The file is one of the tier's largest and one the salt moves: shard 2 unsalted.
+    Falsified by returning `shard_of(path, shards)` for the tooling suite: RED on the first
+    assertion. Restored."""
+    path = "tests/test_worktree_prune_merged.py"
+    assert mod.assign(path, 3, "tooling") == 3
+    assert mod.shard_of(path, 3) == 2
     manifest = sorted(mod.tooling_files())
     moved = [p for p in manifest if mod.assign(p, 3, "tooling") != mod.shard_of(p, 3)]
     assert moved, "the salted split equals the unsalted one, so the salt does nothing"
 
 
 def test_main_prints_a_tooling_shard(
-    mod: ModuleType, tooling: dict[int, list[str]], capsys: pytest.CaptureFixture[str]
+    mod: ModuleType,
+    tooling: dict[int, list[str]],
+    tooling_shards: int,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", str(_TOOLING_SHARDS)]) == 0
+    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", str(tooling_shards)]) == 0
     assert capsys.readouterr().out.splitlines() == tooling[1]
     assert mod.main(["--suite", "tooling", "--shard", "1", "--of", "1"]) == 0
     assert sorted(capsys.readouterr().out.splitlines()) == sorted(mod.tooling_files())
 
 
 def test_check_collection_judges_the_tooling_suite(
-    mod: ModuleType, tooling: dict[int, list[str]]
+    mod: ModuleType, tooling: dict[int, list[str]], tooling_shards: int
 ) -> None:
     """The guard's verdicts on the tooling split, on a stubbed collection: a collected file outside
-    the manifest is a fault, which is what a basename collision with a non-manifest file would be."""
+    the manifest is a fault. That is a file carrying the `tooling` mark itself, the shape
+    tests/test_scan_forbidden_site_prefix_width.py had until the guard found it."""
 
     def check(files: list[str]) -> int:
         def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
             out = "".join(f"{path}::test_x\n" for path in files)
             return subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
 
-        result: int = mod.check_collection(_TOOLING_SHARDS, "tooling", ["-m", "tooling"], run=run)
+        result: int = mod.check_collection(tooling_shards, "tooling", ["-m", "tooling"], run=run)
         return result
 
     every = [f for shard in sorted(tooling) for f in tooling[shard]]
