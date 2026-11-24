@@ -410,7 +410,8 @@ class RetentionRunner:
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
         # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
-        # reload so a window the reload set is enforced now rather than an interval later.
+        # reload. wake() sets it only while the loop is idle, so a window a reload sets is enforced at
+        # once only when the loop was idle; on an active loop it waits for the next scheduled pass.
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         # Whether the last check of `enabled` found something to do; the loop logs when it flips.
@@ -540,6 +541,10 @@ class RetentionRunner:
         # One isolated pass per interval; an error in a pass is logged and the loop continues (a
         # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
+            # Cleared here, before this iteration reads `enabled`, so a wake() that landed before
+            # this read (say between start() and the first iteration) is answered by this pass and
+            # cannot also cut the sleep after it short into a second, back-to-back pass.
+            self._wake.clear()
             try:
                 active = self._refresh_active()
             except Exception:
@@ -579,8 +584,6 @@ class RetentionRunner:
             await asyncio.wait_for(self._wake.wait(), delay)
         except TimeoutError:
             pass
-        if not self._stop.is_set():
-            self._wake.clear()
 
     # --- one pass ------------------------------------------------------------
 

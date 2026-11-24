@@ -2162,6 +2162,32 @@ async def test_wake_runs_a_pass_only_when_it_makes_the_loop_active(store: Messag
         await runner.stop()
 
 
+async def test_a_wake_before_the_first_iteration_runs_one_pass(store: MessageStore) -> None:
+    """A reload that wakes the loop between start() and its first iteration gets one pass, not
+    two back to back: the 3600 s interval means a second pass could only come from a stale wake."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    holder: dict[str, Registry] = {"reg": Registry()}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()  # idle: the task exists but has not run yet
+    try:
+        window = Registry()
+        window.add_inbound(
+            build_inbound_connection("IB", MLLP(port=2613), router="r", messages_days=1)
+        )
+        holder["reg"] = window
+        runner.wake()  # the reload, before the loop's first iteration
+        await asyncio.sleep(0.15)
+        assert len(passes) == 1, f"expected one pass, got {len(passes)}"
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize(
     "window",
     ["i:messages_days=1", "i:prune_documents_after=1", "o:dead_letter_days=1"],
