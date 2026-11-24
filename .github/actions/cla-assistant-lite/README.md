@@ -10,11 +10,22 @@ We vendor only the compiled `dist/index.js`, not the TypeScript source. The sour
 
 Upstream source, for reference: https://github.com/contributor-assistant/github-action/tree/ca4a40a7d1004f18d9960b404b97e5f30a505a08
 
+## `dist/index.js` is a patched fork (BACKLOG #5644, #5645)
+
+Since 2026-11-23 the bundle is not the upstream bytes. The owner ruled that day to fork it, patch it, and re-record its provenance, rather than leave the defects below in place. The two fixes are four small hand edits to the compiled file, each carrying a `// MessageFoundry patch` comment, so a grep for that text finds all four. The bundle was not rebuilt, because rebuilding needs a Node toolchain this repository does not carry. The second header line says the file carries local modifications, as Apache-2.0 section 4(b) asks of a modified file.
+
+What was patched, and why:
+
+1. **`checkAllowList` anchors a wildcard allowlist entry to the whole name** (BACKLOG #5644 item 2). Upstream built `new RegExp(regex)` from an entry containing `*`, with no `^` or `$`, so `bot*` also matched `evilbot-x` in the middle of the name. The non-wildcard parts were already escaped by lodash's `escapeRegExp`, so a dot was already literal; the patch adds only the anchors.
+2. **`getCommitters` follows GraphQL pagination** (BACKLOG #5645 item 2). Upstream read one page of 100 commits with an empty cursor and never followed `pageInfo.hasNextPage`. So an author first seen past page one was missing from the list the action records a sign comment against, and the CLA pre-check's refusal for that author could not be cleared on that pull request. The patch loops on `endCursor` until `hasNextPage` is false. It raises when a page claims a next page but gives a cursor that is missing or already seen, and the action reports that as a failed step. **Limit:** GitHub's commit list for a pull request stops at 250 commits, while its `totalCount` reports the full number. That was measured once, on 2026-11-23, on one public pull request; `scripts/security/cla_precheck.py` records the reading. The patch reads to the end of that list and does not fail on the difference, because failing would red every larger pull request with nothing that clears it. The pre-check stops at the same place and treats the short read as a fault that warns and passes (owner rulings of 2026-11-13 and 2026-11-23). **So an author first seen past commit 250 is checked by neither, and the `cla` check can pass for that author unsigned.** Separately, the action reads only the first page of a pull request's comments when it looks for sign comments; this patch does not change that.
+
+The exact edits are `BUNDLE_PATCHES` in `scripts/security/build_cla_action_provenance.py`, each as an upstream span and its patched span; the gate's error messages number them 1 to 4 in that order. Patch 1 is the allowlist fix, and patches 2 to 4 are the pagination fix. `tests/test_cla_action_patches.py` runs the two patched modules, with the bundle's own lodash, under Node (it skips them where Node is absent) and pins the patched text statically.
+
 ## `action.yml` differs from upstream in its runtime (BACKLOG #1868)
 
 `action.yml` declares `using: "node24"`, with a comment above it saying why. Upstream declares `node20`, and no upstream release will change that, because the repository is archived. `provenance.cdx.json` records what was diffed against upstream.
 
-GitHub removed Node 20 from its hosted runners. Before that, the runner was already running this bundle on Node 24 by force, and the `cla` runs read for this change carry a warning saying so. So the new line changes what the runner is told, not what it runs. The bundle bytes are unchanged.
+GitHub removed Node 20 from its hosted runners. Before that, the runner was already running this bundle on Node 24 by force, and the `cla` runs read for this change carry a warning saying so. So the new line changes what the runner is told, not what it runs. That change left the bundle bytes as they were; the later bundle patches are described above.
 
 `scripts/quality/workflow_local_action_check.py` refuses a retired runtime in any local action a workflow calls directly. It also names a date to revisit `node24`, so the next deadline does not rest on someone remembering. Changing the runtime line again means moving the `action.yml` pin in `scripts/security/build_cla_action_provenance.py` and re-running it with `--write`. ADR 0034's amendment of 2026-09-25 has the readings and their sources.
 
@@ -31,7 +42,7 @@ python scripts/security/build_cla_action_provenance.py --write    # regenerate
 
 ### What is proven
 
-The vendored bundle is the upstream blob at the pinned commit with a 176-byte two-line header prepended, and nothing else changed. Strip the first two lines of `dist/index.js` and the SHA-256 of what remains is `a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb`, the upstream digest recorded in the CycloneDX document. That check needs no network and no Node.
+The vendored bundle is the upstream blob at the pinned commit with the recorded patches applied and a 202-byte two-line header prepended, and nothing else changed. Strip the first two lines of `dist/index.js`, revert each patch in `BUNDLE_PATCHES`, and the SHA-256 of what remains is `a44111084c0d4782206c04b4276292f7fec6d1f7a33525512fbeef3242079dfb`, the upstream digest recorded in the CycloneDX document. A change outside a recorded patch fails the digest comparison. The reversal also requires each patched span to occur once in the bundle and each upstream span once after reverting, which refuses a patch that was edited, duplicated, or applied at a second site. That check needs no network and no Node.
 
 ### What is not proven, and nobody can prove it here
 

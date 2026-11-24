@@ -274,7 +274,15 @@ see its *What it widens* and *Left open*.
   file carries explicitly -- and the hosted runners showed Python 3.13+ temp-directory entries arriving
   as explicit ones (CI run 36039014999). Placement hard-links the store where it can, and a hard link
   shares one security descriptor, so once the published store is restricted the staged link carries the
-  same DACL (measured); on the copy fallback it does not.
+  same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
+  write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
+  account the process runs as, and removes inherited entries and explicit allows for other
+  principals. It carries over some explicit entries the icacls rewrite kept: every deny, and the
+  explicit OWNER RIGHTS entries where the docstring's set rule keeps them. A carried OWNER RIGHTS
+  allow is an explicit allow for the file's owner.
+  On some failures it runs the icacls rewrite instead, which keeps every explicit entry, other
+  principals' allows included. The `_secure_file` docstring, *What the one list carries over*, is
+  the statement of the rule and of those failures; this list follows it.
 
 Because the trio's DACL is protected, a later edit to the directory does not reach the store.
 
@@ -307,6 +315,12 @@ checks resolve the path by name, so someone able to swap an ancestor for a junct
 create and the check could misdirect it. Outside a hardened directory, the owner-only rewrite still
 leaves any explicit entry for another principal in place, because `icacls /inheritance:r /grant:r`
 replaces only the principals it names (measured while building this); that predates this change.
+**AMENDED 2026-11-23:** this rewrite is unchanged for the store trio, and for a config file
+another account owns whose list writes all failed. At least the DR and restore staging callers and
+the config editors' fallback for a file the editing account owns now get the one protected DACL
+`_secure_file` writes, as the amendment above states, so where that write succeeds the only
+explicit allows left on those files are this account's and the OWNER RIGHTS entries the
+`_secure_file` docstring names as carried.
 POSIX is unchanged (`chmod 0600`). Consequences 3 and 4 are not touched here: the key half was answered
 by BACKLOG #1905.
 

@@ -53,6 +53,9 @@ site keeps them unchanged).
   #6823):** a Handler's ``lazy_result`` marks any iterable return whose exact type is not
   ``list``/``tuple``/``set``/``frozenset`` (``str``/``bytes``/``bytearray`` aside). It means only that
   the per-invocation ``sends`` were not read; such a body may still carry line events.
+* *Bounded capture.* An invocation keeps at most :data:`_MAX_EVENTS` line events and
+  :data:`_MAX_WRITES` ``msg`` writes. Past either it carries ``"truncated": true``; past the second
+  also ``"writes_truncated": true``, and later writes on every line are dropped (BACKLOG #6824).
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -67,6 +70,7 @@ from __future__ import annotations
 import inspect
 import math
 import sys
+import threading
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -94,6 +98,10 @@ __all__ = ["trace_dry_run"]
 # marked ``truncated``). A long string local / write value is likewise capped so a body can't be dumped
 # in full even under --show-phi.
 _MAX_EVENTS = 5000
+# Message writes are capped per invocation on their own, because a helper the Handler calls is not
+# line-traced: all its writes land on one Handler line, so the event cap alone never bounds them.
+# Semantics: :meth:`_Recorder.record_write` (BACKLOG #6824).
+_MAX_WRITES = 5000
 _MAX_VALUE_LEN = 120
 
 
@@ -289,6 +297,7 @@ class _Recorder:
         self.sends: list[str] = []
         self.routed_to: list[str] = []
         self.truncated = False
+        self.writes_truncated = False
         # The return was not walked, so this record's sends/routed_to are not measurable here. For a
         # generator the body has not run yet either, so there are no line events; a Handler's other
         # unwalked iterables (BACKLOG #6823) may still have them. See `record_return`.
@@ -300,6 +309,7 @@ class _Recorder:
         self._last_ts: float | None = None
         self._snap_before: dict[str, Any] = {}
         self._writes_by_line: dict[int, list[dict[str, Any]]] = {}
+        self._write_count = 0  # writes kept, pending or emitted, against _MAX_WRITES
 
     # tracer callbacks ---------------------------------------------------------
 
@@ -349,6 +359,22 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
+        # Past the event cap no line is finalized, so a write kept then would only be held: a long
+        # mutating loop would grow this recorder without bound (BACKLOG #6824). A write with no
+        # latched frame is keyed to the def line, where a later finalize may still emit it (a
+        # wrapper writing before a one-line target runs), so it is kept, against _MAX_WRITES.
+        if len(self.events) >= _MAX_EVENTS:
+            self.truncated = True
+            return
+        if self._write_count >= _MAX_WRITES:
+            # Also `truncated`, so the record never reads as complete. The IDE reads only that key,
+            # and only in its test bench, which shows its event-cap message (coverage may
+            # under-report) even when only writes were capped. Its inline write views read neither
+            # flag.
+            self.writes_truncated = True
+            self.truncated = True
+            return
+        self._write_count += 1
         line = self.frame.f_lineno if self.frame is not None else (self.def_line or 0)
         self._writes_by_line.setdefault(line, []).append(
             {"path": path, "value": _safe_value(value, self.show_phi)}
@@ -418,6 +444,8 @@ class _Recorder:
         }
         if self.truncated:
             out["truncated"] = True
+        if self.writes_truncated:
+            out["writes_truncated"] = True
         if self.lazy_result:
             out["lazy_result"] = True
         return out
@@ -525,22 +553,44 @@ def _recording_write(
     *,
     as_data: bool,
 ) -> None:
+    # Recorded before the write, so a write that raises still shows on the line that failed.
     rec = _active_recorder.get()
     if rec is not None:
         rec.record_write(path, value)
     _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
+# ``Message._write`` is class-global, so concurrent traces (one per thread) share one patch. A
+# count under a lock installs it on the first entry and restores it on the last exit; without it
+# the first trace to finish restored the original under the others, which then silently recorded
+# no writes (BACKLOG #6825).
+_patch_lock = threading.Lock()
+_patch_holders = 0
+
+
 @contextmanager
 def _patched_message_writes() -> Iterator[None]:
     """Record ``msg.set(...)`` / ``msg[...] = ...`` / ``msg.set_data(...)`` writes for the active
-    recorder, then restore the original method. A no-op passthrough whenever no recorder is active, so
-    it never perturbs the mutation itself."""
-    Message._write = _recording_write  # type: ignore[method-assign]
+    recorder, then restore the original method once no trace still needs it. A no-op passthrough
+    whenever no recorder is active, so it never perturbs the mutation itself."""
+    global _patch_holders
+    held = False
     try:
+        # Inside the try, which narrows the window in which an interrupt leaks the count; it does
+        # not close it (between the increment and `held = True`, or in the release). A leaked count
+        # leaves the patch installed for the life of the process.
+        with _patch_lock:
+            if _patch_holders == 0:
+                Message._write = _recording_write  # type: ignore[method-assign]
+            _patch_holders += 1
+            held = True
         yield
     finally:
-        Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
+        if held:
+            with _patch_lock:
+                _patch_holders -= 1
+                if _patch_holders == 0:
+                    Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
 
 
 def trace_dry_run(

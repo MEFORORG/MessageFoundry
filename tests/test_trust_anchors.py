@@ -269,7 +269,7 @@ def test_dacl_read_pins_icacls_to_the_system_directory(monkeypatch: pytest.Monke
     # This call's OUTPUT decides whether a TLS trust anchor is owner-only, so it must name icacls by
     # absolute path: CreateProcess resolves an unqualified name through a search path that reaches the
     # caller's working directory, and a planted icacls.exe printing a clean DACL would turn a
-    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._secure_file,
+    # group-writable anchor into an accepted one (BACKLOG #1769). Same pin as store._grant_read,
     # which writes a DACL rather than reading one.
     from messagefoundry import service_status
 
