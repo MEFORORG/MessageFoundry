@@ -25,7 +25,8 @@ section has an env layer and whose key that section does not define. It is narro
 documented ``MEFOR_*`` variables are read straight from ``os.environ`` by their consuming module
 and are not fields on any section (``MEFOR_STORE_VAULT_ADDR``, ``MEFOR_TLS_REVOCATION_ATTESTED``
 and siblings); those are spared by name. A variable whose SECTION part matches no section with
-an env layer is refused when it names a modelled section. When it names none it is not applied:
+an env layer is refused when it names a modelled section, or is the name of one alone
+(``MEFOR_STORE``). When it names none it is not applied:
 :func:`load_settings` logs a WARNING for at least some such names, and the rest are dropped
 with no message. The ``cli`` mapping is not checked: its keys are engine-written
 from parsed arguments, never operator-spelled, and an operator's unknown flag never reaches them,
@@ -8924,8 +8925,13 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     and environment layers, before the model is built, so a typo that is also the cause of a
     cross-field validation error is named here first.
 
-    Two cases refuse:
+    Three cases refuse:
 
+    * the name is a modelled section's name and nothing else, ``MEFOR_<SECTION>`` with or without
+      a trailing ``_`` (``MEFOR_STORE``, ``MEFOR_UPDATE_CHECK``). No setting has that name, and the
+      name of a config section is the engine's, so a refusal here does not guess at another tool's
+      variable. Manager decision d20261123T172418598-d8ffd6, option (c), under the owner's
+      delegation of 2026-11-23;
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
@@ -8935,12 +8941,11 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one that names no modelled section either way (``MEFOR_ALLOW_INSECURE_TLS``, the escape
+    * one that names no modelled section either way, and is not a section's name alone (``MEFOR_ALLOW_INSECURE_TLS``, the escape
       honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
       So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
-    * one with no key part, which gets the same note when it is a section's name;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;
     * a ``[security]`` name, which :func:`_desugar_security` refuses with its own message, and the
       renamed ``[logging]`` keys in :data:`_RENAMED_LOGGING_KEYS`, which the model refuses naming
@@ -8958,6 +8963,20 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
+        bare = rest.rstrip("_")
+        if bare in models:
+            # The exact MEFOR_<SECTION> shape, with or without a trailing "_" (Manager decision
+            # d20261123T172418598-d8ffd6, option (c)). Say how to set one, so the obvious fix is
+            # not a name this refusal then stops.
+            how = (
+                f"a setting in it is {_ENV_PREFIX}{bare.upper()}_<KEY>"
+                if bare in _SECTIONS
+                else "that section has no environment layer; set it in the file"
+            )
+            offenders.append(
+                f"{_printable(name)} (names the [{bare}] section and no setting; {how})"
+            )
+            continue
         unread = next((s for s in no_env_layer if rest.startswith(f"{s}_")), None)
         if unread is not None:
             offenders.append(
@@ -9046,10 +9065,8 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
     costs a log line; a wrong refusal would stop the start.
 
-    At least two shapes are noted:
+    At least one shape is noted. The name of a section alone is not: the refusal stops it.
 
-    * the name is ``MEFOR_<SECTION>`` exactly, a modelled section and no key
-      (``MEFOR_UPDATE_CHECK=false``, ``MEFOR_STORE``). No setting has that name;
     * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
       ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
       (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it
@@ -9068,17 +9085,8 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     gone = set(_RELOCATED_TO_SECURITY) | set(_REMOVED_KEYS)
     notes: list[str] = []
     for name, rest in _unspared_env_names(environ, referenced):
-        if rest in models:
-            # Say how to set one, so the obvious fix is not a name the refusal then stops.
-            how = (
-                f"a setting in it is {_ENV_PREFIX}{rest.upper()}_<KEY>"
-                if rest in _SECTIONS
-                else "that section has no environment layer; set it in the file"
-            )
-            notes.append(
-                f"{_printable(name)} names the [{rest}] section and no setting in it, so "
-                f"nothing reads it ({how})"
-            )
+        if rest.rstrip("_") in models:
+            # A section's name alone: :func:`_reject_unknown_env_keys` refuses it.
             continue
         tokens = rest.split("_")
         for cut in range(1, len(tokens)):
