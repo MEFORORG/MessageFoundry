@@ -1658,7 +1658,9 @@ async def test_the_service_refuses_no_address_and_writes_nothing() -> None:
             must_change_password=False,
             password_generated=False,
         )
-        staged_cell = await store.set_totp_secret("roleless", secret="JBSWY3DPEHPK3PXP")
+        staged_cell = await store.set_totp_secret(
+            "roleless", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        )
         assert await store.enable_totp(
             "roleless", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
         )
@@ -1706,7 +1708,7 @@ async def test_the_service_refuses_no_address_and_writes_nothing() -> None:
         after = await store.get_user("roleless")
         assert after == before
         assert await store.get_user_role_ids("roleless") == []
-        assert await store.get_totp_secret("roleless") == "JBSWY3DPEHPK3PXP"
+        assert await store.get_totp_secret("roleless") == "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
         assert sorted(await store.get_recovery_code_hashes("roleless")) == ["h1", "h2"]
         passkeys = await store.list_webauthn_credentials("roleless")
         assert [c.credential_id for c in passkeys] == ["holder-passkey-id"]
@@ -3444,7 +3446,9 @@ async def test_the_repair_branch_clears_the_earlier_holders_factors_and_sessions
             must_change_password=False,
             password_generated=False,
         )
-        staged_cell = await store.set_totp_secret("earlier", secret="JBSWY3DPEHPK3PXP")
+        staged_cell = await store.set_totp_secret(
+            "earlier", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        )
         assert await store.enable_totp(
             "earlier", expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
         )
@@ -3950,7 +3954,7 @@ def test_the_last_wrong_code_is_not_told_to_try_again(
 
 #: A second synthetic base32 secret, so the two runs show different entries. Two symbols on
 #: purpose, for the reason ``_PASSWORD`` above is low-entropy: it must not look like a secret.
-_OTHER_TOTP_SECRET = "ABABABABABABABAB"
+_OTHER_TOTP_SECRET = "ABABABABABABABABABABABABABABABAB"
 
 
 async def test_the_run_that_loses_an_enrolment_race_is_told_to_remove_its_dead_entry(

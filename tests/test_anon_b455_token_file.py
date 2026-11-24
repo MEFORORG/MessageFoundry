@@ -32,7 +32,7 @@ from tests.test_anon_b254_3004 import _seed
 
 _BOM = chr(0xFEFF)
 _TOKENS = "[site_prefix]\n77\n"
-_SALT = "b455-salt-0123456789abcdef"
+_SALT = "b455-salt-0123456789abcdef-0123456789"
 _MESSAGE = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
 _WARNING = "warning: no site prefix loaded"
 

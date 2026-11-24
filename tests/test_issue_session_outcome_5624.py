@@ -226,3 +226,71 @@ async def test_a_kerberos_sign_in_refused_at_the_insert_names_its_cause(
     assert not outcome.ok and outcome.token is None
     assert await _refusal_reasons(engine.store) == [reason]
     assert await engine.store.list_audit(action="auth.login_success") == []
+
+
+async def test_a_contended_password_insert_is_not_an_unknown_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5653: a password sign-in whose insert found the session epoch raised on every
+    attempt fails as a temporary failure under its own audit reason. RED on the head where the
+    store returned ``False``, so the sign-in answered ``invalid credentials`` and wrote the
+    unknown-account row for an account that exists and a password that was right."""
+    from messagefoundry.auth.service import SESSION_MINT_CONTENDED
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store import store as store_module
+    from messagefoundry.store.store import SESSION_MINT_EPOCH_RAISED, no_audit_row
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(require_mfa=False, login_rate_limit_enabled=False)
+        )
+        admin = await create_admin(service)
+        user = await store.get_user_by_username(admin.username)
+        assert user is not None
+        real_seal = store_module.seal_session_async
+
+        async def seal_then_revoke(sealer: Any, record: Any) -> Any:
+            sealed = await real_seal(sealer, record)
+            await store.revoke_user_sessions(user.id, audit=no_audit_row)
+            return sealed
+
+        monkeypatch.setattr(store_module, "seal_session_async", seal_then_revoke)
+        with pytest.raises(SessionMintContended):
+            await service._issue_session(
+                user.id,
+                None,
+                mfa_verified=True,
+                seed_reauth=False,
+                mechanism=SessionMechanism.PASSWORD,
+                idp_auth_time=None,
+            )
+
+        outcome = await service.login(admin.username, admin.password)
+
+        assert not outcome.ok and outcome.token is None
+        assert outcome.error != "invalid credentials"
+        assert outcome.reason == SESSION_MINT_CONTENDED
+        rows = [
+            json.loads(r["detail"] or "{}")
+            for r in await store.list_audit(action="auth.login_failed")
+        ]
+        stand_in = {"provider": "local", "reason": "bad_credentials"}
+        true_row = {
+            "provider": "local",
+            "reason": SESSION_MINT_CONTENDED,
+            "contention": SESSION_MINT_EPOCH_RAISED,
+        }
+        assert len(rows) == 2 and stand_in in rows and true_row in rows, rows
+        # Only a right password reaches the insert, so a reader without users:manage reads only
+        # the stand-in a wrong password writes, as the real writer stored it (#1131 pattern).
+        from messagefoundry.auth.audit_visibility import HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE
+
+        hidden = HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE
+        shown = await store.list_audit(action="auth.login_failed", exclude=hidden)
+        assert [json.loads(r["detail"] or "{}") for r in shown] == [stand_in]
+        assert await store.list_sessions(user.id) == []
+        again = await store.get_user(user.id)
+        assert again is not None and again.failed_attempts == 0
+    finally:
+        await store.close()

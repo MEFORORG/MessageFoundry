@@ -12,6 +12,7 @@ acceptance criterion). DPAPI round-trips are Windows-only, so the file branch is
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from types import ModuleType, SimpleNamespace
 from typing import Any
 
@@ -215,20 +216,35 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "error",
+    "make_error",
     [
-        pytest.param(ImportError("DLL load failed"), id="broken-c-extension"),
-        pytest.param(ImportError("cannot import name 'Client' from 'sdk'"), id="missing-symbol"),
+        pytest.param(
+            lambda: ImportError("DLL load failed: synthetic C:/x/_sdk.pyd"),
+            id="broken-c-extension",
+        ),
+        pytest.param(
+            lambda: ImportError("cannot import name 'Client' from 'synthetic_sdk'"),
+            id="missing-symbol",
+        ),
+        # Vault BACKLOG #6709 item 3: a module's top-level code can fail with an error that is not
+        # an ImportError at all.
+        pytest.param(lambda: OSError("synthetic C:/x/_sdk.pyd"), id="os-error"),
+        pytest.param(lambda: AttributeError("synthetic attribute"), id="attribute-error"),
     ],
 )
 def test_an_external_provider_whose_backend_import_breaks_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, error: ImportError
+    monkeypatch: pytest.MonkeyPatch, make_error: Callable[[], Exception]
 ) -> None:
     # Vault BACKLOG #6709: an SDK that is installed but broken raises a plain ImportError, not
     # ModuleNotFoundError. The seam itself must raise the KeyProviderError its contract names,
-    # chained to the original, never a raw ImportError. The resolve_active_key half is a control:
-    # it already refused any provider error as a KeyProviderError before this fix.
+    # chained to the original, never the raw error. The resolve_active_key half is a control:
+    # it already refused any provider error as a KeyProviderError before this fix. Each import
+    # raises a fresh error (item 2), so no instance carries a traceback from an earlier raise.
+    raised: list[Exception] = []
+
     def _import(_name: str) -> ModuleType:
+        error = make_error()
+        raised.append(error)
         raise error
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
@@ -236,9 +252,28 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
         KeyProviderError, match="could not load its provider module or backend"
     ) as caught:
         resolve_key_provider(StoreSettings(key_provider="vault"))
-    assert caught.value.__cause__ is error
+    assert caught.value.__cause__ is raised[0]
+    assert "synthetic" not in str(caught.value)
     with pytest.raises(KeyProviderError):
         resolve_active_key(StoreSettings(key_provider="vault"))
+    assert len(raised) == 2 and raised[0] is not raised[1]
+
+
+def test_an_import_time_value_error_is_not_read_as_a_refused_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Vault BACKLOG #6709 item 3: store.base reads a raw ValueError as a refused key and tells the
+    # operator to generate a new one. A provider module whose import raises one is a broken
+    # install, so the seam refuses it as a KeyProviderError like any other failed import.
+    def _import(_name: str) -> ModuleType:
+        raise ValueError("synthetic")
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(KeyProviderError, match="could not load its provider module or backend"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "gen-key" not in str(caught.value)
 
 
 @pytest.mark.parametrize(

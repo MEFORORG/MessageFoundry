@@ -16,6 +16,7 @@ and object ids.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sqlite3
 import sys
@@ -137,9 +138,12 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
             return found
 
         monkeypatch.setattr(store, "get_user_by_directory_object_id", held)
+        # The body outside the per-account directory sign-in queue (BACKLOG #5653): in one process the queue
+        # runs the two in turn, so this drives the race two engine shards still have.
+        unqueued = inspect.unwrap(AuthService._complete_ad_login)
         first, second = await asyncio.gather(
-            service._complete_ad_login(_principal(), None, mfa_verified=True),
-            service._complete_ad_login(_principal(), None, mfa_verified=True),
+            unqueued(service, _principal(), None, mfa_verified=True),
+            unqueued(service, _principal(), None, mfa_verified=True),
         )
         assert arrived == 2, "the barrier must have held both logins at the read"
         assert first.ok and second.ok

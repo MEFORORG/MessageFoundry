@@ -258,6 +258,8 @@ from messagefoundry.store.store import (
     REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
+    SESSION_MINT_ATTEMPTS,
+    SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -325,6 +327,7 @@ from messagefoundry.store.store import (
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
+    SessionMintContended,
     SessionRecord,
     SignCountAnswer,
     Stage,
@@ -435,6 +438,7 @@ from messagefoundry.store.store import (
     seal_role_async,
     seal_session_async,
     seal_user_async,
+    session_epochs_current,
     session_insert_params,
     session_owes_unproven_factor_async,
     session_reseal_params,
@@ -442,6 +446,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    sign_in_state_refused,
     stamped_connection_event,
     tee_audits,
     totp_enable,
@@ -4449,9 +4454,10 @@ class SqlServerStore:
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
-            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
-            # complete while the pool is wedged, so releasing the executor only on the success path
-            # would leak its threads in exactly the case this except exists for.
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is
+            # released in a finally, same as close() below: wait_closed() cannot complete while the
+            # pool is wedged, so releasing the executor only on the success path would leak its
+            # threads in exactly the case this except exists for.
             async def _release() -> None:
                 try:
                     try:
@@ -6086,6 +6092,8 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the pool and its executor stay open; this close is not cancel-safe.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
@@ -16497,8 +16505,8 @@ class SqlServerStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -17468,8 +17476,68 @@ class SqlServerStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the locked transaction opens, as SQLite's
+        # create_session does. Under a Vault Transit sealer it is an HTTP call, and holding the
+        # account's row lock and a pooled connection across it would stall that account's writers
+        # behind Vault. The seal covers the session epochs, so they are read first, unlocked, and
+        # read again under the lock: if a revoke raised either in between, nothing is written and
+        # the record is sealed again over the new values.
+        for _ in range(SESSION_MINT_ATTEMPTS):
+            # Unlocked, so the subquery's snapshot is fine here; the locked read below takes the
+            # global epoch in its own statement (BACKLOG #5091).
+            pre = await self._fetchone(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            if pre is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733); the locked read
+                # below refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=int(pre["session_epoch"]),
+                    global_epoch=global_epoch_or_refuse(pre["global_epoch"]),
+                ),
+            )
+            inserted = await self._insert_sealed_session(
+                record,
+                now=now,
+                require_federated_subject=require_federated_subject,
+                require_sign_in_eligible=require_sign_in_eligible,
+            )
+            if inserted is not None:
+                return inserted
+        log.warning(
+            "sqlserver: a session insert found the session epochs raised %d times; giving up",
+            SESSION_MINT_ATTEMPTS,
+        )
+        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s locked transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
         # concurrent unbind or whole-account revoke committed first, and this read sees the cleared
         # pair (so the insert is refused) and the raised session epoch; or this transaction holds
@@ -17482,47 +17550,53 @@ class SqlServerStore:
                 # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
                 # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
                 # wait on each other.
+                # BACKLOG #5653: the eligibility columns are read under the same lock. A disable or
+                # a lockout is an UPDATE, which the shared HOLDLOCK lock blocks too, so either
+                # committed first and refuses this insert, or waits behind it.
                 if require_federated_subject is None:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
-                        (user_id,),
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        (record.user_id,),
                     )
                 else:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
-                        (user_id,),
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        (record.user_id,),
                     )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
                 # closes the cursor before the pooled connection is reused (EF-6).
                 rows = await cur.fetchall()
+                # Read once the lock is held, so a read that waited behind a writer judges a lock's
+                # expiry at the time of the read, not when this sign-in began to wait.
+                judged_at = time.time() if now is None else now
                 # An account deleted under this sign-in is refused, guarded or not (BACKLOG #2733):
                 # the INSERT would otherwise fail fk_sessions_user with a raw 547. A row this read
                 # found stays locked to the commit, so a delete cannot land before the INSERT.
-                if not rows or (
-                    require_federated_subject is not None
-                    and (rows[0][0], rows[0][1]) != require_federated_subject
+                if (
+                    not rows
+                    or (
+                        require_federated_subject is not None
+                        and (rows[0][0], rows[0][1]) != require_federated_subject
+                    )
+                    or (
+                        require_sign_in_eligible
+                        and sign_in_state_refused(rows[0][3], rows[0][4], rows[0][5], judged_at)
+                    )
                 ):
                     await conn.rollback()
                     return False
-                record = new_session_record(
-                    token_hash=token_hash,
-                    user_id=user_id,
-                    now=now,
-                    expires_at=expires_at,
-                    client=client,
-                    seed_reauth=seed_reauth,
-                    auth_mechanism=auth_mechanism,
-                    idp_auth_time=idp_auth_time,
-                    mfa_verified=mfa_verified,
+                if not session_epochs_current(
+                    record,
                     user_epoch=int(rows[0][2]),
                     # BACKLOG #5091: its own statement, after the row lock, for the reason
                     # postgres.py's create_session gives; revoke_all_sessions says why it cannot
                     # close a cycle.
                     global_epoch=await self._global_session_epoch(cur),
-                )
-                record = await seal_session_async(self._row_sealer, record)
+                ):
+                    await conn.rollback()
+                    return None
                 await cur.execute(_SESSION_INSERT, session_insert_params(record))
                 await self._commit(conn)
             except Exception:
