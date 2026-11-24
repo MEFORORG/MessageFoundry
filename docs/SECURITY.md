@@ -1654,8 +1654,8 @@ tuple: they act only on the caller's own account.
 | `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). **Refuses (400) whenever `[security].require_mfa` covers your local account and TOTP is on, unless a passkey recorded as discoverable remains**, because TOTP is then your only factor with a way past the sign-in lock; an administrator's factor reset is the recovery (`AuthService.disable_mfa`, ADR 0197 Amendment A). A directory account is refused only when TOTP is its last second factor and the requirement's scope covers it (BACKLOG #1022), and a local account the requirement does not cover is not refused. The passkey removal path refuses that last-factor case (ADR 0068 decision 5) and, from wave 2, the removal of a covered local account's last discoverable passkey while no TOTP remains, so the two routes no longer refuse on the same condition |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | data rule: *Single-route data rules* below (BACKLOG #1151) |
-| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate |
-| `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | password-only step-up, bound to the action (ASVS 7.5.2) |
+| `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only_action` (action `session_terminate`) | step-up without the MFA gate, bound to the action (ASVS 7.5.2): a login-seeded window does not unlock a terminate. A pending session is still refused with `403` + `X-MFA-Required`: one on an account with a factor proves it first (BACKLOG #1951), and one on an account with no factor that `[security].require_mfa` covers is MFA-pending and is told to enrol first (BACKLOG #1149) |
+| `DELETE` | `/me/sessions` | `require_reauth_only_action` (action `session_terminate`) | step-up without the MFA gate, bound to the action (ASVS 7.5.2). A pending session is refused as on the row above, including one with no factor under `[security].require_mfa`, which is told to enrol first (BACKLOG #1149) |
 
 #### Users, roles & directory maps
 
@@ -1989,8 +1989,8 @@ the console routes with a rule of their own.
 | `GET` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `POST` | `/ui/account/password` | *(authenticated session only)* | `require_ui` |
 | `GET` | `/ui/account/sessions` | *(authenticated session only)* | `require_ui` |
-| `POST` | `/ui/account/sessions/revoke-others` | *(authenticated session only)* | `require_ui_reauth_only_action` |
-| `POST` | `/ui/account/sessions/{session_id}/revoke` | *(authenticated session only)* | `require_ui_reauth_only_action` |
+| `POST` | `/ui/account/sessions/revoke-others` | *(authenticated session only)* | `require_ui_reauth_only_action`; a pending session is refused: one with a factor is sent to `/ui/reauth`, which asks for its code first (BACKLOG #1951), one with no factor under `[security].require_mfa` to the enrolment page (BACKLOG #1149) |
+| `POST` | `/ui/account/sessions/{session_id}/revoke` | *(authenticated session only)* | `require_ui_reauth_only_action`; a pending session is refused as on the row above (BACKLOG #1149) |
 | `POST` | `/ui/account/webauthn/enroll` | *(authenticated session only)* | `require_ui_reauth_only_action` |
 | `POST` | `/ui/account/webauthn/verify` | *(authenticated session only)* | `require_ui_reauth_only` |
 | `POST` | `/ui/account/webauthn/{credential_id_hash}/delete` | *(authenticated session only)* | `require_ui_step_up_action` |
