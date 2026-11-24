@@ -970,21 +970,37 @@ class _AWarningAsError(UserWarning):
     """What a pydicom warning becomes when the filters turn warnings into errors."""
 
 
+@pytest.mark.parametrize("status", [200, 202])
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize(
-    "fault",
+    ("fault", "code", "config_fault"),
     [
-        pytest.param(TypeError("a value: 1.2.3.Canary"), id="TypeError"),
-        pytest.param(_AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"), id="warning"),
-        pytest.param(RuntimeError("a reader is missing"), id="RuntimeError"),
-        pytest.param(AttributeError("no such reader"), id="AttributeError"),
+        pytest.param(TypeError("a value: 1.2.3.Canary"), "sent-uid-unread", False, id="TypeError"),
+        pytest.param(
+            _AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"),
+            "sent-uid-unread",
+            False,
+            id="warning",
+        ),
+        pytest.param(
+            RuntimeError("a reader is missing: 1.2.3.Canary"),
+            "dicom-extra-unusable",
+            True,
+            id="RuntimeError",
+        ),
     ],
 )
 async def test_dicomweb_a_pydicom_fault_of_any_class_refuses_before_the_post(
-    monkeypatch: pytest.MonkeyPatch, fault: Exception, capture: bool
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+    code: str,
+    config_fault: bool,
+    capture: bool,
+    status: int,
 ) -> None:
     # Manager decision of 2026-11-23: a fault in the data set read becomes a refusal of the
-    # message before anything is sent, never a raise after a partner's 202.
+    # message before anything is sent, never a raise after a partner's 202. A RuntimeError, the
+    # codec's signal of an unusable extra, is a configuration fault every queued row would meet.
     from messagefoundry.transports import dicomweb
 
     def parse(data: bytes) -> object:
@@ -994,23 +1010,59 @@ async def test_dicomweb_a_pydicom_fault_of_any_class_refuses_before_the_post(
     monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
     dest = _dest(capture_response=capture)
     # The reply names another instance, so a read made only after the reply still runs.
-    opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode(), status=202)
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode()
+    opener = _FakeOpener(body=body, status=status)
     dest._opener = opener  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
     assert opener.requests == []  # nothing was sent
-    assert exc.value.code == "sent-uid-unread"
+    assert exc.value.code == code
     assert exc.value.permanent is True
+    assert exc.value.config_fault is config_fault
+    assert (exc.value.remedy is not None) is config_fault
     text = str(exc.value)
     assert type(fault).__name__ in text and "nothing was sent" in text
     assert "Canary" not in text  # the fault's text, which can carry a value, is not named
     assert exc.value.__cause__ is None and exc.value.__context__ is None
 
 
+async def test_dicomweb_a_memory_error_in_the_read_escapes_before_the_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A MemoryError is not a verdict on the object, so it is not a permanent refusal.
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(MemoryError):
+        await dest.send(PAYLOAD)
+    assert opener.requests == []
+
+
+async def test_dicomweb_a_parse_failure_in_the_read_still_sends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Negative control for the refusal above: an object the codec cannot parse is no data set UID,
+    # and the object is still sent.
+    pytest.importorskip("pydicom")
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+    assert len(opener.requests) == 1
+
+
 async def test_dicomweb_a_broken_dicom_extra_refuses_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A pydicom missing a reader the deflate guard replays: the read refuses, before the POST.
+    # A pydicom missing a reader the deflate guard replays: the read refuses, before the POST, as
+    # a configuration fault.
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
@@ -1021,7 +1073,7 @@ async def test_dicomweb_a_broken_dicom_extra_refuses_before_the_post(
     dest._opener = opener  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
-    assert exc.value.code == "sent-uid-unread"
+    assert exc.value.code == "dicom-extra-unusable" and exc.value.config_fault is True
     assert opener.requests == []
 
 
@@ -1029,6 +1081,7 @@ def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The build no longer probes pydicom: a DICOMweb destination that never needs it builds.
+    # A regression pin: the build refused this before (BACKLOG #5914, the reviewer's altitude fix).
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
@@ -1036,10 +1089,11 @@ def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
     assert isinstance(_dest(), DicomWebDestination)
 
 
-def test_dicomweb_a_stray_pydicom_does_not_fail_the_build(
+async def test_dicomweb_a_stray_pydicom_builds_and_refuses_each_send_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A pydicom that find_spec finds but that does not import (here, blocked in sys.modules).
+    # A pydicom that find_spec finds but that does not import (here, blocked in sys.modules): the
+    # build succeeds, and a send is a configuration fault before the POST, whatever the status.
     import sys
 
     from messagefoundry.transports import dicomweb
@@ -1047,7 +1101,13 @@ def test_dicomweb_a_stray_pydicom_does_not_fail_the_build(
     monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
     monkeypatch.setitem(sys.modules, "pydicom", None)
     monkeypatch.setitem(sys.modules, "pydicom.filereader", None)
-    assert isinstance(_dest(), DicomWebDestination)
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "dicom-extra-unusable" and exc.value.config_fault is True
+    assert opener.requests == []
 
 
 def test_dicomweb_an_absent_dicom_extra_does_not_fail_the_build(
