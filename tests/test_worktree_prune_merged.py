@@ -2866,11 +2866,21 @@ def _fwd(path: Path) -> str:
     return str(path).replace("\\", "/")
 
 
-def test_an_unknown_end_state_keeps_the_claim_until_the_tree_is_confirmed_gone(
+def _held_claims(res: dict[str, Any]) -> list[tuple[str, str, str]]:
+    """``(path, key, file name)`` for every claim named by ``ledger.heldForClaims``."""
+    return [
+        (_fwd(Path(h["path"])), c["key"], Path(c["file"]).name)
+        for h in res["ledger"]["heldForClaims"]
+        for c in h["claims"]
+    ]
+
+
+def test_an_unknown_end_state_keeps_the_claim_and_its_ledger_entry(
     fx: Fixture, sleeper: int
 ) -> None:
-    """Red before the fix on the last run: the ledger dropped the entry and the claim stayed, naming
-    a tree that no longer exists, with nothing left that would ever release it."""
+    """Red before this branch's ledger pass: once the tree read as gone the ledger dropped the
+    entry, and the claim stayed with nothing reporting it. The pass releases no claim, ever; it keeps
+    the entry and names the claim, on a dry run and under -Apply, for claim.ps1 to release."""
     live_record(fx, sleeper, fx.primary)
     clean = fx.sibling("clean")
     _backdate(fx.primary, clean, hours=100)
@@ -2887,56 +2897,63 @@ def test_an_unknown_end_state_keeps_the_claim_until_the_tree_is_confirmed_gone(
         assert claim.exists(), "a run that could not confirm the tree gone released the claim"
         assert _ledger_paths(fx) == [_fwd(clean)]
 
+    named = [(_fwd(clean), "clean-work", claim.name)]
     preview = run(fx)
     assert preview["counts"]["claimsReleased"] == 0
     assert claim.exists(), "a dry run released a claim"
+    assert _held_claims(preview) == named, "the dry run did not name the claim"
     assert _ledger_paths(fx) == [_fwd(clean)], "a dry run rewrote the ledger"
 
+    confirmed = run(fx, "-Apply")
+    assert claim.exists(), "the ledger pass released a claim"
+    assert living.exists()
+    assert confirmed["counts"]["claimsReleased"] == 0
+    assert _held_claims(confirmed) == named
+    assert _ledger_paths(fx) == [_fwd(clean)], "the entry went while a claim still names the tree"
+    assert confirmed["_exit"] == 0
+
+    claim.unlink()  # what claim.ps1 -Release -Force does once a seat has checked the holder is gone
     settled = run(fx, "-Apply")
-    assert not claim.exists(), "the tree is confirmed gone and its claim is still held"
-    assert living.exists(), "a claim on a living worktree was released"
-    assert settled["counts"]["claimsReleased"] == 1
+    assert settled["ledger"]["heldForClaims"] == []
     assert _ledger_paths(fx) == []
     assert settled["_exit"] == 0
 
 
-@pytest.mark.parametrize("blocked_by", ["claim-file-locked", "unreadable-claim", "parent-gone"])
-def test_a_gone_entry_stays_in_the_ledger_while_its_claim_cannot_be_released(
-    fx: Fixture, sleeper: int, blocked_by: str
+@pytest.mark.parametrize("claimed_by", ["this-machine", "another-pc", "unreadable-claim"])
+def test_a_gone_entry_stays_in_the_ledger_while_a_claim_may_name_it(
+    fx: Fixture, sleeper: int, claimed_by: str
 ) -> None:
-    """Each block is lifted afterwards, and the same entry then settles. Red before the fix: the
-    ledger dropped the entry on the first run, so nothing could release the claim later."""
+    """The claim is named and never released, and the run's code is the one the claims alone earn:
+    0, so another PC's claim cannot red every run, or 1 for an unreadable claim as before. Red before
+    this branch: the ledger dropped the entry on the first -Apply."""
     live_record(fx, sleeper, fx.primary)
-    tree = (
-        fx.root / "wt" / "deleted-parent" / "repo-deleted"
-        if blocked_by == "parent-gone"
-        else fx.sibling("deleted")
-    )
+    tree = fx.sibling("deleted")
     _write_orphan_ledger(fx, tree)
     claim = write_claim(fx, "deleted-work", tree)
+    if claimed_by == "another-pc":
+        rec = json.loads(claim.read_bytes())
+        rec["host"] = "OTHER-PC"
+        claim.write_bytes(json.dumps(rec).encode("utf-8"))
     corrupt = _claims_dir(fx) / "corrupt.json"
+    if claimed_by == "unreadable-claim":
+        claim.unlink()
+        corrupt.write_bytes(b"{not json at all")
 
-    if blocked_by == "claim-file-locked":
-        with claim.open("rb"):
-            blocked = run(fx, "-Apply")
-        assert blocked["counts"]["claimsUnreleased"] == 1
-    else:
-        if blocked_by == "unreadable-claim":
-            corrupt.write_bytes(b"{not json at all")
-        blocked = run(fx, "-Apply")
-    assert blocked["counts"]["claimsReleased"] == 0
-    assert claim.exists()
-    assert _ledger_paths(fx) == [_fwd(tree)], "the entry went while its claim is still held"
-    assert [_fwd(Path(h["path"])) for h in blocked["ledger"]["heldForClaims"]] == [_fwd(tree)]
-    assert blocked["_exit"] == 1
-
-    if blocked_by == "unreadable-claim":
+    held = run(fx, "-Apply")
+    assert held["counts"]["claimsReleased"] == 0
+    assert _ledger_paths(fx) == [_fwd(tree)], "the entry went while a claim may still name it"
+    assert [_fwd(Path(h["path"])) for h in held["ledger"]["heldForClaims"]] == [_fwd(tree)]
+    if claimed_by == "unreadable-claim":
+        assert "could not be read" in held["ledger"]["heldForClaims"][0]["why"]
+        assert held["_exit"] == 1
         corrupt.unlink()
-    elif blocked_by == "parent-gone":
-        tree.parent.mkdir()
+    else:
+        assert claim.exists()
+        assert _held_claims(held) == [(_fwd(tree), "deleted-work", claim.name)]
+        assert held["_exit"] == 0
+        claim.unlink()
+
     settled = run(fx, "-Apply")
-    assert not claim.exists()
-    assert settled["counts"]["claimsReleased"] == 1
     assert settled["ledger"]["heldForClaims"] == []
     assert _ledger_paths(fx) == []
     assert settled["_exit"] == 0
@@ -2959,9 +2976,10 @@ def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: 
 def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
     fx: Fixture, sleeper: int, tmp_path: Path, git_exit: int, surface: str
 ) -> None:
-    """Red before the fix: it read ORPHANED, exit 3, and printed a recipe for moving a registered
-    checkout aside. The run established only git's exit code, that git still lists the tree, and
-    that the directory could not be read."""
+    """Red before the fix: it read ORPHANED and printed a recipe for moving a registered checkout
+    aside. The run established only git's exit code, that git still lists the tree, and that the
+    directory could not be read. A non-zero git exit keeps exit 3, because git may have deleted part
+    of the tree before it failed; exit 0 reports 1."""
     live_record(fx, sleeper, fx.primary)
     tree = fx.sibling("clean")
     _backdate(fx.primary, tree, hours=100)
@@ -2999,12 +3017,12 @@ def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
         assert d["BranchOutcome"] == "kept"
         assert res["counts"]["orphaned"] == 0
         assert res["counts"]["failed"] == 1
-        assert res["_exit"] == 1
+        assert res["_exit"] == (3 if git_exit else 1)
     else:
         assert "END STATE UNKNOWN" in proc.stdout, proc.stdout
         for wrong in ("ORPHANED", "Move-Item", "FAILED (exit", "not a git repository"):
             assert wrong not in proc.stdout, f"{wrong!r} in:\n{proc.stdout}"
-        assert proc.returncode == 1
+        assert proc.returncode == (3 if git_exit else 1)
 
 
 def test_a_claim_from_ANOTHER_machine_is_never_reaped_with_the_tree(

@@ -155,15 +155,16 @@
     reported a green all-clear over a directory this script had broken -- the recovery recipe existed
     only in the first run's scrollback. Every orphan is now recorded in <git-common-dir>/
     prune-merged-orphans.json and re-reported, with the recipe, on every subsequent run until the
-    directory is gone or re-registered. An entry whose directory is gone stays in the ledger until an
-    -Apply run has released the claims on that tree. A directory that still carries a .git FILE pointing into this
+    directory is gone or re-registered. An entry whose directory is gone stays in the ledger while a
+    coordination claim still names that tree; the run names the claim and releases none. A directory that still carries a .git FILE pointing into this
     repo's worktree admin area while git no longer lists it is reported the same way, ledger or not.
 
     EXIT CODES, highest severity wins: 0 nothing wrong; 1 something was attempted and failed without
-    destroying anything, or its end state could not be read on a tree git still lists, or a gone
-    tree's claims are not settled; 2 REFUSED -- something you asked for was not attempted, because safety could
-    not be established; 3 ORPHANED -- a directory is broken on disk right now and needs the recovery
-    recipe. 3 outranks 2 because damage on disk outranks a refusal to act.
+    destroying anything, or git exited 0 on a tree it still lists whose end state could not be read;
+    2 REFUSED -- something you asked for was not attempted, because safety could not be established;
+    3 ORPHANED -- a directory is broken on disk right now and needs the recovery recipe, or git exited
+    non-zero on a tree it still lists whose end state could not be read. 3 outranks 2 because damage
+    on disk outranks a refusal to act.
 
     2 IS PER-REQUEST, AND ITS CAUSES ARE NOT A CLOSED LIST. This paragraph read "nothing was
     attempted ... (bad cwd, unavailable fence, a -Name that matched nothing)". The list went stale
@@ -1485,7 +1486,8 @@ function Remove-ClaimsHeldBy {
 }
 
 # Still broken RIGHT NOW: on disk, and not registered. An entry that was repaired (re-added) or fully
-# deleted clears itself, so the ledger cannot nag about a state that no longer exists.
+# deleted leaves this report, so it cannot nag about a state that no longer exists. A fully deleted
+# one stays in the ledger while a claim names its tree (the pass after the apply loop).
 function Get-LiveOrphans([object[]]$Ledger) {
     $registered = @{}
     foreach ($w in @(Get-RepoWorktrees $RepoRoot)) { $registered[(ConvertTo-Norm $w.Path)] = $true }
@@ -1763,6 +1765,10 @@ if ($Apply -and $prunable.Count -gt 0) {
                 $d.Outcome = 'unknown'
                 $unread = if ($endUnknown) { 'the directory' } else { 'its .git pointer' }
                 $d.OutcomeDetail = "END STATE UNKNOWN: git exited $removeExit and still lists this worktree, but $unread could not be read ($err); branch '$($d.Branch)' was left alone"
+                # A non-zero git exit may have deleted part of the tree before it failed, so that case
+                # keeps the severity of a broken directory. No ledger entry: Get-LiveOrphans skips a
+                # registered path, so the entry would be dropped on the next read.
+                if ($removeExit -ne 0) { Set-Exit $EXIT_ORPHANED }
                 Write-Note "  $($d.OutcomeDetail)" 'Red'
                 Write-Note "  Re-check it: restore read access to it and its parent folder, then run this script again." 'Yellow'
             }
@@ -1786,7 +1792,7 @@ if ($Apply -and $prunable.Count -gt 0) {
                 }
                 elseif ($ptrState -eq 'unreadable') {
                     Write-Note "    Restore read access to it and its parent folder first, then run this script again:" 'Red'
-                    Write-Note "    the entry clears itself if the directory turns out to be gone. If it is there:" 'Red'
+                    Write-Note "    the entry leaves the orphan report if the directory turns out to be gone. If it is there:" 'Red'
                 }
                 else {
                     Write-Note "    'git worktree repair' cannot fix it (the .git file it needs is gone) and" 'Red'
@@ -1836,38 +1842,30 @@ if ($null -ne $venvReap -and -not $venvReap.ran) { Set-Exit $(if ($removed -gt 0
 # over a key nothing can claim, and a CI consumer reading the JSON would see a clean run.
 if ($claimsUnreadable.Count -gt 0) { Set-Exit $EXIT_FAILED }
 
-# A LEDGER ENTRY WHOSE TREE IS GONE LEAVES ONLY ONCE ITS CLAIMS ARE SETTLED. A removal whose end state
-# was unknown released nothing, so dropping its entry here would strand the claim with nothing left
-# to release it. A claim goes on the reading a confirmed removal uses: deregistered in a list that
-# was read, and gone with -RequireParent. Anything weaker keeps the entry for the next -Apply.
+# A LEDGER ENTRY WHOSE TREE IS GONE STAYS WHILE A CLAIM STILL NAMES THAT TREE. This pass releases no
+# claim, ever: a removal whose end state was unknown released none, and dropping its entry would leave
+# the claim with nothing reporting it. The claim is named instead, on a dry run and under -Apply, and
+# releasing it stays with claim.ps1. It costs no exit code, so another PC's claim at the same path
+# cannot red every run. An entry no claim names leaves the ledger on -Apply, as it always did.
 $heldForClaims = @()
-if ($Apply -and $ledgerPath -and $ledgerConfirmedGone.Count -gt 0) {
-    $listed = @(Get-RepoWorktrees $RepoRoot | ForEach-Object { ConvertTo-Norm $_.Path })
+if ($ledgerConfirmedGone.Count -gt 0) {
     $claimIndex = if ($claimsError) { $null } else { Get-ClaimedWorktreeIndex $claimsDir }
-    $settled = @{}
+    $seenGone = @{}
     foreach ($e in $ledgerConfirmedGone) {
         $p = [string]$e.path
         $n = ConvertTo-Norm $p
-        if ($settled.ContainsKey($n)) { continue }
-        $settled[$n] = $true
-        $why = ''
-        if ($listed.Count -eq 0) { $why = 'the worktree list could not be read, so the tree is not confirmed deregistered' }
-        elseif ($listed -contains $n) { continue }
-        elseif ($null -eq $claimIndex -or $claimIndex.Unreadable) { $why = 'the claim registry could not be read in full, so a claim on this tree cannot be ruled out' }
-        elseif (-not $claimIndex.Claimed.ContainsKey($n)) { continue }
-        elseif ((Get-EndStatePresence $p -Plain:(Test-ClaudeManagedPath $p) -RequireParent -Tries 1) -ne 'absent') {
-            $why = 'a claim names this tree, and it is not confirmed gone with its parent folder present'
+        if ($seenGone.ContainsKey($n)) { continue }
+        $seenGone[$n] = $true
+        $named = @()
+        if ($null -eq $claimIndex -or $claimIndex.Unreadable) { $why = 'the claim registry could not be read in full, so a claim on this tree cannot be ruled out' }
+        elseif ($claimIndex.Claimed.ContainsKey($n)) {
+            $named = @($claimIndex.Claimed[$n])
+            $why = "the directory is gone, but a claim still names it: $(($named | ForEach-Object { "'$($_.Key)' in $($_.File)" }) -join '; ')"
         }
-        else {
-            $cl = @(Remove-ClaimsHeldBy -Path $p)
-            $notReleased = @($cl | Where-Object { $_.outcome -eq 'failed' })
-            $claimsReleased += @($cl | Where-Object { $_.outcome -eq 'released' }).Count
-            $claimsUnreleased += $notReleased.Count
-            if ($notReleased.Count -gt 0) { $why = "a claim could not be released: $(($notReleased | ForEach-Object { "$($_.key) ($($_.detail))" }) -join '; ')" }
-        }
-        if ($why) {
-            Set-Exit $EXIT_FAILED
-            $heldForClaims += [pscustomobject]@{ path = $p; branch = [string]$e.branch; at = [string]$e.at; why = $why }
+        else { continue }
+        $heldForClaims += [pscustomobject]@{
+            path = $p; branch = [string]$e.branch; at = [string]$e.at; why = $why
+            claims = @($named | ForEach-Object { [pscustomobject]@{ key = $_.Key; file = $_.File } })
         }
     }
 }
@@ -1948,7 +1946,7 @@ if ($Json) {
         orphansFromEarlierRuns = @($priorOrphans | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; why = $_.Why } })
         ledger   = [pscustomobject]@{
             path = $ledgerPath; persisted = ($Apply -and -not $ledgerNote); note = $ledgerNote
-            heldForClaims = @($heldForClaims | ForEach-Object { [pscustomobject]@{ path = $_.path; why = $_.why } })
+            heldForClaims = @($heldForClaims | ForEach-Object { [pscustomobject]@{ path = $_.path; why = $_.why; claims = @($_.claims) } })
         }
         counts   = [pscustomobject]@{
             candidates      = $decisions.Count
@@ -2132,13 +2130,14 @@ if ($priorOrphans.Count -gt 0) {
         Write-Host "      3. git -C '$RepoRoot' worktree add '$($o.Path)'$(if ($o.Branch) { " '$($o.Branch)'" })" -ForegroundColor Red
         Write-Host "      4. copy anything you need out of '$($o.Path).salvage'" -ForegroundColor Red
     }
-    if (-not $Apply) { Write-Host "  (this list is re-derived every run; it clears itself once the directory is gone or re-registered)" -ForegroundColor DarkGray }
+    if (-not $Apply) { Write-Host "  (this list is re-derived every run; an entry leaves it once the directory is gone or re-registered, and a gone tree a claim still names is listed separately)" -ForegroundColor DarkGray }
 }
 if ($heldForClaims.Count -gt 0) {
     Write-Host ""
-    Write-Host "$($heldForClaims.Count) ledger entr(ies) kept for a tree read as gone, because its claims are not settled:" -ForegroundColor Red
-    foreach ($h in $heldForClaims) { Write-Host "  $($h.path)  --  $($h.why)" -ForegroundColor Red }
-    Write-Host "  The next -Apply reads them again." -ForegroundColor DarkGray
+    Write-Host "$($heldForClaims.Count) ledger entr(ies) kept for a tree read as gone, because a claim may still name it:" -ForegroundColor Yellow
+    foreach ($h in $heldForClaims) { Write-Host "  $($h.path)  --  $($h.why)" -ForegroundColor Yellow }
+    Write-Host "  This script releases no claim here. Once a claim's holder is confirmed gone, release it with" -ForegroundColor Yellow
+    Write-Host "  claim.ps1 -Release '<key>' -Force; the entry then leaves the ledger on the next -Apply." -ForegroundColor Yellow
 }
 if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
 

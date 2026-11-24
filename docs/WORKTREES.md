@@ -612,11 +612,15 @@ it is no longer in `git worktree list`, so it drops out of the candidate set and
 print a green all-clear over a directory this script had broken. Orphans are now recorded in
 `<git-common-dir>/prune-merged-orphans.json` and re-reported with the recipe on every later run until
 the directory is gone or re-registered — as is any unregistered `<repo>-*` directory whose `.git`
-pointer still names this repo.
+pointer still names this repo. An entry whose directory is gone stays in the ledger while a
+coordination claim still names that tree: the run names the claim's key and file, and releases
+none. Releasing it is `claim.ps1`'s, with `-Force`.
 
 Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
-without destroying anything; `2` **refused** — something you asked for was not attempted, because
-safety could not be established; `3` **orphaned** — a directory is broken on disk right now. `3`
+without destroying anything, or git exited `0` on a tree it still lists whose end state could not be
+read; `2` **refused** — something you asked for was not attempted, because safety could not be
+established; `3` **orphaned** — a directory is broken on disk right now, or git exited non-zero on a
+tree it still lists whose end state could not be read. `3`
 outranks `2` because damage on disk outranks a refusal to act. In the JSON receipt `counts.orphaned`
 is a *subset* of `counts.failed` (`failedNonOrphan` is spelled out alongside it); `removed + failed +
 skipped` covers every candidate exactly once.
