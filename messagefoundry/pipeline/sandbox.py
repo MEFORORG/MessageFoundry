@@ -672,8 +672,10 @@ _EOF_EXIT_POLL_SECONDS: Final = 0.02
 #: dispatch meets at most a handful of EOFs, so its total wait stays bounded.
 _EOF_EXIT_FLOOR_SECONDS: Final = 0.1
 
-#: How many workers a dispatch may replace for exiting, or closing their pipe, before its request
-#: is written; one more fails the call. The bound is per dispatch, shared by both of its
+#: How many counted replacements a dispatch may make before its request is written; one more fails
+#: the call. Not every replacement counts: at least a stray-frame retry and a kept worker the
+#: first check finds exited do not, so a dispatch can boot more workers than this. The bound is
+#: per dispatch, shared by both of its
 #: :meth:`SandboxSession._live_worker` calls, so the call before the write does not restart it.
 _LIVE_WORKER_EOF_RESPAWNS: Final = 2
 
