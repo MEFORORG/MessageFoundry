@@ -1194,6 +1194,14 @@ DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 #: during the role sync, can be refused there first, as ``account_refused``.
 ACCOUNT_DELETED = "account_deleted"
 
+#: The closed-set reason a directory sign-in is refused with when the store refused its session
+#: insert and the read after that refusal cannot name why (BACKLOG #5653): the row then reads
+#: enabled, unlocked and bound as the insert required, or could not be read. The account changed
+#: between the check and the insert (a lock that lapsed by the read, or a binding moved and moved
+#: back), and nothing read afterwards says how, so neither a lock nor a binding change is claimed.
+#: Absent from the browser layer's code map, so it shows as generic there.
+ACCOUNT_STATE_CHANGED_AT_INSERT = "account_state_changed_at_insert"
+
 #: The closed-set reason a directory answer is refused with when it names another directory object
 #: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
 DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
@@ -2759,11 +2767,12 @@ def _in_directory_sign_in_queue[**P](
 
     **ITS OWN QUEUE, NOT THE PASSWORD LEG'S.** :meth:`AuthService.login` holds the credential queue
     across each attempt's padded failure window, so a directory sign-in waiting in it could be
-    stalled by anyone sending passwords for that name. The disable and lock states that queue
-    protects on the password leg are held here by the store instead: the mint is refused for an
-    account disabled or locked when it inserts (``require_sign_in_eligible``), and the counter
-    clear is a compare-and-set on the row read before the mint, so it never clears a lock that
-    landed after that read.
+    stalled by anyone sending passwords for that name. That queue orders only concurrent sign-in
+    attempts (``login`` and ``verify_mfa``); an administrator's disable never takes it. Here the
+    disable and lock states are held by the store guard alone: the mint is refused for an account
+    disabled or locked when it inserts (``require_sign_in_eligible``), and the counter clear is a
+    compare-and-set on the row read before the mint, so it never clears a lock that landed after
+    that read.
 
     **WHAT THE QUEUE DOES NOT ORDER.** At least an administrator's disable or role change, a lock a
     re-proof or a second-step check sets, a directory reconciler pass, and a sign-in on another
@@ -8936,9 +8945,13 @@ class AuthService:
             # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
             # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
             # BACKLOG #5653: the store also refuses a row disabled or locked at the insert. The
-            # account is read once more to name that cause; a row that reads eligible again was
-            # refused for its binding, or its lock lapsed in between, and keeps the binding reason.
+            # account is read once more to name that cause. A binding reason is written only when
+            # that read shows the binding moved off what the insert required; a row that reads
+            # eligible and bound as required (a lock that lapsed by the read, say), or that could
+            # not be read, gets the neutral reason, so no binding change is claimed that the read
+            # does not show.
             now_ineligible: str | None = None
+            binding_moved = False
             if not changed.account_deleted:
                 try:
                     again = await self._load_user(user.id)
@@ -8960,10 +8973,17 @@ class AuthService:
                     # names the disabled and lock states alone; a binding change keeps the reason
                     # chosen below, and the insert's own guard already judged the binding.
                     now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
+                    binding_moved = (
+                        (again.oidc_issuer, again.oidc_subject) != federated_subject
+                        if federated
+                        else _holds_federated_binding(again)
+                    )
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif now_ineligible is not None:
                 reason = now_ineligible
+            elif not binding_moved:
+                reason = ACCOUNT_STATE_CHANGED_AT_INSERT
             elif federated:
                 reason = "federated_subject_unbound"
             else:

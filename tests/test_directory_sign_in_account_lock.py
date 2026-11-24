@@ -690,3 +690,78 @@ async def test_a_lock_that_lapses_while_the_insert_waits_is_judged_at_the_read(
         await asyncio.sleep(0.6)
         assert not mint.done()  # waiting on the writer lock this test holds
     assert await mint is True
+
+
+_OIDC_PAIR = ("https://idp.example/tenant", "S-1-insert-reason")
+
+
+async def _sign_in_on(service: AuthService, leg: str) -> Any:
+    if leg == "kerberos":
+        return await _sign_in(service, _principal())
+    return await service._complete_ad_login(
+        _principal(),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+        federated_subject=_OIDC_PAIR,
+        idp_auth_time=time.time(),
+    )
+
+
+@pytest.mark.parametrize("leg", ["kerberos", "oidc"])
+@pytest.mark.parametrize("reread", ["lock_lapsed", "unreadable"])
+async def test_an_insert_refusal_the_reread_cannot_explain_gets_the_neutral_reason(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, leg: str, reread: str
+) -> None:
+    """The store refuses the insert for a lock, and the read after the refusal finds the row
+    eligible and bound as the insert required (the lock lapsed), or cannot read it. The refusal is
+    audited under the neutral reason, never as a binding change, and the OIDC browser layer shows
+    it as a generic failure. RED on the head that fell through to ``federated_sign_in_required`` or
+    ``federated_subject_unbound`` (``oidc_not_linked`` in the browser)."""
+    from messagefoundry.auth.service import (
+        ACCOUNT_STATE_CHANGED_AT_INSERT,
+        FEDERATED_SIGN_IN_REQUIRED,
+    )
+    from messagefoundry_webconsole.routes.oidc import _REASON_TO_CODE
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    if leg == "oidc":
+        assert await engine.store.set_user_federated_subject(user_id, *_OIDC_PAIR) is not None
+        assert (await _sign_in_on(service, leg)).ok
+    before = await _live_sessions(engine, user_id)
+    refused: list[bool] = []
+    real_create = engine.store.create_session
+    real_load = service._load_user
+
+    async def create(*args: Any, **kwargs: Any) -> Any:
+        await engine.store.record_login_failure(
+            user_id, failed_attempts=5, locked_until=time.time() + 600
+        )
+        result = await real_create(*args, **kwargs)
+        # The lock lapses before the service reads the row again.
+        await engine.store.record_login_failure(user_id, failed_attempts=0, locked_until=None)
+        refused.append(result is False)
+        return result
+
+    async def load(uid: str) -> Any:
+        if refused and reread == "unreadable":
+            return None
+        return await real_load(uid)
+
+    monkeypatch.setattr(engine.store, "create_session", create)
+    monkeypatch.setattr(service, "_load_user", load)
+
+    out = await _sign_in_on(service, leg)
+
+    assert refused == [True], "the store never refused the insert"
+    assert not out.ok and out.token is None
+    assert out.reason == ACCOUNT_STATE_CHANGED_AT_INSERT
+    assert ACCOUNT_STATE_CHANGED_AT_INSERT not in _REASON_TO_CODE
+    assert await _live_sessions(engine, user_id) <= before
+    reasons = [r.get("reason") for r in await _failed_rows(engine)]
+    assert ACCOUNT_STATE_CHANGED_AT_INSERT in reasons
+    assert FEDERATED_SIGN_IN_REQUIRED not in reasons
+    assert "federated_subject_unbound" not in reasons
