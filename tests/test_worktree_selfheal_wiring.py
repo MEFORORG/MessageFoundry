@@ -382,20 +382,43 @@ def test_a_successful_install_preserves_keys_and_leaves_no_temp_file(home: Path,
     assert leftovers == ["settings.json.bak-selfheal"], f"stray files: {leftovers}"
 
 
-def test_the_live_settings_file_is_never_written_in_place() -> None:
-    """A concurrent session reading settings.json must see the old file or the new one, never a
-    truncated one. So the new text is parsed BEFORE anything is written, written to a temp file in the
-    same directory, and moved over the live file in one replace. No direct Set-Content onto it."""
-    src = INSTALLER.read_text(encoding="utf-8")
-    assert "Set-Content -LiteralPath $settingsPath" not in src, (
-        "live settings.json written in place"
+def test_an_invalid_result_leaves_settings_json_byte_identical(home: Path, cfg: Path) -> None:
+    """The new text is parsed BEFORE settings.json is touched. A ConvertFrom-Json shim, defined in the
+    calling scope so the script resolves it ahead of the cmdlet, fails the parse of the new text only,
+    and records whether settings.json already held the new wiring at that moment. origin/main wrote
+    first and rolled back after, so the marker is the witness of the order, not just the end state."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    marker = cfg.parent / "written-before-validate.txt"
+    shim = (
+        "function ConvertFrom-Json { param([Parameter(ValueFromPipeline)]$InputObject) "
+        "process { if (\"$InputObject\" -match 'worktree-selfheal') { "
+        f"if (Select-String -LiteralPath '{settings}' -SimpleMatch 'worktree-selfheal' -Quiet) "
+        f"{{ Set-Content -LiteralPath '{marker}' -Value x }}; throw 'injected parse failure' }} "
+        "$InputObject | Microsoft.PowerShell.Utility\\ConvertFrom-Json } }"
     )
-    parse_at = src.index("$null = $json | ConvertFrom-Json")
-    write_at = src.index("[IO.File]::WriteAllText($tmp")
-    # File.Move with overwrite is one rename; Move-Item -Force can delete the target first on Windows.
-    assert "Move-Item -LiteralPath $tmp" not in src, "a non-atomic replace of settings.json"
-    move_at = src.index("[IO.File]::Move($tmp, (Join-Path $liveAbs 'settings.json'), $true)")
-    assert parse_at < write_at < move_at
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{shim}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode != 0, "an invalid result was written"
+    assert "injected parse failure" in (r.stderr + r.stdout), "the shim never fired"
+    assert not marker.exists(), "settings.json was written before the new text was validated"
+    assert settings.read_bytes() == original, "settings.json changed"
+    assert not (cfg / "settings.json.bak-selfheal").exists()
 
 
 @pytest.mark.parametrize("bad", ["a$b", "a`b", 'a"b'])

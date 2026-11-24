@@ -7,9 +7,8 @@
 
 .DESCRIPTION
     Idempotent. MERGES (never clobbers) a SessionStart hook that runs the shared worktree-selfheal.ps1;
-    existing hooks and top-level keys are preserved. Validates the new JSON before writing, backs up
-    settings.json, and replaces it in one move from a temp file beside it, so it is never written in place.
-    It does not create the allowlist; install-gate.ps1 owns that.
+    existing hooks and top-level keys are preserved. Parses the new JSON before writing anything, backs
+    up settings.json, then writes it in place. It does not create the allowlist; install-gate.ps1 owns that.
 
     Run once per config dir a session can use. On this box (a subscription-swap setup) that is:
       ~/.claude                (the Desktop app; CLAUDE_CONFIG_DIR unset)
@@ -122,8 +121,12 @@ $groups = @($groups) + $entry
 $cfg.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue $groups -Force
 
 # Validate -> backup -> write a temp file beside the live one -> one replace. Other sessions read
-# settings.json at any moment, so it is never written in place: a reader sees the old file or the new
-# one, never a truncated one. Invalid JSON leaves the live file untouched and exits non-zero.
+# Validate -> backup -> write. The text is parsed BEFORE settings.json is touched, so a failed parse
+# leaves the live file byte-identical and exits non-zero. What the parse catches: text ConvertTo-Json
+# emitted that ConvertFrom-Json cannot read back. What it does not: anything ConvertTo-Json emits as
+# valid JSON, including objects nested past -Depth 40, which it turns into strings with only a warning.
+# The write is in place, as before, so it goes through a symlinked or hard-linked settings.json and
+# keeps the file's ACL; a reader during the write can still see a partial file.
 $json = $cfg | ConvertTo-Json -Depth 40
 try {
     $null = $json | ConvertFrom-Json
@@ -133,15 +136,5 @@ try {
 if (Test-Path -LiteralPath $settingsPath) {
     Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
 }
-# .NET resolves relative paths against the process directory, not the PowerShell location, so both
-# paths are made absolute first. File.Move with overwrite is one rename that replaces the target;
-# Move-Item -Force is not, on Windows it can delete the target first and leave a window with no file.
-$liveAbs = (Resolve-Path -LiteralPath $ConfigDir).ProviderPath
-$tmp = Join-Path $liveAbs ("settings.json.tmp-selfheal-{0}" -f [guid]::NewGuid().ToString('N'))
-try {
-    [IO.File]::WriteAllText($tmp, $json, [Text.UTF8Encoding]::new($false))
-    [IO.File]::Move($tmp, (Join-Path $liveAbs 'settings.json'), $true)
-} finally {
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-}
+Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
 Write-Host "[$ConfigDir] wired + valid JSON."

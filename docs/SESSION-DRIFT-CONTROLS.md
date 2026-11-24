@@ -422,7 +422,9 @@ the next action — and no test asserts on deny-text content.
 
 The gate reads `~/.claude/hooks/worktree-gate.repos.txt`; the selfheal backstop reads
 `~/.claude-hooks/worktree-gate.repos.txt`. `install-gate.ps1` rewrites its own unconditionally;
-`install-selfheal.ps1` seeds the other only if absent. Adding a governed repo via one installer never
+`install-selfheal.ps1` seeded the other only if absent. Since BACKLOG #7613 it creates no allowlist,
+and the backstop reads the gate's file first and the legacy one only as a fallback, so a copy an
+earlier run seeded is still read once the gate's file is gone. Adding a governed repo via one installer never
 reaches the other, and `install-gate.ps1 -Uninstall` leaves the backstop armed and still willing to
 `git checkout` the primary — so the "verified byte-for-byte clean uninstall" claim is true of the gate and
 false of the estate. They agree today by luck.
