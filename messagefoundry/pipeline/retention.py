@@ -148,6 +148,27 @@ def _verify_archive(path: str, original: bytes, *, name: str) -> bool:
     return True
 
 
+def _source_unchanged(source: str, read_st: os.stat_result, read_len: int) -> bool:
+    """Is ``source`` still the file the compressor read, holding no more and no fewer bytes?
+
+    Compares device, inode, size and mtime (ns) against ``read_st``, the ``fstat`` taken on the handle
+    the bytes were read through, and requires that size to equal ``read_len``. A failed ``stat``
+    (vanished, denied) counts as changed: the answer gates an unlink, so it fails closed. This narrows
+    the window between the check and the unlink to one ``stat`` then ``remove``; it cannot close it,
+    since no portable call removes a path only if it still names a given inode."""
+    try:
+        now_st = os.stat(source, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        read_st.st_size == read_len
+        and now_st.st_dev == read_st.st_dev
+        and now_st.st_ino == read_st.st_ino
+        and now_st.st_size == read_st.st_size
+        and now_st.st_mtime_ns == read_st.st_mtime_ns
+    )
+
+
 def _unlink_quietly(path: str) -> None:
     """Best-effort removal of a staging file. A leftover ``*.gz.mftmp`` is inert (never a swept suffix,
     never mistaken for an archive), so a failure here is logged at debug and otherwise ignored."""
@@ -1235,9 +1256,11 @@ class RetentionRunner:
            log) is discarded and the original left alone — compressing must not cost disk.
         4. **Integrity validation before deletion.** The archive is staged to an exclusively created,
            unpredictably named temp file (:meth:`_stage_archive`), ``fsync``ed, validated, renamed into
-           place, and then **re-validated at ``dest``** — that last check, on the bytes actually sitting
-           where the log used to be, is the only thing that authorizes removing the original. Any failure
-           leaves the original **untouched** and is logged (:meth:`_compress_one`).
+           place, and then **re-validated at ``dest``**. Removing the original takes that check, on the
+           bytes actually sitting at ``dest``, and a re-check that the source path is still the same
+           file (device, inode, size, mtime) it was read from, so a log appended to or rotated during
+           compression is kept (#6805). Any failure leaves the original **untouched** and is logged
+           (:meth:`_compress_one`).
 
         The archive inherits the source's mtime so the ``app_log_days`` delete window keeps applying to
         it. Blocking I/O throughout, so the caller runs it off the event loop. Never raises — a
@@ -1342,11 +1365,19 @@ class RetentionRunner:
         reports it as a success. Both checks are kept — the staged one so an unvalidated artifact is never
         placed at ``dest`` at all, the ``dest`` one because it is the only one that describes the bytes
         the delete is traded for. (The staging file itself is unpredictable and exclusively created, see
-        :meth:`_stage_archive`, so that window is closed from the other side too.)"""
+        :meth:`_stage_archive`, so that window is closed from the other side too.)
+
+        The ``dest`` read-back proves the archive holds the bytes read at the START; it says nothing
+        about the source since. So the unlink also requires :func:`_source_unchanged`: a source
+        appended to, truncated or replaced at the same path during compression is kept, with the
+        validated archive beside it (#6805)."""
         name = os.path.basename(source)
         try:
             with open(source, "rb") as fh:
                 data = fh.read()
+                # The identity of the file these bytes came from, taken on the SAME handle, so the
+                # unlink below can refuse a path that no longer holds exactly them (#6805).
+                read_st = os.fstat(fh.fileno())
         except OSError:
             log.warning("app-log compression skipped %r: unreadable", name)
             return None
@@ -1390,6 +1421,19 @@ class RetentionRunner:
             log.warning(
                 "app-log %r: the archive did not validate AFTER being renamed into place; the original "
                 "is kept and NOT counted as compressed. The unvalidated %r needs an operator's review.",
+                name,
+                os.path.basename(dest),
+            )
+            return None
+        if not _source_unchanged(source, read_st, len(data)):
+            # The archive validates against the bytes read at the START; the source path no longer holds
+            # exactly those (appended to, truncated, or replaced by a rotation). Removing it would destroy
+            # whatever was written since, so keep it AND the validated archive (under a rotation the
+            # archive may be the only copy of the old content). Not counted as compressed; the next pass
+            # skips this source while `<name>.gz` exists, and the delete window ages both out.
+            log.warning(
+                "app-log %r changed during compression; the original is kept and NOT counted as "
+                "compressed. %r holds only the bytes read before the change.",
                 name,
                 os.path.basename(dest),
             )
