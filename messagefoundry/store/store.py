@@ -3676,7 +3676,8 @@ class SessionRecord:
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
             global_epoch=int(d["global_epoch"]),
-            seal=d["seal"] or "",
+            # Text, as RoleRow and ApprovalRow read their seal (BACKLOG #6718).
+            seal=str(d["seal"] or ""),
         )
 
     def seal_fields(self) -> tuple[tuple[str, object], ...]:
