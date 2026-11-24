@@ -2639,7 +2639,10 @@ Properties of the anonymizer:
   salt**: the same real value yields the same surrogate **within a dataset** (referential integrity
   preserved), **different datasets use different salts** (no cross-dataset linkage), and the salt is
   secret (re-identification-resistant). Generate the salt with `secrets.token_urlsafe(24)`. The
-  keyer refuses a salt that looks degenerate, and that screen also refuses a small share of
+  keyer refuses a salt under 16 characters, so under 16 bytes, the length of a 128-bit key; that
+  is a floor on length, not on entropy, and the tee's refusal names the variable the salt came
+  from without quoting the salt (vault BACKLOG #4652). The
+  keyer also refuses a salt that looks degenerate, and that screen also refuses a small share of
   genuinely random salts drawn from a narrow alphabet, such as decimal digits. That is an accepted
   cost. If one is refused, replace it with a salt from that tool, not another draw from the same
   alphabet. The rates and the stated bound are in the docstring of `_estimated_entropy_bits` in
