@@ -21,11 +21,9 @@ surrogate writes itself, such as the date fill's ``+``, the free-text redaction'
 and a street's space, is judged first, against the field separator and the MSH-2 delimiters, the
 same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
 :func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
-the field separator, which the engine adapter's whole-field ``Message.set`` refuses too, and,
-through the shared ``surrogates.refuse_controls_in_field``, which the engine adapter calls the same
-way, for a C0 control character (BACKLOG #5533 item 14; a field a keep leaves, for CR, LF, an MLLP
-frame byte or NUL only). The shared site-code pass that runs after the rules writes no digit the
-message declares as a separator.
+the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
+``Message.set`` refuses too. The shared site-code pass that runs after the rules writes no digit
+the message declares as a separator.
 """
 
 from __future__ import annotations
@@ -45,7 +43,6 @@ from .surrogates import (
     obx5_kind,
     preserve_obx5_value,
     read_message_seps,
-    refuse_controls_in_field,
     repeats_encoding_characters,
     scrub_message_site_codes,
     surrogate_field_recorded,
@@ -105,24 +102,29 @@ def anonymize_message(
             if _skip_obx5(rule, fields, seps):
                 continue
             if index < len(fields):
-                kind = _kind_for(rule, fields)
                 value = surrogate_field_recorded(
-                    rule.path, kind, fields[index], keyer, seps, blanked
+                    rule.path, _kind_for(rule, fields), fields[index], keyer, seps, blanked
                 )
-                fields[index] = _whole_field(rule.path, value, field_sep, kind, seps)
+                fields[index] = _whole_field(rule.path, value, field_sep)
     encoded = "\r".join(field_sep.join(fields) for fields in segments)
     return scrub_message_site_codes(encoded, keyer, rules)
 
 
-def _whole_field(path: str, value: str, field_sep: str, kind: SurrogateKind, seps: Seps) -> str:
-    """``value``, unless it holds the field separator, which the engine's whole-field
-    ``Message.set`` refuses, or a control byte :func:`refuse_controls_in_field` refuses on both
-    adapters; then a body-free :class:`SurrogateSeparatorRefused` naming the rule and the cause,
-    never the value."""
+#: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then
+#: its ``_STRUCTURE_REFUSED``, which the tee cannot import. A test pins the two refusing alike.
+_REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
+
+
+def _whole_field(path: str, value: str, field_sep: str) -> str:
+    """``value``, unless it holds the field separator or a character in ``_REFUSED_IN_FIELD``; then a
+    body-free :class:`SurrogateSeparatorRefused` naming the rule and the cause, never the value."""
     if field_sep in value:
-        raise SurrogateSeparatorRefused(path, "the message's field separator (MSH-1)")
-    refuse_controls_in_field(path, value, kind, seps)
-    return value
+        cause = "the message's field separator (MSH-1)"
+    elif any(char in value for char in _REFUSED_IN_FIELD):
+        cause = "a segment separator, an MLLP frame byte or NUL"
+    else:
+        return value
+    raise SurrogateSeparatorRefused(path, cause)
 
 
 def _skip_obx5(rule: FieldRule, fields: list[str], seps: Seps) -> bool:

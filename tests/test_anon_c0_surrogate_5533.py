@@ -76,8 +76,8 @@ def test_a_tab_kept_inside_an_identifier_component_is_refused(
 
 @pytest.mark.parametrize("char", ["\x07", "\t", "\x1b"], ids=["BEL", "TAB", "ESC"])
 def test_a_field_a_keep_rule_leaves_is_not_checked(char: str) -> None:
-    """A keep writes nothing, so a control byte in the field it keeps passes on both adapters,
-    the same way. Without this, a capture with a TAB in a kept field would be refused."""
+    """``anonymize`` drops a keep rule before either adapter runs, so no rule writes the field and
+    a control byte in it passes on both adapters, the same way."""
     rules_engine = (engine_anon.FieldRule("PID-3", engine_anon.SurrogateKind.KEEP),)
     rules_tee = (tee_anon.FieldRule("PID-3", tee_anon.SurrogateKind.KEEP),)
     message = _message(f"{_NEEDLE}{char}34^^^H^MR")
@@ -106,6 +106,18 @@ def test_a_control_character_the_message_declares_as_a_delimiter_is_not_refused(
     for anon in (engine_anon, tee_anon):
         with pytest.raises(anon.AnonError, match="C0 control character"):
             anon.anonymize(stray, salt=_SALT)
+
+
+@pytest.mark.parametrize("char", ["\t", "\x0c", "\x1f"], ids=["TAB", "FF", "US"])
+def test_a_control_byte_ending_the_message_is_a_known_difference(char: str) -> None:
+    """The engine's parser trims white space after the last field of the last line before a rule
+    reads it, and the tee does not (``docs/PHI.md`` section 9 lists the difference). So a ruled
+    identifier ending the message with a TAB is emitted without it by the engine and refused by
+    the tee. Both fail closed on the byte: neither emits it."""
+    message = _message(f"{_NEEDLE}34^^^H^MR").split("|||||")[0] + char
+    assert char not in engine_anon.anonymize(message, salt=_SALT)
+    with pytest.raises(tee_surrogates.SurrogateSeparatorRefused, match="C0 control character"):
+        tee_anon.anonymize(message, salt=_SALT)
 
 
 def test_del_is_not_refused_and_both_sides_agree() -> None:

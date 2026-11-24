@@ -36,7 +36,6 @@ from .surrogates import (
     obx5_kind,
     preserve_obx5_value,
     read_message_seps,
-    refuse_controls_in_field,
     repeats_encoding_characters,
     scrub_message_site_codes,
     surrogate_field_recorded,
@@ -95,7 +94,6 @@ def anonymize_message(
                     continue
                 kind = _kind_for(rule, msg, occ)
                 scrubbed = surrogate_field_recorded(rule.path, kind, value, keyer, seps, blanked)
-                refuse_controls_in_field(rule.path, scrubbed, kind, seps)
                 msg.set(rule.path, scrubbed, occurrence=occ)
         encoded = msg.encode()
     except AnonError:
