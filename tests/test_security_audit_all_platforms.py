@@ -13,6 +13,7 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 from __future__ import annotations
 
 import codecs
+import errno
 import io
 import locale
 import os
@@ -21,6 +22,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -1105,9 +1107,41 @@ def test_a_stdout_that_cannot_take_the_summary_exits_2(
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 2
     assert ran == []
-    assert (
-        f"::error::{src}: the summary could not be written to stdout (" in capsys.readouterr().err
-    )
+    err = capsys.readouterr().err
+    assert err.startswith(f"::error::{src}: ")
+    assert err.rstrip().endswith("the audit did not run")
+
+
+def _cli_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    """Point ``cli`` at a clean lock, with both subprocesses answering ``status``."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["audit_all_platforms", str(src)])
+    monkeypatch.setattr(audit_module, "_run", lambda cmd, pass_environment: status)
+
+
+@pytest.mark.parametrize("status", [0, 1])
+def test_cli_passes_the_audit_status_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    _cli_on(tmp_path, monkeypatch, status)
+    assert audit_module.cli() == status
+
+
+def test_an_unrelated_oserror_from_main_still_raises_through_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a refusal's own stream write is held to exit 2. Any other OSError keeps its
+    traceback, one with errno EINVAL included: Windows gives that errno to every Win32 error it
+    has no other mapping for, such as WinError 123 from a bad RUNNER_TEMP."""
+    _cli_on(tmp_path, monkeypatch, 0)
+
+    def bad_temp(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError(errno.EINVAL, "Invalid argument", "C:\\bad<dir", 123)
+
+    monkeypatch.setattr("tempfile.TemporaryDirectory", bad_temp)
+    with pytest.raises(OSError, match="Invalid argument"):
+        audit_module.cli()
 
 
 @pytest.mark.parametrize("shared", [False, True], ids=["stdout", "stdout-and-stderr"])

@@ -74,7 +74,7 @@ With it and a hashed file, pip-audit reads the pins as already resolved and refu
 that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a release PyPI has removed,
 say) fail the audit instead of being skipped.
 
-WHAT IT REFUSES, exit 2: a lock with no requirement lines at all, so an empty input cannot read as
+WHAT IT REFUSES, exit 2, at least: a lock with no requirement lines at all, so an empty input cannot read as
 a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv export
 never writes and which would resolve against the temporary copy's directory, or escape the strip,
 rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
@@ -95,7 +95,10 @@ would print a ``NAME=value`` typed there; and a pip-audit option after the lock 
 on pins it did not audit, ``-r`` among them, as ``_FAIL_OPEN_LONG`` says of each, short,
 abbreviated or in the ``=`` form; and a lock path that holds ``=``; and a summary that cannot
 be written to stdout (a reader that closed the pipe, say), refused before pip runs; a reader that
-leaves after the summary is written is not caught here. No refusal quotes a
+leaves after the summary is written is not caught here. Every refusal prints its
+``::error::`` line through ``_refuse``, which still returns 2 when stderr's reader has gone; run
+as a script (``cli``), what stayed buffered is discarded at exit, so the process exits 2 then
+too, not 120. No refusal quotes a
 word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
 reaches pip-audit, which can print it in its own output. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
@@ -144,7 +147,7 @@ import tempfile
 import urllib.parse
 from collections.abc import Callable, Collection, Sequence
 from pathlib import Path
-from typing import NoReturn
+from typing import NoReturn, TextIO
 
 from messagefoundry.childenv import (
     auditor_environment,
@@ -760,47 +763,71 @@ def _distinct_count(requirements: Sequence[str]) -> int:
     return len(set(requirements))
 
 
+def _refuse(message: str) -> int:
+    """Print ``::error::<message>`` to stderr and return 2, the refusal's exit code.
+
+    A reader that has gone from stderr (``2>&1`` into a closed pipe, say) makes the write raise.
+    That is not re-raised: the refusal still exits 2. Nothing else records it, since stderr is
+    the stream that failed; :func:`cli` then discards what stayed buffered, so the exit-time flush
+    does not turn the 2 into 120.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        print(f"::error::{message}", file=sys.stderr)
+    return 2
+
+
 def _reader_gone(exc: OSError) -> bool:
-    """Whether a write failed because the pipe's reader closed it. Windows reports that as
-    EINVAL, not EPIPE."""
-    return isinstance(exc, BrokenPipeError) or exc.errno == errno.EINVAL
+    """Whether a failed stream flush has the shape of a write to a pipe whose reader closed it.
+
+    That is BrokenPipeError, or on Windows an OSError with errno EINVAL and no winerror, which is
+    what the C runtime raises there. A Win32 API error that CPython maps to EINVAL carries its
+    winerror, so it does not match. Only :func:`_flush_or_discard` asks this, of a flush it made.
+    """
+    if isinstance(exc, BrokenPipeError):
+        return True
+    return (
+        sys.platform == "win32"
+        and exc.errno == errno.EINVAL
+        and getattr(exc, "winerror", None) is None
+    )
 
 
-def _flush_or_discard(stream: object) -> None:
+def _flush_or_discard(stream: TextIO | None) -> None:
     """Flush ``stream``; if its reader has gone, point its descriptor at devnull.
 
     After a failed write the buffer still holds the text, and the interpreter's own flush at exit
     would fail again and turn the exit code into 120. Pointing the descriptor at the null device is
     the recipe in the Python docs' note on SIGPIPE. Only the script entry calls this, never
-    :func:`main`, which would otherwise redirect an in-process caller's stream. Any other write
-    error (EAGAIN from a slow live reader, say) leaves the stream as it is, so a reader still
-    there can get the rest. Where the redirect itself fails, the exit-time flush still fails and
-    the exit code is 120: nonzero either way. Nothing is logged for that, since the streams a line
-    would go to are the ones that failed.
+    :func:`main`, which would otherwise redirect an in-process caller's stream. Any other flush
+    error (EAGAIN from a slow live reader, say) leaves the stream as it is, buffer included, so
+    the interpreter's exit-time flush tries again and, if that fails, reports it on stderr itself
+    and exits 120. So does a redirect that fails: neither is swallowed, and neither exits 0.
     """
-    with contextlib.suppress(AttributeError, OSError, ValueError):
+    if stream is None:
+        return
+    try:
+        stream.flush()
+    except ValueError:
+        return  # a closed stream: nothing is buffered to fail at exit
+    except OSError as exc:
+        if not _reader_gone(exc):
+            return
         try:
-            stream.flush()  # type: ignore[attr-defined]
-        except OSError as exc:
-            if not _reader_gone(exc):
-                return
             devnull = os.open(os.devnull, os.O_WRONLY)
             try:
-                os.dup2(devnull, stream.fileno())  # type: ignore[attr-defined]
+                os.dup2(devnull, stream.fileno())
             finally:
                 os.close(devnull)
+        except (OSError, ValueError):
+            return  # left for the exit-time flush to report, as the docstring says
 
 
 def cli() -> int:
     """The command-line entry: :func:`main`, then :func:`_flush_or_discard` on both console
-    streams, however ``main`` ends, a usage error's ``SystemExit`` included. A refusal whose
-    ``::error::`` line met a reader that had gone exits 2, as the refusal would have."""
+    streams, however ``main`` ends, a usage error's ``SystemExit`` and a traceback included.
+    An exception from ``main`` still propagates, so it ends as a traceback and exit 1."""
     try:
         return main()
-    except OSError as exc:
-        if not _reader_gone(exc):
-            raise
-        return 2
     finally:
         _flush_or_discard(sys.stdout)
         _flush_or_discard(sys.stderr)
@@ -840,94 +867,72 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     # --skip-private entry holding one is refused here unquoted, a word after the lock by its
     # position, and a --pass-environment entry by pass_environment_refusal, which never echoes it.
     if "=" in str(args.lock):
-        print(
-            "::error::the lock path holds '='; it is not quoted, since a NAME=value typed without "
-            "its flag is read as the lock. Name the lock first, or check the option before it",
-            file=sys.stderr,
+        return _refuse(
+            "the lock path holds '='; it is not quoted, since a NAME=value typed without "
+            "its flag is read as the lock. Name the lock first, or check the option before it"
         )
-        return 2
     lock = str(args.lock)
     refusal = _after_lock_refusal(args.pip_audit_args)
     if any("=" in name for name in args.skip_private):
         refusal = "a --skip-private entry is not a package name; name packages only"
     if refusal:
-        print(f"::error::{lock}: {refusal}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: {refusal}")
 
     try:
         raw = args.lock.read_bytes()
     except OSError as exc:
-        print(f"::error::{lock}: not readable: {safe_exc(exc, file_name=lock)}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: not readable: {safe_exc(exc, file_name=lock)}")
     try:
         source, copy_encoding = _decode_lock(raw)
     except (UnicodeError, LookupError) as exc:
         # A codec error's own text quotes the byte it failed on (vault BACKLOG #3033, #3185), so
         # safe_exc names it by type, codec and position; a LookupError keeps its type and a
         # bounded text, since the codec name it quotes is the lock's own, of any length.
-        print(
-            f"::error::{lock}: not decodable the way pip decodes a requirements file: "
-            f"{safe_exc(exc)}",
-            file=sys.stderr,
+        return _refuse(
+            f"{lock}: not decodable the way pip decodes a requirements file: {safe_exc(exc)}"
         )
-        return 2
     lines, kinds = _classify(source)
     stripped_lines, stripped, requirements = _strip(lines, kinds)
     if requirements == 0:
-        print(
-            f"::error::{lock}: no requirement lines -- refusing an empty audit",
-            file=sys.stderr,
-        )
-        return 2
+        return _refuse(f"{lock}: no requirement lines -- refusing an empty audit")
     options = _lines_of(lines, kinds, "option")
     if options:
-        print(f"::error::{lock}: pip option lines are not audited: {options}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: pip option lines are not audited: {options}")
     continued = _lines_of(lines, kinds, "continued")
     if continued:
-        print(
-            f"::error::{lock}: a requirement continues onto a line whose marker would not be "
-            f"removed: {continued}",
-            file=sys.stderr,
+        return _refuse(
+            f"{lock}: a requirement continues onto a line whose marker would not be "
+            f"removed: {continued}"
         )
-        return 2
     # The count is of the lock as committed, which _kinds reads once (L6); the copy is what
     # pip-audit's parser reads (see _pip_audit_requirement_count). Checked here, before _drop reads
     # the stripped lines by the lock's kinds, and again on the copy _drop leaves.
     if _pip_audit_requirement_count("".join(stripped_lines)) != requirements:
-        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: {_COUNT_REFUSAL}")
     private = {canonical_name(name) for name in args.skip_private}
     refusal = _skip_private_refusal(private, args.pip_audit_args) or _pass_environment_refusal(
         args.pass_environment, args.pip_audit_args
     )
     if refusal:
-        print(f"::error::{lock}: {refusal}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: {refusal}")
     # _strip rewrote lines one for one, so _drop reads them by the lock's kinds. Where the strip
     # left a pin ending in a backslash, the copy joins lines the kinds keep apart; the check above
     # refuses that where it changes the count, and the check after _drop reads the copy it leaves.
     kept, skipped = _drop(stripped_lines, kinds, private)
     unmatched = private - {name for name, _ in skipped}
     if unmatched:
-        print(
-            f"::error::{lock}: --skip-private names a package the lock does not pin: "
-            f"{sorted(unmatched)}",
-            file=sys.stderr,
+        return _refuse(
+            f"{lock}: --skip-private names a package the lock does not pin: {sorted(unmatched)}"
         )
-        return 2
     if len(skipped) == requirements:
-        print(f"::error::{lock}: --skip-private leaves no pin to audit", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: --skip-private leaves no pin to audit")
     counted = requirements - len(skipped)
     audited = "".join(kept)
     read = _pip_audit_requirements(audited)
     if read is None or len(read) != counted:
-        print(f"::error::{lock}: {_COUNT_REFUSAL}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: {_COUNT_REFUSAL}")
     if any(map(_pip_audit_may_see_marker, read)):
-        print(f"::error::{lock}: {_MARKER_REFUSAL}", file=sys.stderr)
-        return 2
+        return _refuse(f"{lock}: {_MARKER_REFUSAL}")
     # A skipped pin is neither counted nor listed as audited.
     stripped = [e for e in stripped if (name := _pin_name(e)) is None or name not in private]
     summary = [
@@ -938,24 +943,18 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
     ]
     # A reader that closed the pipe (BrokenPipeError, or OSError errno 22 on Windows) made this a
     # traceback (vault BACKLOG #3786 R5); so did a closed stream (ValueError), and no stream at all
-    # (None under pythonw) printed nothing. Refused before pip or pip-audit runs. The line names
-    # the error's type alone, which is not always a closed pipe.
-    failure = "NoneType" if sys.stdout is None else None
-    if failure is None:
-        try:
-            sys.stdout.write("".join(f"{line}\n" for line in summary))
-            sys.stdout.flush()
-        except (OSError, ValueError) as exc:
-            failure = type(exc).__name__
-    if failure is not None:
-        # Nothing is logged where this print fails too: stderr is the stream that failed.
-        with contextlib.suppress(OSError, ValueError):
-            print(
-                f"::error::{lock}: the summary could not be written to stdout ({failure}); "
-                "the audit did not run",
-                file=sys.stderr,
-            )
-        return 2
+    # (None under pythonw) raised AttributeError at the flush. Refused before pip or pip-audit
+    # runs. The line names the error's type alone, which is not always a closed pipe.
+    if sys.stdout is None:
+        return _refuse(f"{lock}: there is no stdout to write the summary to; the audit did not run")
+    try:
+        sys.stdout.write("".join(f"{line}\n" for line in summary))
+        sys.stdout.flush()
+    except (OSError, ValueError) as exc:
+        return _refuse(
+            f"{lock}: the summary could not be written to stdout ({type(exc).__name__}); "
+            "the audit did not run"
+        )
     if run is None:
         run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
@@ -973,11 +972,7 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
             # before it. Bytes also skip newline translation; pip-audit reads "\n" on every host.
             copy.write_bytes(audited.encode(copy_encoding))
         except UnicodeError as exc:
-            print(
-                f"::error::{lock}: its copy is not writable as {copy_encoding}: {safe_exc(exc)}",
-                file=sys.stderr,
-            )
-            return 2
+            return _refuse(f"{lock}: its copy is not writable as {copy_encoding}: {safe_exc(exc)}")
         # The count above is of `audited`, so pip-audit must decode exactly that. A codec whose
         # encode does not round-trip (unicode_escape escapes every newline, raw_unicode_escape a
         # line separator after a backslash) folds pins into a comment, and pip-audit audits fewer
@@ -991,12 +986,10 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         except (OSError, UnicodeError, LookupError):
             faithful = False
         if not faithful:
-            print(
-                f"::error::{lock}: its copy does not read back, the way pip-audit reads it, "
-                "as the text whose pins were counted",
-                file=sys.stderr,
+            return _refuse(
+                f"{lock}: its copy does not read back, the way pip-audit reads it, "
+                "as the text whose pins were counted"
             )
-            return 2
         audit = [*python_module_argv("pip_audit"), "-r", str(copy), "--desc", "--disable-pip"]
         return run([*audit, "--strict", *args.pip_audit_args])
 
