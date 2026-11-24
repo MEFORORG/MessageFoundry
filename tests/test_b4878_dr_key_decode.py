@@ -7,7 +7,21 @@ Measured before the fix, on Windows, with a synthetic key set in ``MEFOR_STORE_E
 ``restore-verify`` and ``restore`` each exited 1 through the last-resort handler, for a key that is
 not base64 and for one with a character that is not ASCII. For the second, the raised
 ``ValueError`` chained a ``UnicodeEncodeError`` naming that character and its position, and holding
-the whole key as its ``object``. Each site now decodes by the rule ``open_store`` applies and
+the whole key as its ``object``. The output, re-measured on 2026-11-24 at engine ``637771b265`` (the
+parent of the fix, engine PR 2764), on Windows, per route:
+
+- ``restore-verify --json`` and ``restore --json``: exit 1. Stdout, for the non-ASCII key, was
+  ``{"error": "ValueError: string argument should contain only ASCII characters"}``, and for the
+  malformed key ``{"error": "Error: Invalid base64-encoded string: number of data characters (9)
+  cannot be 1 more than a multiple of 4"}``. Stderr held the last-resort CRITICAL line with the
+  same text. Neither put a key byte on stdout or stderr in that run.
+- The backup's ``_resolve_key``, called directly: ``ValueError`` chained from ``UnicodeEncodeError:
+  'ascii' codec can't encode character '\\xd7' in position 8``, and the same ``binascii.Error``
+  text for the malformed key. The ``backup`` command never reached it: with a store file present
+  it exited 2 at the store open, ``the active store key (...) must be valid base64``, and with
+  none it exited 2 at ``no SQLite store``. So no command printed this site's chain.
+
+Each site now decodes by the rule ``open_store`` applies and
 raises ``StoreCipherConfigError`` with fixed text and no chain, and both commands exit 2, "could
 not start".
 
