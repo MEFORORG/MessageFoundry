@@ -1827,25 +1827,53 @@ async def test_app_log_compression_survives_a_racing_rewrite_of_the_staging_file
     assert result.app_logs_compressed == 0  # and it is not reported as compressed
 
 
-@pytest.mark.parametrize("change", ["append", "replace"])
-async def test_app_log_compression_keeps_a_source_that_changed_during_compression(
+_CHANGES = ["append", "replace", "replace_same_size", "rewrite_same_size"]
+
+
+def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> bytes:
+    """Change ``old_log`` the way ``change`` names and return what it should then hold. Every case but
+    ``rewrite_same_size`` puts the old mtime back, so the size or the file id must betray it; the
+    ``*_same_size`` cases keep the size, so only the file id (replace) or the mtime (rewrite) can."""
+    body = old_log.read_bytes()
+    if change == "append":
+        with open(old_log, "ab") as fh:
+            fh.write(late)
+        expected = body + late
+    elif change in ("replace", "replace_same_size"):
+        expected = late if change == "replace" else b"R" * len(body)
+        rotated = old_log.with_name("rotated.tmp")
+        rotated.write_bytes(expected)
+        os.replace(rotated, old_log)
+    else:
+        expected = b"W" * len(body)
+        with open(old_log, "r+b") as fh:
+            fh.write(expected)
+        os.utime(old_log, (old + 1, old + 1))
+        return expected
+    os.utime(old_log, (old, old))
+    return expected
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
     store: MessageStore, tmp_path, monkeypatch, caplog, change: str
 ) -> None:
-    """A log appended to, or replaced (rotated) at the same path, after the compressor read it must NOT
-    be unlinked: the validated archive describes only the bytes read at the START, so removing the path
-    would destroy whatever was written into it since. BACKLOG #6805.
+    """A log appended to, rewritten, or replaced (rotated) at the same path after its archive was placed
+    must NOT be unlinked: the validated archive describes only the bytes read at the START, so removing
+    the path would destroy whatever was written into it since. BACKLOG #6805.
 
     RULE: the read-back at ``dest`` proves the archive matches ``data``; it says nothing about whether
-    ``source`` still holds only ``data``. The unlink must also check that the path is still the same file
-    (device + inode) with the same size and mtime as when it was read."""
+    ``source`` still holds only ``data``. The unlink must also check that the path is still the same
+    file (device + file id) with the same size and times as when it was read."""
     logs = tmp_path / "logs"
     logs.mkdir()
     now = 30 * DAY
+    old = now - 10 * DAY
     old_log = logs / "old.log"
     body = b"engine started\n" * 500
-    late = b"a line written during compression\n"
     old_log.write_bytes(body)
-    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
 
     real_verify = retention_mod._verify_archive
 
@@ -1853,15 +1881,7 @@ async def test_app_log_compression_keeps_a_source_that_changed_during_compressio
         ok = real_verify(path, original, name=name)
         if not path.endswith(".mftmp"):
             # The window between the dest read-back and the unlink: a writer touches the source path.
-            if change == "append":
-                with open(old_log, "ab") as fh:
-                    fh.write(late)
-            else:
-                rotated = logs / "rotated.tmp"
-                rotated.write_bytes(late)
-                os.replace(rotated, old_log)
-            # Keep the mtime unchanged, so only size/inode betray the change (a coarse-mtime filesystem).
-            os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
         return ok
 
     monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
@@ -1871,12 +1891,83 @@ async def test_app_log_compression_keeps_a_source_that_changed_during_compressio
             store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
         ).run_once()
 
-    expected = body + late if change == "append" else late
-    assert old_log.exists() and old_log.read_bytes() == expected  # nothing written mid-pass is lost
+    assert (
+        old_log.exists() and old_log.read_bytes() == expected[0]
+    )  # nothing written mid-pass is lost
     # The validated archive of the ORIGINAL read is kept too: under rotation it may be the only copy.
     assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
     assert result.app_logs_compressed == 0 and result.app_log_bytes_reclaimed == 0
-    assert "changed during compression" in caplog.text
+    assert "changed after its archive was placed" in caplog.text
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_places_nothing_for_a_source_that_changed_before_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A source that changed between the read and the rename gets no archive at all: a stale partial
+    ``<name>.gz`` would block every later compression of that path (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "changed during compression; nothing placed" in caplog.text
+
+
+async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A fresh file rotated into an aged path after the scan, and before the read, is not compressed:
+    the scan's age no longer describes it (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    fresh = b"fresh rotated content\n" * 200
+
+    def rotate_then_allow(self, size, *, name):
+        rotated = logs / "rotated.tmp"
+        rotated.write_bytes(fresh)
+        os.utime(rotated, (now, now))
+        os.replace(rotated, old_log)
+        return True
+
+    monkeypatch.setattr(RetentionRunner, "_has_free_space", rotate_then_allow)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == fresh
+    assert not (logs / "old.log.gz").exists()
+    assert result.app_logs_compressed == 0
+    assert "changed while being read" in caplog.text
 
 
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(

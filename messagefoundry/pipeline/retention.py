@@ -148,25 +148,32 @@ def _verify_archive(path: str, original: bytes, *, name: str) -> bool:
     return True
 
 
-def _source_unchanged(source: str, read_st: os.stat_result, read_len: int) -> bool:
-    """Is ``source`` still the file the compressor read, holding no more and no fewer bytes?
+def _same_file_state(a: os.stat_result, b: os.stat_result) -> bool:
+    """Whether two stat results describe one unchanged file: the same device and file id
+    (:func:`os.path.samestat`), size and mtime (ns), and off Windows the same ctime (ns), the inode
+    change time, which ``os.utime`` cannot set back. Windows is left out of the ctime compare because
+    there ``os.fstat`` reports the change time and ``os.stat`` the creation time, so the two never
+    agree; the file id already separates a replacement there."""
+    if not os.path.samestat(a, b) or (a.st_size, a.st_mtime_ns) != (b.st_size, b.st_mtime_ns):
+        return False
+    return os.name == "nt" or a.st_ctime_ns == b.st_ctime_ns
 
-    Compares device, inode, size and mtime (ns) against ``read_st``, the ``fstat`` taken on the handle
-    the bytes were read through, and requires that size to equal ``read_len``. A failed ``stat``
-    (vanished, denied) counts as changed: the answer gates an unlink, so it fails closed. This narrows
-    the window between the check and the unlink to one ``stat`` then ``remove``; it cannot close it,
-    since no portable call removes a path only if it still names a given inode."""
+
+def _source_change(source: str, read_st: os.stat_result) -> str | None:
+    """``None`` when ``source`` is still the file described by ``read_st`` (the ``fstat`` taken on the
+    handle its bytes were read through), else why not: ``"vanished"`` or ``"changed"``, or the error a
+    re-``stat`` raised. Every non-``None`` answer blocks the unlink it gates, so it fails closed.
+
+    This does not make the check and the unlink atomic: at least a change landing between this
+    ``stat`` and the ``remove`` that follows it, and a same-size rewrite inside one timestamp tick on a
+    file system that reports no file id, still pass it (#6805)."""
     try:
         now_st = os.stat(source, follow_symlinks=False)
-    except OSError:
-        return False
-    return (
-        read_st.st_size == read_len
-        and now_st.st_dev == read_st.st_dev
-        and now_st.st_ino == read_st.st_ino
-        and now_st.st_size == read_st.st_size
-        and now_st.st_mtime_ns == read_st.st_mtime_ns
-    )
+    except FileNotFoundError:
+        return "vanished"
+    except OSError as exc:
+        return f"could not be re-read ({type(exc).__name__})"
+    return None if _same_file_state(now_st, read_st) else "changed"
 
 
 def _unlink_quietly(path: str) -> None:
@@ -1368,18 +1375,31 @@ class RetentionRunner:
         :meth:`_stage_archive`, so that window is closed from the other side too.)
 
         The ``dest`` read-back proves the archive holds the bytes read at the START; it says nothing
-        about the source since. So the unlink also requires :func:`_source_unchanged`: a source
-        appended to, truncated or replaced at the same path during compression is kept, with the
-        validated archive beside it (#6805)."""
+        about the source since. So the source is pinned at the read (two ``fstat`` calls on the read
+        handle must agree with each other, with the bytes read and with the scan's mtime), and
+        :func:`_source_change` is checked again before the archive is placed and before the unlink. A
+        source appended to, truncated or replaced at the same path during compression is kept (#6805);
+        :func:`_source_change` names what that still misses."""
         name = os.path.basename(source)
         try:
             with open(source, "rb") as fh:
+                # The identity of the file these bytes come from, taken on the SAME handle before and
+                # after the read, so a change during the read is caught here and the unlink below can
+                # refuse a path that no longer holds exactly these bytes (#6805).
+                before_st = os.fstat(fh.fileno())
                 data = fh.read()
-                # The identity of the file these bytes came from, taken on the SAME handle, so the
-                # unlink below can refuse a path that no longer holds exactly them (#6805).
                 read_st = os.fstat(fh.fileno())
         except OSError:
             log.warning("app-log compression skipped %r: unreadable", name)
+            return None
+        if (
+            not _same_file_state(before_st, read_st)
+            or read_st.st_size != len(data)
+            or read_st.st_mtime != mtime
+        ):
+            # Changed during the read, or not the file the scan aged (a rotation between the scan and
+            # the open). Nothing is staged, so nothing is left behind; the next pass looks again.
+            log.warning("app-log compression skipped %r: it changed while being read", name)
             return None
         try:
             blob = gzip_compress(data)
@@ -1400,6 +1420,18 @@ class RetentionRunner:
         if not _verify_archive(tmp, data, name=name):
             _unlink_quietly(tmp)
             return None
+        change = _source_change(source, read_st)
+        if change is not None:
+            # Checked before placing too, so a source that changed while it was compressed leaves no
+            # stale partial archive at `dest` to block its later compression, and a source a peer
+            # compressor already archived and removed is not followed by a rename over that archive.
+            log.warning(
+                "app-log compression skipped %r: the source %s during compression; nothing placed",
+                name,
+                change,
+            )
+            _unlink_quietly(tmp)
+            return None
         try:
             # Inherit the source's timestamps so the `app_log_days` delete window still ages the archive
             # out on the ORIGINAL file's clock (compressing a log must not reset its retention clock).
@@ -1412,8 +1444,8 @@ class RetentionRunner:
             _unlink_quietly(tmp)
             return None
         if not _verify_archive(dest, data, name=name):
-            # The ONLY gate on the unlink below, and it did not pass: whatever is at `dest` is not this
-            # log. Keep the original (it is still the only good copy) and do not count it as compressed.
+            # One of the two gates on the unlink below (with `_source_change`), and it did not pass:
+            # whatever is at `dest` is not this log. Keep the original (it is still the only good copy) and do not count it as compressed.
             # The artifact at `dest` is deliberately NOT removed: under a concurrent compressor it may be
             # a VALID archive of a longer read of the same log whose source is already gone, and deleting
             # that would be the very data loss this check exists to prevent. It is inert (the next pass
@@ -1425,16 +1457,19 @@ class RetentionRunner:
                 os.path.basename(dest),
             )
             return None
-        if not _source_unchanged(source, read_st, len(data)):
+        change = _source_change(source, read_st)
+        if change is not None:
             # The archive validates against the bytes read at the START; the source path no longer holds
-            # exactly those (appended to, truncated, or replaced by a rotation). Removing it would destroy
-            # whatever was written since, so keep it AND the validated archive (under a rotation the
-            # archive may be the only copy of the old content). Not counted as compressed; the next pass
-            # skips this source while `<name>.gz` exists, and the delete window ages both out.
+            # exactly those (appended to, truncated, replaced by a rotation, or gone). Removing it would
+            # destroy whatever was written since, so leave the path alone AND keep the validated archive
+            # (under a rotation it may be the only copy of the old content). Not counted as compressed.
+            # The next pass skips this source while `<name>.gz` exists; only an `app_log_days` window
+            # ages the two out, so with none set both stay until an operator acts.
             log.warning(
-                "app-log %r changed during compression; the original is kept and NOT counted as "
-                "compressed. %r holds only the bytes read before the change.",
+                "app-log %r: the source %s after its archive was placed; the source path is left "
+                "alone and NOT counted as compressed. %r holds the bytes read before that.",
                 name,
+                change,
                 os.path.basename(dest),
             )
             return None
