@@ -836,3 +836,70 @@ def test_trace_accepts_declined_is_empty_without_predicates() -> None:
     traced = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
     assert traced["accepts_declined"] == []
     assert not [inv for inv in traced["invocations"] if inv["kind"] == "accepts"]
+
+
+# --- bounded capture + the shared Message patch (BACKLOG #6824, #6825) --------------------------
+
+
+def _capture_tracers(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Keep each `_Tracer` that `trace_dry_run` builds, so a test can read its recorders."""
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    made: list = []
+
+    class _Kept(dt._Tracer):
+        def __init__(self, show_phi: bool) -> None:
+            super().__init__(show_phi)
+            made.append(self)
+
+    monkeypatch.setattr(dt, "_Tracer", _Kept)
+    return made
+
+
+def _retained_writes(rec) -> int:
+    pending = sum(len(v) for v in rec._writes_by_line.values())
+    return pending + sum(len(ev.get("writes", [])) for ev in rec.events)
+
+
+def test_writes_after_the_event_cap_are_not_retained(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past _MAX_EVENTS no line is finalized, so a write recorded then is never emitted. It must not
+    # be kept either, or a long mutating loop grows the recorder without bound (BACKLOG #6824).
+    from messagefoundry.pipeline.dryrun_trace import _MAX_EVENTS
+
+    def handle_loops(msg: Message) -> Send:
+        for _ in range(_MAX_EVENTS * 2):
+            msg["MSH-3"] = "X"
+        return Send("out", msg)
+
+    made = _capture_tracers(monkeypatch)
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_loops}), ADT_A01)
+    assert traced["sends"] == [{"outbound": "out"}]
+    inv = _handler_invocation(traced)
+    assert inv.get("truncated") is True
+    rec = next(r for r in made[0].invocations if r.kind == "handler")
+    assert rec._writes_by_line == {}
+    assert _retained_writes(rec) <= _MAX_EVENTS
+    assert _all_writes(inv), "writes before the cap are still emitted"
+
+
+def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A helper the Handler calls is not line-traced, so all its writes land on one Handler line.
+    # The per-invocation cap must bound those too, and say the record is truncated (BACKLOG #6824).
+    from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
+
+    def fill(msg: Message) -> None:
+        for _ in range(_MAX_WRITES * 2):
+            msg["MSH-3"] = "X"
+
+    def handle_calls_fill(msg: Message) -> Send:
+        fill(msg)
+        return Send("out", msg)
+
+    made = _capture_tracers(monkeypatch)
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_calls_fill}), ADT_A01)
+    assert traced["sends"] == [{"outbound": "out"}]
+    inv = _handler_invocation(traced)
+    assert inv.get("truncated") is True
+    rec = next(r for r in made[0].invocations if r.kind == "handler")
+    assert _retained_writes(rec) <= _MAX_WRITES
+    assert len(_all_writes(inv)) == _MAX_WRITES

@@ -94,6 +94,10 @@ __all__ = ["trace_dry_run"]
 # marked ``truncated``). A long string local / write value is likewise capped so a body can't be dumped
 # in full even under --show-phi.
 _MAX_EVENTS = 5000
+# Message writes are capped per invocation on their own, because a helper the Handler calls is not
+# line-traced: all its writes land on one Handler line, so the event cap alone never bounds them.
+# Past either cap a write is dropped and the record marked ``truncated`` (BACKLOG #6824).
+_MAX_WRITES = 5000
 _MAX_VALUE_LEN = 120
 
 
@@ -300,6 +304,7 @@ class _Recorder:
         self._last_ts: float | None = None
         self._snap_before: dict[str, Any] = {}
         self._writes_by_line: dict[int, list[dict[str, Any]]] = {}
+        self._write_count = 0  # writes kept, pending or emitted, against _MAX_WRITES
 
     # tracer callbacks ---------------------------------------------------------
 
@@ -335,6 +340,8 @@ class _Recorder:
     def _finalize(self, frame: FrameType, line: int, elapsed: float) -> None:
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
+            # No later line is emitted, so writes still pending here never will be either.
+            self._writes_by_line.clear()
             return
         now = _safe_snapshot(frame)
         assigned = _diff(now, self._snap_before, self.show_phi)
@@ -349,6 +356,12 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
+        # Past the event cap no line is finalized, so a write kept now would never be emitted, only
+        # held: a long mutating loop would grow this recorder without bound (BACKLOG #6824).
+        if len(self.events) >= _MAX_EVENTS or self._write_count >= _MAX_WRITES:
+            self.truncated = True
+            return
+        self._write_count += 1
         line = self.frame.f_lineno if self.frame is not None else (self.def_line or 0)
         self._writes_by_line.setdefault(line, []).append(
             {"path": path, "value": _safe_value(value, self.show_phi)}
