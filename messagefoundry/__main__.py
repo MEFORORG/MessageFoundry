@@ -10213,6 +10213,43 @@ def _opened_left_behind(exc: BaseException, store: StoreSettings, *, keyed: bool
     )
 
 
+def _two_opens_left_behind(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    earlier_open: str,
+    this_open: str,
+    this_open_returned: bool = False,
+) -> str:
+    """What a refusal at, or after, a command's second store open left behind, once its first
+    open had returned (BACKLOG #5067, PR 3162 hold 3): sentences, the last with no full stop, as
+    :func:`_open_refusal_left_behind` returns them. ``earlier_open`` and ``this_open`` name the two
+    opens, as ``opener`` does there.
+
+    The earlier open's sentence takes keyedness and the genesis record from the refused class
+    where it says (:func:`_refused_open_keying`), since both opens ran under the same settings,
+    and from ``keyed`` otherwise. That open ran the one-time steps, so they are named once, for
+    it, and ``this_open`` is described with none of them, and with no claim about this command's
+    rows. A refusal whose class says nothing names the earlier open alone, unless
+    ``this_open_returned`` says the caller knows ``this_open`` returned before the refusal: then
+    it may also have written."""
+    keying = _refused_open_keying(exc)
+    left = _open_steps_left_behind(
+        store,
+        keyed=keyed if keying is None else keying.keyed,
+        genesis=None if keying is None else keying.genesis,
+        returned=True,
+        opener=earlier_open,
+    )
+    this_left = _open_refusal_left_behind(exc, store, opener=this_open, after_an_earlier_open=True)
+    if this_left is None and this_open_returned:
+        this_left = _open_steps_left_behind(
+            store, keyed=keyed, returned=True, opener=this_open, after_an_earlier_open=True
+        )
+    return left if this_left is None else f"{_sentence(left)} {this_left}"
+
+
 def _kept_key_sentence(kept: Path) -> str:
     """``provision-admin``'s words for the store key a failed create kept (PR 2804 fourteenth
     hold), with no full stop."""
@@ -10316,27 +10353,78 @@ def _invocation_bound_provision_refusal(
     return text if kept is None else f"{text}. {_kept_key_sentence(kept)}"
 
 
+#: ``provision-admin``'s name for its pre-check's open, once the write's open came after it.
+_PRE_CHECK_OPEN = "this command's earlier open, which ran the pre-check before the prompts,"
+#: ``provision-admin``'s name for its write's open, once the pre-check's open came before it.
+_WRITE_OPEN = "the write's own open"
+
+
+def _provision_left_behind(
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    opened: bool = False,
+    after_the_pre_check: bool = False,
+) -> str | None:
+    """What a ``provision-admin`` refusal at, or after, one of its store opens left behind
+    (BACKLOG #5067), or ``None`` where nothing was. ``opened`` says the open the refusal came at
+    had returned before ``exc``, so a refusal :func:`_open_refusal_left_behind` says nothing for
+    names what that open may have changed. ``keyed`` is :func:`_open_is_keyed` under the
+    settings.
+
+    ``after_the_pre_check`` says the refusal came at, or after, the write's open, once the
+    pre-check's open over an existing store had returned. The command then ran two opens, and the
+    text names each (:func:`_two_opens_left_behind`), as ``admin-reset-totp``'s does for its own
+    two (follow-up from PR 3162's review)."""
+    if opened:
+        return _provision_opened_left_behind(
+            exc, store, keyed=keyed, after_the_pre_check=after_the_pre_check
+        )
+    if after_the_pre_check:
+        return _two_opens_left_behind(
+            exc, store, keyed=keyed, earlier_open=_PRE_CHECK_OPEN, this_open=_WRITE_OPEN
+        )
+    return _open_refusal_left_behind(exc, store)
+
+
+def _provision_opened_left_behind(
+    exc: BaseException, store: StoreSettings, *, keyed: bool, after_the_pre_check: bool
+) -> str:
+    """:func:`_provision_left_behind` for a refusal raised once the open it came at had returned,
+    which never leaves nothing behind."""
+    if after_the_pre_check:
+        return _two_opens_left_behind(
+            exc,
+            store,
+            keyed=keyed,
+            earlier_open=_PRE_CHECK_OPEN,
+            this_open=_WRITE_OPEN,
+            this_open_returned=True,
+        )
+    return _opened_left_behind(exc, store, keyed=keyed)
+
+
 def _provision_open_refusal(
     exc: BaseException,
     store: StoreSettings,
     *,
     kept: Path | None = None,
     opened: bool = False,
+    after_the_pre_check: bool = False,
     keyed: bool = True,
 ) -> str:
     """``provision-admin``'s text for a refused store open: the refusal, then what it left
-    behind (:func:`_open_refusal_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
+    behind (:func:`_provision_left_behind`, BACKLOG #5067). Through ``codec_safe_str``, as
     every other command prints an open refusal: a key source's codec error quotes a byte of what
     it decoded (BACKLOG #2532). ``kept`` is the store key a failed create kept: the text then
-    names it, and never says nothing was written (PR 2804 fourteenth hold). ``opened`` says the
-    open had returned before ``exc``, so a refusal :func:`_open_refusal_left_behind` says nothing
-    for names what the open may have changed (BACKLOG #5067); ``keyed`` says a store key is
-    configured, since a keyless open binds no salt."""
+    names it, and never says nothing was written (PR 2804 fourteenth hold). ``opened``,
+    ``after_the_pre_check`` and ``keyed`` are as for :func:`_provision_left_behind`."""
     from messagefoundry.redaction import codec_safe_str
 
-    left = _open_refusal_left_behind(exc, store)
-    if left is None and opened:
-        left = _open_steps_left_behind(store, keyed=keyed, returned=True)
+    left = _provision_left_behind(
+        exc, store, keyed=keyed, opened=opened, after_the_pre_check=after_the_pre_check
+    )
     if kept is not None:
         held = _kept_key_sentence(kept)
         tail = (
@@ -11283,8 +11371,14 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # two keyless ones, or the audit row's check. Each is raised before the write, so the
         # shown key's entry has no seed (#5067). Each follows a full open, which may have changed
         # the database, so the text says so (#5067). Each follows a keyless open whatever this
-        # passes, `_UnauditableWrite` included (`_refused_open_keying`).
-        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        # passes, `_UnauditableWrite` included (`_refused_open_keying`). Over an existing store
+        # the pre-check's open came first, and the text names both (#5067).
+        left = _provision_opened_left_behind(
+            exc,
+            settings.store,
+            keyed=_open_is_keyed(settings),
+            after_the_pre_check=precheck_opened,
+        )
         _emit_error(after_the_key(str(exc), f"{_sentence(exc)} {left}"), as_json=args.json)
         return 2
     except key_unresolved + (InsecureHopRefused, ServerSchemaMismatchError) as exc:
@@ -11298,8 +11392,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 exc,
                 settings.store,
                 kept=kept_key,
+                opened=store_opened,
                 # The pre-check's open, over an existing store, came first (#5067).
-                opened=store_opened or precheck_opened,
+                after_the_pre_check=precheck_opened,
                 keyed=_open_is_keyed(settings),
             ),
         )
@@ -11317,8 +11412,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 exc,
                 settings.store,
                 kept=kept_key,
+                opened=store_opened,
                 # The pre-check's open, over an existing store, came first (#5067).
-                opened=store_opened or precheck_opened,
+                after_the_pre_check=precheck_opened,
                 keyed=_open_is_keyed(settings),
             ),
         )
@@ -11351,7 +11447,12 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # After the open returned, such as a lock during the writes: the store opened, so this is
         # no "cannot open". The class only: a driver's message can quote a stored value.
         refusal = f"the store failed after it opened ({type(exc).__name__})"
-        left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
+        left = _provision_opened_left_behind(
+            exc,
+            settings.store,
+            keyed=_open_is_keyed(settings),
+            after_the_pre_check=precheck_opened,
+        )
         _emit_error(
             after_the_key(refusal, f"{refusal}. Refusing to provision. {left}"), as_json=args.json
         )
@@ -11892,34 +11993,21 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
         ``after_check`` says the refusal came from the swap's open or a read after it, so check()'s
         open had returned before it: the sentence that says what an open may have changed names
         which open, the earlier one or the replacement's own, since "the open" would read as the
-        one just refused. The earlier open's keyedness and genesis record come from the refused
-        class where it says (:func:`_refused_open_keying`), since both opens ran under the same
-        settings, and from the settings otherwise. That open ran the one-time steps, so the
-        replacement's own open is described with none of them, and the genesis record is named
-        for at most one open (PR 3162 hold 3). A refusal the class says nothing about names the
-        earlier open alone: it may have come before the replacement's open touched the
-        database."""
+        one just refused (:func:`_two_opens_left_behind`, PR 3162 hold 3). A refusal the class
+        says nothing about names the earlier open alone: it may have come before the
+        replacement's open touched the database."""
         keyed = _open_is_keyed(settings)
         if after_check:
-            earlier_open = (
-                "this command's earlier open, which checked the account before the key was shown,"
-            )
-            keying = _refused_open_keying(exc)
-            left = _open_steps_left_behind(
-                settings.store,
-                keyed=keyed if keying is None else keying.keyed,
-                genesis=None if keying is None else keying.genesis,
-                returned=True,
-                opener=earlier_open,
-            )
-            this_open = _open_refusal_left_behind(
+            left = _two_opens_left_behind(
                 exc,
                 settings.store,
-                opener="the replacement's own open",
-                after_an_earlier_open=True,
+                keyed=keyed,
+                earlier_open=(
+                    "this command's earlier open, which checked the account before the key was "
+                    "shown,"
+                ),
+                this_open="the replacement's own open",
             )
-            if this_open is not None:
-                left = f"{_sentence(left)} {this_open}"
         elif store_returned:
             left = _opened_left_behind(exc, settings.store, keyed=keyed)
         else:

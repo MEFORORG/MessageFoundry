@@ -1202,7 +1202,7 @@ def test_a_key_refusal_at_the_write_open_over_an_existing_store_names_the_pre_ch
     """Over an existing store the pre-check's open returned, and may have written, before the
     write's open is refused, so the refusal does not say nothing was written.
 
-    Mutation: pass ``opened=store_opened`` alone from the write's key-resolution arm."""
+    Mutation: pass ``after_the_pre_check=False`` from the write's key-resolution arm."""
     from messagefoundry import __main__ as cli
     from messagefoundry.auth.service import AuthService
     from messagefoundry.store import base
@@ -1333,3 +1333,168 @@ def test_admin_unlock_keyless_chain_refusal_says_so_with_certainty(
     assert "[store].synthetic" in out, out
     assert _CERTAIN in out and _MAY_OR_MAY_NOT not in out, out
     assert _SALT not in out and _GENESIS not in out, out
+
+
+# Follow-up from PR 3162's review (BACKLOG #5067): provision-admin runs two opens over an existing
+# store, the pre-check's and then the write's, the same shape PR 3162 fixed in admin-reset-totp.
+
+_PRE_CHECK_OPEN = "this command's earlier open, which ran the pre-check before the prompts,"
+_WRITE_OPEN = "the write's own open"
+_SCHEMA = "the schema, which the open creates or migrates"
+
+
+def _refused_at_the_write_after_the_pre_check(
+    monkeypatch: pytest.MonkeyPatch, refusal: Exception
+) -> None:
+    """The pre-check's open returns over an existing store and finds nothing to refuse, so
+    ``provision-admin`` prompts, shows the key and reaches the write's open, which raises
+    ``refusal``. The settings read as keyed, so a sentence built from them would name the salt
+    record and the genesis record."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.auth.service import AuthService
+    from messagefoundry.store import base
+
+    class _Opened:
+        async def close(self) -> None:
+            return None
+
+    async def opening(*_a: object, create: bool = False, **_k: object) -> object:
+        if create:
+            raise refusal
+        return _Opened()
+
+    async def no_refusal(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(cli, "_open_is_keyed", lambda _settings: True)
+    monkeypatch.setattr(base, "open_store", opening)
+    monkeypatch.setattr(AuthService, "provision_refusal", no_refusal)
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
+    monkeypatch.setattr(
+        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+    )
+
+
+@pytest.mark.parametrize("refusal", ["keyless-chain", "keyless-key"])
+def test_provision_admin_keyless_refusal_at_the_write_names_no_keyed_step_for_the_pre_check(
+    refusal: str, shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 1, at provision-admin: a keyless-class refusal at the write's open,
+    after the pre-check's open returned, names the pre-check's open as the earlier one, with no
+    salt record and no genesis record, whatever the settings say: the refused class says the store
+    opens keyless, and both opens ran under the same settings.
+
+    Mutation: build the pre-check-open sentence from ``_open_is_keyed`` instead of the class."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+    from messagefoundry.store.crypto import StoreKeylessError
+
+    exc: Exception = (
+        KeylessAuditChainRefused("mefor", "[store].synthetic")
+        if refusal == "keyless-chain"
+        else StoreKeylessError("synthetic keyless store at the write")
+    )
+    _refused_at_the_write_after_the_pre_check(monkeypatch, exc)
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert _PRE_CHECK_OPEN in out, out
+    assert _SALT not in out and _GENESIS not in out, out
+    assert _UNUSED_ENTRY in out, out
+
+
+def test_provision_admin_cipher_refusal_at_the_write_names_each_one_time_step_once(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 2, at provision-admin: the pre-check's open returned first and ran the
+    one-time steps, so they are named once, for it, and the write's own open is described with
+    none of them. The text described one "open" that may or may not have run them.
+
+    Mutation: list the one-time steps in the write-open sentence again."""
+    from messagefoundry.store.crypto import CipherError
+
+    _refused_at_the_write_after_the_pre_check(
+        monkeypatch, CipherError("synthetic cipher refusal at the write")
+    )
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert _PRE_CHECK_OPEN in out, out
+    assert out.count(_GENESIS) == 1 and out.count(_SALT) == 1, out
+    assert out.count(_SCHEMA) == 1 and out.count(_RCSI) == 1, out
+    assert f"{_WRITE_OPEN} may or may not have reached its own writing steps" in out.lower(), out
+    assert _UNUSED_ENTRY in out, out
+
+
+def test_provision_admin_short_schema_at_the_write_claims_no_row_count(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """PR 3162 hold 3 item 3, at provision-admin: "and this command wrote no row" described the
+    write's open as this command's only one. The pre-check's open ran first, so the text drops
+    it and names that open.
+
+    Mutation: append "and this command wrote no row" whatever the opener."""
+    _refused_at_the_write_after_the_pre_check(monkeypatch, _refusal("sqlserver"))
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert f"{_WRITE_OPEN} rolled its schema batch back" in out.lower(), out
+    assert "wrote no row" not in out, out
+    assert _PRE_CHECK_OPEN in out, out
+
+
+def test_provision_admin_key_resolution_refusal_at_the_write_names_the_pre_check_open_alone(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A key-resolution refusal's class says nothing of the write's open, which may not have
+    touched the database, so only the pre-check's open is named as the one that may have.
+
+    Mutation: name the write's open, or "the open", for a class that says nothing."""
+    from messagefoundry.store.keyprovider import KeyProviderError
+
+    _refused_at_the_write_after_the_pre_check(
+        monkeypatch, KeyProviderError("synthetic key service refusal at the write")
+    )
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert _PRE_CHECK_OPEN in out and _WRITE_OPEN not in out.lower(), out
+    assert out.count(_SCHEMA) == 1, out
+
+
+def test_provision_admin_after_open_refusal_at_the_write_names_both_opens(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal raised only after a full open, at the write's open over an existing store: the
+    pre-check's open is named with the one-time steps, and the write's own open only as one that
+    may also have written.
+
+    Mutation: describe one "open" again in the after-open arm."""
+    _refused_at_the_write_after_the_pre_check(monkeypatch, _after_full_open("unauditable"))
+    out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
+    assert _PRE_CHECK_OPEN in out, out
+    assert f"{_WRITE_OPEN} may also have written to the database" in out.lower(), out
+    assert out.count(_SCHEMA) == 1, out
+    assert _SALT not in out and _GENESIS not in out, out
+
+
+def test_provision_admin_locked_store_after_the_write_open_names_both_opens(
+    shell: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A "database is locked" from the service over an existing SQLite store: the pre-check's
+    open and the write's open both returned first, so the text names the pre-check's open with
+    the one-time steps, and the write's own open only as one that may also have written.
+
+    Mutation: describe one "open" again in the database-error arm."""
+    import asyncio
+
+    from messagefoundry.config.settings import StoreSettings
+    from messagefoundry.store.base import open_store
+
+    db = shell / "provision.db"
+
+    async def create() -> None:
+        store = await open_store(
+            StoreSettings(path=str(db)), create=True, keyless_chain_refusal=None
+        )
+        await store.close()
+
+    asyncio.run(create())
+    _service_raises(monkeypatch, sqlite3.OperationalError("database is locked"), wrote=False)
+    out = _run(_provision_sqlite(shell), capsys)
+    assert "the store failed after it opened (OperationalError)" in out, out
+    assert _PRE_CHECK_OPEN in out, out
+    assert f"{_WRITE_OPEN} may also have written to the database" in out.lower(), out
+    assert out.count(_SCHEMA) == 1, out
