@@ -466,7 +466,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 # BACKLOG #5520 items 7 and 16: the username rule's reason is fixed text that never
                 # echoes the value, so the form can say why; any other field keeps "invalid input".
                 # Read from the model's own refusal rather than by running the rule again, so a name
-                # the length cap refused is never walked whole on the event loop.
+                # the length cap refused is never run through the rule.
                 detail = _username_rule_reason(exc) or detail
             all_roles = await admin.list_roles(service=service, _=identity)
             return HTMLResponse(

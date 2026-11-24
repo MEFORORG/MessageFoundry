@@ -40,8 +40,8 @@ lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes 
 script pass too: ``cli:root`` spelled with a dotless i (U+0131), ``<oidc>`` spelled with the
 modifier low arrowheads U+02F1 and U+02F2, and ``<oidc>`` followed by a combining low line
 (U+0332). It matches the reserved forms after NFKC,
-with the delimiter lookalikes that table lists taken to ASCII, and case folding; it does not fold
-confusable letters across scripts.
+with the delimiter lookalikes that table lists taken to ASCII, and case folding; it folds no
+confusable letters, in any script.
 
 This docstring is the one statement of the rule; the request model, the service and
 docs/SECURITY.md point here rather than restate it.
@@ -72,7 +72,8 @@ RESERVED_ACTOR_FORMS: Final = re.compile(r"(?s)system(:.*)?|cli:.*|<.*>")
 #: letters it lists (Canadian syllabics PA and PO, a runic letter and a Lisu tone letter), so a
 #: name in those scripts is not refused as a ``<...>`` form, though the modifier letters U+02D0,
 #: U+02F8, U+A789, U+02C2 and U+02C3 are kept; and U+FE30, which NFKC turns into two full stops
-#: (``..``) rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008 and U+3009.
+#: (``..``) rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008
+#: and U+3009.
 _DELIMITER_LOOKALIKES: Final = str.maketrans(
     dict.fromkeys(
         (0x02D0, 0x02F8, 0x0589, 0x05C3, 0x0703, 0x0704, 0x0903, 0x0A83, 0x16EC, 0x17D6, 0x1803)
