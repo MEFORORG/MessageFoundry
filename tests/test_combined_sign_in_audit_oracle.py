@@ -731,6 +731,90 @@ async def test_a_local_mint_contended_row_is_hidden_from_a_reader_without_users_
         await world.engine.stop()
 
 
+_CONTENDED_TARGET = "probe-contended"
+_CONTENDED_PASSWORD = "the-contended-target-passphrase"
+
+
+async def _contended_or_wrong_sign_in(
+    world: _World, monkeypatch: pytest.MonkeyPatch, *, contended: bool
+) -> None:
+    """One local password sign-in on a fresh password-only account. ``contended`` sends the right
+    password into an insert that meets contention; otherwise a wrong password is sent."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_BUSY
+
+    user_id = await create_local_user_chosen(
+        world.service,
+        username=_CONTENDED_TARGET,
+        password=_CONTENDED_PASSWORD,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await world.engine.store.get_user(user_id)
+    assert user is not None and user.password_hash is not None
+    await world.engine.store.set_password(
+        user_id,
+        password_hash=user.password_hash,
+        must_change_password=False,
+        password_generated=False,
+    )
+    world.since = time.time()
+    if contended:
+
+        async def contended_insert(*_a: Any, **_k: Any) -> bool:
+            raise SessionMintContended(SESSION_MINT_BUSY, 3)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(world.engine.store, "create_session", contended_insert)
+            out = await world.service.login(_CONTENDED_TARGET, _CONTENDED_PASSWORD)
+        assert out.reason == "session_mint_contended", out
+    else:
+        out = await world.service.login(_CONTENDED_TARGET, "not-the-passphrase")
+        assert out.error == "invalid credentials", out
+    assert not out.ok
+
+
+def _target_rows(rows: list[_Row]) -> list[_Row]:
+    return [r for r in rows if r[0] == _CONTENDED_TARGET]
+
+
+async def test_a_contended_local_sign_in_reads_as_a_wrong_password_without_users_manage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5653, the #1131 pattern: only a right password reaches the session insert, so its
+    ``session_mint_contended`` row is hidden, and the writer first stores the row a wrong password
+    stores. Through ``GET /audit`` and the CSV export the Auditor's view of a contended sign-in
+    equals their view of a wrong password; an Administrator reads the stand-in and the true row,
+    as with a refusal by a lock. RED on the head that wrote only the hidden row."""
+    right = await _open_world(tmp_path / "right", monkeypatch)
+    wrong = await _open_world(tmp_path / "wrong", monkeypatch)
+    try:
+        await _contended_or_wrong_sign_in(right, monkeypatch, contended=True)
+        await _contended_or_wrong_sign_in(wrong, monkeypatch, contended=False)
+        stand_in = json.dumps({"provider": "local", "reason": "bad_credentials"}, sort_keys=True)
+        true_row = json.dumps(
+            {"contention": "busy", "provider": "local", "reason": "session_mint_contended"},
+            sort_keys=True,
+        )
+        for read in (_read_trail, _read_export):
+            seen_right = _target_rows(await read(right, _AUDITOR))
+            seen_wrong = _target_rows(await read(wrong, _AUDITOR))
+            assert seen_right == seen_wrong, (read.__name__, seen_right, seen_wrong)
+            assert [(r[1], r[3]) for r in seen_right] == [("auth.login_failed", stand_in)], (
+                read.__name__,
+                seen_right,
+            )
+            admin = sorted((r[1], r[3]) for r in _target_rows(await read(right, _SECOND_ADMIN)))
+            assert admin == sorted(
+                [("auth.login_failed", stand_in), ("auth.login_failed", true_row)]
+            ), (read.__name__, admin)
+    finally:
+        await right.engine.stop()
+        await wrong.engine.stop()
+
+
 async def test_a_marked_directory_lock_refusal_is_hidden_whole_on_every_read_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -327,7 +327,17 @@ def _one(detail: str | None) -> int:
 
 
 def _signin_weight(detail: str | None) -> int:
-    return 0 if detail == _DIRECTORY_LOCKED_DETAIL else 1
+    if detail == _DIRECTORY_LOCKED_DETAIL:
+        return 0
+    # A contended local sign-in (BACKLOG #5653) writes two ``auth.login_failed`` rows: the visible
+    # stand-in a wrong password writes, which counts, and the hidden true row, which does not, so
+    # the sign-in counts once, as a wrong password does. Matched on its fields, since ``pipeline/``
+    # does not import the exact details from ``auth/``.
+    parsed = _detail_of(detail)
+    local_contended = parsed.get("provider") == "local" and parsed.get("reason") == (
+        "session_mint_contended"
+    )
+    return 0 if local_contended else 1
 
 
 def _export_size(detail: str | None) -> int:

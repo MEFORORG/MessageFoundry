@@ -6561,7 +6561,20 @@ class AuthService:
             # nor a wrong credential, and nothing is charged to the lockout.
             cause = contended.cause
 
-            async def contended_row() -> None:
+            # As for a refusal by a lock (owner ruling 2026-09-28, BACKLOG #1131): first the row
+            # every reader sees, byte-identical to a wrong credential's, then the true row only
+            # ``users:manage`` reads. Only a right password reaches this insert, so without the
+            # first a reader without ``users:manage`` would see a missing row where a wrong
+            # password leaves one. The first is not a false record: ``bad_credentials`` is the one
+            # reason every refused local sign-in records (:data:`_LOCAL_REFUSAL_REASON`), and the
+            # administrator reads the row naming the cause beside it.
+            async def contended_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                    client=client,
+                )
                 await self._audit(
                     "auth.login_failed",
                     actor=username,
@@ -6571,7 +6584,7 @@ class AuthService:
                     client=client,
                 )
 
-            await later(contended_row)
+            await later(contended_rows)
             return LoginOutcome(ok=False, error=_SIGN_IN_UNAVAILABLE, reason=SESSION_MINT_CONTENDED)
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
