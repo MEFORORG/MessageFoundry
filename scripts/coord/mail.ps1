@@ -57,7 +57,12 @@
     seat's worktree and host key to now, never to the old box, which every PC at that path reads. A
     record under it that names no host is refused, and so is any seat record that names no worktree:
     neither can be keyed to one PC's box.
-    A cwd is matched case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
+    A PATH IS FIRST RAISED TO ITS WORKTREE ROOT, the first directory at or above it holding `.git`,
+    by the drain's own rule (Get-CcxWorktreeRoot in scripts/hooks/_hookinput.ps1); seat.ps1 keys a
+    seat on the same root, read as `git rev-parse --show-toplevel`. A path inside a worktree therefore
+    names that worktree's box, and a -To path in no worktree is refused: hashed as given, either would
+    mint a box nobody drains under a "Queued" line (BACKLOG #7581). The roots are then compared
+    case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
     an extension of the primary checkout's path, so a prefix match resolves any peer to some arbitrary
     worktree. VS Code also records a lowercase drive letter where the Desktop app records an uppercase
     one, so a case-sensitive compare splits one worktree into two boxes.
@@ -118,7 +123,7 @@ param(
     # a caller whose stdin stays open and silent (the Bash tool) waits forever. Measured 2026-10-13/14:
     # four sends hung. The one box checked got nothing. The refusal is right after this param block.
     [Parameter(ParameterSetName = 'Send')][switch]$Send,
-    # Recipient worktree. A path (matched case-insensitively and exactly), a seat id from the shared
+    # Recipient worktree. A path in a worktree (keyed on that worktree's root), a seat id from the shared
     # seat registry (e.g. autonomy-plan-62022e2c, for a seat on another PC), or "all" to broadcast to
     # every live peer in this repo. Defaults to nothing: refusing to guess is the point.
     [Parameter(ParameterSetName = 'Send')][string]$To,
@@ -255,6 +260,11 @@ function Resolve-SeatRecipient {
 # computed different keys, mail would be written to a box nobody reads and BOTH sides would look
 # healthy. See mail-key.ps1 for why the normalisation is load-bearing.
 . "$PSScriptRoot\mail-key.ps1"
+
+# The worktree root a path sits in, by the DRAIN's rule: Get-CcxWorktreeRoot, the first directory at
+# or above the path that holds `.git`. One definition, not a third copy beside the drain's and
+# seat.ps1's; see ADDRESSING in the header. Functions only, so dot-sourcing it runs nothing.
+. (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
 
 # The claim primitive is shared with the drain for exactly the reason the box key is: three call sites
 # hand-rolling "did my move win" is three chances for one of them to drift back to a check that was
@@ -480,7 +490,11 @@ if ($Send) {
         $rosterUnavailable = @($rosterErr | Where-Object { $_ -match 'UNAVAILABLE' }).Count -gt 0
         $roster = @()
         try { $roster = @($rosterJson | ConvertFrom-Json) } catch { $roster = @(); $rosterUnavailable = $true }
-        $me = (Get-Location).Path.TrimEnd('\', '/').ToLowerInvariant()
+        # Both sides raised to the worktree root, so a session whose cwd is a subdirectory is still
+        # this worktree, and a peer's box is the one its drain reads.
+        $me = Get-CcxWorktreeRoot (Get-Location).Path
+        if (-not $me) { $me = (Get-Location).Path }
+        $outside = 0
         foreach ($r in $roster) {
             # Cwd, NOT Worktree. `Worktree` is the roster's DISPLAY LABEL -- a bare leaf name like
             # `builder-<n>-session-<hex>` -- while `Cwd` carries the addressable absolute path. The two
@@ -501,8 +515,14 @@ if ($Send) {
             # This comparison used to be made against $r.Worktree -- a bare name tested against an
             # absolute path, so it could never match and NEVER excluded anyone. Self-exclusion rested
             # entirely on IsSelf. Against Cwd it finally does the job it was written to do.
-            if ($r.Cwd.TrimEnd('\', '/').ToLowerInvariant() -eq $me) { continue }
-            $targets += $r.Cwd
+            $top = Get-CcxWorktreeRoot $r.Cwd
+            # A peer whose cwd is in no worktree has no box a send can name; counted, not hashed.
+            if (-not $top) { $outside++; continue }
+            if (Test-CcxSamePath $top $me) { continue }
+            $targets += $top
+        }
+        if ($outside -gt 0) {
+            Write-Host "Skipped $outside live peer(s) whose cwd is in no git worktree: no box can be named for them."
         }
         if ($targets.Count -eq 0) {
             # THE TWO CASES ARE NOW SEPARATED BY EVIDENCE RATHER THAN BY ASSERTION, and they exit
@@ -523,7 +543,12 @@ if ($Send) {
         }
     }
     elseif (Test-Path -LiteralPath $To -PathType Container) {
-        $targets = @((Resolve-Path -LiteralPath $To).Path)
+        $top = Get-CcxWorktreeRoot (Resolve-Path -LiteralPath $To).Path
+        if (-not $top) {
+            throw ("Refusing to send: '$To' is in no git worktree, so no drain reads a box keyed on it. " +
+                "Pass a worktree path, or a seat id from the shared seat registry.")
+        }
+        $targets = @($top)
     }
     else {
         # Not a directory here. It may be a seat id for a seat on another PC; see ADDRESSING.
@@ -601,7 +626,14 @@ if ($Send) {
     # reporting layer. Every target gets its own row and its own status.
     # One row per recipient. A path is keyed through ConvertTo-BoxKey; a seat id already IS the key.
     $rows = @()
-    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path $t); Cwd = $t } }
+    # Two sessions in one worktree share its box, so a broadcast names that box once.
+    $keyed = @{}
+    foreach ($t in $targets) {
+        $k = ConvertTo-BoxKey -Path $t
+        if ($keyed.ContainsKey($k)) { continue }
+        $keyed[$k] = $true
+        $rows += [pscustomobject]@{ To = $t; Key = $k; Cwd = $t }
+    }
     foreach ($s in $seatTargets) {
         $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
         $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
@@ -701,8 +733,11 @@ if ($List) {
     exit 0
 }
 
-# -Status (default): this worktree's own box.
+# -Status (default): this worktree's own box, keyed on its root as the send path keys it. A cwd in
+# no worktree keeps its own path: that is the box an -AnchorRepo drain reads (docs/SESSION-MAIL.md).
 $here = (Get-Location).Path
+$hereTop = Get-CcxWorktreeRoot $here
+if ($hereTop) { $here = $hereTop }
 $key = ConvertTo-BoxKey -Path $here
 # The box under the old path-only key, read only. The drain moves the inbox names this channel
 # minted into $key, so only those are counted as waiting; claiming/ and stranded/ stay where they are,
