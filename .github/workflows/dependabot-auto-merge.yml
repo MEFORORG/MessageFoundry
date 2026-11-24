@@ -65,10 +65,11 @@ name: Dependabot auto-merge
 #      READ THIS BEFORE CITING #2 OR #4 AS A CONTROL: both hold every eligible security-track PR
 #      today, so as shipped neither can ever CONFIRM a PR for merge. For a uv/pip PR, a populated
 #      allow row is NECESSARY before either can confirm a PR for merge, and not sufficient: at least
-#      a uv PR that dependabot-lock-resync.yml pushes a second commit to (through its App, not
-#      Dependabot) fails the sole-author step and holds. For an npm PR, its names must be on the
-#      allow row too (one `case` arm, shared with uv and pip), #2's query must be made aware of npm
-#      and #4 given a publish-date source for it. Recording either as confirming would be exactly
+#      a uv PR that dependabot-lock-resync.yml pushes a second commit to still holds, because that
+#      push's run disarms it and its sole-author step then fails the sender and single-commit
+#      checks. For any other ecosystem, github-actions included, #2's query must be made aware of it
+#      and #4 given a publish-date source for it, and an npm PR's names must also be on the allow
+#      row. Recording either as confirming would be exactly
 #      the false premise docs/Secure_Development_Standards.md §3 forbids. Among the checks that can
 #      change a merge decision today are at least #2's hold of an unreadable track (described
 #      under #2 above), #3 and the sole-author, update-type,
@@ -78,9 +79,8 @@ name: Dependabot auto-merge
 #      allow rows ship EMPTY). Those two sets are DISJOINT, so no PR can satisfy both conjuncts the
 #      merge `if` requires, and the same disjointness keeps #2 from confirming (its
 #      `advisory_ok=true` is reachable only for uv/pip: its query is pip-keyed). The confirming
-#      halves of #2 and #4 are FORWARD guards: built, tested and gated now, and unable to confirm a
-#      PR for merge before the conditions stated above under READ THIS BEFORE CITING #2 OR #4
-#      hold. Populating an allow row is the owner's call, not this workflow's.
+#      halves of #2 and #4 are FORWARD guards: built, tested and gated now, and as shipped unable to
+#      confirm a PR for merge. Populating an allow row is the owner's call, not this workflow's.
 #
 # RESIDUAL ACCEPTED RISK, stated at the ONE path that can actually auto-merge: a VERSION-track patch
 # (or dev-only minor) bumping a GitHub-published action. Its only aging is dependabot.yml's cooldown,
