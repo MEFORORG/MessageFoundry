@@ -3277,10 +3277,11 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     (it could not be judged: the cell did not open, or the value is not base32).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
-    the account and never the value. A keyless open hands the stored ciphertext through unchanged,
-    which is not base32, so computing a code from it fails. Or the cell opens but its enrolment
-    marker is refused (:class:`totp.RefusedEnrolment`, BACKLOG #3422) or its key is short or not
-    base32 (:class:`totp.RefusedTotpSecret`, BACKLOG #5340), each logged with its own cause since
+    the account and never the value. A keyless open hands the stored ciphertext through unchanged;
+    the census does not judge that cell but raises :class:`CensusNeedsTheStoreKey`, since the fault
+    is the shell's key, not the account. Or the cell opens but its enrolment marker is refused
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422), its key is short (:class:`totp.RefusedTotpSecret`,
+    BACKLOG #5340) or it is not base32 (:class:`totp.UndecodableTotpSecret`), each logged with its own cause since
     the store key is healthy. Any other store error propagates: it
     says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
     a healthy account."""
