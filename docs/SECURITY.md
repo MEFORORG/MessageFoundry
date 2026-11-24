@@ -7981,14 +7981,17 @@ come before the provision row in the chain, because the notice is sent while the
 again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
-  fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
-  step is cut, the close cancels its drain and records the send it cut with `reason: interrupted`
-  and each notice still queued with `reason: abandoned` (BACKLOG #6832). The cut send's thread
-  runs on to its own timeout, so that notice may still go out. Those writes run one at a time in
-  the step's cut grace, so the ones still to run when the grace ends meet the closed store and
-  are lost; under a full queue that is most of them. A WARNING line counting the queued notices
-  comes before their writes, and one counting the writes that failed comes after; neither counts
-  a lock notice. A lock notice among them keeps its `auth.lock_notice` row
+  fails in its final drain is recorded. That close is one bounded step of the shutdown. The close
+  stops waiting for its drain at part of that step's bound, or when the step is cut, then cancels
+  the drain and records the send it cut with `reason: interrupted` and each notice still queued
+  with `reason: abandoned` (BACKLOG #6832). The cut send's thread runs on to its own timeout, so
+  that notice may still go out. Those writes run one at a time and are not bounded. The shutdown
+  stops waiting for them at the step's bound plus its cut grace; the rest go on beside
+  `engine.stop()`, competing with its writes, until the store closes, and those still to run then
+  fail. Under a full queue that can be most of them. A WARNING line counting the queued notices
+  comes before their writes, and one counting the writes that failed comes after; it does not
+  count the writes a cancel stopped before they ran. Neither line counts a lock notice. A lock
+  notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.
 - A notice that reaches the notifier once it has begun to close is refused and recorded with

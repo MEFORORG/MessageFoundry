@@ -742,12 +742,14 @@ async def test_a_cut_during_a_failed_send_s_record_keeps_that_record(
     )
     notifier.start()
     await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
-    await asyncio.wait_for(entered.wait(), 5.0)
-    closing = asyncio.create_task(notifier.aclose())
-    await asyncio.sleep(0.05)
-    closing.cancel()
-    await asyncio.sleep(0.05)
-    gate.set()
+    try:
+        await asyncio.wait_for(entered.wait(), 5.0)
+        closing = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
+        closing.cancel()
+        await asyncio.sleep(0.05)
+    finally:
+        gate.set()
     with pytest.raises(asyncio.CancelledError):
         await closing
     assert await _undelivered(store) == [
@@ -782,3 +784,57 @@ async def test_a_cut_close_with_no_audit_sink_still_logs_the_queued_count(
         "SecurityEventNotifier closed with 1 security notice(s) still queued, never sent"
     ]
     assert not [r for r in caplog.records if "could not be recorded" in r.getMessage()]
+
+
+async def test_a_close_timeout_cuts_the_drain_and_records_before_returning(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, review round two. The shutdown hands the close part of its bound, so the
+    close cuts its own drain and records, then returns without raising."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = _notifier(store)
+    notifier.start()
+    drain = notifier._task
+    assert drain is not None
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
+        assert drain.done()
+        assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == [
+            ("amy", "interrupted"),
+            ("ben", "abandoned"),
+        ]
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "rows"),
+    [("sent", []), ("raised", ["send_failed"]), ("cancelled", ["interrupted"])],
+)
+async def test_a_send_settled_before_the_cut_reached_the_drain_is_read_as_it_ended(
+    store: MessageStore, outcome: str, rows: list[str]
+) -> None:
+    """BACKLOG #6832, review rounds one and two. A send can end between the cut and the drain's
+    resumption: a sent one is no undelivered row, a raised one is send_failed, and a cancelled one
+    (the loop tearing down) still lets the queued notices be recorded."""
+    notifier = _notifier(store)
+    loop = asyncio.get_running_loop()
+    send: asyncio.Future[bool] = loop.create_future()
+    if outcome == "sent":
+        send.set_result(True)
+    elif outcome == "raised":
+        send.set_exception(OSError("relay down"))
+    else:
+        send.cancel()
+    calls: list[int] = []
+    amy = SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test")
+    notifier._sending = (amy, send, lambda: calls.append(1))
+    ben = SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test")
+    await notifier._record_cut([ben])
+    assert calls == ([1] if outcome == "sent" else [])
+    assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == sorted(
+        [("amy", reason) for reason in rows] + [("ben", "abandoned")]
+    )
