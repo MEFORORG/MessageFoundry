@@ -888,6 +888,9 @@ def test_ci_executing_ecosystem_is_aged_at_least_five_days() -> None:
         ("github_actions", "evil/actions/checkout", "false"),
         # An empty name list cannot confirm eligibility.
         ("github_actions", "", "false"),
+        # Nor can an empty member, which only a nameless dependency produces (BACKLOG #5474).
+        ("github_actions", "actions/checkout, ", "false"),
+        ("github_actions", "actions/checkout,,actions/setup-python", "false"),
         # uv/npm allow rows ship empty, so every bump on them holds.
         ("uv", "certifi", "false"),
         ("uv", "cryptography", "false"),
@@ -1020,6 +1023,7 @@ def test_the_advisory_guard_fails_closed_when_the_api_errors(
         "ghsa",
         {
             "DEP_GROUP": "pip-security",
+            "DEP_ECOSYSTEM": "uv",
             "DEPS_JSON": '[{"dependencyName":"requests","prevVersion":"2.19.0"}]',
             "GH_TOKEN": "stub",
         },
@@ -1623,11 +1627,12 @@ _VERSION_ARM = re.compile(r"^\s*([A-Za-z0-9_|-]+)\)\s*track=version\s*;;", re.MU
 def _version_groups_in_workflow() -> set[str]:
     body = str(_step("ghsa")["run"])
     found = _VERSION_ARM.findall(body)
-    # Counted on the raw text too, so a second route to the version track (a glob arm, or an
-    # assignment after the case) cannot sit beside the literal arm unread.
+    # Counted on the raw text too, so at least a second `track=version` assignment, or a second
+    # emission of the version track's output, cannot sit beside the literal arm unread.
     assert len(found) == 1 and body.count("track=version") == 1, (
         f"expected exactly one version-track assignment in the ghsa step, got {found}"
     )
+    assert body.count("security_track=false") == 1, "a second route to the version track"
     return set(found[0].split("|"))
 
 
@@ -1765,16 +1770,16 @@ def test_the_ghsa_step_reads_the_track_from_a_named_group(
         ("an empty name and version", [("", "")], "false"),
         ("a whitespace-only name", [(" ", "2.19.0")], "false"),
         ("a nameless row after a named one", [("requests", "2.19.0"), (None, None)], "false"),
-        # Shifted by `read` into raw=version, prev='', so the prevVersion guard denies it.
-        ("a nameless row with a version", [(None, "2.19.0")], "false"),
         # The row's unadjudicated item: `affects` is a comma-separated list, so a comma adds an
         # unversioned package of the PR's choosing.
         ("a comma in the name", [("requests,django", "2.19.0")], "false"),
         ("a comma in the previous version", [("requests", "2.19.0,django")], "false"),
         ("an @ in the name", [("requests@1.0,django", "2.19.0")], "false"),
         ("an action, not a pip name", [("actions/checkout", "v4")], "false"),
-        # Already denied before the fix, kept as the neighbouring control.
+        # Already denied before the fix, kept as the neighbouring controls. The second is shifted
+        # by `read` into raw=version, prev='', so the prevVersion guard denies it.
         ("a name with no previous version", [("requests", None)], "false"),
+        ("a nameless row with a version", [(None, "2.19.0")], "false"),
     ],
 )
 def test_the_advisory_gate_denies_a_nameless_or_malformed_dependency(
@@ -1807,6 +1812,8 @@ def test_the_advisory_gate_denies_a_nameless_or_malformed_dependency(
         ("no name and no version, as `[{}]`", [(None, None)], "false"),
         ("a whitespace-only name", [(" ", "2.32.3")], "false"),
         ("a nameless row after a named one", [("requests", "2.32.3"), (None, None)], "false"),
+        ("an interior space, once rewritten to another name", [("py yaml", "6.0")], "false"),
+        # Already denied before the fix (shifted by `read`), kept as a control.
         ("a nameless row with a version", [(None, "2.32.3")], "false"),
     ],
 )

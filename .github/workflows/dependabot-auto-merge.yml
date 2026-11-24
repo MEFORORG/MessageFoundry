@@ -10,8 +10,9 @@ name: Dependabot auto-merge
 # IN SCOPE (auto-merged):
 #   - a PATCH update (or a MINOR of a DEV-only dependency) whose EVERY named dependency sits on its
 #     own ecosystem's ALLOW row (guardrail #3 below), and whose Dependabot group is one of
-#     dependabot.yml's VERSION-update groups or passes #2 and #4 (BACKLOG #5474). An UNGROUPED PR,
-#     or one in a group the ghsa step does not name, is read as the security track and holds.
+#     dependabot.yml's VERSION-update groups or passes #2 and #4 (BACKLOG #5474). The ghsa step
+#     reads an exact version-group name as the version track and a `*security*` group as the
+#     security track; every other value, an UNGROUPED PR's empty group included, holds.
 # OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
 #   - EVERYTHING ELSE, and that is the default by design. An unnamed dependency, an unrecognised
 #     ecosystem, a MINOR/MAJOR update of a runtime dep, any MAJOR update — every one of them HOLDS.
@@ -229,7 +230,14 @@ jobs:
           for raw in "${names[@]}"; do
             name="${raw,,}"
             name="${name//[[:space:]]/}"
-            [ -z "$name" ] && continue
+            # An EMPTY token denies the WHOLE PR rather than being skipped (BACKLOG #5474). It can
+            # only come from a dependency with no name, and on the version track this step is the
+            # only one that reads the names, so a skip would arm a PR carrying an unnamed member.
+            if [ -z "$name" ]; then
+              echo "::notice::a dependency with no name — routing the WHOLE PR to manual review."
+              eligible=false
+              continue
+            fi
             saw_any=true
             matched=false
             for p in $allow_prefixes; do
@@ -290,15 +298,12 @@ jobs:
           # and pass the conjunct this step exists to hold.
           echo "security_track=true" >> "$GITHUB_OUTPUT"
           if [ "$track" != "security" ]; then
-            echo "::warning::dependency-group '${DEP_GROUP:-<none>}' names no known track — failing closed (manual review)."
+            echo "::notice::dependency-group '${DEP_GROUP:-<none>}' names no known track — failing closed (manual review)."
             echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # The query below is pip-keyed, so a name from any other ecosystem would be asked about a
-          # PyPI package that merely shares it (npm `lodash`, say) and could be confirmed by that
-          # package's advisory (BACKLOG #5474). Such a PR could not reach a merge through this gate
-          # before either, since its own ecosystem's advisories were never asked; now it holds
-          # without asking the wrong one.
+          # Pip-keyed query (see #2 in the header): any other ecosystem's name would be asked about
+          # a same-named PyPI package (npm `lodash`, say), whose advisory would confirm it.
           eco="${DEP_ECOSYSTEM,,}"
           eco="${eco//[[:space:]]/}"
           case "$eco" in
@@ -347,7 +352,7 @@ jobs:
             # means the advisory question cannot be asked, so DENY; skipping it would wave the dep
             # through on a gate whose whole contract is to fail closed.
             if [ -z "$prev" ]; then
-              echo "::warning::no previous version for '$name' — failing closed (manual review)."
+              echo "::warning::a dependency row with no previous version or no name ('$raw') — failing closed (manual review)."
               advisory_ok=false
               break
             fi
@@ -468,8 +473,9 @@ jobs:
           age_ok=true
           now="$(date -u +%s)"
           while IFS="$(printf '\t')" read -r raw ver; do
+            # Whitespace is not stripped: a name carrying it fails the shape check below rather
+            # than being rewritten into another package's name, as the advisory loop does too.
             name="${raw,,}"
-            name="${name//[[:space:]]/}"
             # An EMPTY name DENIES, it is not skipped, for the reason the advisory loop above gives
             # (BACKLOG #5474).
             if [ -z "$name" ]; then
@@ -481,7 +487,7 @@ jobs:
             # guard above cites: a non-first dependency can arrive with an empty string. An unknown
             # candidate version means the age question cannot be asked, so DENY.
             if [ -z "$ver" ]; then
-              echo "::warning::no new version for '$name' — failing closed (manual review)."
+              echo "::warning::a dependency row with no new version or no name ('$raw') — failing closed (manual review)."
               age_ok=false
               break
             fi
