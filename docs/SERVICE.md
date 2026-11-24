@@ -325,7 +325,8 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 variable the service needs in one call, or the ones you leave out are gone at the next start.
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
-the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
+the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`, unless it
+may hold a value `serve` or `supervise` refused, as the next paragraph says.
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
 settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
@@ -343,15 +344,15 @@ a variable with `Get-ItemProperty`, printing nothing. Edit the strings in that s
 write each value back with `Set-ItemProperty -Type MultiString`:
 
 ```powershell
-$key = 'HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters'
+$service = 'MessageFoundry'   # the service the refusal names
+$key = "HKLM:\SYSTEM\CurrentControlSet\Services\$service\Parameters"
 $extra = (Get-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra).AppEnvironmentExtra
 # edit $extra here, printing nothing
 Set-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra -Value $extra -Type MultiString
 ```
 
-install-service.ps1's `Set-ServiceEnvironmentValue` writes `AppEnvironmentExtra` the same way: it
-reads the list from the registry with `Get-Item` and its `GetValue` method, writes the merged list
-back with `Set-ItemProperty -Type MultiString`, and reads it back.
+install-service.ps1's `Set-ServiceEnvironmentValue` writes `AppEnvironmentExtra` back the same
+way, with `Set-ItemProperty -Type MultiString`.
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
 interpreter in isolated mode, which ignores every one of them

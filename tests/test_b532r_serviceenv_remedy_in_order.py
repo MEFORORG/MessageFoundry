@@ -28,6 +28,7 @@ from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
     _installer_reads,
     _may_name_directory,
+    _refused_name,
     _variables,
     read_service_env_posture,
     service_env_refusal,
@@ -146,20 +147,62 @@ def _readings(
     entries: list[tuple[str, str]], refused: frozenset[str]
 ) -> frozenset[tuple[str, str, str]]:
     """How the engine's own reader reads each refused variable in ``entries``: its registry
-    value, its upper-cased name and its value, line breaks written as one ``\\n``."""
+    value, its name as written and its value, line breaks written as one ``\\n``. A name a line
+    break broke counts by its first line, as the engine may load it under a name that starts
+    with it."""
     return frozenset(
-        (v.where, v.written.strip().upper(), _LINE_BREAK.sub("\n", v.value))
+        (v.where, _LINE_BREAK.sub("\n", v.written.strip()), _LINE_BREAK.sub("\n", v.value))
         for v in _variables(entries)
-        if v.written.strip().upper() in refused
+        if _LINE_BREAK.split(v.written.strip().upper())[0].strip() in refused
     )
 
 
+def _refused_names(entries: list[tuple[str, str]]) -> frozenset[str]:
+    """Every name the refusal is about that a line of ``entries`` sets or names alone, empty or
+    not, such as an empty MEFOR_STORE_PASSWORD= that has nothing to move."""
+    return frozenset(
+        name
+        for _where, string in entries
+        for line in _LINE_BREAK.split(string)
+        if _refused_name(name := line.partition("=")[0].strip().upper())
+    )
+
+
+def _part_of_refused_value(entries: list[tuple[str, str]], where: str) -> set[tuple[int, int]]:
+    """The ``(string, line)`` positions in the list ``where`` that the installer clause's printed
+    rule makes part of a refused value: each line below a refused name written alone or set to
+    nothing, up to the next that names a refused variable, and each line below another line of
+    a refused value, up to the next that names one or sets another variable as the doubt step
+    says, where a line that may set the directory ends neither."""
+    part: set[tuple[int, int]] = set()
+    state: str | None = None
+    for i, (at, string) in enumerate(entries):
+        if at != where:
+            continue
+        for j, line in enumerate(_LINE_BREAK.split(string)):
+            name, equals, value = line.partition("=")
+            if _refused_name(name.strip().upper()):
+                state = "open" if not equals or not value.replace("=", "").strip() else "value"
+                continue
+            if (
+                state == "value"
+                and not _may_name_directory(line)
+                and _ends_the_value(line, frozenset())
+            ):
+                state = None
+                continue
+            if state is not None:
+                part.add((i, j))
+    return part
+
+
 def _value_lines(entries: list[tuple[str, str]], refused: frozenset[str]) -> frozenset[str]:
-    """Every non-blank line of each refused variable's value as the reader reads it."""
+    """Every non-blank line of each refused variable as the reader reads it, its name and its
+    value."""
     return frozenset(
         line.strip()
-        for _where, _name, value in _readings(entries, refused)
-        for line in value.split("\n")
+        for _where, name, value in _readings(entries, refused)
+        for line in f"{name}={value}".split("\n")
         if line.strip()
     )
 
@@ -173,8 +216,11 @@ def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -
         "leave as it is each string that holds a refused variable or that a refused" in text.lower()
     )
     # Since the Lander's hold on PR 3142, comment 7119680463, item 3: also each string whose
-    # take-out would change how the engine reads a refused variable.
-    rejoin = "whose take-out would change how the engine reads a refused variable" in text
+    # take-out, alone or beside the others the step takes out, would change how the engine reads
+    # a refused variable, any refused name counted, empty or not, as the engine's own gate counts
+    # them (code review round 1 on that repair).
+    rejoin = "would change how the engine reads a refused variable" in text
+    beside = "alone or beside the others this step takes out" in text
     with_value = (
         "each line below it in its string that the engine reads as part of its value" in text
     )
@@ -189,27 +235,42 @@ def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -
         also_removed = True
     else:
         raise AssertionError(f"no pass-back clause the walk knows: {text!r}")
-    before = _readings(registry.entries, refused)
-    kept: list[tuple[str, str]] = []
-    for index, (where, string) in enumerate(registry.entries):
-        if also_removed and string in registry.runs_on_into:
-            continue
+    entries = registry.entries
+    wide = refused | _refused_names(entries)
+    taken: list[list[tuple[str, str]]] = []
+    for where, string in entries:
         lines = [
             line
             for line in _take_out(string, refused, with_value=with_value)
             if not (also_removed and _names_refused(line, refused))
         ]
-        taken = [(where, "\n".join(lines))] if any(line.strip() for line in lines) else []
-        if leave and (string in registry.runs_on_into or _holds_refused(string, refused)):
-            kept.append((where, string))
-            continue
-        if rejoin:
-            alone = [*registry.entries[:index], *taken, *registry.entries[index + 1 :]]
-            if _readings(alone, refused) != before:
-                kept.append((where, string))
-                continue
-        kept.extend(taken)
-    registry.entries = kept
+        removed_whole = also_removed and string in registry.runs_on_into
+        keep = any(line.strip() for line in lines) and not removed_whole
+        taken.append([(where, "\n".join(lines))] if keep else [])
+    left = {
+        i
+        for i, (_where, string) in enumerate(entries)
+        if leave
+        and (string in registry.runs_on_into or _holds_refused(string, refused))
+        and not (also_removed and string in registry.runs_on_into)
+    }
+
+    def build(kept: set[int]) -> list[tuple[str, str]]:
+        return [e for i, entry in enumerate(entries) for e in ([entry] if i in kept else taken[i])]
+
+    if rejoin:
+        before = _readings(entries, wide)
+        all_out = _readings(build(left), wide)
+        left |= {
+            i
+            for i in range(len(entries))
+            if i not in left
+            and (
+                _readings(build(set(range(len(entries))) - {i}), wide) != before
+                or (beside and _readings(build(left | {i}), wide) != all_out)
+            )
+        }
+    registry.entries = build(left)
 
 
 def _run_installer(registry: _Registry) -> None:
@@ -240,18 +301,20 @@ def _follow_installer_clause(
     # Since code review on that repair, with each string a refused value in it runs on into.
     with_run_on = (
         "and of each string a refused value in it runs on into" in clause
-        or "and of each string a refused value in these runs on into" in clause
+        or "and of each string a refused value in them runs on into" in clause
     )
-    # Since the Lander's hold on PR 3142, comment 7119680463, item 3: also each string holding a
-    # refused variable that removing the installer's string would read differently.
-    with_changed = "whose reading removing that string would change" in clause
-    # Before that hold, item 1, each other line; since, none that is part of a refused value,
-    # which the walk takes as every line of each refused value as the reader reads it.
+    # Since the Lander's hold on PR 3142, comment 7119680463, item 3, and code review round 1 on
+    # that repair: also, until none is left, each string holding a refused variable, empty or
+    # not, that removing the strings the sentence names would read differently.
+    with_changed = "whose reading removing the strings this sentence names would change" in clause
+    # Before that hold, item 1, each other line; since, none that is part of a refused value
+    # under the clause's printed rule (_part_of_refused_value), which the walk follows as
+    # printed, so the check after the walk tests that rule against the reader.
     add_back = (
         "add each other line back as an entry of its own" in clause
         or "add back as an entry of its own each other line" in clause
     )
-    by_reading = "none that is part of a refused value" in clause
+    by_rule = "none that is part of a refused value" in clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -262,38 +325,46 @@ def _follow_installer_clause(
             for name in refused
             if name not in registry.moved and registry.readable(name, moves[name])
         }
-        value_lines = _value_lines(registry.entries, refused)
-        was_read = _readings(registry.entries, refused)
-        index = registry.entries.index((where, string))
-        removed = [registry.entries.pop(index)]
-        while (
-            with_run_on
-            and index < len(registry.entries)
-            and registry.entries[index][0] == where
-            and registry.entries[index][1] in registry.runs_on_into
-        ):
-            removed.append(registry.entries.pop(index))
+        snapshot = list(registry.entries)
+        wide = refused | _refused_names(snapshot)
+        part = _part_of_refused_value(snapshot, where)
+        start = snapshot.index((where, string))
+        gone = {start}
+
+        def run_on(k: int, *, snap: list[tuple[str, str]] = snapshot, at: str = where) -> set[int]:
+            """The strings after ``k`` in its list that a refused value runs on into."""
+            out: set[int] = set()
+            k += 1
+            while k < len(snap) and snap[k][0] == at and snap[k][1] in registry.runs_on_into:
+                out.add(k)
+                k += 1
+            return out
+
+        if with_run_on:
+            gone |= run_on(start)
         if with_changed:
-            now_read = _readings(registry.entries, refused)
-            changed = frozenset(name for _w, name, _v in was_read ^ now_read)
-            # Each string of this list holding such a variable, and each string its value runs on
-            # into, which the clause has read out with it.
-            at = 0
-            taking = False
-            while at < len(registry.entries):
-                entry_where, entry = registry.entries[at]
-                taking = entry_where == where and (
-                    _holds_refused(entry, changed) or (taking and entry in registry.runs_on_into)
+            was_read = _readings(snapshot, wide)
+            while True:
+                now = [s for k, s in enumerate(snapshot) if k not in gone]
+                changed = frozenset(
+                    name.split("\n")[0].strip().upper()
+                    for _w, name, _v in was_read ^ _readings(now, wide)
                 )
-                if not taking:
-                    at += 1
-                    continue
-                removed.append(registry.entries.pop(at))
-                if at < index:
-                    index -= 1
+                more = {
+                    k
+                    for k, (at, text) in enumerate(snapshot)
+                    if k not in gone and at == where and _holds_refused(text, changed)
+                }
+                more |= {r for k in more for r in run_on(k)}
+                if not more - gone:
+                    break
+                gone |= more
+        removed = [(k, snapshot[k]) for k in sorted(gone)]
+        registry.entries = [s for k, s in enumerate(snapshot) if k not in gone]
+        index = sum(1 for k in range(start) if k not in gone)
         lost = {name for name in holders if not registry.readable(name, moves[name])}
         # Read out only where its value was in a string the operator read, not left behind.
-        read = {name for name in lost if any(moves[name] in text for _w, text in removed)}
+        read = {name for name in lost if any(moves[name] in text for _k, (_w, text) in removed)}
         registry.read_out |= read if every_line else read - set(KEY_CLASS_NAMES)
         # A refused variable whose value it held goes with it: the string before it, when that
         # is the refused name set to nothing that ran on into it.
@@ -307,14 +378,12 @@ def _follow_installer_clause(
             # the clause says, none that may set the directory.
             others = [
                 line
-                for _where, text in removed
-                for line in _LINE_BREAK.split(text)
+                for k, (_where, text) in removed
+                for j, line in enumerate(_LINE_BREAK.split(text))
                 if line.strip()
-                and not _names_refused(line, refused)
+                and not _names_refused(line, wide if by_rule else refused)
                 and not (
-                    line.strip() in value_lines
-                    if by_reading
-                    else any(secret in line for secret in moves.values())
+                    (k, j) in part if by_rule else any(secret in line for secret in moves.values())
                 )
                 and not ("but none that may set" in clause and _may_name_directory(line))
             ]
@@ -578,6 +647,58 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_B": "SEKRITb"},
         True,
     ),
+    # Code review round 1 on that repair: below an empty refused name only a refused line ends
+    # its value, so a key the reader holds there under a Windows name is not added back.
+    "windows-name-key-below-an-empty-retired-key": (
+        [
+            (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
+            (_EXTRA, f"{_RETIRED}="),
+            (_EXTRA, f"mefor_secrets_directory={_KEY_B64},\nPath={_KEY_B64_2}"),
+        ],
+        frozenset({f"mefor_secrets_directory={_KEY_B64},\nPath={_KEY_B64_2}"}),
+        {_RETIRED: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # The same review: a name written alone opens a value as a name set to nothing does.
+    "name-alone-in-an-installer-string": (
+        [
+            (_EXTRA, "mefor_secrets_directory=x\nMEFOR_VALUE_A\nSEKRITa\nSEKRITz"),
+            (_EXTRA, f"{_RETIRED}="),
+            (_EXTRA, f"mefor_secrets_directory={_KEY_B64}"),
+        ],
+        frozenset({f"mefor_secrets_directory={_KEY_B64}"}),
+        {"MEFOR_VALUE_A": "SEKRITa", _RETIRED: _KEY_B64},
+        False,
+    ),
+    # The same review: two take-outs that change no reading alone rejoin together.
+    "two-directory-strings-between-an-empty-key-and-a-name-alone": (
+        [
+            (_EXTRA, "MEFOR_STORE_PASSWORD="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d"),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\e"),
+            (_EXTRA, "MEFOR_VALUE_B"),
+            (_EXTRA, "SEKRITb"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\f"),
+        ],
+        frozenset({"SEKRITb"}),
+        {"MEFOR_VALUE_B": "SEKRITb"},
+        False,
+    ),
+    # The same review: removing the name's strings would join the empty password to the
+    # ordinary line below them, so the clause takes the password's string too.
+    "empty-key-rejoins-an-ordinary-line": (
+        [
+            (_EXTRA, "MEFOR_STORE_PASSWORD="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d"),
+            (_EXTRA, "MEFOR_VALUE_B"),
+            (_EXTRA, "SEKRITb"),
+            (_EXTRA, "HTTP_PROXY=http://proxy.invalid"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"SEKRITb"}),
+        {"MEFOR_VALUE_B": "SEKRITb"},
+        False,
+    ),
 }
 
 
@@ -601,21 +722,38 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     assert registry.read_out == _READ_OUT.get(case, set())
     # The Lander's hold on PR 3142, comment 7119680463, item 1: no line of a refused value is
     # left in the lists but one a refused variable still holds, for the removal step to take.
-    assert _refused_text_left(entries, registry.entries, frozenset(moves)) == []
+    assert _refused_text_left(entries, registry, moves) == []
+    # Code review round 1 on that repair: and no line the steps leave has joined a refused value
+    # it was not part of, which the next start would refuse again.
+    wide = frozenset(moves) | _refused_names(entries)
+    was = _value_lines(entries, wide)
+    joined = _value_lines(registry.entries, wide | _refused_names(registry.entries)) - was
+    assert joined - {f"{_DIR}={_NEW_DIRECTORY}"} == set()
 
 
 def _refused_text_left(
-    entries: list[tuple[str, str]], now: list[tuple[str, str]], refused: frozenset[str]
+    entries: list[tuple[str, str]], registry: _Registry, moves: dict[str, str]
 ) -> list[str]:
-    """Each line of ``now`` that was a line of a refused value in ``entries``, as the reader read
-    it, and that neither names a refused variable nor is a line of one's value in ``now``."""
-    was = _value_lines(entries, refused)
-    held = _value_lines(now, refused)
+    """Each line left in ``registry`` that was a line of a refused value in ``entries``, as the
+    reader read it, any refused name counted, or that holds a secret the case moves, and that a
+    later step does not remove: it is in no string that names a refused variable or that a
+    refused value runs on into, and no refused variable's reading holds it. The walk follows
+    the clause's printed rule for what to add back, so this tests that rule against the reader
+    (code review round 1 on the repair of the Lander's hold on PR 3142, comment 7119680463)."""
+    now = registry.entries
+    wide = frozenset(moves) | _refused_names(entries)
+    was = _value_lines(entries, wide)
+    held = _value_lines(now, wide | _refused_names(now))
     return [
         line
         for _where, string in now
+        # A string that still names a refused variable goes whole with it at the removal step,
+        # and one a refused value runs on into at the run-on step.
+        if not _holds_refused(string, wide | _refused_names(now))
+        and string not in registry.runs_on_into
         for line in _LINE_BREAK.split(string)
-        if line.strip() in was and line.strip() not in held and not _names_refused(line, refused)
+        if (line.strip() in was or any(secret in line for secret in moves.values()))
+        and line.strip() not in held
     ]
 
 
@@ -623,6 +761,10 @@ def _refused_text_left(
 _READ_OUT = {
     "retired-key-list-on-two-lines-in-an-installer-string": {_RETIRED},
     "directory-string-between-an-empty-key-and-a-name-alone": {"MEFOR_VALUE_B"},
+    "windows-name-key-below-an-empty-retired-key": {_RETIRED},
+    "name-alone-in-an-installer-string": {"MEFOR_VALUE_A", _RETIRED},
+    "two-directory-strings-between-an-empty-key-and-a-name-alone": {"MEFOR_VALUE_B"},
+    "empty-key-rejoins-an-ordinary-line": {"MEFOR_VALUE_B"},
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},
@@ -711,4 +853,10 @@ def test_the_installer_model_matches_install_service_ps1() -> None:
         "-Entry $_ -Name $Name) })"
     ) in script
     assert "GetValue('AppEnvironmentExtra', $null)" in script
+    # docs/SERVICE.md, "Start / stop / status", which the doubt step cites, names the installer's
+    # write as its registry route (the Lander's hold on PR 3142, comment 7119680463, item 2).
+    assert (
+        "Set-ItemProperty -LiteralPath $keyPath -Name 'AppEnvironmentExtra' -Value $merged "
+        "-Type MultiString"
+    ) in script
     assert _installer_reads(f"{_DIR.lower()}=x") and not _installer_reads(f" {_DIR}=x")

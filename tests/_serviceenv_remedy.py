@@ -127,10 +127,10 @@ NO_COMMAND_LINE = "No refused value may be typed on a command line"
 DOUBT_LEAVE = (
     ". Leave as it is each string that holds a refused variable or that a refused variable's "
     "value runs on into, since a line there that may set MEFOR_SECRETS_DIRECTORY may be part of "
-    "that value, and each string whose take-out would change how the engine reads a refused "
-    "variable, such as one between a refused name set to nothing and the string below it, which "
-    "the take-out may join, until a step below removes that variable, then take such lines out "
-    "with it"
+    "that value, and each string whose take-out, alone or beside the others this step takes out, "
+    "would change how the engine reads a refused variable, such as one between a refused name "
+    "written alone or set to nothing and the string below it, which the take-out may join, until "
+    "a step below removes that variable, then take such lines out with it"
 )
 
 #: DOUBT_STEP as printed where DOUBT_LEAVE applies.
@@ -205,23 +205,27 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: operator read every line out before removing the string, since the registry may hold its
 #: only copy, a retired store key among them, which protect-key never stores (code review round
 #: 1 on the repair of PR 3142's round-3 open findings 1 and 2; the Lander's hold on PR 3142,
-#: comment 7116005396, F1). It adds back no line of a refused value, bounded by the doubt step's
-#: rule, and reads out each string whose refused variable removing that string would read
-#: differently (the Lander's hold on PR 3142, comment 7119680463, items 1 and 3).
+#: comment 7116005396, F1). It adds back no line of a refused value, under a printed rule that
+#: ends one below a refused name written alone or set to nothing only at a refused line, and
+#: reads out, until none is left, each string whose refused variable removing the others would
+#: read differently (the Lander's hold on PR 3142, comment 7119680463, items 1 and 3; code review
+#: round 1 on that repair).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
     "service install` also runs, may read that string as the directory the service names and "
     "print it, and drops it whole, so before you run the installer read out of that string, of "
-    "each string that holds a refused variable whose reading removing that string would change, "
-    "and of each string a refused value in these runs on into, every line they hold, remove "
-    "those strings with each refused variable whose value they hold, put each refused value you "
-    "read where the other steps say, keep a retired key for the shell that runs `messagefoundry "
-    "rotate-key`, and add back as an entry of its own each other line, but none that may set "
-    "MEFOR_SECRETS_DIRECTORY and none that is part of a refused value: a line below a refused "
-    "name set to nothing, or below a line of a refused value, up to the next that names a "
-    "refused variable or sets another variable as the first step says, which a line that may "
-    "set MEFOR_SECRETS_DIRECTORY never does, writing the list back as the first step says"
+    "each string that holds a refused variable, alone or set, whose reading removing the strings "
+    "this sentence names would change, and of each string a refused value in them runs on into, "
+    "every line they hold, remove those strings with each refused variable whose value they "
+    "hold, put each refused value you read where the other steps say, keep a retired key for the "
+    "shell that runs `messagefoundry rotate-key`, and add back as an entry of its own each other "
+    "line, but none that may set MEFOR_SECRETS_DIRECTORY and none that is part of a refused "
+    "value: each line below a refused name written alone or set to nothing, up to the next that "
+    "names a refused variable, alone or set, and each line below another line of a refused "
+    "value, up to the next that names a refused variable or sets another variable as the first "
+    "step says, where a line that may set MEFOR_SECRETS_DIRECTORY ends neither, writing the list "
+    "back as the first step says"
 )
 
 #: How the Put step names the directory wherever a directory entry is in doubt, since the doubt
