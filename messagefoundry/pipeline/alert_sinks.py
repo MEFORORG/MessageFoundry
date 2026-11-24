@@ -372,10 +372,12 @@ class _BackgroundDispatcher(abc.ABC, Generic[_T]):  # noqa: UP046
         self._queue: asyncio.Queue[_T | None] = asyncio.Queue(maxsize=max_queue)
         self._task: asyncio.Task[None] | None = None
         # Queued, in flight, or handled without being delivered (BACKLOG #5907 step 4). api.app's
-        # startup unwind (_unwind_failed_start) logs it after its close. api.app's managed shutdown
-        # and its open_store failure path also close the notifier, and neither reads it.
-        # CORRECTED 2026-11-23 (BACKLOG #8350 item 2): this read "Read at least by api.app's
-        # startup unwind, which logs it after its close", which did not say those closes omit it.
+        # startup unwind (_unwind_failed_start) logs an alert notifier's count after its close; it
+        # is handed no security notifier. At least api.app's managed shutdown, its open_store
+        # failure path and __main__'s offline alert feed close an alert notifier without reading
+        # the count. CORRECTED 2026-11-23 (BACKLOG #8350 item 2): this read "Read at least by
+        # api.app's startup unwind, which logs it after its close", which did not say that other
+        # closes leave it unread.
         self._undelivered = 0
 
     def _enqueue(self, item: _T, *, dropped: str | None) -> bool:
