@@ -1475,35 +1475,100 @@ def cas_without_own_crl(ca_ders: Iterable[bytes], crl_pem: bytes) -> list[tuple[
     return missing
 
 
-def own_crl_reason(ca_ders: Iterable[bytes], crl_pem: bytes) -> str | None:
+def cas_not_reaching_a_root(ca_ders: Iterable[bytes]) -> list[str]:
+    """Each CA in ``ca_ders`` with no path through ``ca_ders`` to a self-signed root also in it,
+    named with its serial number, sorted (vault BACKLOG #5511). Each link needs the issuer's key
+    to verify the CA's signature, so a CA whose signature cannot be checked, or that does not
+    parse, is listed too, failing closed."""
+    named = []
+    pending = []
+    for index, der in enumerate(ca_ders, 1):
+        try:
+            pending.append(x509.load_der_x509_certificate(der))
+        except _UNREADABLE_CA:
+            named.append(f"CA certificate {index}, which does not parse")
+    rooted = [cert for cert in pending if _directly_issued(cert, cert)]
+    pending = [cert for cert in pending if cert not in rooted]
+    # A fixed point: each pass roots every pending CA that a rooted CA issued.
+    while reached := [c for c in pending if any(_directly_issued(c, r) for r in rooted)]:
+        rooted.extend(reached)
+        pending = [cert for cert in pending if cert not in reached]
+    named.extend(
+        f"{quoted_issuer(cert.subject.rfc4514_string())} (serial number {cert.serial_number:#x})"
+        for cert in pending
+    )
+    return sorted(named)
+
+
+#: The CA setting an outbound whole-chain hop loads its CAs from, as a refusal names it.
+_OUTBOUND_CA_SETTINGS = (
+    "such as a connection's tls_ca_file, [alerts].email_tls_ca_file, or "
+    "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
+)
+
+#: The no-partner-TLS case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection
+#: whose url is http, or a REST connection with ech_egress, sending through its ech_sidecar, makes
+#: no TLS connection of the engine's own to the partner, yet the engine still builds an https handler for it from its trust
+#: anchor, so the same rules apply. This refusal and the rooted-CA refusals in tls_policy carry it.
+OUTBOUND_NO_PARTNER_TLS_CASE = (
+    "A connection with an http url, or a REST connection with ech_egress, sending through its "
+    "ech_sidecar, makes no TLS connection of the engine's own to the partner, so no CRL is checked against the partner "
+    "there, but the engine still builds an https handler for that connection from its trust "
+    "anchor, and these rules apply to it"
+)
+
+
+def own_crl_reason(
+    ca_ders: Iterable[bytes], crl_pem: bytes, *, outbound: bool = False
+) -> str | None:
     """Why a whole-chain CRL check on a hop listing ``ca_ders`` refuses ``crl_pem``, after the
     setting or the file, or ``None`` when every CA has a CRL of its own (vault BACKLOG #5627,
-    #5511). A start and the running-hop reload both ask this, so the rule and its words are one."""
+    #5511). A start and the running-hop reload both ask this, so the rule and its words are one.
+    ``outbound`` words it for an outbound hop under ``[tls].crl_check_chain``, which on a hop
+    that sends over TLS checks a server's chain against CAs from its own CA setting."""
     try:
         missing = cas_without_own_crl(ca_ders, crl_pem)
     except ValueError as exc:
+        if outbound:
+            return (
+                "it could not be checked against the CAs the hop loaded from its CA setting, "
+                f"{_OUTBOUND_CA_SETTINGS}: {str(exc).replace('loaded client CA', 'loaded CA')}"
+            )
         return (
             "it could not be checked against the client CAs the hop loaded from its client-CA "
             f"setting, such as tls_ca_file or [api].tls_client_ca_file: {exc}"
         )
-    return own_crl_refusal(missing) if missing else None
+    return own_crl_refusal(missing, outbound=outbound) if missing else None
 
 
-def own_crl_refusal(missing: Iterable[tuple[str, int]]) -> str:
+def own_crl_refusal(missing: Iterable[tuple[str, int]], *, outbound: bool = False) -> str:
     """What a start and the running-hop reload say of the CAs :func:`cas_without_own_crl` found,
     after the setting or the file, so the two cannot drift apart (vault BACKLOG #5627). Each CA is
     named with its serial number, since two CAs can share a name, in one order whatever order the
-    caller read them in."""
+    caller read them in. ``outbound`` is :func:`own_crl_reason`'s."""
     named = ", ".join(
         f"{quoted_issuer(subject)} (serial number {serial:#x})"
         for subject, serial in sorted(missing)
     )
+    if outbound:
+        who = f"the CA(s) {named}, loaded from this hop's CA setting ({_OUTBOUND_CA_SETTINGS}),"
+        peers = "servers"
+        checked = (
+            "[tls].crl_check_chain checks the whole server chain against this file on a hop "
+            "that sends to its server over TLS"
+        )
+        http_case = f"{OUTBOUND_NO_PARTNER_TLS_CASE}. "
+    else:
+        who = f"the loaded client CA(s) {named}"
+        peers = "clients"
+        checked = "The whole client chain is checked against this file"
+        http_case = ""
     return (
-        f"the loaded client CA(s) {named} have no CRL of their own in it. Each needs a CRL that "
+        f"{who} have no CRL of their own in it. Each needs a CRL that "
         "carries its name and that its key signed, and every other CRL under its name that it "
-        "fits must be signed by it too, since OpenSSL may judge its clients by any of them. The "
-        "whole client chain is checked against this file, so every client under such a CA would "
-        "be refused. Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
+        f"fits must be signed by it too, since OpenSSL may judge its {peers} by any of them. "
+        f"{checked}, so every {peers[:-1]} under such a CA would "
+        f"be refused. {http_case}Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
         "authority key identifier that rules the other CA out: one naming the signing CA's key "
         "separates two CAs that each carry a subject key identifier, and one naming the signing "
         "CA's issuer and serial number separates two CAs unless they share both. A CA with no "

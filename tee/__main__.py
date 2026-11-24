@@ -805,7 +805,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     try:
         Keyer(salt)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        # Names the setting the salt came from; the keyer's message withholds the salt itself.
+        print(f"error: {args.salt_env}: {exc}", file=sys.stderr)
         return 1
 
     # LOAD THE RULES ONCE, HERE, FOR THE SAME REASON: the overlay is a property of the run, and a

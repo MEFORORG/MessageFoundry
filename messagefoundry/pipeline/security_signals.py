@@ -24,7 +24,10 @@ sign-in row. A refused local credential sign-in writes that row the same way in 
 directory (Kerberos or OIDC) lock refusal writes ``auth.directory_login_locked`` instead (BACKLOG
 #3726), so it is not counted. Refusals that write some other action are not counted either. The
 lock rows themselves are not read, and so an account lock raises no alert: that would show lock
-state to a reader the 2026-09-28 owner ruling withholds it from.
+state to a reader the 2026-09-28 owner ruling withholds it from. A local ``session_mint_contended``
+row weighs 0 (BACKLOG #5653): that sign-in writes two ``auth.login_failed`` rows, the visible
+stand-in a wrong password writes, which counts, and the hidden true row, so counting both would
+weigh one sign-in twice.
 
 **Refused peers are the one input that is not an audit row.** A listener refusing a peer at its
 source allowlist or a connection cap writes a ``connection_event`` row only while the operator's
@@ -327,7 +330,17 @@ def _one(detail: str | None) -> int:
 
 
 def _signin_weight(detail: str | None) -> int:
-    return 0 if detail == _DIRECTORY_LOCKED_DETAIL else 1
+    if detail == _DIRECTORY_LOCKED_DETAIL:
+        return 0
+    # A contended local sign-in (BACKLOG #5653) writes two ``auth.login_failed`` rows: the visible
+    # stand-in a wrong password writes, which counts, and the hidden true row, which does not, so
+    # the sign-in counts once, as a wrong password does. Matched on its fields, since ``pipeline/``
+    # does not import the exact details from ``auth/``.
+    parsed = _detail_of(detail)
+    local_contended = parsed.get("provider") == "local" and parsed.get("reason") == (
+        "session_mint_contended"
+    )
+    return 0 if local_contended else 1
 
 
 def _export_size(detail: str | None) -> int:

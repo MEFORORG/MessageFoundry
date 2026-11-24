@@ -258,7 +258,9 @@ async def _assert_escalation(store: Any) -> None:
         password_generated=False,
         audits=(),
     )
-    staged_cell = await store.set_totp_secret("lock-totp", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    staged_cell = await store.set_totp_secret(
+        "lock-totp", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0
+    )
     assert await store.enable_totp(
         "lock-totp", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
     )
@@ -271,7 +273,9 @@ async def _assert_escalation(store: Any) -> None:
         password_generated=False,
         audits=(),
     )
-    staged_cell = await store.set_totp_secret("lock-ad", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    staged_cell = await store.set_totp_secret(
+        "lock-ad", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0
+    )
     assert await store.enable_totp(
         "lock-ad", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=1.0
     )
@@ -526,7 +530,7 @@ async def _assert_unreadable_passkeys_beside_a_totp(
         )
 
     for case, corrupt in corrupt_passkeys.items():
-        for secret in ("JBSWY3DPEHPK3PXP", _REFUSED_A):
+        for secret in ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", _REFUSED_A):
             usable = secret != _REFUSED_A
             user_id = f"rot-bad-{case}-{'usable' if usable else 'refused'}"
             pk = credential_id_hash(user_id.encode())
@@ -807,7 +811,9 @@ async def _assert_conditional_rotation_on_a_passkey(store: Any) -> None:
     assert await store.delete_webauthn_credential(
         "rot-pk1", "rot-pk-plain", require_way_past=_opened_totp_state
     )
-    staged_cell = await store.set_totp_secret("rot-pk1", secret="JBSWY3DPEHPK3PXP", now=5.0)
+    staged_cell = await store.set_totp_secret(
+        "rot-pk1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=5.0
+    )
     assert await store.enable_totp(
         "rot-pk1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=5.0
     )
@@ -850,7 +856,7 @@ async def _assert_an_unknown_totp_behaves_as_an_enabled_one(store: Any, kind: st
         password_generated=False,
         audits=(),
     )
-    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
     plain = credential_id_hash(f"lock-uk-{kind}-plain".encode())
     await store.add_webauthn_credential(_cred(uid, "plain", id_hash=plain))
@@ -904,7 +910,9 @@ async def _assert_a_stale_pre_read_still_escalates(store: Any) -> None:
         password_generated=False,
         audits=(),
     )
-    cell = await store.set_totp_secret("lock-st1", secret="JBSWY3DPEHPK3PXP", now=1.0)
+    cell = await store.set_totp_secret(
+        "lock-st1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0
+    )
     assert await store.enable_totp(
         "lock-st1", expected_secret_cell=cell, recovery_code_hashes=[], now=1.0
     )
@@ -1027,7 +1035,7 @@ async def _assert_a_wrong_password_below_the_threshold_opens_no_cell(store: Any)
         password_generated=False,
         audits=(),
     )
-    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXP", now=1.0)
+    cell = await store.set_totp_secret(uid, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=1.0)
     assert await store.enable_totp(uid, expected_secret_cell=cell, recovery_code_hashes=[], now=1.0)
     real_open = store.open_totp_secret
     opened: list[str] = []
@@ -1170,7 +1178,9 @@ async def _assert_conditional_rotation(store: Any) -> None:
         True,
     )
     # TOTP on: the caller "checks" here and sees it...
-    staged_cell = await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=2.0)
+    staged_cell = await store.set_totp_secret(
+        "rot-u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=2.0
+    )
     assert await store.enable_totp(
         "rot-u1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=2.0
     )
@@ -1189,7 +1199,9 @@ async def _assert_conditional_rotation(store: Any) -> None:
     user = await store.get_user("rot-u1")
     assert user is not None and user.password_hash == "h-issued" and user.password_generated
     # With TOTP standing, the same write lands.
-    staged_cell = await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP", now=4.0)
+    staged_cell = await store.set_totp_secret(
+        "rot-u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", now=4.0
+    )
     assert await store.enable_totp(
         "rot-u1", expected_secret_cell=staged_cell, recovery_code_hashes=[], now=4.0
     )
@@ -1212,7 +1224,12 @@ async def _assert_conditional_rotation(store: Any) -> None:
     # conditional, and since BACKLOG #3025 neither can a stage: ``set_totp_secret`` has no clear and
     # writes nothing once TOTP is on, so the enabled secret is left as it was.
     before = await store.get_totp_secret("rot-u1")
-    assert await store.set_totp_secret("rot-u1", secret="JBSWY3DPEHPK3PXP"[::-1], now=5.0) is None
+    assert (
+        await store.set_totp_secret(
+            "rot-u1", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"[::-1], now=5.0
+        )
+        is None
+    )
     user = await store.get_user("rot-u1")
     assert user is not None and user.totp_enabled
     assert await store.get_totp_secret("rot-u1") == before
@@ -1246,7 +1263,7 @@ async def _assert_get_totp_secret_opens_off_the_loop(store: Any) -> None:
         password_generated=False,
         audits=(),
     )
-    secret = "JBSWY3DPEHPK3PXP"
+    secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     cell = await store.set_totp_secret("loop-u1", secret=secret, now=2.0)
     real_open = store.open_totp_secret
     threads: list[threading.Thread] = []
@@ -1276,7 +1293,7 @@ async def _assert_the_increment_carries_the_escalation_verdict(store: Any) -> No
     it rather than judge the cell again. A first lock, which the escalation does not judge, and the
     second-step counter carry none."""
     for uid, secret, verdict in (
-        ("lock-tv1", "JBSWY3DPEHPK3PXP", "usable"),
+        ("lock-tv1", "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "usable"),
         ("lock-tv2", "totp1:SHA1:6:30:JBSWY3DPEHPK3PXP", "refused"),
     ):
         await store.create_user(

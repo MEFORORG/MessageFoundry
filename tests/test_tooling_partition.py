@@ -251,12 +251,13 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
         # security/runtime-closure-core.txt and holds that to two exported locks. The
-        # gating argument is the one that keeps the repo-wide scanners here. A dependency bump edits
-        # pyproject.toml / uv.lock / requirements.lock, which sets `code=true` but NOT `tooling=true`
-        # -- that gate's few tests/ files are named above. Listed as tooling this would be dropped by
-        # `-m 'not tooling'` on the engine legs AND unreached by the tooling job's path gate, so the
-        # PR that added an unclassified dependency would face nothing, which is the one thing the
-        # designation exists to prevent (BACKLOG #1189).
+        # gating argument is the one that keeps the repo-wide scanners here. Several paths it reads
+        # match neither arm of ci.yml's tooling path gate: security/runtime-closure-*.txt,
+        # security/risky-component-readings.json, security/bundled-code-survey.json and harness/**.py.
+        # And the tooling tier does not run in the merge queue. Listed as tooling this would be dropped by
+        # `-m 'not tooling'` on the engine legs and reached only when the path gate happens to match,
+        # so a PR that edited only those paths could face nothing, which is the one thing
+        # the designation exists to prevent (BACKLOG #1189).
         "test_risky_component_designation.py",
         "test_sandbox_worker_logging.py",
         "test_scan_forbidden.py",
@@ -378,9 +379,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # security.yml's windows-lock-install job to the hashed runtime locks, and its
         # test_every_runtime_lock_exists reads requirements.lock, docker/locks/, security/locks/ and
         # ci/locks/ off disk (BACKLOG #5594). A lock removed, or renamed without the matching
-        # security.yml edit, sets `code=true` but NOT `tooling=true`; and the tooling tier does not
-        # run in the merge queue at all. Listed as tooling it would run on no pre-merge leg for that
-        # change, and on no queue run for any change. It spawns no subprocess, so staying on the
+        # security.yml edit, now sets `tooling=true` as well as `code=true` (ci.yml's tooling
+        # predicate names `(ci|docker|security)/locks/`, requirements.lock and `.github/`); but the
+        # tooling tier does not run in the merge queue at all, and a change that breaks it from a
+        # path the predicate omits would face nothing there. Listed as tooling it would run on no
+        # queue run for any change. It spawns no subprocess, so staying on the
         # engine legs costs them almost nothing.
         "test_windows_lock_install.py",
         # Imports its receipt and policy helpers from tests/test_dast_auth_sweep.py, an engine-tier
@@ -403,6 +406,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # each stopped before any worker spawns.
         "test_xdist_auto_worker_cap.py",
         "test_b622_5828_compose_host_ports.py",  # docker/compose.yaml: no tooling=true path
+        "test_b622_8298_compose_ha_postgres_start.py",  # docker/compose.yaml: no tooling=true path
     }
 )
 

@@ -58,9 +58,12 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     driver can quote its DSN or a ``password=`` / ``PWD=`` pair, and a config module can raise
     anything. :func:`~messagefoundry.redaction.safe_text` is a PHI pass, and on such a text it left
     the DSN password and the ``PWD=`` and ``password=`` values in place
-    (``tests/test_verify_detail_redaction.py``). So the text also takes
-    :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
-    log filter and wiring's own diagnostics use.
+    (``tests/test_verify_detail_redaction.py``). So the text also takes the write-time credential
+    vocabulary the log filter and wiring's own diagnostics use, read as
+    :func:`~messagefoundry.secretscrub.scrub_credentials_without_tails`: without the masked tails and
+    the PRIVATE KEY block mask the log filter applies (BACKLOG #5546 to #5550), so a quoted Basic
+    token68, a bytes literal, a Digest parameter list and a key block body print here as they did
+    before those rows. The comment at the import below says why.
 
     NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment either
     order hid a copy of is hidden in the result. Credentials first: the credential pass read
@@ -86,7 +89,10 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
     capitalized two-word phrase such as ``Program Files``."""
     from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, clamp_untrusted, redact
-    from messagefoundry.secretscrub import scrub_credentials
+
+    # Without the masked tails (BACKLOG #5546 to #5550): _printed_by_both counts word fragments, and
+    # a tail's "x" run is a fragment neither result hid, so the tails printed words this hid.
+    from messagefoundry.secretscrub import scrub_credentials_without_tails as scrub_credentials
 
     bounded = clamp_untrusted(text)
     # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it

@@ -1157,9 +1157,12 @@ per tier which of those its code provides, and an operator carries the rest
     frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**
     ([store/backup_codec.py](../messagefoundry/store/backup_codec.py), whose own docstring says the
-    cipher *mechanism* is net-new): chunked AES-256-GCM under the store DEK resolved directly by
-    `resolve_active_key`, with a per-chunk AAD of
-    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. The archive's
+    cipher *mechanism* is net-new): chunked AES-256-GCM keyed from the store DEK resolved directly by
+    `resolve_active_key` (when the header carries a salt, under the store data sub-key derived from
+    the DEK and that salt, ADR 0196), with a per-chunk AAD of
+    `header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)` — **not** a per-cell AAD. It carries no
+    per-archive value, so frames splice between archives that share a header; the codec's module
+    docstring says which do and what a splice can do. The archive's
     own seal is keyed by `resolve_active_key` and not `build_store_cipher`, so `cipher_provider =
     vault_transit` **never applies to sealing or unsealing a `.mfbak`**. It DOES apply one frame
     further in, and the distinction is the archive versus the cells inside it: `full_restore_verify`
@@ -2710,7 +2713,7 @@ both are described below:
 | --- | --- |
 | The message has no parseable MSH, or its structure cannot be parsed (`AnonError`) | The whole message |
 | A known partner, vendor or site token, or a routable IPv4 address, survives | The whole message |
-| A routable IPv6 address appears. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first, as for the SSN and phone rows. In the MSH header, MSH-2 past its four encoding characters and every field from MSH-3 on that no rule maps, as written and decoded. Not checked, at least: MSH-1, the encoding characters, the components a rule keeps past the first in a header field, and component 1 of a field a rule rewrites, which holds the surrogate |
+| A routable IPv6 address appears. An IPv6 address the check can read counts unless it is unspecified, loopback, link-local, unique-local, multicast without the P flag, or in a documentation range (`2001:db8::/32`, `3fff::/20`). A multicast address with the P flag set is refused, whether or not it embeds a prefix: that includes the RFC 3306 and RFC 3956 forms and source-specific `ff3x::/32`. An IPv4-mapped or IPv4-compatible one counts when its IPv4 part is routable. An allowed address is not routable on the internet, but it can still name a site or a device: a unique-local address carries its site's random Global ID, and a link-local one built from a MAC carries that MAC. The forms it cannot read are below (BACKLOG #5654) | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first, as for the SSN and phone rows. In the MSH header, MSH-2 past its four encoding characters and every field from MSH-3 on that no rule rewrites, a field under a `keep` included, as written and decoded, and the part past component 1 of a header field an `id`, `mrn`, `ssn` or `dln` rule rewrites. Not checked, at least: MSH-1, the encoding characters, and component 1 of a field a rule rewrites, which holds the surrogate |
 | The header's `MSH-12` version is made of digits and dots, and one run of digits is longer than 32 (`AnonError`, raised by the anonymizer before the leak-check runs) | The header |
 | A rule's surrogate would hold the message's own field separator, CR, LF, an MLLP frame byte or NUL, or what a surrogate writes itself could hold a component, repetition or subcomponent separator or the escape character the message's `MSH-2` declares (`AnonError`, raised by the anonymizer before the leak-check runs; BACKLOG #5540). What it could write is judged, not the one value the salt picked: the whole pool a `name`, `address` or `provider` rule draws from, so a space component separator refuses every address; any digit, for a `phone` or `dob` rule; and the fill and offset placeholder of a date. A field separator a surrogate could write is judged the same way. Text a surrogate copies from the sender is not checked for the `MSH-2` delimiters, at least a kept CX component, an SSN's dashes and a date's year, except at least the date of birth's fraction dot, which is checked; a phone number's dashes are written at fixed places and are checked. A keep on that field would emit the captured value; an overlay that points the field at `drop` clears it | The fields a rule rewrites |
 | A dashed SSN (`NNN-NN-NNNN`) appears inside one field, or across fields the message's own field separator cut it into | Fields no rule maps, what a retarget of a default field leaves past its first component, and the components an `id`, `mrn`, `ssn` or `dln` rule keeps past its first. A cut shape counts when at least one of its fields is one no rule maps |
@@ -2778,11 +2781,16 @@ still pass:
   the character alone. A code a vertical tab or file separator interrupts there is found, and a
   carriage return or line feed there ends the line, so the message is refused as holding a line
   no rule can reach.
-- The IPv6 check misses some routable addresses. At least these pass: one joined to an allowed
-  address, such as `fe80::1.4000:a1::5`, one written with fullwidth hex digits, which the IPv6 check does not fold, and an IPv4-mapped or
+- The IPv6 check misses some routable addresses. At least these pass: some addresses after
+  dotted groups with no colon before them in the run, such as `1.2.4000::5`, and an IPv4-mapped or
   IPv4-compatible one whose IPv4 part sits inside more than four dotted groups after the
   last colon, neither first nor last, such as `::ffff:10.0.0.1.8.8.8.8.10.0.0.1`
-  (BACKLOG #5654).
+  (BACKLOG #5654). A fullwidth colon written as an escape is not read as a colon, so the
+  address passes, though the same address written in fullwidth colons is refused (the folded
+  reading, below). At least two forms pass: hex escapes, whose pairs decode to a character each
+  (next item), so its UTF-8 bytes never make the fullwidth character, as in
+  `4000\XEFBC9A\a1\XEFBC9A\\XEFBC9A\5`; and a multi-byte character-set escape, which decodes to
+  nothing, as in `4000\MFF1A\a1\MFF1A\\MFF1A\5`.
 - A hex escape decodes one byte to one character. A non-ASCII character a UTF-8 sender wrote as
   several hex pairs reads as several characters, so a token holding it is not found in that form.
   An invisible character written that way still hides a dashed SSN, a punctuated phone number or
@@ -2795,9 +2803,33 @@ colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these
 `Decade::`, whose hex run is too long to be an address group, and `Xfe80::`, which reads as an
 allowed link-local address.
 
+The IPv6 check reads each value as written and also folded to compatibility form (NFKC), and
+refuses when either reading holds an address it counts as routable. So at least a routable
+address the check reads, written with fullwidth digits or colons or with a circled digit, is
+refused, such as `4000<U+FF1A>a1<U+FF1A><U+FF1A>5`. Some fullwidth forms of a miss listed
+above still pass, such as `1.2.4000<U+FF1A><U+FF1A>5`. A fullwidth full stop is not a character
+the check reads a run from, so as written it ends the run: `1.2<U+FF0E>4000::5` is refused,
+because as written it holds `4000::5`; written with fullwidth colons too, as
+`1.2<U+FF0E>4000<U+FF1A><U+FF1A>5`, it passes. A folded reading that is an allowed address adds
+no hit, so `fe80<U+FF1A><U+FF1A>1` and `::<U+2460>` pass: they fold to `fe80::1` and `::1`, and
+neither holds a routable address as written. The written reading still counts on its own:
+`<U+FF46>e80::1` folds to the allowed `fe80::1` and is refused, because as written it holds
+`e80::1`, which the check counts as routable (BACKLOG #5654).
+
+The IPv6 check also cuts a run at each dot that has a colon before it in the run and a colon
+after it, before the next dot or the end of the run, and reads each piece as a run of its own. A
+hit on a piece is named like any other IPv6 hit. At least these refuse that way: `a:b.c.d::1`
+for the piece `d::1`, `fe80::1.2::3` for `2::3`, and `fe80::1.bead::` for `bead::`. Each of
+those three pieces parses as an IPv6 address outside the ranges the check allows. Some are written as addresses, such as
+`2::3`; others are a hex word before `::`, the kind `Note::` is, such as `bead::`.
+The check cannot tell the two apart, and neither can the hit, so read the field's value in the
+source message before you dismiss such a hit, and treat text written as an address as one
+(BACKLOG #5654).
+
 In a message whose field separator is `:`, every IPv6 address is cut into separate fields, none
 of which holds it, and there is no cut-across-fields check for IPv6 as there is for the SSN and
-phone shapes, so every IPv6 address there passes, and `1::1234` refuses nothing (BACKLOG #5654).
+phone shapes, so every IPv6 address whose colons are literal field separators there passes, and `1::1234`
+refuses nothing (BACKLOG #5654).
 
 **A shape cut across fields by the message's own field separator is refused, but not in every
 form.** Under a field separator of `-`, the line `ZZZ-1-123-45-6789` holds the number as three
@@ -2814,8 +2846,10 @@ these still get through, on both anonymizers:
   such a rest too.
 - A shape cut by a digit field separator, such as `4`, when a separator sits right before or after
   it. The detectors read that digit as part of a longer number.
-- A cut shape in the header line, which this check skips whole. Of the shape checks, only the
-  IPv6 one reads the header.
+- A cut shape in the header line, which this check skips whole. The IPv6 row of the table above
+  says which parts of the header the IPv6 check reads. The SSN and phone checks read in the
+  header only the part past component 1 of a field an `id`, `mrn`, `ssn` or `dln` rule
+  rewrites, which on the anonymizer's output holds the components the rule keeps.
 
 With `require_full_coverage` on, such a message is refused for as long as nobody decides the
 fields that carry the rest of the shape. A `keep` on each of them would let it through. That

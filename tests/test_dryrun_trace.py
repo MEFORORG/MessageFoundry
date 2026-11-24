@@ -21,6 +21,8 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.__main__ import main
 from messagefoundry.config.db_lookup import db_lookup
 from messagefoundry.config.fhir_lookup import fhir_lookup
@@ -306,8 +308,9 @@ def test_gate_1a_a_generator_handler_traces_byte_identically_at_message_level() 
     non-``str`` iterable, and materialising a generator CONSUMES it. Mirroring that rule literally
     would leave the real ``_partition`` an exhausted iterator, so the *traced* run would deliver 0
     where the untraced run delivers 2: a tracer that changes the disposition, which is the one thing
-    ADR 0072 forbids. The two-line ``isinstance(result, Iterator)`` guard in ``_sends_from`` is what
-    prevents it, and before this test nothing covered it — deleting the guard left the whole tracer
+    ADR 0072 forbids. ``_sends_from``'s refusal to walk a return it cannot prove re-iterable (an
+    ``isinstance(result, Iterator)`` guard until BACKLOG #6823) is what prevents it, and before this
+    test nothing covered it — deleting the guard left the whole tracer
     suite green while turning a traced generator Handler into an accept-and-drop.
 
     The untraced side is asserted non-empty first, so this cannot pass by both runs delivering nothing
@@ -340,6 +343,99 @@ def test_gate_1b_a_generator_invocation_declares_lazy_result() -> None:
     control_inv = _handler_invocation(control)
     assert "lazy_result" not in control_inv  # absent, not False — an eagerly-returning handler
     assert control_inv["sends"] == [{"outbound": "out"}] and control_inv["events"]
+
+
+class _SinglePassSends:
+    """A Handler's single-pass Iterable of ``Send``s: ``__iter__`` returns one stored generator.
+
+    Not an ``Iterator``, so the ``Iterator`` guard alone let ``_sends_from`` walk it, drain it, and
+    hand ``_partition`` an empty iterable (BACKLOG #6823)."""
+
+    def __init__(self, *items: Send) -> None:
+        self._gen = (i for i in items)
+
+    def __iter__(self) -> Iterator[Send]:
+        return self._gen
+
+
+def handle_single_pass(msg: Message) -> _SinglePassSends:
+    return _SinglePassSends(Send("out", msg), Send("out2", msg))
+
+
+def test_gate_1a_a_single_pass_iterable_handler_traces_byte_identically() -> None:
+    """ADR 0072 gate 1a for a Handler returning a single-pass Iterable that is not an Iterator.
+
+    Walking it in the observer exhausted it, so the traced run reported FILTERED with zero
+    deliveries while the untraced run delivered two (BACKLOG #6823). The untraced side is asserted
+    to deliver first, so the test cannot pass by both runs delivering nothing. The under-report on
+    the invocation is declared with ``lazy_result``, as for a generator Handler."""
+    plain = dry_run(_two_out_registry(handle_single_pass), ADT_A01)
+    traced = trace_dry_run(_two_out_registry(handle_single_pass), ADT_A01)
+
+    assert [d.to for d in plain.deliveries] == ["out", "out2"]
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
+    assert traced["disposition"] == plain.disposition.value
+    inv = _handler_invocation(traced)
+    assert inv["sends"] == []
+    assert inv["lazy_result"] is True
+
+
+class _GenList(list[Send]):
+    """A ``list`` subclass whose ``__iter__`` is single-pass: ``isinstance(x, list)`` is True."""
+
+    def __init__(self, *items: Send) -> None:
+        super().__init__(items)
+        self._gen = (i for i in items)
+
+    def __iter__(self) -> Iterator[Send]:
+        return self._gen
+
+
+class _IterList(list[Send]):
+    """A ``list`` subclass that is also its own one-shot ``Iterator``."""
+
+    def __init__(self, *items: Send) -> None:
+        super().__init__(items)
+        self._pos = 0
+
+    def __iter__(self) -> _IterList:
+        return self
+
+    def __next__(self) -> Send:
+        if self._pos >= len(self):
+            raise StopIteration
+        self._pos += 1
+        return list.__getitem__(self, self._pos - 1)
+
+
+@pytest.mark.parametrize("cls", [_GenList, _IterList])
+def test_gate_1a_a_single_pass_container_subclass_handler_is_not_drained(cls: type) -> None:
+    """The allowlist is tested on the EXACT type: a builtin-container subclass may be single-pass."""
+
+    def handle(msg: Message) -> object:
+        return cls(Send("out", msg), Send("out2", msg))
+
+    plain = dry_run(_two_out_registry(handle), ADT_A01)
+    traced = trace_dry_run(_two_out_registry(handle), ADT_A01)
+
+    assert [d.to for d in plain.deliveries] == ["out", "out2"]
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
+    assert traced["disposition"] == plain.disposition.value
+    inv = _handler_invocation(traced)
+    assert inv["sends"] == []
+    assert inv["lazy_result"] is True
+
+
+@pytest.mark.parametrize("make", [list, tuple, set, frozenset])
+def test_handler_invocation_still_traces_re_iterable_containers(make: type) -> None:
+    """Control for the allowlist: re-iterable containers are still walked and not marked lazy."""
+
+    def handle(msg: Message) -> object:
+        return make([Send("out", msg), Send("out2", msg)])
+
+    inv = _handler_invocation(trace_dry_run(_two_out_registry(handle), ADT_A01))
+    assert sorted(s["outbound"] for s in inv["sends"]) == ["out", "out2"]
+    assert "lazy_result" not in inv
 
 
 def test_gate_byte_identical_unrouted_and_filtered() -> None:
@@ -566,6 +662,115 @@ def test_cli_trace_show_phi(tmp_path: Path, capsys) -> None:
     handler_inv = next(inv for inv in out[0]["invocations"] if inv["kind"] == "handler")
     writes = [w for ev in handler_inv["events"] for w in ev.get("writes", [])]
     assert any(w["path"] == "MSH-3" and w["value"] == "FOUNDRY" for w in writes)
+
+
+# --- BACKLOG #6822: --show-phi values must still serialize as RFC 8259 JSON --------------------
+
+
+def handle_non_json_numbers(msg: Message) -> Send:
+    nan = float("nan")
+    pos_inf = float("inf")
+    neg_inf = float("-inf")
+    huge = 10**5000  # past CPython's default 4300-digit int-to-str limit
+    _unused = (nan, pos_inf, neg_inf, huge)
+    return Send("out", msg)
+
+
+def handle_ordinary_numbers(msg: Message) -> Send:
+    count = 42
+    ratio = 0.5
+    pos_cap = 10**119  # 120 characters: the longest int still kept as a JSON number
+    neg_cap = 1 - 10**119  # 120 characters with the sign
+    over_cap = -(10**119)  # 121 characters: truncated like a string
+    flag = True
+    _unused = (count, ratio, pos_cap, neg_cap, over_cap, flag)
+    return Send("out", msg)
+
+
+class _HostileInt(int):
+    def __abs__(self) -> int:
+        raise RuntimeError("user __abs__ ran")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("user __repr__ ran")
+
+
+class _HostileFloat(float):
+    def __repr__(self) -> str:
+        raise RuntimeError("user __repr__ ran")
+
+    def __gt__(self, other: object) -> bool:
+        raise RuntimeError("user __gt__ ran")
+
+
+def handle_hostile_numbers(msg: Message) -> Send:
+    h_int = _HostileInt(10**200)
+    h_nan = _HostileFloat("nan")
+    h_inf = _HostileFloat("inf")
+    _unused = (h_int, h_nan, h_inf)
+    return Send("out", msg)
+
+
+def _strict_assigned(handler) -> dict:
+    reg = _registry(route_to_h, {"h": handler})
+    traced = trace_dry_run(reg, ADT_A01, show_phi=True)
+    # The traced run stays a pure observer: same disposition as the untraced one (ADR 0072 gate 1).
+    assert traced["disposition"] == dry_run(reg, ADT_A01).disposition.value
+    text = json.dumps(traced, allow_nan=False)  # raises on NaN/Infinity or an unprintable int
+    return _all_assigned(_handler_invocation(json.loads(text)))
+
+
+def test_show_phi_values_serialize_as_strict_json() -> None:
+    # Under --show-phi a NaN/Infinity float passed through unchanged, so the CLI's json.dumps wrote the
+    # bare tokens NaN/Infinity (not JSON), and a >4300-digit int made json.dumps raise ValueError.
+    assigned = _strict_assigned(handle_non_json_numbers)
+    assert assigned["nan"] == "<float: nan>"
+    assert assigned["pos_inf"] == "<float: inf>"
+    assert assigned["neg_inf"] == "<float: -inf>"
+    assert assigned["huge"] == "<int: too large>"
+
+
+def test_show_phi_keeps_ordinary_numbers_as_numbers() -> None:
+    assigned = _strict_assigned(handle_ordinary_numbers)
+    assert assigned["count"] == 42
+    assert assigned["ratio"] == 0.5
+    assert assigned["pos_cap"] == 10**119
+    assert assigned["neg_cap"] == 1 - 10**119
+    assert assigned["over_cap"] == str(-(10**119))[:120] + "…(truncated)"
+    assert assigned["flag"] is True
+
+
+def test_show_phi_numbers_call_no_subclass_hook() -> None:
+    # The tracer must not run user code a numeric subclass defines, or a traced run could ERROR where
+    # the untraced one delivers.
+    assigned = _strict_assigned(handle_hostile_numbers)
+    assert assigned["h_int"] == str(10**200)[:120] + "…(truncated)"
+    assert assigned["h_nan"] == "<float: nan>"
+    assert assigned["h_inf"] == "<float: inf>"
+
+
+def test_cli_trace_show_phi_writes_strict_json(tmp_path: Path, capsys) -> None:
+    # The real serializer: `dryrun --trace --show-phi` stdout must parse with NaN/Infinity refused.
+    module = _CONFIG_MODULE.replace(
+        '    mrn = msg["PID-3.1"]\n',
+        '    mrn = msg["PID-3.1"]\n    nan = float("nan")\n    huge = 10**5000\n',
+    )
+    assert module != _CONFIG_MODULE
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(module, encoding="utf-8")
+    msg = tmp_path / "adt.hl7"
+    msg.write_text(ADT_A01, encoding="utf-8")
+    rc = main(["dryrun", "--config", str(cfg), "--messages", str(msg), "--trace", "--show-phi"])
+    assert rc == 0
+
+    def _refuse(token: str) -> object:
+        raise ValueError(f"non-JSON token {token}")
+
+    out = json.loads(capsys.readouterr().out, parse_constant=_refuse)
+    assigned = _all_assigned(_handler_invocation(out[0]))
+    assert assigned["nan"] == "<float: nan>"
+    assert assigned["huge"] == "<int: too large>"
 
 
 # --- ADR 0084: an `accepts=` decline is surfaced in the trace ----------------------------------

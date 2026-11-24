@@ -127,8 +127,7 @@ cleartext note under `[egress]` in [CONFIGURATION.md](../../docs/CONFIGURATION.m
 (the sidecar *is* that connection's egress proxy) — refused in `RestDestination.__init__`
 ([`transports/rest.py`](../../messagefoundry/transports/rest.py); named by symbol rather than by line,
 because a line number goes stale silently and a wrong one reads as a working reference forever).
-`verify_tls = false` beside it is refused there too, and so are `tls_allow_expired`,
-`tls_ca_file` and `tls_ca_pin` (vault BACKLOG #2977). It composes with the
+`verify_tls = false` beside it is refused there too (vault BACKLOG #2977). It composes with the
 connection's allowlist/signing posture.
 
 **Both of the connection's outbound hops take the sidecar.** The delivery request and — when the

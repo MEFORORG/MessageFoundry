@@ -471,7 +471,7 @@ def test_a_codeset_rename_interrupted_after_a_write_keeps_table_and_references_t
     text = (config_dir / "mod.py").read_text(encoding="utf-8")
     assert 'code_set("meals")' in text and 'code_set("diets")' not in text
     load_config(config_dir)
-    assert "mod.py" in caplog.text and "stays as meals.csv" in caplog.text
+    assert "mod.py" in caplog.text and "stays as codesets/meals.csv" in caplog.text
 
 
 def test_reapplying_a_plan_with_two_edits_on_one_line_is_a_no_op(tmp_path: Path) -> None:
@@ -805,8 +805,10 @@ def test_codeset_rename_says_so_when_the_table_cannot_be_moved_back(
     with pytest.raises(WiringError) as caught:
         codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
     message = str(caught.value)
-    assert message.startswith("writing mod.py failed. Nothing was written. The code set was then")
-    assert "left as meals.csv" in message and "still name 'diets'" in message
+    assert message.startswith(
+        "writing mod.py failed. Nothing was written. Moving the code set back then failed"
+    )
+    assert "the table is codesets/meals.csv" in message and "still name 'diets'" in message
 
 
 def test_the_codeset_rename_row_spells_its_steps_in_words() -> None:

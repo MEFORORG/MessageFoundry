@@ -752,7 +752,8 @@ def test_a_glued_value_ending_at_a_clamp_notes_line_break_is_found_and_masked(
     :data:`redaction._GLUED_BARE_VALUE` needs a space or the text's end after the value, so the
     value right before the note was not found and printed whole, with the label gone into the run.
     These values, letters or a credential not opening with a digit, are masked now. A digit-bearing
-    PHI value there still prints, as on main (a residual the changelog names).
+    value there is masked too since the root fix; ``tests/test_redaction_clamp_note_end.py`` pins
+    it.
 
     The log-chain route is asserted only where the clamp keeps the value: its name walk drops a
     trailing capitalized word such as ``Li`` before any redaction runs, so for that value the

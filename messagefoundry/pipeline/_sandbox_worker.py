@@ -47,9 +47,12 @@ import os
 import sys
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.logging_setup import configure_stderr_logging
+
+if TYPE_CHECKING:
+    from messagefoundry.config.run_context import RunPhase
 
 # stdout is the IPC channel, so the root logger goes to stderr — a stray log line there cannot corrupt
 # a frame. It is `configure_stderr_logging` rather than a bare `basicConfig` because redaction is a
@@ -354,6 +357,7 @@ def _run_one(
         req.run_context, code_sets=registry.code_sets if code_sets is None else code_sets
     )
 
+    phase_key: RunPhase
     if phase == "router":
         fn = registry.routers.get(name)
         phase_key = "router"

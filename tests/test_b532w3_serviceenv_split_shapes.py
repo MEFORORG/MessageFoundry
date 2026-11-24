@@ -27,6 +27,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
+from tests._serviceenv_remedy import CREATE
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 
@@ -81,7 +82,11 @@ def _read(entries: Sequence[str]) -> ServiceEnvPosture:
 def test_the_stand_ins_have_the_shapes_they_stand_for() -> None:
     assert len(_URL_KEY) == 44 and _URL_KEY.endswith("=") and not _URL_KEY.endswith("==")
     assert "-" in _URL_KEY and "_" in _URL_KEY
-    assert not serviceenv._holds_key_run(_URL_KEY)
+    # No store-key-sized run of the standard alphabet in it; since BACKLOG #5394 items 6 and 12
+    # read a whole base64url secret as key material too, ``_holds_key_run`` reads it as one, which
+    # only refuses more.
+    assert serviceenv._KEY_SHAPED_RUN.search(_URL_KEY) is None
+    assert serviceenv._holds_key_run(_URL_KEY)
     assert _URL_SHORT.endswith("=") and not _URL_SHORT.endswith("==") and "-" in _URL_SHORT
     assert len(_STD_KEY) == 44 and _STD_KEY.endswith("=") and not _STD_KEY.endswith("==")
 
@@ -324,18 +329,18 @@ def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable()
     posture = _read(["MEFOR_SECRETS_DIRECTORY=\nNO_PROXY=,localhost", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",)
     refusal = service_env_refusal(posture)
-    assert refusal is not None and "The service's lists set no" in refusal
+    assert refusal is not None and CREATE in refusal
 
 
 @pytest.mark.parametrize("line", ['"x"=y', "PATH=,C:\\x", "Http_Proxy=,x", "\u201cx\u201d=y"])
 def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: str) -> None:
     """A regression an earlier repair of this item made: the directory's name is no secret, so
     a later line ends its empty value under the plain line rule, and the remedy still
-    says the lists set no directory."""
+    says no entry names the directory."""
     posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",), line
     refusal = service_env_refusal(posture)
-    assert refusal is not None and "The service's lists set no" in refusal, line
+    assert refusal is not None and CREATE in refusal, line
 
 
 @pytest.mark.parametrize("item", ["Http_Proxy=", "=ExitCode=0", "=abc123", "ab-c_dE="])

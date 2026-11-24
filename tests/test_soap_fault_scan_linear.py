@@ -34,7 +34,8 @@ import gc
 import random
 import re
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import pytest
@@ -45,6 +46,7 @@ from messagefoundry.config.wiring import Soap
 from messagefoundry.transports import build_destination, soap
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
+from tests._cpu_clock import interleaved_thread_cpu
 from tests._growth import _growth_between
 
 # The patterns as they stood at engine origin/main 7051dbc552, before BACKLOG #2827.
@@ -1201,14 +1203,20 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
 }
 
 
-def _attempt_ratio(scan: Callable[[str], object], small: str, large: str) -> float:
+@contextmanager
+def _collector_off() -> Iterator[None]:
     was_enabled = gc.isenabled()
     gc.disable()
     try:
-        return _growth_between(scan, small, large, rounds=3)
+        yield
     finally:
         if was_enabled:
             gc.enable()
+
+
+def _attempt_ratio(scan: Callable[[str], object], small: str, large: str) -> float:
+    with _collector_off():
+        return _growth_between(scan, small, large, rounds=3)
 
 
 def _scaling_ratios(
@@ -1224,6 +1232,18 @@ def _scaling_ratios(
         if readings[-1] < _MAX_LINEAR_RATIO:
             break
     return readings
+
+
+def _cpu_ratio(scan: Callable[[str], object], small: str, large: str) -> float:
+    """The control's two inputs timed again on the calling thread's CPU clock, for the record
+    only; tests/test_ad_group_dn_only.py's ``_cpu_ratio`` says what the reading tells apart
+    (BACKLOG #3452). Each arm takes at least three calls, so one load-skewed call of the large
+    input, about 0.15 s of CPU at the largest ``k``, does not set it alone."""
+    with _collector_off():
+        per_call = interleaved_thread_cpu(
+            {"small": lambda: scan(small), "large": lambda: scan(large)}, min_calls=3
+        )
+    return per_call["large"] / per_call["small"]
 
 
 def _attempts(readings: list[float]) -> str:
@@ -1249,11 +1269,17 @@ def test_a_pathological_reply_is_classified_in_linear_time(make: Callable[[int],
     )
 
 
+# record_property warns that <properties> inside a <testcase> is outside the xunit2 schema, the
+# default family. pytest writes them there all the same, which is where the readings are wanted.
+@pytest.mark.filterwarnings("ignore:record_property is incompatible:pytest.PytestWarning")
 @pytest.mark.parametrize(
-    ("shape", "k"), [("faultcode-start-tags", 2_000), ("unterminated-value-tags", 8_000)]
+    ("shape", "k"), [("faultcode-start-tags", 2_000), ("unterminated-value-tags", 16_000)]
 )
 def test_the_linear_check_fails_the_old_patterns(
-    shape: str, k: int, monkeypatch: pytest.MonkeyPatch
+    shape: str,
+    k: int,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Callable[[str, object], None],
 ) -> None:
     """Positive control: the check above must fail the patterns #2827 replaced, or its pass proves
     nothing. It times the same subject, the 2xx classification, with the old extraction patched
@@ -1261,14 +1287,39 @@ def test_the_linear_check_fails_the_old_patterns(
     tail (``(.*?)</`` and ``[^>]*>``).
 
     The old patterns took about 0.4 s at 44,000 characters, so this runs far below the linear
-    check's sizes. Each ``k`` is where the old curve read well clear of the line in 12 runs on one
-    workstation (2026-11-03): 13.8x to 15.8x and 12.9x to 15.9x. The ``(.*?)</`` tail is the
-    costlier one, so its ``k`` is smaller; at 4,000 it read once at 9.6x and took 1.6 s a run."""
+    check's sizes. The ``(.*?)</`` tail is the costlier one, so its ``k`` is smaller; at 4,000 it
+    read once at 9.6x and took 1.6 s a run.
+
+    ``unterminated-value-tags`` ran at 8,000 until hosted ubuntu merge-group runs read it under
+    the line on 2026-11-24, at 7.98x (one attempt) and at 14.12x, 14.36x, 7.61x. As in
+    tests/test_ad_group_dn_only.py (BACKLOG #3452), the size went up and the rule did not: a low
+    attempt means the linear check would have passed the old patterns on that run. At 16,000 one
+    Windows workstation read 13.7x to 15.3x in 12 attempts, about 1.0 s each (2026-11-24); at
+    8,000 it read 13.4x to 14.7x there. Its CPU readings moved by up to 40% between runs, so none
+    is quoted here. That the low hosted readings are the
+    runner's, and that a longer sample rides them out, is inferred from those local readings, not
+    measured on a hosted runner; the CPU reading below is how a hosted run measures it.
+    ``faultcode-start-tags`` read low in neither hosted run, so it stays at 2,000; on the same
+    workstation it read 14.4x to 15.6x in 12 attempts. Two hosted runs are a small sample, so a
+    low hosted reading of it is the next cue to raise its ``k`` too.
+
+    The wall readings and :func:`_cpu_ratio`'s reading go into the failure message and, as
+    ``wall_ratios`` and ``cpu_ratio``, into this test's junit properties, on a pass too, because a
+    sample taken only on a red is selected on the outcome. ci.yml's engine ``test`` job writes and
+    uploads that file; its ``Upload engine suite junit`` steps say when and for how long."""
     monkeypatch.setattr(soap, "_fault_code", _old_fault_code)
-    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], k)
+    make = _PATHOLOGICAL_REPLIES[shape]
+    readings = _scaling_ratios(_classify_2xx, make, k)
+    record_property("wall_ratios", ",".join(f"{reading:.3f}" for reading in readings))
+    try:
+        cpu = f"{_cpu_ratio(_classify_2xx, make(k), make(4 * k)):.3f}"
+    except RuntimeError as broken:  # interleaved_thread_cpu's spin guard; a reading, not a verdict
+        cpu = f"error: {broken}"
+    record_property("cpu_ratio", cpu)
     ratio = min(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
-        f"the old patterns scaled by only {ratio:.2f}x ({_attempts(readings)})"
+        f"the old patterns scaled by only {ratio:.2f}x ({_attempts(readings)}; "
+        f"thread CPU clock {cpu})"
     )
 
 
