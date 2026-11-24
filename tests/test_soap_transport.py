@@ -514,8 +514,10 @@ async def test_another_status_or_no_answer_between_leaves_the_ws_security_401_ru
 ) -> None:
     """A 5xx, a 407 (at least these can come from a gateway or proxy rather than the endpoint),
     or no answer at all leaves the run open, so the next WS-Security 401 is the second in a row:
-    a credential fault. Mutation: reset the flag in the 401 arm for any other status, or in a
-    transport-failure arm. Red: the second WS-Security 401 is retried again."""
+    a credential fault. So does a 2xx carrying a WS-Security fault (BACKLOG #5798 added item 2).
+    Mutation: reset the flag in the 401 arm for any other status, or in a transport-failure arm,
+    or on any 2xx in _post_and_classify (red: "2xx-ws-security-fault"). Red: the second
+    WS-Security 401 is retried again."""
     dest, _ = _oauth2_dest()
     await _ws_security_401_then(dest, kind)
     with pytest.raises(NegativeAckError) as ei:
@@ -623,6 +625,11 @@ _EXPIRED_IN_THE_CODE = {
         b"<soap:Fault><faultcode>soap:Client</faultcode>"
         b"<faultstring>wsse:MessageExpired</faultstring></soap:Fault>"
     ),
+    "client-code-credential-in-detail": (
+        b"<soap:Fault><faultcode>soap:Client</faultcode>"
+        b"<faultstring>wsse:MessageExpired</faultstring>"
+        b"<detail>InvalidSecurityToken</detail></soap:Fault>"
+    ),
     "comment-in-the-faultcode": (
         b"<soap:Fault><faultcode><!-- </faultcode> -->wsse:MessageExpired</faultcode>"
         b"<faultstring>FailedAuthentication</faultstring></soap:Fault>"
@@ -639,7 +646,9 @@ async def test_control_message_expired_in_the_code_or_with_no_code_stays_permane
     """A SOAP 1.2 Subcode is inside the Code element, so it decides. A Fault with no code
     element, or a reply whose only WS-Security code is MessageExpired, keeps the earlier search,
     as on main ("client-code-expired-elsewhere", review round 2c51ab65; mutation: read only the
-    code element whenever it is found, red: a bearer retry, then a lane stop). A faultcode close
+    code element whenever it is found, red: a bearer retry, then a lane stop), even where a
+    credential code sits outside the code element ("client-code-credential-in-detail", round
+    4c3aa241). A faultcode close
     tag inside a comment does not end the element (mutation: a plain close-tag search, red: a
     bearer retry)."""
     dest, _ = _oauth2_dest()

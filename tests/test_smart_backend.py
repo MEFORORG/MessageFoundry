@@ -31,7 +31,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import FhirDestination
-from messagefoundry.transports.rest import RestDestination
+from messagefoundry.transports.rest import ProxyConfig, RestDestination
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
     CompactJwtSigner,
@@ -708,9 +708,26 @@ def test_smart_refuses_an_unencodable_grant_value_at_construction(
         SmartAuthError, match=f"{setting} holds a character UTF-8 cannot encode"
     ) as ei:
         _provider(rsa_pem, **over)
-    assert "synthetic" not in str(ei.value)
+    (value,) = over.values()
+    assert value not in str(ei.value) and value[:12] not in str(ei.value)
     # Raised outside any handler, so no exception holding the value rides the chain.
     assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_smart_refuses_an_over_length_proxy_credential_at_construction(rsa_pem: str) -> None:
+    """Mutation: drop the second length check, after ``_open_token_hop``. Red: the provider
+    builds, and nothing measures its Proxy-Authorization header at mint either (review round
+    4c3aa241)."""
+    proxy = ProxyConfig(
+        proxies=(("https", "https://proxy.example:3128"),),
+        use_default=False,
+        bypass=(),
+        auth_header=(("Proxy-Authorization", "Basic " + "x" * 20_000),),
+        digest=None,
+    )
+    with pytest.raises(SmartAuthError, match=r"'Proxy-Authorization' is \d+ chars, over the") as ei:
+        _provider(rsa_pem, proxy=proxy)
+    assert "x" * 64 not in str(ei.value)
 
 
 def test_smart_refuses_an_over_length_token_url_at_construction(rsa_pem: str) -> None:

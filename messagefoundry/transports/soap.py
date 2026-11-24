@@ -488,11 +488,10 @@ def _searched_code(body: str, start: int, end: int) -> str:
 
 
 # BACKLOG #5798 added item 3: the faultcode close tag outside markup, as _CODE_END_OUTSIDE_MARKUP_RE
-# finds the Code's, and the two WS-Security codes that name a credential rather than the Timestamp.
+# finds the Code's.
 _FAULTCODE_END_OUTSIDE_MARKUP_RE = re.compile(
     r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?faultcode\s*>)"
 )
-_WSSE_CREDENTIAL_RE = re.compile(r"FailedAuthentication|InvalidSecurityToken", re.IGNORECASE)
 
 
 def _code_element_span(body: str, fault: re.Match[str]) -> tuple[int, int] | None:
@@ -520,20 +519,15 @@ def _code_element_span(body: str, fault: re.Match[str]) -> tuple[int, int] | Non
 
 
 def _names_expired_timestamp(body: str) -> bool:
-    """Whether ``body``'s Fault reads as ``MessageExpired`` for the bearer retry in ``_post``.
-
-    ``MessageExpired`` is searched for as :func:`_classify_soap` searches for a WS-Security code,
-    from where :func:`_find_fault` starts, unless both of these hold: the Fault's code element
-    (:func:`_code_element_span`) is found, and a ``FailedAuthentication`` or
-    ``InvalidSecurityToken`` is in that searched range. Then only the code element decides.
-    BACKLOG #5798 added item 3: the range search alone let a ``MessageExpired`` in a faultstring,
-    a Detail or after the Fault keep such a fault from its bearer retry. A reply whose only
-    WS-Security code is ``MessageExpired`` still reads as it did, wherever that code sits."""
+    """Whether ``body``'s Fault reads as ``MessageExpired`` for the bearer retry in ``_post``, by
+    the rule docs/CONNECTIONS.md states in its WS-Security mode section (BACKLOG #5798 added
+    item 3): the code element (:func:`_code_element_span`) decides where it names a WS-Security
+    code, and otherwise the search :func:`_classify_soap` runs for one."""
     fault, start = _find_fault(body)
     if fault is None:
         return False
     span = _code_element_span(body, fault)
-    if span is not None and _WSSE_CREDENTIAL_RE.search(body, start) is not None:
+    if span is not None and _WSSE_FAULT_RE.search(body, *span) is not None:
         return _WSSE_EXPIRED_RE.search(body, *span) is not None
     return _WSSE_EXPIRED_RE.search(body, start) is not None
 
@@ -943,9 +937,10 @@ class SoapDestination(DestinationConnector):
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener(*proxy_handlers)
-        # #65: an opt-in bearer provider (OAuth2 client-credentials) for the HTTP *hop*, independent
-        # of WS-Security, which secures the SOAP *message*. Minted in _post and _probe. Built after
-        # the gates above, so a build one of them refuses never builds it.
+        # #65: an opt-in bearer provider (OAuth2 client-credentials, or SMART from hand-written
+        # smart_* settings) for the HTTP *hop*, independent of WS-Security, which secures the SOAP
+        # *message*. Minted in _post and _probe. Built after the gates above, so a build one of
+        # them refuses never builds it.
         from messagefoundry.transports.http_auth import (
             bearer_provider_from_settings,
             oauth2_auth_configured,
@@ -1445,15 +1440,11 @@ class SoapDestination(DestinationConnector):
         # so the wire (and any detached JWS over those bytes) carries the secret while the store still
         # holds only the token. No-op / byte-identical when no body_secrets are configured.
         payload = self._apply_body_secrets(payload)
-        run_open = self._wssecurity_401_retried
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
-        if _is_wssecurity_fault(failure):
-            # BACKLOG #5798 added item 2: _post ended the WS-Security 401 run on this 2xx, but a
-            # 2xx carrying a WS-Security fault says the credential is still refused, so the run
-            # stays as it was. Like the flag itself, this assumes no other send on this connection
-            # runs between the two reads.
-            self._wssecurity_401_retried = run_open
+        if not _is_wssecurity_fault(failure):
+            # BACKLOG #5798 added item 2: this 2xx ends a WS-Security 401 run (CONNECTIONS.md).
+            self._wssecurity_401_retried = False
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
         # echoed secret before send() returns it (a validating registry may echo a bad credential in
         # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
@@ -1471,7 +1462,7 @@ class SoapDestination(DestinationConnector):
         # payload is the FINAL wire body (in WS-* mode _post_and_classify already wrapped + stamped it),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
-        # #65: a fresh OAuth2-CC bearer per request, acquired off-loop past the queue boundary (a
+        # #65: a fresh provider bearer per request, acquired off-loop past the queue boundary (a
         # retry re-mints — re-run purity holds).
         headers = self._send_headers()
         if self._signer is not None:
@@ -1490,22 +1481,25 @@ class SoapDestination(DestinationConnector):
         self._bound_sent_headers(req.full_url, headers, connector=f"SOAP {_redact_url(self.url)}")
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                # BACKLOG #5798: a 2xx ends a WS-Security 401 run. First, so a 2xx whose read below
-                # raises still ends it. _post_and_classify reopens it on a 2xx WS-Security fault.
-                self._wssecurity_401_retried = False
-                # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
-                # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
-                # vault BACKLOG #2180: the status here is 2xx, so an over-cap body must not
-                # re-send. A Fault can sit inside a 2xx, so _post_and_classify reads this body in both
-                # capture modes, and the refusal is permanent.
-                body = read_2xx_reply_text(
-                    resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
-                )
-                status = int(getattr(resp, "status", 200))
-                # #154: capture only the allow-listed response headers (empty allow-list → {}).
-                headers = capture_response_headers(
-                    getattr(resp, "headers", None), self.capture_response_headers
-                )
+                try:
+                    # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far
+                    # under the 16 MiB ceiling, so this refuses only a peer that is broken or
+                    # hostile. vault BACKLOG #2180: the status here is 2xx, so an over-cap body must
+                    # not re-send. A Fault can sit inside a 2xx, so _post_and_classify reads this
+                    # body in both capture modes, and the refusal is permanent.
+                    body = read_2xx_reply_text(
+                        resp, connector=self._hop, encoding=self.encoding, body_is_needed=True
+                    )
+                    status = int(getattr(resp, "status", 200))
+                    # #154: capture only the allow-listed response headers (empty allow-list → {}).
+                    headers = capture_response_headers(
+                        getattr(resp, "headers", None), self.capture_response_headers
+                    )
+                except Exception:
+                    # BACKLOG #5798: a 2xx whose reply cannot be read ends a WS-Security 401 run;
+                    # one read whole ends it in _post_and_classify unless it is a WS-Security fault.
+                    self._wssecurity_401_retried = False
+                    raise
                 return body, status, headers
         except urllib.error.HTTPError as exc:
             try:

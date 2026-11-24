@@ -3130,12 +3130,12 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
   queue (ADR 0095), because the credential at fault is one the engine cannot see, at least a
   `UsernameToken` a Handler writes into its own envelope or a client certificate. A 2xx ends that
   run unless its body is a WS-Security fault, and so does a `401` that is not a WS-Security fault;
-  a 5xx, a `407`, any other status or no answer leaves it open. A `401` carrying `MessageExpired`
-  dead-letters on every connection. The WS-Security code search looks after the first Body start
-  tag when a Fault follows it, else at the whole reply. Where it also finds `FailedAuthentication`
-  or `InvalidSecurityToken` and the Fault's first child is a code element with a close tag (SOAP
-  1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`), `MessageExpired` counts only in that
-  element; otherwise it counts anywhere that search looks (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  a 5xx, a `407`, any other status or no answer leaves it open. A `401` whose fault reads as
+  `MessageExpired` dead-letters on every connection. Where the Fault's first child is a code
+  element with a close tag (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) that
+  names a WS-Security code, the fault reads as `MessageExpired` only if that element names it.
+  Otherwise it does if `MessageExpired` is anywhere the WS-Security code search looks: after the
+  first Body start tag when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
   module docstring points here.
 
 ```python

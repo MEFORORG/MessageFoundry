@@ -638,9 +638,9 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
                 "SMART backend services requires a 'smart_private_key' setting (PEM via env())"
             )
         # BACKLOG #5800 added item 1: the scope is URL-encoded as strict UTF-8 at each mint, so a
-        # lone surrogate raised UnicodeEncodeError out of send or test_connection; the key and its
-        # password are encoded strictly as UTF-8 while the signer loads them below, and that
-        # exception's `object` is the whole value. Refused here, by setting name only, as the
+        # lone surrogate raised UnicodeEncodeError out of send or test_connection; an inline PEM key
+        # and its password are encoded strictly as UTF-8 while the signer loads them below, and
+        # that exception's `object` is the whole value. Refused here, by setting name only, as the
         # OAuth2 provider refuses its grant values. The client id, audience and key id ride the
         # JSON assertion, whose encoder escapes a lone surrogate.
         unencodable = next(
@@ -648,7 +648,8 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
                 name
                 for name, value in (
                     ("smart_scope", scope),
-                    ("smart_private_key", private_key),
+                    # Only inline PEM is encoded; a path goes to open(), which takes one.
+                    ("smart_private_key", private_key if "-----BEGIN" in private_key else None),
                     ("smart_private_key_password", private_key_password),
                 )
                 if value and has_lone_surrogate(value)
@@ -674,8 +675,9 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         # config error rather than an opaque IdP failure. BACKLOG #5800 added item 1: this ran at
         # each mint, where its ValueError escaped send and test_connection unclassified. Measured
         # here, before _open_token_hop's revocation guard can record a crossing for a build this
-        # refuses; the proxy headers that hop adds are measured after it. The message names a
-        # header and a length, never a value.
+        # refuses. The proxy headers that hop adds are measured after it, so an over-length proxy
+        # credential can still follow a recorded crossing. The message names a header and a
+        # length, never a value.
         self._refuse_over_length(token_url, {})
         # Loads + validates the key/curve for the algorithm — a bad key fails loud here, before the
         # token hop's revocation guard, as it always has.
