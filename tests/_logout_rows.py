@@ -24,18 +24,6 @@ async def logout_rows(
     ]
 
 
-async def age_session_links(store: Any, seconds: float) -> None:
-    """Move every ``session_lineage`` link of a SQLite ``MessageStore`` ``seconds`` into the past.
-
-    The store stamps a link and measures the window a revoke follows it for on the DATABASE's
-    clock, not on ``time.time`` (vault BACKLOG #4276), so patching ``time`` no longer ages a link.
-    This is how a test puts a link past a window instead."""
-    await store._db.execute(
-        "UPDATE session_lineage SET retired_at = retired_at - ?", (float(seconds),)
-    )
-    await store._db.commit()
-
-
 async def temp_password_expired_rows(store: Any) -> list[tuple[object, object, object]]:
     """Each ``auth.temp_password_expired`` row, newest first, as its actor, client address and
     whole ``detail``: the row a sign-out writes when it ends a session whose temporary credential

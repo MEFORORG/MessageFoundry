@@ -22476,6 +22476,7 @@ class MessageStore:
         unit: the writer lock orders them against every in-process writer, ``rotate_session``
         included. The first ``UPDATE`` takes SQLite's write lock even when it matches no row, and
         holds it until the commit, so no other process can re-key a row while the walk runs."""
+        started = time.monotonic()  # before the lock, so its wait cannot shorten the window
 
         async def _revoke(h: str) -> SessionRecord | None:
             cur = await self._db.execute(
@@ -22499,6 +22500,7 @@ class MessageStore:
                 ended = await revoke_through_lineage(
                     token_hash,
                     lineage_seconds=lineage_seconds,
+                    started=started,
                     revoke=_revoke,
                     successor=_successor,
                 )

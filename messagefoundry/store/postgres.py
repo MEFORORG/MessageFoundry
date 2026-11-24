@@ -12298,6 +12298,7 @@ class PostgresStore:
         Each step's ``UPDATE ... RETURNING`` locks the row it ends. Under READ COMMITTED each
         statement reads what has committed when it starts, so a rotation that commits while the
         walk runs is seen by the next step's lineage read. The borrow stays bounded, as it was."""
+        started = time.monotonic()  # before the borrow, so its wait cannot shorten the window
         async with self._timed_acquire(record=False) as conn, conn.transaction():
 
             async def _revoke(h: str) -> SessionRecord | None:
@@ -12317,6 +12318,7 @@ class PostgresStore:
                 return await revoke_through_lineage(
                     token_hash,
                     lineage_seconds=lineage_seconds,
+                    started=started,
                     revoke=_revoke,
                     successor=_successor,
                 )

@@ -34,7 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.session_lineage import LINEAGE_MAX_HOPS, revoke_through_lineage
 from messagefoundry.store.store import MessageStore, SessionRecord
 from tests._ast_sites import code_names, code_strings, parse_source
-from tests._logout_rows import age_session_links
+from tests._session_rotation_contract import age_sqlite_session_links
 from tests.test_session_supersession import (
     PW,
     _live,
@@ -158,7 +158,7 @@ async def test_a_link_older_than_the_window_is_not_followed(store: MessageStore)
     assert window >= service.oidc_flow_ttl_seconds, "the window must outlast the longest sign-in"
     prior = await _token(service)
     rotated = await _elevate(service, prior)
-    await age_session_links(store, window + 5)
+    await age_sqlite_session_links(store, window + 5)
     assert await _live(service, rotated)
     await _token(service, supersedes=prior)
     assert await _live(service, rotated), "a link past its window ended a session"
@@ -171,7 +171,10 @@ async def test_a_forward_step_of_the_signing_in_process_clock_does_not_drop_a_li
     # Vault BACKLOG #4276, ASVS 7.2.4 arm (ii). The 2026-10-26 pass moved `time.time` forward 425
     # seconds after one elevation, and a sign-in presenting the older token then left the rotated
     # session live: the link was stamped and judged on this process's clock. Both now read the
-    # store's clock, so the same step, past the whole window, drops nothing.
+    # store's clock, so the same step, past the whole window, drops nothing. The patch moves only
+    # Python's clock, not SQLite's, so it models an engine process whose clock differs from the
+    # store's, as an engine host over a PostgreSQL or SQL Server store can. On SQLite a real step
+    # of the host's clock moves the store's clock too, and this does not show that case closed.
     service = await _service(store, session_idle_timeout_minutes=240)
     window = service.supersession_lineage_seconds
     prior = await _token(service)
@@ -372,7 +375,9 @@ async def test_the_reaper_purges_links_by_the_window_it_is_given(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-    assert seen[0] == 420.0
+    # Plus the step tolerance: the store measures the age on its own clock, which the reaper's
+    # step guard does not read (vault BACKLOG #4276).
+    assert seen[0] == 420.0 + api_app._SESSION_REAP_STEP_TOLERANCE
 
 
 def test_the_lifespan_hands_the_reaper_the_supersession_window() -> None:
@@ -435,7 +440,7 @@ async def test_a_rotation_landing_mid_walk_costs_a_step_not_the_revoke() -> None
         return found
 
     ended = await revoke_through_lineage(
-        "a", lineage_seconds=0.0, revoke=_revoke, successor=_successor
+        "a", lineage_seconds=0.0, started=time.monotonic(), revoke=_revoke, successor=_successor
     )
     assert ended is not None and ended.token_hash == "c"
     assert calls == ["revoke a", "follow a", "revoke b", "follow b", "revoke c"]
@@ -452,10 +457,41 @@ async def test_the_walk_stops_at_its_hop_bound() -> None:
         return _revoke
 
     reach = await revoke_through_lineage(
-        "0", lineage_seconds=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS), successor=_successor
+        "0",
+        lineage_seconds=0.0,
+        started=time.monotonic(),
+        revoke=_revoke_only(LINEAGE_MAX_HOPS),
+        successor=_successor,
     )
     assert reach is not None and reach.token_hash == str(LINEAGE_MAX_HOPS)
     past = await revoke_through_lineage(
-        "0", lineage_seconds=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS + 1), successor=_successor
+        "0",
+        lineage_seconds=0.0,
+        started=time.monotonic(),
+        revoke=_revoke_only(LINEAGE_MAX_HOPS + 1),
+        successor=_successor,
     )
     assert past is None, "the walk followed more links than its bound"
+
+
+async def test_the_walk_adds_the_time_since_the_store_call_began_to_the_window() -> None:
+    # Vault BACKLOG #4276. The store measures the window at each lookup, after any wait for its
+    # lock, a connection or a row lock. The walk adds the time since the call began back, so the
+    # window starts where a fixed instant read at the call would have started it.
+    asked: list[float] = []
+
+    async def _revoke(h: str) -> SessionRecord | None:
+        return None
+
+    async def _successor(h: str, seconds: float) -> str | None:
+        asked.append(seconds)
+        return None
+
+    await revoke_through_lineage(
+        "a",
+        lineage_seconds=5.0,
+        started=time.monotonic() - 30.0,
+        revoke=_revoke,
+        successor=_successor,
+    )
+    assert len(asked) == 1 and 35.0 <= asked[0] < 40.0, asked

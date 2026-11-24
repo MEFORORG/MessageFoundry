@@ -3622,9 +3622,10 @@ class AuthStore(Protocol):
         live end, inside one transaction. A link retired more than ``lineage_seconds`` before the
         database's own clock, read in the walk's own statement, is not followed, so a retired hash
         leads anywhere only for a bounded time; the caller chooses the bound, because the store
-        reads no settings. The stamp and the test read one clock, the database's, so neither an
-        engine process's clock step nor skew between engine hosts moves the bound (vault BACKLOG
-        #4276). ``now`` stamps only the revoke. On Postgres and SQL Server a rotation can still commit
+        reads no settings. The stamp and the test read one clock, the database's (vault BACKLOG
+        #4276), so on a server store neither an engine host's clock step nor skew between engine
+        hosts moves the bound; on SQLite the database's clock is the engine host's. Time the call
+        spends waiting is added back to the window, so no wait shortens it. ``now`` stamps only the revoke. On Postgres and SQL Server a rotation can still commit
         between two steps; it costs the walk one more step, never the revoke, because each step
         revokes before it reads a link. ``store/session_lineage.py`` says why that order is the
         control. With

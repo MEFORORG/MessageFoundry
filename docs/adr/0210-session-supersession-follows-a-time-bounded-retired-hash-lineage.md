@@ -135,10 +135,15 @@ ahead of the elevating one, dropped a link inside the real window. Now every bac
 the reaper's purge measure the window back from that same clock: SQLite's `julianday('now')`,
 Postgres `statement_timestamp()`, SQL Server `SYSUTCDATETIME()`. Decision 3's bound is now a
 length, `lineage_seconds`, not an instant, `lineage_since`, and `rotate_session` takes no `now`.
-The sign-out asks for its 5 seconds plus the time since its proof on the engine's clock: two
-readings of one process's clock, never compared with a stamp.
+The sign-out asks for its 5 seconds plus the time since its proof, on the engine's monotonic clock.
+Each store adds back, on the monotonic clock, the time its own call spent waiting before a lookup,
+so no lock, connection or row wait shortens the window. The reaper asks the purge for the window
+plus its step tolerance, so a forward step of the store's clock under that tolerance cannot delete
+a link the supersession would still follow.
 
-What this closes: a step of an engine process's clock, and skew between engine hosts sharing one
-store, no longer move the window. What stays: a step of the store's own clock between the elevation
-and the sign-in still moves it by the step. On SQLite that is the clock of the host that holds the
-database file. `docs/SECURITY.md` states both.
+What this closes: on PostgreSQL and SQL Server, a step of an engine host's clock, and skew between
+engine hosts sharing one store, no longer move the window. What stays: a step of the store's own
+clock between the elevation and the sign-in still moves it by the step. On SQLite that clock is the
+engine host's own, since SQLite reads the host clock and every engine shard runs on the host that
+holds the file, so on SQLite this change leaves a real host clock step where it was.
+`docs/SECURITY.md` states both.

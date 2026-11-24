@@ -17821,6 +17821,7 @@ class SqlServerStore:
         which a session-wide ``SET NOCOUNT ON`` cannot hide (BACKLOG #2283). Each statement reads
         what has committed when it runs, so a rotation that commits while the walk runs is seen by
         the next step's lineage read. Committed as a durable write, never as a READ."""
+        started = time.monotonic()  # before the borrow, so its wait cannot shorten the window
         async with self._acquire() as conn, self._cursor(conn) as cur:
 
             async def _revoke(h: str) -> SessionRecord | None:
@@ -17843,6 +17844,7 @@ class SqlServerStore:
                     ended = await revoke_through_lineage(
                         token_hash,
                         lineage_seconds=lineage_seconds,
+                        started=started,
                         revoke=_revoke,
                         successor=_successor,
                     )

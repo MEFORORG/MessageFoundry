@@ -41,7 +41,6 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._logout_rows import (
-    age_session_links,
     logout_details,
     logout_entries,
     logout_rows,
@@ -50,6 +49,7 @@ from tests._logout_rows import (
 )
 from tests._session_cap_contract import _revoked
 from tests._session_race import rotate_after_first_call
+from tests._session_rotation_contract import age_sqlite_session_links
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms -- satisfies the ASVS policy (WP-3)
 
@@ -591,8 +591,8 @@ async def test_a_logout_follows_no_rotation_older_than_its_bound_before_proven_a
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
     successor = await _rotated(service, token)
-    await age_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
-    outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
+    await age_sqlite_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=time.monotonic())
     assert outcome == "nothing_to_revoke"
     assert await _live(service, successor), "a link older than the bound was followed"
 
@@ -606,8 +606,8 @@ async def test_a_logout_follows_a_link_retired_after_an_earlier_proof(
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
     successor = await _rotated(service, token)
-    await age_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
-    proven = time.time() - (_LOGOUT_LINEAGE_SECONDS + 5.0)
+    await age_sqlite_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
+    proven = time.monotonic() - (_LOGOUT_LINEAGE_SECONDS + 5.0)
     outcome = await service.logout(token, client=None, actor="op", proven_at=proven)
     assert outcome == "revoked"
     assert not await _live(service, successor)
@@ -617,13 +617,15 @@ async def test_a_logout_after_a_forward_step_of_this_process_clock_still_follows
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Vault BACKLOG #4276. The process clock jumps past the bound after the rotation. The link's
-    # stamp and the window are both the store's clock, so the step drops nothing.
+    # stamp and the window are both the store's clock, so the step drops nothing. The patch moves
+    # Python's clock and not SQLite's, so this models an engine whose clock differs from its store's
+    # (a server store); on SQLite a real host step moves both, which this does not cover.
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
     successor = await _rotated(service, token)
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 60.0)
-    outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
+    outcome = await service.logout(token, client=None, actor="op", proven_at=time.monotonic())
     assert outcome == "revoked"
     assert not await _live(service, successor), "a forward step of the process clock dropped a link"
 
@@ -635,7 +637,7 @@ async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(
     # ends its successor, and the row names both hashes.
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
-    proven = time.time()
+    proven = time.monotonic()
     successor = await _rotated(service, token)
     outcome = await service.logout(token, client=None, actor="op", proven_at=proven)
     assert outcome == "revoked"

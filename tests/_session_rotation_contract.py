@@ -25,15 +25,33 @@ implementation would pass without it:
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 import time
 from typing import Any
+
+#: Real seconds between two lineage links in the contract, so a window can fall between their ages.
+_LINK_GAP_SECONDS = 2.0
 
 
 def _h() -> str:
     """A 64-char hex token hash — the exact shape ``hash_token`` produces, and the width SQL
     Server's ``NVARCHAR(64)`` PK is declared at."""
     return secrets.token_hex(32)
+
+
+async def age_sqlite_session_links(store: Any, seconds: float) -> None:
+    """Move every ``session_lineage`` link of a SQLite ``MessageStore`` ``seconds`` into the past.
+    SQLite only: it writes through the store's own connection, ``store._db``.
+
+    The store stamps a link and measures the window a revoke follows it for on the DATABASE's
+    clock, not on ``time.time`` (vault BACKLOG #4276), so patching ``time`` no longer ages a link.
+    This is how a SQLite test puts a link past a window instead. The backend-neutral contract
+    below ages links by waiting instead."""
+    await store._db.execute(
+        "UPDATE session_lineage SET retired_at = retired_at - ?", (float(seconds),)
+    )
+    await store._db.commit()
 
 
 async def _count_sessions(store: Any, user_id: str) -> int:
@@ -305,20 +323,44 @@ async def assert_session_lineage_contract(store: Any, *, user_id: str = "lin-u1"
     kept = await store.get_session(d)
     assert kept is not None and kept.revoked_at is None
 
-    # --- the purge measures on the database's clock: a `now` ahead of it drops no live link, and a
-    # window that ends after the database's present drops every link ---------------------------
+    # --- one window between two links' ages follows and keeps the younger only -----------------
     old, old_next, fresh, fresh_next = _h(), _h(), _h(), _h()
     await store.create_session(token_hash=old, user_id=user_id, expires_at=expires, now=now)
     await store.create_session(token_hash=fresh, user_id=user_id, expires_at=expires, now=now)
     assert await store.rotate_session(old, new_token_hash=old_next) is True
+    # Real time between the two links, so one window can sit between their ages on the database's
+    # clock: this is what shows each backend stamps and measures in the same unit and epoch.
+    await asyncio.sleep(_LINK_GAP_SECONDS)
+    fresh_from = time.monotonic()
     assert await store.rotate_session(fresh, new_token_hash=fresh_next) is True
     await store.purge_expired_sessions(now=now)  # no window: every link stays
+
+    def _between() -> float:
+        # Older than the fresh link by a margin, younger than the old one by about as much.
+        return (time.monotonic() - fresh_from) + _LINK_GAP_SECONDS / 2
+
+    assert await store.supersede_session(old, now=now, lineage_seconds=_between()) is None, (
+        "a window shorter than a link's age followed it"
+    )
+    await store.purge_expired_sessions(now=now, lineage_seconds=_between())
+    assert await store.supersede_session(old, now=now, lineage_seconds=10_000) is None, (
+        "a purge kept a link older than its window"
+    )
+    old_live = await store.get_session(old_next)
+    assert old_live is not None and old_live.revoked_at is None
+
+    # --- a `now` far ahead of the database's clock leaves a live link alone ---------------------
     await store.purge_expired_sessions(now=ahead, lineage_seconds=600)
     swept = await store.supersede_session(fresh, now=now + 7, lineage_seconds=60)
     assert swept is not None and swept.token_hash == fresh_next, "the purge dropped a live link"
+
+    # --- a window that ends after the database's present drops every link ----------------------
+    last, last_next = _h(), _h()
+    await store.create_session(token_hash=last, user_id=user_id, expires_at=expires, now=now)
+    assert await store.rotate_session(last, new_token_hash=last_next) is True
     await store.purge_expired_sessions(now=now, lineage_seconds=-60)
-    assert await store.supersede_session(old, now=now, lineage_seconds=10_000) is None, (
+    assert await store.supersede_session(last, now=now, lineage_seconds=10_000) is None, (
         "a link past the purge window survived the purge"
     )
-    survivor = await store.get_session(old_next)
+    survivor = await store.get_session(last_next)
     assert survivor is not None and survivor.revoked_at is None

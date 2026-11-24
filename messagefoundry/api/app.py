@@ -12237,9 +12237,13 @@ async def _session_reaper(
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
     uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
     BACKLOG #3028); the lifespan passes the window the supersession follows them for. The store
-    measures that age on its own clock, the one the supersession measures its window on (vault
-    BACKLOG #4276), never from the ``now`` passed below, so the guard below does not cover the
-    links and need not: the purge drops only a link the supersession would no longer follow.
+    measures a link's age on its own clock, the one the supersession measures its window on (vault
+    BACKLOG #4276), never from the ``now`` passed below. So the reaper asks for that window plus
+    ``_SESSION_REAP_STEP_TOLERANCE``: a forward step of the store's clock no larger than that, which
+    the guard below lets through, or cannot see at all when the store's clock is a database
+    server's, then cannot make the purge delete a link the supersession would follow once the clock
+    is set right. A larger step of a database server's clock still can.
+    The cost is that a link waits that much longer to go, and the supersession ignores it meanwhile.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
@@ -12300,7 +12304,11 @@ async def _session_reaper(
             await store.purge_expired_sessions(
                 now=now - _SESSION_REAP_STEP_TOLERANCE,
                 idle_seconds=idle_seconds,
-                lineage_seconds=lineage_seconds,
+                lineage_seconds=(
+                    None
+                    if lineage_seconds is None
+                    else lineage_seconds + _SESSION_REAP_STEP_TOLERANCE
+                ),
             )
         except asyncio.CancelledError:
             raise

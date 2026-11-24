@@ -680,21 +680,33 @@ async def test_logout_passes_a_proven_at_read_before_its_gate(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #3715. ``POST /auth/logout`` passes a ``proven_at`` read during the request and
-    before its gate reads the session; ``AuthService.logout`` says why. The clock ticks on every
-    read, so "before" is a strict order. ``proven_at=None`` fails here."""
+    before its gate reads the session; ``AuthService.logout`` says why. It is a monotonic reading
+    (vault BACKLOG #4276), so the route's ``time.monotonic`` is replaced by a clock that ticks on
+    every read, which makes "before" a strict order; the event loop's own clock is left alone.
+    ``proven_at=None`` fails here."""
+    from messagefoundry.api import auth_routes
+
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service) as c:
         token = (await _login(c, "u")).json()["token"]
 
-    start = time.time()
+    start = time.monotonic()
     ticks = iter(range(1, 10**9))
-    monkeypatch.setattr(time, "time", lambda: start + next(ticks) * 0.001)
+
+    def _tick() -> float:
+        return start + next(ticks) * 0.001
+
+    class _RouteTime:
+        def __getattr__(self, name: str) -> Any:
+            return _tick if name == "monotonic" else getattr(time, name)
+
+    monkeypatch.setattr(auth_routes, "time", _RouteTime())
     gate_reads: list[float] = []
     real_get_session = engine.store.get_session
 
     async def _timed_get_session(*args: Any, **kwargs: Any) -> Any:
-        gate_reads.append(time.time())
+        gate_reads.append(_tick())
         return await real_get_session(*args, **kwargs)
 
     monkeypatch.setattr(engine.store, "get_session", _timed_get_session)
@@ -707,7 +719,7 @@ async def test_logout_passes_a_proven_at_read_before_its_gate(
 
     monkeypatch.setattr(service, "logout", _spy_logout)
     async with _client(engine, service) as c:
-        sent = time.time()
+        sent = _tick()
         assert (await c.post("/auth/logout", headers=_auth(token))).status_code == 200
     assert gate_reads, "the gate never read the session, so this measured nothing"
     assert len(proven) == 1
@@ -715,7 +727,7 @@ async def test_logout_passes_a_proven_at_read_before_its_gate(
         "the route passed no proven_at, so it took the credential-free bound"
     )
     assert sent < proven[0] < gate_reads[0], (
-        "proven_at is not a wall-clock read taken during this request, before the gate"
+        "proven_at is not a monotonic read taken during this request, before the gate"
     )
 
 
@@ -3598,7 +3610,7 @@ async def test_a_logout_whose_credential_lapsed_after_its_gate_records_lapsed(
     assert await service.identity_for_token(outcome.token) is not None
     await _move_deadline_to(engine, ned_id, time.time() - 1)
     ended = await service.logout(
-        outcome.token, actor="ned", client="192.0.2.7", proven_at=time.time()
+        outcome.token, actor="ned", client="192.0.2.7", proven_at=time.monotonic()
     )
     assert ended == "lapsed"
     assert await logout_rows(engine.store) == [("ned", "192.0.2.7", "lapsed")]
