@@ -9653,8 +9653,8 @@ class _CountingNoticeAudit:
     notifier asked for, so ``provision-admin`` can say that delivery of a notice it reported as
     dispatched is unconfirmed (BACKLOG #5634). For a dispatched notice the notifier records a send
     that raised, and, when its close is cut, the send it cut or the notice it left queued (BACKLOG
-    #6832); only an interrupt cuts this command's close, and it ends the run before the count is
-    read. So a count above zero says delivery is unconfirmed, whether or not the forwarded write
+    #6832); at least an interrupt cuts this command's close, and it ends the run before the count
+    is read. So a count above zero says delivery is unconfirmed, whether or not the forwarded write
     then succeeded. A send can raise after the relay queued the mail, so it is not proof the notice
     never left. A count of zero is not a delivery receipt: a send that returned says only that the
     relay took the mail."""

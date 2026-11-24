@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any, Final, Protocol
 
@@ -651,6 +652,33 @@ def _consume_outcome(send: asyncio.Future[bool]) -> None:
         send.exception()
 
 
+class _SendGate:
+    """Whether a send's thread has begun, so a cut close can stop one still waiting for a worker
+    thread from mailing after the close (BACKLOG #6832). Thread-safe: the send's thread calls
+    :meth:`begin`, the loop calls :meth:`skip`, and exactly one of them wins."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = False
+        self._skipped = False
+
+    def begin(self) -> bool:
+        """In the send's thread: whether to send. False once :meth:`skip` won."""
+        with self._lock:
+            if self._skipped:
+                return False
+            self._started = True
+            return True
+
+    def skip(self) -> bool:
+        """On the loop: whether the send never began, and now never will."""
+        with self._lock:
+            if self._started:
+                return False
+            self._skipped = True
+            return True
+
+
 class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
     """Emails the affected user about a security event, on a bounded background queue.
 
@@ -716,7 +744,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._recording: set[asyncio.Future[Any]] = set()
         # The send the drain is waiting on, with what it needs to record or count it, so a cut
         # close can record it (BACKLOG #6832). None between sends.
-        self._sending: tuple[SecurityEvent, asyncio.Future[bool], Callable[[], None]] | None = None
+        self._sending: (
+            tuple[SecurityEvent, asyncio.Future[bool], _SendGate, Callable[[], None]] | None
+        ) = None
+        # Set when the first aclose() has finished or been cut, so a second one waits for it rather
+        # than racing it (BACKLOG #6832).
+        self._closed = asyncio.Event()
         # Set when aclose() begins, and never cleared: start() refuses (vault BACKLOG #3120). An event
         # queued after that sits behind the stop sentinel, or on a queue nothing reads, and is never
         # sent, so notify() refuses it; the contract on ``SecurityNotifier`` says why.
@@ -826,26 +859,34 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         and the records start before the step itself is cut; a cancel of the caller cuts it the same
         way. The writes are not bounded: past the step's bound the shutdown stops waiting for them,
         and they go on, beside engine.stop(), until the store closes, which fails the rest. The
-        count of queued notices is logged before any of them is written."""
+        count of queued notices is logged before any of them is written. A second call waits for
+        the first to finish or be cut, and closes nothing itself."""
+        if self._closing:
+            await self._closed.wait()
+            return
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
+        try:
+            await self._close(timeout)
+        finally:
+            self._closed.set()
+
+    async def _close(self, timeout: float | None) -> None:
         drain = self._task
         deadline = asyncio.timeout(timeout)
-        cut = False
+        cut = timed_out = False
         try:
             async with deadline:
                 await super().aclose()
         except TimeoutError:
-            # No line of its own: what was cut is logged below, without the lock notices a bare
-            # "cut" line would hint at (BACKLOG #1131).
             if not deadline.expired():
                 raise
-            cut = True
+            cut = timed_out = True
         except asyncio.CancelledError:
             cut = True
             raise
         finally:
             # Taken and logged before any await, so a second cancel cannot leave them untold.
-            left = self._take_queued()
+            left = self._take_queued(timeout if timed_out else None)
             try:
                 if drain is not None:
                     # Cut while the sentinel waited on a full queue, the drain still runs; cut while
@@ -865,16 +906,28 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 # Each one swallows its own failure, so this only waits.
                 await asyncio.shield(asyncio.gather(*self._recording, return_exceptions=True))
 
-    def _take_queued(self) -> list[SecurityEvent]:
+    def _take_queued(self, timed_out: float | None) -> list[SecurityEvent]:
         """Empty the queue, stop sentinel included, and log how many notices it held. At least a
-        cut close, and the close of a notifier never started, leave some."""
+        cut close, and the close of a notifier never started, leave some. ``timed_out`` is the
+        timeout that cut the close, if one did."""
         left: list[SecurityEvent] = []
         while not self._queue.empty():
             if (event := self._queue.get_nowait()) is not None:
                 left.append(event)
         # A count, never one that includes a lock notice (BACKLOG #1131).
         shown = sum(event.event_type not in LOG_SILENT_EVENT_TYPES for event in left)
-        if shown:
+        if timed_out is not None:
+            # On every timeout cut, whatever kinds were in flight, so neither its presence nor its
+            # absence says a lock landed. It stands in for the teardown's own cut line, which a
+            # close cut inside its bound no longer reaches.
+            log.warning(
+                "%s did not drain within %.2fs; cut it with %d security notice(s) still queued, "
+                "never sent",
+                type(self).__name__,
+                timed_out,
+                shown,
+            )
+        elif shown:
             log.warning(
                 "%s closed with %d security notice(s) still queued, never sent",
                 type(self).__name__,
@@ -887,13 +940,15 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         records: list[tuple[SecurityEvent, str]] = []
         pending, self._sending = self._sending, None
         if pending is not None:
-            event, send, delivered = pending
+            event, send, gate, delivered = pending
             if not send.done() or send.cancelled():
-                # A thread runs on to its own timeout, so the notice may still go out:
-                # "interrupted" says its delivery is unknown. No line for it: a cut that leaves
-                # notices queued nearly always has a send in flight, so a line skipped for a lock
-                # notice would say a lock landed (BACKLOG #1131).
-                records.append((event, "interrupted"))
+                # A send still waiting for a worker thread is skipped, so it never mails after the
+                # close: "abandoned", like a queued one. One whose thread began runs on to its own
+                # timeout, so the notice may still go out: "interrupted" says its delivery is
+                # unknown. No line for it: a cut that leaves notices queued nearly always has a send
+                # in flight, so a line skipped for a lock notice would say a lock landed (BACKLOG
+                # #1131).
+                records.append((event, "abandoned" if gate.skip() else "interrupted"))
             elif (exc := send.exception()) is not None:
                 # It ended before the cut reached the drain, so its outcome is known.
                 self._log_send_failed(event, exc)
@@ -924,9 +979,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
     async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
         # Shielded, so a cut close can read how the send ended (BACKLOG #6832). Its outcome is
         # consumed here, since a cut leaves nobody else to read it.
-        send = asyncio.ensure_future(asyncio.to_thread(self._send, event))
+        gate = _SendGate()
+        send = asyncio.ensure_future(asyncio.to_thread(self._send_gated, event, gate))
         send.add_done_callback(_consume_outcome)
-        self._sending = (event, send, delivered)
+        self._sending = (event, send, gate, delivered)
         try:
             sent = await asyncio.shield(send)
         except Exception as exc:
@@ -995,6 +1051,12 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 )
             return False
         return True
+
+    def _send_gated(self, event: SecurityEvent, gate: _SendGate) -> bool:
+        """Mail the notice unless a cut close skipped it before its thread began."""
+        if not gate.begin():
+            return False
+        return self._send(event)
 
     def _send(self, event: SecurityEvent) -> bool:
         """Mail the notice, returning whether it was sent."""

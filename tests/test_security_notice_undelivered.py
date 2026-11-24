@@ -32,6 +32,7 @@ from messagefoundry.auth.notifications import (
 from messagefoundry.pipeline.security_notify import (
     SECURITY_NOTICE_UNDELIVERED_ACTION,
     SecurityEventNotifier,
+    _SendGate,
 )
 from messagefoundry.store.base import AuditStore
 from messagefoundry.store.store import MessageStore
@@ -889,10 +890,96 @@ async def test_a_send_settled_before_the_cut_reached_the_drain_is_read_as_it_end
         send.cancel()
     calls: list[int] = []
     amy = SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test")
-    notifier._sending = (amy, send, lambda: calls.append(1))
+    gate = _SendGate()
+    assert gate.begin()  # its thread began, so a cut cannot skip it
+    notifier._sending = (amy, send, gate, lambda: calls.append(1))
     ben = SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test")
     await notifier._record_cut([ben])
     assert calls == ([1] if outcome == "sent" else [])
     assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == sorted(
         [("amy", reason) for reason in rows] + [("ben", "abandoned")]
     )
+
+
+async def test_a_second_close_beside_a_cut_one_returns_cleanly(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, Manager repair (a). Two closes overlap on a full queue and the first is cut.
+    The second waits for it and returns, rather than awaiting the drain the first set to None."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = _notifier(store)
+    notifier._queue = asyncio.Queue(maxsize=1)
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
+        first = asyncio.create_task(notifier.aclose(0.05))
+        second = asyncio.create_task(notifier.aclose())
+        await asyncio.wait_for(asyncio.gather(first, second), 5.0)
+    finally:
+        release.set()
+    assert notifier._queue.qsize() == 0
+
+
+async def test_a_send_still_waiting_for_a_thread_at_the_cut_never_mails(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, Manager repair (b). The executor is busy, so the send waits for a thread when
+    the close is cut. It must not mail once a thread frees up, and it is recorded as abandoned."""
+    import concurrent.futures
+
+    sent: list[list[str]] = []
+    monkeypatch.setattr(_SEND, lambda **kw: sent.append(kw["recipients"]))
+    loop = asyncio.get_running_loop()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    real = loop.run_in_executor
+
+    def on_busy_executor(_executor: Any, func: Any, *args: Any) -> Any:
+        return real(executor, func, *args)
+
+    # Only this loop, only this test: the default executor stays the loop's own.
+    monkeypatch.setattr(loop, "run_in_executor", on_busy_executor)
+    busy = threading.Event()
+    occupied = real(executor, busy.wait, 5.0)
+    notifier = _notifier(store)
+    notifier.start()
+    try:
+        await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+        await asyncio.sleep(0.05)  # the drain is now waiting on the queued send
+        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
+    finally:
+        busy.set()
+    await occupied
+    executor.shutdown(wait=True)  # the queued work item has had its thread by now
+    assert sent == []
+    assert [(actor, d["reason"]) for _, actor, d in await _undelivered(store)] == [
+        ("amy", "abandoned")
+    ]
+
+
+async def test_a_timeout_cut_logs_a_warning_naming_the_queued_count(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6832, Manager repair (c). A close cut by its own timeout ends inside the step's
+    bound, so the teardown's cut line no longer fires; the close logs one of its own, on every
+    timeout cut, with a count that leaves lock notices out (BACKLOG #1131)."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = _notifier(store)
+    notifier.start()
+    await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-a", email="a@x.test"))
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
+    await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-c", email="c@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
+    finally:
+        release.set()
+    lines = [r for r in caplog.records if "did not drain" in r.getMessage()]
+    assert [(r.levelname, r.getMessage()) for r in lines] == [
+        (
+            "WARNING",
+            "SecurityEventNotifier did not drain within 0.05s; cut it with 1 security notice(s) "
+            "still queued, never sent",
+        )
+    ]
