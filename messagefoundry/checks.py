@@ -1944,8 +1944,8 @@ def _check_dryrun(
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import (
-        _dry_run_reference_view,
         dry_run,
+        dry_run_reference_view,
         fixture_cap,
         read_message_sets,
     )
@@ -2032,9 +2032,19 @@ def _check_dryrun(
         0  # runs checked against a declared .expect disposition (executable acceptance criteria)
     )
     # Built once for the whole run, so each file-backed reference set is read once rather than once
-    # per fixture per inbound (BACKLOG #6820). Every fixture then reads the same snapshot, as every
-    # message reads the live engine's sealed cache.
-    reference_view = _dry_run_reference_view(reg)
+    # per fixture per inbound (BACKLOG #6820). Every fixture reads the same snapshot, and each read
+    # of a value decodes its own copy, as the live engine's sealed cache does. A loader fault the
+    # builder does not turn into a skipped set fails this leg, naming its type alone, rather than
+    # ending the report: per fixture it was an ERROR, through dry_run's own guard.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the detail
+        return CheckResult(
+            "dryrun",
+            ok=False,
+            required=True,
+            detail=f"reference sets did not load for the preview ({type(exc).__name__})",
+        )
     for label, path, raw, target in message_sets:
         try:
             expected = _expected_disposition(path, cap=cap)

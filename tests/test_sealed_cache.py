@@ -265,7 +265,7 @@ def test_sandbox_state_encoder_walks_a_copy_not_the_live_cache() -> None:
 
 
 def test_dry_run_state_and_reference_read_back_in_the_live_json_form(tmp_path: Path) -> None:
-    from messagefoundry.pipeline.dryrun import _dry_run_reference_view
+    from messagefoundry.pipeline.dryrun import dry_run_reference_view
 
     ref = tmp_path / "payers.toml"
     ref.write_text('[acme]\nplan = "PPO"\neffective = 2026-01-01\n', encoding="utf-8")
@@ -273,7 +273,7 @@ def test_dry_run_state_and_reference_read_back_in_the_live_json_form(tmp_path: P
     registry.references["payers"] = SimpleNamespace(  # type: ignore[assignment]
         name="payers", source=SimpleNamespace(kind="file", settings={"path": str(ref)})
     )
-    view = _dry_run_reference_view(registry)
+    view = dry_run_reference_view(registry)
     assert view["payers"]["acme"] == {"plan": "PPO", "effective": "2026-01-01"}
 
 

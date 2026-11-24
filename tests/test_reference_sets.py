@@ -1255,6 +1255,32 @@ def test_route_message_reads_a_passed_reference_view(
     assert loads == [str(csv), str(csv)]
 
 
+def _check_repo(
+    tmp_path: Path, ref: Path, handler_body: str, fixtures: int = 3
+) -> tuple[Path, Path]:
+    """A config dir declaring ``provider_npi`` from ``ref`` and one Handler, and ``fixtures``
+    copies of one ADT fixture."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "from messagefoundry import Reference, FileRef, reference\n"
+        f"Reference('provider_npi', source=FileRef(path={str(ref)!r}))\n"
+        "inbound('IB_REF', File(directory='in'), router='r')\n"
+        "outbound('OB_REF', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        f"def h(m):\n{handler_body}",
+        encoding="utf-8",
+    )
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    for n in range(fixtures):
+        (msgs / f"m{n}.hl7").write_text(_REF_RAW, encoding="utf-8")
+    return cfg, msgs
+
+
 def test_check_reads_each_reference_file_once_per_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1265,26 +1291,54 @@ def test_check_reads_each_reference_file_once_per_run(
 
     loads = _counting_loader(monkeypatch)
     csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
-    cfg = tmp_path / "config"
-    cfg.mkdir()
-    (cfg / "c.py").write_text(
-        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
-        "from messagefoundry import Reference, FileRef, reference\n"
-        f"Reference('provider_npi', source=FileRef(path={str(csv)!r}))\n"
-        "inbound('IB_REF', File(directory='in'), router='r')\n"
-        "outbound('OB_REF', File(directory='out'))\n"
-        "@router('r')\n"
-        "def r(m): return ['h']\n"
-        "@handler('h')\n"
-        "def h(m): return Send('OB_REF', reference('provider_npi')['MED1'])\n",
-        encoding="utf-8",
-    )
-    msgs = tmp_path / "messages"
-    msgs.mkdir()
-    for n in range(3):
-        (msgs / f"m{n}.hl7").write_text(_REF_RAW, encoding="utf-8")
+    body = "    return Send('OB_REF', reference('provider_npi')['MED1'])\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
 
-    result = checks._check_dryrun(cfg, msgs)
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
     assert result.ok, result.detail
-    assert "3/3" in result.detail or "3 run" in result.detail, result.detail
+    assert result.detail.startswith("3 run(s) clean"), result.detail
     assert loads == [str(csv)]
+
+
+def test_check_fixtures_each_read_a_fresh_reference_value(tmp_path: Path) -> None:
+    """The run's one view hands every read its own copy of a value, as the live sealed cache does,
+    so a Handler that edits a container it read in one fixture does not change what the next
+    fixture reads (BACKLOG #6820). A shared plain view failed the second and third fixtures."""
+    from messagefoundry import checks
+
+    toml = tmp_path / "npi.toml"
+    toml.write_text('MED1 = ["9991"]\n', encoding="utf-8")
+    body = (
+        "    value = reference('provider_npi')['MED1']\n"
+        "    if value != ['9991']:\n"
+        "        raise ValueError('the reference value changed between fixtures')\n"
+        "    value.append('EDITED')\n"
+        "    return Send('OB_REF', m)\n"
+    )
+    cfg, msgs = _check_repo(tmp_path, toml, body)
+
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
+    assert result.ok, result.detail
+    assert result.detail.startswith("3 run(s) clean"), result.detail
+
+
+def test_check_fails_the_leg_when_the_reference_view_faults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loader fault the view builder does not turn into a skipped set fails the dry-run leg,
+    naming its type alone, rather than raising out of ``check`` and losing the report: built once
+    per run, the view sits outside each fixture's own guard (BACKLOG #6820)."""
+    from messagefoundry import checks
+    from messagefoundry.pipeline import dryrun
+
+    def faulting(path: str) -> Any:
+        raise RecursionError("MRN999SECRET")
+
+    monkeypatch.setattr(dryrun, "load_code_set", faulting)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    body = "    return Send('OB_REF', m)\n"
+    cfg, msgs = _check_repo(tmp_path, csv, body)
+
+    result = checks._check_dryrun(cfg, msgs, suppress_search=True)
+    assert not result.ok and result.required and not result.skipped
+    assert result.detail == "reference sets did not load for the preview (RecursionError)"

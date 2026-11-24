@@ -69,6 +69,7 @@ from messagefoundry.pipeline.ingress_guards import (
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
 from messagefoundry.store.metadata import encode_reference_value
+from messagefoundry.store.sealed_cache import sealed_reference_set
 
 __all__ = [
     "DeliveryPreview",
@@ -83,6 +84,7 @@ __all__ = [
     "transform_one",
     "disposition_for",
     "dry_run",
+    "dry_run_reference_view",
     "select_inbound",
     "AmbiguousInboundError",
     "NoInboundError",
@@ -607,18 +609,20 @@ def transform_one(
     return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
-#: The ``(set name, file path)`` pairs whose skip :func:`_dry_run_reference_view` has already logged
+#: The ``(set name, file path)`` pairs whose skip :func:`dry_run_reference_view` has already logged
 #: in this process; the path too, so another config's set of the same name still logs. A test resets it.
 _skipped_reference_sets_logged: set[tuple[str, str]] = set()
 
 
-def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
+def dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
     declaration with a literal path. DB-backed or ``env()``-path sets can't be materialized without a
     store/environment, so they're omitted (a read of one then raises, as a preview error).
 
-    Each value goes through the same JSON encoding the store applies, so a preview reads what the live
-    engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
+    Each set is the live engine's own sealed reference cache, filled through the JSON encoding the
+    store applies, so a preview reads what the engine returns (BACKLOG #1174): a TOML date is an ISO
+    string in both, and every read decodes a fresh copy, so a Handler that edits a value it read
+    changes neither the view nor a later read of it (BACKLOG #6820). A
     set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
     a set whose file did not load (vault BACKLOG #3340); both log a warning naming it, the second once
     per set per process.
@@ -634,9 +638,10 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
         if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
             continue
         try:
-            view[spec.name] = {
-                k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
-            }
+            view[spec.name] = sealed_reference_set(
+                spec.name,
+                ((k, encode_reference_value(v)) for k, v in load_code_set(path).items()),
+            )
         except CodeSetError:
             # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
             # missing with nothing to say why. The set name only, never the loader's text: that can
@@ -757,10 +762,12 @@ def route_message(
     where the site has set it.
 
     ``reference_view`` is the reference sets the preview reads, as
-    :func:`_dry_run_reference_view` builds them. ``None``, the default, builds them from the graph
+    :func:`dry_run_reference_view` builds them; a view built another way may share mutable
+    values between previews, which this one does not. ``None``, the default, builds them from the graph
     on this call, reading every file-backed set again. A caller previewing many messages against
-    one graph builds it once and passes it, so each file is read once (BACKLOG #6820); the
-    previews then share its values, as the live engine's messages share its sealed cache.
+    one graph builds it once and passes it, so each file is read once (BACKLOG #6820). The previews
+    then share one snapshot of each set, and each read of a value decodes its own copy, as the
+    live engine's sealed cache does.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -775,7 +782,7 @@ def route_message(
     # view from the graph's FILE-backed declarations (literal paths) so a reference(...) read resolves
     # during `check`/Test Bench. DB-backed or env()-path sets can't be reached in a pure dry-run and are
     # simply absent (a read of one then raises, surfaced as that message's preview error).
-    sim_reference = _dry_run_reference_view(registry) if reference_view is None else reference_view
+    sim_reference = dry_run_reference_view(registry) if reference_view is None else reference_view
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
     meta_ops: list[MetaOpPreview] = []
