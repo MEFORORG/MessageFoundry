@@ -842,11 +842,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        # Never again once closed (vault BACKLOG #3120). A cut close empties the queue (BACKLOG
-        # #6832), but a second aclose() running beside it can still leave its stop sentinel there,
-        # so a drain loop started again would read it and stop, and
-        # notify() would answer True for events nothing sends. The engine builds a new notifier for
-        # each lifespan rather than restart one.
+        # Never again once closed (vault BACKLOG #3120). The close has stopped the drain, emptied the
+        # queue and refuses new events (BACKLOG #6832), so a drain started again would sit on a queue
+        # nothing fills while notify() answers False. The engine builds a new notifier for each
+        # lifespan rather than restart one.
         if self._closing:
             raise RuntimeError(f"{type(self).__name__} has been closed and cannot be started again")
         super().start()
@@ -919,8 +918,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         if timed_out is not None:
             # On every timeout cut, whatever kinds were in flight, so neither its presence nor its
             # absence says a lock landed. It stands in for the teardown's own cut line, which a
-            # close cut inside its bound no longer reaches.
-            log.warning(
+            # close cut inside its bound no longer reaches, and at that line's level.
+            log.error(
                 "%s did not drain within %.2fs; cut it with %d security notice(s) still queued, "
                 "never sent",
                 type(self).__name__,
@@ -1012,8 +1011,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         if event.event_type not in LOG_SILENT_EVENT_TYPES:
             log.warning(
                 "security-event email failed for %s (%s)",
-                event.username,
-                event.event_type,
+                scrub_log_argument(event.username),
+                notice_kind_log_label(event.event_type),
                 exc_info=exc,
             )
 

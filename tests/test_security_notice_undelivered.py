@@ -978,7 +978,7 @@ async def test_a_timeout_cut_logs_a_warning_naming_the_queued_count(
     lines = [r for r in caplog.records if "did not drain" in r.getMessage()]
     assert [(r.levelname, r.getMessage()) for r in lines] == [
         (
-            "WARNING",
+            "ERROR",
             "SecurityEventNotifier did not drain within 0.05s; cut it with 1 security notice(s) "
             "still queued, never sent",
         )

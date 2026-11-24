@@ -7986,8 +7986,10 @@ again for the row, and only when a send failed. **Still open, at least:**
   fails in its final drain is recorded. That close is one bounded step of the shutdown. The close
   stops waiting for its drain at part of that step's bound, or when the step is cut, then cancels
   the drain and records the send it cut with `reason: interrupted` and each notice still queued
-  with `reason: abandoned` (BACKLOG #6832). The cut send's thread runs on to its own timeout, so
-  that notice may still go out. Those writes run one at a time and are not bounded. The shutdown
+  with `reason: abandoned` (BACKLOG #6832). A send still waiting for a worker thread at the cut
+  is skipped, so it never mails, and is recorded `abandoned` too; one that ended just before the
+  cut is recorded as it ended. A cut send whose thread began runs on to its own timeout, so that
+  notice may still go out. Those writes run one at a time and are not bounded. The shutdown
   stops waiting for them at the step's bound plus its cut grace; the rest go on beside
   `engine.stop()`, competing with its writes, until the store closes, and those still to run then
   fail. Under a full queue that can be most of them. A WARNING line counting the queued notices
