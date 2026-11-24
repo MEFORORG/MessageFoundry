@@ -853,3 +853,26 @@ def test_a_bare_message_return_is_not_iterated_to_reach_that_raise() -> None:
     with pytest.raises(ValueError, match="unsupported _Watched"):
         transform_one(reg, "h", ADT_A01)
     assert seen == [], f"the return value was iterated, not classified: {seen}"
+
+
+# --- BACKLOG #6819: the shared payload is build_payload's, not a copy of its branch -------------
+
+
+def test_shareable_payload_delegates_to_build_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The non-HL7 shared payload is built by ``build_payload``, the one definition the sandbox
+    child also uses, so the fan-out's shared object cannot drift from the per-consumer one
+    (BACKLOG #6819). It used to repeat that branch inline."""
+    from messagefoundry.pipeline import dryrun
+
+    built = RawMessage("{}", "json")
+    calls: list[tuple[str | bytes, str]] = []
+
+    def spy(raw: str | bytes, content_type: str) -> Message | RawMessage:
+        calls.append((raw, content_type))
+        return built
+
+    monkeypatch.setattr(dryrun, "build_payload", spy)
+    assert dryrun._shareable_payload(b"{}", "json") is built
+    assert calls == [(b"{}", "json")]
+    assert dryrun._shareable_payload(ADT_A01, ContentType.HL7V2.value) is None
+    assert len(calls) == 1  # HL7 is never shared, so never built here

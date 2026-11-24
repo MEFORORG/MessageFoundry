@@ -239,10 +239,13 @@ def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMess
     high-fan-out non-HL7 feed. Because it IS shared, a consumer that broke the convention and mutated
     ``.raw`` would be visible to later consumers of the same message. An HL7 :class:`Message` is *mutable*
     (Handlers transform it in place), so it cannot be shared: this returns ``None`` and each consumer
-    re-parses (the optimal isolation strategy — see :func:`_payload`)."""
+    re-parses (the optimal isolation strategy — see :func:`_payload`).
+
+    The object is :func:`build_payload`'s, the one construction every consumer and the sandbox child
+    use, rather than a copy of its non-HL7 branch that could drift from it (BACKLOG #6819)."""
     if content_type == ContentType.HL7V2.value:
         return None
-    return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
+    return build_payload(raw, content_type)
 
 
 @dataclass(frozen=True)
