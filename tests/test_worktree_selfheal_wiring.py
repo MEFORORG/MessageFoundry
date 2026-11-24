@@ -221,8 +221,9 @@ def test_the_selfheal_installer_completes_with_USERPROFILE_unset(tmp_path: Path)
     the fallback in install-selfheal.ps1 left the CLAUDECODE test green. The uncovered path is the one
     that matters in real use, since an operator runs this from a plain terminal with no CLAUDECODE set.
 
-    Fully isolated: -HookPath and -ConfigDir both land in tmp, and the allowlist is pre-created so the
-    seeding branch (which would read the real home) never runs. Nothing outside tmp is written.
+    -HookPath and -ConfigDir both land in tmp. The installer no longer creates an allowlist (BACKLOG
+    #7613); it only tests whether the gate's allowlist exists under the resolved home, so nothing outside
+    tmp is written.
     """
     cfg = tmp_path / "cfg"
     cfg.mkdir()
@@ -391,7 +392,9 @@ def test_the_live_settings_file_is_never_written_in_place() -> None:
     )
     parse_at = src.index("$null = $json | ConvertFrom-Json")
     write_at = src.index("[IO.File]::WriteAllText($tmp")
-    move_at = src.index("Move-Item -LiteralPath $tmp -Destination $settingsPath -Force")
+    # File.Move with overwrite is one rename; Move-Item -Force can delete the target first on Windows.
+    assert "Move-Item -LiteralPath $tmp" not in src, "a non-atomic replace of settings.json"
+    move_at = src.index("[IO.File]::Move($tmp, (Join-Path $liveAbs 'settings.json'), $true)")
     assert parse_at < write_at < move_at
 
 
@@ -436,3 +439,29 @@ def test_an_existing_legacy_allowlist_is_left_alone(home: Path, cfg: Path) -> No
     r = run_installer(home, cfg)
     assert r.returncode == 0, r.stderr
     assert legacy.read_text(encoding="utf-8") == "C:/Kept\n"
+    assert "reads the legacy" in r.stdout, "the operator is told the backstop is off when it is not"
+
+
+def test_a_tilde_config_dir_still_installs(home: Path, tmp_path: Path) -> None:
+    """The temp file is written through .NET, which does not resolve PowerShell's ``~``. The old
+    in-place Set-Content did, so a ``~``-relative ConfigDir must keep working."""
+    (home / "cfg").mkdir()
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"Set-Location -LiteralPath '{tmp_path}'; "
+            f"(Get-PSProvider FileSystem).Home = '{home}'; "
+            f"& '{INSTALLER}' -ConfigDir '~/cfg' -HookPath '{home / '.claude-hooks' / 'w' / 'worktree-selfheal.ps1'}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert (home / "cfg" / "settings.json").is_file()

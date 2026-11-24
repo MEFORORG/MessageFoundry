@@ -71,8 +71,13 @@ elseif (-not (Test-Path -LiteralPath $HookPath)) { throw "worktree-selfheal.ps1 
 # running `git checkout` on the primary after the gate's allowlist was gone. install-gate.ps1 owns the one
 # allowlist. An existing legacy file is left as it is.
 $gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
+$legacyRepos = Join-Path $sharedDir 'worktree-gate.repos.txt'
 if (-not (Test-Path -LiteralPath $gateRepos)) {
-    Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop guards nothing until install-gate.ps1 writes it."
+    if (Test-Path -LiteralPath $legacyRepos) {
+        Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop reads the legacy $legacyRepos. install-gate.ps1 writes the gate's allowlist; delete the legacy file to stop that fallback."
+    } else {
+        Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop guards nothing until install-gate.ps1 writes it."
+    }
 }
 
 $raw = if (Test-Path -LiteralPath $settingsPath) { Get-Content -LiteralPath $settingsPath -Raw } else { '{}' }
@@ -125,10 +130,14 @@ try {
 if (Test-Path -LiteralPath $settingsPath) {
     Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
 }
-$tmp = Join-Path $ConfigDir ("settings.json.tmp-selfheal-{0}" -f [guid]::NewGuid().ToString('N'))
+# .NET resolves relative paths against the process directory, not the PowerShell location, so both
+# paths are made absolute first. File.Move with overwrite is one rename that replaces the target;
+# Move-Item -Force is not, on Windows it can delete the target first and leave a window with no file.
+$liveAbs = (Resolve-Path -LiteralPath $ConfigDir).ProviderPath
+$tmp = Join-Path $liveAbs ("settings.json.tmp-selfheal-{0}" -f [guid]::NewGuid().ToString('N'))
 try {
     [IO.File]::WriteAllText($tmp, $json, [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $tmp -Destination $settingsPath -Force
+    [IO.File]::Move($tmp, (Join-Path $liveAbs 'settings.json'), $true)
 } finally {
     if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
