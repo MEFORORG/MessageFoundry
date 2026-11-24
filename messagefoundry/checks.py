@@ -2033,7 +2033,7 @@ def _check_dryrun(
     )
     # Built once for the whole run, so each file-backed reference set is read once rather than once
     # per fixture per inbound (BACKLOG #6820). Every fixture reads the same snapshot, and each read
-    # of a value decodes its own copy, as the live engine's sealed cache does. A loader fault the
+    # of a value decodes its own copy, as a read of the live engine's cache does. A loader fault the
     # builder does not turn into a skipped set fails this leg, naming its type alone, rather than
     # ending the report: per fixture it was an ERROR, through dry_run's own guard.
     try:

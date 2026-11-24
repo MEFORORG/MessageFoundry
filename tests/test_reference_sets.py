@@ -719,8 +719,8 @@ def test_dryrun_logs_a_reference_file_it_skips_once(
     was left out with no log line, so a later read reported the set missing with no word on why. The
     line names the set only, never the loader's text: a duplicate-key error quotes the key, which may
     be PHI for a patient-keyed set. It names no cause either, since a guess from the path misnames
-    one. And it is logged once per set per process: `check` rebuilds the view for every fixture on
-    every inbound, and a line per rebuild buries the log."""
+    one. And it is logged once per set per process: a caller that passes no view, as this test
+    does, rebuilds it for every message, and a line per rebuild buries the log."""
     from messagefoundry.pipeline import dryrun
 
     monkeypatch.setattr(dryrun, "_skipped_reference_sets_logged", set())
