@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (
     Send,
     env,
 )
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
@@ -1227,11 +1227,11 @@ def test_dryrun_reads_an_unchanged_reference_file_once(
     an edited one is read again, so the preview still shows the file as it stands."""
     import os
 
+    from messagefoundry.config.code_sets import load_code_set as real
     from messagefoundry.pipeline import dryrun
 
     monkeypatch.setattr(dryrun, "_reference_file_cache", {})
     loads: list[str] = []
-    real = dryrun.load_code_set
 
     def counting(path: str) -> Any:
         loads.append(path)
@@ -1267,7 +1267,7 @@ def test_dryrun_reference_containers_are_fresh_per_preview(
     reg = _ref_graph(toml)
     seen: list[list[str]] = []
 
-    def handle(m: Message) -> list[Send]:
+    def handle(m: Message | RawMessage) -> list[Send]:
         value = reference("provider_npi")["MED1"]
         seen.append(list(value))
         value.append("EDITED")
