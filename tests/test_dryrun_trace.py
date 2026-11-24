@@ -921,29 +921,6 @@ def test_a_write_that_raises_still_shows_on_its_line() -> None:
     assert {"path": "PID-5", "value": "A|B"} in writes
 
 
-def test_a_write_after_the_traced_frame_returned_is_not_held(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A wrapper's write after the unwrapped Handler returns has no line left to emit it on, so it
-    # must not be kept (BACKLOG #6824).
-    import functools
-
-    def inner(msg: Message) -> Send:
-        return Send("out", msg)
-
-    @functools.wraps(inner)
-    def wrapper(msg: Message) -> Send:
-        out = inner(msg)
-        msg["MSH-4"] = "LATE"
-        return out
-
-    made = _capture_tracers(monkeypatch)
-    trace_dry_run(_registry(route_to_h, {"h": wrapper}), ADT_A01)
-    rec = next(r for r in made[0].invocations if r.kind == "handler")
-    assert rec.frame is not None
-    assert rec._writes_by_line == {}
-
-
 def _run_threads(*targets) -> None:
     """Run each target on its own thread; re-raise the first error, and fail on a hung thread."""
     import threading

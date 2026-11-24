@@ -361,11 +361,10 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
-        # A write is kept only where a later `_finalize` will emit it. Past the event cap no line is
-        # finalized, and with no latched frame or no open line (the frame has returned) none is, so a
-        # write kept then would only be held: a long mutating loop would grow this recorder without
-        # bound (BACKLOG #6824).
-        if self.frame is None or self._last_line is None:
+        # Past the event cap no line is finalized, and with no latched frame none ever is, so a write
+        # kept then would only be held: a long mutating loop would grow this recorder without bound
+        # (BACKLOG #6824). Other kept writes are bounded by _MAX_WRITES.
+        if self.frame is None:
             return
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
@@ -575,8 +574,9 @@ def _patched_message_writes() -> Iterator[None]:
     global _patch_holders
     held = False
     try:
-        # Inside the try, so an interrupt after the count rose still releases it; a leaked count
-        # would leave the patch installed for the life of the process.
+        # Inside the try, which narrows the window in which an interrupt leaks the count; it does
+        # not close it (between the increment and `held = True`, or in the release). A leaked count
+        # leaves the patch installed for the life of the process.
         with _patch_lock:
             if _patch_holders == 0:
                 Message._write = _recording_write  # type: ignore[method-assign]
