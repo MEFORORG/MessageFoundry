@@ -864,19 +864,33 @@ async def test_wal_cadence_ignores_an_explicit_now(store: MessageStore) -> None:
 
 
 async def test_a_capped_pass_leaves_the_wal_marker_unadvanced(store: MessageStore) -> None:
-    """A WAL truncate the #121 cap skips keeps its marker, so it stays due on the next pass. The
-    control is the next uncapped pass, which truncates."""
-    ticks = iter([0.0] + [1e9] * 100)  # the cap is hit at the first between-phase check
-    capped = RetentionRunner(
+    """A WAL truncate the #121 cap skips keeps the marker its last truncate set, so it stays due.
+    Pass 1 truncates at monotonic 0. Pass 2 is past the cadence but capped before the WAL phase,
+    and the marker stays 0. Pass 3 is uncapped and truncates, which it could not do had the skip
+    moved the marker to pass 2's reading."""
+    clock = {"start": 0.0, "later": 0.0, "first": True}
+
+    def mono() -> float:
+        # The pass reads `start` once as its start time; every later read is `later`.
+        if clock["first"]:
+            clock["first"] = False
+            return float(clock["start"])
+        return float(clock["later"])
+
+    runner = RetentionRunner(
         store,
         RetentionSettings(max_pass_seconds=1, wal_checkpoint_seconds=3600),
-        monotonic=lambda: next(ticks),
+        monotonic=mono,
     )
-    result = await capped.run_once()
+    assert (await runner.run_once()).wal_checkpointed is True
+    assert runner._last_wal == 0.0
+    clock.update(start=5000.0, later=1e9, first=True)
+    result = await runner.run_once()
     assert result.capped is True and result.wal_checkpointed is False
-    assert capped._last_wal is None
-    capped._settings = RetentionSettings(wal_checkpoint_seconds=3600)
-    assert (await capped.run_once()).wal_checkpointed is True
+    assert runner._last_wal == 0.0
+    clock.update(start=9000.0, later=9000.0, first=True)
+    result = await runner.run_once()
+    assert result.capped is False and result.wal_checkpointed is True
 
 
 # --- RetentionRunner ----------------------------------------------------------
