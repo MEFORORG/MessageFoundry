@@ -321,18 +321,20 @@ def _git_at(root: Path, *args: str) -> str:
 
 
 def hooks_dir_for(root: Path) -> Path | None:
-    """Where git looks for ``root``'s hooks, resolved exactly as ``install-git-hooks.ps1`` resolves it.
+    """Where git looks for ``root``'s hooks, taken from git itself.
 
-    ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. Deriving it any other way
-    would compare a directory git never consults and report parity for a copy that is not the one
-    running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
+    ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. When it is set, the answer
+    is ``git rev-parse --git-path hooks``, because git expands ``~/`` and resolves a relative value
+    against the worktree root (BACKLOG #6258). ``install-git-hooks.ps1`` takes the same answer but
+    refuses to install for some values this still resolves (non-local scope, relative). Deriving it
+    any other way would compare a directory git never consults and report parity for a copy that is
+    not the one running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
     ``root/.git`` is a FILE pointing at the common dir, so ``root/.git/hooks`` never exists and every
     payload would read as "not installed".
     """
-    configured = _git_at(root, "config", "--get", "core.hooksPath")
-    if configured:
-        p = Path(configured)
-        return p if p.is_absolute() else root / configured
+    if _git_at(root, "config", "--get", "core.hooksPath"):
+        resolved = _git_at(root, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+        return Path(resolved) if resolved else None
     common = _git_at(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(common) / "hooks" if common else None
 
@@ -1750,3 +1752,220 @@ def test_the_re_run_probe_can_fail() -> None:
     found = _reissue_instructions(planted)
     assert found, "the probe did not see a re-run instruction it was handed"
     assert found[0][1] - declared == {"-Arm"}, found
+
+
+# ------------------------------------- core.hooksPath is resolved the way git resolves it (#6258)
+
+
+def _hookspath_clone(tmp_path: Path, hooks_path: str | None) -> tuple[Path, dict[str, str]]:
+    """A throwaway clone carrying its own copy of the installer, with ``core.hooksPath`` set.
+
+    The installer anchors on its own ``$PSScriptRoot``, so copying ``scripts/coord`` and
+    ``scripts/hooks`` in means every write it makes lands in this clone or the temporary HOME,
+    never in this checkout. Global and system git config are cut off, so an operator's own global
+    ``core.hooksPath`` cannot steer the run.
+    """
+    repo = tmp_path / "repo"
+    home = tmp_path / "home"
+    home.mkdir()
+    gitconfig = tmp_path / "global.gitconfig"
+    gitconfig.write_text("", encoding="utf-8")
+    # GIT_* stripped: an inherited GIT_DIR or GIT_CONFIG_PARAMETERS would aim every git call below,
+    # the `config core.hooksPath` write included, at the outer repository instead of this clone.
+    env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "GIT_CONFIG_GLOBAL": str(gitconfig),
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env, capture_output=True)
+    for sub in ("coord", "hooks"):
+        shutil.copytree(ROOT / "scripts" / sub, repo / "scripts" / sub)
+    if hooks_path is not None:
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "core.hooksPath", hooks_path],
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+    return repo, env
+
+
+def _run_git_hooks_installer(
+    repo: Path, env: dict[str, str], *flags: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(repo / "scripts" / "coord" / "install-git-hooks.ps1"),
+            *flags,
+        ],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+_NEEDS_PWSH = pytest.mark.skipif(shutil.which("pwsh") is None, reason="runs the real installer")
+
+
+def _squashed(result: subprocess.CompletedProcess[str]) -> str:
+    """Output with ANSI codes, whitespace and pwsh's ``|`` error-wrap gutters removed, so a phrase
+    the error view wrapped across lines can still be matched (compare against ``_squash(phrase)``)."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout + result.stderr)
+    return re.sub(r"[\s|]", "", text)
+
+
+def _squash(phrase: str) -> str:
+    return re.sub(r"[\s|]", "", phrase)
+
+
+@_NEEDS_PWSH
+def test_a_home_prefixed_hookspath_installs_where_git_runs_hooks(tmp_path: Path) -> None:
+    """``~/hk`` is expanded against HOME by git; the installer used to join it under the repo root."""
+    repo, env = _hookspath_clone(tmp_path, "~/hk")
+    result = _run_git_hooks_installer(repo, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    hooks = tmp_path / "home" / "hk"
+    assert "MessageFoundry claim gate" in (hooks / "commit-msg").read_text(encoding="utf-8")
+    assert "MessageFoundry push guard" in (hooks / "pre-push").read_text(encoding="utf-8")
+    assert not (repo / "~").exists(), "the hooks went to a literal '~' directory git never reads"
+
+
+@_NEEDS_PWSH
+@pytest.mark.parametrize("hooks_path", ["rel/hooks", ".githooks"])
+def test_a_relative_hookspath_is_refused_not_reported_as_governing(
+    tmp_path: Path, hooks_path: str
+) -> None:
+    """Git resolves a relative ``core.hooksPath`` against EACH worktree's own root.
+
+    So no single directory governs every worktree, and an install into this worktree's copy would
+    print "governs: all N worktree(s)" while a sibling worktree ran nothing. Refuse instead.
+    """
+    repo, env = _hookspath_clone(tmp_path, hooks_path)
+    result = _run_git_hooks_installer(repo, env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "core.hooksPath" in out and "relative" in out, out
+    assert "governs" not in out, out
+    assert not (repo / hooks_path / "commit-msg").exists()
+    # -Status refuses too, and says UNRESOLVABLE, a word hygiene-report.ps1 flags as drift, so the
+    # refusal cannot read there as "0 hook line(s) flagged".
+    status = _run_git_hooks_installer(repo, env, "-Status")
+    assert status.returncode != 0
+    assert "UNRESOLVABLE" in status.stdout + status.stderr
+
+
+@_NEEDS_PWSH
+@pytest.mark.parametrize("scope", ["--global", "--worktree"])
+def test_a_hookspath_outside_this_repos_local_config_is_refused(tmp_path: Path, scope: str) -> None:
+    """A global ``~/`` value is a hooks directory every repository on the machine shares, and a
+    worktree-scoped value governs one worktree; neither is the shared install this script reports."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    target = (tmp_path / "scoped-hooks").as_posix()
+    if scope == "--worktree":
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "extensions.worktreeConfig", "true"],
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", scope, "core.hooksPath", target],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    result = _run_git_hooks_installer(repo, env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    name = scope.removeprefix("--")
+    assert _squash(f"is set in {name} config, not in this repository's local config") in _squashed(
+        result
+    ), out
+    assert "governs" not in out, out
+    assert not (tmp_path / "scoped-hooks" / "commit-msg").exists()
+
+
+@_NEEDS_PWSH
+def test_a_worktree_scope_refusal_names_the_unset_at_that_scope(tmp_path: Path) -> None:
+    """Worktree config beats local config, so the remedy must not offer a local override."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    for args in (
+        ("config", "extensions.worktreeConfig", "true"),
+        ("config", "--worktree", "core.hooksPath", (tmp_path / "wt-hooks").as_posix()),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env, capture_output=True)
+    result = _run_git_hooks_installer(repo, env)
+    assert result.returncode != 0
+    squashed = _squashed(result)
+    assert _squash("git config --worktree --unset core.hooksPath") in squashed, squashed
+    assert _squash("in this repository's local config overrides it") not in squashed, squashed
+
+
+@_NEEDS_PWSH
+def test_status_with_uninstall_is_refused_before_anything_runs(tmp_path: Path) -> None:
+    """-Status is read-only; with -Uninstall the script must refuse, not report and skip."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "commit-msg").write_text("#!/bin/sh\n# MessageFoundry claim gate\n", encoding="utf-8")
+    result = _run_git_hooks_installer(repo, env, "-Status", "-Uninstall")
+    assert result.returncode != 0
+    assert _squash("cannot be used together") in _squashed(result)
+    assert "hooks dir" not in result.stdout, "the status report ran"
+    assert (hooks / "commit-msg").exists(), "the uninstall ran"
+
+
+@_NEEDS_PWSH
+def test_uninstall_still_removes_our_hooks_from_a_refused_hookspath(tmp_path: Path) -> None:
+    """-Uninstall removes only marker-bearing files, so a refusal must not strand an older install."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    target = tmp_path / "global-hooks"
+    target.mkdir()
+    (target / "commit-msg").write_text("#!/bin/sh\n# MessageFoundry claim gate\n", encoding="utf-8")
+    (target / "pre-push").write_text("#!/bin/sh\n# someone else's hook\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--global", "core.hooksPath", target.as_posix()],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    result = _run_git_hooks_installer(repo, env, "-Uninstall")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (target / "commit-msg").exists()
+    assert (target / "pre-push").exists(), "a hook without our marker must survive -Uninstall"
+
+
+@_NEEDS_PWSH
+@pytest.mark.skipif(sys.platform != "win32", reason="a drive-relative path exists only on Windows")
+def test_a_drive_relative_hookspath_is_refused_on_windows(tmp_path: Path) -> None:
+    """``/x/hooks`` is rooted but not fully qualified on Windows: its drive is whichever is current."""
+    # Drive-less but pointing inside tmp_path, so a regressed install lands nowhere outside it.
+    drive_less = "/" + tmp_path.relative_to(tmp_path.anchor).as_posix() + "/dr-hooks"
+    repo, env = _hookspath_clone(tmp_path, drive_less)
+    result = _run_git_hooks_installer(repo, env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    # The fully-qualified check on the configured value is what must fire, not the later check on
+    # rev-parse's answer, whose refusal also names core.hooksPath.
+    assert _squash("which is relative, or on Windows has no drive") in _squashed(result), out
+    assert "governs" not in out, out
+    assert not (tmp_path / "dr-hooks" / "commit-msg").exists()
+
+
+@_NEEDS_PWSH
+def test_an_absolute_hookspath_still_installs_there(tmp_path: Path) -> None:
+    """The positive control: a fully qualified ``core.hooksPath`` is honoured, as before."""
+    target = tmp_path / "abs-hooks"
+    repo, env = _hookspath_clone(tmp_path, target.as_posix())
+    result = _run_git_hooks_installer(repo, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "MessageFoundry claim gate" in (target / "commit-msg").read_text(encoding="utf-8")
+    assert "governs" in result.stdout
