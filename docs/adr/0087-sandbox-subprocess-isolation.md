@@ -392,8 +392,9 @@ target, no `pickle` import left to mis-suppress:
   >   found there is handled as at `_live_worker`'s check, since it is a second `_live_worker`
   >   call: the worker is dropped and the message is retried on a fresh worker, sharing the one
   >   retry each dispatch gets, so a second stray frame fails the call. A worker found exited
-  >   there, or whose EOF is queued, is replaced before the write, within the same per-dispatch
-  >   respawn bound.
+  >   there, or whose EOF is queued, is replaced before the write. One spawned in the same
+  >   dispatch is recorded as `EXITED_AFTER_BOOT` and counts toward the dispatch's respawn bound;
+  >   one kept from an earlier dispatch is replaced as at the first check.
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
   >   arrives after that call's check before its request is not read by that call.
@@ -506,7 +507,9 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox.py::test_the_second_check_shares_the_one_retry_a_dispatch_gets`,
   `tests/test_sandbox.py::test_a_process_a_handler_spawns_cannot_read_the_request_pipe`,
   `tests/test_sandbox.py::test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs`,
-  `tests/test_sandbox.py::test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write`
+  `tests/test_sandbox.py::test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write`,
+  `tests/test_sandbox.py::test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded`,
+  `tests/test_sandbox.py::test_the_private_request_pipe_is_not_inheritable`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (under the default `[delivery] internal_error` it previously
   dead-lettered every message), and SHALL preserve `_partition` parity for **every** return shape —

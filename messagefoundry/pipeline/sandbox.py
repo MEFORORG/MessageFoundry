@@ -1450,7 +1450,9 @@ class SandboxSession:
 
         A worker spawned in this dispatch and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
-        check asks the process too. It cannot see an exit that comes after it, so a worker that
+        check asks the process too, the second call included, and it counts toward the bound. A
+        worker kept from an earlier dispatch and found exited is replaced as it always was, with
+        its EOF recorded as :meth:`_drop_unsolicited` says when the EOF is queued first. It cannot see an exit that comes after it, so a worker that
         exits as its request is written is recorded under another cause, such as
         :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
 
@@ -1458,6 +1460,11 @@ class SandboxSession:
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
         while True:
             if self._proc is None or _has_exited(self._proc):
+                if self._proc is not None and self._generation != self._dispatch_generation:
+                    # Booted in this dispatch and found exited by its second call: a death to
+                    # record and count, not a silent reap in _spawn.
+                    self._kill(self._proc, KillCause.EXITED_AFTER_BOOT, phase)
+                    self._count_eof_respawn()
                 self._spawn(phase)
             # Booted in this dispatch, by this call or by the dispatch's first one.
             fresh = self._generation != self._dispatch_generation
@@ -1474,12 +1481,17 @@ class SandboxSession:
                 if not (fresh and _has_exited(proc)):
                     return proc
                 self._kill(proc, KillCause.EXITED_AFTER_BOOT, phase)
-            self._eof_respawns += 1
-            if self._eof_respawns > _LIVE_WORKER_EOF_RESPAWNS:
-                raise SandboxError(
-                    f"sandbox worker for inbound {self._inbound!r} kept exiting, or closing its "
-                    f"pipe, before its request: {self._eof_respawns} workers in a row"
-                )
+            self._count_eof_respawn()
+
+    def _count_eof_respawn(self) -> None:
+        """Count one more worker this dispatch replaced for exiting, or closing its pipe, before its
+        request, and fail the call once the bound is spent (see :meth:`_live_worker`)."""
+        self._eof_respawns += 1
+        if self._eof_respawns > _LIVE_WORKER_EOF_RESPAWNS:
+            raise SandboxError(
+                f"sandbox worker for inbound {self._inbound!r} kept exiting, or closing its "
+                f"pipe, before its request: {self._eof_respawns} workers in a row"
+            )
 
     # -- the lookup broker (mode=isolated, ADR 0147) ----------------------------
 
@@ -1843,7 +1855,7 @@ class SandboxSession:
             # the first call and shares its one retry. Only a frame the reader has already queued is
             # found, so this narrows the AC-10 window by the time the request takes to encode; it
             # does not close it. A worker found exited here, or whose EOF is queued, is replaced as
-            # at the first call.
+            # _live_worker says.
             proc = self._live_worker(phase)
             assert proc.stdin is not None
             try:

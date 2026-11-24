@@ -5,7 +5,9 @@
 Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` through
 :func:`messagefoundry.childenv.python_child_argv`, which runs this module the way ``python -m``
 would. It speaks the length-prefixed **MFW2** codec
-(:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — a closed-tag JSON+segment wire whose
+(:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — requests are read from a
+private copy of the stdin pipe, since fd 0 is the null device once :func:`_detach_request_pipe`
+has run (vault BACKLOG #3135 step 8) — a closed-tag JSON+segment wire whose
 decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
 direction, in either process.
 
@@ -42,6 +44,7 @@ this process never needs its own watchdog.
 from __future__ import annotations
 
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -92,7 +95,7 @@ def _redirect_stdout_to_stderr() -> None:
     sys.stdout = sys.stderr
 
 
-def _detach_request_pipe() -> Any:
+def _detach_request_pipe() -> io.BufferedReader:
     """Move the request pipe off fd 0 and return a reader on the private copy (vault BACKLOG #3135
     step 8).
 
@@ -101,8 +104,10 @@ def _detach_request_pipe() -> Any:
     The pipe moves to a descriptor :func:`os.dup` makes non-inheritable (PEP 446), and fd 0 is
     pointed at the null device, so such a process finds no pipe on fd 0, with its descriptors
     inherited or not. On Windows :mod:`subprocess` hands a child the process's standard input
-    handle rather than fd 0, so that handle is set to the null device too: ``os.dup2`` sets it only
-    in a console-subsystem interpreter. The old pipe handle is closed by the ``dup2``.
+    handle rather than fd 0. ``os.dup2`` repoints that handle only in a console-subsystem
+    interpreter, so the handle is read back and the worker refuses to boot when it does not name
+    the null device. The old pipe handle is closed by the ``dup2``. An :class:`OSError` here is a
+    bootstrap failure, reported as one.
 
     This closes inheritance across a new program only. Code running in the worker can still read
     the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps it, and a
@@ -116,12 +121,12 @@ def _detach_request_pipe() -> Any:
     finally:
         os.close(null)
     if sys.platform == "win32":
-        import ctypes
+        import _winapi
         import msvcrt
 
-        std_input_handle = -10  # STD_INPUT_HANDLE
-        if not ctypes.windll.kernel32.SetStdHandle(std_input_handle, msvcrt.get_osfhandle(0)):
-            raise OSError("could not point the standard input handle at the null device")
+        if _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE) != msvcrt.get_osfhandle(0):
+            os.close(private)
+            raise OSError("the standard input handle still names the request pipe")
     return os.fdopen(private, "rb")
 
 
@@ -591,8 +596,16 @@ def main() -> int:
     from messagefoundry.pipeline._sandbox_codec import SandboxError
     from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame, graph_shape
 
-    stdin = _detach_request_pipe()
     stdout = sys.stdout.buffer
+    try:
+        stdin = _detach_request_pipe()
+    except OSError as exc:
+        # No boot frame is read, so the parent reads this reply in place of the boot reply.
+        try:  # noqa: SIM105
+            _write_frame(stdout, codec.encode_bootfail(_error_text(exc)))
+        except (OSError, SandboxError):
+            pass
+        return 1
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
     # frame read below, whose reply path runs ``load_snapshot()`` -- the earliest untrusted code.

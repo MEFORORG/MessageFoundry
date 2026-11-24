@@ -1241,15 +1241,77 @@ def test_a_process_a_handler_spawns_cannot_read_the_request_pipe(tmp_path: Path)
 def test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs() -> None:
     """Vault BACKLOG #3135 step 8: the detach must come before the boot frame is read, since the
     boot frame's reply path runs ``load_snapshot()``, the earliest admin code, which can start a
-    process of its own. The Handler-time test above cannot see a detach moved below that point."""
+    process of its own. The Handler-time test above cannot see a detach moved below that point, so
+    this reads the order of the calls in ``main`` from its syntax tree, never from its text."""
+    import ast
     import inspect
+    import textwrap
 
     from messagefoundry.pipeline import _sandbox_worker
 
-    source = inspect.getsource(_sandbox_worker.main)
-    detach = source.index("_detach_request_pipe()")
-    assert detach < source.index("_read_frame_bytes(stdin)")
-    assert detach < source.index("load_snapshot(")
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_sandbox_worker.main)))
+    first: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called is not None:
+                first[called] = min(first.get(called, node.lineno), node.lineno)
+    assert first["_detach_request_pipe"] < first["_read_frame_bytes"]
+    assert first["_detach_request_pipe"] < first["load_snapshot"]
+
+
+_DETACH_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline._sandbox_worker import _detach_request_pipe
+
+reader = _detach_request_pipe()
+fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+sys.stderr.write(
+    f"{os.get_inheritable(reader.fileno())},{fd0_is_pipe},{reader.readline().decode().strip()}"
+)
+"""
+
+
+def test_the_private_request_pipe_is_not_inheritable() -> None:
+    """Vault BACKLOG #3135 step 8: the private copy of the request pipe is non-inheritable, fd 0 is
+    no longer a pipe, and the copy still reads what the parent writes. A grandchild that keeps
+    every inheritable descriptor (``close_fds=False``) therefore does not get the copy either."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "False,False,hello"
+
+
+def test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: a worker spawned by a dispatch's first check and dead by its
+    second is recorded as ``EXITED_AFTER_BOOT``, not reaped silently by the respawn."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed = session._proc
+            assert doomed is not None
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session.kill_counts[KillCause.EXITED_AFTER_BOOT] == 1
+        assert session._generation == 2
+    finally:
+        session.close()
 
 
 def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write(
