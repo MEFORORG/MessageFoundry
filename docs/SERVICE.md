@@ -287,7 +287,10 @@ the service account itself, such as the write the Vault Agent sink route
 Of the entries the script does not set itself, at least an explicit grant to the service
 account, an explicit Deny entry, and an explicit SYSTEM or Administrators entry with other
 inheritance flags survive: the script turns inheritance off (`/inheritance:r`), which
-drops every inherited entry, and removes every other account's Allow entry, a group's included.
+drops every inherited entry, and removes at least every other account's plain Allow entry, a
+group's included. A conditional (callback) Allow entry survives that removal, and the read-back
+then refuses the install. The read-back does not check a surviving Deny entry, so one that names
+the service account, or a group it belongs to, can leave the service unable to read its secrets.
 So when the install script reads
 `[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
 files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names

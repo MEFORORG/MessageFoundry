@@ -909,7 +909,8 @@ function Get-OtherServiceNamingPath {
       protected Windows services deny administrators that read, and none of them is an NSSM service.
 
       A SECOND SERVICE ON THE SAME -DataDir GETS THE SAME DEFAULT secrets directory, and
-      Set-SecretsDirAcl removes every Allow entry but its own service's and the two admin ones. So
+      Set-SecretsDirAcl removes at least every plain Allow entry but its own service's and the two
+      admin ones (a conditional Allow entry survives, and its read-back then refuses). So
       adopting the directory would strip the first service's read, and sharing it would let each
       service read the other's secrets. The installer refuses instead.
     #>
@@ -1012,9 +1013,10 @@ function Set-SecretsDirAcl {
       THE ACCOUNT'S GRANT IS ADDED, NEVER REPLACED. An existing directory may give a dedicated engine
       account more than read, for the Vault Agent sink route docs/CONFIGURATION.md describes, and a
       rerun must not take that away. Inheritance comes off, so a grant the directory inherited goes.
-      Every Allow entry for another account is removed (icacls /remove:g removes grants only, so an
-      explicit Deny entry stays): none is offered one, and anyone may have made the
-      folder first under ProgramData.
+      At least every plain Allow entry for another account is removed (icacls /remove:g removes
+      grants only, so an explicit Deny entry stays, and a conditional (callback) Allow entry
+      survives it too, which the read-back below then refuses): none is offered one, and anyone may
+      have made the folder first under ProgramData.
 
       THROWS WHEN THE RESULT IS NOT RESTRICTED. Each step runs whatever the one before it did, so one
       failure does not leave a broad entry standing; then the owner and the list are read back, and
@@ -1054,7 +1056,8 @@ function Set-SecretsDirAcl {
     $broad = Get-WellKnownBroadSids
     & icacls $Path /remove:g @broad | Out-Null
     # No other account is offered a grant here (docs/CONFIGURATION.md), and a folder made under
-    # ProgramData may have been made by any local user first. So every other Allow entry is removed.
+    # ProgramData may have been made by any local user first. So every other plain Allow entry is
+    # removed; a conditional (callback) Allow entry survives /remove:g, and the read-back refuses it.
     foreach ($holder in @(Get-BroadAclResidue -Path $Path -Account $Account)) {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:g $spelled | Out-Null
