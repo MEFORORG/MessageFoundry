@@ -18,7 +18,8 @@ docker arm in ``ci.yml``'s ``changes`` job. This file pins that arm. The invaria
 
 THE RUN RATE, measured 2026-11-05 over the 544 first-parent commits on engine ``main``
 (``4b006afc69``) since 2026-10-04, each read with ``git diff-tree --name-only -r``: the arms that
-predate #3455 fired on 67, the arm as it stands fires on 278, and the old arms plus
+predate #3455 fired on 67, the arm as it stood then fires on 278 (before BACKLOG #5472 added
+README.md, LICENSE and NOTICE), and the old arms plus
 ``^messagefoundry/`` would fire on 413. These count squash commits on ``main``, not pull-request
 runs, and a pull request pushed more than once runs the job more than once.
 
@@ -37,10 +38,9 @@ from pathlib import Path
 
 import pytest
 
-from tests._workflow_contexts import jobs_of
+from tests._workflow_contexts import changes_arm_pattern, jobs_of
 
 _ROOT = Path(__file__).resolve().parents[1]
-_CI = _ROOT / ".github" / "workflows" / "ci.yml"
 _DOCKERFILE = _ROOT / "docker" / "Dockerfile"
 
 #: The engine modules on the image's start path that the gate names. ci.yml's comment above the
@@ -97,16 +97,7 @@ def _docker_pattern() -> re.Pattern[str]:
     Anchored on the LAST ``docker=true`` emission: the workflow_dispatch arm emits one first, with
     no grep in front of it. The last ``grep -qE`` before the emission is the arm that decides it.
     """
-    text = _CI.read_text(encoding="utf-8")
-    emit = text.rfind('echo "docker=true" >> "$GITHUB_OUTPUT"')
-    assert emit > 0, "the docker arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
-    matches = list(re.finditer(r"grep -qE '([^']*)'", text[:emit]))
-    assert matches, "no `grep -qE` found before the docker emission"
-    pattern = matches[-1].group(1)
-    assert "dockerignore" in pattern, (
-        f"the grep picked up before the docker emission is not the docker arm: {pattern}"
-    )
-    return re.compile(pattern)
+    return re.compile(changes_arm_pattern("docker", "dockerignore"))
 
 
 def gate(changed: list[str]) -> bool:
@@ -284,7 +275,7 @@ def test_the_gate_admits_no_other_engine_source() -> None:
 @pytest.mark.parametrize(
     ("path", "why"),
     [
-        ("README.md", "a docs file reaches no container start"),
+        ("CONTRIBUTING.md", "a root docs file the image never COPYs"),
         ("docs/BACKLOG.md", "the ledger stub"),
         ("tests/test_api_auth.py", "an engine test runs on the `test` legs, not in the image"),
         ("harness/load/corpus.py", "a harness file the smoke steps do not run"),
@@ -304,3 +295,44 @@ def test_the_gate_refuses(path: str, why: str) -> None:
 def test_the_existing_arms_still_trip_the_gate(path: str) -> None:
     """The control for the refusals above: the arms that were there before #3455 still fire."""
     assert gate([path]), f"the docker arm no longer admits {path}"
+
+
+#: A COPY line's arguments. The last source-shaped token is the destination.
+_COPY = re.compile(r"^COPY\s+(?P<args>.+)$", re.M)
+
+
+def _root_files_the_image_copies() -> set[str]:
+    """Every repo-ROOT file a Dockerfile COPY line reads from the checkout (BACKLOG #5472).
+
+    A root file only: a directory source (``messagefoundry``) is the start-path set above, and a
+    nested source (``docker/locks/...``) sits under an arm of its own. A ``--from`` copy reads
+    another build stage, not the checkout, so it is skipped.
+    """
+    found: set[str] = set()
+    for match in _COPY.finditer(_DOCKERFILE.read_text(encoding="utf-8")):
+        tokens = match.group("args").split()
+        if any(token.startswith("--from") for token in tokens):
+            continue
+        sources = [token for token in tokens if not token.startswith("--")][:-1]
+        found |= {s for s in sources if "/" not in s and (_ROOT / s).is_file()}
+    return found
+
+
+def test_every_root_file_the_image_copies_trips_the_gate() -> None:
+    """The builder stage COPYs README.md, LICENSE and NOTICE beside pyproject.toml, and the engine
+    build reads them by name, so a rename or a removal fails the image build. Before BACKLOG #5472
+    only pyproject.toml matched, so a PR touching only one of the other three skipped this job."""
+    copied = _root_files_the_image_copies()
+    assert {"pyproject.toml", "README.md", "LICENSE", "NOTICE"} <= copied, (
+        f"the Dockerfile COPY reader found {sorted(copied)}; it has drifted from the Dockerfile"
+    )
+    missed = sorted(path for path in copied if not gate([path]))
+    assert not missed, (
+        f"the image COPYs these root files, yet editing one skips the smoke: {missed}"
+    )
+
+
+@pytest.mark.parametrize("path", ["README.md.orig", "LICENSE-3RD", "NOTICE.txt", "docs/README.md"])
+def test_the_root_file_arm_is_anchored(path: str) -> None:
+    """SHAPE: each matches only if the root-file alternation loses its ``$`` or its ``^``."""
+    assert not gate([path]), f"the docker arm admits {path}"
