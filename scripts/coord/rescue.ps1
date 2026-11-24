@@ -9,23 +9,29 @@
     A rescue ref is consulted once, in the moment the original is already gone. That is the whole
     hazard: it is the one instrument whose failure surfaces only when it is too late to fix.
 
-    AND THE SECOND HAZARD IS THAT A TIDY-UP CAN DESTROY THEM, WITH NO REMOTE COPY TO RESTORE FROM.
-    A REF UNDER `refs/rescue/` USUALLY HAS NO REMOTE COPY, AND NOTHING HERE GUARANTEES EITHER WAY.
-    `scripts/hooks/push_guard.py` refuses a push whose REMOTE ref is outside its allowlist,
-    `PUSHABLE_NAMESPACES = ("refs/heads/", "refs/tags/")`, so an ordinary `git push` of
+    AND THE SECOND HAZARD IS THAT A TIDY-UP CAN DESTROY THEM, OFTEN WITH NO REMOTE COPY TO RESTORE
+    FROM. A REF UNDER `refs/rescue/` USUALLY HAS NO REMOTE COPY, AND NOTHING HERE GUARANTEES EITHER
+    WAY. Guard A in `scripts/hooks/push_guard.py` refuses a push whose REMOTE ref name is outside
+    its allowlist (`PUSHABLE_NAMESPACES`, read it there), so an ordinary `git push` of
     `refs/rescue/<x>` to the same name is refused where that hook is installed. It does NOT stop at
     least: a push with `--no-verify`; a push from a clone where `install-git-hooks.ps1` never ran
     (the hook is local); a refspec that maps the ref into an allowed name, such as
-    `refs/rescue/<x>:refs/heads/<x>`, since the guard reads only the remote name; and a copy made by
-    anything other than `git push`. So do not assume a remote copy exists. Deleting one and then
-    running `gc` can be unrecoverable loss of the only copy, and nothing reports it.
+    `refs/rescue/<x>:refs/heads/<x>`, since Guard A reads only the remote name (the guard's other
+    checks still look at what the push carries); and a copy made by anything other than
+    `git push`. So do not assume a remote copy exists. Deleting one and then running `gc` can be
+    unrecoverable loss of the only copy, and nothing reports it.
 
-    AND THE TAGS `-Anchor` WRITES ARE PUSHABLE. `-Anchor` writes `refs/tags/rescue/<slug>`, which is
-    inside the allowlist, and `scripts/hooks/durability_push.sh` pushes `refs/tags/rescue/auto/...`
-    tags to a remote on purpose. A remote copy of a tag may exist, may lag, and may disagree with
-    the local tag; it is not a reason to delete either.
+    AND THE TAGS `-Anchor` WRITES ARE PUSHABLE, WHICH IS A PUBLICATION RISK, NOT A BACKUP. `-Anchor`
+    writes the local annotated tag `refs/tags/rescue/<slug>`, which is inside the allowlist. A
+    `git push --tags` or `--follow-tags` (or `push.followTags`) can sweep it to whatever remote the
+    push names, the public one included, with its message, which carries the local worktree path.
+    `scripts/hooks/durability_push.sh` avoids that for its own captures by pushing tag objects BY ID
+    with no local tag; they come back only through the fetch refspec, under
+    `refs/remotes/<r>/rescuetags/` (its `auto/` and immutable `orphan/` captures). So an `-Anchor`
+    tag is usually local only, and must not be treated as backed up.
 
-    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A `refs/rescue/` REF. Measured 2026-09-20: this
+    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits:
+    `refs/rescue/`, `refs/tags/rescue/` and `refs/remotes/<r>/rescuetags/`. Measured 2026-09-20: this
     checkout holds 328 of them, at least one being the sole remaining copy of files deleted from the
     working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
@@ -170,7 +176,7 @@ function Get-RescueNamespaces {
     $ns = [ordered]@{}
     $ns['refs/rescue'] = $SNAPSHOT
     $ns['refs/tags/rescue'] = $SNAPSHOT
-    # $LASTEXITCODE IS READ, AS FOR THE rev-list PAIR BELOW (BACKLOG #7591): a failed `git remote`
+    # BACKLOG #7591: $LASTEXITCODE IS READ, AS THE rev-list PAIR BELOW ALREADY DID. A failed `git remote`
     # prints nothing, which would read as "no remotes" and drop every push-updated namespace from
     # the coverage without a word.
     $remotes = @(& git -C $repo remote)

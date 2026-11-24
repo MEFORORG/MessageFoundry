@@ -567,14 +567,18 @@ def _run_with_failing_git(
     real_git = shutil.which("git")
     assert real_git, "git not on PATH"
     shim_dir.mkdir()
-    wanted = ", ".join(f"'{a}'" for a in fail_when_all_present)
+
+    def quote(s: str) -> str:  # a PowerShell single-quoted literal doubles an apostrophe
+        return "'" + s.replace("'", "''") + "'"
+
+    wanted = ", ".join(quote(a) for a in fail_when_all_present)
     (shim_dir / "git.ps1").write_text(
         # $argv, not $args, inside the filter: a script block has its own empty $args. Flattened,
         # because an array the caller passes to a .ps1 arrives as ONE argument, not spread out.
         "$argv = @($args | ForEach-Object { $_ })\n"
         f"$missing = @({wanted}) | Where-Object {{ $argv -notcontains $_ }}\n"
         "if (-not $missing) { [Console]::Error.WriteLine('shim: injected git failure'); exit 128 }\n"
-        f"& '{real_git}' @args\n"
+        f"& {quote(real_git)} @args\n"
         "exit $LASTEXITCODE\n",
         encoding="utf-8",
     )
