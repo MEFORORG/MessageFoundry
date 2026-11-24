@@ -12,6 +12,7 @@ an odd timestamp read as younger than any threshold and its item was never flagg
 from __future__ import annotations
 
 import argparse
+import datetime
 import importlib.util
 import os
 import sys
@@ -51,11 +52,17 @@ def _rec(item: str, event: str, ts: str) -> dict[str, str]:
     }
 
 
-def test_ensure_never_truncates_an_existing_ledger(tmp_path: Path) -> None:
+def test_ensure_never_truncates_a_ledger_that_appeared_after_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lost race, made deterministic: the existence probe says absent, but another writer has
+    already created the file and appended a row. ensure() must leave that row in place."""
     ledger = tmp_path / "OWNER-ITEMS.md"
     ol.append(str(ledger), _rec("1", "request_sent", "2026-11-24T10:00:00Z"))
     before = ledger.read_bytes()
+    monkeypatch.setattr(ol.os.path, "isfile", lambda _p: False)
     ol.ensure(str(ledger))
+    monkeypatch.undo()
     assert ledger.read_bytes() == before
 
 
@@ -93,6 +100,16 @@ def test_age_minutes_reads_a_good_stamp_and_refuses_a_bad_one() -> None:
     assert ol.age_minutes("2026-11-24 10:00") is None
     assert ol.age_minutes("") is None
     assert ol.age_minutes("2999-01-01T00:00:00Z") is None, "a far-future stamp is not fresh"
+
+
+def _stamp(offset_minutes: float) -> str:
+    t = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=offset_minutes)
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_the_future_skew_boundary() -> None:
+    assert ol.age_minutes(_stamp(2)) == 0.0, "within skew reads as just written"
+    assert ol.age_minutes(_stamp(10)) is None, "beyond skew cannot be read as fresh"
 
 
 @pytest.fixture

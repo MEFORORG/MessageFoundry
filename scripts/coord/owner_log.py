@@ -193,6 +193,8 @@ def ensure(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
+    if os.path.isfile(path):
+        return  # the common case, in one round trip; the create below is what is race-safe
     # Exclusive create, never truncate: the ledger is shared across sessions and PCs, and a writer
     # that lost a check-then-"wb" race wiped the rows the winner had just appended. O_APPEND as
     # well, because another writer may append a row between this create and the header write; the
@@ -201,9 +203,12 @@ def ensure(path: str) -> None:
     try:
         fd = os.open(path, flags, 0o666)
     except FileExistsError:
-        if os.path.isfile(path):
-            return  # already present; its header and rows stand
-        raise  # something that is not a ledger file, such as a dangling link, holds the name
+        # Another writer won. Not re-checked with isfile(): an SMB client may answer that from a
+        # stale not-found cache and would turn a won race into a lost row. A directory is the one
+        # holder append() could not write to, so name it here rather than fail obscurely there.
+        if os.path.isdir(path):
+            raise
+        return
     with os.fdopen(fd, "ab") as fh:
         fh.write(("\n".join(HEADER) + "\n").encode())
 
@@ -270,7 +275,9 @@ def age_minutes(ts: str) -> float | None:
     except ValueError:
         return None
     mins = (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
-    return None if mins < -FUTURE_SKEW_MINUTES else mins
+    if mins < -FUTURE_SKEW_MINUTES:
+        return None
+    return max(mins, 0.0)  # within skew: treat as just written, never as a negative age
 
 
 def cmd_event(a: argparse.Namespace) -> int:
@@ -368,11 +375,9 @@ def cmd_check(a: argparse.Namespace) -> int:
         print("")
     if unreadable:
         print(f"  *** {len(unreadable)} OPEN ITEM(S) WITH AN UNREADABLE TIMESTAMP ***")
-        print(
-            "  Their age cannot be computed, so they cannot be shown not stalled. Expected a past"
-        )
-        print("  stamp like 2026-01-31T09:05:00Z. Append the item's next leg or `withdrawn` to")
-        print("  clear it; re-logging the same leg does not, as rows sort by their raw stamp.")
+        print("  Their age cannot be computed, so they cannot be shown not stalled. The stamp does")
+        print("  not parse as e.g. 2026-01-31T09:05:00Z, or lies in the future (check the writing")
+        print("  PC's clock). Logging the item's next leg, or `withdrawn`, clears it.")
         print("")
         for item, last, ev in unreadable:
             print(f"  {item}")
