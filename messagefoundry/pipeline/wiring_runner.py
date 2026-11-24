@@ -6583,8 +6583,9 @@ class RegistryRunner:
 
         Under pooled each lane the pre-claim gate parked is released
         (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
-        :meth:`_resume_pooled_lane`, which re-arms a PAUSED or STOPPED one and lifts the inbound's
-        hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
+        ``resume_lane``, which re-arms a PAUSED or STOPPED one; the inbound's hold is lifted when
+        that re-armed a lane, no lane is kept, and no stage that recorded the hold is still
+        mid-episode. That covers at least a lane the halt's hand-back STOPPED at T17 or on
         leadership loss. A lane STOPPED with claimed rows still in flight is re-armed too when
         its next chunk assembly would re-pend them before it claims (BACKLOG #5744), and is not
         re-armed here when it would not
@@ -6613,16 +6614,23 @@ class RegistryRunner:
                 stage.value,
                 name,
             )
+        rearmed = False
         for stage, d in lanes:
             d.release_gated([name])
-            if stage in kept:
-                continue
-            if kept:
-                # The ("inbound", name) hold is shared by the internal stages, and a kept sibling
-                # still needs it, so this re-arm leaves it in place.
-                d.resume_lane(name)
-            else:
-                self._resume_pooled_lane(d, stage, name)
+            if stage not in kept:
+                rearmed = d.resume_lane(name) or rearmed
+        # The ("inbound", name) hold is shared by the internal stages. It is released, as
+        # _resume_pooled_lane releases it, only when this re-armed a lane, and only once no stage
+        # still needs it: a kept lane, or a lane still CLAIMING or PROCESSING whose STOP site
+        # recorded the hold before the lane reached STOPPED (BACKLOG #2072).
+        recorded = self._stop_held_stages.get(name, set())
+        needed = [
+            stage
+            for stage, d in lanes
+            if stage in kept or ((stage in recorded or None in recorded) and d.mid_episode(name))
+        ]
+        if rearmed and not needed:
+            self._release_operator_hold(name, "inbound")
 
     def _wake_log_gated(self) -> None:
         """Wake every router, transform and response lane waiting at the #122 claim gate, so a

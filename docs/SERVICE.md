@@ -1148,7 +1148,7 @@ return to the queue never landed is re-armed too when it would return them to th
 next claim, as it does at least after the infra-fault bound ended the retry of their return on a
 node that still holds its lease. Under the pooled claim mode only, a connection restart leaves
 STOPPED a lane that could claim past such rows instead, at least when this node leads again under
-a new lease after another node led while their return was retried (ADR 0162 section 7);
+a new lease after another node led while their return was retried; ADR 0162 section 7 says which, and the limit of that check;
 under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
 inject or a dead-letter replay, and it can then claim past the unlanded rows; until one arrives it

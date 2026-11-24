@@ -4404,6 +4404,62 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
         assert claimed is None, f"{record}: a lane that would claim past its rows was re-armed"
 
 
+@pytest.mark.parametrize("ingress", ["recorded_rows", "no_rows"])
+def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_stage_is_mid_stop(
+    store: MessageStore, ingress: str
+) -> None:
+    # BACKLOG #5704 (#2072 hazard): ROUTED's STOP site recorded the shared ("inbound", name) hold,
+    # but its lane is still PROCESSING, retrying its tail release, so it is not STOPPED yet. The
+    # lift re-arms the STOPPED INGRESS lane. Releasing the whole hold then would let a later window
+    # open bring the listener up over a ROUTED lane that STOPs with no hold.
+    # MEASURED: both cases fail on 9e33bdb on the hold. On main "no_rows" fails on the hold too,
+    # and "recorded_rows" on the re-arm, since main kept a recorded lane STOPPED (with the hold).
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    phase = stage_dispatcher._LanePhase
+    for stage in (Stage.INGRESS, Stage.ROUTED):
+        d = runner._make_dispatcher(stage)
+        runner._dispatchers[stage] = d
+        d.mark_ready(INBOUND)
+    ingress_st = runner._dispatchers[Stage.INGRESS]._states[INBOUND]
+    ingress_st.phase = phase.STOPPED
+    if ingress == "recorded_rows":
+        ingress_st.unlanded = True
+        ingress_st.stranded = stage_dispatcher._Stranded(
+            None, ("row-id",), stage_dispatcher.RependFence.capture(lambda: True, lambda: None)
+        )
+    runner._dispatchers[Stage.ROUTED]._states[INBOUND].phase = phase.PROCESSING
+    runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)
+    runner._hold_for_operator(INBOUND, "inbound", Stage.ROUTED)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert not runner._dispatchers[Stage.INGRESS].stopped(INBOUND)
+    assert ("inbound", INBOUND) in runner._stop_held, (
+        "the hold a mid-STOP sibling needs was released"
+    )
+
+
+def test_an_inbounds_lift_releases_the_shared_hold_once_no_stage_needs_it(
+    store: MessageStore,
+) -> None:
+    # The positive control: with every recorded stage re-armed, the lift releases the hold.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    for stage in (Stage.INGRESS, Stage.ROUTED):
+        d = runner._make_dispatcher(stage)
+        runner._dispatchers[stage] = d
+        d.mark_ready(INBOUND)
+        d._states[INBOUND].phase = stage_dispatcher._LanePhase.STOPPED
+        runner._hold_for_operator(INBOUND, "inbound", stage)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert ("inbound", INBOUND) not in runner._stop_held
+
+
 async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
     store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
