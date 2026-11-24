@@ -81,6 +81,8 @@ def _env(root: str | Path | None, **extra: str) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("MEFOR_COORD_ROOT", None)
     env.pop("CLAUDE_CODE_SESSION_ID", None)
+    # An inherited Codex marker would refuse every -BumpEpoch here for the wrong reason.
+    env.pop("KORUS_AGENT", None)
     if root is not None:
         env["MEFOR_COORD_ROOT"] = str(root)
     env.update(extra)
@@ -725,7 +727,8 @@ def test_bump_epoch_is_refused_for_a_codex_session(repo: Path, shared: Path) -> 
     )
     assert proc.returncode == 1, proc.stdout
     assert "REFUSED for a Codex session" in proc.stderr
-    assert not list(shared.rglob(".pool-epoch")) and not list(_local(repo).rglob(".pool-epoch"))
+    # Nothing was read or written: the refusal comes before any registry directory is made.
+    assert not (shared / "seats").exists() and not (_local(repo) / "codex-seats").exists()
 
 
 def test_writer_errors_take_a_bracketed_root_and_the_record_host(
@@ -754,13 +757,18 @@ def test_writer_errors_take_a_bracketed_root_and_the_record_host(
     ]
     assert lines, errors.read_text(encoding="utf-8-sig")
     host = lines[0].split("\t")[1]
-    assert host != "ENV-SAYS-OTHER" and host, lines[0]
+    # The same name the record carries, not the planted environment variable.
+    recs = list(seats.rglob("sess-brk.json"))
+    assert len(recs) == 1, proc.stderr
+    assert host == json.loads(recs[0].read_text(encoding="utf-8-sig"))["host"] != "ENV-SAYS-OTHER"
 
 
-def test_the_heartbeat_is_replaced_whole_and_leaves_no_temp(repo: Path, shared: Path) -> None:
+def test_a_read_only_heartbeat_is_replaced_and_no_temp_is_left(repo: Path, shared: Path) -> None:
+    # Pins the temp-then-rename write through its -ReplaceReadOnly rename: an in-place Set-Content
+    # fails on a read-only file. It does not observe atomicity itself.
     top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
     alive = shared / "seats" / ".writer-alive"
-    for _ in range(2):
+    for run in range(2):
         proc = _ps(
             COORD / "seat.ps1",
             repo,
@@ -773,8 +781,8 @@ def test_the_heartbeat_is_replaced_whole_and_leaves_no_temp(repo: Path, shared: 
         beats = list(alive.iterdir())
         assert len(beats) == 1 and beats[0].suffix == ".txt", beats
         assert time.strptime(beats[0].read_text(encoding="utf-8-sig").strip(), "%Y-%m-%dT%H:%M:%SZ")
-        # A read-only heartbeat is replaced, as the records are, not left stale (temp then rename).
-        os.chmod(beats[0], 0o444)
+        if run == 0:
+            os.chmod(beats[0], 0o444)
     assert not (shared / "seats" / ".writer-errors.txt").exists()
 
 

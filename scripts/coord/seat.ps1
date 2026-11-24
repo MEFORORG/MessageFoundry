@@ -170,8 +170,10 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true' -and $PSCmdlet.ParameterSetName -notin 'R
 }
 
 # The pool epoch marks a CLAUDE account switch. docs/CODEX.md: "Do not use Claude's account-switch or
-# pool-epoch commands for a Codex account." bridge.py refuses it too; this holds for a direct run
-# (BACKLOG #7594). Nothing is read or written.
+# pool-epoch commands for a Codex account." bridge.py refuses the literal argument; this also
+# refuses any other spelling that reaches seat.ps1 under the bridge (BACKLOG #7594). It keys on
+# KORUS_AGENT, which the bridge sets only for its child processes (docs/CODEX.md), so a run from a
+# Codex shell outside the bridge is not recognized here. Nothing is read or written.
 if ($env:KORUS_AGENT -eq 'codex' -and $BumpEpoch) {
     [Console]::Error.WriteLine('seat.ps1 -BumpEpoch: REFUSED for a Codex session (KORUS_AGENT=codex). The pool epoch marks a Claude account switch; docs/CODEX.md says not to use it for a Codex account. Nothing was read or written.')
     exit 1
@@ -200,7 +202,9 @@ function Write-WriterError {
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
         # Get-CoordHost, the name every shared record carries, not the inherited $env:COMPUTERNAME;
         # -LiteralPath, so a '[' in a shared-root path is not read as a wildcard (BACKLOG #7593).
-        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), (Get-CoordHost), $Stage, ($Message -replace '\s+', ' ')
+        # MachineName can throw (mail-claim.ps1 says so); the line must still be written then.
+        $hostName = try { Get-CoordHost } catch { $env:COMPUTERNAME }
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $hostName, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
