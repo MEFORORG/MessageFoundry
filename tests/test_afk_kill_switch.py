@@ -318,35 +318,55 @@ def _foreign_repo(sb: Sandbox, seat: str) -> Path:
     return foreign
 
 
+NOT_OURS = "not shown to be a checkout of this repository"
+
+
+def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
+    """The run read the seat as undeclared: the instruction, its Special-skips sentence, the note."""
+    text = _instruction(proc.stdout)
+    assert "A Special seat skips this" in text, (proc.stdout, proc.stderr)
+    assert NOT_OURS in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("seat", ["special", "adhoc"])
+def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox, seat: str) -> None:
+    # BACKLOG #7559. A cwd in another repository's checkout must not let that checkout's marker, or
+    # its roster missing the Special alias, name the seat: either way it reads as undeclared.
+    foreign = _foreign_repo(sb, seat)
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
 @pytest.mark.parametrize("seat", ["builder", "adhoc"])
-def test_a_cwd_in_another_repository_gives_no_instruction_and_says_so(
+def test_a_foreign_cwd_beside_our_special_marker_reads_as_undeclared(
     sb: Sandbox, seat: str
 ) -> None:
-    # BACKLOG #7559. This worktree's marker says Special. A cwd in another repository's checkout must
-    # not let that checkout's marker, or its roster missing the Special alias, name the seat.
     foreign = _foreign_repo(sb, seat)
-    proc = _seat_run(sb, "off", "special", cwd=foreign / "src")
-    assert proc.stdout == "", proc.stdout
-    assert "not a checkout of this repository" in proc.stderr, proc.stderr
+    _undeclared(_seat_run(sb, "off", "special", cwd=foreign / "src"))
 
 
-def test_a_linked_worktree_of_another_repository_gives_no_instruction(sb: Sandbox) -> None:
-    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "builder"))
-    _mark(wt, "builder")
-    proc = _seat_run(sb, "off", "special", cwd=wt)
-    assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
+@pytest.mark.parametrize("seat", ["special", "adhoc"])
+def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: str) -> None:
+    # The foreign roster maps no alias, so only this script's roster can make 'adhoc' Special.
+    foreign = _foreign_repo(sb, "builder")
+    proc = _seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT=seat)
+    assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
 
 
-def test_a_worktree_whose_git_dir_is_gone_gives_no_instruction(sb: Sandbox) -> None:
+def test_a_linked_worktree_of_another_repository_reads_as_undeclared(sb: Sandbox) -> None:
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "special"))
+    _mark(wt, "special")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=wt))
+
+
+def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> None:
     # Its common dir cannot be read, so it cannot be shown to be this repository's.
     wt = sb.repo.parent / "orphan"
     wt.mkdir()
     (wt / ".git").write_text(
         f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
     )
-    _mark(wt, "builder")
-    proc = _seat_run(sb, "off", "special", cwd=wt)
-    assert proc.stdout == "" and "cannot be read" in proc.stderr, proc.stderr
+    _mark(wt, "special")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=wt))
 
 
 def _dir_link(link: Path, target: Path) -> None:
@@ -361,13 +381,14 @@ def _dir_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
 
 
-def test_a_worktree_of_this_repository_spelled_through_a_link_gets_the_instruction(
+def test_a_worktree_of_this_repository_spelled_through_a_link_names_its_seat(
     sb: Sandbox,
 ) -> None:
     # The positive control for the repository check: the script runs through a link to the repo,
-    # while the worktree's gitdir line names the real path, as git writes it.
+    # while the worktree's gitdir line names the real path, as git writes it. Its Special marker
+    # holds only if the worktree is recognised as ours; read as undeclared it would print.
     wt = _linked_worktree(sb)
-    _mark(wt, "builder")
+    _mark(wt, "special")
     link = sb.repo.parent / "linked-repo"
     _dir_link(link, sb.repo)
     sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
@@ -389,14 +410,13 @@ def test_a_worktree_of_this_repository_spelled_through_a_link_gets_the_instructi
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert _instruction(proc.stdout), proc.stderr
+    assert (proc.stdout, proc.stderr) == ("", "")
 
 
-def test_an_unreadable_own_checkout_gives_no_instruction_and_names_it(sb: Sandbox) -> None:
+def test_an_unreadable_own_checkout_reads_as_undeclared(sb: Sandbox) -> None:
     # The script's own common dir cannot be read, so no cwd can be shown to be this repository's.
     (sb.repo / ".git" / "HEAD").unlink()
-    proc = _seat_run(sb, "off", "builder")
-    assert proc.stdout == "" and "this script's own checkout" in proc.stderr, proc.stderr
+    _undeclared(_seat_run(sb, "off", "special"))
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
