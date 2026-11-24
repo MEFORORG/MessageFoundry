@@ -915,6 +915,98 @@ def test_dead_record_is_not_a_veto_and_not_a_permission(fx: Fixture, sleeper: in
     assert d["Reason"].startswith("recently active")
 
 
+@pytest.fixture
+def stale_pid() -> Iterator[int]:
+    """A running process for a STALE record: its start time is after the record's ``startedAt``."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(900)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        yield proc.pid
+    finally:
+        proc.kill()
+        proc.wait(timeout=30)
+
+
+def _gone_session_fields(state: str, stale_pid: int) -> tuple[int, int]:
+    """The pid and ``startedAt`` that make the fence read a record as ``state``."""
+    now_ms = int(time.time() * 1000)
+    if state == "DEAD":
+        return never_live_pid(), now_ms
+    return stale_pid, now_ms - 2 * 3600 * 1000  # the process started two hours after the record
+
+
+@pytest.mark.parametrize(
+    ("state", "where"), [("DEAD", "root"), ("STALE", "root"), ("DEAD", "subdirectory")]
+)
+def test_a_dead_or_stale_record_holds_its_tree_and_the_next_run_still_works(
+    fx: Fixture, sleeper: int, stale_pid: int, state: str, where: str
+) -> None:
+    """Removing a tree with such a record in it left a record naming a checkout that is gone. The
+    fence cannot place that, so the next run refused every candidate, exit 2. The record stays
+    untouched, so the tree stays too: it is not a veto, it is not a permission, and -Name does not
+    lift it. Red before the fix on the second run's fence. ``repo-gone`` is the positive control."""
+    live_record(fx, sleeper, fx.primary)
+    clean = fx.sibling("clean")
+    cwd = clean if where == "root" else clean / "sub" / "dir"
+    pid, started_at = _gone_session_fields(state, stale_pid)
+    fx.write_session(pid=pid, cwd=cwd, session_id="eeeeeeee-5555", started_at=started_at)
+    record = fx.cfg / "sessions" / f"{pid}.json"
+    _backdate(fx.primary, clean, hours=100)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+
+    first = run(fx, "-Apply", "-Name", "clean")
+    d = by_leaf(first, "clean")
+    assert d["Decision"] == "SKIP", d
+    assert d["Occupants"] == [], "it is not reported as an occupant"
+    assert f"[{state}]" in d["Reason"], d["Reason"]
+    assert first["counts"]["removed"] == 0
+    assert clean.exists()
+
+    second = run(fx, "-Apply", "-Name", "gone")
+    assert second["fence"]["available"] is True, second["fence"]["detail"]
+    assert second["fence"]["recordsUnplaceable"] == 0
+    assert by_leaf(second, "gone")["Outcome"] == "removed"
+    assert second["_exit"] == 0
+    assert clean.exists()
+    assert record.exists(), "a record this script did not write is not its to delete"
+
+
+@pytest.mark.parametrize("state", ["DEAD", "STALE"])
+def test_a_dead_or_stale_record_arriving_mid_run_holds_the_tree(
+    fx: Fixture, sleeper: int, stale_pid: int, tmp_path: Path, state: str
+) -> None:
+    """The -Apply re-check reads the same hold: the record lands after the decision pass."""
+    _stage_recheck(fx, sleeper)
+    pid, started_at = _gone_session_fields(state, stale_pid)
+    shim = gh_shim(
+        tmp_path,
+        side_effect=(
+            "import json\n"
+            f"rec = {{'pid': {pid}, 'sessionId': 'beef0002-2222',"
+            f" 'cwd': r'{fx.sibling('clean')}', 'entrypoint': 'claude-desktop',"
+            f" 'startedAt': {started_at}}}\n"
+            f"pathlib.Path(r'{fx.cfg / 'sessions' / 'beef2.json'}')"
+            ".write_text(json.dumps(rec), encoding='utf-8')\n"
+        ),
+    )
+    res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
+
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "PRUNE", "the decision pass could not have known"
+    assert d["Outcome"] == "skipped"
+    assert d["OutcomeDetail"].startswith("re-check: "), d["OutcomeDetail"]
+    assert f"[{state}]" in d["OutcomeDetail"], d["OutcomeDetail"]
+    assert d["Occupants"] == []
+    assert fx.sibling("clean").exists()
+    assert by_leaf(res, "gone")["Outcome"] == "removed"  # positive control
+
+    later = run(fx)
+    assert later["fence"]["available"] is True, later["fence"]["detail"]
+
+
 def test_unreadable_record_vetoes_while_the_fence_stays_available(
     fx: Fixture, sleeper: int
 ) -> None:
@@ -2469,6 +2561,68 @@ def test_an_orphan_under_a_linked_ancestor(fx: Fixture, sleeper: int, where: str
     assert [o["path"] for o in later["orphansFromEarlierRuns"]] == [str(gone)], later
     assert "is a link" in later["orphansFromEarlierRuns"][0]["why"], later
     assert later["_exit"] == 3
+
+
+@pytest.mark.parametrize("shape", ["not-found-under-unlistable-parent", "unreadable-leftover"])
+def test_an_end_state_it_cannot_confirm_is_not_counted_as_removed(
+    fx: Fixture, sleeper: int, tmp_path: Path, shape: str
+) -> None:
+    """The -Apply end state read the directory with Test-Path. Two shapes, both red before the fix:
+
+    * not found, under a parent this user may not list: Test-Path said false, so the tree counted as
+      removed, on a reading the shared "gone" rule does not accept;
+    * a leftover this user may not read, under that parent: Test-Path raised access denied, which
+      this script's Stop preference made fatal, so the run ended with exit 1 and no JSON receipt
+      after git had already run its removal.
+    """
+    live_record(fx, sleeper, fx.primary)
+    leftover = fx.sibling("clean")
+    _backdate(fx.primary, leftover, hours=100)
+    who = subprocess.run(
+        ["whoami"], capture_output=True, text=True, check=False, timeout=30
+    ).stdout.strip()
+    real = shutil.which("git")
+    assert real and who
+    shim: Path | None = None
+    if shape == "unreadable-leftover":
+        shim = _shim_dir(tmp_path)
+        (shim / "git.ps1").write_text(
+            "if (($args -contains 'worktree') -and ($args -contains 'remove')) {\n"
+            f"    & '{real}' @args\n"
+            "    $code = $LASTEXITCODE\n"
+            "    $left = [string]$args[-1]\n"
+            "    [void][System.IO.Directory]::CreateDirectory($left)\n"
+            f"    & icacls $left /deny '{who}:(RA,REA,RD)' | Out-Null\n"
+            "    exit $code\n"
+            "}\n"
+            f"& '{real}' @args\n"
+            "exit $LASTEXITCODE\n",
+            encoding="utf-8",
+        )
+    try:
+        with _unlistable(fx.primary.parent):
+            res = run(fx, "-Apply", "-Name", "clean", path_prepend=shim)
+    finally:
+        if shim is not None:
+            subprocess.run(
+                ["icacls", str(leftover), "/remove:d", who],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] == "orphaned", d
+    assert "not confirmed gone" in d["OutcomeDetail"], d["OutcomeDetail"]
+    assert d["BranchOutcome"] == "kept"
+    assert res["counts"]["removed"] == 0
+    assert res["_exit"] == 3
+    assert "clean" in _git(fx.primary, "branch", "--list", "clean")
+
+    # With the deny lifted the ledger settles it: a leftover stays reported, a gone tree clears.
+    later = run(fx)
+    expected = [str(leftover)] if shape == "unreadable-leftover" else []
+    assert [o["path"].replace("/", "\\") for o in later["orphansFromEarlierRuns"]] == expected
 
 
 def test_a_name_that_matches_nothing_does_not_exit_green(fx: Fixture, sleeper: int) -> None:

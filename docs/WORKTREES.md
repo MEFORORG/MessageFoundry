@@ -541,7 +541,10 @@ description blames.
 
 **Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
 can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
-permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
+permission. A `DEAD` or `STALE` record inside a candidate still keeps that candidate, for another
+reason: removing the tree would leave a record the fence cannot place, and every later run would
+refuse. The script leaves both the record and the tree, and `-Name` does not lift this.
+And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
 unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
 config root with a registry, at least one readable record, **and no record that cannot be placed**.
 That last one matters more than it sounds. Three shapes qualify — a file that will not parse, a

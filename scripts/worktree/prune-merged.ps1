@@ -55,6 +55,11 @@
          <config-root>/sessions/<pid>.json, maps each session's recorded cwd onto a worktree, and
          fences it on pid + process start time. Only LIVE / UNVERIFIED / UNREADABLE veto, for the
          veto-only reason above. A session in a NESTED worktree vetoes its ancestor too.
+         A DEAD or STALE record is not a veto, and it still keeps its tree, for a different reason:
+         removing the tree would leave a record naming a checkout that is gone, which the fence
+         cannot place, so every later run would refuse (exit 2) until someone cleared the record.
+         This script does not clear it, because nothing here can prove the session ended, and -Name
+         does not lift the hold. It covers records present at this run's two reads.
       2. RECENT ACTIVITY (-IdleHours, default 72). Newest mtime of the worktree's PRIVATE git metadata
          (index, HEAD, ORIG_HEAD, FETCH_HEAD, COMMIT_EDITMSG, MERGE_MSG) crossed with the timestamp of
          the LAST ENTRY IN logs/HEAD -- the reflog is read by CONTENT, never by mtime, because a
@@ -650,6 +655,23 @@ function ConvertTo-OccupantRows([object[]]$Rows) {
         })
 }
 
+# Session records placed in $Path, or in a tree nested in it, whose state does not veto. Removing the
+# tree would strand them: their cwd would name a missing `<primary>-<slug>` checkout, which
+# Get-UnplaceableCwdReason faults whatever the record's liveness, and one fault refuses the whole run.
+function Get-StrandableRecords {
+    param([object]$Occupancy, [string]$Path)
+    $norm = ConvertTo-Norm $Path
+    return @($Occupancy.Sessions | Where-Object {
+            $wt = ConvertTo-Norm $_.WorktreePath
+            (-not (Test-OccupancyVeto $_.State)) -and ($wt -eq $norm -or $wt.StartsWith("$norm/"))
+        })
+}
+
+function Format-StrandableRecords([object[]]$Rows) {
+    $who = ($Rows | ForEach-Object { "$($_.Short) [$($_.State)] pid $($_.Pid) in $($_.Root)" }) -join ', '
+    return "holds $($Rows.Count) session record(s) that read as ended: $who -- removing this tree would leave a record the fence cannot place, and every later run would refuse. Nothing here can prove the session ended, so the record and the tree are both left for a person to check"
+}
+
 function Get-Decision {
     param([object]$Wt, [bool]$Confirmed)
     $leaf = Split-Path $Wt.Path -Leaf
@@ -722,6 +744,13 @@ function Get-Decision {
         }
     }
 
+    # After signal 2, so a reason that already explains the skip stays the headline.
+    $strandable = @()
+    if ($occ.Available) {
+        $strandable = @(Get-StrandableRecords -Occupancy $occ -Path $Wt.Path)
+        if ($strandable.Count -gt 0) { $reasons += Format-StrandableRecords $strandable }
+    }
+
     # Merge signal LAST -- only worth the gh round trip when nothing local already disqualifies it.
     $merged = $null
     $mergeReason = 'not evaluated (already disqualified)'
@@ -755,6 +784,8 @@ function Get-Decision {
         Locked       = [bool]$Wt.Locked
         NestedWorktrees = @($nested | ForEach-Object { Split-Path $_.Path -Leaf })
         Occupants    = @(ConvertTo-OccupantRows $occupants)
+        # Apart from Occupants: these do not veto, and the receipt's signal 1 figure counts Occupants.
+        StrandableRecords = @(ConvertTo-OccupantRows $strandable)
         ActivityAgeHours = $activityAge
         Confirmed    = [bool]$Confirmed
         Outcome      = 'not attempted'
@@ -1578,6 +1609,14 @@ if ($Apply -and $prunable.Count -gt 0) {
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
+        $strandableNow = @(Get-StrandableRecords -Occupancy $occ2 -Path $d.Path)
+        if ($strandableNow.Count -gt 0) {
+            $d.Outcome = 'skipped'
+            $d.OutcomeDetail = "re-check: $(Format-StrandableRecords $strandableNow)"
+            $d.StrandableRecords = @(ConvertTo-OccupantRows $strandableNow)
+            Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+            continue
+        }
         $nestedNow = @(Get-NestedWorktrees -Occupancy $occ2 -Path $d.Path)
         if ($nestedNow.Count -gt 0) {
             $d.Outcome = 'skipped'
@@ -1628,8 +1667,23 @@ if ($Apply -and $prunable.Count -gt 0) {
         $out = @(& git -C $RepoRoot worktree remove --force $d.Path 2>&1)
         $removeExit = $LASTEXITCODE
         $err = ($out -join ' ').Trim()
-        $dirExists = Test-Path -LiteralPath $d.Path
-        $ptrExists = $dirExists -and (Test-Path -LiteralPath (Join-Path $d.Path '.git'))
+        # FAIL CLOSED, through the "gone" rule the nightly removal's end state reads. Test-Path said
+        # false for a not-found under a folder this user may not list, which counted as removed, and
+        # threw on an unreadable leftover, which ended the run after git had deregistered the tree.
+        # No -Plain: a sibling may sit under a linked folder, as Get-LiveOrphans says.
+        $endState = Get-EndStatePresence $d.Path -RequireParent
+        $dirExists = $endState -ne 'absent'
+        $endUnknown = $endState.StartsWith('unknown: ')
+        $ptrState = 'unreadable'
+        if ($endState -eq 'present') {
+            try { $ptrState = if (Test-PresentOrThrow (Join-Path $d.Path '.git') 'the .git pointer') { 'intact' } else { 'DELETED' } }
+            catch { $ptrState = 'unreadable' }
+        }
+        $ptrExists = $ptrState -eq 'intact'
+        if ($endUnknown) {
+            $notGone = "the directory is not confirmed gone: $($endState.Substring('unknown: '.Length))"
+            $err = if ($err) { "$err; $notGone" } else { $notGone }
+        }
         $stillRegistered = @(Get-RepoWorktrees $RepoRoot | Where-Object { (ConvertTo-Norm $_.Path) -eq (ConvertTo-Norm $d.Path) }).Count -gt 0
 
         # OUTCOME, NOT EXIT CODE. Exit 0 is git's claim; the directory being gone and deregistered is
@@ -1673,7 +1727,7 @@ if ($Apply -and $prunable.Count -gt 0) {
                 Write-Note "  removed; branch $($b.Outcome).$(if ($b.Detail) { " $($b.Detail)" })" 'Green'
             }
         }
-        elseif ($removeExit -eq 0) {
+        elseif ($removeExit -eq 0 -and -not $endUnknown) {
             # git said it worked and it did not. Do NOT touch the branch on an unverified removal.
             $failed++
             Set-Exit $EXIT_FAILED
@@ -1696,11 +1750,11 @@ if ($Apply -and $prunable.Count -gt 0) {
             $d.BranchDetail = 'the removal failed, so the branch was left alone'
             $branchesKept++
             $fileCount = 0
-            if ($dirExists) {
+            if ($endState -eq 'present') {
                 $probe = @(Get-ChildItem -LiteralPath $d.Path -Recurse -File -Force -EA SilentlyContinue | Select-Object -First 501)
                 $fileCount = $probe.Count
             }
-            $fileText = if ($fileCount -gt 500) { '500+' } else { "$fileCount" }
+            $fileText = if ($endUnknown) { 'an unknown number of' } elseif ($fileCount -gt 500) { '500+' } else { "$fileCount" }
 
             if (-not $dirExists) {
                 $d.Outcome = 'failed'
@@ -1715,17 +1769,20 @@ if ($Apply -and $prunable.Count -gt 0) {
                 # Remembered on disk: git has deregistered it, so it will not be in the candidate set of
                 # any future run and nothing else would ever mention it again.
                 $newOrphans += [pscustomobject]@{ path = $d.Path; branch = $d.Branch; at = (Get-Date).ToString('o'); detail = $err }
-                $ptrText = if ($ptrExists) { 'intact' } else { 'DELETED' }
-                $d.OutcomeDetail = "ORPHANED: .git pointer $ptrText, $fileText file(s) left, registered=$stillRegistered ($err)"
+                $d.OutcomeDetail = "ORPHANED: .git pointer $ptrState, $fileText file(s) left, registered=$stillRegistered ($err)"
                 Write-Note "  FAILED (exit $removeExit): $err" 'Red'
                 Write-Note "  ORPHANED -- this is the state that nearly cost a session its work:" 'Red'
-                Write-Note "    directory:      still on disk ($fileText file(s) remain)" 'Red'
-                Write-Note "    .git pointer:   $(if ($ptrExists) { 'intact' } else { 'DELETED -- git no longer recognises this directory' })" 'Red'
+                Write-Note "    directory:      $(if ($endUnknown) { 'NOT CONFIRMED GONE (it could not be read)' } else { "still on disk ($fileText file(s) remain)" })" 'Red'
+                Write-Note "    .git pointer:   $(switch ($ptrState) { 'intact' { 'intact' } 'unreadable' { 'could not be read' } default { 'DELETED -- git no longer recognises this directory' } })" 'Red'
                 Write-Note "    registration:   $(if ($stillRegistered) { 'still listed by git worktree list' } else { 'DEREGISTERED' })" 'Red'
                 Write-Note "    Any session working there will now see 'fatal: not a git repository'." 'Red'
                 if ($ptrExists) {
                     Write-Note "    Try 'git -C ""$RepoRoot"" worktree repair ""$($d.Path)""' FIRST -- the .git file survived, so" 'Red'
                     Write-Note "    the registration may be re-creatable in place. If that fails, use the move-aside recipe:" 'Red'
+                }
+                elseif ($ptrState -eq 'unreadable') {
+                    Write-Note "    Restore read access to it and its parent folder first, then run this script again:" 'Red'
+                    Write-Note "    the entry clears itself if the directory turns out to be gone. If it is there:" 'Red'
                 }
                 else {
                     Write-Note "    'git worktree repair' cannot fix it (the .git file it needs is gone) and" 'Red'

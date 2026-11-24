@@ -23,7 +23,7 @@
     them too), Get-FlaggedFiles,
     $CACHE_DATA_NAME_PATTERN, $MYPY_CACHE_DB_PATTERN, Test-MypyCacheFile, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
-    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
+    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Get-EndStatePresence, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
     Test-SameAsPrimaryCopy.
 #>
@@ -472,8 +472,8 @@ function Test-RegistryPresentOrThrow([string]$Dir, [string]$What) {
     throw "Neither $What ('$Dir') nor the folder that holds it can be found, so the folder above it may be unreachable. Nothing was removed."
 }
 
-# THE ONE RULE FOR "GONE", for what a removal leaves behind: prune-merged.ps1's orphan ledger and the
-# nightly removal's end state both read it here. $false when $What is there, $true only when it is
+# THE ONE RULE FOR "GONE", for what a removal leaves behind: prune-merged.ps1's orphan ledger and -Apply
+# end state, and the nightly removal's end state, all read it here. $false when $What is there, $true only when it is
 # CONFIRMED gone, a throw for anything else. Confirmed gone means two things. The path is not found. And
 # the nearest item above it that IS there lists as a folder, in full, without the next name down, so a
 # not-found under a dead link or under a folder this user may not list is not gone. -Plain also requires
@@ -500,6 +500,25 @@ function Test-ConfirmedGoneOrThrow([string]$Path, [string]$What, [switch]$Plain,
             return $true
         }
         $below = $above
+    }
+}
+
+# Whether a tree's directory is still there after a removal: 'present', 'absent', or 'unknown: <why>'.
+# FAIL CLOSED. Test-Path answers $false for a path it may not read, so it cannot say "gone". Absent is
+# only what Test-ConfirmedGoneOrThrow confirms; -Plain and -RequireParent are passed to it. The nightly
+# removal passes both. prune-merged.ps1 passes -RequireParent only, because a sibling may sit under a
+# linked folder, which is how its orphan ledger reads one.
+# A directory git has just deleted can sit delete-pending for a moment while another process (an
+# indexer, an antivirus scan) still holds it, and answers access-denied until it goes; so an unreadable
+# reading is taken again a few times before it stands. Only 'unknown' is retried, never 'present'.
+function Get-EndStatePresence([string]$Path, [switch]$Plain, [switch]$RequireParent, [int]$Tries = 5, [int]$WaitMs = 400) {
+    for ($i = 1; ; $i++) {
+        try { return $(if (Test-ConfirmedGoneOrThrow $Path 'the removed tree' -Plain:$Plain -RequireParent:$RequireParent) { 'absent' } else { 'present' }) }
+        catch {
+            # The readers end their message "Nothing was removed.", which is false once git has run.
+            if ($i -ge $Tries) { return "unknown: $($_.Exception.Message -replace '\s*Nothing was removed\.\s*$', '')" }
+        }
+        Start-Sleep -Milliseconds $WaitMs
     }
 }
 
