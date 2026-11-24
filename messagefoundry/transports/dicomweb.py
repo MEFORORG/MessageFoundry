@@ -16,7 +16,9 @@ It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works withou
 (:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
 #5914). An installed ``pydicom`` that does not load, or whose read of the object raises, is taken
 as reading no data set UID, with one WARNING per process for each of the two, so the object is
-still sent. A read that raises a fault the codec does not wrap, on an object with no File Meta UID,
+still sent; a :class:`MemoryError` from the load or the read is raised instead, before the POST,
+and the object is not sent. A read that raises a fault the codec wraps (an object it cannot
+parse) also reads as no data set UID, with no WARNING. A read that raises a fault the codec does not wrap, on an object with no File Meta UID,
 lets a 202 naming any UID confirm it (:func:`_unconfirmed_202`). :func:`_data_set_instance_uid` says
 which faults do what.
 
@@ -146,9 +148,12 @@ _SHORT_FORM_VRS = frozenset({
 # The File Meta group read is bounded by this many bytes after "DICM": a conformant group is a few
 # hundred bytes, so the cap refuses only a broken or hostile object (BACKLOG #5914).
 _FILE_META_CAP = 64 * 1024
-# Why the object sent has no File Meta UID to compare: fixed text, never a value (PHI-safe). Lower
-# case, so the PHI name-run redaction leaves them whole, and short, so the stored dead letter's
-# 200-character cut keeps the whole of the unconfirmed-202 reason they end (_unconfirmed_202).
+# Why the object sent has no File Meta UID to compare: fixed text, never a value (PHI-safe). No two
+# capitalised words sit side by side, so the PHI name-run redaction leaves them whole. They end the
+# unconfirmed-202 reason (_unconfirmed_202), which is cut twice before it is stored: safe_exc cuts
+# the message at 200 characters, and the store cuts again at 200 after the "NegativeAckError: "
+# prefix. The replay advice before the cause survives both cuts, as on main; the cause may be cut
+# part-way in the stored text.
 _META_NO_MAGIC = "no Part-10 preamble and DICM magic"
 _META_NO_0003 = "no (0002,0003) in the file meta group"
 _META_WRONG_VR = "a (0002,0003) whose VR is not UI"
@@ -645,7 +650,8 @@ def _stowrs_refusal(body: str, status: int, sent: _SentUids) -> tuple[str, str] 
       there is nothing to compare, so a 202 not refused above is one whatever its reply names,
       with a reason naming why (BACKLOG #5914, decisions of 2026-11-23), except where the data
       set read raised a fault the codec does not wrap (``read_fault``): then an item naming any UID
-      confirms it, as before BACKLOG #5914 (Manager decision of 2026-11-24).
+      confirms it, as the BACKLOG #5914 reply check did before the UID comparison; an empty 202, or one naming no valid UID, is still refused
+      (Manager decision of 2026-11-24).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
     the ReferencedSOPSequence rule and is not compared with ``sent`` (BACKLOG #5914 ruling), so a 200
@@ -685,14 +691,15 @@ def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] 
     here parses the object. With neither UID to compare, the reason names why the File Meta has
     none (BACKLOG #5914). The exception is an object with no File Meta UID whose data set read
     raised a fault the codec does not wrap (``read_fault``): nothing can be compared, so a 202 is
-    confirmed as before BACKLOG #5914, by an item that names any UID."""
+    confirmed as the BACKLOG #5914 reply check did before the UID comparison, by an item that names any UID; with none named it is
+    still refused."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     if any(uid in named for uid in (sent.meta, sent.data_set)):
         return None
     if sent.meta is None and sent.read_fault and named:
         return None
     if sent.meta is None and sent.data_set is None:
-        # The replay advice goes before the cause, so the stored text's 200-character cut keeps it.
+        # The replay advice goes before the cause, so the stored text's two cuts keep it.
         return "unconfirmed-202", f"no UID to compare; {_NOT_SENT}; the object has {sent.cause}"
     return "unconfirmed-202", f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}"
 

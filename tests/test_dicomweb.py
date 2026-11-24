@@ -32,7 +32,7 @@ from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.dicom.errors import DicomPeekError
 from messagefoundry.parsing.dicom.peek import DicomPeek
-from messagefoundry.redaction import safe_exc
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
@@ -495,7 +495,7 @@ async def test_dicomweb_capture_empty_response_is_no_reply() -> None:
     assert resp.detail == "HTTP 200"
 
 
-# --- BACKLOG #5914: a 2xx reply that does not confirm the store is not a delivery ---------------
+# --- BACKLOG #5914: 2xx replies that do not confirm the store; most are refused, not all -------
 
 # Nested arrays past json's recursion limit: json.loads raises RecursionError, not ValueError.
 _TOO_DEEP = "[" * 100_000 + "]" * 100_000
@@ -865,6 +865,9 @@ async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
     stored = safe_exc(exc.value)
     assert cause in stored
     assert "before a replay" in stored
+    # The store cuts again at 200 after the "NegativeAckError: " prefix (dead_letter_now's
+    # safe_text). The replay advice still survives, as on main; the cause may be cut part-way.
+    assert "before a replay" in safe_text(stored)
 
 
 def _pydicom_part10(meta_uid: str, dataset_uid: str) -> bytes:
@@ -993,7 +996,7 @@ async def test_dicomweb_a_pydicom_fault_of_any_class_reads_as_no_data_set_uid(
     capture: bool,
     status: int,
 ) -> None:
-    # Manager decision of 2026-11-24 (parity with origin/main): a fault in the data set read, of
+    # Manager decision of 2026-11-24 (parity with the code before this PR): a fault in the data set read, of
     # any class but MemoryError, reads as no data set UID. The object is sent; a 200 delivers, and
     # a 202 is compared with the File Meta UID alone, here naming another instance. One WARNING
     # per process names the class, never the fault's text, which can carry a value.
@@ -1042,7 +1045,7 @@ async def test_dicomweb_a_loading_pydicom_whose_reader_raises_delivers(
     # A pydicom that loads but whose private File Meta reader has another signature (a version
     # skew): the codec's read raises TypeError, which it does not wrap. The object is still sent:
     # a 200 delivers, a 202 naming the File Meta UID confirms it, and one naming only the data set
-    # UID does not, as with no extra (BACKLOG #5914; on origin/main every such row is delivered).
+    # UID does not, as with no extra (BACKLOG #5914; before this PR every such row was delivered).
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
@@ -1079,11 +1082,11 @@ async def test_dicomweb_a_loading_pydicom_whose_reader_raises_delivers(
 
 
 @pytest.mark.parametrize(("named", "delivered"), [("1.2.3.4.6", True), (None, False)])
-async def test_dicomweb_a_read_fault_with_no_file_meta_uid_confirms_as_main_did(
+async def test_dicomweb_a_read_fault_with_no_file_meta_uid_confirms_by_any_named_uid(
     monkeypatch: pytest.MonkeyPatch, named: str | None, delivered: bool
 ) -> None:
     # Nothing can be compared: no File Meta UID, and the data set read raised. A 202 is then
-    # confirmed as origin/main confirms it, by an item naming any UID (Manager decision of
+    # confirmed as the BACKLOG #5914 reply check did before the UID comparison, by an item naming any UID (Manager decision of
     # 2026-11-24); one naming none is still refused.
     pytest.importorskip("pydicom")
     from messagefoundry.transports import dicomweb
@@ -1158,7 +1161,7 @@ async def test_dicomweb_a_broken_dicom_extra_compares_the_file_meta_uid_alone(
     # A pydicom missing a reader the deflate guard replays does not load, so it is taken as absent
     # (BACKLOG #5914, Manager decision of 2026-11-24): no lane stop and no refusal before the POST.
     # The object is sent; a 202 naming the File Meta UID confirms it, and one naming only the data
-    # set UID does not, as on this branch with no extra installed (origin/main confirms any UID).
+    # set UID does not, as with no extra installed (before this PR, any UID confirmed it).
     pytest.importorskip("pydicom")
     from pydicom import filereader
 

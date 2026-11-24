@@ -10,6 +10,6 @@
   not load is taken as absent, so only the File Meta UID is compared, and one WARNING per process
   says to repair or remove it. Any other fault in that read, except a `MemoryError`, reads as no
   data set UID too, with one WARNING per process naming its class; where the object also has no
-  File Meta UID, a 202 is confirmed as before, by any UID it names. A 200 is not compared. The
+  File Meta UID, a 202 is confirmed as the BACKLOG #5914 reply check did before the UID comparison, by any UID it names. A 200 is not compared. The
   refusal text names no UID. The
   rule in full is docs/CONNECTIONS.md *DICOMweb*, *Status classification*. (`BACKLOG #5914`)

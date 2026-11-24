@@ -4031,7 +4031,9 @@ adds only the `multipart/related; type="application/dicom"` framing + `applicati
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
 adds the data set's UID to that comparison. An installed extra that does not load, or whose
-read of an object raises, adds no data set UID, with a WARNING. That changes what a 202 is
+read of an object raises a fault the codec does not wrap, adds no data set UID, with a WARNING; a
+read the codec cannot parse adds none either, with no WARNING, and a `MemoryError` is raised
+before the POST, so the object is not sent. That changes what a 202 is
 compared with, and in one case what confirms it, as *Status classification* below says. So
 on a host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
@@ -4095,15 +4097,15 @@ leave, is taken as no extra too. After fixing or removing `pydicom`, restart the
 the read of the object itself, such as a `TypeError` from a `pydicom` whose private readers changed,
 or a warning the filters turn into an error, also reads as no data set UID: the object is sent, and
 one WARNING per process names the exception class only, never its text. Where the object also has
-no File Meta UID, nothing can be compared, so a 202 is confirmed as before BACKLOG #5914, by a
-ReferencedSOPSequence item that names any UID; on a host without the extra the same 202 is
+no File Meta UID, nothing can be compared, so a 202 is confirmed as the BACKLOG #5914 reply check did before the UID comparison, by a
+ReferencedSOPSequence item that names any UID (one naming none is still refused); on a host without the extra the same 202 is
 `unconfirmed-202`. A `MemoryError` is not caught there. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
 confirmed by a 202 naming either UID; without it, only by one naming the File Meta UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
 dead-lettered on every such 202 although the server may hold it, except in the read-fault case
-above. A ReferencedSOPSequence that is not an object, has a `Value` that
+above, which also needs no File Meta UID. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
 required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200
