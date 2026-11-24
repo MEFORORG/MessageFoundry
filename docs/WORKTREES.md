@@ -2012,11 +2012,12 @@ It also refuses at least these cases (BACKLOG #7622, #7623). A session registry 
 parse and was written in the last 24h, has vanished, or carries a future stamp: it may be this session's
 own record mid-write. `-Force` overrides this one. A file at the destination that is not a title stub,
 meaning not only `custom-title`/`ai-title` records: it may be a real transcript, and `-Force` does not
-override it. An existing `<id>.jsonl.stub.bak`, which is never overwritten. If a sidecar dir already
+override it. Where a title stub is at the destination, an existing `<id>.jsonl.stub.bak`, which is
+never overwritten; with no stub there, a stale backup does not refuse. If a sidecar dir already
 exists at the destination, the transcript still moves, the source sidecar stays where it is, and a
 warning names it.
 
-**It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
+**The worktree gate keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
 the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
 path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
 where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.

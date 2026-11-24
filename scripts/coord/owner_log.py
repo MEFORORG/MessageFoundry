@@ -198,10 +198,12 @@ def ensure(path: str) -> None:
         return  # the common case; the exclusive create below is what never truncates
     # Exclusive create: ensure() never truncates an existing ledger. The ledger is shared across
     # sessions and PCs, and a writer that lost a check-then-"wb" race wiped the rows the winner had
-    # just appended. O_APPEND is set as well, so on POSIX a row another writer appends between this
-    # create and the header write is not overwritten; read() skips header lines anywhere. On
-    # Windows, O_APPEND is a seek-to-end and then a write, so a truly simultaneous append and header
-    # write can still interleave and lose a row. BACKLOG #7584 carries that remaining work.
+    # just appended. O_APPEND is set as well, so on a LOCAL POSIX filesystem a row another writer
+    # appends between this create and the header write is not overwritten; read() skips header
+    # lines anywhere. O_APPEND is not atomic over NFS or an SMB/CIFS mount, which is where a shared
+    # coord root lives, and on Windows it is a seek-to-end and then a write. There a truly
+    # simultaneous append and header write can still interleave and lose a row, and so can two
+    # appends. BACKLOG #7584 carries that remaining work.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags, 0o666)
@@ -379,8 +381,9 @@ def cmd_check(a: argparse.Namespace) -> int:
     if unreadable:
         print(f"  *** {len(unreadable)} OPEN ITEM(S) WITH AN UNREADABLE TIMESTAMP ***")
         print("  Their age cannot be computed, so they cannot be shown not stalled. The stamp does")
-        print("  not parse as e.g. 2026-01-31T09:05:00Z, or lies in the future (check the writing")
-        print("  PC's clock). Logging the item's next leg, or `withdrawn`, clears it.")
+        print("  not parse as e.g. 2026-01-31T09:05:00Z, or lies in the future (check the")
+        print("  clocks of the PC that wrote it and of this one). Logging the item's next leg,")
+        print("  or `withdrawn`, clears it.")
         print("")
         for item, last, ev in unreadable:
             print(f"  {item}")
