@@ -4413,7 +4413,9 @@ def test_an_inbounds_lift_releases_the_shared_hold_as_main_or_its_next_broadcast
 ) -> None:
     # BACKLOG #5704: the shared ("inbound", name) hold is released when a resume re-armed a lane
     # and no lane is left STOPPED holding rows in flight. "no_rows" and "stale_entry" are main's
-    # lift outcome (ROUTED is listed as a recording stage but is PROCESSING an ordinary episode).
+    # lift outcome. In "stale_entry" ROUTED is listed as a recording stage and is PROCESSING; the
+    # rule cannot tell a stale entry from a STOP not yet landed (BACKLOG #2072, open), and this
+    # pins main's release, not that it is safe.
     # "recorded_rows" is main's next broadcast's outcome: main's lift kept that lane STOPPED with
     # the hold, and the broadcast that re-armed it released the hold; the lift is that re-arm now.
     # MEASURED: "stale_entry" fails on 6c1f02f21bc, which kept the hold; "recorded_rows" fails on

@@ -6590,9 +6590,8 @@ class RegistryRunner:
         ``resume_lane``, which re-arms a PAUSED or STOPPED one. That covers at least a lane the
         halt's hand-back STOPPED at T17 or on leadership loss. The inbound's hold is lifted when
         a resume re-armed a lane and, after the resumes, no lane is left STOPPED holding claimed
-        rows in flight (:meth:`StageDispatcher.stopped_holding_rows`): a kept lane keeps it, and
-        a recorded lane re-armed here releases it, as the broadcast that re-armed such a lane
-        before this lift did. A lane STOPPED with claimed rows still in flight is re-armed too when
+        rows in flight (:meth:`StageDispatcher.stopped_holding_rows`), so a kept lane keeps it
+        whatever else is re-armed; ADR 0162 section 6's note states the limit of this rule. A lane STOPPED with claimed rows still in flight is re-armed too when
         its next chunk assembly would re-pend them before it claims (BACKLOG #5744), and is not
         re-armed here when it would not
         (:meth:`StageDispatcher.stopped_past_unrecorded_rows` says when), because a re-arm would

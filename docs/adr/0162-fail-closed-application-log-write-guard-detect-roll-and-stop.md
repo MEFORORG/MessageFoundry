@@ -167,9 +167,9 @@ under the pooled claim mode a router, transform or response lane that is STOPPED
 per-connection restart of its inbound is re-armed by it, except a lane that could claim past
 claimed rows it holds in flight, which stays STOPPED with a WARNING; section 7 says which. The
 inbound's hold is released by this pooled lift when the restart re-armed one of its lanes and,
-after it, none of them is left STOPPED holding claimed rows in flight: a kept lane keeps the hold,
-and a recorded lane the lift re-arms releases it, as the broadcast that re-armed such a lane did
-before. The per_lane respawn releases the hold by its own rule.)*
+after it, none of them is left STOPPED holding claimed rows in flight, so a lane the lift keeps
+STOPPED keeps the hold, whatever else it re-arms. This does not wait for a sibling lane whose STOP
+site recorded the hold and that has not reached STOPPED yet (BACKLOG #2072, open). The per_lane respawn releases the hold by its own rule.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
