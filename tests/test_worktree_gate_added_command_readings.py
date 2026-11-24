@@ -333,9 +333,8 @@ def test_each_git_question_is_asked_once_across_the_passes(
     starts, with its argument list, so a repeated question shows as a repeated line. At
     PRE_CACHE_HEAD a command of this shape, with one `-C` on every line, made 108 git calls, one of
     them 90 times (measured 2026-11-23). Each line here names its own directory, so each hoist has a
-    question of its own. The directories exist, so every question succeeds. A failed question is
-    asked again unless its `-C` is a plain absolute path that names no directory (Invoke-GitRead's
-    note), and this test does not bound how often.
+    question of its own. The directories exist, so every question succeeds. Invoke-GitRead's note
+    says when a failed question is asked again; this test does not bound how often.
     """
     trace = tmp_path / "trace2.log"
     for i in range(9):

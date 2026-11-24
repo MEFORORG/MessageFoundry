@@ -1231,8 +1231,9 @@ function Test-TrueSeparatorIn([string]$Text) {
 # reset --hard)`). Before the cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s,
 # 19.9 s and 11.8 s (review of 2026-11-23). Review round 62fa86c0fa measured nine lines whose `-C`
 # names an existing directory that is not a repository at 108 git calls and 20.7 s, against 20 calls
-# and 4.6 s at origin/main, when a failure that was not kept was asked again on every ask in both
-# passes; the rewritten pass now asks it once (Invoke-GitRead's note). With the cache as it now
+# and 4.6 s at origin/main in that round's run on that day's load, when a failure that was not kept
+# was asked again on every ask in both passes; the rewritten pass now asks it once per pass
+# (Invoke-GitRead's note). With the cache as it now
 # stands, one run of the seven TIMED shapes in tests/test_worktree_gate_added_command_readings.py on a
 # loaded Windows box on 2026-11-24, against the BASELINE commit 1983d8eb79a and against cf790ecc157
 # before the cache: 10.0 s (10.0 s, 51.5 s) for that existing-non-repository shape; 4.2 s (11.6 s,
@@ -3319,14 +3320,17 @@ function Invoke-GitRead([object[]]$GitArgs) {
     # failure allowed a hijack origin/main refused (review round a9c38332ff). Any other failure, or an
     # answer with no line, is asked again on every ask in the given pass, as with no cache and as
     # origin/main asked it, so one spawn that failed under load does not stand for a later ask there
-    # that could read the answer and deny. In the rewritten pass such a failure is asked once more, on
-    # the first ask of that pass, and that answer is replayed for the rest of the pass: each hoist
-    # carries the lines before it, so asking on every ask there cost 108 git calls and 20.7 s on nine
-    # lines whose `-C` names an existing directory that is not a repository, against 20 calls and
-    # 4.6 s at origin/main (review round 62fa86c0fa). The rewritten pass can only add a refusal, so the
-    # replay removes no deny origin/main made (Manager decisions of 2026-11-23 under the owner's
-    # instruction, and the Lander's hold of the same day). A kept success is replayed where an
-    # uncached ask could have failed instead.
+    # that could read the answer and deny. In the rewritten pass a failure is asked on that pass's
+    # first ask of the question and replayed for the rest of the pass, because each hoist carries the
+    # lines before it and asking on every ask there cost too much (the COST note has the times;
+    # Manager decision of 2026-11-24 under the owner's instruction of 2026-11-23). So a question the
+    # given pass asked gets one more ask, and a question only the rewritten pass asks gets ONE ask in
+    # all: one spawn that fails under load there stands for the rest of the pass. That pass can only
+    # add a refusal, so the replay removes no deny origin/main made, but it can lose a deny the
+    # rewritten readings add: review round 296da1aba2 measured `echo $(git -C <wt> checkout <b>)`
+    # from outside, with its one `rev-parse --verify` ask failing, ALLOWED here and DENIED at
+    # 2d729ea4eff, which asked twice. A kept success is replayed where an uncached ask could have
+    # failed instead.
     $hit = $null
     if ($gitReadCache.TryGetValue($key, [ref]$hit)) {
         $global:LASTEXITCODE = $hit.Code
@@ -3626,7 +3630,9 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
 # kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
 # Neither re-ask runs in the call that made the first ask, and each goes through Invoke-GitRead, so
-# it reaches git only where that function did not keep the failure, which its note says. The comparable forms are built in the path form current at the call.
+# it reaches git only where that function neither kept the failure nor, in the rewritten pass,
+# already asked the question in that pass; its note says when. The comparable forms are built in the
+# path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Read-AbsoluteCommonDir([string]$CandRaw) {
     $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
