@@ -41,7 +41,9 @@ EVERY commit it can read, paging on ``hasNextPage``:
      the action builds its list, first commit seen under each key. Rule 2 was written for the
      upstream action, which read that page only. The patched action now lists such an author
      itself and asks them to sign, so rule 2 duplicates the action's own demand there rather than
-     adding to it; it is kept, and it is cleared the same way, by the author signing.
+     adding to it; it is kept. It clears once the signature file holds the author's id. This
+     pre-check runs before the action step that writes that id, so the run on which the author
+     signs still refuses, and a later run (a recheck comment or a push) clears.
 
 It faults in at least these cases: the pull request's head moved while it read, it read fewer
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
@@ -230,7 +232,7 @@ class PullRequestRead:
     commits: list[Mapping[str, Any]]
     total: int
     head: str
-    #: How many commits the first page held. Rule 2 keys that page as the action keys its list.
+    #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
     #: Indexes into ``commits`` that a GraphQL error points inside. They are not judged.
     tainted: frozenset[int] = frozenset()
@@ -272,8 +274,9 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
 
     A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
     chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
-    null person there would throw in the action: that is a fault here, and the commit keys nothing
-    among the first page's keys.
+    null person there would throw in the action. A null committer there is a fault here; the commit
+    keys nothing among the first page's keys. ``evaluate`` never calls this for a null author:
+    rule 1 refuses that commit first, and it is not also a fault.
     """
     author = _person(commit, "author")
     if author is None:
@@ -568,7 +571,7 @@ def evaluate(
             # account the action would file it under, is then missing from the first page's keys.
             faults.append(f"commit {oid}: {exc}; its key is missing from the first page's keys")
             slots.append(None)
-    # The first page's keys, one per `login || name`, as the action keys its list. A linked
+    # The first page's keys this read could form, one per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
     first_slots = slots[: read.first_page]
     first_page_keys = {slot.name for slot in first_slots if slot is not None}
