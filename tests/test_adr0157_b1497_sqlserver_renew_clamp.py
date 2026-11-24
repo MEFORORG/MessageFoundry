@@ -37,6 +37,7 @@ from messagefoundry.config.settings import (
     _clamped_statement_timeout,
     _detection_margin_seconds,
     _sqlserver_renew_reach_seconds,
+    _sqlserver_statement_timeout_left,
     load_settings,
 )
 from messagefoundry.pipeline.cluster import build_coordinator
@@ -672,33 +673,87 @@ async def test_a_stalled_paused_owner_read_ends_at_the_driver_not_at_command_tim
 # --- the two-times bound, and the loop's other statements (BACKLOG #5064, #6472) -----------
 
 
-async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_twice_the_clamp() -> (
-    None
-):
-    """The kept bound (Manager decision d20261030T213636115-0af931), pinned by timing rather than
-    by the warning's arithmetic: the borrow and the statement each get the clamp, with no shared
-    deadline, so a renew that waits on a busy pool and then meets a stalled server still resolves
-    inside twice the clamp, and the node takes nothing. The borrow takes half the clamp, which
-    leaves the acquire bound 1.0 s of headroom against a stalled loop, and the statement the whole
-    of it, so 1.5 x clamp is expected; the 0.5 s allowed over twice the clamp is timer slack on a loaded runner, not part
-    of the bound. The lower
-    bound shows both windows were spent, so this is the composite and not one window alone. The
-    COMMIT is outside both windows, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
+async def test_a_renew_on_a_busy_pool_and_a_stalled_server_resolves_within_the_clamp() -> None:
+    """The shared deadline (BACKLOG #5064), pinned by timing: a renew that waits on a busy pool and
+    then meets a stalled server gets only the whole seconds the borrow left, so it resolves inside
+    the clamp, and the node takes nothing. Before #5064 the statement got the whole clamp again and
+    this ran 0.5 + 3 = 3.5 s, past the bound below; the 0.4 s allowed over the clamp is timer slack
+    on a loaded runner, not part of the bound. The lower bound shows both windows were spent. The
+    COMMIT is outside the deadline, by a reading of pyodbc, not a measurement (BACKLOG #6621); this
     fake's commit is immediate."""
-    clamp = 2.0
+    clamp = 3.0
     conn = _Conn()
     conn.stalls = True
     store = _store(conn)
-    store._pool = _SlowPool(conn, delay=0.5 * clamp)
+    store._pool = _SlowPool(conn, delay=0.5)
     coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=clamp)
     started = time.monotonic()
     with pytest.raises(RuntimeError, match="HYT00"):
         await coord._maintain_leadership()
     elapsed = time.monotonic() - started
-    assert 1.4 * clamp <= elapsed < 2 * clamp + 0.5, elapsed
-    assert conn.statement_timeouts == [2]
+    assert 2.4 <= elapsed < clamp + 0.4, elapsed
+    assert conn.statement_timeouts == [2]  # floor(3.0 - 0.5); the whole clamp would read [3]
     assert coord.is_leader() is False
     assert not coord._leadership_lock.locked()
+
+
+async def test_the_clamped_borrow_leaves_the_statement_its_second() -> None:
+    """From a 2 s clamp up the borrow waits at most the clamp less 1 s, so a wedged pool fails the
+    renew with the deadline's last second unspent rather than at the clamp. Control: under 2 s
+    the borrow keeps the whole floored clamp, since no shared deadline fits there."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    store = _store(_Conn())
+    store._pool = _HangingPool()
+    started = time.monotonic()
+    with pytest.raises(StoreAcquireTimeout, match="after 2s"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=3.0)
+    assert time.monotonic() - started < 2.9
+    with pytest.raises(StoreAcquireTimeout, match="after 1.5s"):
+        await store._fetchone_clamped("MERGE leader_lease ...", ("k",), timeout_clamp=1.5)
+
+
+@pytest.mark.parametrize("method", ["_fetchone_clamped", "_execute_clamped"])
+async def test_a_borrow_that_leaves_under_a_second_issues_no_statement(method: str) -> None:
+    """A borrow that returned with under 1 s of the deadline left (timer slack past its limit, or a
+    loop stall) cannot carry a whole-second statement inside the deadline, so the statement is
+    refused, not run at 1 s past it: a renew refused here extends nothing (BACKLOG #5064)."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    conn = _Conn()
+    store = _store(conn)
+
+    @contextlib.asynccontextmanager
+    async def late_borrow(_limit: float) -> Any:
+        await asyncio.sleep(2.3)  # of a 3 s clamp: 0.7 s left
+        yield conn
+
+    store._acquire_clamped = late_borrow
+    with pytest.raises(StoreAcquireTimeout, match="statement was not issued"):
+        await getattr(store, method)("MERGE leader_lease ...", ("k",), timeout_clamp=3.0)
+    assert conn.statement_timeouts == []
+    assert conn.rolled_back == 0
+    assert conn.raw.assigned == []  # the fake borrow applied nothing, and neither did the refusal
+
+
+@pytest.mark.parametrize(
+    ("clamp", "elapsed", "cap", "expected"),
+    [
+        (4.5, 0.0, 4, 4),
+        (4.5, 0.6, 4, 3),  # the borrow spent the fraction and more: 3.9 s left runs as 3
+        (4.5, 3.4, 4, 1),
+        (4.5, 3.6, 4, None),  # 0.9 s left: refused
+        (4.5, 0.0, 2, 2),  # a shorter command_timeout cap still wins
+        (2.0, 0.0, 2, 2),
+        (2.0, 1.01, 2, None),
+        (1.9, 1.5, 1, 1),  # under 2 s no deadline is shared: the statement runs at 1 s
+        (1.0, 0.9, 1, 1),
+    ],
+)
+def test_the_statement_gets_the_whole_seconds_the_borrow_left(
+    clamp: float, elapsed: float, cap: int, expected: int | None
+) -> None:
+    assert _sqlserver_statement_timeout_left(clamp, elapsed, cap) == expected
 
 
 async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> None:
@@ -713,7 +768,9 @@ async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> N
     assert coord.is_leader() is True
     conn.statement_timeouts.clear()
     await coord.stop()
-    assert conn.statement_timeouts == [2, 2]
+    # Each write's borrow and statement share the 2 s bound, so each statement gets the 1 s the
+    # borrow left (BACKLOG #5064 shared deadline; before it, [2, 2]).
+    assert conn.statement_timeouts == [1, 1]
     assert conn.raw.timeout == 30
 
 
@@ -794,7 +851,7 @@ async def test_the_start_up_seed_runs_under_command_timeout_not_the_renew_clamp(
     assert conn.statement_timeouts == [17]
 
 
-@pytest.mark.parametrize(("stop_bound", "expected"), [(None, 3), (10.0, 10)])
+@pytest.mark.parametrize(("stop_bound", "expected"), [(None, 3), (10.0, 9)])
 async def test_the_lease_release_is_bounded_at_the_driver(
     stop_bound: float | None, expected: int
 ) -> None:
@@ -962,22 +1019,45 @@ def test_the_settings_reach_is_what_the_store_applies(
     rather than retyped."""
     store = _store(_Conn(), command_timeout=command_timeout, acquire_timeout=acquire_timeout)
     store._borrow = lambda timeout, **_kw: timeout
-    borrow_timeout, statement_timeout, _ = store._clamp_bounds(clamp)
-    assert statement_timeout is not None
-    assert _sqlserver_renew_reach_seconds(clamp, acquire_timeout, command_timeout) == pytest.approx(
-        borrow_timeout + statement_timeout
-    )
+    borrow_timeout, statement_cap, _ = store._clamp_bounds(clamp)
+    assert statement_cap is not None
+    reach = _sqlserver_renew_reach_seconds(clamp, acquire_timeout, command_timeout)
+    # The latest a statement the store issues can end, over every borrow duration up to its limit:
+    # the borrow's time plus the statement timeout it is then given (BACKLOG #5064).
+    latest = 0.0
+    for step in range(101):
+        elapsed = borrow_timeout * step / 100
+        seconds = _sqlserver_statement_timeout_left(clamp, elapsed, statement_cap)
+        if seconds is not None:
+            latest = max(latest, elapsed + seconds)
+    assert latest <= reach + 1e-9
+    assert reach <= borrow_timeout + statement_cap + 1e-9
+
+
+#: Fence 2.0 / TTL 4.9: a 2.5 s margin, under which a clamp below 2 s cannot share its deadline.
+_TIGHT = (
+    "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 2.0\nleader_lease_ttl_seconds = 4.9\n"
+)
 
 
 def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_path: Path) -> None:
-    """The defect: 5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, but on SQL Server the
-    claim waits up to 5 s for a connection and then runs a 5 s statement, 10 s past its issue."""
+    """The defect: 1.8 < 2.5 passes ClusterSettings._renew_fits_the_margin, but under 2 s the SQL
+    Server claim waits up to 1.8 s for a connection and then runs a 1 s statement, 2.8 s past its
+    issue."""
     with pytest.raises(ValidationError) as caught:
-        _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
+        _load(tmp_path, _SQLSERVER + _TIGHT + "lease_renew_timeout_seconds = 1.8\n")
     text = str(caught.value)
-    assert "for up to 10 s, which reaches the demotion detection margin (9 s)" in text
+    assert "for up to 2.8 s, which reaches the demotion detection margin (2.5 s)" in text
     # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
     assert "Lower lease_renew_timeout_seconds or unset it" in text
+
+
+def test_a_clamp_of_2_s_or_more_shares_its_deadline_and_loads(tmp_path: Path) -> None:
+    """BACKLOG #5064: an explicit 5.0 at 10/20/30 used to be refused as a 5 s wait plus a 5 s
+    statement, 10 s of a 9 s margin. Its borrow and statement now share the 5 s deadline."""
+    s = _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
+    assert s.cluster.lease_renew_timeout_seconds == 5.0
+    assert _sqlserver_renew_reach_seconds(5.0, 30.0, 30) == 5.0
 
 
 def test_the_same_clamp_loads_on_postgres(tmp_path: Path) -> None:
@@ -986,10 +1066,10 @@ def test_the_same_clamp_loads_on_postgres(tmp_path: Path) -> None:
 
 
 def test_a_shorter_pool_wait_brings_the_same_clamp_inside_the_margin(tmp_path: Path) -> None:
-    """Control on the term: a 3 s acquire_timeout makes the reach 3 + 5 = 8 s, under 9."""
-    text = _sqlserver_with_acquire_timeout(3.0)
-    s = _load(tmp_path, text + "lease_renew_timeout_seconds = 5.0\n")
-    assert s.cluster.lease_renew_timeout_seconds == 5.0
+    """Control on the term: a 1 s acquire_timeout makes the reach 1 + 1 = 2 s, under 2.5."""
+    text = _sqlserver_with_acquire_timeout(1.0)
+    s = _load(tmp_path, text + _TIGHT + "lease_renew_timeout_seconds = 1.8\n")
+    assert s.cluster.lease_renew_timeout_seconds == 1.8
 
 
 def test_a_tight_pair_whose_derived_clamp_cannot_fit_is_refused_on_sqlserver(
@@ -1039,19 +1119,19 @@ def test_a_set_clamp_at_a_margin_no_clamp_fits_names_widening_alone(tmp_path: Pa
 @pytest.mark.parametrize(
     ("fence", "ttl", "expected"),
     [
-        (10.0, 15.0, 1.0),  # margin 4.0: derived 2.0 runs as 2 + 2 s, so it steps to 1
-        (20.0, 27.0, 2.0),  # margin 6.0: derived 3.0 runs as 3 + 3 s
-        (20.0, 31.0, 4.0),  # margin 10.0: derived 5.0 (the ceiling) runs as 5 + 5 s
-        (20.0, 30.0, 4.5),  # control: the stock margin 9.0 keeps 4.5, which runs as 4.5 + 4 s
+        (10.0, 15.0, 2.0),  # margin 4.0: derived 2.0 shares its deadline; it stepped to 1 before
+        (20.0, 27.0, 3.0),  # margin 6.0: derived 3.0; it stepped to 2 before
+        (20.0, 31.0, 5.0),  # margin 10.0: derived 5.0 (the ceiling); it stepped to 4 before
+        (20.0, 30.0, 4.5),  # control: the stock margin 9.0 keeps 4.5
     ],
 )
 def test_a_derived_clamp_steps_down_to_fit_an_even_margin(
     tmp_path: Path, fence: float, ttl: float, expected: float
 ) -> None:
-    """An even margin derives half of itself, which on SQL Server runs as exactly the margin. Such a
-    pair must load at a smaller whole-second clamp rather than be refused: the operator set no
-    clamp, and lowering all three timings proportionally is the documented way to tighten them.
-    Postgres is the control: there the derived value stands."""
+    """An even margin derives half of itself. Before the shared deadline of BACKLOG #5064 that ran
+    on SQL Server as exactly the margin and was stepped down to a smaller whole second; from a 2 s
+    clamp up the borrow and statement now share the clamp, so the derived value stands there as it
+    does on Postgres, the control."""
     timings = (
         f"heartbeat_seconds = 5.0\nleader_fence_timeout_seconds = {fence}\n"
         f"leader_lease_ttl_seconds = {ttl}\n"

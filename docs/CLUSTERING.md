@@ -138,13 +138,14 @@ cluster coordinates the parts that must not double-run or interleave:
   ages out at the TTL.
 
   On SQL Server the claim/renew is clamped at `[cluster].lease_renew_timeout_seconds`, derived from
-  the margin unless set. There its wait for a pooled connection and its statement each get the full
-  clamp, rather than sharing one deadline as on Postgres, so a renew can land up to about twice the
-  clamp after it is issued, while the cluster section's own margin check compares the clamp alone
-  with the margin. The statement timeout counts whole seconds, so a clamp under 1 s is refused on
-  that backend, and the engine also checks the pool wait plus the statement against the margin,
-  stepping a derived clamp down or refusing the config. `serve` logs a warning at start-up when
-  twice the clamp reaches the margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
+  the margin unless set. From a 2 s clamp up its wait for a pooled connection and its statement
+  share one deadline, as on Postgres, so a renew is in flight for at most the clamp after it is
+  issued, short of its COMMIT. The statement timeout counts whole seconds, so under a 2 s clamp the
+  two cannot share it and a renew can land up to the wait plus 1 s after it is issued, while the
+  cluster section's own margin check compares the clamp alone with the margin; a clamp under 1 s is
+  refused on that backend, and the engine also checks the pool wait plus the statement against the
+  margin, stepping a derived clamp down or refusing the config. `serve` logs a warning at start-up
+  when twice the clamp reaches the margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
   arithmetic and what the clamp leaves unbounded.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL

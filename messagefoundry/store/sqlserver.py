@@ -73,7 +73,8 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
-    _clamped_statement_timeout,
+    _sqlserver_clamp_windows,
+    _sqlserver_statement_timeout_left,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -101,6 +102,7 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreAcquireTimeout,
     StoreNotFoundError,
     TableCensusIncomplete,
     acquire_pooled,
@@ -6543,22 +6545,46 @@ class SqlServerStore:
     def _clamp_bounds(
         self, timeout_clamp: float | None
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
-        """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
-        ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
-        the borrow, the statement and the rollback bounds, so none can be set without the others; a
-        shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
-        the other two."""
+        """``(borrow, statement-timeout cap, rollback bound)`` for one statement. ``timeout_clamp``
+        is ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps
+        the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets the borrow, the
+        statement and the rollback bounds, so none can be set without the others; a shorter
+        ``[store].command_timeout`` still ends the statement first, and bounds neither of the other
+        two. The cap is what :meth:`_statement_timeout_left` starts from once the borrow returns,
+        and :func:`~messagefoundry.config.settings._sqlserver_clamp_windows` says how the borrow and
+        the statement share the clamp's deadline (BACKLOG #5064)."""
         if timeout_clamp is None:
             return self._acquire(), None, None
         # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
         # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
         # rollback after a failure gets the same floored clamp (BACKLOG #5066).
         floored_clamp = max(1.0, timeout_clamp)
-        return (
-            self._acquire_clamped(floored_clamp),
-            _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
-            floored_clamp,
+        borrow_limit, statement_cap = _sqlserver_clamp_windows(
+            timeout_clamp, self._settings.command_timeout
         )
+        return self._acquire_clamped(borrow_limit), statement_cap, floored_clamp
+
+    @staticmethod
+    def _statement_timeout_left(
+        timeout_clamp: float | None, statement_cap: int | None, started: float
+    ) -> int | None:
+        """The statement timeout a clamped statement runs under, given the ``perf_counter()`` taken
+        before its borrow: the whole seconds the borrow left of the clamp's deadline
+        (:func:`~messagefoundry.config.settings._sqlserver_statement_timeout_left`). ``None`` in,
+        ``None`` out, for an unclamped statement. Raises :class:`StoreAcquireTimeout` when the
+        borrow left less than the 1 s a statement needs, so the statement is never issued past the
+        deadline: a renew refused here extends nothing (BACKLOG #5064)."""
+        if timeout_clamp is None or statement_cap is None:
+            return None
+        elapsed = perf_counter() - started
+        seconds = _sqlserver_statement_timeout_left(timeout_clamp, elapsed, statement_cap)
+        if seconds is None:
+            raise StoreAcquireTimeout(
+                f"sqlserver: the pooled-connection wait took {elapsed:.3f}s of a"
+                f" {max(1.0, timeout_clamp):g}s clamp, leaving under the 1s a statement needs, so the"
+                f" statement was not issued; retune with {CLAMPED_BORROW_ADVICE}"
+            )
+        return seconds
 
     async def _fetch_rows(
         self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
@@ -6568,10 +6594,15 @@ class SqlServerStore:
         keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
         refresh are MERGEs that come through here, so a claim that committed must not read as a
         failed renew (BACKLOG #5064)."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        borrow, statement_cap, floored_clamp = self._clamp_bounds(timeout_clamp)
+        started = perf_counter()
         result: list[dict[str, Any]] | None = None
         try:
             async with borrow as conn:
+                # Before the try: a refusal here has issued nothing, so there is nothing to roll back.
+                statement_timeout = self._statement_timeout_left(
+                    timeout_clamp, statement_cap, started
+                )
                 try:
                     async with (
                         self._statement_timeout(conn, statement_timeout),
@@ -6618,29 +6649,29 @@ class SqlServerStore:
         :meth:`_execute_clamped` is its twin for a write. A borrow that times out at the clamp
         advises :data:`CLAMPED_BORROW_ADVICE` (:meth:`_acquire_clamped`).
 
-        Two windows before the statement returns, each at most the clamp floored at 1 s. The wait
-        for a pooled connection is the smaller of ``max(1.0, clamp)`` and ``[store].acquire_timeout`` (:meth:`_clamp_bounds` applies
-        the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
-        fence would otherwise still extend the lease after this node self-fenced. The statement's
-        own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+        One deadline before the statement returns, the clamp floored at 1 s, measured from before
+        the borrow (BACKLOG #5064). :func:`~messagefoundry.config.settings._sqlserver_clamp_windows`
+        sets the borrow's limit, capped by ``[store].acquire_timeout``: a renew that waited out a
+        saturated pool past the fence would otherwise still extend the lease after this node
+        self-fenced. :meth:`_statement_timeout_left` then gives the statement only the whole seconds
+        the borrow left, applied by :meth:`_statement_timeout`, and refuses to issue it when under
+        1 s is left. So from a clamp of 2 s up a renew is in flight for at most the clamp after it
+        is issued, as on Postgres (``pipeline.cluster._call_within``). Under 2 s the statement
+        timeout, which counts whole seconds and never drops below 1, cannot share the deadline, so
+        a renew there can land up to the borrow limit plus 1 s after it is issued.
 
-        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
-        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
-        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
-        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
-        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
+        Short of the COMMIT. The COMMIT after the statement is a call on the connection, not a
         statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
         reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
         ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
-        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
+        is outside the deadline (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
         it discards the connection, so a claim's open ``HOLDLOCK`` transaction is never lent to the
         next borrower. A failed claim can therefore hold the caller's ``_leadership_lock`` for up to
-        about three times the clamp, plus at least a COMMIT, the cursor's creation and its close,
-        none of which anything here bounds. The bound frees the lock, not the server: a discarded
+        about twice the clamp from a 2 s clamp up and three times under it, plus at least a COMMIT,
+        the cursor's creation and its close, none of which anything here bounds. The bound frees the lock, not the server: a discarded
         session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
         its close lands or the server ends it, and the timed-out rollback keeps its executor thread
         until the driver returns."""
@@ -6677,10 +6708,15 @@ class SqlServerStore:
         returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
         tell the cluster stepdown its release is unconfirmed when it landed (BACKLOG #5064). Before
         #5064, :meth:`_execute` lost the count the same way."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        borrow, statement_cap, floored_clamp = self._clamp_bounds(timeout_clamp)
+        started = perf_counter()
         committed: int | None = None
         try:
             async with borrow as conn:
+                # Before the try: a refusal here has issued nothing, so there is nothing to roll back.
+                statement_timeout = self._statement_timeout_left(
+                    timeout_clamp, statement_cap, started
+                )
                 try:
                     async with (
                         self._statement_timeout(conn, statement_timeout),
