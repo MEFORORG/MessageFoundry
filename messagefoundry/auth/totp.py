@@ -188,10 +188,13 @@ _ENROLMENT_MARKER = "totp1"
 
 
 class RefusedEnrolment(ValueError):
-    """A TOTP enrolment or secret this release refuses, never computed with. Raised directly for
-    a stored enrolment whose marker is malformed or names parameters outside
-    :data:`_COMPILED_PARAMETERS`; it is also the base of :class:`RefusedTotpSecret` (and so of
-    :class:`UndecodableTotpSecret`), a secret that is empty, not base32 or too short (BACKLOG
+    """A TOTP enrolment or secret this release refuses, never computed with. Raised directly by
+    :func:`parse_enrolment` for a stored value holding a colon that is not an accepted marker
+    followed by a colon-free secret: a malformed marker (``'AB:CD'``), one naming parameters outside
+    :data:`_COMPILED_PARAMETERS`, a secret that itself holds a colon
+    (``'totp1:SHA256:6:30:AB:CD'``), or an accepted marker followed by an empty secret
+    (``'totp1:SHA256:6:30:'``). It is also the base of :class:`RefusedTotpSecret` (and so of
+    :class:`UndecodableTotpSecret`), a bare secret that is empty, not base32 or too short (BACKLOG
     #5340). A caller that must tell those apart catches the subclasses first. The message names no
     value."""
 

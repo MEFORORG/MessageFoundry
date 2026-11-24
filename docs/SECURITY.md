@@ -4348,9 +4348,10 @@ cure is the holder removing the authenticator app and enrolling it again. **Only
 changes a decision.** A TOTP the engine cannot judge, because its cell does not open (a wrong store
 key, or a cipher service such as Transit that does not answer), it is still ciphertext that a
 keyless open passed through, or its secret, after any marker this release accepts, is not base32, so
-it holds no key to measure, is **unknown**: every gate then applies the plain enabled-TOTP rule, so
+it holds no key to measure (a value holding a colon reads as a refused marker, a known refusal), is **unknown**: every gate then applies the plain enabled-TOTP rule, so
 it still counts as a way past and as a factor, its removal is refused as before, and the sign-in
-lock still escalates. The census names such an account as unknown, never as refused, and still says
+lock still escalates. For every cause but ciphertext a keyless open passed through, the census
+names such an account as unknown, never as refused, and still says
 when a factor reset would remove its passkey; its lock notice names the passkey sign-in beside the
 code sign-in. A census run in a shell opened with no store key stops at the first enabled TOTP cell
 that is still ciphertext and names no account (`CensusNeedsTheStoreKey`); one that meets no such

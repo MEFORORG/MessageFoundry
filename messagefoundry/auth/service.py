@@ -3050,7 +3050,7 @@ class LockableAccountCensus:
     undecryptable_totp: tuple[str, ...] = ()
     #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
     #: or the opened value is not base32), as opposed to a KNOWN refusal: a refused enrolment
-    #: marker, a key too short to compute with (BACKLOG #5340) or an empty secret is a known refusal
+    #: marker (a value holding a colon reads as a refused marker, a known refusal), a key too short to compute with (BACKLOG #5340) or an empty secret is a known refusal
     #: and is not named here. Every gate counts such a TOTP as the plain enabled-TOTP rule does;
     #: this names them as unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
@@ -3161,11 +3161,14 @@ def _log_totp_undecryptable(username: str) -> None:
 
 
 def _log_totp_refused(username: str) -> None:
-    """Log an account whose TOTP cell opens but names parameters this release does not compile in
-    (BACKLOG #3422). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    """Log an account whose TOTP cell opens to an enrolment this release refuses
+    (:class:`totp.RefusedEnrolment` raised directly, BACKLOG #3422, #5340): a malformed marker, one
+    naming parameters it does not compile in, or an accepted marker followed by an empty secret. No
+    code matches it, so the cure is a fresh enrolment, not the store key."""
     _log.warning(
-        "the TOTP enrolment of account %r names parameters this release does not compute with; no "
-        "code matches it until the account enrols again",
+        "the TOTP enrolment of account %r is refused by this release (a malformed marker, "
+        "parameters it does not compute with, or no secret after the marker); no code matches it "
+        "until the account enrols again",
         username,
     )
 
@@ -3274,7 +3277,7 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
     refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"``
-    (it could not be judged: the cell did not open, or the value is not base32).
+    (it could not be judged: the cell did not open, or the value is not base32; a value holding a colon reads as a refused marker, a known refusal).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
     the account and never the value. A keyless open hands the stored ciphertext through
@@ -17388,7 +17391,8 @@ class AuthService:
         if census.unknown_totp:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
-                "value it holds is not base32): %s. Until they can be, every gate treats each as "
+                "value it holds is not base32, where a value holding a colon reads as a refused marker "
+                "and is not counted here): %s. Until they can be, every gate treats each as "
                 "an enabled TOTP, and its holder cannot remove it while no discoverable passkey "
                 "remains. For a cell that does not open, check the store key and the cipher "
                 "service before resetting anything, since a reset destroys a healthy enrolment; a "

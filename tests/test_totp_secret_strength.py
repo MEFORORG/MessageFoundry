@@ -25,7 +25,13 @@ import pytest
 from _totp_clock import fresh_totp
 
 from messagefoundry.auth import totp
-from messagefoundry.auth.service import AuthService, FirstAdministratorRefused, _opened_totp_state
+from messagefoundry.auth.service import (
+    AuthService,
+    FirstAdministratorRefused,
+    _log_totp_unusable,
+    _opened_totp_state,
+    _totp_unusable_reason,
+)
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, PROVISION_EMAIL, login_admin
@@ -213,3 +219,26 @@ async def test_the_two_step_verify_fails_closed_on_a_bad_stored_secret(
         assert (await service.verify_mfa(out.token, enrolled.recovery_codes[0])).ok is True
     finally:
         await store.close()
+
+
+@pytest.mark.parametrize(
+    "stored", [f"{totp._marker(totp.DEFAULT_PARAMETERS)}:", "AB:CD", "totp1:SHA256:6:30:AB:CD"]
+)
+def test_a_refused_enrolment_raised_directly_logs_a_cause_true_for_it(
+    stored: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An accepted marker followed by an empty secret, a malformed marker and a secret holding a
+    colon each raise plain :class:`totp.RefusedEnrolment`, and the log names a cause that covers
+    them, not only parameters this release does not compute with (BACKLOG #5340)."""
+    with pytest.raises(totp.RefusedEnrolment) as raised:
+        totp.parse_enrolment(stored)
+    assert type(raised.value) is totp.RefusedEnrolment
+    reason = _totp_unusable_reason(stored)
+    assert reason == "refused"
+    caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+    _log_totp_unusable("synthetic-user", reason)
+    assert (
+        "the TOTP enrolment of account 'synthetic-user' is refused by this release (a malformed "
+        "marker, parameters it does not compute with, or no secret after the marker); no code "
+        "matches it until the account enrols again"
+    ) in caplog.text
