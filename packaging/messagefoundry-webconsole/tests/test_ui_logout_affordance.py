@@ -332,12 +332,13 @@ async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_succes
     tab's sign-out is in flight, so the cookie it sends names no session. Within 5 seconds of
     the elevation the sign-out follows the link, ends the session under its new token, and the
     row names the owner, where it used to keep a NULL actor and leave the session live. The link
-    is aged 3 seconds on the store's clock, the one the window is measured on (vault BACKLOG
-    #4276), so it sits 2 seconds inside the bound less the time the sign-out itself takes."""
+    is aged 1 second on the store's clock, the one the window is measured on (vault BACKLOG
+    #4276), so it sits 4 seconds inside the bound less the time the sign-out request takes before
+    its store call; real time, unlike the frozen clock this used, so the margin is kept wide."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None, "the rotation failed closed, so the race was not driven"
-    await age_sqlite_session_links(engine.store, _LOGOUT_LINEAGE_SECONDS - 2.0)
+    await age_sqlite_session_links(engine.store, _LOGOUT_LINEAGE_SECONDS - 4.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is None

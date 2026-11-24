@@ -613,6 +613,16 @@ async def test_a_logout_follows_a_link_retired_after_an_earlier_proof(
     assert not await _live(service, successor)
 
 
+async def test_a_logout_refuses_a_wall_clock_proven_at(store: MessageStore) -> None:
+    # Vault BACKLOG #4276. proven_at is a monotonic reading now. A wall-clock one, which this
+    # argument took before, would narrow the window silently, so it is refused before any revoke.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    with pytest.raises(ValueError, match="monotonic"):
+        await service.logout(token, client=None, actor="op", proven_at=time.time())
+    assert await _live(service, token), "the refused sign-out ended the session anyway"
+
+
 async def test_a_logout_after_a_forward_step_of_this_process_clock_still_follows_the_link(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

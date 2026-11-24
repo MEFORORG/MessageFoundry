@@ -7211,7 +7211,8 @@ class AuthService:
     def supersession_lineage_seconds(self) -> float:
         """How long a retired session hash still leads a sign-in's supersession to the session it
         became (vault BACKLOG #3028, ADR 0210), in seconds. The session reaper purges links older
-        than this.
+        than this plus its step tolerance, on the store's clock (vault BACKLOG #4276; the reaper
+        says why).
 
         It must outlast the longest sign-in a rotation can race, because the presented hash is read
         at the START of the sign-in and the supersession runs at its end. The longest is the
@@ -14731,7 +14732,12 @@ class AuthService:
         # A length back from the store's own clock (vault BACKLOG #4276): the bound, plus the time
         # since the proof, on the monotonic clock `proven_at` was read on, so no wall-clock step
         # moves it. The store adds any wait of its own, so the window starts where it did.
-        elapsed = 0.0 if proven_at is None else max(0.0, time.monotonic() - proven_at)
+        ticks = time.monotonic()
+        if proven_at is not None and proven_at > ticks:
+            # A wall-clock reading, as this argument was before vault BACKLOG #4276, is far ahead
+            # of the monotonic clock and would silently narrow the window to the bare bound.
+            raise ValueError("proven_at must be a time.monotonic() reading from this process")
+        elapsed = 0.0 if proven_at is None else ticks - proven_at
         ended = await self._supersede_session(
             presented, now=before, lineage_seconds=_LOGOUT_LINEAGE_SECONDS + elapsed
         )
@@ -15022,9 +15028,8 @@ class AuthService:
         each rotation wrote to the session's live end and revokes that, in the same transaction.
         Only links retired within :attr:`supersession_lineage_seconds` of now, on the store's own
         clock, are followed: the store stamps each link and measures the window on that one clock
-        (vault BACKLOG #4276). On a server store this process's clock, and skew between engine
-        hosts, do not move the bound. A step of the store's own clock still does, and on SQLite
-        that is this host's clock. This and
+        (vault BACKLOG #4276); ADR 0210 Amendment B says which clock steps that leaves moving the
+        bound. This and
         :meth:`logout` are the only places a retired hash leads anywhere, and it leads only to an
         end. An elevation
         that finished longer ago than that, such as one a second holder of the token completed

@@ -17834,7 +17834,7 @@ class SqlServerStore:
                 return SessionRecord.from_mapping(rows[0]) if rows else None
 
             async def _successor(h: str, seconds: float) -> str | None:
-                await cur.execute(_MSSQL_SESSION_LINEAGE_SUCCESSOR, (h, float(seconds)))
+                await cur.execute(_MSSQL_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
                 rows = await cur.fetchall()
                 return str(rows[0][0]) if rows else None
 

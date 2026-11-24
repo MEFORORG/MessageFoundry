@@ -6585,7 +6585,12 @@ as before this change:
   that one clock (vault BACKLOG #4276). On PostgreSQL and SQL Server it is the database server's,
   so a step of an engine host's clock, or skew between engine hosts that share the store, does not
   move the bound there. **On SQLite it is the engine host's own clock**, which SQLite reads and on
-  which every engine shard runs, so on SQLite a step of that host's clock still moves the bound.
+  which every engine shard runs, so on SQLite a step of that host's clock still moves the bound;
+- on PostgreSQL and SQL Server, a forward step of the database server's clock larger than the
+  session reaper's step tolerance (`_SESSION_REAP_STEP_TOLERANCE`, 600 seconds) while a reaper
+  pass runs. The reaper's step guard reads only the engine's clock, so it cannot see that step, and
+  the purge then deletes links still inside the bound. The deletion stands after the clock is set
+  right.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the

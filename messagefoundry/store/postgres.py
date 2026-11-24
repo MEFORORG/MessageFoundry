@@ -12311,7 +12311,7 @@ class PostgresStore:
                 return SessionRecord.from_mapping(dict(d)) if d else None
 
             async def _successor(h: str, seconds: float) -> str | None:
-                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, float(seconds))
+                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, seconds)
                 return None if found is None else str(found)
 
             try:

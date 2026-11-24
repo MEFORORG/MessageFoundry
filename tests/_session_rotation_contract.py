@@ -48,10 +48,11 @@ async def age_sqlite_session_links(store: Any, seconds: float) -> None:
     clock, not on ``time.time`` (vault BACKLOG #4276), so patching ``time`` no longer ages a link.
     This is how a SQLite test puts a link past a window instead. The backend-neutral contract
     below ages links by waiting instead."""
-    await store._db.execute(
-        "UPDATE session_lineage SET retired_at = retired_at - ?", (float(seconds),)
-    )
-    await store._db.commit()
+    async with store._lock:  # the store's writer lock, as its own writes take it
+        await store._db.execute(
+            "UPDATE session_lineage SET retired_at = retired_at - ?", (float(seconds),)
+        )
+        await store._db.commit()
 
 
 async def _count_sessions(store: Any, user_id: str) -> int:

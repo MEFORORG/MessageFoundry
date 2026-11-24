@@ -22490,7 +22490,7 @@ class MessageStore:
             return SessionRecord.from_mapping(dict(row)) if row else None
 
         async def _successor(h: str, seconds: float) -> str | None:
-            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, float(seconds)))
+            cur = await self._db.execute(_SESSION_LINEAGE_SUCCESSOR, (h, seconds))
             row = await cur.fetchone()
             return str(row[0]) if row else None
 
