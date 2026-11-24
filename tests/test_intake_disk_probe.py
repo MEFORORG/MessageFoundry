@@ -427,7 +427,6 @@ def test_a_probe_that_never_returns_does_not_block_process_exit(tmp_path: Path) 
     done = subprocess.run(
         [sys.executable, "-c", _EXIT_SCRIPT],
         cwd=tmp_path,
-        env=None,
         capture_output=True,
         text=True,
         timeout=60,
