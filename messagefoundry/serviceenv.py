@@ -1536,11 +1536,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     f"line, but none that may set {_DIRECTORY_VARIABLE} and none that is part of "
                     "a refused value: each line below a refused name written alone or set to "
                     "nothing, up to the next that names a refused variable, alone or set, each "
-                    "other line of a string whose first line names a refused variable, and each "
-                    "line below another line of a refused value, up to the next that names a "
-                    "refused variable or sets another variable as the first step says, where a "
-                    f"line that may set {_DIRECTORY_VARIABLE} ends neither, writing the list back "
-                    "as the first step says"
+                    "other line of a string whose first non-blank line names a refused "
+                    "variable, and each line below another line of a refused value, up to the "
+                    "next that names a refused variable or sets another variable as the first "
+                    f"step says, where a line that may set {_DIRECTORY_VARIABLE} ends neither, "
+                    "writing the list back as the first step says"
                 )
             steps.append(create)
         put = [", ".join(moving_others)] if moving_others else []

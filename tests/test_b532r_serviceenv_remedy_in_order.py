@@ -168,21 +168,26 @@ def _refused_names(entries: list[tuple[str, str]]) -> frozenset[str]:
     )
 
 
-def _part_of_refused_value(entries: list[tuple[str, str]], where: str) -> set[tuple[int, int]]:
+def _part_of_refused_value(
+    entries: list[tuple[str, str]], where: str, *, non_blank: bool
+) -> set[tuple[int, int]]:
     """The ``(string, line)`` positions in the list ``where`` that the installer clause's printed
     rule makes part of a refused value: each line below a refused name written alone or set to
     nothing, up to the next that names a refused variable, each other line of a string whose
-    first line names a refused variable, and each line below another line of a refused value,
-    up to the next that names one or sets another variable as the doubt step says, where a line
-    that may set the directory ends neither."""
+    first non-blank line names a refused variable, and each line below another line of a
+    refused value, up to the next that names one or sets another variable as the doubt step
+    says, where a line that may set the directory ends neither. ``non_blank`` is whether the
+    clause says first non-blank line; before the Lander's hold on PR 3142, comment 7122889682,
+    item 1, it said first line, which a blank first line hid the refused name from."""
     part: set[tuple[int, int]] = set()
     state: str | None = None
     for i, (at, string) in enumerate(entries):
         if at != where:
             continue
         lines = _LINE_BREAK.split(string)
-        if _refused_name(lines[0].partition("=")[0].strip().upper()):
-            part |= {(i, j) for j in range(1, len(lines))}
+        lead = next((j for j, line in enumerate(lines) if line.strip()), 0) if non_blank else 0
+        if _refused_name(lines[lead].partition("=")[0].strip().upper()):
+            part |= {(i, j) for j in range(len(lines)) if j != lead}
         for j, line in enumerate(lines):
             name, equals, value = line.partition("=")
             if _refused_name(name.strip().upper()):
@@ -319,6 +324,9 @@ def _follow_installer_clause(
         or "add back as an entry of its own each other line" in clause
     )
     by_rule = "none that is part of a refused value" in clause
+    # Since the Lander's hold on PR 3142, comment 7122889682, item 1: the string's first
+    # non-blank line, as the reader skips leading blank lines.
+    non_blank = "of a string whose first non-blank line names a refused variable" in clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -331,7 +339,7 @@ def _follow_installer_clause(
         }
         snapshot = list(registry.entries)
         wide = refused | _refused_names(snapshot)
-        part = _part_of_refused_value(snapshot, where)
+        part = _part_of_refused_value(snapshot, where, non_blank=non_blank)
         start = snapshot.index((where, string))
         gone = {start}
 
@@ -705,6 +713,37 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_A": "SEKRITa", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
         False,
     ),
+    # The Lander's hold on PR 3142, comment 7122889682, item 1: a blank first line, then a
+    # refused name. The reader skips the blank line, so every line below the name is part of
+    # its value, SEKz43=Q a line of the private key's among them, and none is added back.
+    "blank-first-line-above-a-refused-name": (
+        [
+            (
+                _EXTRA,
+                "\nMefor_Auth_Oidc_Client_Private_Key=SEKoidc42\nSEKz43=Q\nMEFOR_STORE_PASSWORD=",
+            ),
+            (_EXTRA, "mefor_secrets_directory=SEKRITpw"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKRITpw"}),
+        {"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY": "SEKoidc42", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
+        False,
+    ),
+    # The same hold, item 2: the same shape adds back no ordinary line the reader held as part
+    # of a refused value.
+    "blank-first-line-above-a-value-name": (
+        [
+            (
+                _EXTRA,
+                "\nMEFOR_VALUE_A=SEKRITa\nHTTP_PROXY=http://proxy.invalid\nMEFOR_STORE_PASSWORD=",
+            ),
+            (_EXTRA, "mefor_secrets_directory=SEKRITpw"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKRITpw"}),
+        {"MEFOR_VALUE_A": "SEKRITa", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
+        False,
+    ),
     "empty-key-rejoins-an-ordinary-line": (
         [
             (_EXTRA, "MEFOR_STORE_PASSWORD="),
@@ -785,6 +824,11 @@ _READ_OUT = {
     "two-directory-strings-between-an-empty-key-and-a-name-alone": {"MEFOR_VALUE_B"},
     "empty-key-rejoins-an-ordinary-line": {"MEFOR_VALUE_B"},
     "ordinary-line-in-a-string-led-by-a-refused-name": {"MEFOR_VALUE_A", "MEFOR_STORE_PASSWORD"},
+    "blank-first-line-above-a-refused-name": {
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
+        "MEFOR_STORE_PASSWORD",
+    },
+    "blank-first-line-above-a-value-name": {"MEFOR_VALUE_A", "MEFOR_STORE_PASSWORD"},
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},
