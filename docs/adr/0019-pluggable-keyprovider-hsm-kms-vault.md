@@ -949,11 +949,11 @@ read on 2026-11-24.
    Node, and no page for those versions was read. The crypto library under that Node's `randomBytes`
    inside Electron was not checked either.
 
-4. **The second 2026-10-10 correction note is not a source for the Transit gate.** That note, under
-   the 2026-09-28 amendment's point 4, ends by saying the check counts no invocations and the bound
-   stays weaker than the counted one. Point 4 says the same, and ADR 0138's 2026-10-07 amendment
-   records what the gate checks and what it does not catch. Where they differ, point 4 and that
-   amendment govern; the note's last sentence adds nothing to them.
+4. **The 2026-09-28 amendment's correction note is not a source for the Transit gate.** That note,
+   dated 2026-10-10, follows the amendment's *What this statement does not cover* paragraph. Its last
+   sentence describes what the Transit start gate counts. ADR 0138's 2026-10-07 amendment is the
+   record of what that gate checks and what it does not catch, and it governs wherever this ADR's
+   wording differs.
 
 5. **An enforced bound for DR archives under `vault_transit` is not built.** This ADR does not cover
    it. Vault BACKLOG #3568 holds that follow-up.

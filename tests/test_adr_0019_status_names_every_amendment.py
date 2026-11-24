@@ -3,9 +3,9 @@
 """ADR 0019's Status header names the date of every amendment section below it (vault BACKLOG #1173
 item 6).
 
-The header stopped at the 2026-07-12 amendment while five later RNG and invocation-bound amendments
-were added, so a reader of the header alone missed them. This checks dates only: it does not prove
-the header describes each amendment correctly.
+The header named the 2026-07-12 and 2026-11-05 amendments and none of the six between them, so a
+reader of the header alone missed them. This checks dates only, outside link targets: it does not
+prove the header describes each amendment correctly, or names each of two amendments of one date.
 """
 
 from __future__ import annotations
@@ -21,11 +21,14 @@ _ADR_0019 = (
 )
 _HEADING = re.compile(r"^## Amendment (\d{4}-\d{2}-\d{2})\b", re.MULTILINE)
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+# A link target such as (#amendment-2026-11-24--corrections-to-the-2026-09-28-...) carries other
+# amendments' dates, so it is dropped before the dates are read.
+_LINK_TARGET = re.compile(r"\(#[^)]*\)")
 
 
 def _status_block(text: str) -> str:
     head = text.index("- **Status:**")
-    return text[head : text.index("Designs the pluggable", head)]
+    return _LINK_TARGET.sub("", text[head : text.index("Designs the pluggable", head)])
 
 
 def test_the_status_header_names_every_amendment_date() -> None:
@@ -38,8 +41,9 @@ def test_the_status_header_names_every_amendment_date() -> None:
 
 
 def test_the_status_block_reader_stops_before_the_body() -> None:
-    # Negative control: the block must not reach the amendment headings themselves, or every date
-    # would match trivially.
+    # Negative controls: the block must not reach the amendment headings themselves, or every date
+    # would match trivially, and no link target may survive to lend its dates.
     block = _status_block(_ADR_0019.read_text(encoding="utf-8"))
     assert "## Amendment" not in block
     assert "## Context" not in block
+    assert "(#amendment-" not in block
