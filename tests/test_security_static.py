@@ -927,11 +927,13 @@ _UNSCANNABLE_RE_PATTERNS = {
     ),
     # BACKLOG #5526 item 3 -- the Authorization-name rule. Unresolvable BY CONSTRUCTION: ``_TCHARS``
     # is imported from ``transports/bounded_read.py`` so the two copies of the RFC 9110 tchar set
-    # cannot drift, and this scanner does not follow an import. ``bounded_read`` spells its twin,
-    # ``_PROXY_CREDENTIAL_NAME``, with a local ``_TCHARS``, so that copy resolves and is scanned. The
-    # shape is linear by inspection: the leading ``[^tchar]*`` cannot match the ``a`` that follows
-    # it, a tchar, so each character is read once; the optional tail is one ``.*`` with nothing
-    # after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is one start position.
+    # cannot drift, and this scanner does not follow an import from a module outside
+    # :data:`_IMPORTED_CONSTANT_MODULES`, which does not name ``bounded_read``. ``bounded_read``
+    # spells its twin, ``_PROXY_CREDENTIAL_NAME``, with a local ``_TCHARS``, so that copy resolves and
+    # is scanned. The shape is linear by inspection: the leading ``[^tchar]*`` cannot match the
+    # ``a`` that follows it, a tchar, so each character is read once; the optional tail is one
+    # ``.*`` with nothing after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is
+    # one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
     # BACKLOG #6637 -- the ignores for pydicom's UserWarning copies of a refused value. ``message``
     # iterates ``reversed(_PYDICOM_VALUE_WARNINGS)``, which is derived from the ``warning`` field of
