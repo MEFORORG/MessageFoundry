@@ -74,9 +74,10 @@
     repository's refs, so a sibling repository's claim on a branch name that also exists here could
     read as landed. The evidence this reads is where the holder lived: the nearest directory above
     it that still exists must resolve to this repository's git common dir. A holder that lay inside
-    another repository, or outside any, reads UNKNOWN and is never released, and so does every gone
-    holder while GIT_DIR or GIT_COMMON_DIR is set, because git then answers for that directory
-    instead. The -Apply re-check tests it again. It misreads at least two layouts. Another
+    another repository, or outside any, reads UNKNOWN and is never released. While GIT_DIR or
+    GIT_COMMON_DIR is set, a gone holder that reaches the repository check reads UNKNOWN too, because
+    git then answers for that directory instead; STRANDED-REGISTERED and no-branch rows are decided
+    before the check. The -Apply re-check tests it again. It misreads at least two layouts. Another
     repository's linked worktree placed inside this one's tree reads as this repository's once it is
     removed, because its .git file goes with it, so that claim can still be judged here. A sibling
     worktree beside the primary, whose nearest surviving directory is in no repository, reads
