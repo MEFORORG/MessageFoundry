@@ -119,9 +119,9 @@ def _mark(root: Path, seat: str) -> None:
     marker.write_text(seat, encoding="utf-8")
 
 
-def _linked_worktree(sb: Sandbox, name: str = "wt") -> Path:
-    """A linked worktree of the sandbox repository, as git lays one out: _hookinput.ps1 reads it."""
-    gitdir = sb.repo / ".git" / "worktrees" / name
+def _linked_worktree(sb: Sandbox, name: str = "wt", repo: Path | None = None) -> Path:
+    """A linked worktree of ``repo`` (the sandbox's by default), as git lays one out."""
+    gitdir = (repo or sb.repo) / ".git" / "worktrees" / name
     gitdir.mkdir(parents=True)
     (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
     (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
@@ -330,14 +330,7 @@ def test_a_cwd_in_another_repository_gives_no_instruction_and_says_so(
 
 
 def test_a_linked_worktree_of_another_repository_gives_no_instruction(sb: Sandbox) -> None:
-    foreign = _foreign_repo(sb, "builder")
-    gitdir = foreign / ".git" / "worktrees" / "fwt"
-    gitdir.mkdir(parents=True)
-    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
-    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
-    wt = sb.repo.parent / "fwt"
-    wt.mkdir()
-    (wt / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "builder"))
     _mark(wt, "builder")
     proc = _seat_run(sb, "off", "special", cwd=wt)
     assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
@@ -355,11 +348,11 @@ def test_a_worktree_whose_git_dir_is_gone_gives_no_instruction(sb: Sandbox) -> N
     assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
 
 
-def test_a_cwd_in_another_repository_leaves_the_switch_reading(sb: Sandbox) -> None:
-    # The switch read never depends on the cwd: ON still prints the banner.
-    foreign = _foreign_repo(sb, "builder")
-    hook = json.loads(_seat_banner(sb, "on", "builder", cwd=foreign))
-    assert hook["hookSpecificOutput"]["additionalContext"].startswith("AFK KILL SWITCH IS ON")
+def test_an_unreadable_own_checkout_gives_no_instruction_and_names_it(sb: Sandbox) -> None:
+    # The script's own common dir cannot be read, so no cwd can be shown to be this repository's.
+    (sb.repo / ".git" / "HEAD").unlink()
+    proc = _seat_run(sb, "off", "builder")
+    assert proc.stdout == "" and "this script's own checkout" in proc.stderr, proc.stderr
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
