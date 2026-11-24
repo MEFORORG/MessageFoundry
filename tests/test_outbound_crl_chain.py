@@ -40,7 +40,11 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.pipeline import crl_reload
-from messagefoundry.pki import OUTBOUND_HTTP_URL_CASE, cas_not_reaching_a_root, own_crl_refusal
+from messagefoundry.pki import (
+    OUTBOUND_NO_PARTNER_TLS_CASE,
+    cas_not_reaching_a_root,
+    own_crl_refusal,
+)
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import opener_tls_context
@@ -459,7 +463,8 @@ def test_an_http_hop_on_its_ca_file_remedy_is_told_it_checks_no_server_chain(
 ) -> None:
     """Red on a1f268bad59: an http hop that follows the tls_ca_file remedy still meets the own-CRL
     and rooted-CA refusals, which said only that the whole server chain is checked. Each now
-    scopes that to a hop over TLS and names the http case."""
+    names the case of a connection that makes no TLS connection of its own to the partner, and
+    the own-CRL refusal scopes the chain check to a hop over TLS."""
     root_crl_missing = tmp_path / "inter-crl-only.pem"
     root_crl_missing.write_bytes(two_tier.inter_crl_file.read_bytes())
     for crl, ca_file, said in (
@@ -474,8 +479,8 @@ def test_an_http_hop_on_its_ca_file_remedy_is_told_it_checks_no_server_chain(
             )
         text = str(refused.value)
         assert said in text
-        assert OUTBOUND_HTTP_URL_CASE in text
-        assert "checks the whole server chain against this file\n" not in text
+        assert OUTBOUND_NO_PARTNER_TLS_CASE in text
+        assert "against this file, so" not in text
     assert "on a hop that sends to its server over TLS" in own_crl_refusal(
         [("CN=Client Root", 1)], outbound=True
     )

@@ -3586,7 +3586,7 @@ def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
     root it does not hold is refused here, at build, since no chain through that CA could end at
     a root the CRL file covers. An intermediate beside its root is admitted: the chain runs on
     through it to the root, and the own-CRL rule then asks for the intermediate's CRL too."""
-    from messagefoundry.pki import OUTBOUND_HTTP_URL_CASE, cas_not_reaching_a_root
+    from messagefoundry.pki import OUTBOUND_NO_PARTNER_TLS_CASE, cas_not_reaching_a_root
 
     stats = ctx.cert_store_stats()
     if stats["x509"] != stats["x509_ca"]:
@@ -3597,7 +3597,7 @@ def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
             f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
             f"loads {stats['x509'] - stats['x509_ca']} certificate(s) that are not CAs. The "
             "whole-chain check needs the chain to end at a root whose CRL is in [tls].crl_file. "
-            f"{OUTBOUND_HTTP_URL_CASE}. Put only CA certificates in that CA file"
+            f"{OUTBOUND_NO_PARTNER_TLS_CASE}. Put only CA certificates in that CA file"
         )
     unrooted = cas_not_reaching_a_root(ctx.get_ca_certs(binary_form=True))
     if unrooted:
@@ -3605,7 +3605,7 @@ def _require_rooted_cas(ctx: ssl.SSLContext, anchor: TrustAnchor) -> None:
             f"[tls].crl_check_chain is set, and {anchor.cafile_setting or 'the CA file setting'} "
             f"loads CA(s) that do not chain to a self-signed root CA in that file: "
             f"{', '.join(unrooted)}. The whole-chain check needs the chain to end at a root "
-            f"whose CRL is in [tls].crl_file. {OUTBOUND_HTTP_URL_CASE}. Add each one's root CA "
+            f"whose CRL is in [tls].crl_file. {OUTBOUND_NO_PARTNER_TLS_CASE}. Add each one's root CA "
             "to that CA file, or remove "
             "the CA; the server can send its intermediates"
         )

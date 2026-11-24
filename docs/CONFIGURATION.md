@@ -2483,7 +2483,7 @@ key usage extension without `cRLSign` (vault BACKLOG #5896, RFC 5280 section 6.3
 OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that CRL would fail
 with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
 A hop that checks only the peer's own certificate does not refuse that CRL. There, a root that
-signs only intermediates is never judged by its own CRL, so the file can still pass. An outbound hop that `[tls].crl_check_chain` reaches checks the whole server chain, so it refuses that CRL too. Where the
+signs only intermediates is never judged by its own CRL, so the file can still pass. An outbound hop that `[tls].crl_check_chain` reaches refuses that CRL too: on a hop over TLS it checks the whole server chain, and an `http` or ECH sidecar connection, which checks no CRL against its partner, meets the same rule at build. Where the
 build succeeds, it logs a WARNING that names the first such CRL in the file. Another CA's CRL
 fixes nothing, since OpenSSL judges a peer by a CRL from its own issuer. Reissue that CA with
 `cRLSign` and give the setting a CRL it signs. Otherwise, on a whole-chain hop, remove the CA from

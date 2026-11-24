@@ -1479,14 +1479,15 @@ _OUTBOUND_CA_SETTINGS = (
     "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
 )
 
-#: The http case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection whose url
-#: is http still builds an https handler from its CA setting, so the same rules refuse it, though
-#: it sends to its partner without TLS and no CRL is checked against the partner there. This
-#: refusal and the rooted-CA refusals in tls_policy carry it.
-OUTBOUND_HTTP_URL_CASE = (
-    "A connection with an http url sends to its partner without TLS, so no CRL is checked "
-    "against the partner there, but the engine still builds an https handler from its CA "
-    "setting and refuses it the same way"
+#: The no-partner-TLS case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection
+#: whose url is http, or a REST connection with an ech_sidecar, makes no TLS connection of the
+#: engine's own to the partner, yet the engine still builds an https handler for it from its trust
+#: anchor, so the same rules apply. This refusal and the rooted-CA refusals in tls_policy carry it.
+OUTBOUND_NO_PARTNER_TLS_CASE = (
+    "A connection with an http url, or a REST connection with an ech_sidecar, makes no TLS "
+    "connection of the engine's own to the partner, so no CRL is checked against the partner "
+    "there, but the engine still builds an https handler for that connection from its trust "
+    "anchor, and these rules apply to it"
 )
 
 
@@ -1496,8 +1497,8 @@ def own_crl_reason(
     """Why a whole-chain CRL check on a hop listing ``ca_ders`` refuses ``crl_pem``, after the
     setting or the file, or ``None`` when every CA has a CRL of its own (vault BACKLOG #5627,
     #5511). A start and the running-hop reload both ask this, so the rule and its words are one.
-    ``outbound`` words it for an outbound hop under ``[tls].crl_check_chain``, which checks a
-    server's chain against CAs from its own CA setting."""
+    ``outbound`` words it for an outbound hop under ``[tls].crl_check_chain``, which on a hop
+    that sends over TLS checks a server's chain against CAs from its own CA setting."""
     try:
         missing = cas_without_own_crl(ca_ders, crl_pem)
     except ValueError as exc:
@@ -1529,7 +1530,7 @@ def own_crl_refusal(missing: Iterable[tuple[str, int]], *, outbound: bool = Fals
             "[tls].crl_check_chain checks the whole server chain against this file on a hop "
             "that sends to its server over TLS"
         )
-        http_case = f"{OUTBOUND_HTTP_URL_CASE}. "
+        http_case = f"{OUTBOUND_NO_PARTNER_TLS_CASE}. "
     else:
         who = f"the loaded client CA(s) {named}"
         peers = "clients"
