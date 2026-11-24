@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #6687: a DR copy loop reads a ``None`` read as "no data yet", never as end of stream.
 
-A non-blocking source answers ``None`` when it has nothing ready. The copy loops in
-``pipeline/dr_backup.py`` each stopped on ``if not buf: break``, so a ``None`` ended the copy short and
-the run went on as if it were complete. They now share :func:`dr_backup._read_chunks`. The sources
-here are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
+A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
+``if not buf: break`` ends the copy short there and the run goes on as if it were complete. Three of
+the copy loops in ``pipeline/dr_backup.py`` now share :func:`dr_backup._read_chunks`, and these tests
+drive each of the three; the loops in ``_extract_member`` and ``_restore_blocking`` are not changed
+here. The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import builtins
 import hashlib
 import io
 import tarfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,7 @@ from messagefoundry.pipeline import dr_backup as dr
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.store import MessageStore
 
-_CHUNK = 1024 * 1024
+_CHUNK = dr._COPY_CHUNK_BYTES
 
 
 class _Scripted:
@@ -71,10 +73,39 @@ class _Stalling:
 # --- the shared loop itself -------------------------------------------------------------------
 
 
-def test_a_none_read_is_waited_out_not_read_as_end_of_stream() -> None:
+def test_a_none_read_is_waited_out_not_read_as_end_of_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr(time, "sleep", waits.append)
     src = _Scripted([None, b"ab", None, None, b"cd", b""])
     assert list(dr._read_chunks(src)) == [b"ab", b"cd"]
     assert src.reads == 6
+    # Each None read sleeps the documented wait, rather than spinning on the source.
+    assert waits == [dr._NO_DATA_YET_WAIT_SECONDS] * 3
+
+
+def test_a_source_that_only_answers_none_is_refused_after_the_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dr, "_NO_DATA_YET_LIMIT_SECONDS", 0.05)
+    src = _Scripted([b"ab"] + [None] * 10_000)
+    chunks = dr._read_chunks(src)
+    assert next(chunks) == b"ab"
+    with pytest.raises(TimeoutError, match="no data ready"):
+        next(chunks)
+    assert src.reads < 10_001
+
+
+def test_a_byte_arriving_restarts_the_no_data_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each stall here is shorter than the limit, so the copy finishes even though the stalls add up
+    # to more than it.
+    monkeypatch.setattr(dr, "_NO_DATA_YET_LIMIT_SECONDS", 0.2)
+    script: list[bytes | None] = []
+    for _ in range(6):
+        script += [None] * 4 + [b"x"]
+    src = _Scripted([*script, b""])
+    assert b"".join(dr._read_chunks(src)) == b"xxxxxx"
 
 
 def test_an_empty_read_ends_the_stream_and_nothing_reads_past_it() -> None:

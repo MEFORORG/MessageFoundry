@@ -458,8 +458,10 @@ class _ChunkSource(Protocol):
 
 #: The read size of :func:`_read_chunks`, the 1 MiB the copy loops it replaced read.
 _COPY_CHUNK_BYTES = 1024 * 1024
-#: How long :func:`_read_chunks` waits after a ``None`` read before it reads again (BACKLOG #6687).
+#: How long :func:`_read_chunks` sleeps after a ``None`` read before it reads again (BACKLOG #6687).
 _NO_DATA_YET_WAIT_SECONDS = 0.01
+#: How long :func:`_read_chunks` keeps reading ``None`` with no byte arriving before it refuses.
+_NO_DATA_YET_LIMIT_SECONDS = 30.0
 
 
 def _read_chunks(src: _ChunkSource) -> Iterator[bytes]:
@@ -468,15 +470,26 @@ def _read_chunks(src: _ChunkSource) -> Iterator[bytes]:
 
     A ``None`` read is not the end of the stream: a non-blocking source answers ``None`` when it has
     no data ready YET. Stopping there, as a bare ``if not buf: break`` loop does, would finish a copy
-    short and report it as complete. So the loop waits :data:`_NO_DATA_YET_WAIT_SECONDS` and reads
-    again. The wait is not bounded, the same as a blocking read that never returns. A blocking source
-    does not answer ``None``, so for one this yields the same reads the old loops wrote (BACKLOG
-    #6687)."""
+    short and report it as complete. So the loop sleeps :data:`_NO_DATA_YET_WAIT_SECONDS` and reads
+    again. Once ``None`` has been the only answer for :data:`_NO_DATA_YET_LIMIT_SECONDS` it raises
+    :class:`TimeoutError`, an ``OSError``, so a source that stalls ends the copy as a failure rather
+    than holding the worker thread. A blocking source does not answer ``None``, so for one this
+    yields the same reads the old loops wrote (BACKLOG #6687)."""
+    stalled_since: float | None = None
     while True:
         buf = src.read(_COPY_CHUNK_BYTES)
         if buf is None:
+            now = time.monotonic()
+            if stalled_since is None:
+                stalled_since = now
+            elif now - stalled_since >= _NO_DATA_YET_LIMIT_SECONDS:
+                raise TimeoutError(
+                    "the source stream had no data ready for "
+                    f"{_NO_DATA_YET_LIMIT_SECONDS:g} seconds (non-blocking source)"
+                )
             time.sleep(_NO_DATA_YET_WAIT_SECONDS)
             continue
+        stalled_since = None
         if not buf:
             return
         yield buf
