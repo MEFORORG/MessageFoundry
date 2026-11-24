@@ -1212,3 +1212,68 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         assert [r["key"] for r in rows] == ["OLD"], "the freshly-eligible rows were destroyed"
     finally:
         await store.close()
+
+
+# --- BACKLOG #6820: the preview reads a reference file once while it is unchanged ----------------
+
+_REF_RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+
+
+def test_dryrun_reads_an_unchanged_reference_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`check` calls the preview once per fixture per inbound, and each call used to re-read and
+    re-parse every file-backed reference set (BACKLOG #6820). An unchanged file is now read once;
+    an edited one is read again, so the preview still shows the file as it stands."""
+    import os
+
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(dryrun, "_reference_file_cache", {})
+    loads: list[str] = []
+    real = dryrun.load_code_set
+
+    def counting(path: str) -> Any:
+        loads.append(path)
+        return real(path)
+
+    monkeypatch.setattr(dryrun, "load_code_set", counting)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    reg = _ref_graph(csv)
+    reg.handlers["h"] = lambda m: [Send("OB_REF", reference("provider_npi")["MED1"])]
+
+    first = [route_message(reg, reg.inbound["IB_REF"], _REF_RAW) for _ in range(3)]
+    assert [o.deliveries[0].payload for o in first] == ["9991"] * 3
+    assert len(loads) == 1
+
+    _csv(csv, "code,npi\nMED1,9992222\n")
+    stat = csv.stat()
+    os.utime(csv, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    again = route_message(reg, reg.inbound["IB_REF"], _REF_RAW)
+    assert again.deliveries[0].payload == "9992222"
+    assert len(loads) == 2
+
+
+def test_dryrun_reference_containers_are_fresh_per_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cached set hands each preview its own copy of a container value, so a Handler that edits
+    one in a fixture does not change what the next fixture reads (BACKLOG #6820)."""
+    from messagefoundry.pipeline import dryrun
+
+    monkeypatch.setattr(dryrun, "_reference_file_cache", {})
+    toml = tmp_path / "npi.toml"
+    toml.write_text('MED1 = ["9991"]\n', encoding="utf-8")
+    reg = _ref_graph(toml)
+    seen: list[list[str]] = []
+
+    def handle(m: Message) -> list[Send]:
+        value = reference("provider_npi")["MED1"]
+        seen.append(list(value))
+        value.append("EDITED")
+        return [Send("OB_REF", m)]
+
+    reg.handlers["h"] = handle
+    for _ in range(2):
+        route_message(reg, reg.inbound["IB_REF"], _REF_RAW)
+    assert seen == [["9991"], ["9991"]]

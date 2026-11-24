@@ -611,6 +611,37 @@ def transform_one(
 #: in this process; the path too, so another config's set of the same name still logs. A test resets it.
 _skipped_reference_sets_logged: set[tuple[str, str]] = set()
 
+#: Each FILE-backed reference set the preview has loaded, by path: the file's stat signature at the
+#: load and the table as the store encodes it (BACKLOG #6820). ``check`` previews every fixture on
+#: every inbound, and each preview re-read and re-parsed every file; an unchanged file is now read
+#: once. Stat is taken before the read, so a file edited during it is read again on the next
+#: preview. Values are kept encoded and decoded per preview, so a Handler that edits a container
+#: value changes its own preview only. Bounded, oldest out first. A test resets it.
+_reference_file_cache: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
+_REFERENCE_FILE_CACHE_MAX = 64
+
+
+def _encoded_reference_file(path: str) -> dict[str, str]:
+    """The set at ``path``, each value as the store encodes it, from the cache while the file's
+    stat signature is unchanged. Raises as :func:`load_code_set` and
+    :func:`encode_reference_value` do; neither outcome is cached."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        signature = None  # the load below raises the loader's own refusal
+    else:
+        signature = (st.st_mtime_ns, st.st_size, st.st_ino)
+        cached = _reference_file_cache.get(path)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+    encoded = {k: encode_reference_value(v) for k, v in load_code_set(path).items()}
+    if signature is not None:
+        _reference_file_cache.pop(path, None)  # re-inserted last, so eviction takes the oldest
+        _reference_file_cache[path] = (signature, encoded)
+        while len(_reference_file_cache) > _REFERENCE_FILE_CACHE_MAX:
+            _reference_file_cache.pop(next(iter(_reference_file_cache)), None)
+    return encoded
+
 
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
@@ -630,9 +661,7 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
         if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
             continue
         try:
-            view[spec.name] = {
-                k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
-            }
+            view[spec.name] = {k: json.loads(v) for k, v in _encoded_reference_file(path).items()}
         except CodeSetError:
             # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
             # missing with nothing to say why. The set name only, never the loader's text: that can
