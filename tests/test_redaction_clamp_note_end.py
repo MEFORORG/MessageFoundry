@@ -94,7 +94,7 @@ def _main() -> Iterator[None]:
         judged = body if note_follows and bare.end() == len(body) else text
         return maskable(judged, end, bare.end(), field_run, credential=True)
 
-    def before_notes_off(head: str, notes: str) -> str:
+    def before_notes_off(head: str, *_: object) -> str:
         return redact(head)
 
     def last_note_only(text: str) -> str:
@@ -152,15 +152,6 @@ def test_safe_text_and_safe_exc_mask_a_value_their_bound_left_last(text: str, va
     assert value not in safe_exc(ValueError(routed))
 
 
-def test_the_audit_tees_split_call_equals_the_whole_call() -> None:
-    """The off-box tee bounds a detail itself and passes the note back in: that must give what one
-    call on the whole detail gives, value masked."""
-    routed = "a|b|mrn: 12345 " + "q" * 70_000
-    head, note = redaction.safe_text_bound(routed)
-    assert safe_text(head, note=note) == safe_text(routed)
-    assert "12345" not in safe_text(head, note=note)
-
-
 #: Suffixes after each text, for the differential: no note, each joiner, and whitespace before one.
 _SUFFIXES = ("", "\n" + _NOTE, " " + _NOTE, "  \n" + _NOTE, " \n" + _NOTE, "\n\n" + _NOTE)
 _CORPUS = tuple(text for text, _ in _FIELD_RUN_VALUES + _END_TAG_RESTS) + (
@@ -195,7 +186,6 @@ def test_no_route_unmasks_what_main_masked(text: str, suffix: str) -> None:
         "safe_text": lambda t: safe_text(t, limit=4096),
         "safe_text padded": lambda t: safe_text(t + " " + "q" * 70_000, limit=4096),
         "chain padded": lambda t: _through_the_chain(t + " " + "q" * 70_000),
-        "safe_text note= padded": lambda t: safe_text(t + " " + "q" * 70_000, note=" " + _NOTE),
         "untrusted stacked": lambda t: redaction.redact_untrusted(f"{t}\n{_NOTE} " + "q" * 70_000),
     }
     for route, call in routes.items():
@@ -214,21 +204,6 @@ def test_a_rest_ending_in_a_boundary_free_word_is_masked_before_a_note(joiner: s
     assert "ZqMSH" not in redact(f"a|b|mrn: ZqMSH{joiner}{_NOTE}")
 
 
-def test_safe_text_reads_its_own_note_and_a_passed_one_together() -> None:
-    """Code review round 1, a regression the first head shipped: text over the window with
-    ``note=`` reads two notes, and only the last was set aside, so a rest main masked printed. The
-    audit tee's ``_bounded_detail`` takes this path when its scrub lengthens a detail."""
-    passed = " " + redaction._clamp_marker(5)
-    for text, value in (
-        ("<family>Smith</family zqxdoe " + "q" * 70_000, "zqxdoe"),
-        ("a|b|</family zqxdoe " + "q" * 70_000, "zqxdoe"),
-        ("a|b|mrn: 12345 " + "q" * 70_000, "12345"),
-    ):
-        out = safe_text(text, note=passed)
-        assert value not in out, out
-        assert out.endswith(passed)
-
-
 def test_a_value_before_an_earlier_of_stacked_notes() -> None:
     """A text that already ends in a note, bounded again. ``safe_text`` reads the head alone, whose
     last note is set aside, so the value is masked. ``redact_untrusted`` stacks a second note on the
@@ -243,27 +218,20 @@ def test_a_value_before_an_earlier_of_stacked_notes() -> None:
     assert redaction.redact_untrusted(text) == main
 
 
-def test_a_note_argument_that_is_not_a_bound_note_is_not_read() -> None:
-    """Code review round 1: a suffix glued to the head's last token could make the head less
-    redacted than ``redact(head)``. Such a ``note`` is appended but not read."""
-    out = safe_text("a|b|mrn: zqxdoe", note="|y")
-    assert "zqxdoe" not in out
-    assert out == f"{redact('a|b|mrn: zqxdoe')}|y"
+def test_a_head_redacted_whole_is_not_redacted_twice(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Code review round 2: a mismatched JSON closer makes the answer the placeholder alone, which
+    drops the note read after the head; reading the head again would only repeat that answer."""
+    calls: list[int] = []
+    real = redaction.redact
 
+    def counting(text: str) -> str:
+        calls.append(len(text))
+        return real(text)
 
-def test_a_note_argument_is_read_only_when_it_is_wholly_bound_notes() -> None:
-    """The walk back reads each note once, so many notes cost a linear pass, and anything that is
-    not a whole note, at either end or between, refuses the suffix."""
-    notes = (" " + redaction._clamp_marker(7)) * 1_000
-    assert redaction._is_bound_notes(notes)
-    assert redaction._is_bound_notes("\n" + _NOTE)
-    assert not redaction._is_bound_notes("")
-    assert not redaction._is_bound_notes(_NOTE)  # no joiner
-    assert not redaction._is_bound_notes("x" + notes)
-    assert not redaction._is_bound_notes(notes + " x")
-    assert not redaction._is_bound_notes(
-        notes + " [redaction bound: dropped x more chars unscanned]"
-    )
+    monkeypatch.setattr(redaction, "redact", counting)
+    head = "word " * 50 + '{"name": ["a"} '
+    assert redaction._redact_before_notes(head) == redaction._REDACTED
+    assert len(calls) == 1
 
 
 def test_a_rest_with_no_note_after_it_keeps_the_end_of_text_rules() -> None:

@@ -307,7 +307,7 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     the value was, with ``note``, the bound note ``safe_text`` gave the value, which the scrub's
     own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
     and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead."""
-    shipped = safe_text(kept, note=note)
+    shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
     return shipped
@@ -627,9 +627,11 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # safe_text(head, note=note) is safe_text(tee_detail); the note is kept for a scrubbed detail.
+    # safe_text(head) + note is safe_text(tee_detail), except that safe_text(tee_detail) reads its
+    # head as followed by the note and this does not (BACKLOG #5925): a value the window left last
+    # can print here that safe_text(tee_detail) masks. The note is kept for a scrubbed detail.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
-    old_detail = safe_text(head, note=note)
+    old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,

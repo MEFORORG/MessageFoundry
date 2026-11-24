@@ -1324,8 +1324,6 @@ _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+"
 #: it. Since then a first result can be shorter than its limit, so a second call can keep the count
 #: and a further pass can read it as a value; :func:`safe_text` lists that among its exceptions.
 _TRAILING_NOTES = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]\Z")
-#: One bound note with its joiner, matched whole, for :func:`_is_bound_notes`'s walk back.
-_JOINED_NOTE = re.compile(r"[\n ]\[redaction bound: dropped [0-9_]+ more chars unscanned\]")
 
 
 def _is_dicom_phi_tag(tag: str, widened: bool) -> bool:
@@ -1807,10 +1805,11 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool =
     #5925): the XML pass reads the text with the note set aside, but no caller's text can be glued
     to the rest there, so the end-of-text refusals and :func:`_ends_in_camel_head` do not apply,
     nor do the rules for a value glued to what follows where only whitespace stands between the
-    rest and the notes, nor the whole-word rule for a rest the tag's ``>`` ends: a boundary-free
-    word such as ``MSH`` needs a non-space separator after it (:data:`_MSH_DELIMITERS`), and what
-    follows here is whitespace. Before the root fix ``</family Kim`` then the note printed
-    ``Kim``."""
+    rest and the notes (:func:`_maskable_rest` says why). Where only whitespace stands there, the
+    whole-word rule for a rest the tag's ``>`` ends is not applied either: a boundary-free word such
+    as ``MSH`` needs a non-space separator after it (:data:`_MSH_DELIMITERS`). A rest the tag's
+    ``>`` ends is judged as before, note or not (``</family ZqMSH>`` keeps ``ZqMSH``). Before the
+    root fix ``</family Kim`` then the note printed ``Kim``."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
@@ -2396,15 +2395,14 @@ def _glued_value(
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
     end after it). A defect found in the #5925 review: with both read on ``text``, such a value
-    printed whole behind a clamp. A value that ends exactly where ``body`` ends, with the note's
-    line break right after it, is then judged on ``body`` with ``noted`` set
-    (:func:`_maskable_rest`): the note follows it, so the end-of-text refusals do not apply, and a
-    PHI value holding a digit, or a credential value opening with one, is masked there too
-    (``a|b|mrn: 12345`` cut by a clamp right after it; before the BACKLOG #5925 root fix it printed).
-    Every other value is judged on ``text``, as before. Judged on ``text`` there, the value read as
-    glued to the line break, and a last word of two characters or fewer was refused (``a|b|mrn:
-    qw``). Judged on ``body`` without ``noted`` anywhere else, a value followed by whitespace and
-    then the note, or by a space-joined note, would read as ending the text, and the end-of-text
+    printed whole behind a clamp. A value that ends exactly where ``body`` ends, with a note's
+    joiner of either kind right after it, is then judged on ``body`` with ``noted`` set
+    (:func:`_maskable_rest`), so a PHI value holding a digit, or a credential value opening with
+    one, is masked there too (``a|b|mrn: 12345`` cut by a clamp right after it; before the BACKLOG
+    #5925 root fix it printed). Every other value is judged on ``text``, as before. Judged on
+    ``text`` there, the value read as glued to the line break, and a last word of two characters or
+    fewer was refused (``a|b|mrn: qw``). Judged on ``body`` without ``noted`` anywhere else, a value
+    followed by whitespace and then the note would read as ending the text, and the end-of-text
     refusals would keep values the earlier answer masked (``a|b|password: 4455`` then two spaces
     and a clamp).
 
@@ -2516,18 +2514,6 @@ def _without_trailing_note(text: str) -> str:
     return text if note is None else text[: note.start()]
 
 
-def _is_bound_notes(text: str) -> bool:
-    """Whether ``text`` is one or more of this module's bound notes, each with its joiner and
-    nothing else. Walked back one note at a time from the end, so the cost is linear in the text."""
-    end = len(text)
-    while end and text.endswith("unscanned]", 0, end):
-        start = text.rfind("[redaction bound: dropped ", 0, end) - 1
-        if start < 0 or _JOINED_NOTE.fullmatch(text, start, end) is None:
-            return False
-        end = start
-    return bool(text) and end == 0
-
-
 def _ends_in_credential_label(token: str) -> bool:
     """Whether ``token`` ends on a credential label and its separator. On an ASCII tail the word
     screen is a necessary condition of the pattern, so most tokens skip the search. A tail outside
@@ -2586,14 +2572,9 @@ def _maskable_rest(
     if words is None:
         return None
     last = words[-1]
-    trailing = _TRAILING_SPACE.match(text, stop) is not None
-    ends = trailing and not noted
-    # Behind the notes, whitespace up to them is not something a word is glued to either.
-    glued = (
-        not rest.endswith(" ")
-        and text[stop : stop + 1] not in ("", " ")
-        and not (noted and trailing)
-    )
+    # Every caller that sets `noted` passes a value only whitespace follows to the text's end.
+    ends = not noted and _TRAILING_SPACE.match(text, stop) is not None
+    glued = not noted and not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
     # Punctuation after the last word, a caller's or the terminator, could complete a word read
     # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
     heads = _CREDENTIAL_UNBOUNDED_HEADS if credential else _UNBOUNDED_HEADS
@@ -2785,7 +2766,7 @@ def _held_back(message: str, limit: int) -> str:
     return f"{message[:kept]}{_COUNT_OPENER}{len(message) - kept}{_COUNT_CLOSER}"
 
 
-def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT, note: str = "") -> str:
+def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     """A PHI-redacted, length-bounded rendering of a free-text diagnostic string — the string analog of
     :func:`safe_exc`, for error/detail text that isn't an exception object (joined strict-validation
     errors, a ``last_error`` built at the store layer, a connector's reply-parse note). HL7-shaped content
@@ -2828,35 +2809,31 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT, note: str = "") -> str:
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way.
 
-    ``note`` is a bound note an earlier cut of ``text`` wrote, which the result carries after this
-    call's own (:func:`safe_text_bound`'s caller, the off-box audit tee). **The redaction reads the
-    scanned text with those notes after it (BACKLOG #5925)**, so a value the cut left last is not
-    judged as ending the text: before, ``a|b|mrn: 12345`` cut by the bound printed ``12345`` in
-    front of the note, which a caller's text could not have been glued to. A ``note`` that is not
-    wholly bound notes is appended but not read (:func:`_redact_before_notes`)."""
-    head, own = safe_text_bound(text)
-    notes = own + note
-    message = _held_back(_redact_before_notes(head, notes).strip(), limit)
-    return f"{message}{notes}"
+    **The redaction reads the scanned head as followed by a bound note (BACKLOG #5925)**, so a
+    value the cut left last is not judged as ending the text (:func:`_redact_before_notes`).
+    Before, ``a|b|mrn: 12345`` cut by the bound printed ``12345`` in front of the note."""
+    head, note = safe_text_bound(text)
+    redacted = _redact_before_notes(head) if note else redact(head)
+    message = _held_back(redacted.strip(), limit)
+    return f"{message}{note}"
 
 
-def _redact_before_notes(head: str, notes: str) -> str:
-    """:func:`redact` of ``head``, read with a bound note after it and returned without it, so the
-    rules for a value that ends the text do not fire on a value ``notes`` follows.
-
-    ``notes`` is read only when it is wholly bound notes, each with its joiner
-    (:func:`_is_bound_notes`); any other suffix a caller passes is not read, so it cannot join the
-    head's last token. However many notes there are, one is read, joined by a newline: the passes
-    set aside only the last note (:func:`_without_trailing_note`), and a space-joined note after a
-    head whose last line is HL7-shaped is swallowed by :data:`_HL7_SEGMENT`, which runs to the end
-    of the line (:func:`_clamp_marker`). A ``head`` that already ends in a note is read alone, as
-    are those notes after it: with another note after it the earlier one would be read as text.
-    Where the redaction still changed what it read after ``head``, it is ``redact(head)``, the
-    answer before BACKLOG #5925."""
-    if not _is_bound_notes(notes) or _without_trailing_note(head) is not head:
+def _redact_before_notes(head: str) -> str:
+    """:func:`redact` of ``head`` with :data:`_READ_NOTE` read after it and taken off again, so a
+    value the note follows is judged as :func:`_maskable_rest` judges one with ``noted``. The note
+    read is joined by a newline, whatever the caller appends: a space-joined note after a head
+    whose last line is HL7-shaped is swallowed by :data:`_HL7_SEGMENT`, which runs to the end of
+    the line (:func:`_clamp_marker`). A ``head`` that already ends in a note is read alone: the
+    passes set aside only the last note (:func:`_without_trailing_note`), so the earlier one would
+    be read as text. Where the redaction changed the note it read, it is ``redact(head)``, the
+    answer before BACKLOG #5925, unless the answer was the placeholder alone, which a second read
+    would only repeat."""
+    if _without_trailing_note(head) is not head:
         return redact(head)
     out = redact(head + _READ_NOTE)
-    return out[: -len(_READ_NOTE)] if out.endswith(_READ_NOTE) else redact(head)
+    if out.endswith(_READ_NOTE):
+        return out[: -len(_READ_NOTE)]
+    return out if out == _REDACTED else redact(head)
 
 
 #: The note :func:`_redact_before_notes` reads after a head in place of the notes that follow it.
