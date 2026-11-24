@@ -513,6 +513,41 @@ def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
 
 
 @pytest.mark.parametrize(
+    "weekly",
+    [[float("nan"), 94, 97], [93, float("nan"), 97], [93, 96, float("nan")]],
+    ids=["nan-first", "nan-middle", "nan-last"],
+)
+def test_a_nan_weekly_level_never_lifts_the_rung(sb: Sandbox, weekly: list[float]) -> None:
+    """BACKLOG #5178. ConvertFrom-Json reads a bare NaN as a number, and the lowest-number rule made a
+    NaN in any slot the rung, which no level reaches. A NaN slot now reads as the default 90."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(92.0))
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [93, 96, 98]}}), encoding="utf-8")
+    assert gate(sb)[0] == NO_REVIEW, "control: 92 is below an in-order rung of 93"
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": weekly}}), encoding="utf-8")
+    assert "NaN" in _thresholds(sb).read_text(encoding="utf-8"), "control: the file holds a NaN"
+    code, doc = gate(sb)
+    assert code == HALT and "levels.weekly holds NaN" in why(doc), why(doc)
+
+
+def test_a_nan_minutes_slot_never_shortens_the_lead_time(sb: Sandbox) -> None:
+    """BACKLOG #5178, the minutes triple: a NaN slot reads as the default 60, and the largest holds."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(
+            50.0, state="CRITICAL", rate_pct_per_hr=50.0, minutes_to_empty=45, minutes_to_reset=90
+        ),
+    )
+    _thresholds(sb).write_text(json.dumps({"minutes": [30, 20, 10]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "does not reach the rung" in why(doc), "control: " + why(doc)
+    _thresholds(sb).write_text(json.dumps({"minutes": [float("nan"), 30, 10]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == HALT and "minutes holds NaN" in why(doc), why(doc)
+
+
+@pytest.mark.parametrize(
     "body",
     [
         pytest.param("{not json", id="unreadable"),

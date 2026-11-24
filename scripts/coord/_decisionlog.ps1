@@ -912,40 +912,54 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       [97, 94, 90] cannot put HOLD at 97. Refusing the triple would answer UNKNOWN even at the ceiling.
       watch.py keeps the first number and prints a fault instead, so the two can disagree; the rung's
       source then says the triple was out of order, and a typo such as 9.5 halts early, not late.
+
+      A NaN CANNOT LIFT THE RUNG EITHER. ConvertFrom-Json reads a bare NaN as a number, and no
+      comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes the default instead
+      and the strictest number still holds, so a NaN can only pull the rung toward the default, never
+      past it. Throwing would answer UNKNOWN, which is a REVIEW where the triple's other numbers can
+      halt. Other out-of-range values pass as written: 0, a negative level or an infinite lead time
+      halts early. Only a triple whose every level is Infinity, or whose every lead time is minus
+      Infinity, never fires.
     #>
     $holdAt = 90.0
     $holdMin = 60.0
     $source = 'the owner ruling of 2026-10-31 defaults'
-    $disorder = @()
+    $notes = @()
     if (-not [System.IO.File]::Exists($ThresholdsFile)) { return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source } }
     $doc = [System.IO.File]::ReadAllText($ThresholdsFile) | ConvertFrom-Json -ErrorAction Stop
     if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile is not a JSON object" }
-    function Get-Triple($Raw, [string]$What) {
+    # The triple's HOLD: Minimum for levels, Maximum for minutes, a NaN slot read as $Default first.
+    function Get-Hold($Raw, [string]$What, [double]$Default, [string]$Pick) {
         $vals = @($Raw)
         if ($Raw -isnot [array] -or $vals.Count -ne 3 -or @($vals | Where-Object { $_ -isnot [int] -and $_ -isnot [long] -and $_ -isnot [double] -and $_ -isnot [decimal] }).Count) {
             throw "$ThresholdsFile $What is not three numbers"
         }
-        return @($vals | ForEach-Object { [double]$_ })
+        $t = @($vals | ForEach-Object { [double]$_ })
+        $nanCount = @($t | Where-Object { [double]::IsNaN($_) }).Count
+        $t = @($t | ForEach-Object { if ([double]::IsNaN($_)) { $Default } else { $_ } })
+        $hold = ($t | Measure-Object -Minimum:($Pick -eq 'Minimum') -Maximum:($Pick -eq 'Maximum')).$Pick
+        $note = if ($nanCount) { "$What holds NaN, read as the default" } elseif ($hold -ne $t[0]) { "$What out of order" } else { $null }
+        return [pscustomobject]@{ Hold = $hold; Note = $note }
     }
     $levels = Get-DecisionJsonValue $doc 'levels'
     if ($null -ne $levels) {
         if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
         foreach ($p in $levels.PSObject.Properties) {
             if ($p.Name -cne 'weekly') { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
-            $t = Get-Triple $p.Value 'levels[weekly]'
-            $holdAt = ($t | Measure-Object -Minimum).Minimum
+            $h = Get-Hold $p.Value 'levels.weekly' $holdAt 'Minimum'
+            $holdAt = $h.Hold
             $source = $ThresholdsFile
-            if ($holdAt -ne $t[0]) { $disorder += 'levels.weekly' }
+            if ($h.Note) { $notes += $h.Note }
         }
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
     if ($null -ne $minutes) {
-        $t = Get-Triple $minutes 'minutes'
-        $holdMin = ($t | Measure-Object -Maximum).Maximum
+        $h = Get-Hold $minutes 'minutes' $holdMin 'Maximum'
+        $holdMin = $h.Hold
         $source = $ThresholdsFile
-        if ($holdMin -ne $t[0]) { $disorder += 'minutes' }
+        if ($h.Note) { $notes += $h.Note }
     }
-    if ($disorder) { $source = "$source ($($disorder -join ' and ') out of order, so the strictest number holds)" }
+    if ($notes) { $source = "$source ($($notes -join ' and '), so the strictest number holds)" }
     return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source }
 }
 

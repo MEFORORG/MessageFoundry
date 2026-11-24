@@ -396,7 +396,8 @@ roster alias of the Lander.
 > and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
 > Steward's minutes default is (60, 10, 5), though the gate reads only HOLD: the lowest weekly level
 > and the longest lead time in the triple, so an out-of-order hand edit cannot lift the rung, and the
-> rung's source says so (BACKLOG #5178).
+> rung's source says so. A NaN slot reads as the default before that choice, so a NaN cannot lift it
+> either (BACKLOG #5178).
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
 > `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
@@ -528,8 +529,8 @@ roster alias of the Lander.
 > - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
 >   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. At the
 >   ceiling only a new reading clears it, and only an interactive terminal session on that root publishes
->   one. A new reading at or below the stale number clears it only from a session of this root that has
->   just called the API (BACKLOG #5178). Such a floor needs no verified stamp, so on an unpinned root that number may not be this
+>   one. A new reading at or below the stale number, on another reset, clears it only from a session of
+>   this root that has just called the API; on the same reset it never does (BACKLOG #5178). Such a floor needs no verified stamp, so on an unpinned root that number may not be this
 >   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
 >   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
 > - A session pinned to another root that publishes here does the same at any level, the ceiling included
