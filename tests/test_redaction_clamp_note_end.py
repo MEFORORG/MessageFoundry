@@ -94,9 +94,6 @@ def _main() -> Iterator[None]:
         judged = body if note_follows and bare.end() == len(body) else text
         return maskable(judged, end, bare.end(), field_run, credential=True)
 
-    def before_notes_off(head: str, *_: object) -> str:
-        return redact(head)
-
     def last_note_only(text: str) -> str:
         note = redaction._TRAILING_NOTES.search(text)
         return text if note is None else text[: note.start()]
@@ -106,7 +103,6 @@ def _main() -> Iterator[None]:
         patch.setattr(redaction, "_glued_value", main_glued_value)
         patch.setattr(redaction, "_maskable_rest", maskable_off)
         patch.setattr(redaction, "_end_tag_rest", end_tag_off)
-        patch.setattr(redaction, "_redact_before_notes", before_notes_off, raising=False)
         yield
 
 
@@ -142,14 +138,33 @@ def test_the_log_chain_masks_a_value_its_clamp_left_last(text: str, value: str) 
 
 
 @pytest.mark.parametrize(("text", "value"), _FIELD_RUN_VALUES[:4] + _END_TAG_RESTS[:2])
-def test_safe_text_and_safe_exc_mask_a_value_their_bound_left_last(text: str, value: str) -> None:
-    """:func:`redaction.safe_text` appends its space-joined note after it redacts, so before the
-    root fix the redaction never saw it and judged the value as ending the text."""
+def test_safe_text_still_judges_its_heads_last_value_as_ending_the_text(
+    text: str, value: str
+) -> None:
+    """A residual the changelog names: :func:`redaction.safe_text` appends its note after it
+    redacts, and its answer is main's. Reading a stand-in note after the head was withdrawn after
+    code review round 3, which found a ``bearer`` gate it flipped (pinned below)."""
     routed = text + " " + "q" * 70_000
-    head, note = redaction.safe_text_bound(routed)
-    assert note and head.rstrip().endswith(value)  # the premise: the bound left it last
-    assert value not in safe_text(routed, limit=400)
-    assert value not in safe_exc(ValueError(routed))
+    with _main():
+        main = (safe_text(routed, limit=400), safe_exc(ValueError(routed)))
+    assert (safe_text(routed, limit=400), safe_exc(ValueError(routed))) == main
+
+
+@pytest.mark.parametrize(
+    "text", ["x%7Cy%7Cz bearer", "PID%7C123%7CDOE bearer", "PID%7C1%7C2 a|b|mrn: 12345 bearer"]
+)
+def test_an_encoded_run_before_a_final_scheme_word_is_redacted_as_main_redacted_it(
+    text: str,
+) -> None:
+    """Code review round 3: a stand-in note read after ``safe_text``'s head put a line break after
+    a final ``bearer``, which the credential gate read as a scheme, so the encoded field run printed
+    where main redacted it."""
+    routed = text + " " + "q" * 70_000
+    with _main():
+        main = safe_text(routed, limit=4096)
+    out = safe_text(routed, limit=4096)
+    assert "%7C" not in main  # the premise: main redacted the encoded run
+    assert out == main
 
 
 #: Suffixes after each text, for the differential: no note, each joiner, and whitespace before one.
@@ -205,8 +220,8 @@ def test_a_rest_ending_in_a_boundary_free_word_is_masked_before_a_note(joiner: s
 
 
 def test_a_value_before_an_earlier_of_stacked_notes() -> None:
-    """A text that already ends in a note, bounded again. ``safe_text`` reads the head alone, whose
-    last note is set aside, so the value is masked. ``redact_untrusted`` stacks a second note on the
+    """A text that already ends in a note, bounded again. ``safe_text``'s head then ends in that
+    note, which the passes set aside, so the value is masked. ``redact_untrusted`` stacks a second note on the
     text, the passes set aside only the last, and the value still prints, as on main: setting the
     run aside whole made a differential print a credential main masked, so it is a residual the
     changelog names."""
@@ -216,22 +231,6 @@ def test_a_value_before_an_earlier_of_stacked_notes() -> None:
         main = redaction.redact_untrusted(text)
     assert "12345" in main
     assert redaction.redact_untrusted(text) == main
-
-
-def test_a_head_redacted_whole_is_not_redacted_twice(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Code review round 2: a mismatched JSON closer makes the answer the placeholder alone, which
-    drops the note read after the head; reading the head again would only repeat that answer."""
-    calls: list[int] = []
-    real = redaction.redact
-
-    def counting(text: str) -> str:
-        calls.append(len(text))
-        return real(text)
-
-    monkeypatch.setattr(redaction, "redact", counting)
-    head = "word " * 50 + '{"name": ["a"} '
-    assert redaction._redact_before_notes(head) == redaction._REDACTED
-    assert len(calls) == 1
 
 
 def test_a_rest_with_no_note_after_it_keeps_the_end_of_text_rules() -> None:

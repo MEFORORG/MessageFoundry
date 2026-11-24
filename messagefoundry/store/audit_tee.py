@@ -627,9 +627,7 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # safe_text(head) + note is safe_text(tee_detail), except that safe_text(tee_detail) reads its
-    # head as followed by the note and this does not (BACKLOG #5925): a value the window left last
-    # can print here that safe_text(tee_detail) masks. The note is kept for a scrubbed detail.
+    # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
     old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {

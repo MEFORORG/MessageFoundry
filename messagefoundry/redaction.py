@@ -834,9 +834,8 @@ def _clamp_marker(dropped: int) -> str:
     line swallows a space-joined note into its own ``[redacted]``. Measured while building this, on a
     record of unbroken ``PID|…`` text: an 8 MiB message rendered as ``PID|[redacted]`` with no sign it
     had been cut. A newline is outside that class and ends the match. :func:`safe_text` appends its
-    note AFTER redaction and uses a space so a stored ``last_error`` stays one line; it lets the
-    redaction read the note joined by a newline instead (:func:`_redact_before_notes`, BACKLOG #5925),
-    for the reason above."""
+    note AFTER redaction, where no pass reads it, and uses a space so a stored ``last_error`` stays
+    one line."""
     return f"[redaction bound: dropped {dropped:_d} more chars unscanned]"
 
 
@@ -2809,35 +2808,15 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
     unterminated, which a further pass scrubbed the same way.
 
-    **The redaction reads the scanned head as followed by a bound note (BACKLOG #5925)**, so a
-    value the cut left last is not judged as ending the text (:func:`_redact_before_notes`).
-    Before, ``a|b|mrn: 12345`` cut by the bound printed ``12345`` in front of the note."""
+    **The head is redacted without the note this call appends after it**, so a value the bound
+    left last is judged as ending the text, and a digit-bearing one prints in front of the note
+    (``a|b|mrn: 12345`` cut by the bound). Reading a stand-in note after the head was tried under
+    BACKLOG #5925 and withdrawn: the stand-in's line break let a whole-text gate in
+    :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which switched off a scrub the
+    answer without it made."""
     head, note = safe_text_bound(text)
-    redacted = _redact_before_notes(head) if note else redact(head)
-    message = _held_back(redacted.strip(), limit)
+    message = _held_back(redact(head).strip(), limit)
     return f"{message}{note}"
-
-
-def _redact_before_notes(head: str) -> str:
-    """:func:`redact` of ``head`` with :data:`_READ_NOTE` read after it and taken off again, so a
-    value the note follows is judged as :func:`_maskable_rest` judges one with ``noted``. The note
-    read is joined by a newline, whatever the caller appends: a space-joined note after a head
-    whose last line is HL7-shaped is swallowed by :data:`_HL7_SEGMENT`, which runs to the end of
-    the line (:func:`_clamp_marker`). A ``head`` that already ends in a note is read alone: the
-    passes set aside only the last note (:func:`_without_trailing_note`), so the earlier one would
-    be read as text. Where the redaction changed the note it read, it is ``redact(head)``, the
-    answer before BACKLOG #5925, unless the answer was the placeholder alone, which a second read
-    would only repeat."""
-    if _without_trailing_note(head) is not head:
-        return redact(head)
-    out = redact(head + _READ_NOTE)
-    if out.endswith(_READ_NOTE):
-        return out[: -len(_READ_NOTE)]
-    return out if out == _REDACTED else redact(head)
-
-
-#: The note :func:`_redact_before_notes` reads after a head in place of the notes that follow it.
-_READ_NOTE = "\n" + _clamp_marker(0)
 
 
 def safe_text_bound(text: str) -> tuple[str, str]:
