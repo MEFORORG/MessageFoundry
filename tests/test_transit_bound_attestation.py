@@ -611,15 +611,22 @@ def _needs_hvac() -> None:
     pytest.importorskip("hvac.exceptions")
 
 
+@pytest.mark.parametrize("proxied", [False, True], ids=["vault", "proxy"])
 async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    proxied: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A DML writer sets both hashes to a key version Transit does not hold. Transit refuses to
-    verify at it; that must read as unattested, so a warn start still starts."""
+    verify at it; that must read as unattested, so a warn start still starts. Behind a proxy that
+    answers with its own page, the gap must not say Transit refused the check (vault BACKLOG #6707
+    item 24); the cipher's own text says what is known."""
     _needs_hvac()
-    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+    from messagefoundry.store.crypto import (
+        AuditKeyVersionRefusedError,
+        AuditKeyVersionUnverifiedError,
+    )
 
-    transit = _RotatingTransit()
+    transit = _ProxiedRotatingTransit() if proxied else _RotatingTransit()
+    error = AuditKeyVersionUnverifiedError if proxied else AuditKeyVersionRefusedError
     _use_fake(monkeypatch, transit)
     db = tmp_path / "forged-version.db"
     store = await _transit_store(db)
@@ -631,14 +638,15 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     transit.verified.clear()
     try:
         got = await again.get_transit_bound_attestation()
-        # The whole gap text, so it is the refused-version outcome and no other: an AssertionError
-        # in the fake, or any CipherError the cipher does not classify as a refused version, also
-        # writes a gap starting "Transit refused to check", and must fail here.
+        # The whole gap text, so it is the expected outcome and no other: an AssertionError in the
+        # fake, or any other CipherError, also writes a gap starting "the check of audit row", and
+        # must fail here.
         assert got is not None
         assert got.audit_gap == (
-            f"Transit refused to check audit row {recorded.audit_seq}'s MAC: "
-            f"{AuditKeyVersionRefusedError(_UNHELD_VERSION)}"
+            f"the check of audit row {recorded.audit_seq}'s MAC failed: {error(_UNHELD_VERSION)}"
         ), got.audit_gap
+        if proxied:
+            assert "Transit refused" not in got.audit_gap, got.audit_gap
         # The refusal came from Transit's verify, at the planted version.
         assert transit.verified == [_UNHELD_VERSION], transit.verified
     except BaseException:
@@ -1476,6 +1484,8 @@ _PROXY_PAGE = "<html><body><h1>400 Bad Request</h1></body></html>"
 
 #: A well-formed stored MAC naming key version 3, as the cipher's verify call is handed one.
 _V3_MAC = "vault:v3:" + base64.b64encode(bytes(32)).decode("ascii")
+#: A well-formed MAC naming key version 2, as the probe under the latest version answers one.
+_V2_MAC = "vault:v2:" + base64.b64encode(bytes(32)).decode("ascii")
 
 
 def _verify_refusal(
@@ -1509,14 +1519,36 @@ def _verify_refusal(
 def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
-    assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionRefusedError)
+    assert isinstance(_verify_refusal(_V2_MAC), AuditKeyVersionRefusedError)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("not a transit mac", id="names-no-version"),
+        pytest.param("vault:v2:AAAA", id="short-digest"),
+        pytest.param("vault:v02:" + base64.b64encode(bytes(32)).decode("ascii"), id="leading-zero"),
+    ],
+)
+def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_no_refused_version(
+    answer: str,
+) -> None:
+    """BACKLOG #6707 item 73: the probe clears a 400 as a refused version only when it answers a
+    well-formed Transit MAC naming another version, the same parse the fixed-input check and the
+    writer apply. An empty or versionless answer is a service that cannot MAC, not evidence about
+    the row, so the check could not run rather than read as a planted version."""
+    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
+
+    refused = _verify_refusal(answer)
+    assert not isinstance(refused, AuditKeyVersionRefusedError), refused
 
 
 @pytest.mark.parametrize(
     "answer",
     [
         pytest.param(RuntimeError("key not found"), id="probe-fails"),
-        pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
+        pytest.param(_V3_MAC, id="probe-names-the-same-version"),
     ],
 )
 def test_a_verify_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
@@ -1573,7 +1605,7 @@ def test_a_verify_400_read_as_a_version_refusal_keeps_the_refused_label(
         AuditKeyVersionUnverifiedError,
     )
 
-    refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
+    refused = _verify_refusal(_V2_MAC, errors, text=text)
     assert isinstance(refused, AuditKeyVersionRefusedError)
     assert not isinstance(refused, AuditKeyVersionUnverifiedError)
 
@@ -1608,13 +1640,16 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     stays a subclass, so its handlers handle the row as on main."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
-    refused = _verify_refusal("vault:v2:AAAA", errors, text=text)
+    refused = _verify_refusal(_V2_MAC, errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
+    # BACKLOG #6707 items 11 and 25: the alert names every cause the reply leaves open, a refusal
+    # for another reason among them, and reads as a statement about the cause, not an outage.
     assert str(refused) == (
-        "the Transit audit MAC check at key version 3 got HTTP 400 that was not read as a "
-        "version refusal, so the version could not be confirmed; the key may not hold it, or its "
-        "policy may retire it"
+        "the Transit audit MAC check at key version 3 got HTTP 400 whose reply names no version "
+        "refusal, so its cause is unknown: the key may not hold that version, its policy may "
+        "retire it, or the check was refused for another reason"
     )
+    assert "could not be confirmed" not in str(refused)
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
 
@@ -1622,7 +1657,7 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
     "answer",
     [
         pytest.param(RuntimeError("down"), id="probe-fails"),
-        pytest.param("vault:v3:AAAA", id="probe-names-the-same-version"),
+        pytest.param(_V3_MAC, id="probe-names-the-same-version"),
     ],
 )
 def test_a_proxy_400_the_probe_does_not_clear_is_a_plain_cipher_error(answer: Any) -> None:
@@ -1646,11 +1681,11 @@ def test_an_unconfirmed_label_logs_its_reason_once_per_interval(
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
     for _ in range(3):
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
-    _verify_refusal("vault:v2:AAAA", ["reworded refusal"])
-    _verify_refusal("vault:v2:AAAA", ["no such key version"])  # the refused label logs nothing
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
+    _verify_refusal(_V2_MAC, ["reworded refusal"])
+    _verify_refusal(_V2_MAC, ["no such key version"])  # the refused label logs nothing
     now[0] += crypto_transit._WARNING_LOG_INTERVAL_S
-    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
     assert len(logged) == 3, logged
     assert "because it carries no errors list (key=" in logged[0], logged
@@ -1673,7 +1708,7 @@ def test_a_fault_in_the_unconfirmed_log_keeps_the_label(
 
     monkeypatch.setattr(crypto_transit.log, "warning", failing)
     assert isinstance(
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
     )
 
 
@@ -1711,7 +1746,7 @@ def test_a_raising_log_filter_keeps_the_ciphers_break(
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     assert isinstance(
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
     )
     cipher = _scripted_cipher([InvalidRequest("bad"), InvalidRequest("bad")])
     assert cipher.verify_audit_hmac(b"row", cipher.audit_hmac(b"row")) is False
@@ -1794,7 +1829,7 @@ def test_a_persistently_failing_unconfirmed_log_reports_once(
 
     for _ in range(4):
         assert isinstance(
-            _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE),
+            _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE),
             AuditKeyVersionUnverifiedError,
         )
     assert capsys.readouterr().err.count("could not be logged ('ValueError')") == 1
@@ -1818,7 +1853,7 @@ def test_a_fault_in_the_unconfirmed_throttle_keeps_the_label(
 
     monkeypatch.setattr(crypto_transit, "_logged_at", _FullDict())
     assert isinstance(
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE), AuditKeyVersionUnverifiedError
     )
     assert "rate limit failed ('MemoryError')" in capsys.readouterr().err
 
@@ -1933,10 +1968,10 @@ def test_a_failed_unconfirmed_log_is_tried_again(caplog: pytest.LogCaptureFixtur
     raising = _RaisingFilter()
     crypto_transit.log.addFilter(raising)
     try:
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     finally:
         crypto_transit.log.removeFilter(raising)
-    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
     assert len(logged) == 1, logged
 
@@ -1955,7 +1990,7 @@ def test_a_fault_reading_the_400_is_labelled_unconfirmed_and_logged_by_type(
 
     monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
     caplog.set_level(logging.WARNING, logger=crypto_transit.__name__)
-    assert isinstance(_verify_refusal("vault:v2:AAAA"), AuditKeyVersionUnverifiedError)
+    assert isinstance(_verify_refusal(_V2_MAC), AuditKeyVersionUnverifiedError)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
     expected = f"because reading it raised {fault.__name__} (key="
     assert len(logged) == 1 and expected in logged[0], logged
@@ -1978,7 +2013,7 @@ def test_a_programming_error_reading_the_400_propagates(
 
     monkeypatch.setattr(crypto_transit, "_names_no_version_reason", broken)
     with pytest.raises(fault):
-        _verify_refusal("vault:v2:AAAA")
+        _verify_refusal(_V2_MAC)
 
 
 @pytest.mark.parametrize("fault", [MemoryError, RecursionError])
@@ -1995,7 +2030,7 @@ def test_a_fault_making_the_unconfirmed_warning_keeps_the_label(
         raise fault
 
     monkeypatch.setattr(crypto_transit, "_unconfirmed_warning", short)
-    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    refused = _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert crypto_transit._WARNING_UNBUILT in capsys.readouterr().err
 
@@ -2013,7 +2048,7 @@ def test_a_fault_inside_warn_when_due_is_not_reported_as_unbuilt(
         raise MemoryError
 
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
-    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    refused = _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     err = capsys.readouterr().err
     assert crypto_transit._WARNING_UNBUILT not in err
@@ -2039,7 +2074,7 @@ def test_a_raising_report_of_an_escaped_warning_fault_keeps_the_label(
 
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
     monkeypatch.setattr(crypto_transit, "_report_unlogged", report_fails)
-    refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    refused = _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
     assert len(reported) == 1 and isinstance(reported[0], MemoryError)
 
@@ -2056,7 +2091,7 @@ def test_repeated_escapes_from_the_unconfirmed_warning_report_once_per_interval(
 
     monkeypatch.setattr(crypto_transit, "_warn_when_due", short_of_memory)
     for _ in range(5):
-        _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+        _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     lines = [line for line in capsys.readouterr().err.splitlines() if "could not be" in line]
     assert len(lines) == 1, lines
 
@@ -2080,11 +2115,11 @@ def test_a_fault_escaping_the_unconfirmed_warning_keeps_the_label_and_frees_the_
     try:
         with monkeypatch.context() as patched:
             patched.setattr(crypto_transit, "_report_unlogged", report_fails)
-            refused = _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+            refused = _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     finally:
         crypto_transit.log.removeFilter(raising)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
-    _verify_refusal("vault:v2:AAAA", None, text=_PROXY_PAGE)
+    _verify_refusal(_V2_MAC, None, text=_PROXY_PAGE)
     logged = [r.getMessage() for r in caplog.records if "labelled unconfirmed" in r.getMessage()]
     assert len(logged) == 1, logged
 
@@ -2095,7 +2130,7 @@ def test_a_body_hvac_parsed_past_the_bound_is_not_read() -> None:
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
-    refused = _verify_refusal("vault:v2:AAAA", ["no such key version"], text=body)
+    refused = _verify_refusal(_V2_MAC, ["no such key version"], text=body)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
 
 
@@ -2245,14 +2280,12 @@ def test_an_oversized_vault_shaped_body_is_labelled_unconfirmed_unparsed(
     monkeypatch.setattr(crypto_transit, "json_loads_or_refusal", must_not_parse)
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}')
     assert len(body) == crypto_transit._REPARSED_BODY_MAX_CHARS + 1
-    assert isinstance(
-        _verify_refusal("vault:v2:AAAA", None, text=body), AuditKeyVersionUnverifiedError
-    )
+    assert isinstance(_verify_refusal(_V2_MAC, None, text=body), AuditKeyVersionUnverifiedError)
     # The negative control: with the bound one character wider the body is parsed, and the
     # parser's AssertionError propagates, so the assertion above can fail.
     monkeypatch.setattr(crypto_transit, "_REPARSED_BODY_MAX_CHARS", len(body))
     with pytest.raises(AssertionError, match="an oversized body was parsed"):
-        _verify_refusal("vault:v2:AAAA", None, text=body)
+        _verify_refusal(_V2_MAC, None, text=body)
 
 
 def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
@@ -2264,7 +2297,7 @@ def test_a_vault_shaped_body_at_the_bound_is_still_read() -> None:
     )
 
     body = _past_the_reparse_bound('{"errors": ["no such key version"], "pad": "', '"}', over=0)
-    refused = _verify_refusal("vault:v2:AAAA", None, text=body)
+    refused = _verify_refusal(_V2_MAC, None, text=body)
     assert isinstance(refused, AuditKeyVersionRefusedError)
     assert not isinstance(refused, AuditKeyVersionUnverifiedError)
 
@@ -3085,7 +3118,9 @@ async def test_posture_survives_a_transit_failure(
     monkeypatch.setattr(store_module, "_audit_row_mac", boom)
     view = (await _posture(store))["transit_bound_attestation"]
     assert isinstance(view, dict)
-    assert view["attested"] is False and "Transit refused" in str(view["gap"])
+    assert view["attested"] is False and "MAC failed: Transit audit HMAC failed" in str(view["gap"])
+    # An outage is no refusal, so the gap does not say Transit refused (vault BACKLOG #6707 item 24).
+    assert "Transit refused" not in str(view["gap"]), view["gap"]
 
 
 async def test_posture_reports_no_attestation_off_vault_transit(tmp_path: Path) -> None:

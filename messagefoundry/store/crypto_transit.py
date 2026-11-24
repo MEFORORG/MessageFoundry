@@ -139,7 +139,7 @@ _ENV_TRANSIT_KEY = "MEFOR_STORE_TRANSIT_KEY"
 #: is held to the narrower data-key set, because it has to do both jobs.
 _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: Texts Transit's ``hmac`` and ``verify`` endpoints answer a refused key VERSION with, lower-cased
-#: (BACKLOG #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
+#: (vault BACKLOG #6707). Read on 2026-11-10 from Vault ``builtin/logical/transit/path_hmac.go`` and
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
 #: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. ``version is too new`` was
 #: read on 2026-11-11 from Vault's ``pathHMACVerify`` at cbc874e2358f only (BACKLOG #2720); OpenBao
@@ -153,21 +153,21 @@ _VERSION_REFUSAL_TEXTS = (
     "version is too new",
 )
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
-#: (BACKLOG #6707): a body over this many characters is not parsed, and one of up to this many is.
-#: Vault's own refusal is far shorter. It bounds both readers of a 400, and a change here changes
+#: (vault BACKLOG #6707): a body over this many characters is not parsed, and one of up to this
+#: many is. Vault's own refusal is far shorter. It bounds both readers of a 400, and a change here changes
 #: both. The audit walk's version check reads nothing from a longer body, not even a list hvac
 #: parsed. The data-key decrypt's AEAD check (BACKLOG #5650) does not re-parse one, but still reads
 #: a list hvac parsed.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
 #: The fixed reasons :func:`_names_no_version_reason` gives, and the one a fault reading the 400
-#: gives, so none is built while the read may be short of memory (BACKLOG #6707).
+#: gives, so none is built while the read may be short of memory (vault BACKLOG #6707).
 _OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bound and was not read"
 _NO_ERRORS_LIST = "it carries no errors list"
 _NO_VERSION_REFUSAL = "its errors list names no version refusal"
 _READ_RAISED = "reading it raised"
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
-#: label's warning is made and logged (BACKLOG #6707): a step short of memory or stack. Anything
-#: else the read raises propagates. No reply is known to cause either: a body past
+#: label's warning is made and logged (vault BACKLOG #6707): a step short of memory or stack.
+#: Anything else the read raises propagates. No reply is known to cause either: a body past
 #: :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
 #: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
 #: rather than raising it. Out of memory or stack, a fault on the unconfirmed label's path can still
@@ -208,7 +208,7 @@ def _reply_errors(exc: Exception, *, bound_parsed: bool = False) -> tuple[object
 
 def _names_no_version_reason(exc: Exception) -> str | None:
     """Why an audit-MAC ``verify`` 400 is NOT read as Vault's own refusal of the key version, or
-    ``None`` when it is (BACKLOG #6707). It is read as one only when its ``errors`` value
+    ``None`` when it is (vault BACKLOG #6707). It is read as one only when its ``errors`` value
     (:func:`_reply_errors`, ``bound_parsed``) is a list with a text entry holding a
     :data:`_VERSION_REFUSAL_TEXTS` text, in any case. Any other 400 gets a fixed reason, never the
     reply's own text.
@@ -363,7 +363,7 @@ def _names_aead_failure(exc: Exception) -> bool:
 
 
 #: The seconds within which each :func:`_warn_when_due` warning is logged at most once per process
-#: unless logging it raises, and :func:`_report_unlogged`'s rate limit (BACKLOG #5650, #6707). A proxy can cause one on every
+#: unless logging it raises, and :func:`_report_unlogged`'s rate limit (vault BACKLOG #5650, #6707). A proxy can cause one on every
 #: read or every row; once is the signal.
 _WARNING_LOG_INTERVAL_S = 3600.0
 #: When each such warning, by kind, was last logged.
@@ -411,7 +411,7 @@ def _report_unlogged(
 
 def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = None) -> bool:
     """``log.warning(*build())`` under a guard, and whether that call returned without raising
-    (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
+    (vault BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
     ``build`` is called inside the guard. A failure is reported by :func:`_report_unlogged` under
     ``site``, by default ``build``, so each call site is rate-limited apart. The record names the
     caller ``stacklevel`` frames up."""
@@ -489,7 +489,7 @@ def _unconfirmed_warning(
     audit_key: str, version: int, cause: str, raised: str
 ) -> tuple[Callable[[], object], _WarningParts]:
     """The :func:`_warn_when_due` key and text for an audit-MAC 400 labelled unconfirmed because
-    of ``cause`` (BACKLOG #6707); ``raised`` names the read's fault class, or is empty."""
+    of ``cause`` (vault BACKLOG #6707); ``raised`` names the read's fault class, or is empty."""
     return (
         lambda: ("unconfirmed", audit_key, cause, raised),
         lambda: (
@@ -1047,16 +1047,16 @@ class TransitCipher(_UnmarkedPolicy):
         Transit's ``valid: false``.
 
         A 400 that hvac raises as ``InvalidRequest``, while a probe under the latest version
-        answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
-        names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
+        answers a well-formed MAC naming a version other than the one ``stored`` names, raises
+        :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
         reason, for example for a proxy's page, or when it raises one of :data:`_READ_FAULTS`,
-        both except as :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else it raises
+        both except as :data:`_READ_FAULTS` says (vault BACKLOG #6707). Anything else it raises
         propagates.
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
-        those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
+        those, and is read as the next paragraph says (vault BACKLOG #6707). hvac 2.4.0 raises
         ``AttributeError`` or ``TypeError`` when it parses the body as JSON (see
         :func:`_reply_errors` for when it does) and the value is not an object, or its ``errors``
         value is truthy and is a number, ``true``, or a list holding an entry that is not text. A
@@ -1115,7 +1115,7 @@ class TransitCipher(_UnmarkedPolicy):
         outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
-            # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
+            # The same flow, labelled apart (vault BACKLOG #6707). Reading the reply only picks the
             # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
             # walk, except as _READ_FAULTS says. Any other exception propagates.
             reason: str | None
@@ -1252,8 +1252,9 @@ class TransitCipher(_UnmarkedPolicy):
         reads as a refused version. A 400 can also mean the
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. The probe must also
-        answer with a string that does not start ``vault:v<key_version>:``; an empty string or one
-        naming no version passes too.
+        answer with a MAC :func:`~messagefoundry.store.row_seal.transit_mac_version` accepts, naming
+        a version other than ``key_version`` (vault BACKLOG #6707 item 73): an empty or versionless
+        answer is a service that cannot MAC, not evidence about the row.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
@@ -1273,7 +1274,8 @@ class TransitCipher(_UnmarkedPolicy):
                 )
             )
             return False
-        return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
+        named = transit_mac_version(answered) if isinstance(answered, str) else None
+        return named is not None and named != key_version
 
     def _is_outage(self, exc: Exception) -> bool:
         """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's

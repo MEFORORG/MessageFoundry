@@ -10272,9 +10272,10 @@ async def settle_transit_bound_attestation(
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
     except CipherError as exc:
-        return replace(
-            attestation, audit_gap=f"Transit refused to check audit row {seq}'s MAC: {exc}"
-        )
+        # Any cipher failure lands here, an outage or a 400 a proxy wrote among them, so the gap
+        # says only that the check failed; the cipher's own text says what is known (vault
+        # BACKLOG #6707 item 24).
+        return replace(attestation, audit_gap=f"the check of audit row {seq}'s MAC failed: {exc}")
     if not verified:
         return replace(
             attestation, audit_gap=f"audit row {seq}'s MAC does not verify under the audit key"

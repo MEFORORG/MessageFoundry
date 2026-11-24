@@ -8495,7 +8495,10 @@ walk checks every row the same way, so a rotation does not read as a chain break
 
 **A planted key version is a break at its row.** A writer can plant a version Transit does not
 hold. Transit refuses it with HTTP 400 while it still answers under the latest version. The walk
-then reports a break at that row and keeps going. `audit-verify` names the row and exits 1. With
+then reports a break at that row and keeps going. A 400 whose reply names no version refusal, a
+page from a proxy in front of Vault among them, is read the same way, as a break at that row, and
+only its text differs: it says the cause is unknown (`AuditKeyVersionUnverifiedError`, vault
+BACKLOG #6707). `audit-verify` names the row and exits 1. With
 `[integrity].audit_verify_on_start` on, the startup check also raises its `audit-chain` alert.
 So is a row whose own request Transit refuses, such as one Vault answers with HTTP 413 past
 `max_request_size`; ADR 0193's 2026-11-11 amendment, item 4, as its 2026-11-13 amendment, item

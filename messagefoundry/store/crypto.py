@@ -880,7 +880,7 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
     refusal, or whose reading raises one of
     :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while the key still answers under the
-    latest (BACKLOG #6707).
+    latest (vault BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
@@ -889,10 +889,13 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     never the key or the reply, because the walk puts it in the tamper alert."""
 
     def __str__(self) -> str:
+        # It names every cause the reply leaves open, a refusal for another reason among them,
+        # so the alert reads as an unknown cause rather than an outage (vault BACKLOG #6707 items
+        # 11 and 25).
         return (
-            f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
-            "read as a version refusal, so the version could not be confirmed; the key may not "
-            "hold it, or its policy may retire it"
+            f"the Transit audit MAC check at key version {self.version} got HTTP 400 whose reply "
+            "names no version refusal, so its cause is unknown: the key may not hold that "
+            "version, its policy may retire it, or the check was refused for another reason"
         )
 
 
