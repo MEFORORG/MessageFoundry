@@ -252,6 +252,7 @@ def test_the_os_trust_store_arms_refuse_the_build(build: _Builder, two_tier: _Tw
             assert setting in text
         assert "docs/CONFIGURATION.md" not in text
         assert "ech_sidecar" not in text
+        assert "rather than honoured unchecked" in text
 
 
 def _ech_rest(policy: TrustAnchorPolicy, settings: dict[str, object] | None = None) -> object:
@@ -293,12 +294,72 @@ def test_an_ech_rest_hop_on_the_os_roots_refuses_without_promising_a_check(
         assert "sends through its ECH sidecar (ech_sidecar)" in text
         assert "no CRL in [tls].crl_file is checked against the partner" in text
         assert OS_ROOTS_CHAIN_CHECK_REASON in text
+        assert "rather than honoured unchecked" not in text
         assert "To clear this refusal, unset [tls].crl_check_chain" in text
         assert "through its own tls_ca_file or [tls].internal_ca_file" in text
         assert "token server" not in text and "[alerts]" not in text
         assert "verifies it" not in text
         assert "None of these makes the engine check the partner's revocation" in text
         assert "To chain-check" not in text
+
+
+def _http_rest(policy: TrustAnchorPolicy, settings: dict[str, object] | None = None) -> object:
+    """A REST destination whose url is http, accepted as cleartext, built as the loader builds it."""
+    return build_destination(
+        Destination(
+            name=_CONNECTION,
+            type=ConnectorType.REST,
+            settings={**Rest(url=f"http://{_HOST}/x").settings, **(settings or {})},
+            trust_anchor_policy=policy,
+            cleartext_accepted=True,
+            cleartext_reason="synthetic cleartext reason for this test",
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="synthetic attestation for this test",
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+@pytest.mark.parametrize("extra", [{}, {"tls_allow_expired": True}], ids=["plain", "expired"])
+def test_an_http_rest_hop_on_the_os_roots_refuses_without_claiming_tls(
+    two_tier: _TwoTier, extra: dict[str, object]
+) -> None:
+    """Red before the fix: an http hop got the generic refusal, which said it "verifies its
+    server" and promised a chain check, though the hop makes no TLS connection."""
+    for mode, internal in (("system", None), ("augment", str(two_tier.root_file))):
+        policy = TrustAnchorPolicy(
+            internal_ca_file=internal,
+            mode=mode,  # type: ignore[arg-type]
+            crl_file=str(two_tier.revokes_nothing),
+            crl_check_chain=True,
+        )
+        with pytest.raises(ValueError, match=r"crl_check_chain is set, and this REST") as refused:
+            _http_rest(policy, extra)
+        text = str(refused.value)
+        assert "has an http url, so it sends to the partner without TLS" in text
+        assert "verifies its server" not in text
+        assert "To chain-check" not in text
+        assert "rather than honoured unchecked" not in text
+        assert OS_ROOTS_CHAIN_CHECK_REASON in text
+        assert "None of these makes the engine check the partner's revocation" in text
+
+
+def test_an_http_rest_hop_builds_on_the_remedies_its_refusal_names(two_tier: _TwoTier) -> None:
+    """Each way out the http refusal names builds: the connection's own tls_ca_file, and a pinned
+    internal CA."""
+    crl = str(two_tier.revokes_nothing)
+    _http_rest(
+        TrustAnchorPolicy(crl_file=crl, crl_check_chain=True),
+        {"tls_ca_file": str(two_tier.root_file)},
+    )
+    _http_rest(
+        TrustAnchorPolicy(
+            internal_ca_file=str(two_tier.root_file),
+            mode="pinned",
+            crl_file=crl,
+            crl_check_chain=True,
+        )
+    )
 
 
 def test_an_ech_rest_hop_pinned_by_its_ca_file_builds_and_checks_no_crl(

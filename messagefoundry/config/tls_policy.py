@@ -3483,9 +3483,13 @@ OS_ROOTS_CHAIN_CHECK_REASON = (
     "more, and gathering a current CRL from each is not practical. The store can also hold "
     "certificates that are not CAs, which the CA list the engine reads leaves out, and that list "
     "leaves out a CA in a hashed CA directory (capath), as OpenSSL's default trust paths name on "
-    "Linux, until a handshake has used it. So the setting is refused here rather than honoured "
-    "unchecked"
+    "Linux, until a handshake has used it"
 )
+
+#: The generic refusal's closing clause. A hop that sends no TLS of its own to the partner (an
+#: ECH sidecar connection, or an http url) is refused without it, since the remedies its refusal
+#: names leave the partner unchecked.
+_REFUSED_NOT_UNCHECKED = "So the setting is refused here rather than honoured unchecked"
 
 #: The CA settings that give a hop operator CAs alone, named in the refusal itself, since
 #: docs/CONFIGURATION.md does not ship in the wheel.
@@ -3509,17 +3513,21 @@ _UNSET_CHAIN_CHECK = (
 )
 
 
-def refuse_chain_check_on_os_roots(anchor: TrustAnchor, *, ech_sidecar: bool = False) -> None:
+def refuse_chain_check_on_os_roots(
+    anchor: TrustAnchor, *, ech_sidecar: bool = False, cleartext: bool = False
+) -> None:
     """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
 
     It refuses at build, with a remedy, rather than leave the gap to a handshake. The reason is
     :data:`OS_ROOTS_CHAIN_CHECK_REASON`, stated there once.
 
-    ``ech_sidecar`` words it for a REST connection with an ``ech_sidecar``. There the engine
-    builds a verifying context for the partner from the hop's trust anchor, and then sends to the
-    sidecar on a plain loopback opener instead, so no ``[tls]`` CRL is checked against the partner,
-    leaf or chain, and pinning the hop would not make one be. Its refusal says so, and names
-    settings that clear it without promising a check."""
+    ``ech_sidecar`` and ``cleartext`` word it for a REST connection that makes no TLS connection
+    to the partner of its own: one with an ``ech_sidecar``, where the sidecar makes it and the
+    engine sends to the sidecar on a plain loopback opener, and one whose url is ``http``. The
+    engine still resolves a trust anchor for each and builds an https handler on it, so the
+    refusal still fires, but no ``[tls]`` CRL is checked against the partner, leaf or chain, and
+    pinning the hop would not make one be. Their refusal says so, and names settings that clear
+    it without promising a check."""
     if not (anchor.crl_check_chain and anchor.load_system_roots):
         return
     arm = (
@@ -3528,17 +3536,22 @@ def refuse_chain_check_on_os_roots(anchor: TrustAnchor, *, ech_sidecar: bool = F
         if anchor.cafile is not None
         else "the system arm (the OS trust store, with no CA file of its own)"
     )
-    if ech_sidecar:
+    if ech_sidecar or cleartext:
         # The token hop of an ECH connection resolves a trust anchor, but its opener does not use
         # it (smart.py, http_auth.py), so the remedy here names no token server and no other
         # hop's setting.
+        no_partner_tls = (
+            "sends through its ECH sidecar (ech_sidecar), which makes the TLS connection to the "
+            "partner itself"
+            if ech_sidecar
+            else "has an http url, so it sends to the partner without TLS"
+        )
         raise ValueError(
-            "[tls].crl_check_chain is set, and this REST connection sends through its ECH "
-            "sidecar (ech_sidecar), which makes the TLS connection to the partner itself. So no "
+            f"[tls].crl_check_chain is set, and this REST connection {no_partner_tls}. So no "
             "CRL in [tls].crl_file is checked against the partner on this connection, leaf or "
-            "chain, whatever its CA setting. The engine still builds a context for the partner "
-            f"from this connection's trust anchor, which is {arm}. "
-            f"{OS_ROOTS_CHAIN_CHECK_REASON}. To clear this refusal, "
+            "chain, whatever its CA setting. The engine still builds an https handler for this "
+            f"connection from its trust anchor, which is {arm}, and refuses the whole-chain "
+            f"check on that arm. {OS_ROOTS_CHAIN_CHECK_REASON}. To clear this refusal, "
             f"{_UNSET_CHAIN_CHECK}, or give the connection operator CAs alone through its own "
             'tls_ca_file or [tls].internal_ca_file with [tls].trust_anchor_mode = "pinned", '
             "which also takes the OS roots away from the other non-loopback hops that resolve "
@@ -3548,7 +3561,7 @@ def refuse_chain_check_on_os_roots(anchor: TrustAnchor, *, ech_sidecar: bool = F
         )
     raise ValueError(
         f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. "
-        f"{OS_ROOTS_CHAIN_CHECK_REASON}. To chain-check this hop, give "
+        f"{OS_ROOTS_CHAIN_CHECK_REASON}. {_REFUSED_NOT_UNCHECKED}. To chain-check this hop, give "
         f"it operator CAs alone, through {_OPERATOR_CA_SETTINGS}. {_OPERATOR_CA_FILE_RULE}. Or "
         f"{_UNSET_CHAIN_CHECK}"
     )

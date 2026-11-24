@@ -3157,6 +3157,10 @@ class RestDestination(DestinationConnector):
                 # Vault BACKLOG #5511: the opener built below is replaced by the sidecar's, so the
                 # whole-chain refusal is worded for an ECH hop before the generic one can fire.
                 refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
+            elif scheme == "http":
+                # The same refusal for an http url (accepted as cleartext), worded so it does not
+                # say the hop verifies a server: the opener never makes a TLS connection.
+                refuse_chain_check_on_os_roots(anchor, cleartext=True)
             if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
