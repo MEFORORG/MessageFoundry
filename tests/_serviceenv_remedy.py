@@ -222,8 +222,9 @@ CREATE_INSTALLER = (
     "shell that runs `messagefoundry rotate-key`, and add back as an entry of its own each other "
     "line, but none that may set MEFOR_SECRETS_DIRECTORY and none that is part of a refused "
     "value: each line below a refused name written alone or set to nothing, up to the next that "
-    "names a refused variable, alone or set, and each line below another line of a refused "
-    "value, up to the next that names a refused variable or sets another variable as the first "
+    "names a refused variable, alone or set, each other line of a string whose first line names "
+    "a refused variable, and each line below another line of a refused value, up to the next "
+    "that names a refused variable or sets another variable as the first "
     "step says, where a line that may set MEFOR_SECRETS_DIRECTORY ends neither, writing the list "
     "back as the first step says"
 )

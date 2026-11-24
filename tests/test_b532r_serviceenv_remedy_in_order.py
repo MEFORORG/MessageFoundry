@@ -171,15 +171,19 @@ def _refused_names(entries: list[tuple[str, str]]) -> frozenset[str]:
 def _part_of_refused_value(entries: list[tuple[str, str]], where: str) -> set[tuple[int, int]]:
     """The ``(string, line)`` positions in the list ``where`` that the installer clause's printed
     rule makes part of a refused value: each line below a refused name written alone or set to
-    nothing, up to the next that names a refused variable, and each line below another line of
-    a refused value, up to the next that names one or sets another variable as the doubt step
-    says, where a line that may set the directory ends neither."""
+    nothing, up to the next that names a refused variable, each other line of a string whose
+    first line names a refused variable, and each line below another line of a refused value,
+    up to the next that names one or sets another variable as the doubt step says, where a line
+    that may set the directory ends neither."""
     part: set[tuple[int, int]] = set()
     state: str | None = None
     for i, (at, string) in enumerate(entries):
         if at != where:
             continue
-        for j, line in enumerate(_LINE_BREAK.split(string)):
+        lines = _LINE_BREAK.split(string)
+        if _refused_name(lines[0].partition("=")[0].strip().upper()):
+            part |= {(i, j) for j in range(1, len(lines))}
+        for j, line in enumerate(lines):
             name, equals, value = line.partition("=")
             if _refused_name(name.strip().upper()):
                 state = "open" if not equals or not value.replace("=", "").strip() else "value"
@@ -686,6 +690,21 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
     ),
     # The same review: removing the name's strings would join the empty password to the
     # ordinary line below them, so the clause takes the password's string too.
+    # Code review round 2 on that repair: the whole-string reading of a string led by a refused
+    # name holds every line below it, an ordinary one among them, so none is added back.
+    "ordinary-line-in-a-string-led-by-a-refused-name": (
+        [
+            (
+                _EXTRA,
+                "MEFOR_VALUE_A=SEKRITa\nHTTP_PROXY=http://proxy.invalid\nMEFOR_STORE_PASSWORD=",
+            ),
+            (_EXTRA, "mefor_secrets_directory=SEKRITpw"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKRITpw"}),
+        {"MEFOR_VALUE_A": "SEKRITa", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
+        False,
+    ),
     "empty-key-rejoins-an-ordinary-line": (
         [
             (_EXTRA, "MEFOR_STORE_PASSWORD="),
@@ -728,7 +747,7 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     wide = frozenset(moves) | _refused_names(entries)
     was = _value_lines(entries, wide)
     joined = _value_lines(registry.entries, wide | _refused_names(registry.entries)) - was
-    assert joined - {f"{_DIR}={_NEW_DIRECTORY}"} == set()
+    assert joined == set()
 
 
 def _refused_text_left(
@@ -765,6 +784,7 @@ _READ_OUT = {
     "name-alone-in-an-installer-string": {"MEFOR_VALUE_A", _RETIRED},
     "two-directory-strings-between-an-empty-key-and-a-name-alone": {"MEFOR_VALUE_B"},
     "empty-key-rejoins-an-ordinary-line": {"MEFOR_VALUE_B"},
+    "ordinary-line-in-a-string-led-by-a-refused-name": {"MEFOR_VALUE_A", "MEFOR_STORE_PASSWORD"},
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},
@@ -859,4 +879,16 @@ def test_the_installer_model_matches_install_service_ps1() -> None:
         "Set-ItemProperty -LiteralPath $keyPath -Name 'AppEnvironmentExtra' -Value $merged "
         "-Type MultiString"
     ) in script
+    assert "function Set-ServiceEnvironmentValue {" in script
+    # And the section itself carries that route, so the citation names a written one (code
+    # review round 2 on that repair).
+    doc = (Path(__file__).resolve().parent.parent / "docs" / "SERVICE.md").read_text(
+        encoding="utf-8"
+    )
+    section = doc.split("\n## Start / stop / status\n", 1)[1].split("\n## ", 1)[0]
+    flat = " ".join(section.split())
+    assert "edit it in the registry, never with `nssm get` or `nssm set`" in flat
+    assert "with `Get-ItemProperty`, printing nothing" in flat
+    assert "-Name AppEnvironmentExtra -Value $extra -Type MultiString" in flat
+    assert "`Set-ServiceEnvironmentValue` writes `AppEnvironmentExtra` back the same way" in flat
     assert _installer_reads(f"{_DIR.lower()}=x") and not _installer_reads(f" {_DIR}=x")

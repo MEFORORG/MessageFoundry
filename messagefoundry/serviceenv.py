@@ -199,7 +199,9 @@ class ServiceEnvPosture:
     #: refused variable (:func:`_take_out_changes_refused`), so the reader may hold such a line
     #: as part of that variable. Where it does, the doubt step then
     #: leaves as it is each string that holds a refused variable or that one's value runs on
-    #: into, so no value goes before the step that moves it. The remedy alone reads this.
+    #: into, and each string whose take-out, alone or beside the others, would change how the
+    #: reader reads a refused variable, so no value goes before the step that moves it. The
+    #: remedy alone reads this.
     directory_in_refused: bool = False
     #: Whether any AppEnvironmentExtra string is one install-service.ps1 reads as setting
     #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`), so the doubt step may leave such a
@@ -1044,8 +1046,9 @@ def _take_out_changes_refused(
     refused variable (:func:`_refused_readings`): its value, its name, or whether it is read at
     all. Then a line it takes out may be part of a refused value, a store key among them, and
     the step leaves as it is each string that holds a refused variable or that one's value runs
-    on into (the Lander's hold on PR 3142, comment 7116005396, F3). The remedy alone reads
-    this."""
+    on into (the Lander's hold on PR 3142, comment 7116005396, F3), and each string whose
+    take-out, alone or beside the others, would change such a reading (the Lander's hold on PR
+    3142, comment 7119680463, item 3). The remedy alone reads this."""
     return _refused_readings(variables) != _refused_readings(_variables(_taken_out(entries)))
 
 
@@ -1501,10 +1504,14 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # that repair). A line that may set the directory is not added back, so the installer
         # still finds none to read, and nor is a line of a refused value: below a refused name
         # written alone or set to nothing only a refused line ends it, erring past the reader's
-        # fail-closed rule (_ends_blank_class), and below any other line of one the doubt step's
-        # rule does. It also takes, until none is left, the strings whose refused variables
-        # removing the others would read differently (the Lander's hold on PR 3142, comment
-        # 7119680463, items 1 and 3; code review round 1 on that repair).
+        # fail-closed rule (_ends_blank_class); every line of a string led by a refused name is
+        # part of it, as the whole-string reading holds them; and below any other line of one
+        # the doubt step's rule ends it. It also takes, until none is left, the strings whose
+        # refused variables removing the others would read differently (the Lander's hold on PR
+        # 3142, comment 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair).
+        # The rule still differs from the reader at least for a mixed-case name that takes a key
+        # or its path below an empty value, which the reader reads as that value: an open
+        # finding of code review round 2 on that repair, not a guarantee this text gives.
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
@@ -1528,7 +1535,8 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     "`messagefoundry rotate-key`, and add back as an entry of its own each other "
                     f"line, but none that may set {_DIRECTORY_VARIABLE} and none that is part of "
                     "a refused value: each line below a refused name written alone or set to "
-                    "nothing, up to the next that names a refused variable, alone or set, and each "
+                    "nothing, up to the next that names a refused variable, alone or set, each "
+                    "other line of a string whose first line names a refused variable, and each "
                     "line below another line of a refused value, up to the next that names a "
                     "refused variable or sets another variable as the first step says, where a "
                     f"line that may set {_DIRECTORY_VARIABLE} ends neither, writing the list back "
