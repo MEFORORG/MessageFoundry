@@ -6,9 +6,11 @@ It imports only the standard library and the engine-free ``controlchars`` leaf, 
 model ``api.auth_models.UserCreateRequest`` can apply the same rule the service does without
 importing the service. ``AuthService.create_local_user`` checks it before anything is generated or
 written, and the model mirrors it, so ``POST /users`` refuses a name it refuses. The console's
-``POST /ui/users`` applies it to the name after ``str.strip``, which also takes control and
-separator characters at the ends, so a name refused only for what sits at its ends is created
-there trimmed, and the trimmed name passes the rule. Paths that write a username without it include
+``POST /ui/users`` applies it to the name after ``str.strip``, which takes the characters
+``str.isspace`` counts as white space from the ends (at least the C0 separators U+001C to U+001F
+and the line and paragraph separators among them), so a name refused only for such characters at
+its ends is created there trimmed, and the trimmed name passes the rule. A control, format or
+blank-glyph character at an end that is not white space is still refused there. Paths that write a username without it include
 at least
 ``provision-admin``, the directory create paths (``POST /users/directory`` and an AD sign-in that
 creates its account) and the directory rename refresh (``AuthService._refresh_cached_username``),
@@ -62,18 +64,19 @@ RESERVED_ACTOR_FORMS: Final = re.compile(r"(?s)system(:.*)?|cli:.*|<.*>")
 #: each taken to the ASCII character it renders as before the reserved-form match (BACKLOG #5520
 #: items 3, 14 and 35), so ``cli`` + RATIO + ``root`` or ``<oidc>`` in angle quotation marks is
 #: refused as ``cli:root`` and ``<oidc>`` are. Code points taken from Unicode's confusables data
-#: for ``:``, ``<`` and ``>``, and not every lookalike of them: the letters it lists for them (at
-#: least Canadian syllabics PA and PO, a runic letter and a Lisu tone letter) are left out, so a
-#: name in those scripts is not refused as a ``<...>`` form. Applied after NFKC, which takes U+2329
-#: and U+232A to U+3008 and U+3009.
+#: for ``:``, ``<`` and ``>``, and not every lookalike of them. At least these are left out: some
+#: letters it lists (Canadian syllabics PA and PO, a runic letter and a Lisu tone letter), so a
+#: name in those scripts is not refused as a ``<...>`` form, though the modifier letters U+02D0,
+#: U+02F8, U+A789, U+02C2 and U+02C3 are kept; and U+FE30, which NFKC turns into a two-dot leader
+#: rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008 and U+3009.
 _DELIMITER_LOOKALIKES: Final = str.maketrans(
     dict.fromkeys(
-        (0x02D0, 0x02F8, 0x0589, 0x05C3, 0x0703, 0x0704, 0x0903, 0x0A83, 0x16EC, 0x1803, 0x1809)
-        + (0x205A, 0x2236, 0xA789),
+        (0x02D0, 0x02F8, 0x0589, 0x05C3, 0x0703, 0x0704, 0x0903, 0x0A83, 0x16EC, 0x17D6, 0x1803)
+        + (0x1809, 0x205A, 0x2236, 0xA789),
         ":",
     )
-    | dict.fromkeys((0x02C2, 0x2039, 0x276C, 0x276E, 0x27E8, 0x3008), "<")
-    | dict.fromkeys((0x02C3, 0x203A, 0x276D, 0x276F, 0x27E9, 0x3009), ">")
+    | dict.fromkeys((0x02C2, 0x2039, 0x276C, 0x276E, 0x27E8, 0x3008, 0x1D236), "<")
+    | dict.fromkeys((0x02C3, 0x203A, 0x276D, 0x276F, 0x27E9, 0x3009, 0x1D237), ">")
 )
 
 

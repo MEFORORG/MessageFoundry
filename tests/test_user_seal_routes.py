@@ -39,7 +39,6 @@ from messagefoundry.auth.service import (
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.crypto import generate_key, make_cipher
-from messagefoundry.store.row_seal import TransitSealUnavailableError
 from messagefoundry.store.store import AdminRemoval, MessageStore, UserRecord
 from tests.test_api_auth import ABSENT_USER_ID, _add, _auth, _login, _reauth
 from tests.test_user_seal import _raw_for
@@ -224,38 +223,6 @@ async def test_an_admin_write_answers_423_for_a_failing_record(
     assert any(victim in alert for alert in alerts)
     assert absent.status_code == 404, absent.text
     assert served.status_code == 200, served.text
-
-
-async def test_a_reset_refused_for_a_vault_outage_gives_its_grant_back(
-    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The reset's checked read answers a Vault transit outage 503 before anything is changed, so
-    the ``admin_reset_password`` grant its gate spent is given back, as for the route's other
-    no-change 503: the retry the 503 asks for is served with no new proof. The control is the 423,
-    which keeps the cost docs/SECURITY.md states."""
-    engine, path = keyed
-    service, _alerts, intact, victim = await _setup(engine)
-    await _tamper(path, victim)
-    real = service.checked_user
-
-    async def outage(user_id: str) -> None:
-        raise TransitSealUnavailableError()
-
-    async with _client(engine, service) as c:
-        token = (await _login(c, "root")).json()["token"]
-        _, token = await _reauth(c, token, purpose="admin_reset_password")
-        monkeypatch.setattr(service, "checked_user", outage)
-        refused = await c.post(f"/users/{intact}/reset-password", headers=_auth(token))
-        monkeypatch.setattr(service, "checked_user", real)
-        retried = await c.post(f"/users/{intact}/reset-password", headers=_auth(token))
-        # Control: a 423 spends the grant, so the next reset needs a new proof.
-        _, token = await _reauth(c, token, purpose="admin_reset_password")
-        locked = await c.post(f"/users/{victim}/reset-password", headers=_auth(token))
-        spent = await c.post(f"/users/{intact}/reset-password", headers=_auth(token))
-    assert refused.status_code == 503, refused.text
-    assert retried.status_code == 200, retried.text
-    assert locked.status_code == 423, locked.text
-    assert spent.status_code == 403, spent.text
 
 
 async def test_checked_user_tells_a_failing_record_from_a_missing_one(
@@ -557,7 +524,7 @@ def test_the_security_doc_states_what_a_423_reports_and_costs() -> None:
         "Each engine process sharing the store keeps its own interval",
         "Where `[auth].require_action_step_up` is on, the default",
         "the single-use `admin_user_update` grant, so its 423 and its 404 cost that proof",
-        "the single-use `admin_reset_password` grant, so its 423 and its 404 cost that proof",
+        "the single-use `admin_reset_password` grant, so its 423, its 404 and the 503",
         "Where it is off, the gate checks the step-up session window instead and spends nothing",
     ):
         assert fact in body, fact

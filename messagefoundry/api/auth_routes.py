@@ -1877,14 +1877,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         )
         # BACKLOG #5520 items 2 and 13: a record that fails its seal answers the reads' 423, not
         # the service loader's 404. The service reads the account again before it writes.
-        try:
-            await _checked_user(service, user_id)
-        except HTTPException as exc:
-            if exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
-                # A Vault transit outage: nothing was read or changed, so, as for the 503 below,
-                # the grant this request's gate spent is given back for the retry the 503 asks for.
-                service.refund_action_step_up(STEP_UP_ACTION_ADMIN_RESET_PASSWORD)
-            raise
+        await _checked_user(service, user_id)
         try:
             issued = await service.admin_reset_password(user_id, actor=identity.username)
         except ValueError as exc:
