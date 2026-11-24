@@ -1534,17 +1534,19 @@ def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
         pytest.param("not a transit mac", id="names-no-version"),
         pytest.param("vault:v2:AAAA", id="short-digest"),
         pytest.param("vault:v02:" + base64.b64encode(bytes(32)).decode("ascii"), id="leading-zero"),
+        # Main read these two as a check that could not run, with no alert.
+        pytest.param("vault:v3:AAAA", id="short-digest-naming-the-rows-version"),
+        pytest.param(None, id="not-text"),
     ],
 )
 def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_labelled_unconfirmed(
-    answer: str, caplog: pytest.LogCaptureFixture
+    answer: object, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Vault BACKLOG #6707 item 73: the probe confirms a 400 as a refused version only when it
     answers a well-formed Transit MAC naming another version, the same parse the fixed-input check
     and the writer apply. An empty or versionless answer is no evidence that Transit refused the
-    version, so the 400 takes the unconfirmed label, even under Vault's own refusal wording. It
-    stays a break at the row, as on main before item 73, so whoever controls the probe's reply
-    cannot turn a planted version into a check that could not run (Lander hold 7133673869 on PR
+    version, so the 400 takes the unconfirmed label, even under Vault's own refusal wording, and
+    stays a break at the row rather than a check that could not run (Lander hold 7133673869 on PR
     3238)."""
     from messagefoundry.store import crypto_transit
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
@@ -2272,29 +2274,38 @@ async def test_a_planted_genesis_version_behind_a_proxy_opens_and_reads_as_a_bre
 
 class _MalformedProbeTransit(_RotatingTransit):
     """``_RotatingTransit`` whose answer to the cipher's version probe, the ``hmac`` over the fixed
-    probe input, is ``probe_answer`` in place of a MAC. Every other ``hmac`` is Transit's own, so
-    the chain is written as usual."""
+    probe input, is ``probe_answer`` in place of a MAC once :meth:`arm` sets it. Until then, and
+    for every other ``hmac``, Transit answers as usual, so the chain is written as usual."""
 
-    probe_answer = ""
+    probe_answer: object = None
+    armed = False
 
     def generate_hmac(self, *, hash_input: str, **kw: Any) -> dict[str, Any]:
         from messagefoundry.store.crypto_transit import _VERSION_PROBE_INPUT
 
-        if hash_input == _VERSION_PROBE_INPUT:
+        if self.armed and hash_input == _VERSION_PROBE_INPUT:
             return {"data": {"hmac": self.probe_answer}}
         return super().generate_hmac(hash_input=hash_input, **kw)
+
+    def arm(self, answer: object) -> None:
+        self.probe_answer, self.armed = answer, True
 
 
 _MALFORMED_PROBE_ANSWERS = [
     pytest.param("", id="empty"),
     pytest.param("not a transit mac", id="names-no-version"),
     pytest.param("vault:v2:AAAA", id="short-digest"),
+    pytest.param(f"vault:v{_UNHELD_VERSION}:AAAA", id="short-digest-naming-the-rows-version"),
+    pytest.param(None, id="not-text"),
 ]
 
 
 @pytest.mark.parametrize("answer", _MALFORMED_PROBE_ANSWERS)
 async def test_a_planted_version_whose_probe_answers_no_well_formed_mac_is_a_chain_break(
-    answer: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    answer: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238: a probe answering no
     well-formed MAC must not turn a planted version into a walk that could not run. The startup
@@ -2306,7 +2317,7 @@ async def test_a_planted_version_whose_probe_answers_no_well_formed_mac_is_a_cha
     _use_fake(monkeypatch, transit)
     db = tmp_path / "malformed-probe-planted.db"
     seq = await _chain_with_a_planted_version(db)
-    transit.probe_answer = answer
+    transit.arm(answer)
     store = await _transit_store(db)
     try:
         ok, msg = await store.verify_audit_chain()
@@ -2322,7 +2333,10 @@ async def test_a_planted_version_whose_probe_answers_no_well_formed_mac_is_a_cha
 
 @pytest.mark.parametrize("answer", _MALFORMED_PROBE_ANSWERS)
 async def test_a_planted_genesis_version_whose_probe_answers_no_well_formed_mac_opens(
-    answer: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    answer: object,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238: with the genesis row's
     version planted and a probe answering no well-formed MAC, the store still opens, logs an ERROR
@@ -2335,7 +2349,7 @@ async def test_a_planted_genesis_version_whose_probe_answers_no_well_formed_mac_
     db = tmp_path / "malformed-probe-genesis.db"
     await _chain_with_a_planted_version(db)
     _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = 1", (_PLANTED,))
-    transit.probe_answer = answer
+    transit.arm(answer)
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="messagefoundry.store.store"):
         store = await _transit_store(db)

@@ -857,7 +857,8 @@ class AuditKeyVersionRefusedError(CipherError):
     read as a refusal of that version, while a probe under the latest version answers a
     well-formed MAC naming another version (vault BACKLOG #6707 item 73). Transit's own refusal is
     one cause; the subclass :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does
-    not read as one.
+    not read as one, and a 400 whose probe answers no well-formed MAC, so a handler of this class
+    cannot take a caught instance as proof that the probe answered one.
 
     The version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
@@ -882,9 +883,8 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     refusal, or whose reading raises one of
     :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while a probe under the latest
     version answers a well-formed MAC naming another version (vault BACKLOG #6707). It also covers
-    a 400 whose probe answers a string that is no well-formed MAC, at least an empty or versionless
-    one, whatever the reply says (vault BACKLOG #6707 item 73): no evidence of a refused version,
-    but the row's break and its alert stay, as before item 73.
+    a 400 whose probe answers no well-formed MAC, whatever the reply says (vault BACKLOG #6707
+    item 73): no evidence of a refused version, but a break at the row with its alert.
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass: a handler

@@ -170,7 +170,7 @@ _READ_RAISED = "reading it raised"
 _PROBE_MALFORMED = "the probe under the latest version answered no well-formed MAC"
 #: How :meth:`TransitCipher._refuses_only_version` reads an audit-MAC verify failure: ``""`` for
 #: no version refusal, ``"version"`` for one the probe clears, and ``"malformed"`` for one whose
-#: probe answered no well-formed MAC.
+#: probe answered no well-formed MAC. Compare it by value; ``"malformed"`` is no refusal by Transit.
 _ProbeReading = Literal["", "version", "malformed"]
 #: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
 #: label's warning is made and logged (vault BACKLOG #6707): a step short of memory or stack.
@@ -490,6 +490,13 @@ def _log_unread_decrypt_body(length: int) -> None:
             _REPARSED_BODY_MAX_CHARS,
         ),
     )
+
+
+def _probe_mac_version(answer: object) -> int | None:
+    """The key version a probe's ``answer`` names when it is a well-formed Transit MAC, by
+    :func:`~messagefoundry.store.row_seal.transit_mac_version`; ``None`` for any other answer,
+    whatever its type (vault BACKLOG #6707 item 73)."""
+    return transit_mac_version(answer) if isinstance(answer, str) else None
 
 
 def _unconfirmed_warning(
@@ -1060,7 +1067,8 @@ class TransitCipher(_UnmarkedPolicy):
         :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
         reason, for example for a proxy's page, or when it raises one of :data:`_READ_FAULTS`,
         both except as :data:`_READ_FAULTS` says (vault BACKLOG #6707). Anything else it raises
-        propagates.
+        propagates. Such a 400 whose probe answers anything that is no well-formed MAC raises the
+        subclass too, without reading the reply (vault BACKLOG #6707 item 73).
 
         A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
         those, and is read as the next paragraph says (vault BACKLOG #6707). hvac 2.4.0 raises
@@ -1070,8 +1078,8 @@ class TransitCipher(_UnmarkedPolicy):
         ``MemoryError`` hvac raises while it joins a truthy ``errors`` value is read the same way,
         though out of memory or stack a later fault can still propagate.
 
-        A failure of the verify call not read as a refused version, and not an outage
-        (:meth:`_is_outage`), is checked once the handler has let go
+        A failure of the verify call not read as a refused version or its subclass, and not an
+        outage (:meth:`_is_outage`), is checked once the handler has let go
         of the failed request (BACKLOG #2720): a verify over FIXED input must succeed
         (:meth:`_fixed_input_verifies`), and then the row's own verify is asked once more
         (:meth:`_recheck_refused_row`, which says how the second ask is read). Where that reads
@@ -1122,7 +1130,7 @@ class TransitCipher(_UnmarkedPolicy):
         outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
         handler. Blocking."""
         reading = self._refuses_only_version(exc, version)
-        if reading:
+        if reading in ("version", "malformed"):
             # The same flow, labelled apart (vault BACKLOG #6707). Reading the reply only picks the
             # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
             # walk, except as _READ_FAULTS says. Any other exception propagates. A malformed probe
@@ -1266,12 +1274,12 @@ class TransitCipher(_UnmarkedPolicy):
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. A probe answering a
         MAC :func:`~messagefoundry.store.row_seal.transit_mac_version` accepts, naming a version
-        other than ``key_version``, reads ``"version"``. A probe answering a string that is no such
-        MAC, at least an empty or versionless one, reads ``"malformed"`` (vault BACKLOG #6707 item
-        73): no evidence that Transit refused the version, but still a break at the row, as on
-        ``main`` before item 73, so a malformed probe reply leaves a planted version a break with
-        its alert rather than a walk that could not run. Any other answer, or a probe that fails,
-        reads ``""``.
+        other than ``key_version``, reads ``"version"``. A probe answering anything else that is
+        no such MAC, at least an empty, versionless or non-text one, reads ``"malformed"`` (vault
+        BACKLOG #6707 item 73): no evidence that Transit refused the version, but the caller
+        still reads it as a break at the row. Such an answer was a break before item 73 too,
+        except a text one starting ``vault:v<key_version>:`` or a non-text one, which could not
+        run. A well-formed answer naming ``key_version``, or a probe that raises, reads ``""``.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""
@@ -1291,9 +1299,7 @@ class TransitCipher(_UnmarkedPolicy):
                 )
             )
             return ""
-        if not isinstance(answered, str):
-            return ""
-        named = transit_mac_version(answered)
+        named = _probe_mac_version(answered)
         if named is None:
             return "malformed"
         return "version" if named != key_version else ""
@@ -1319,7 +1325,7 @@ class TransitCipher(_UnmarkedPolicy):
         Blocking."""
         try:
             mac = self._probe_mac()
-            if not isinstance(mac, str) or transit_mac_version(mac) is None:
+            if not isinstance(mac, str) or _probe_mac_version(mac) is None:
                 _warn_quietly(
                     lambda: (
                         "an audit MAC verify failed, and the fixed-input probe answered no "

@@ -425,14 +425,15 @@ skips the audit row or the throttled page a refusal writes.
 refusal only when the probe answers a well-formed MAC naming a version other than the pinned one
 (`crypto_transit._refuses_only_version` on `main`; corrected 2026-11-24, vault BACKLOG #6707 item
 73: an empty answer or one naming no version passed until then, and now gives the unconfirmed
-label, still a break at that row). That 400 need not be Transit's own: a proxy can author it
+label, a break at that row). That 400 need not be Transit's own: a proxy can author it
 (corrected 2026-11-11, vault BACKLOG #6707). A row seal reads **any**
 400 with a working probe as Unverifiable, whatever version the probe names. A planted seal
 naming the latest version, checked on a lagging node while the probe reaches a caught-up one, would otherwise read as an Outage: a 503 that ends nothing and writes no
 integrity record, the loosening (a) rejects. Item 3.6's shared helper returns the probe's answer and
-each caller applies its own rule. Since 2026-11-24 the audit chain also reads a well-formed
-answer apart from a malformed one, but only for the label: both are a break at the row (vault
-BACKLOG #6707 item 73). The cost is that a genuine row checked on a lagging node is denied and recorded as Unverifiable, which (a)
+each caller applies its own rule. Since 2026-11-24 the audit chain reads a probe answer that is
+no well-formed MAC as a break at the row under the unconfirmed label, and a well-formed one
+naming another version as a break under a label the reply's wording picks (vault BACKLOG #6707
+item 73). The cost is that a genuine row checked on a lagging node is denied and recorded as Unverifiable, which (a)
 already accepts. With the strict parse and the fixed-length input, no other 400 is known; the
 build lists any it finds.
 
