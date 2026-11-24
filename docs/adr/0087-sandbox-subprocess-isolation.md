@@ -187,7 +187,10 @@ memory rose about 8 MiB.
 4. A `MemoryError` while the worker runs a call or encodes its result is answered with a `fail`
    frame of kind `memory`, which names the cap. The worker then exits, and the parent reaps it, so
    memory the call left held cannot fail a later message. The parent reports that the call ran
-   out of memory, with the worker's text naming the cap.
+   out of memory, with the worker's text naming the cap. The reply is built after the worker lets
+   go of at least the request and the error's traceback and chain, and collects cycles (BACKLOG
+   #6813). It still needs memory, so where what the call left held leaves too little, no reply goes
+   out and the parent reports a crash instead.
 
 **What this gives up.** `RLIMIT_DATA` does not count a shared mapping. Python's `mmap.mmap(-1, n)`
 makes one, so a call can allocate around the cap that way. It was never a bound against admin code

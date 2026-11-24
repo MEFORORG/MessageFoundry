@@ -97,7 +97,9 @@ def _alive(watched: dict[str, Any]) -> list[str]:
 
 
 class _Sneaky(MemoryError):
-    """A Handler's own MemoryError whose methods would fail if the worker called them."""
+    """A Handler's own MemoryError whose methods would fail if ``main`` called them. Through the real
+    ``_run_one`` the run-context managers set ``__traceback__`` first, through ``__setattr__``, so
+    such a subclass ends as that call's ``error`` there; this pins ``main``'s own handling."""
 
     def with_traceback(self, tb: Any) -> Any:
         raise RuntimeError("user code ran")

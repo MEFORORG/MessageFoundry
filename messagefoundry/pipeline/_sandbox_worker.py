@@ -670,8 +670,9 @@ def main() -> int:
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
             # the parent starts a fresh worker (vault BACKLOG #3133 part 2). This loop's raw frame and
             # decoded request are let go first, and a collection frees what only a cycle still held,
-            # so the reply is not built beside them (BACKLOG #6813). That cannot free what the call
-            # left in a global, a cache or a thread, so the reply can still fail for want of memory.
+            # so the reply is not built beside them (BACKLOG #6813). That cannot free all the call
+            # left held: at least a global, a cache, a thread, or an error held in the MemoryError's
+            # own args. So the reply can still fail for want of memory.
             request_id, phase, name = req.request_id, req.phase, req.name
             del frame, req
             with contextlib.suppress(OSError, SandboxError, MemoryError):
