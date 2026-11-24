@@ -290,11 +290,15 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
 > are delivered is unaffected. **Use an ordered container whenever order matters.**
 >
-> A **generator** Handler delivers exactly like a list, but its body runs *after* the execution tracer
-> behind `dryrun --trace` (and the Test Bench that reads it) has detached. That invocation's trace
-> record therefore carries no executed lines and no sends, marked `"lazy_result": true` so the omission
-> is declared rather than read as a handler that did nothing; the run's message-level `sends` are still
-> exact. Return a list or tuple if you want the handler's body traced line-by-line.
+> The execution tracer behind `dryrun --trace` (and the Test Bench that reads it) reports a
+> Handler's per-invocation sends for a single returned value, such as a bare `return Send(...)`, and
+> for an exact `list`, `tuple`, `set` or `frozenset`. Any other iterable return (other than `str`/`bytes`/`bytearray`), such as a generator, a `deque`, a
+> custom iterable or a subclass of one of those four, may be single-pass, so the tracer does not walk
+> it: that invocation's record reports no sends and is marked `"lazy_result": true`, so the omission
+> is declared rather than read as a handler that did nothing (BACKLOG #6823). The run's message-level
+> `sends` are still exact. A **generator** Handler's body also runs *after* the tracer has detached,
+> so its record carries no executed lines either. Return a list or tuple if you want the handler's
+> per-invocation sends and body traced.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
