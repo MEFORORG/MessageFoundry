@@ -3121,15 +3121,20 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 - A WS-Security auth/expiry fault (`FailedAuthentication` / `InvalidSecurityToken` / `MessageExpired`)
   **dead-letters** (a credential/expiry reject won't fix on a retry), with two exceptions. In a 2xx
   body with `capture_response` on, any fault is captured as a rejected reply instead. And on a
-  connection with OAuth2 client credentials whose transport does not stamp a `UsernameToken`
+  connection with a bearer token provider whose transport does not stamp a `UsernameToken`
   (`ws_security` with `ws_username`), the first HTTP `401` carrying `FailedAuthentication` or
-  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The next such
+  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The provider is
+  OAuth2 client credentials, or SMART Backend Services: `with_smart_backend` refuses a SOAP spec,
+  but `smart_*` settings written into its settings by hand still build a SMART provider. The next such
   `401` is a **credential fault**: under the default `credential_fault_policy` (`stop`) it stops the lane and keeps the
   queue (ADR 0095), because the credential at fault is one the engine cannot see, at least a
-  `UsernameToken` a Handler writes into its own envelope or a client certificate. Only a 2xx or a
-  `401` that is not a WS-Security fault ends that run; a 5xx, a `407`, any other status or no
-  answer leaves it open. A `401` carrying `MessageExpired` dead-letters on every connection
-  (BACKLOG #5798).
+  `UsernameToken` a Handler writes into its own envelope or a client certificate. A 2xx ends that
+  run unless its body is a WS-Security fault, and so does a `401` that is not a WS-Security fault;
+  a 5xx, a `407`, any other status or no answer leaves it open. A `401` whose fault code element
+  (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) names `MessageExpired` dead-letters
+  on every connection; where the Fault has no such element, `MessageExpired` anywhere from the
+  Fault on counts (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py` module
+  docstring points here.
 
 ```python
 from messagefoundry import outbound, Soap, env

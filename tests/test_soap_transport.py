@@ -465,6 +465,10 @@ def _between(kind: str) -> _Opener:
         return _Opener(resp=_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"))
     if kind == "2xx-read-fails":
         return _Opener(resp=_ResetDuringRead(200))
+    if kind == "2xx-sender-fault":
+        return _Opener(resp=_Resp(200, _SENDER_11.encode()))
+    if kind == "2xx-ws-security-fault":
+        return _Opener(resp=_Resp(200, _WSSE_401))
     if kind == "plain-401":
         return _Opener(exc=_http_error(401, b""))
     if kind in ("500", "502", "407"):
@@ -488,7 +492,7 @@ async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
 
 
-@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "plain-401"])
+@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "2xx-sender-fault", "plain-401"])
 async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run(kind: str) -> None:
     """Only a 2xx or a 401 that is not a WS-Security fault ends the run, so the next WS-Security
     401 gets its retry again. Mutations: move the 2xx reset after the body read (red:
@@ -500,7 +504,10 @@ async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run
     assert not isinstance(ei.value, NegativeAckError)
 
 
-@pytest.mark.parametrize("kind", ["500", "502", "407", "unreachable", "reset", "malformed"])
+@pytest.mark.parametrize(
+    "kind",
+    ["500", "502", "407", "unreachable", "reset", "malformed", "2xx-ws-security-fault"],
+)
 async def test_another_status_or_no_answer_between_leaves_the_ws_security_401_run_open(
     kind: str,
 ) -> None:
@@ -553,6 +560,80 @@ async def test_a_username_token_connection_still_retries_a_non_ws_security_401(
         await dest.send("<op/>")
     assert not isinstance(ei.value, NegativeAckError)
     assert provider.invalidations == 1
+
+
+async def test_control_a_2xx_ws_security_fault_does_not_open_a_ws_security_401_run() -> None:
+    """BACKLOG #5798 added item 2: a 2xx WS-Security fault keeps the run as it was. With no run
+    open, it opens none, so the next WS-Security 401 still gets its bearer retry. Mutation: set
+    the flag on a 2xx WS-Security fault. Red: NegativeAckError."""
+    dest, _ = _oauth2_dest()
+    dest._opener = _Opener(resp=_Resp(200, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError):
+        await dest.send("<op/>")
+    dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+
+
+_FAILED_AUTH_EXPIRED_ELSEWHERE = {
+    "faultstring": (
+        b"<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode>"
+        b"<faultstring>token rejected, not MessageExpired</faultstring></soap:Fault>"
+    ),
+    "detail-12": (
+        b"<soap:Fault><soap:Code><soap:Value>soap:Sender</soap:Value><soap:Subcode>"
+        b"<soap:Value>wsse:FailedAuthentication</soap:Value></soap:Subcode></soap:Code>"
+        b"<soap:Detail><note>MessageExpired</note></soap:Detail></soap:Fault>"
+    ),
+    "after-the-fault": (
+        b"<soap:Envelope><soap:Body><soap:Fault><faultcode>wsse:InvalidSecurityToken</faultcode>"
+        b"</soap:Fault></soap:Body></soap:Envelope><!-- MessageExpired -->"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "body", list(_FAILED_AUTH_EXPIRED_ELSEWHERE.values()), ids=list(_FAILED_AUTH_EXPIRED_ELSEWHERE)
+)
+async def test_message_expired_outside_the_fault_code_does_not_block_the_bearer_retry(
+    body: bytes,
+) -> None:
+    """BACKLOG #5798 added item 3: only the fault code element decides MessageExpired, so a
+    FailedAuthentication or InvalidSecurityToken fault whose faultstring, Detail or trailing
+    text says MessageExpired still gets its bearer retry. Mutation: search from the Fault start
+    to the reply's end again. Red: a permanent wssecurity NegativeAckError."""
+    dest, provider = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as ei:
+        await dest.send("<op/>")
+    assert not isinstance(ei.value, NegativeAckError)
+    assert provider.invalidations == 1
+
+
+_EXPIRED_IN_THE_CODE = {
+    "subcode-12": (
+        b"<soap:Fault><soap:Code><soap:Value>soap:Sender</soap:Value><soap:Subcode>"
+        b"<soap:Value>wsse:MessageExpired</soap:Value></soap:Subcode></soap:Code>"
+        b"<soap:Reason><soap:Text>expired</soap:Text></soap:Reason></soap:Fault>"
+    ),
+    "no-code-element": (b"<soap:Fault><faultstring>wsse:MessageExpired</faultstring></soap:Fault>"),
+}
+
+
+@pytest.mark.parametrize(
+    "body", list(_EXPIRED_IN_THE_CODE.values()), ids=list(_EXPIRED_IN_THE_CODE)
+)
+async def test_control_message_expired_in_the_code_or_with_no_code_stays_permanent(
+    body: bytes,
+) -> None:
+    """A SOAP 1.2 Subcode is inside the Code element, so it decides. A Fault with no code
+    element keeps the earlier search, which errs toward permanent."""
+    dest, _ = _oauth2_dest()
+    dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("<op/>")
+    assert ei.value.permanent is True and ei.value.code == "wssecurity"
 
 
 async def test_control_an_oauth2_403_stays_permanent_and_keeps_the_token() -> None:

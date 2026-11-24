@@ -682,3 +682,39 @@ def test_audit_token_url_must_be_egress_listed(rsa_pem: str) -> None:
     dest = Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings)
     with pytest.raises(WiringError, match="SMART token endpoint"):
         check_egress_allowed(dest, EgressSettings(allowed_http=["fhir.example"]))
+
+
+# --- BACKLOG #5800 added item 1: the SMART provider's grant checks run at construction ------------
+
+
+def test_smart_refuses_an_unencodable_scope_at_construction(rsa_pem: str) -> None:
+    """The form body is URL-encoded as strict UTF-8 at each mint. Mutation: drop the surrogate
+    check in ``__init__``. Red: the provider builds, and the first mint raises UnicodeEncodeError
+    out of send or test_connection."""
+    with pytest.raises(
+        SmartAuthError, match="smart_scope holds a character UTF-8 cannot encode"
+    ) as ei:
+        _provider(rsa_pem, scope="system/Patient.rs\ud800")
+    # Raised outside any handler, so no exception holding the value rides the chain.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_smart_refuses_an_over_length_token_url_at_construction(rsa_pem: str) -> None:
+    """Mutation: move the length check back into ``_fetch_token``. Red: the provider builds, and
+    the first mint raises a bare ValueError out of send or test_connection."""
+    with pytest.raises(
+        SmartAuthError,
+        match=r"SMART token request \(smart_token_url and the proxy headers\): .*over the",
+    ) as ei:
+        _provider(rsa_pem, token_url=TOKEN_URL + "?" + "q" * 20_000, audience=TOKEN_URL)
+    assert "q" * 64 not in str(ei.value)
+
+
+def test_control_a_smart_provider_with_a_plain_scope_still_mints(rsa_pem: str) -> None:
+    """The checks moved, the mint did not: a provider that builds still posts its scope."""
+    p = _provider(rsa_pem)
+    opener = _token_opener("AT")
+    p._opener = opener  # type: ignore[assignment]
+    assert p.access_token() == "AT"
+    sent = urllib.parse.parse_qs((opener.requests[0].data or b"").decode("ascii"))  # type: ignore[union-attr]
+    assert sent["scope"] == ["system/*.rs"]
