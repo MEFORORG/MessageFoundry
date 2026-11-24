@@ -850,13 +850,14 @@ def test_a_burn_dated_after_now_with_no_reset_halts_and_names_the_clock(
     ("rows", "minutes_to_reset"),
     [
         pytest.param([(85, 55), (70, 80)], 60, id="span-ends-at-the-newest-row"),
-        pytest.param([(0.5, 79), (0.02, 80)], 240, id="one-tick-seconds-apart"),
+        pytest.param([(1.5, 79), (0.1, 80)], 240, id="one-tick-just-over-the-minimum-span"),
     ],
 )
 def test_a_real_burn_halts_however_the_rows_lie(
     sb: Sandbox, tmp_path: Path, rows: list[tuple[float, int]], minutes_to_reset: int
 ) -> None:
-    """Both of these are main's HALT. A span run to now, and a minimum span, each read them as clear."""
+    """Both of these are main's HALT. A span run to now, and a minimum span that fell back to the level,
+    each read them as clear."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
@@ -869,6 +870,23 @@ def test_a_real_burn_halts_however_the_rows_lie(
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
     assert code == HALT and "Projected to run out" in why(doc), why(doc)
+
+
+def test_a_tick_seconds_apart_reviews_and_never_reads_clear(sb: Sandbox, tmp_path: Path) -> None:
+    """BACKLOG #5494. A span under the minimum is mostly the rounding of the ages, so usage.ps1 refuses
+    the rate and reads the window UNKNOWN: the gate reviews. It must not fall back to the level, where 80
+    percent below the rung reads clear."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 240 * 60
+    assert _fire(sb, state, {"used_percentage": 80, "resets_at": resets}, env).returncode == 0
+    _set_rows(state, [(ago(minutes=0.5), 79), (ago(minutes=0.02), 80)], resets)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW and "minimum" in why(doc), why(doc)
 
 
 def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(

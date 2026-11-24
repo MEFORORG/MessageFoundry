@@ -33,7 +33,9 @@
            - a rate from its history rows that projects a run-out, counted from now, before the reset or
              with no reset, which sets CRITICAL.
          Below two samples in the current window there is no rate and no projection, and the percentage
-         bands still grade the reading.
+         bands still grade the reading. Two or more that cannot give a trustworthy rate -- a row dated
+         well after now, a span under the minimum, or rows across a reset the reading cannot name --
+         REFUSE the rate, and the window reads UNKNOWN below the ceiling; Get-Rate says why.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -59,7 +61,8 @@
                           the ceiling, projected to exhaust before reset, or projected at all with no reset
                           time
         20 UNKNOWN     -- no data, stale data with no level_floor at the ceiling, a window whose reset has
-                          passed, a reading dated after now with none of the above, or a reading this root
+                          passed, a reading dated after now with none of the above, history rows that
+                          show a move no trustworthy rate can be taken from, or a reading this root
                           may not trust. A level_floor below the ceiling reads UNKNOWN too, because the
                           number is only a lower bound; the gate reads level_floor for itself
         21 UNAVAILABLE -- this account has no subscription; there is no pool to be a percentage of
@@ -304,9 +307,29 @@ function Test-DatedAfterNow($v) {
 # computed across that boundary is a large NEGATIVE number, which would read as "consumption has stopped"
 # at the exact moment a fresh window starts being spent. Rows are therefore grouped by their reset epoch
 # and only rows sharing the CURRENT epoch are used.
-function Get-Rate($CurrentResetEpoch) {
+#
+# THREE ANSWERS, NOT TWO (BACKLOG #5494). $null is NO RATE: fewer than two rows, which is a flat or slow
+# burn, and the owner's rung then falls back to the level. A result with Refused set is a REFUSED RATE:
+# the rows show a move, but no number from them can be trusted, so Get-WindowReport reads the window
+# UNKNOWN below the ceiling. Folding a refusal into no rate would be a calm answer, because the level
+# reads a pool below the gate's rung as clear; and any small positive rate lifts that backstop, so a
+# diluted number is the fail-open the refusals below exist to prevent. Otherwise, PctPerHour.
+#
+# A row dated this far ahead of now is not clock skew. Test-DatedAfterNow allows a reading no tolerance,
+# because a reading ahead is only graded more cautiously; a row ahead changes a span. Within it, a row
+# keeps its raw age, because a backward clock step dates every row before it ahead by the same amount
+# and the span, a difference, is unchanged. Past it, the row would stretch the span by its distance and
+# dilute the rate toward 0.
+$RateClockSkewMinutes = 5.0
+# The shortest span a rate is taken over. An age is rounded to 0.1 minute, so this is ten rounding steps
+# and bounds the rounding error to a tenth of the span; a span of one or two steps is mostly rounding,
+# and the rate divided by it spiked to hundreds of percent an hour.
+$RateMinSpanMinutes = 1.0
+function New-RateRefusal([string]$Why) { [pscustomobject]@{ PctPerHour = $null; Refused = $Why } }
+function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
     if (-not (Test-Path -LiteralPath $histPath)) { return $null }
     $rows = @()
+    $ahead = 0
     try {
         foreach ($line in (Get-Content -LiteralPath $histPath -Tail 400 -ErrorAction Stop)) {
             try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
@@ -314,29 +337,53 @@ function Get-Rate($CurrentResetEpoch) {
             # whole rate into NaN and clear a burn, and a blank row reads as 0 and fakes one.
             $observed = Get-Percentage $r.seven_day
             if ($null -eq $observed) { continue }
+            # ANOTHER ROOT'S ROW IS ANOTHER POOL. A collector of another root wired to publish here writes
+            # its rows into this history, stamped with the root that observed them. Skipped by the
+            # window's own test, so an unstamped or unset row still counts (finding S33-100).
+            if (-not (Test-WindowFromRoot $r $ReadRoot)) { continue }
             if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
             $age = Get-AgeMinutes $r.at
             if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
-            $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed }
+            if ($age -lt -$RateClockSkewMinutes) { $ahead++; continue }
+            $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed; Reset = [string]$r.seven_reset }
         }
     } catch { return $null }
+    # NOT DROPPED AND COMPUTED FROM THE REST: the row may carry the highest level, and losing it
+    # understated a real burn. Nothing proves when it was taken, so nothing from these rows is a rate.
+    if ($ahead) {
+        return (New-RateRefusal "$ahead history row(s) dated more than $RateClockSkewMinutes min in the FUTURE -- clock skew or a bad timestamp, so no rate from these rows")
+    }
     if ($rows.Count -lt 2) { return $null }                            # one point is a reading, not a rate
-    $oldest = $rows | Sort-Object AgeMin -Descending | Select-Object -First 1
-    # THE SPAN RUNS FROM THE OLDEST ROW TO THE NEWEST ROW, ON RAW AGES, AND THERE IS NO MINIMUM. So a burn
-    # that stopped keeps reading as a burn until its rows leave the window, and one tick seconds apart
-    # reads as a fast burn. Both can stop work on a pool that has room, and a false stop is the safe
-    # direction. A row dated after now has a negative age and stays in the span: dropping it, or clamping
-    # it to 0, lost or understated a rate that stopped work on a real burn.
-    $newestRow = $rows | Sort-Object AgeMin | Select-Object -First 1
-    $spanH = ($oldest.AgeMin - $newestRow.AgeMin) / 60.0
-    if ($spanH -le 0) { return $null }
+    # WITH NO RESET ON THE READING, THE FILTER ABOVE CANNOT RUN, so the rows are tested for a reset
+    # themselves: a change in their reset column, or a fall in their percentage, since usage does not
+    # fall inside a window. Rows across a reset are two pools, and their rate is either diluted or a
+    # spike. Which of them belong to the reading is not known, so none is used.
+    $inTime = @($rows | Sort-Object AgeMin -Descending)
+    if (-not $CurrentResetEpoch) {
+        for ($i = 1; $i -lt $inTime.Count; $i++) {
+            if ($inTime[$i].Reset -ne $inTime[$i - 1].Reset -or $inTime[$i].Pct -lt $inTime[$i - 1].Pct) {
+                return (New-RateRefusal "this reading carries no reset time and its history rows cross a window reset, so no rate from them")
+            }
+        }
+    }
+    $oldest = $inTime[0]
+    # THE SPAN RUNS FROM THE OLDEST ROW TO THE NEWEST ROW, ON RAW AGES. So a burn that stopped keeps
+    # reading as a burn until its rows leave the window, and one tick a minute or two apart reads as a
+    # fast burn. Both can stop work on a pool that has room, and a false stop is the safe direction.
+    # Shorter than the minimum the span is mostly rounding, and the result is refused, not a rate.
+    $newestRow = $inTime[-1]
+    $spanMin = $oldest.AgeMin - $newestRow.AgeMin
+    if ($spanMin -lt $RateMinSpanMinutes) {
+        return (New-RateRefusal "the history rows span $([math]::Round($spanMin, 1)) min, under the $RateMinSpanMinutes-min minimum for a rate")
+    }
     # THE HIGHEST PERCENTAGE IS THE LEVEL IT REACHED. Usage does not fall inside a window, and a row's date
     # can be wrong, so a low row ahead of the clock cannot turn the rate negative and clear a burn.
     $delta = ($rows | Sort-Object Pct -Descending | Select-Object -First 1).Pct - $oldest.Pct
     return [pscustomobject]@{
-        PctPerHour = [math]::Round($delta / $spanH, 2)
+        PctPerHour = [math]::Round($delta / ($spanMin / 60.0), 2)
+        Refused    = $null
         Samples    = $rows.Count
-        SpanMin    = [math]::Round($oldest.AgeMin - $newestRow.AgeMin, 1)
+        SpanMin    = [math]::Round($spanMin, 1)
     }
 }
 
@@ -697,6 +744,8 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         resets_at        = $w.resets_at
         minutes_to_reset = $minsToReset
         rate_pct_per_hr  = $null
+        # Why the history rows gave no rate though they show a move, or $null. See Get-Rate.
+        rate_refused     = $null
         projected_at_reset = $null
         minutes_to_empty = $null
         # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
@@ -744,8 +793,12 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # so the run-out is too: the reading's age is taken off. A run-out already past is 0, which the
         # gate hits on, and its reason says it has passed rather than naming a moment already gone.
         if ($age -gt $MaxAgeMinutes) {
-            $rate = Get-Rate -CurrentResetEpoch $resetEpoch
-            if ($rate -and $rate.PctPerHour -gt 0) {
+            $rate = Get-Rate -CurrentResetEpoch $resetEpoch -ReadRoot $ReadRoot
+            if ($rate.Refused) {
+                $o.rate_refused = $rate.Refused
+                $o.reason = "$($o.reason); $($rate.Refused)"
+            }
+            elseif ($rate -and $rate.PctPerHour -gt 0) {
                 # The tense is chosen on the unrounded value, so a run-out seconds ahead is not "already".
                 $fromNow = (100.0 - $pct) / $rate.PctPerHour * 60.0 - $age
                 $toEmpty = [math]::Max(0.0, [math]::Round($fromNow, 0))
@@ -767,8 +820,11 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # HoldMin are counted from now, so the minutes since the reading come off the run-out and onto the
     # burn to the reset. A reading dated ahead takes nothing off.
     $elapsed = [math]::Max(0.0, [double]$age)
-    $rate = Get-Rate -CurrentResetEpoch $resetEpoch
-    if ($rate) {
+    $rate = Get-Rate -CurrentResetEpoch $resetEpoch -ReadRoot $ReadRoot
+    if ($rate.Refused) {
+        $o.rate_refused = $rate.Refused
+    }
+    elseif ($rate) {
         $o.rate_pct_per_hr = $rate.PctPerHour
         if ($null -ne $minsToReset -and $minsToReset -gt 0) {
             $o.projected_at_reset = [math]::Round([math]::Min(100.0, $pct + $rate.PctPerHour * (($minsToReset + $elapsed) / 60.0)), 1)
@@ -793,6 +849,13 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     }
     elseif ($null -ne $o.projected_at_reset -and $o.projected_at_reset -ge 95) {
         $o.state = "WARN"; $o.reason = "projected to reach $($o.projected_at_reset)% by reset"
+    }
+
+    # A REFUSED RATE IS UNKNOWN BELOW THE CEILING, NEVER A BAND. The rows show a move nothing measured, so
+    # neither OK nor WARN can come from them, and "no rate" would let the level clear it (BACKLOG #5494).
+    if ($o.rate_refused -and $o.state -ne "CRITICAL") {
+        $o.state = "UNKNOWN"
+        $o.reason = "no trustworthy burn rate: $($o.rate_refused)"
     }
 
     # A READING DATED AFTER NOW CAN STOP WORK AND CANNOT CLEAR IT. Nothing proves when it was taken, so it

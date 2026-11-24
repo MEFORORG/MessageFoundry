@@ -163,7 +163,9 @@ def test_publishes_the_weekly_window_and_ignores_a_five_hour_key(tmp_path: Path)
     assert "five_hour" not in d, d
     assert "7d 36%" in line and "80" not in line and "5h" not in line, line
     (row,) = history(tmp_path)
-    assert set(row) == {"at", "seven_day", "seven_reset"}, row
+    assert set(row) == {"at", "seven_day", "seven_reset", "config_root_env"}, row
+    # The root that observed it, as the window carries it, so the reader can skip another root's rows.
+    assert row["config_root_env"] == "unset", row
 
 
 def test_a_payload_carrying_only_five_hour_publishes_no_window(tmp_path: Path) -> None:
@@ -543,12 +545,19 @@ def _floor(state: Path, **published: Any) -> float | None:
     return floor
 
 
-def write_history(state: Path, points: list[tuple[float, float]], seven_epoch: int) -> None:
-    """points = [(minutes_ago, seven_day_pct)] within one window epoch."""
+def write_history(
+    state: Path,
+    points: list[tuple[float, float]],
+    seven_epoch: int | None = None,
+    extra: list[dict[str, Any]] | None = None,
+) -> None:
+    """points = [(minutes_ago, seven_day_pct)] within one window epoch. With no ``seven_epoch`` the rows
+    carry no reset column; ``extra`` adds fields to each row, by position."""
     state.mkdir(parents=True, exist_ok=True)
+    reset = {} if seven_epoch is None else {"seven_reset": seven_epoch}
     rows = [
-        {"at": _minutes_ago(mins), "seven_day": pct, "seven_reset": seven_epoch}
-        for mins, pct in points
+        {"at": _minutes_ago(mins), "seven_day": pct, **reset, **(extra[i] if extra else {})}
+        for i, (mins, pct) in enumerate(points)
     ]
     (state / "history.jsonl").write_text(
         "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8"
@@ -1243,12 +1252,13 @@ def test_a_history_row_dated_after_now_stays_in_the_rate(
 
 
 def test_rows_all_dated_after_now_still_give_a_rate(tmp_path: Path) -> None:
-    """Clamping both to 0 left no span and no rate, so a burn read OK where main stops."""
+    """Clamping both to 0 left no span and no rate, so a burn read OK where main stops. Both rows sit
+    inside the clock-skew tolerance; a row past it refuses the rate (BACKLOG #5494)."""
     epoch = int(time.time()) + 14400
     publish(tmp_path, seven=70.0, seven_epoch=epoch)
-    write_history(tmp_path, [(-1.0, 40.0), (-16.0, 70.0)], epoch)
+    write_history(tmp_path, [(-0.5, 40.0), (-4.5, 70.0)], epoch)
     code, doc = read(tmp_path)
-    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(120, abs=1), (
+    assert code == CRITICAL and doc["seven_day"]["rate_pct_per_hr"] == pytest.approx(450, abs=5), (
         doc
     )
 
@@ -1488,20 +1498,129 @@ def test_a_burn_that_stopped_still_reads_as_a_burn_until_its_rows_age_out(tmp_pa
     ("older", "newer", "rate"),
     [
         pytest.param((4.0, 85.0), (0.1, 86.0), 15.4, id="over-four-minutes"),
-        pytest.param((0.5, 85.0), (0.02, 86.0), 120.0, id="seconds-apart"),
+        pytest.param((1.2, 85.0), (0.1, 86.0), 54.5, id="just-over-the-minimum-span"),
     ],
 )
 def test_one_tick_is_a_rate_however_close_the_rows(
     tmp_path: Path, older: tuple[float, float], newer: tuple[float, float], rate: float
 ) -> None:
     """The weekly prints whole numbers, so a tick can be quantisation, and this can stop work on a pool
-    that has room. A false stop is the safe direction, and a minimum span read a real burn as clear."""
+    that has room. A false stop is the safe direction, so any span at or over the minimum is a rate."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
     write_history(tmp_path, [older, newer], epoch)
     code, d = read(tmp_path)
     assert code == CRITICAL, d
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, rel=0.15), d
+
+
+@pytest.mark.parametrize(
+    ("older", "newer"),
+    [
+        pytest.param((0.5, 85.0), (0.02, 86.0), id="seconds-apart"),
+        pytest.param((0.2, 85.0), (0.1, 86.0), id="one-rounding-step"),
+        pytest.param((0.1, 85.0), (0.1, 86.0), id="no-span"),
+    ],
+)
+def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
+    tmp_path: Path, older: tuple[float, float], newer: tuple[float, float]
+) -> None:
+    """BACKLOG #5494. An age is rounded to a tenth of a minute, so a span of a step or two is mostly
+    rounding, and the rate divided by it spiked to hundreds of percent an hour. Refusing it must not fall
+    back to the level, which reads 86 percent as clear below the gate's rung: the rows show a move, so
+    the window is UNKNOWN."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [older, newer], epoch)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert "minimum" in d["seven_day"]["rate_refused"], d
+
+
+def test_a_span_under_the_minimum_at_the_ceiling_stays_critical(tmp_path: Path) -> None:
+    """The refusal grades nothing below the ceiling band."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=99.0, seven_epoch=epoch)
+    write_history(tmp_path, [(0.3, 98.0), (0.1, 99.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+
+
+def _drop_reset(state: Path) -> None:
+    """Remove the published window's reset, as a reading that carried none."""
+    doc = latest(state)
+    del doc["seven_day"]["resets_at_epoch"]
+    (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
+def test_a_history_row_far_ahead_of_now_refuses_the_rate(tmp_path: Path) -> None:
+    """BACKLOG #5494. 80 to 86 over 18 minutes runs out in about 42 minutes, before the reset in two
+    hours. A row dated ten hours ahead stretched the span to 620 minutes, so the rate read 0.6 percent an
+    hour and the window graded WARN, not projected to run out. Past the clock-skew tolerance a row is
+    refused, the rate with it, and the window reads UNKNOWN."""
+    epoch = int(time.time()) + 7200
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(20.0, 80.0), (2.0, 86.0), (-600.0, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert "FUTURE" in d["seven_day"]["rate_refused"].upper(), d
+    assert "FUTURE" in d["seven_day"]["reason"].upper(), d
+    # The control: the same rows with nothing ahead project the run-out.
+    write_history(tmp_path, [(20.0, 80.0), (2.0, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["rate_refused"] is None, d
+
+
+@pytest.mark.parametrize("stamp_resets", [True, False], ids=["reset-column", "no-reset-column"])
+def test_with_no_reset_time_rows_across_a_reset_give_no_rate(
+    tmp_path: Path, stamp_resets: bool
+) -> None:
+    """BACKLOG #5494. With no reset on the reading, the rows' reset filter was skipped, so the last
+    window's 60 to 95 diluted this window's 0 to 60 in 28 minutes, and the reading graded OK. A reset in
+    the rows, by their reset column or by a fall, refuses the rate. A fall is a reset because usage does
+    not fall inside a window."""
+    old_epoch, new_epoch = int(time.time()) - 1800, int(time.time()) + 280000
+    publish(tmp_path, seven=60.0)
+    _drop_reset(tmp_path)
+    resets = [old_epoch, old_epoch, new_epoch, new_epoch]
+    write_history(
+        tmp_path,
+        [(80.0, 60.0), (50.0, 95.0), (30.0, 0.0), (2.0, 60.0)],
+        extra=[{"seven_reset": e} for e in resets] if stamp_resets else None,
+    )
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert "reset" in d["seven_day"]["rate_refused"], d
+
+
+def test_with_no_reset_time_rows_of_one_window_still_give_a_rate(tmp_path: Path) -> None:
+    """The control: the same reading over this window's rows alone keeps its rate."""
+    publish(tmp_path, seven=60.0)
+    _drop_reset(tmp_path)
+    write_history(tmp_path, [(30.0, 0.0), (2.0, 60.0)])
+    _, d = read(tmp_path)
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(128.6, abs=1), d
+    assert d["seven_day"]["rate_refused"] is None, d
+
+
+def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) -> None:
+    """BACKLOG #5494, finding S33-100. A collector of another root wired to publish here leaves rows in
+    this root's history. One at 85 an hour and a half back diluted this root's 80 to 86 in 18 minutes to
+    0.8 percent an hour, and the window graded WARN where it runs out before the reset. Rows stamped
+    with another root are skipped, as a window stamped with one is refused; unstamped rows still count."""
+    root = tmp_path / "root"
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 7200
+    publish(state, seven=86.0, seven_epoch=epoch)
+    _stamp(state, root)
+    stamps = [{"config_root_env": str(tmp_path / "other-root")}, {"config_root_env": str(root)}, {}]
+    write_history(state, [(80.0, 85.0), (20.0, 80.0), (2.0, 86.0)], epoch, extra=stamps)
+    code, d = read(state)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=1), d
 
 
 def test_a_fast_burn_is_a_rate(tmp_path: Path) -> None:

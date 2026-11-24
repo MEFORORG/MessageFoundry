@@ -333,7 +333,8 @@ try {
     # no reset, one higher than the published window for the same gone reset, and one with a later reset
     # than the published window. Nothing here reads the clock against a lone reading. The reader reports
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
-    # row can still be read: with no current reset, usage.ps1's rate skips its reset filter.
+    # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
+    # so it refuses any that show one.
     #
     # AN EQUAL READING IS REFUSED TOO. The payload carries no time of its own, so an idle session's
     # cached number looks like a live flat one. Restamping it let one idle terminal keep a frozen number
@@ -448,10 +449,13 @@ try {
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
         if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch) {
+            # STAMPED WITH THE ROOT THAT OBSERVED IT, as the window is, so usage.ps1's rate can skip a row
+            # another root's collector wrote here when it was wired to publish into this directory.
             $row = [ordered]@{
-                at          = $now
-                seven_day   = $freshSeven
-                seven_reset = $seven.resets_at_epoch
+                at              = $now
+                seven_day       = $freshSeven
+                seven_reset     = $seven.resets_at_epoch
+                config_root_env = $stampEnv
             } | ConvertTo-Json -Compress
             Add-Content -LiteralPath $histPath -Value $row -Encoding UTF8
         }
