@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -1833,6 +1834,7 @@ _CHANGES = [
     "replace_same_size",
     "rewrite_same_size",
     "rewrite_same_size_same_mtime",
+    "metadata_only",
 ]
 
 
@@ -1842,6 +1844,13 @@ def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> by
     the ``*_same_size`` cases keep the size, so only the file id (replace), the mtime (rewrite) or the
     ctime alone (rewrite with the mtime put back) can."""
     body = old_log.read_bytes()
+    if change == "metadata_only":
+        # Only the ctime moves (an attribute flip, as backup software clears the archive bit): the
+        # content and the mtime are untouched. Past a coarse ctime tick first, as below.
+        time.sleep(0.05)
+        os.chmod(old_log, stat.S_IREAD)
+        os.chmod(old_log, stat.S_IREAD | stat.S_IWRITE)
+        return body
     if change == "append":
         with open(old_log, "ab") as fh:
             fh.write(late)
@@ -1889,8 +1898,9 @@ async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
 
     def verify_then_mutate(path, original, *, name):
         ok = real_verify(path, original, name=name)
-        if not path.endswith(".mftmp"):
-            # The window between the dest read-back and the unlink: a writer touches the source path.
+        if not path.endswith(".mftmp") and not expected:
+            # The window between the dest read-back and the unlink: a writer touches the source path
+            # (once; the code may read `dest` back again before removing a redundant archive).
             expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
         return ok
 
@@ -1904,8 +1914,16 @@ async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
     assert (
         old_log.exists() and old_log.read_bytes() == expected[0]
     )  # nothing written mid-pass is lost
-    # The validated archive of the ORIGINAL read is kept too: under rotation it may be the only copy.
-    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
+    archive = logs / "old.log.gz"
+    if change in ("append", "metadata_only"):
+        # The kept source still holds every archived byte, so the archive this pass placed is removed:
+        # left beside the source it would make every later pass skip this path, forever when no
+        # `app_log_days` window is set. The next pass retries.
+        assert not archive.exists()
+    else:
+        # The source no longer holds the archived bytes: under a replace the archive may be the only
+        # copy of the old content, so it is kept.
+        assert gzip.decompress(archive.read_bytes()) == body
     assert result.app_logs_compressed == 0 and result.app_log_bytes_reclaimed == 0
     assert "changed after its archive was placed" in caplog.text
 
@@ -2034,7 +2052,7 @@ async def test_app_log_compression_reports_a_source_that_vanished_after_placemen
 
     def verify_then_remove(path, original, *, name):
         ok = real_verify(path, original, name=name)
-        if not path.endswith(".mftmp"):
+        if not path.endswith(".mftmp") and old_log.exists():
             old_log.unlink()
         return ok
 

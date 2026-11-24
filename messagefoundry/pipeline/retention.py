@@ -199,6 +199,31 @@ def _source_change(source: str, read_st: os.stat_result) -> str | None:
     return None if _same_file_state(now_st, read_st) else "changed"
 
 
+def _source_still_holds(source: str, read_st: os.stat_result, data: bytes) -> bool:
+    """Whether ``source`` is still the same regular file as ``read_st`` (device and file id) and its
+    content still starts with ``data``, so an archive of ``data`` is redundant beside it. Any error is
+    False: the answer gates removing an archive, so it fails closed and keeps the archive."""
+    try:
+        fd = os.open(source, _SOURCE_OPEN_FLAGS)
+    except OSError:
+        return False
+    try:
+        now_st = os.fstat(fd)
+        if not stat.S_ISREG(now_st.st_mode) or not os.path.samestat(now_st, read_st):
+            return False
+        if hasattr(os, "O_NONBLOCK"):
+            os.set_blocking(fd, True)
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            return fh.read(len(data)) == data
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            log.debug("could not close a re-check descriptor", exc_info=True)
+
+
 def _unlink_quietly(path: str) -> None:
     """Best-effort removal of a staging file. A leftover ``*.gz.mftmp`` is inert (never a swept suffix,
     never mistaken for an archive), so a failure here is logged at debug and otherwise ignored."""
@@ -1344,7 +1369,9 @@ class RetentionRunner:
                     continue
                 saved = self._compress_one(entry.path, dest, atime=st.st_atime, mtime=st.st_mtime)
                 if saved is None:
-                    continue  # skipped or failed validation — the original is still in place
+                    # Not compressed by this call. The source path may still hold the original, or
+                    # may now hold changed content or nothing at all (see `_compress_one`).
+                    continue
                 compressed += 1
                 reclaimed += saved
             except OSError:
@@ -1502,7 +1529,8 @@ class RetentionRunner:
             # The artifact at `dest` is deliberately NOT removed: under a concurrent compressor it may be
             # a VALID archive of a longer read of the same log whose source is already gone, and deleting
             # that would be the very data loss this check exists to prevent. It is inert (the next pass
-            # skips a source whose `<name>.gz` exists) and the `app_log_days` window still ages it out.
+            # skips a source whose `<name>.gz` exists), and only an `app_log_days` window, where one
+            # is set, ages it out.
             log.warning(
                 "app-log %r: the archive did not validate AFTER being renamed into place; the original "
                 "is kept and NOT counted as compressed. The unvalidated %r needs an operator's review.",
@@ -1512,13 +1540,35 @@ class RetentionRunner:
             return None
         change = _source_change(source, read_st)
         if change is not None:
-            # The archive validates against the bytes read at the START; the source path no longer holds
-            # exactly those (appended to, truncated, replaced by a rotation, or gone). Removing it would
-            # destroy whatever was written since, so leave the path alone AND keep the validated archive
-            # (under a rotation it may be the only copy of the old content). Not counted as compressed.
-            # The next pass skips this source while `<name>.gz` exists, silently; only an
-            # `app_log_days` window ages the two out, so with none set the path is never compressed
-            # again until an operator removes the archive, and this warning is the only signal.
+            # The archive validates against the bytes read at the START; the source path no longer
+            # matches them (appended to, a metadata-only change, truncated, replaced by a rotation, or
+            # gone). Removing it would destroy whatever was written since, so the path is left alone.
+            # Not counted as compressed. A `<name>.gz` left here would make every later pass skip this
+            # path silently, forever with no `app_log_days` window, so the archive THIS pass placed is
+            # removed whenever the kept source still holds every archived byte (same file, `data` as
+            # its prefix): it is then redundant and the next pass retries. Otherwise it is kept,
+            # because under a replace it may be the only copy of the old content.
+            if _source_still_holds(source, read_st, data) and _verify_archive(
+                dest, data, name=name
+            ):
+                try:
+                    os.remove(dest)
+                except OSError:
+                    log.warning(
+                        "app-log %r: the redundant archive %r could not be removed; the path is "
+                        "skipped until it is",
+                        name,
+                        os.path.basename(dest),
+                    )
+                else:
+                    log.warning(
+                        "app-log %r: the source %s after its archive was placed; the source is kept "
+                        "and holds every archived byte, so the archive was removed and the next pass "
+                        "retries",
+                        name,
+                        change,
+                    )
+                    return None
             log.warning(
                 "app-log %r: the source %s after its archive was placed; the source path is left "
                 "alone and NOT counted as compressed. %r holds the bytes read before that.",
