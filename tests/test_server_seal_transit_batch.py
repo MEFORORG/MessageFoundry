@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The PostgreSQL and SQL Server at-open seal opens many cells per Transit request (vault BACKLOG
+"""The PostgreSQL and SQL Server at-open seal encrypts many cells per Transit request (vault BACKLOG
 #6706).
 
 All three stores' seals now encrypt each page in chunks through ``row_seal.seal_chunks``. The two
@@ -316,8 +316,8 @@ class _LoggedMssqlCursor(_MssqlCursor):
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 async def test_a_single_value_cipher_writes_each_value_before_the_next_call(backend: str) -> None:
-    """A cipher that sends values one at a time gets one value per chunk, so the seal's
-    transaction is never idle for more than one call, as before batching."""
+    """A cipher with no batch path gets one value per chunk, so on the server stores each encrypt
+    is followed by its write. A Transit cipher sending values alone is not covered by this."""
     log: list[str] = []
     store: PostgresStore | SqlServerStore
     if backend == "postgres":

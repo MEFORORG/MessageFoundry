@@ -608,10 +608,11 @@ async def seal_chunks(
     The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
     :func:`cell_aad` over ``aad_cols``. For a :class:`BatchCipher`, a chunk is cut at
     :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64. That is the cost
-    ``TransitCipher.encrypt_many`` cuts its requests by, so while it batches one chunk is one
-    request. A cancelled seal then leaves at most that request's values running on in the Transit
-    pool. A value over the character bound is a chunk of its own. Once a Transit cipher sends values
-    alone, one chunk can still be up to :data:`BATCH_MAX_ITEMS` requests. Any other cipher gets one
+    ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch is
+    one request. A value over the character bound is a chunk of its own. A chunk Transit refuses,
+    or any chunk once the cipher sends values alone, can take up to one request per value more, so
+    a cancelled seal can leave up to :data:`BATCH_MAX_ITEMS` values running on in the Transit pool,
+    and the seal's transaction waits across those requests. Any other cipher gets one
     value per chunk, so each call is followed by its write and no sizing copy of the plaintext is
     made. Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as
     that does."""
