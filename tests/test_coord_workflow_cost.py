@@ -1108,6 +1108,32 @@ def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
     assert not mod.price_script(script).exact, label
 
 
+@pytest.mark.parametrize(
+    ("script", "agent_lines"),
+    [
+        ("const s = `${await agent(1)}`\n", [1]),
+        ("const R = [1, 2, 3]\nconst s = `${await parallel(R.map(r => () => agent(r)))}`\n", [2]),
+        ("const R = [1, 2, 3]\nconst s = `${Promise.all(R.map(r => agent(r)))}`\n", [2]),
+        ("const R = [1, 2]\nconst s = `${R.map(agent)}`\n", [2]),
+        ("const s = `a ${`b ${await agent(1)}`}`\n", [1]),
+        ("const s = `${(await agent(1)) + `${agent(2)}`}`\n", [1, 1]),
+        ("const s = `x${ /* c */ agent?.(1)}`\n", [1]),
+        ("const s = tag`${agent(1)}`\n", [1]),
+        ("const f = r => `${agent(r)}`\nawait f(1)\n", [1]),
+    ],
+)
+def test_an_agent_inside_a_template_interpolation_is_residue_not_zero(
+    mod: ModuleType, script: str, agent_lines: list[int]
+) -> None:
+    """BACKLOG #7599: the mask blanks a template whole, ``${...}`` included, so no pricer sees a
+    call there. Before PR 2982 each of these priced 0 agents as EXACT; ``_residue`` now reads the
+    raw text of every interpolation, so each ``agent`` there is an ``unattributed`` term and the
+    total is a floor. Pinned so a mask change cannot reopen the silent zero."""
+    cost = mod.price_script(script)
+    assert not cost.exact
+    assert [u.line for u in cost.unknowns if u.kind == "unattributed"] == agent_lines
+
+
 def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:
     """An agent in a body nobody calls by name may still run, passed as a value: say so."""
     script = "function review(r) { return agent(r) }\n"
