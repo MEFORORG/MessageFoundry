@@ -45,6 +45,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
+from messagefoundry.pipeline.stage_dispatcher import LaneResultKind, StageDispatcher
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, SandboxRefusalOvertaken
 from messagefoundry.redaction import safe_text
 from messagefoundry.store import Stage
@@ -397,7 +398,7 @@ async def test_a_refusal_overtaken_by_a_graph_change_alerts_when_the_graph_retur
                 )
             assert sink.refused == []
             assert "IB_PARITY" not in runner._sandbox_sessions
-            await runner._await_sandbox_closes()  # the close runs off the worker (BACKLOG #6830)
+            await _detached_closes(runner)  # the close runs off the worker (BACKLOG #6830)
             assert session._closed
             runner.registry = copy.copy(registry)  # an equal graph is served again
             with pytest.raises(SandboxWorkerRefused) as refused:
@@ -449,10 +450,15 @@ async def test_a_failed_close_of_an_overtaken_session_still_re_pends(
             assert isinstance(closed.value.__cause__, SandboxWorkerRefused)
             assert sink.refused == []
             with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.wiring_runner"):
-                await runner._await_sandbox_closes()  # the close runs off the worker
-            assert any(
-                "IB_X" in r.getMessage() and "close" in r.getMessage() for r in caplog.records
-            )
+                await _detached_closes(runner)  # the close runs off the worker
+            warned = [
+                r.getMessage()
+                for r in caplog.records
+                if r.name == "messagefoundry.pipeline.wiring_runner"
+                and r.levelno == logging.WARNING
+                and "could not close the sandbox session" in r.getMessage()
+            ]
+            assert len(warned) == 1 and "'IB_X'" in warned[0] and "OSError" in warned[0], warned
         finally:
             runner._sandbox_sessions.clear()
             await runner._close_sandbox_sessions()
@@ -465,8 +471,9 @@ async def test_a_slow_close_of_an_overtaken_session_does_not_hold_the_dispatch(
 ) -> None:
     """The graph-overtaken branch closes the session it discards OFF the inbound's worker
     (BACKLOG #6830): the dispatch re-pends at once while the close still runs, so a slow close
-    cannot stall routing or transform. The close is not dropped: the session teardown, which a
-    reload and :meth:`RegistryRunner.stop` both run, waits for it."""
+    cannot stall routing or transform. The close is not dropped: it is tracked with the detached
+    closes the teardown of :meth:`RegistryRunner.stop` waits for. A reload's session close does
+    not wait for it, since a reload holds its lock with every listener unbound."""
     registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     other = graph_shape(Registry(code_digest="1" * 64))
@@ -487,16 +494,22 @@ async def test_a_slow_close_of_an_overtaken_session_does_not_hold_the_dispatch(
             session = runner._sandbox_for("IB_X")
             assert session is not None
             session.close = slow_close  # type: ignore[method-assign]
+            before = set(runner._lookup_close_tasks)
             with pytest.raises(SandboxSessionClosed):
                 await asyncio.wait_for(runner._off_loop_sandboxed("IB_X", dispatch, registry), 5)
             assert not closed.is_set()  # the dispatch came back with the close still running
             assert "IB_X" not in runner._sandbox_sessions
-            teardown = asyncio.ensure_future(runner._close_sandbox_sessions())
-            await asyncio.sleep(0.2)
-            assert not teardown.done()  # it waits for the pending close
+            pending = set(runner._lookup_close_tasks) - before
+            # Tracked, so the stop teardown waits for them: one per discarded session, the first
+            # and the one its immediate retry made, since the registry is still the one served.
+            assert len(pending) == 2
+            # A reload's session close returns without waiting on it.
+            await asyncio.wait_for(runner._close_sandbox_sessions(), 5)
+            assert not closed.is_set()
             release.set()
-            await asyncio.wait_for(teardown, 10)
+            await asyncio.wait_for(asyncio.wait(pending), 10)
             assert closed.is_set()
+            assert not pending & runner._lookup_close_tasks  # dropped once it ended
         finally:
             release.set()
             runner._sandbox_sessions.clear()
@@ -545,10 +558,18 @@ async def test_an_overtaken_refusal_re_pends_with_no_error_traceback(
         raise SandboxSessionClosed("closed twice")
 
     monkeypatch.setattr(runner, body_attr, raiser)
+    slept: list[float] = []
+    real_sleep = runner._stop_or_sleep
+
+    async def recording_sleep(seconds: float) -> bool:
+        slept.append(seconds)
+        return await real_sleep(seconds)
+
+    monkeypatch.setattr(runner, "_stop_or_sleep", recording_sleep)
     with caplog.at_level(logging.DEBUG, logger=wiring_runner.log.name):
         task = asyncio.ensure_future(getattr(runner, worker_attr)("IB"))
         try:
-            await _until(lambda: store.rescheduled, timeout=5.0)
+            await _until(lambda: store.rescheduled and slept, timeout=5.0)
         finally:
             runner._stop.set()
             for ev in (runner._work, runner._ingress_work, runner._routed_work):
@@ -556,17 +577,58 @@ async def test_an_overtaken_refusal_re_pends_with_no_error_traceback(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     assert store.rescheduled[0] == ["row-1"]  # re-pended either way
+    assert slept[0] == wiring_runner._WORKER_ERROR_BACKOFF_SECONDS  # and the back-off stays
     records = [r for r in caplog.records if r.name == wiring_runner.log.name]
     assert records  # the arm wrote something, so the absence checks below are over a real log
     errors = [r for r in records if r.levelno >= logging.ERROR or r.exc_info]
     if overtaken:
         assert errors == [], [r.getMessage() for r in errors]
         assert any(
-            r.levelno == logging.INFO and "'IB'" in r.getMessage() and "re-pend" in r.getMessage()
+            r.levelno == logging.INFO and "'IB'" in r.getMessage() and "overtook" in r.getMessage()
             for r in records
         ), [r.getMessage() for r in records]
     else:
         assert any(r.levelno >= logging.ERROR and r.exc_info for r in errors)
+
+
+@pytest.mark.parametrize("overtaken", [True, False], ids=["overtaken", "control_infra_fault"])
+def test_the_pooled_dispatcher_re_pends_an_overtaken_refusal_as_a_hand_back(
+    overtaken: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The default claim mode, pooled (BACKLOG #6830): an overtaken refusal escaping the per-item
+    body re-pends the head on the base backoff with one INFO line and no traceback, as a hand-back,
+    so it neither counts toward the infra-fault STOP nor resets that count. CONTROL: any other
+    exception there is still a T17 infra fault, logged at ERROR with its traceback."""
+    dispatcher = StageDispatcher(
+        Stage.INGRESS,
+        cast(Any, None),
+        process_item=cast(Any, None),
+        lane_provider=set,
+        per_lane_limit=1,
+        clock=lambda: 1000.0,
+    )
+    exc: Exception = (
+        SandboxRefusalOvertaken("overtaken") if overtaken else SandboxSessionClosed("closed twice")
+    )
+    items = [cast(Any, type("Row", (), {"id": f"row-{n}"})()) for n in (1, 2)]
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.stage_dispatcher"):
+        outcome, tail, head = dispatcher._infra_fault_outcome("IB", items, 0, exc)
+    assert tail == ["row-2"] and head is not None and head[0] == "row-1"
+    assert outcome.kind is LaneResultKind.RETRY and outcome.park_until == head[1]
+    records = [r for r in caplog.records if r.name == "messagefoundry.pipeline.stage_dispatcher"]
+    assert records
+    if overtaken:
+        assert not outcome.is_infra_fault and outcome.hand_back
+        assert all(r.levelno == logging.INFO and not r.exc_info for r in records)
+    else:
+        assert outcome.is_infra_fault and not outcome.hand_back
+        assert any(r.levelno >= logging.ERROR and r.exc_info for r in records)
+
+
+async def _detached_closes(runner: RegistryRunner) -> None:
+    """Wait for the detached closes the runner tracks for its stop teardown."""
+    if runner._lookup_close_tasks:
+        await asyncio.wait(set(runner._lookup_close_tasks))
 
 
 async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(

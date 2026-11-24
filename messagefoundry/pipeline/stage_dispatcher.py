@@ -97,6 +97,14 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
     return min(float(base * (2 ** min(max(exp, 0), 20))), cap)
 
 
+class RependWithoutFault(Exception):  # noqa: N818 - a marker mixin, not an error of its own
+    """A mixin for an exception a per-item body raises to hand its row back when nothing failed,
+    such as a sandbox refusal a reload overtook (BACKLOG #6830). :meth:`StageDispatcher._drain_lane`
+    re-pends the head on the base backoff, as for an infra fault, but logs one INFO line with no
+    traceback, does not escalate the backoff, and neither counts it toward the infra-fault STOP
+    nor resets that count, as for any zero-progress hand-back."""
+
+
 class HoldResult(Enum):
     """How a hold on a failed re-pend of claimed rows ended (BACKLOG #1611): the pooled
     :meth:`StageDispatcher._land_while_holding` and the per-lane
@@ -2101,6 +2109,28 @@ class StageDispatcher:
         # NOT-due (collapsing the spin). A zero-progress (i==0) fault escalates the backoff by the
         # lane's streak; a fault that made forward progress (i>0) resets the streak (fix B terminal
         # block), so it retries at the base backoff.
+        head_id = items[i].id
+        tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
+        if isinstance(exc, RependWithoutFault):
+            # Not a fault (BACKLOG #6830): the base backoff, no traceback, and a hand-back, which
+            # leaves the infra streak as it was, so a run of reloads neither stops the lane through
+            # it nor resets a real fault's count toward the STOP.
+            park_until = self._clock() + self._infra_backoff(0)
+            log.info(
+                "StageDispatcher %s lane %s: item %d handed back (%s); re-pending head until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                type(exc).__name__,
+                park_until,
+            )
+            return (
+                _LaneOutcome(
+                    LaneResultKind.RETRY, park_until, made_progress=(i > 0), hand_back=True
+                ),
+                tail,
+                (head_id, park_until),
+            )
         st = self._states.get(lane)
         streak = st.infra_error_streak if (st is not None and i == 0) else 0
         park_until = self._clock() + self._infra_backoff(streak)
@@ -2113,8 +2143,6 @@ class StageDispatcher:
             park_until,
             exc_info=exc,
         )
-        head_id = items[i].id
-        tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
         return (
             _LaneOutcome(
                 LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)

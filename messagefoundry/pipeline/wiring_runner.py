@@ -248,6 +248,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
     RependFence,
+    RependWithoutFault,
     StageDispatcher,
     _capped_backoff,
     wait_to_retry,
@@ -682,11 +683,12 @@ class _SendGated(Exception):
     does."""
 
 
-class SandboxRefusalOvertaken(SandboxSessionClosed):
+class SandboxRefusalOvertaken(SandboxSessionClosed, RependWithoutFault):
     """A sandbox refusal a reload, a rollback, a stop or a graph swap overtook, raised as a close
     (BACKLOG #6830; :meth:`RegistryRunner._sandboxed_dispatch` says when). It is retried or
-    re-pended as any close is, but a per-lane worker's fault arm logs its re-pend at INFO with no
-    traceback, since what overtook it is not a fault. The message's rerun compares again, and a
+    re-pended as any close is, but a per-lane worker's fault arm, and the pooled dispatcher
+    (:class:`~messagefoundry.pipeline.stage_dispatcher.RependWithoutFault`), log its re-pend at INFO
+    with no traceback, since what overtook it is not a fault. The message's rerun compares again, and a
     refusal there alerts and dead-letters as before."""
 
 
@@ -698,11 +700,12 @@ _WORKER_ERROR_BACKOFF_SECONDS = 1.0
 def _log_overtaken_repend(worker: str, name: str) -> None:
     """The fault arm's line for a :class:`SandboxRefusalOvertaken` (BACKLOG #6830): INFO, with no
     traceback and outside the worker's fault run, as the retry line in
-    :meth:`RegistryRunner._off_loop_sandboxed` is. The arm still re-pends and backs off: the back-off
-    bounds how fast a run of reloads can make the lane spawn and refuse workers."""
+    :meth:`RegistryRunner._off_loop_sandboxed` is. The arm still hands the row back and backs off:
+    the back-off bounds how fast a run of reloads can make the lane spawn and refuse workers. A
+    hand-back that does not land is logged by the arm's own re-pend path."""
     log.info(
-        "%s worker %r: a reload or graph change overtook a sandbox worker's refusal; re-pending "
-        "the message to compare again",
+        "%s worker %r: a reload, a stop or a graph change overtook a sandbox worker's refusal; "
+        "handing the message back to be compared again",
         worker,
         name,
     )
@@ -2118,8 +2121,6 @@ class RegistryRunner:
                 # says why, and _sandbox_for why no config dir is exempt.
                 raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
-        # Closes of sessions an overtaken refusal dropped, run off the worker (BACKLOG #6830).
-        self._sandbox_closing: set[asyncio.Future[None]] = set()
         # The running reload's step-3 connectors, built before its quiesce (BACKLOG #5755), set
         # under ``_reload_lock`` only for the step-3 call that takes them.
         self._outbound_plan: _OutboundPlan | None = None
@@ -7379,41 +7380,35 @@ class RegistryRunner:
             return cached[1]
 
     def _close_sandbox_session_later(self, name: str, session: SandboxSession) -> None:
-        """Close ``session``, already dropped from ``_sandbox_sessions``, in a task of its own, so
+        """Close ``session``, already dropped from ``_sandbox_sessions``, in a detached task, so
         the inbound's worker does not wait on it (BACKLOG #6830): a close waits on a process and
         joins its drains, and the worker would stall routing or transform for as long. The task is
-        held until it ends, and :meth:`_close_sandbox_sessions`, which a reload and :meth:`stop`
-        both run, waits for it, so the close is neither dropped nor left running past a stop."""
+        tracked as the lookup executors' detached closes are (:meth:`_track_detached_close`), so the
+        teardown of :meth:`stop` waits for it, on the same terms, and a reload does not: a reload
+        holds ``_reload_lock`` with every listener unbound, and must not wait on a close queued
+        behind a sibling worker's dispatch. Until it ends, that inbound can briefly run two worker
+        processes, the one being reaped and the one its retry starts."""
 
         async def close() -> None:
             try:
                 await asyncio.to_thread(session.close)
-            except Exception:  # noqa: BLE001 - logged; the session is already dropped
+            except Exception as exc:  # noqa: BLE001 - logged by type; the session is already dropped
                 # A failed close leaves at most a worker for the collector. It is not the
-                # message's fault, and the dispatch that dropped the session has re-pended it.
+                # message's fault, and the dispatch that dropped the session raised it as a close.
                 log.warning(
-                    "inbound %r: could not close the sandbox session a graph change overtook",
+                    "inbound %r: could not close the sandbox session a graph change overtook (%s)",
                     name,
+                    type(exc).__name__,
                 )
 
-        task = asyncio.ensure_future(close())
-        self._sandbox_closing.add(task)
-        task.add_done_callback(self._sandbox_closing.discard)
-
-    async def _await_sandbox_closes(self) -> None:
-        """Wait for every close :meth:`_close_sandbox_session_later` started. ``asyncio.wait``,
-        not ``gather``, so a teardown that is itself cancelled does not cancel them."""
-        if self._sandbox_closing:
-            await asyncio.wait(set(self._sandbox_closing))
+        self._track_detached_close(asyncio.create_task(close()))
 
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
         a process. A no-op unless a worker sandbox mode spawned any. The next dispatch on an
         inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
         holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
-        dead-lettered as a Router or Handler fault. It also waits for any close an overtaken
-        refusal started off its worker (:meth:`_close_sandbox_session_later`)."""
-        await self._await_sandbox_closes()
+        dead-lettered as a Router or Handler fault."""
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -7522,8 +7517,8 @@ class RegistryRunner:
         **An overtaken refusal is a close, not a refusal** (BACKLOG #6830):
         :meth:`_sandboxed_dispatch` says which refusals are overtaken, and raises each as
         :class:`SandboxRefusalOvertaken`, a :class:`SandboxSessionClosed`, so it is retried or
-        re-pended exactly as above, raises no alert and is not dead-lettered. A per-lane worker
-        logs that re-pend at INFO with no traceback, and still backs off. The message's next run
+        re-pended exactly as above, raises no alert and is not dead-lettered. Both claim modes log
+        that re-pend at INFO with no traceback, and still back off. The message's next run
         compares again, and that refusal, if the cause still stands, is the one that alerts and
         dead-letters, whether or not any further message arrives."""
         try:
