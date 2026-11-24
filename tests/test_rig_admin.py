@@ -143,7 +143,7 @@ def test_the_rig_computes_the_engines_totp_codes() -> None:
     assert rigadmin._totp_code(spaced, 1e9) == totp.totp(key, now=1e9)
 
 
-@pytest.mark.parametrize("key", ["", "not base32!", "1" * 32, "A" * 25, "AA"])
+@pytest.mark.parametrize("key", ["", "not base32!", "1" * 32, "A" * 25, "A" * 31, "AA"])
 def test_a_key_that_is_not_base32_or_too_short_is_refused_by_name_and_never_by_value(
     key: str,
 ) -> None:

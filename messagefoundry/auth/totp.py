@@ -107,8 +107,8 @@ def _decode_secret(secret: str) -> bytes:
     Raises :class:`RefusedTotpSecret` for a key shorter than :data:`_MIN_SECRET_BYTES`, a
     whitespace-only secret's zero-length key included, so no code is ever computed from one
     (BACKLOG #5340). A value that is not base32, a non-ASCII one included, still raises
-    :class:`binascii.Error` (a :class:`ValueError`): ciphertext a keyless store open passes through
-    looks the same, and callers keep that apart from a known refusal."""
+    :class:`binascii.Error` (a :class:`ValueError`), which the service's TOTP state reads as
+    "could not be judged" rather than as a known refusal, as it did before BACKLOG #5340."""
     cleaned = secret.strip().replace(" ", "")
     # Before upper(), which maps some non-ASCII letters into the alphabet ("ss" from U+00DF).
     if not cleaned.isascii():
@@ -205,11 +205,12 @@ def _marker(params: TotpParameters) -> str:
 def new_enrolment(secret: str) -> str:
     """The stored form of a new enrolment of ``secret``: the bare base32 secret marked with
     :data:`DEFAULT_PARAMETERS`, which :func:`otpauth_uri` then advertises and every code check
-    computes with. A ``secret`` already in the stored form is returned unchanged once it parses,
-    whichever compiled-in set it names, with its secret in canonical form. A ``secret`` that is
-    empty, not base32, or decodes to fewer than :data:`_MIN_SECRET_BYTES` bytes raises
-    :class:`RefusedTotpSecret` (BACKLOG #5340), so no stored enrolment carries a weak or
-    undecodable key.
+    computes with. A ``secret`` already in the stored form keeps the compiled-in set it names once
+    it parses. A ``secret`` that is empty, not base32, or decodes to fewer than
+    :data:`_MIN_SECRET_BYTES` bytes raises :class:`RefusedTotpSecret` (BACKLOG #5340), so no stored
+    enrolment carries a weak or undecodable key. A malformed or refused marker, an empty secret
+    after one included, raises its parent :class:`RefusedEnrolment` from :func:`parse_enrolment`;
+    catch that class to catch both.
 
     The secret is stored CANONICAL: upper case, no whitespace, no padding, as
     :func:`generate_secret` makes it. :func:`otpauth_uri` advertises the stored text, so the
@@ -220,9 +221,7 @@ def new_enrolment(secret: str) -> str:
     bare, params = parse_enrolment(stored)
     try:
         key = _decode_secret(bare)
-    except RefusedEnrolment:
-        raise
-    except ValueError as exc:  # binascii.Error: not base32, so no key
+    except binascii.Error as exc:  # not base32, so no key
         raise RefusedTotpSecret("the TOTP secret is not base32") from exc
     return f"{_marker(params)}:{base64.b32encode(key).decode('ascii').rstrip('=')}"
 
@@ -246,7 +245,10 @@ def parse_enrolment(stored: str) -> tuple[str, TotpParameters]:
 
 def reenrolment_possible() -> bool:
     """Whether any enrolment this release accepts can differ from its default, so a caller can skip
-    opening a cell only to learn that :func:`needs_reenrolment` is false."""
+    opening a cell only to learn that :func:`needs_reenrolment` is false. It counts parameter sets
+    only: a stored key under :data:`_MIN_SECRET_BYTES` also makes :func:`needs_reenrolment` true,
+    and a caller that skips on this does not see one. :func:`new_enrolment` refuses such a key, so
+    one reaches a cell only by a write that bypasses it (BACKLOG #5340)."""
     return any(params != DEFAULT_PARAMETERS for params in _COMPILED_PARAMETERS)
 
 

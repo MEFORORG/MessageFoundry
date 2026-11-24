@@ -3262,8 +3262,8 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
-    refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
-    open, or the value could not be computed with).
+    refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"``
+    (it could not be judged: the cell did not open, or the value could not be computed with).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
     the account and never the value. A keyless open hands the stored ciphertext through unchanged,
@@ -3313,7 +3313,8 @@ def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None
 def _opened_totp_state(secret: str | None) -> TotpState:
     """What an OPENED TOTP secret is (BACKLOG #3422): ``"usable"`` when the engine can compute
     codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
-    enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
+    enrolment marker this release refuses, a key too short to compute with, or no secret at all),
+    and ``"unknown"`` when it cannot
     tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
     gates ask it, and pass it to the store's writes as their TOTP rule. Only ``"refused"`` moves any
     decision away from the plain ``totp_enabled`` rule."""

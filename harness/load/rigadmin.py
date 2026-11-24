@@ -314,7 +314,7 @@ def _check_key(key: str) -> None:
     from messagefoundry.auth import totp
 
     refusal = RigAdminError(
-        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 160 bits"
+        f"{ADMIN_FACTOR_ENV} does not hold a base32 TOTP key of at least 160 bits "
         f"({_MIN_KEY_CHARS} characters)"
     )
     if len(key.strip().replace(" ", "").rstrip("=")) < _MIN_KEY_CHARS:
