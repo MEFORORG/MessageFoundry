@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -335,28 +336,49 @@ def test_a_first_take_that_fails_before_writing_leaves_no_empty_claim_file(repo:
 def test_concurrent_first_takes_from_different_worktrees_have_exactly_one_winner(
     repo: Path, tmp_path: Path
 ) -> None:
-    """Building the record before ``CreateNew`` must not move the exclusion off it (BACKLOG #7565)."""
+    """Building the record before ``CreateNew`` must not move the exclusion off it (BACKLOG #7565).
+
+    A smoke check, not a proof: the barrier below lines up the four starts, but nothing can force
+    every run to collide inside the take, so a broken exclusion may still pass a given run.
+    """
     trees = []
     for i in range(4):
         wt = tmp_path / f"wt{i}"
         git(repo, "worktree", "add", "-q", "-b", f"b{i}", str(wt))
         trees.append(wt)
-    procs = [
-        subprocess.Popen(
-            [
-                "pwsh", "-NoProfile", "-NonInteractive", "-File",
-                str(wt / "scripts" / "coord" / "claim.ps1"), "-Take", "k", "-Note", wt.name,
-            ],
-            cwd=str(wt),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        for wt in trees
-    ]  # fmt: skip
-    results = [(p.returncode, out) for p in procs for out, _ in [p.communicate(timeout=TIMEOUT)]]
-    winners = [out for rc, out in results if rc == 0 and "CLAIMED" in out]
+    # Every process spins until one shared instant, past pwsh start-up, then runs the take.
+    go = (datetime.now(UTC) + timedelta(seconds=8)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    procs: list[subprocess.Popen[str]] = []
+    try:
+        for wt in trees:
+            script = str(wt / "scripts" / "coord" / "claim.ps1").replace("'", "''")
+            command = (
+                f"$go = [DateTimeOffset]::Parse('{go}'); "
+                "while ([DateTimeOffset]::UtcNow -lt $go) { }; "
+                f"& '{script}' -Take 'k' -Note '{wt.name}'; exit $LASTEXITCODE"
+            )
+            procs.append(
+                subprocess.Popen(
+                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+                    cwd=str(wt),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            )
+        results = []
+        for p in procs:
+            out, err = p.communicate(timeout=TIMEOUT)
+            results.append((p.returncode, out, err))
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.communicate()
+    winners = [out for rc, out, _ in results if rc == 0 and "CLAIMED" in out]
     assert len(winners) == 1, results
-    assert all(rc == 1 for rc, out in results if out not in winners), results
+    assert all(rc == 1 and "BLOCKED" in out for rc, out, _ in results if out not in winners), (
+        results
+    )
     # The file holds the winner's whole record, never an empty or a second taker's one.
-    assert read_claim(repo, "k")["note"] in winners[0]
+    assert f"note : {read_claim(repo, 'k')['note']}" in winners[0]

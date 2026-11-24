@@ -1104,9 +1104,9 @@ $file = Join-Path $claims "$safe.json"
 # The record is built BEFORE the CreateNew below, never between it and the write (BACKLOG #7565). From
 # CreateNew until the handle closes the name exists at 0 bytes, and a failure or a kill in that span
 # leaves an empty claim file: no reader can name its holder, and the key stays blocked until someone
-# runs -Release -Force on it. With everything that can throw done first, the span holds only the Write
-# and its flush. A kill inside that span can still leave the empty file; the exclusion stays on
-# CreateNew, the primitive alloc.ps1 shares, rather than moving to a rename.
+# runs -Release -Force on it. With the record built first, the span holds only the Write. A failed
+# Write, or a kill inside the span, can still leave the empty file: this narrows the window and does
+# not close it. The exclusion stays on CreateNew, the primitive alloc.ps1 shares.
 $claim = [ordered]@{
     key      = $Take
     note     = if ($Note) { $Note } else { "(no note)" }
@@ -1278,9 +1278,6 @@ try {
 }
 try {
     $fs.Write($bytes, 0, $bytes.Length)
-    # Through to the disk before the handle closes, so a power loss after CLAIMED is printed does not
-    # leave the name with no bytes behind it.
-    $fs.Flush($true)
 } finally {
     $fs.Dispose()
 }
