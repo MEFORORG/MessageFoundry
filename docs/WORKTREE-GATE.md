@@ -187,8 +187,9 @@ pwsh -NoProfile -File scripts\worktree\rescue.ps1 -Name <task>
 ```
 
 It stashes the primary's changes (tracked **and** untracked), creates a worktree branched off the primary's
-**current commit** — not `origin/main`, so the stash applies cleanly — and pops it there. If any step
-fails, the work stays in `git stash list` and the script says so. Nothing is ever discarded.
+**current commit** — not `origin/main`, so the stash applies cleanly — and applies it there by its commit id,
+never a bare pop of the shared stack. If any step fails, the work stays in `git stash list` and the script
+says so. Nothing is ever discarded.
 
 ## Repairing a primary that is already detached or on the wrong branch
 

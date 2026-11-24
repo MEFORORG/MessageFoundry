@@ -2020,8 +2020,8 @@ pwsh -NoProfile -File scripts\worktree\rescue.ps1 -Name <task>
 ```
 
 [`rescue.ps1`](../scripts/worktree/rescue.ps1) stashes the primary's changes (tracked *and* untracked),
-creates a worktree branched off the primary's **current commit** so the stash applies cleanly, and pops it
-there. If any step fails the work stays in `git stash list` and the script says so — nothing is discarded.
+creates a worktree branched off the primary's **current commit** so the stash applies cleanly, and applies it
+there by its commit id, never a bare pop of the shared stack. If any step fails the work stays in `git stash list` and the script says so — nothing is discarded.
 
 Two deliberate limits. The gate lives in **user scope** because a hook committed to the project's
 `.claude/settings.json` sits on one branch and doesn't exist in the other worktrees until each merges it —
