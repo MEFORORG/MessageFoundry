@@ -11162,11 +11162,13 @@ class AuthService:
     ) -> None:
         """Log and audit each bound id-less row a pass skipped (BACKLOG #2027).
 
-        A row is marked once its audit row is written, and a marked row is not reported again in
-        this process. ``still_unkeyed`` is every such row, signed in or not; a mark is dropped only
-        when its row stops being one (unbound, locally disabled or removed). A row whose audit
-        write was refused stays unmarked, so a later pass that still finds it signed in logs it
-        and tries the audit again.
+        A row is marked once its audit row is written, and is not reported again while it stays
+        marked. ``still_unkeyed`` is every enabled bound id-less row the pass loaded, signed in or
+        not. A row missing from it loses its mark, so it can be reported again in this process; at
+        least an unbound, locally disabled or removed row goes missing, and so does one the load
+        leaves out. The loop stops at the first refused write, so the refused row and any behind it
+        stay unmarked. A later pass logs them and tries the audit again only if it finds them
+        signed in and reaches them.
 
         **Its own audit action, ``auth.ad_reconcile_binding_unkeyed``, not the outage row.**
         ``auth.ad_reconcile_skipped`` means the directory was unreachable and the accounts are fine.
@@ -11217,7 +11219,7 @@ class AuthService:
                     }
                 ),
             )
-            # Marked only once the audit row is written, so a failed write is retried next pass.
+            # Marked only once the audit row is written, so a later pass can retry a failed write.
             if not written:
                 # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
                 # acquire timeout behind a store that is refusing every write.
