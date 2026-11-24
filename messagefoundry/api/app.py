@@ -4775,7 +4775,7 @@ def create_app(
     alerts_settings: AlertsSettings | None = None,
     service_settings: ServiceStatusSettings | None = None,
     # The [tls] section POST /ai/chat and POST /alerts/test-email resolve their trust anchor and
-    # CRL from (BACKLOG #5527 item 8). None leaves both hops on the OS trust store with no CRL.
+    # CRL from (BACKLOG #5527 item 8), stashed on app.state. None stashes no [tls] policy.
     tls_settings: TlsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
@@ -5479,7 +5479,7 @@ def create_app(
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
         # [tls].crl_file as the other HTTP-family hops are. create_app stashes its tls_settings
-        # argument; where its caller passed none, None goes down.
+        # argument and an embedder may set the stash itself; with neither, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
@@ -13877,6 +13877,11 @@ def create_managed_app(
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
             app.state.secret_provider = secret_provider
+            # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
+            # read, re-stashed at start from the argument the live notifier and the connections
+            # read, so a stash written before start cannot split the two (create_app stashed it
+            # first, BACKLOG #5527 item 8).
+            app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail
             app.state.approval_gate = _build_approval_gate(

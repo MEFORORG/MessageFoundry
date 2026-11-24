@@ -531,10 +531,11 @@ def _no_redirect_opener(
     strict reply class every opener gets, BACKLOG #2052), which is why a
     connection needs one of these openers only when it carries an extra handler OR an anchor that
     ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`.
-    :func:`_verifying_opener` makes that choice.
+    :func:`_verifying_opener` makes that choice for the hops that call it.
 
-    ``connector`` is the hop label a refusal raised while the context is built or asserted names;
-    a hop outside the HTTP-family destinations passes its own (BACKLOG #5527 item 9)."""
+    ``connector`` is the hop label a refusal raised while the context is built or asserted names.
+    The AI broker's anchored opener passes its own (BACKLOG #5527 item 9); the shared opener is
+    built once, with the default."""
     return build_strict_opener(
         _NoRedirectHandler,
         build_anchored_https_handler(anchor=trust_anchor, connector=connector),
@@ -545,14 +546,13 @@ def _no_redirect_opener(
 def _verifying_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor,
-    connector: str = _HTTP_FAMILY_CELL,
 ) -> urllib.request.OpenerDirector:
     """The verifying, no-redirect opener for a hop with ``extra_handlers`` and ``trust_anchor``:
     rest.py's shared opener when there is no handler and the anchor narrows nothing, otherwise one
-    of the hop's own from :func:`_no_redirect_opener` (BACKLOG #5527 item 10). The one place the
-    hops that adopt it make that choice, so they cannot drift onto different tests of it."""
+    of the hop's own from :func:`_no_redirect_opener` (BACKLOG #5527 item 10). At least the
+    DICOMweb destination and the token hops call it."""
     if extra_handlers or trust_anchor.narrows:
-        return _no_redirect_opener(*extra_handlers, trust_anchor=trust_anchor, connector=connector)
+        return _no_redirect_opener(*extra_handlers, trust_anchor=trust_anchor)
     return _shared_no_redirect_opener()
 
 

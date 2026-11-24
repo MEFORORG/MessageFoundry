@@ -444,9 +444,9 @@ class _TokenEndpointProvider(abc.ABC):
         ):
             raise self.digest_proxy_refusal(connection)
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
-        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
-        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
-        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
+        # forward proxy) OR a trust anchor that ``narrows`` -- chosen by rest._verifying_opener
+        # (BACKLOG #5527 item 10), on the one ``narrows`` predicate the HTTP-family destinations
+        # read. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
         #
         # With an ECH sidecar the POST goes to the loopback sidecar, never to the token host, so the
         # opener is the plain one the REST destination's own ECH hop uses: no proxy, and no anchor

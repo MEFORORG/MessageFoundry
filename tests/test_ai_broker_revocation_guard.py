@@ -934,7 +934,7 @@ def test_an_opener_build_refusal_names_the_ai_hop_not_the_http_family(
     text = str(caught.value)
     assert "synthetic cipher assertion refused" in text
     assert "HTTP-family destination" not in text
-    assert "endpoint opener refused: [ai] " in text
+    assert "endpoint opener refused: AI endpoint: " in text
 
 
 def test_the_verifying_opener_is_shared_only_with_no_handler_and_no_narrowing_anchor(
@@ -980,7 +980,8 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
 ) -> None:
     """The ``GET /security/posture`` entry must not say a CRL is checked on a path where none is,
     whatever ``[tls].crl_file`` the instance names. Two such paths: a direct ``create_app`` whose
-    embedder passed no ``tls_settings``, so no ``crl_file`` reaches its route; and a
+    embedder passed no ``tls_settings`` and set no ``app.state.tls_settings``, so no ``crl_file``
+    reaches its route; and a
     loopback endpoint on an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve``
     stashes it, which ``resolve_trust_anchor`` exempts from the CRL. In both arms a ``crl_file``
     is configured where it would matter if reached: the loopback app holds it, and for the direct
