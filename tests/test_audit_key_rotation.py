@@ -832,8 +832,9 @@ async def test_the_roll_makes_its_handover_tag_through_cipher_call(
     open makes its handover-tag check, so a provider that blocks on I/O would run off the loop.
 
     The roll reaches that tag only under an in-heap key today (docs/CONNECTIONS.md, the Vault
-    Transit bulk-cipher row, says why). So this pins the route only. It cannot tell which MAC provider the call is keyed on, since both are ``None``
-    here, and under an in-heap key ``cipher_call`` runs the call inline."""
+    Transit bulk-cipher row, says why). So this pins the route only. It cannot tell keying on the
+    outgoing secret's MAC provider from keying on the store's ``_audit_mac_fn``, since both are
+    ``None`` here, and under an in-heap key ``cipher_call`` runs the call inline."""
     path = tmp_path / "r.db"
     a, b = generate_key(), generate_key()
     store = await _open(path, a)

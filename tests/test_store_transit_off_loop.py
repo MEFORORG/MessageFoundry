@@ -419,8 +419,8 @@ async def test_the_open_checks_a_transit_handover_tag_off_the_loop() -> None:
     assert threading.get_ident() not in transit.threads
 
 
-async def test_the_open_refuses_a_transit_handover_tag_that_does_not_verify() -> None:
-    """The control: the check still refuses a tag the outgoing key did not make."""
+async def test_a_transit_handover_tag_that_does_not_verify_is_read_as_a_break() -> None:
+    """The control: a tag the outgoing key did not make is read as a break; the store opens."""
     mac_fn = TransitCipher(_FakeClient(_RecordingTransit()), _KEY).audit_mac_fn()
     transit_id = store_module.AUDIT_TRANSIT_KEY_ID
     host = _RangeHost(mac_fn, _range_rows((b"\x02" * 32, None)))
