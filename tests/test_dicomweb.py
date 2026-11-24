@@ -21,6 +21,7 @@ import struct
 import urllib.error
 import urllib.request
 import warnings
+from pathlib import Path
 
 import pytest
 
@@ -973,28 +974,16 @@ class _AWarningAsError(UserWarning):
 @pytest.mark.parametrize("status", [200, 202])
 @pytest.mark.parametrize("capture", [False, True])
 @pytest.mark.parametrize(
-    ("fault", "code", "config_fault"),
+    "fault",
     [
-        pytest.param(TypeError("a value: 1.2.3.Canary"), "sent-uid-unread", False, id="TypeError"),
-        pytest.param(
-            _AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"),
-            "sent-uid-unread",
-            False,
-            id="warning",
-        ),
-        pytest.param(
-            RuntimeError("a value: 1.2.3.Canary"),
-            "sent-uid-unread",
-            False,
-            id="RuntimeError",
-        ),
+        pytest.param(TypeError("a value: 1.2.3.Canary"), id="TypeError"),
+        pytest.param(_AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"), id="warning"),
+        pytest.param(RuntimeError("a value: 1.2.3.Canary"), id="RuntimeError"),
     ],
 )
 async def test_dicomweb_a_pydicom_fault_of_any_class_refuses_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
     fault: Exception,
-    code: str,
-    config_fault: bool,
     capture: bool,
     status: int,
 ) -> None:
@@ -1017,10 +1006,10 @@ async def test_dicomweb_a_pydicom_fault_of_any_class_refuses_before_the_post(
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
     assert opener.requests == []  # nothing was sent
-    assert exc.value.code == code
+    assert exc.value.code == "sent-uid-unread"
     assert exc.value.permanent is True
-    assert exc.value.config_fault is config_fault
-    assert (exc.value.remedy is not None) is config_fault
+    assert exc.value.config_fault is False  # this object's alone, not the lane's
+    assert exc.value.remedy is None
     text = str(exc.value)
     assert type(fault).__name__ in text and "nothing was sent" in text
     assert "Canary" not in text  # the fault's text, which can carry a value, is not named
@@ -1063,11 +1052,12 @@ async def test_dicomweb_a_parse_failure_in_the_read_still_sends() -> None:
     assert len(opener.requests) == 1
 
 
-async def test_dicomweb_a_broken_dicom_extra_refuses_before_the_post(
+async def test_dicomweb_a_broken_dicom_extra_raises_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A pydicom missing a reader the deflate guard replays: the read refuses, before the POST, as
-    # a configuration fault.
+    # A pydicom missing a reader the deflate guard replays: the load raises its RuntimeError before
+    # the POST, an internal error as the SCU's own load raises (BACKLOG #5914, Manager decision of
+    # 2026-11-24: follow the SCU), never a verdict on the object.
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
@@ -1076,9 +1066,9 @@ async def test_dicomweb_a_broken_dicom_extra_refuses_before_the_post(
     dest = _dest()
     opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError) as exc:
+    with pytest.raises(RuntimeError, match="_read_file_meta_info") as exc:
         await dest.send(_carried(obj))
-    assert exc.value.code == "dicom-extra-unusable" and exc.value.config_fault is True
+    assert not isinstance(exc.value, NegativeAckError)
     assert opener.requests == []
 
 
@@ -1095,36 +1085,53 @@ def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
 
 
 @pytest.mark.parametrize("fault", [RuntimeError, SyntaxError, AttributeError, TypeError])
-async def test_dicomweb_an_extra_that_does_not_load_builds_and_stops_each_send_before_the_post(
+async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_each_post(
     monkeypatch: pytest.MonkeyPatch, fault: type[Exception]
 ) -> None:
     # A pydicom found on disk whose load raises (an import can raise any class; load_dcmread
-    # turns an ImportError into a RuntimeError): the build succeeds, and a send is a
-    # configuration fault before the POST, whatever the status. The patches stand for that host.
+    # turns an ImportError into a RuntimeError): the build succeeds, and a send raises what the
+    # load raised, before the POST, whatever the status. It is the SCU's class for the same
+    # fault (_store_object loads outside its handler): an internal error, which the runner's
+    # internal_error policy handles, not a permanent refusal. The patches stand for that host.
     from messagefoundry.transports import dicomweb
 
     def load() -> object:
-        raise fault("1.2.3.Canary")
+        raise fault("a broken pydicom")
 
     monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
     monkeypatch.setattr(dicomweb, "load_dcmread", load)
     dest = _dest()
     opener = _FakeOpener(body=STORED_OK.encode(), status=200)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError) as exc:
+    with pytest.raises(fault):
         await dest.send(PAYLOAD)
-    assert exc.value.code == "dicom-extra-unusable" and exc.value.config_fault is True
-    assert exc.value.remedy is not None and "restart" in exc.value.remedy
-    assert fault.__name__ in str(exc.value) and "Canary" not in str(exc.value)
-    assert exc.value.__cause__ is None and exc.value.__context__ is None
     assert opener.requests == []
 
 
-async def test_dicomweb_a_pydicom_blocked_in_sys_modules_stops_each_send_before_the_post(
+async def test_dicomweb_a_memory_error_in_the_extra_load_escapes_before_the_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.transports import dicomweb
+
+    def load() -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(dicomweb, "load_header_readers", load)
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(MemoryError):
+        await dest.send(PAYLOAD)
+    assert opener.requests == []
+
+
+async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_each_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A pydicom in sys.modules with no usable module: find_spec answers None for a None entry, so
-    # the extra is forced found here; load_dcmread's import then fails for real.
+    # the extra is forced found here; load_dcmread's import then fails for real, as its
+    # missing-extra RuntimeError.
     import sys
 
     from messagefoundry.transports import dicomweb
@@ -1134,10 +1141,76 @@ async def test_dicomweb_a_pydicom_blocked_in_sys_modules_stops_each_send_before_
     dest = _dest()
     opener = _FakeOpener(body=STORED_OK.encode(), status=200)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError) as exc:
+    with pytest.raises(RuntimeError, match="optional 'dicom' extra"):
         await dest.send(PAYLOAD)
-    assert exc.value.code == "dicom-extra-unusable" and exc.value.config_fault is True
     assert opener.requests == []
+
+
+def test_dicomweb_a_namespace_pydicom_directory_is_no_extra(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A pydicom directory with no __init__.py, as an uninstall can leave behind, is a namespace
+    # package: find_spec finds it, but it holds nothing to load, so it is taken as no extra
+    # (BACKLOG #5914 review). The search is held to that directory alone.
+    import importlib.util
+    import sys
+
+    from messagefoundry.transports import dicomweb
+
+    root = tmp_path
+    (root / "pydicom").mkdir()
+    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
+    monkeypatch.setattr(sys, "path", [str(root)])
+    spec = importlib.util.find_spec("pydicom")
+    assert spec is not None and spec.origin is None  # control: found, and a namespace package
+    assert dicomweb._dicom_extra_installed() is False
+
+
+def test_dicomweb_a_regular_pydicom_package_is_the_extra(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Negative control for the namespace case: the same directory with an __init__.py counts.
+    import sys
+
+    from messagefoundry.transports import dicomweb
+
+    root = tmp_path
+    (root / "pydicom").mkdir()
+    (root / "pydicom" / "__init__.py").write_text("", encoding="ascii")
+    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
+    monkeypatch.setattr(sys, "path", [str(root)])
+    assert dicomweb._dicom_extra_installed() is True
+
+
+async def test_dicomweb_the_data_set_pre_read_logs_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An object pydicom reads with a WARNING ("Expected implicit VR, but found explicit VR"): the
+    # pre-read holds pydicom's lines and writes none, as the object rides as bytes and the line
+    # says nothing of the send (BACKLOG #5914 review). The SCU holds its reads' lines the same way.
+    pytest.importorskip("pydicom")
+    obj = b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914"
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert await dest.send(_carried(obj)) is None
+    assert caplog.records == []
+    assert len(opener.requests) == 1
+
+
+def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Control for the test above: the same object, read outside the hold, does log a pydicom
+    # WARNING, so an empty capture there is the hold's doing.
+    pytest.importorskip("pydicom")
+    obj = b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        DicomPeek.parse(obj)
+    assert [r for r in caplog.records if r.name == "pydicom" and r.levelno == logging.WARNING]
 
 
 async def test_dicomweb_an_absent_dicom_extra_compares_the_file_meta_uid_alone(
