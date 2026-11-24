@@ -433,8 +433,8 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    `share_deadline`). From a 2 s clamp up the statement timeout expires within the clamp; under
 >    2 s it runs at 1 s and can overrun by up to a second. The heartbeat, refresh and release keep
 >    two windows, since none re-extends the lease. The load check and the warning are unchanged:
->    the check still counts two windows, so no config it refused loads, and the warning now
->    stands for the headroom the unbounded COMMIT needs.
+>    the check still counts two windows, so no config it refused loads, and whether the
+>    warning's `2 * clamp >= margin` predicate still earns its place is open.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
 >    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.

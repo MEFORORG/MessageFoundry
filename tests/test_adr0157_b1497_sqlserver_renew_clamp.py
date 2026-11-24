@@ -797,6 +797,24 @@ def test_the_load_check_still_covers_the_shared_claim(clamp: float) -> None:
     assert latest <= max(clamp, 2.0)  # the clamp itself from 2 s up, 2 s below it
 
 
+@pytest.mark.parametrize("step", ["heartbeat", "refresh"])
+async def test_only_the_claim_shares_its_deadline(step: str) -> None:
+    """The heartbeat and the config-version refresh re-extend no lease, so they keep two windows:
+    after the same 0.5 s borrow that cuts the claim's statement to 2 s (the timing test above),
+    each still runs its statement at the whole 3 s clamp (BACKLOG #5064)."""
+    conn = _Conn()
+    conn.columns = ("config_version",)
+    conn.row = (1,)
+    store = _store(conn)
+    store._pool = _SlowPool(conn, delay=0.5)
+    coord = SqlServerCoordinator(store, "A", lease_renew_timeout_seconds=3.0)
+    if step == "heartbeat":
+        await coord.heartbeat_once()
+    else:
+        await coord._refresh_config_version()
+    assert conn.statement_timeouts == [3]
+
+
 async def test_stop_bounds_both_its_writes_at_the_driver_by_its_own_bound() -> None:
     """stop()'s release and its ``left`` write each run at the shutdown bound, not the renew clamp
     and not [store].command_timeout, so neither keeps its executor thread for 30 s (BACKLOG
@@ -1066,12 +1084,13 @@ def test_the_settings_reach_is_what_the_store_applies(
 
 
 def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_path: Path) -> None:
-    """The defect: 5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, but on SQL Server the
-    claim waits up to 5 s for a connection and then runs a 5 s statement, 10 s past its issue."""
+    """5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, and on SQL Server the check counts
+    a 5 s wait plus a 5 s statement, 10 s. Since BACKLOG #5064 the claim shares one 5 s deadline,
+    so this refusal now over-counts it; it is kept so that no config the check refused loads."""
     with pytest.raises(ValidationError) as caught:
         _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
     text = str(caught.value)
-    assert "for up to 10 s, which reaches the demotion detection margin (9 s)" in text
+    assert "10 s counted as two windows, which reaches the demotion detection margin (9 s)" in text
     # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
     assert "Lower lease_renew_timeout_seconds or unset it" in text
 

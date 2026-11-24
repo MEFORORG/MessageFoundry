@@ -139,9 +139,10 @@ cluster coordinates the parts that must not double-run or interleave:
 
   On SQL Server the claim/renew is clamped at `[cluster].lease_renew_timeout_seconds`, derived from
   the margin unless set. There its wait for a pooled connection and its statement share one
-  deadline, as on Postgres, but the statement timeout counts whole seconds, so under a 2 s clamp
-  the renew can overrun the clamp by up to a second, and its COMMIT is outside the deadline on any
-  clamp, while the cluster section's own margin check compares the clamp alone with the margin. The statement timeout counts whole seconds, so a clamp under 1 s is refused on
+  deadline, as on Postgres, but under a 2 s clamp the renew can overrun the clamp by up to a
+  second, and its COMMIT is outside the deadline on any clamp, while the cluster section's own
+  margin check compares the clamp alone with the margin. The statement timeout counts whole
+  seconds, so a clamp under 1 s is refused on
   that backend, and the engine also checks the pool wait plus the statement against the margin,
   stepping a derived clamp down or refusing the config. `serve` logs a warning at start-up when
   twice the clamp reaches the margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
