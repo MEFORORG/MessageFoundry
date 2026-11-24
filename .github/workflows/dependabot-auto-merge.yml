@@ -54,7 +54,9 @@ name: Dependabot auto-merge
 #      version track (an UNGROUPED PR's empty group, an unknown group) is reported as the security
 #      track with advisory_ok=false. The shipped dependabot.yml puts every github-actions update in
 #      `actions-deps` or `actions-security`, so for a PR the allow-set passes this hold is reached
-#      only by an actions PR Dependabot opens outside those groups.
+#      at least by an actions PR Dependabot opens outside those groups, and by a grouped PR whose
+#      `dependency-group` matches no version group byte for byte and no `*security*` pattern
+#      (DEP_GROUP is not whitespace-normalised before the `case`).
 #      `advisory_ok=true` is reachable only for a SECURITY-track uv/pip PR, `eligible=true` only for
 #      github-actions, so no PR can satisfy both the allow-set and a confirmed advisory.
 #   #4 RELEASE AGE (security track only) — a SECURITY-track PR additionally requires every candidate
@@ -63,27 +65,33 @@ name: Dependabot auto-merge
 #      or unparseable upload timestamp, a package name/version that does not match its expected
 #      shape, or an ecosystem with no publish-date source wired all route to manual review.
 #      READ THIS BEFORE CITING #2 OR #4 AS A CONTROL: both hold every eligible security-track PR
-#      today; neither can confirm until a uv/pip allow row is populated, or, for another
-#      ecosystem, #2's query is made aware of it and #4 gets a publish-date source for it, so as
-#      shipped neither can ever CONFIRM a PR for merge. Recording either as confirming would be
-#      exactly the false premise docs/Secure_Development_Standards.md §3 forbids. Among the checks
-#      that can change a merge decision today are at least #2's hold of an unreadable track (for an
-#      actions PR outside dependabot.yml's groups), #3 and the sole-author, update-type,
+#      today, so as shipped neither can ever CONFIRM a PR for merge. For a uv/pip PR, a populated
+#      uv/pip allow row is NECESSARY before either can confirm, and not sufficient: at least a uv
+#      PR that Dependabot's A3 lock-resync gives a second commit still trips the sole-author check
+#      and holds. For another ecosystem, npm included, that ecosystem's own allow row must be
+#      populated as well as #2's query being made aware of it and #4 getting a publish-date source
+#      for it. Recording either as confirming would be exactly the false premise
+#      docs/Secure_Development_Standards.md §3 forbids. Among the checks that can change a merge
+#      decision today are at least #2's hold of an unreadable track (for an actions PR outside
+#      dependabot.yml's groups, or one whose `dependency-group` matches no version group byte for
+#      byte and no `*security*` pattern), #3 and the sole-author, update-type,
 #      dependency-type (`direct:development`) and disarm checks; every security-track PR holds.
 #      `age_ok=true` is reachable only for uv/pip (no publish-date source is wired for any
 #      other ecosystem), while `eligible=true` is reachable only for github-actions (the uv/pip/npm
 #      allow rows ship EMPTY). Those two sets are DISJOINT, so no PR can satisfy both conjuncts the
 #      merge `if` requires, and the same disjointness keeps #2 from confirming (its
 #      `advisory_ok=true` is reachable only for uv/pip: its query is pip-keyed). The confirming
-#      halves of #2 and #4 are FORWARD guards: built, tested and gated now, load-bearing the day a
-#      Python allow row is populated or the advisory gate is made ecosystem-aware. Populating an
-#      allow row is the owner's call, not this workflow's.
+#      halves of #2 and #4 are FORWARD guards: built, tested and gated now. A populated allow row
+#      alone does not make either load-bearing; at least the further conditions stated above under
+#      READ THIS BEFORE CITING #2 OR #4 must also hold. Populating an allow row is the owner's
+#      call, not this workflow's.
 #
 # RESIDUAL ACCEPTED RISK, stated at the ONE path that can actually auto-merge: a VERSION-track patch
 # (or dev-only minor) bumping a GitHub-published action. Its only aging is dependabot.yml's cooldown,
 # which that file itself qualifies as approximate for this ecosystem, so a malicious release from a
 # compromised GitHub-owned publisher would still auto-merge. What keeps an actions PR outside
-# dependabot.yml's groups off that path is #2's track allow-list, which reads only a named version
+# dependabot.yml's groups, or one whose `dependency-group` does not match a version group byte for
+# byte, off that path is #2's track allow-list, which reads only a named version
 # group as the version track; #2's advisory check and #4 act on the security track only.
 # What main's required CI does and does not backstop, stated precisely: pip-audit reads the
 # committed LOCKS for already-published advisories, and bandit/semgrep read THIS repository's own
