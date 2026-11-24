@@ -583,34 +583,98 @@ def handle_non_json_numbers(msg: Message) -> Send:
 def handle_ordinary_numbers(msg: Message) -> Send:
     count = 42
     ratio = 0.5
-    big = 1 - 10**119  # 120 characters with the sign: the longest int still kept as a JSON number
-    too_long = -(10**119)  # 121 characters: one past the cap
+    pos_cap = 10**119  # 120 characters: the longest int still kept as a JSON number
+    neg_cap = 1 - 10**119  # 120 characters with the sign
+    over_cap = -(10**119)  # 121 characters: truncated like a string
     flag = True
-    _unused = (count, ratio, big, too_long, flag)
+    _unused = (count, ratio, pos_cap, neg_cap, over_cap, flag)
     return Send("out", msg)
+
+
+class _HostileInt(int):
+    def __abs__(self) -> int:
+        raise RuntimeError("user __abs__ ran")
+
+    def __repr__(self) -> str:
+        raise RuntimeError("user __repr__ ran")
+
+
+class _HostileFloat(float):
+    def __repr__(self) -> str:
+        raise RuntimeError("user __repr__ ran")
+
+    def __gt__(self, other: object) -> bool:
+        raise RuntimeError("user __gt__ ran")
+
+
+def handle_hostile_numbers(msg: Message) -> Send:
+    h_int = _HostileInt(10**200)
+    h_nan = _HostileFloat("nan")
+    h_inf = _HostileFloat("inf")
+    _unused = (h_int, h_nan, h_inf)
+    return Send("out", msg)
+
+
+def _strict_assigned(handler) -> dict:
+    reg = _registry(route_to_h, {"h": handler})
+    traced = trace_dry_run(reg, ADT_A01, show_phi=True)
+    # The traced run stays a pure observer: same disposition as the untraced one (ADR 0072 gate 1).
+    assert traced["disposition"] == dry_run(reg, ADT_A01).disposition.value
+    text = json.dumps(traced, allow_nan=False)  # raises on NaN/Infinity or an unprintable int
+    return _all_assigned(_handler_invocation(json.loads(text)))
 
 
 def test_show_phi_values_serialize_as_strict_json() -> None:
     # Under --show-phi a NaN/Infinity float passed through unchanged, so the CLI's json.dumps wrote the
     # bare tokens NaN/Infinity (not JSON), and a >4300-digit int made json.dumps raise ValueError.
-    reg = _registry(route_to_h, {"h": handle_non_json_numbers})
-    traced = trace_dry_run(reg, ADT_A01, show_phi=True)
-    text = json.dumps(traced, allow_nan=False)  # raises on NaN/Infinity or an unprintable int
-    assigned = _all_assigned(_handler_invocation(json.loads(text)))
-    assert assigned["nan"] == "nan"
-    assert assigned["pos_inf"] == "inf"
-    assert assigned["neg_inf"] == "-inf"
+    assigned = _strict_assigned(handle_non_json_numbers)
+    assert assigned["nan"] == "<float: nan>"
+    assert assigned["pos_inf"] == "<float: inf>"
+    assert assigned["neg_inf"] == "<float: -inf>"
     assert assigned["huge"] == "<int: too large>"
 
 
 def test_show_phi_keeps_ordinary_numbers_as_numbers() -> None:
-    reg = _registry(route_to_h, {"h": handle_ordinary_numbers})
-    assigned = _all_assigned(_handler_invocation(trace_dry_run(reg, ADT_A01, show_phi=True)))
+    assigned = _strict_assigned(handle_ordinary_numbers)
     assert assigned["count"] == 42
     assert assigned["ratio"] == 0.5
-    assert assigned["big"] == 1 - 10**119
-    assert assigned["too_long"] == "<int: too large>"
+    assert assigned["pos_cap"] == 10**119
+    assert assigned["neg_cap"] == 1 - 10**119
+    assert assigned["over_cap"] == str(-(10**119))[:120] + "…(truncated)"
     assert assigned["flag"] is True
+
+
+def test_show_phi_numbers_call_no_subclass_hook() -> None:
+    # The tracer must not run user code a numeric subclass defines, or a traced run could ERROR where
+    # the untraced one delivers.
+    assigned = _strict_assigned(handle_hostile_numbers)
+    assert assigned["h_int"] == str(10**200)[:120] + "…(truncated)"
+    assert assigned["h_nan"] == "<float: nan>"
+    assert assigned["h_inf"] == "<float: inf>"
+
+
+def test_cli_trace_show_phi_writes_strict_json(tmp_path: Path, capsys) -> None:
+    # The real serializer: `dryrun --trace --show-phi` stdout must parse with NaN/Infinity refused.
+    module = _CONFIG_MODULE.replace(
+        '    mrn = msg["PID-3.1"]\n',
+        '    mrn = msg["PID-3.1"]\n    nan = float("nan")\n    huge = 10**5000\n',
+    )
+    assert module != _CONFIG_MODULE
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "IB_TEST.py").write_text(module, encoding="utf-8")
+    msg = tmp_path / "adt.hl7"
+    msg.write_text(ADT_A01, encoding="utf-8")
+    rc = main(["dryrun", "--config", str(cfg), "--messages", str(msg), "--trace", "--show-phi"])
+    assert rc == 0
+
+    def _refuse(token: str) -> object:
+        raise ValueError(f"non-JSON token {token}")
+
+    out = json.loads(capsys.readouterr().out, parse_constant=_refuse)
+    assigned = _all_assigned(_handler_invocation(out[0]))
+    assert assigned["nan"] == "<float: nan>"
+    assert assigned["huge"] == "<int: too large>"
 
 
 # --- ADR 0084: an `accepts=` decline is surfaced in the trace ----------------------------------

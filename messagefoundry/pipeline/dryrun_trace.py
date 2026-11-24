@@ -93,8 +93,6 @@ __all__ = ["trace_dry_run"]
 # in full even under --show-phi.
 _MAX_EVENTS = 5000
 _MAX_VALUE_LEN = 120
-# The bound below which an int's decimal form, sign included, fits in _MAX_VALUE_LEN characters.
-_MAX_INT_MAGNITUDE = 10 ** (_MAX_VALUE_LEN - 1)
 
 
 # --- value serialization (PHI-gated) -----------------------------------------
@@ -105,19 +103,30 @@ def _safe_value(value: object, show_phi: bool) -> Any:
 
     Without ``show_phi`` every value collapses to ``"REDACTED"`` (values are message-derived, hence PHI).
     With it, scalars pass through and any other object is ``repr``'d; both are length-capped so a full
-    message body can never be dumped. A NaN/Infinity float is ``repr``'d and an int longer than the cap
-    becomes a placeholder, because ``json.dumps`` would otherwise write a token RFC 8259 rejects or, past
-    the interpreter's int-to-str digit limit, raise (BACKLOG #6822)."""
+    message body can never be dumped. A NaN/Infinity float becomes a tagged string and an over-cap int is
+    truncated like a string, because ``json.dumps`` would otherwise write a token RFC 8259 rejects or,
+    past the interpreter's int-to-str digit limit, raise (BACKLOG #6822). The numeric checks go by
+    ``type()`` and call no hook a subclass defines, so the observer never runs user code there."""
     if not show_phi:
         return "REDACTED"
-    if value is None or isinstance(value, bool):
+    if value is None or type(value) is bool:
         return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else repr(value)
-    if isinstance(value, int):
-        # Compared, never str()'d: converting a huge int is itself what raises.
-        return value if abs(value) < _MAX_INT_MAGNITUDE else "<int: too large>"
-    if isinstance(value, str):
+    cls = type(value)
+    if issubclass(cls, float) and isinstance(value, float):  # isinstance only narrows for mypy
+        # math.isnan/isinf/copysign read the C double directly; a comparison would call __gt__.
+        if math.isnan(value):
+            return "<float: nan>"
+        if math.isinf(value):
+            return "<float: inf>" if math.copysign(1.0, value) > 0 else "<float: -inf>"
+        return value
+    if issubclass(cls, int):
+        try:
+            text = int.__repr__(value)
+        except ValueError:  # past sys.get_int_max_str_digits(): json.dumps would raise the same
+            return "<int: too large>"
+        if len(text) <= _MAX_VALUE_LEN:
+            return value
+    elif isinstance(value, str):
         text = value
     else:
         try:
