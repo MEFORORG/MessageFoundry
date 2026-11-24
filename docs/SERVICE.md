@@ -334,6 +334,25 @@ key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
 
+**While a list holds a value `serve` or `supervise` refused, edit it in the registry, never with
+`nssm get` or `nssm set`.** `nssm get` prints every value in the list, and `nssm set` takes the
+values on its command line, where they reach at least the shell's history, a transcript and
+process-creation audit events. Read `AppEnvironment` and `AppEnvironmentExtra`, under `Parameters`
+in the service's registry key, and the service's own `Environment` value, on that key itself, into
+a variable with `Get-ItemProperty`, printing nothing. Edit the strings in that same session, and
+write each value back with `Set-ItemProperty -Type MultiString`:
+
+```powershell
+$key = 'HKLM:\SYSTEM\CurrentControlSet\Services\MessageFoundry\Parameters'
+$extra = (Get-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra).AppEnvironmentExtra
+# edit $extra here, printing nothing
+Set-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra -Value $extra -Type MultiString
+```
+
+install-service.ps1's `Set-ServiceEnvironmentValue` writes `AppEnvironmentExtra` the same way: it
+reads the list from the registry with `Get-Item` and its `GetValue` method, writes the merged list
+back with `Set-ItemProperty -Type MultiString`, and reads it back.
+
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
 interpreter in isolated mode, which ignores every one of them
 ([The service launch](#the-service-launch)). The engine's own `MEFOR_*` variables work as before.
