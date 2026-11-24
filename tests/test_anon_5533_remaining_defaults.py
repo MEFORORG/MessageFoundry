@@ -28,7 +28,7 @@ from messagefoundry_toolkit.anon import rules as engine_rules
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import rules as tee_rules
 
-_SALT = "b5533-salt-fedcba9876543210"
+_SALT = "b5533-salt-fedcba9876543210-0123456789"
 _EACH_RULES = pytest.mark.parametrize("module", (engine_rules, tee_rules), ids=("engine", "tee"))
 _EACH_ADAPTER = pytest.mark.parametrize(
     "adapter", (engine_anonymize, tee_anonymize), ids=("engine", "tee")

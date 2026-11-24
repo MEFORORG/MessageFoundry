@@ -1008,6 +1008,25 @@ def test_a_weakening_bit_clear_is_not_the_same_token_as_a_hardening_bit_set() ->
     assert found["pkg/b.py"] == frozenset({"tls_context:.options &= ~OP_NO_TLSv1"})
 
 
+def test_a_bit_clear_through_int_names_the_flag_it_clears() -> None:
+    """Vault BACKLOG #5511: ``~int(FLAG)`` names FLAG rather than reading as an unlabelled ``&=``,
+    and keeps a token apart from ``~FLAG``, which also clears the bits VerifyFlags does not name."""
+    ops = _gate().crypto_operations
+    sources = {
+        "pkg/a.py": "import ssl\n\ndef f(ctx):\n"
+        "    ctx.verify_flags &= ~int(ssl.VERIFY_X509_PARTIAL_CHAIN)\n",
+        "pkg/b.py": "import ssl\n\ndef f(ctx):\n"
+        "    ctx.verify_flags &= ~ssl.VERIFY_X509_PARTIAL_CHAIN\n",
+    }
+    found = ops.aggregate(ops.discover_operations_in(sources))
+    assert found["pkg/a.py"] == frozenset(
+        {"tls_context:.verify_flags &= ~int(VERIFY_X509_PARTIAL_CHAIN)"}
+    )
+    assert found["pkg/b.py"] == frozenset(
+        {"tls_context:.verify_flags &= ~VERIFY_X509_PARTIAL_CHAIN"}
+    )
+
+
 def test_an_algorithm_in_a_method_calls_nested_arguments_is_carried() -> None:
     ops = _gate().crypto_operations
     source = (
