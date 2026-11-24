@@ -18,6 +18,7 @@ import asyncio
 import copy
 import logging
 import pickle
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -31,6 +32,7 @@ from messagefoundry.config.settings import (
 )
 from messagefoundry.config.snapshot import read_config_snapshot
 from messagefoundry.config.wiring import Registry, load_config
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink, sandbox_worker_refused_detail
 from messagefoundry.pipeline.dryrun import transform_one
@@ -43,8 +45,9 @@ from messagefoundry.pipeline.sandbox import (
     SandboxWorkerRefused,
     graph_shape,
 )
-from messagefoundry.pipeline.wiring_runner import RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, SandboxRefusalOvertaken
 from messagefoundry.redaction import safe_text
+from messagefoundry.store import Stage
 from messagefoundry.store.store import MessageStore
 from tests.test_alert_sinks import _drain as _drain_transports
 from tests.test_alert_sinks import _RecordingTransport
@@ -52,6 +55,7 @@ from tests.test_alert_state import _drain as _drain_state
 from tests.test_alert_state import _RecordingStore
 from tests.test_sandbox import RAW
 from tests.test_sandbox_graph_parity import _GRAPH, _VARIABLE
+from tests.test_task_resilience import _OneRowThenFaultStore, _until
 
 #: A digest for a graph built here: the runner refuses a worker mode beside a config dir for a
 #: graph with none (BACKLOG #5334), and these tests are about the alert, not that refusal.
@@ -392,7 +396,9 @@ async def test_a_refusal_overtaken_by_a_graph_change_alerts_when_the_graph_retur
                     "IB_PARITY", call, registry, "h_0", RAW, run_context=RunContext()
                 )
             assert sink.refused == []
-            assert session._closed and "IB_PARITY" not in runner._sandbox_sessions
+            assert "IB_PARITY" not in runner._sandbox_sessions
+            await runner._await_sandbox_closes()  # the close runs off the worker (BACKLOG #6830)
+            assert session._closed
             runner.registry = copy.copy(registry)  # an equal graph is served again
             with pytest.raises(SandboxWorkerRefused) as refused:
                 await runner._off_loop_sandboxed(
@@ -439,8 +445,11 @@ async def test_a_failed_close_of_an_overtaken_session_still_re_pends(
                 pytest.raises(SandboxSessionClosed) as closed,
             ):
                 await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert isinstance(closed.value, SandboxRefusalOvertaken)
             assert isinstance(closed.value.__cause__, SandboxWorkerRefused)
             assert sink.refused == []
+            with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.wiring_runner"):
+                await runner._await_sandbox_closes()  # the close runs off the worker
             assert any(
                 "IB_X" in r.getMessage() and "close" in r.getMessage() for r in caplog.records
             )
@@ -449,6 +458,115 @@ async def test_a_failed_close_of_an_overtaken_session_still_re_pends(
             await runner._close_sandbox_sessions()
     finally:
         await store.close()
+
+
+async def test_a_slow_close_of_an_overtaken_session_does_not_hold_the_dispatch(
+    tmp_path: Path,
+) -> None:
+    """The graph-overtaken branch closes the session it discards OFF the inbound's worker
+    (BACKLOG #6830): the dispatch re-pends at once while the close still runs, so a slow close
+    cannot stall routing or transform. The close is not dropped: the session teardown, which a
+    reload and :meth:`RegistryRunner.stop` both run, waits for it."""
+    registry = Registry(code_digest=_SOME_DIGEST)
+    sink = _Recorder()
+    other = graph_shape(Registry(code_digest="1" * 64))
+    release = threading.Event()
+    closed = threading.Event()
+
+    def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+        raise SandboxWorkerRefused("refused", first=True, content_only=False, graph=other)
+
+    def slow_close() -> None:
+        assert release.wait(30)
+        closed.set()
+
+    store = await MessageStore.open(tmp_path / "slow_close.db")
+    try:
+        runner = _runner(registry, store, tmp_path, cast(Any, sink))
+        try:
+            session = runner._sandbox_for("IB_X")
+            assert session is not None
+            session.close = slow_close  # type: ignore[method-assign]
+            with pytest.raises(SandboxSessionClosed):
+                await asyncio.wait_for(runner._off_loop_sandboxed("IB_X", dispatch, registry), 5)
+            assert not closed.is_set()  # the dispatch came back with the close still running
+            assert "IB_X" not in runner._sandbox_sessions
+            teardown = asyncio.ensure_future(runner._close_sandbox_sessions())
+            await asyncio.sleep(0.2)
+            assert not teardown.done()  # it waits for the pending close
+            release.set()
+            await asyncio.wait_for(teardown, 10)
+            assert closed.is_set()
+        finally:
+            release.set()
+            runner._sandbox_sessions.clear()
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    ("worker_attr", "body_attr", "stage"),
+    [
+        ("_router_worker", "_process_ingress_item", Stage.INGRESS.value),
+        ("_transform_worker", "_process_routed_batch", Stage.ROUTED.value),
+    ],
+    ids=["router", "transform"],
+)
+@pytest.mark.parametrize("overtaken", [True, False], ids=["overtaken", "control_closed_twice"])
+async def test_an_overtaken_refusal_re_pends_with_no_error_traceback(
+    worker_attr: str,
+    body_attr: str,
+    stage: str,
+    overtaken: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An overtaken refusal that reaches the worker's fault arm is re-pended with one INFO line and
+    no ERROR traceback (BACKLOG #6830): what overtook it is a reload, not a fault. The back-off
+    stays. CONTROL: any other close that reaches the arm, such as a dispatch closed twice, is still
+    an infrastructure fault, logged at ERROR with its traceback, so the instrument can see one."""
+    monkeypatch.setattr(wiring_runner, "_WORKER_ERROR_BACKOFF_SECONDS", 0.01)
+    store = _OneRowThenFaultStore(stage)
+    runner = RegistryRunner(
+        Registry(),
+        store,  # type: ignore[arg-type]
+        poll_interval=0.02,
+        claim_mode="per_lane",
+        egress=EgressSettings(deny_by_default=False),
+    )
+    runner._running = True
+
+    async def raiser(*a: Any, **k: Any) -> Any:
+        if overtaken:
+            raise SandboxRefusalOvertaken("overtaken") from SandboxWorkerRefused(
+                "refused", first=True, content_only=False
+            )
+        raise SandboxSessionClosed("closed twice")
+
+    monkeypatch.setattr(runner, body_attr, raiser)
+    with caplog.at_level(logging.DEBUG, logger=wiring_runner.log.name):
+        task = asyncio.ensure_future(getattr(runner, worker_attr)("IB"))
+        try:
+            await _until(lambda: store.rescheduled, timeout=5.0)
+        finally:
+            runner._stop.set()
+            for ev in (runner._work, runner._ingress_work, runner._routed_work):
+                ev.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert store.rescheduled[0] == ["row-1"]  # re-pended either way
+    records = [r for r in caplog.records if r.name == wiring_runner.log.name]
+    assert records  # the arm wrote something, so the absence checks below are over a real log
+    errors = [r for r in records if r.levelno >= logging.ERROR or r.exc_info]
+    if overtaken:
+        assert errors == [], [r.getMessage() for r in errors]
+        assert any(
+            r.levelno == logging.INFO and "'IB'" in r.getMessage() and "re-pend" in r.getMessage()
+            for r in records
+        ), [r.getMessage() for r in records]
+    else:
+        assert any(r.levelno >= logging.ERROR and r.exc_info for r in errors)
 
 
 async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(

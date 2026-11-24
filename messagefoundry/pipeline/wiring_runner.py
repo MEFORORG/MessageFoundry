@@ -682,9 +682,30 @@ class _SendGated(Exception):
     does."""
 
 
+class SandboxRefusalOvertaken(SandboxSessionClosed):
+    """A sandbox refusal a reload, a rollback, a stop or a graph swap overtook, raised as a close
+    (BACKLOG #6830; :meth:`RegistryRunner._sandboxed_dispatch` says when). It is retried or
+    re-pended as any close is, but a per-lane worker's fault arm logs its re-pend at INFO with no
+    traceback, since what overtook it is not a fault. The message's rerun compares again, and a
+    refusal there alerts and dead-letters as before."""
+
+
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
 # unavailable) before retrying, so a transient failure logs once and recovers instead of hot-looping.
 _WORKER_ERROR_BACKOFF_SECONDS = 1.0
+
+
+def _log_overtaken_repend(worker: str, name: str) -> None:
+    """The fault arm's line for a :class:`SandboxRefusalOvertaken` (BACKLOG #6830): INFO, with no
+    traceback and outside the worker's fault run, as the retry line in
+    :meth:`RegistryRunner._off_loop_sandboxed` is. The arm still re-pends and backs off: the back-off
+    bounds how fast a run of reloads can make the lane spawn and refuse workers."""
+    log.info(
+        "%s worker %r: a reload or graph change overtook a sandbox worker's refusal; re-pending "
+        "the message to compare again",
+        worker,
+        name,
+    )
 
 
 # A per-lane worker's run of faults closes on the first healthy pass or empty claim at least this
@@ -2097,6 +2118,8 @@ class RegistryRunner:
                 # says why, and _sandbox_for why no config dir is exempt.
                 raise ValueError(undigested_graph_refusal(sandbox_policy.mode))
         self._sandbox_sessions: dict[str, SandboxSession] = {}
+        # Closes of sessions an overtaken refusal dropped, run off the worker (BACKLOG #6830).
+        self._sandbox_closing: set[asyncio.Future[None]] = set()
         # The running reload's step-3 connectors, built before its quiesce (BACKLOG #5755), set
         # under ``_reload_lock`` only for the step-3 call that takes them.
         self._outbound_plan: _OutboundPlan | None = None
@@ -7355,12 +7378,42 @@ class RegistryRunner:
                 cached = self._sandbox_graph_shape = (registry, graph_shape(registry))
             return cached[1]
 
+    def _close_sandbox_session_later(self, name: str, session: SandboxSession) -> None:
+        """Close ``session``, already dropped from ``_sandbox_sessions``, in a task of its own, so
+        the inbound's worker does not wait on it (BACKLOG #6830): a close waits on a process and
+        joins its drains, and the worker would stall routing or transform for as long. The task is
+        held until it ends, and :meth:`_close_sandbox_sessions`, which a reload and :meth:`stop`
+        both run, waits for it, so the close is neither dropped nor left running past a stop."""
+
+        async def close() -> None:
+            try:
+                await asyncio.to_thread(session.close)
+            except Exception:  # noqa: BLE001 - logged; the session is already dropped
+                # A failed close leaves at most a worker for the collector. It is not the
+                # message's fault, and the dispatch that dropped the session has re-pended it.
+                log.warning(
+                    "inbound %r: could not close the sandbox session a graph change overtook",
+                    name,
+                )
+
+        task = asyncio.ensure_future(close())
+        self._sandbox_closing.add(task)
+        task.add_done_callback(self._sandbox_closing.discard)
+
+    async def _await_sandbox_closes(self) -> None:
+        """Wait for every close :meth:`_close_sandbox_session_later` started. ``asyncio.wait``,
+        not ``gather``, so a teardown that is itself cancelled does not cancel them."""
+        if self._sandbox_closing:
+            await asyncio.wait(set(self._sandbox_closing))
+
     async def _close_sandbox_sessions(self) -> None:
         """Drop every sandbox session and close its worker, off the loop: each ``close()`` waits on
         a process. A no-op unless a worker sandbox mode spawned any. The next dispatch on an
         inbound makes a fresh session, whose worker loads the config as it is then. A dispatch already
         holding a closed session is retried or re-pended by :meth:`_off_loop_sandboxed`, never
-        dead-lettered as a Router or Handler fault."""
+        dead-lettered as a Router or Handler fault. It also waits for any close an overtaken
+        refusal started off its worker (:meth:`_close_sandbox_session_later`)."""
+        await self._await_sandbox_closes()
         if not self._sandbox_sessions:
             return
         sessions = list(self._sandbox_sessions.values())
@@ -7468,10 +7521,11 @@ class RegistryRunner:
 
         **An overtaken refusal is a close, not a refusal** (BACKLOG #6830):
         :meth:`_sandboxed_dispatch` says which refusals are overtaken, and raises each as
-        :class:`SandboxSessionClosed`, so it is retried or re-pended exactly as above, raises no
-        alert and is not dead-lettered. The message's next run compares again, and that refusal,
-        if the cause still stands, is the one that alerts, whether or not any further message
-        arrives."""
+        :class:`SandboxRefusalOvertaken`, a :class:`SandboxSessionClosed`, so it is retried or
+        re-pended exactly as above, raises no alert and is not dead-lettered. A per-lane worker
+        logs that re-pend at INFO with no traceback, and still backs off. The message's next run
+        compares again, and that refusal, if the cause still stands, is the one that alerts and
+        dead-letters, whether or not any further message arrives."""
         try:
             try:
                 return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
@@ -7509,7 +7563,7 @@ class RegistryRunner:
     ) -> T:
         """One dispatch of :meth:`_off_loop_sandboxed`, on the session resolved for it now.
 
-        An overtaken :class:`SandboxWorkerRefused` is raised as :class:`SandboxSessionClosed`
+        An overtaken :class:`SandboxWorkerRefused` is raised as :class:`SandboxRefusalOvertaken`
         (BACKLOG #6830). It is overtaken when the session that raised it is no longer the one
         serving ``name``, which at least a reload, a rollback and a stop cause by discarding every
         session, or when the graph its worker was compared with is not equal to the one served now.
@@ -7517,7 +7571,9 @@ class RegistryRunner:
         cause, and if not, the message's next run compares again and alerts once. That run is on a
         fresh session: a session still serving when only the graph changed is discarded here, since
         its refusal cache holds the overtaken refusal, and an equal graph served again later would
-        be refused from that cache with no alert. The graph is compared by value, as the session's
+        be refused from that cache with no alert. Its close runs in a task of its own
+        (:meth:`_close_sandbox_session_later`), so this dispatch does not wait on it. The graph is
+        compared by value, as the session's
         refusal cache is, so a swap of ``self.registry`` to an equal graph does not overtake a
         refusal. Checked on the loop with no await before the caller's alert, so a reload cannot
         discard the session between this check and that alert."""
@@ -7532,17 +7588,8 @@ class RegistryRunner:
                 raise
             if serving:
                 del self._sandbox_sessions[name]
-                try:
-                    await asyncio.to_thread(session.close)
-                except Exception:  # noqa: BLE001 - logged; must not turn the close into a fault
-                    # The session is already dropped, so a failed close leaves at most a worker
-                    # for the collector. Raising it instead would dead-letter the message as a
-                    # Router or Handler fault, which an overtaken refusal is not.
-                    log.warning(
-                        "inbound %r: could not close the sandbox session a graph change overtook",
-                        name,
-                    )
-            raise SandboxSessionClosed(
+                self._close_sandbox_session_later(name, session)
+            raise SandboxRefusalOvertaken(
                 f"inbound {name!r}: its sandbox worker's refusal was overtaken: its session was "
                 "discarded or the graph it was compared with is no longer served"
             ) from exc
@@ -12605,7 +12652,12 @@ class RegistryRunner:
                 # A store error in the loop itself (claim/handoff failing — DB locked, disk full) must
                 # never kill the worker: that would stall routing while the listener keeps ACKing. Log,
                 # back off, and keep going (mirrors the delivery worker). #1844: with a backoff.
-                faults.failed(exc, "router worker %r: unexpected error; backing off and retrying")
+                if isinstance(exc, SandboxRefusalOvertaken):
+                    _log_overtaken_repend("router", name)
+                else:
+                    faults.failed(
+                        exc, "router worker %r: unexpected error; backing off and retrying"
+                    )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
                     "router", name, claimed, faults=faults, fence=fence
@@ -13196,9 +13248,12 @@ class RegistryRunner:
             except Exception as exc:
                 # A store error in the loop itself must never kill the worker (mirrors the others).
                 # #1844: logged with a backoff, not a traceback per pass (see _WorkerFaultLog).
-                faults.failed(
-                    exc, "transform worker %r: unexpected error; backing off and retrying"
-                )
+                if isinstance(exc, SandboxRefusalOvertaken):
+                    _log_overtaken_repend("transform", name)
+                else:
+                    faults.failed(
+                        exc, "transform worker %r: unexpected error; backing off and retrying"
+                    )
                 # #1611: surviving is not enough — hand the claimed row back (see the helper).
                 held = await self._repend_claimed_on_fault(
                     "transform", name, claimed, faults=faults, fence=fence
