@@ -53,11 +53,12 @@ STEP_UP_ACTION_MAX = 64
 STEP_UP_VIA_HEADER = "X-Step-Up-Via"
 STEP_UP_VIA_IDP = "idp"
 
-#: The step-up refusal's reason header and its two values (ADR 0215 section 2). What each value
+#: The step-up refusal's reason header and its three values (ADR 0215 section 2). What each value
 #: means is stated once, in docs/SECURITY.md beneath the gate-wrapper table.
 STEP_UP_REASON_HEADER = "X-Step-Up-Reason"
 STEP_UP_REASON_NEW_ADDRESS = "new-address"
 STEP_UP_REASON_REVERIFY = "reverify"
+STEP_UP_REASON_VERIFY_FACTOR = "verify-factor"
 
 #: The must-change refusal's next-step header and its three values (ADR 0215 section 2). What each
 #: value means is stated once, in docs/SECURITY.md under the ``require*()`` ladder.

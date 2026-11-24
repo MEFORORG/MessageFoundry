@@ -100,6 +100,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline_for,
     public_route,
     recheck_standing,
+    record_check_grant,
     record_repeated_credential,
     refuse_unless_step_up_window_live,
     require,
@@ -843,16 +844,19 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # ADR 0215 section 2: gate-only routes, for the web console's later slices to sub-request before
     # a page that shows no engine data of its own renders. No console code calls them yet. Each is a
     # static gate, require(p) for one permission, registered in a loop over Permission so the route
-    # walk and the route map read it; the permission never comes from the request. docs/SECURITY.md
-    # (Gate-only check routes) states what they answer and which rows they write.
+    # walk and the route map read it; the permission never comes from the request. Each writes the
+    # grant row its permission's own routes audit (record_check_grant). docs/SECURITY.md (Gate-only
+    # check routes) states what they answer and which rows they write.
     @app.get("/auth/check", response_model=SimpleMessage)
     async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
         return SimpleMessage(detail="authorized")
 
     def _add_permission_check(permission: Permission) -> None:
         async def auth_check_permission(
-            _: Identity = Depends(require(permission)),
+            request: Request,
+            identity: Identity = Depends(require(permission)),
         ) -> SimpleMessage:
+            await record_check_grant(request, identity, permission)
             return SimpleMessage(detail="authorized")
 
         app.add_api_route(
@@ -870,10 +874,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def my_step_up_status(
         request: Request,
         action: Annotated[str | None, Query(max_length=STEP_UP_ACTION_MAX)] = None,
-        _: Identity = Depends(require()),
+        identity: Identity = Depends(require()),
     ) -> StepUpStatusReply:
         """:func:`step_up_status`, for the caller's own session (ADR 0215 section 2)."""
-        return await step_up_status(request, action)
+        return await step_up_status(request, identity, action)
 
     @app.post("/me/password", response_model=SimpleMessage)
     async def change_password(

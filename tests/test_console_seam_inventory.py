@@ -1789,7 +1789,7 @@ def test_a_wrong_ui_class_or_authority_is_reported(facts: _UiFacts) -> None:
         "GET /ui/messages/{message_id}/summary": Ui("ceremony", "", body),
         "GET /ui/messages/{message_id}/errors": Ui("public", "", body),
         # A check page given a permission its gate does not name.
-        "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/monitoring:read", ""),
+        "GET /ui/roles/new": Ui("check", "GET /auth/check/monitoring:read", ""),
         # A confirmation page carried by a list read weaker than its own gate.
         "GET /ui/cluster/stepdown-confirm": _J(
             "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"

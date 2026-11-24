@@ -35,9 +35,13 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from tests._admin_account import create_admin
-from tests.test_mfa_access_gate import PW, _add, _enroll_totp_out_of_band
+from tests.test_mfa_access_gate import PW, _add, _add_passkey, _enroll_totp_out_of_band
 
 _GRANTED = "auth.permission_granted"
+# Spelled here rather than imported, so they pin the wire strings a client reads.
+_STATUS_READ = "auth.step_up_status_read"
+_VERIFY_FACTOR_REASON = "verify-factor"
+_VERIFY_FACTOR_SUFFIX = "; verify your second factor first"
 
 
 @pytest.fixture
@@ -252,9 +256,9 @@ async def test_a_store_fault_on_the_factor_read_keeps_the_must_change_refusal(
         assert r.headers.get(MUST_CHANGE_NEXT_HEADER) == MUST_CHANGE_NEXT_ROTATE
 
 
-async def test_a_phi_view_check_route_writes_no_grant_row(engine: Engine) -> None:
-    """Pins the documented state (docs/SECURITY.md, Gate-only check routes): a PHI-view grant is
-    left to the PHI-access audit row, and a check route writes none. A change here is deliberate."""
+async def test_a_phi_view_check_route_writes_the_grant_row(engine: Engine) -> None:
+    """A PHI-view grant is audited on its own routes through the PHI-access row, so its check route
+    must leave a decision row too: the grant row naming the permission (BACKLOG #2603)."""
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     async with _client(engine, service) as c:
@@ -263,7 +267,37 @@ async def test_a_phi_view_check_route_writes_no_grant_row(engine: Engine) -> Non
             r = await c.get(f"/auth/check/{permission}", headers=_auth(tok))
             assert r.status_code == 200, r.text
     rows = await engine.store.list_audit(limit=200)
-    assert not [row for row in rows if "/auth/check/messages:view_" in str(row["detail"])]
+    for permission in ("messages:view_raw", "messages:view_summary"):
+        mine = [
+            row
+            for row in rows
+            if row["action"] == _GRANTED and f"/auth/check/{permission}" in str(row["detail"])
+        ]
+        assert len(mine) == 1, (permission, rows)
+        assert permission in str(mine[0]["detail"])
+
+
+async def test_a_narrowed_trail_still_records_the_check_routes_of_audited_grants(
+    engine: Engine,
+) -> None:
+    """With ``[diagnostics].audit_all_authz`` off, a GET writes no grant row, but a check route for
+    a permission whose grant is still audited (the sensitive set, the PHI views, a files browse)
+    writes one. A permission whose grant the narrowed trail drops writes none."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    recorded = ("config:deploy", "messages:view_raw", "messages:view_summary", "files:browse")
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, audit_all_authz=False), client=("127.0.0.1", 123)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        tok = await _login(c, "boss")
+        for permission in (*recorded, "monitoring:read"):
+            r = await c.get(f"/auth/check/{permission}", headers=_auth(tok))
+            assert r.status_code == 200, (permission, r.text)
+    rows = [row for row in await engine.store.list_audit(limit=200) if row["action"] == _GRANTED]
+    for permission in recorded:
+        assert any(f"/auth/check/{permission}" in str(row["detail"]) for row in rows), permission
+    assert not any("/auth/check/monitoring:read" in str(row["detail"]) for row in rows)
 
 
 async def test_an_action_bound_new_address_refusal_names_the_new_address(engine: Engine) -> None:
@@ -350,3 +384,90 @@ async def test_step_up_status_refuses_an_overlong_action(engine: Engine) -> None
         tok = await _login(c, "vic")
         r = await c.get("/me/step-up", params={"action": "a" * 65}, headers=_auth(tok))
         assert r.status_code == 422
+
+
+# --- review round 3 (BACKLOG #2603): one target, a factor reason, a paced and audited status read --
+
+
+async def test_a_passkey_only_enrol_first_account_owing_its_factor_is_told_one_step(
+    engine: Engine,
+) -> None:
+    """A covered account whose only factor is a passkey that is not discoverable must enrol first
+    AND owes that passkey. The header and the detail name the same step, the factor, because the
+    factor gate stands in front of every enrolment route for this session."""
+    service = AuthService(
+        engine.store, AuthSettings(mfa_verify_min_elapsed_seconds=0, login_rate_limit_enabled=False)
+    )
+    await service.initialize()
+    user_id = await _add(service, "vic", Role.VIEWER)
+    await _add_passkey(service, "vic")
+    temp = (await service.admin_reset_password(user_id, actor="test")).password
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic", temp)
+        r = await c.get("/messages", headers=_auth(tok))
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert detail.startswith("password change required")
+        assert r.headers.get(MUST_CHANGE_NEXT_HEADER) == MUST_CHANGE_NEXT_VERIFY_FACTOR
+        assert "enrol an authenticator app first" not in detail, detail
+        assert detail.endswith(_VERIFY_FACTOR_SUFFIX), detail
+
+
+@pytest.mark.parametrize("path", ("/me/mfa", "/config/reload"))
+async def test_a_factor_binding_refusal_names_its_own_reason(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """``reverify`` would send the client to ``POST /me/reauth``, which mints nothing that clears
+    this refusal, so the client would loop (BACKLOG #1951). Both the gate-side and the
+    route-side (proof in route) refusals name the factor instead."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+
+    async def _blocked(_token: str | None, _action: str) -> bool:
+        return True
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "boss")
+        monkeypatch.setattr(service, "factor_binding_is_blocked", _blocked)
+        method = c.delete if path == "/me/mfa" else c.post
+        r = await method(path, headers=_auth(tok))
+        assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1", r.text
+        assert r.headers.get(STEP_UP_REASON_HEADER) == _VERIFY_FACTOR_REASON
+
+
+async def test_step_up_status_writes_an_audit_row(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "vic", Role.VIEWER)
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")
+        r = await c.get("/me/step-up", params={"action": "config_reload"}, headers=_auth(tok))
+        assert r.status_code == 200, r.text
+    rows = [
+        row for row in await engine.store.list_audit(limit=200) if row["action"] == _STATUS_READ
+    ]
+    assert len(rows) == 1, rows
+    assert rows[0]["actor"] == "vic"
+    assert "/me/step-up" in str(rows[0]["detail"]) and "config_reload" in str(rows[0]["detail"])
+
+
+async def test_step_up_status_is_paced_like_the_step_up_routes(engine: Engine) -> None:
+    """It draws the per-actor bucket the step-up routes draw, though it is a GET."""
+    service = await _service(engine, admin_write_rate_limit_per_actor=1)
+    await _add(service, "vic", Role.VIEWER)
+    async with _client(engine, service) as c:
+        tok = await _login(c, "vic")
+        assert (await c.get("/me/step-up", headers=_auth(tok))).status_code == 200
+        r = await c.get("/me/step-up", headers=_auth(tok))
+        assert r.status_code == 429, r.text
+        assert int(r.headers["Retry-After"]) >= 1
+
+
+async def test_step_up_status_refuses_a_new_address(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service, peer=("10.1.1.1", 4000)) as c:
+        tok = await _login(c, "boss")
+    async with _client(engine, service, peer=("10.2.2.2", 4000)) as c:
+        r = await c.get("/me/step-up", headers=_auth(tok))
+        assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1", r.text
+        assert r.headers.get(STEP_UP_REASON_HEADER) == STEP_UP_REASON_NEW_ADDRESS

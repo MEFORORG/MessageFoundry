@@ -1419,13 +1419,18 @@ route handler only when all of them pass.
    required` when the identity is flagged `must_change_password` and the path is not must-change
    exempt (`_MUST_CHANGE_EXEMPT_PATHS`; at least `/auth/logout`, `/auth/me`, `/auth/mfa-verify` and
    `/me/password`). While `[security].require_mfa` covers the local account and it has no TOTP, the
-   `_ENROL_FIRST_ROUTES` pass too, so it can enrol TOTP before it rotates, and the refusal's detail
-   ends `; enrol an authenticator app first` (ADR 0197 Amendment A). The refusal also carries
-   `X-Password-Change-Next`, naming the step the session takes next: `verify-factor` while it owes
-   a factor it has enrolled, `enrol-factor` while its account must enrol first, otherwise
-   `change-password` (ADR 0215 section 2). It is absent once the temporary credential has lapsed,
-   when the detail names an administrator reset instead. The header only names where to go; each
-   of those routes keeps its own checks → **403** + `X-MFA-Required`
+   `_ENROL_FIRST_ROUTES` pass too, so it can enrol TOTP before it rotates (ADR 0197 Amendment A).
+   The refusal also carries `X-Password-Change-Next`, naming the step the session takes next:
+   `verify-factor` while it owes a factor it has enrolled, else `enrol-factor` while its account
+   must enrol first, otherwise `change-password` (ADR 0215 section 2). The detail's ending is
+   derived from the same step: `; verify your second factor first`, `; enrol an authenticator app
+   first`, or nothing. So an account that must enrol first but already holds a factor it owes,
+   such as a passkey that is not discoverable, is sent to the factor first, because the enrolment
+   routes refuse a session that owes a factor its account holds until it proves that factor
+   (BACKLOG #1951). The header is absent once the
+   temporary credential has lapsed, when the detail names an administrator reset instead. The
+   header only names where to go; each of those routes keeps its own checks → **403** +
+   `X-MFA-Required`
    plus an `auth.mfa_denied` audit row when the session's second factor is pending and the route is not
    MFA-exempt (on `/me/password`, only when an account other than a directory account holds a
    factor, BACKLOG #1954; see the "MFA state" row below) → **403** `notification address required`
@@ -1463,12 +1468,19 @@ apply. What each **adds** over plain `require()`:
 
 `optional_identity` (2 routes) never raises, so a tokenless client is answered.
 
-Each 403 + `X-Step-Up-Required: 1` above also carries `X-Step-Up-Reason` (ADR 0215 section 2):
-`new-address` when the session was last verified from another host, `reverify` for any other
-cause. At least a lapsed window, a missing or spent action proof, and a factor-binding refusal give
-`reverify`. A step-up from the caller's host clears a new-address refusal, a lapsed window and a
-missing proof. It does not clear a factor-binding refusal, which proving the session's existing
-factor at `POST /auth/mfa-verify` clears. The header names a cause and decides nothing.
+Each 403 + `X-Step-Up-Required: 1` above also carries `X-Step-Up-Reason` (ADR 0215 section 2),
+one of three values. `new-address` when the session was last verified from another host.
+`verify-factor` for the factor-binding refusal of the per-action gates and their in-route spend:
+the session has not proven a second factor its account holds, or the gate could not read the
+session or its account and refused closed. Otherwise `reverify`, at least for a lapsed window and
+a missing or spent action proof. A step-up from the caller's host clears a new-address refusal, a
+lapsed window and a missing proof. No step-up clears a factor-binding refusal: `POST /me/reauth`
+mints nothing it accepts, so a client that answered it with a re-authentication would be refused
+again (BACKLOG #1951). Proving the account's existing factor, at `POST /auth/mfa-verify` or its
+console twins, clears its first cause; the second needs a new sign-in. Its detail is still the
+step-up detail, which names `POST /me/reauth` (or the IdP step-up, on an `oidc` session), so a
+client tells the causes apart by this header. Where both a new address and a factor-binding
+refusal hold, the header names the new address. The header names a cause and decides nothing.
 
 The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before** `accept()`:
 
@@ -1658,7 +1670,7 @@ tuple: they act only on the caller's own account.
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/check` | `require` | gate-only: answers 200 once the ladder admits the session, and reads nothing else (ADR 0215 section 2). **Not** exempt from the `must_change_password` confinement, the factor gate or the notification-address gate. Like every bare `require()` route, it does not ask the new-client-IP question and writes no grant row |
-| `GET` | `/me/step-up` | `require` | whether the session's step-up window is live and, with `?action=`, whether that action's gate would accept the caller's proof, read **without spending it** (ADR 0215 section 2). A hint for a page, never an authorization, and it can be wrong both ways. The action's own gate can refuse where this reads `true`, at least from a host the session has not verified from, a question this read does not ask. And a `proof_in_route` route that rejoins an open hold, or a group-wide save that ends none of the caller's sessions, admits on a live window alone where this reads `false`. It does not check the `action` against the ids gates name: `POST /me/reauth` mints a proof for any `purpose`, and this reads such a proof as live. `action` is capped at 64 characters (422) and is not echoed back |
+| `GET` | `/me/step-up` | `require` | whether the session's step-up window is live and, with `?action=`, whether that action's step-up check would accept the caller's proof now (no factor-binding refusal, and a live grant for that action, or a live window where `[auth].require_action_step_up` is off), read **without spending it** (ADR 0215 section 2). Before it reads, it takes what the step-up routes take: the per-**actor** admin-write pacing `require_step_up` charges, charged on this GET too (429 + `Retry-After`), and the **new-client-IP** refusal (403 + `X-Step-Up-Required: 1` + `X-Step-Up-Reason: new-address`). Each answer writes an `auth.step_up_status_read` audit row naming the `action` asked and the two answers. A hint for a page, never an authorization, and it can be wrong both ways. The action's own gate can refuse where this reads `true`, at least when the window or proof lapses in between. And a `proof_in_route` route that rejoins an open hold, or a group-wide save that ends none of the caller's sessions, admits on a live window alone where this reads `false`. It does not check the `action` against the ids gates name: `POST /me/reauth` mints a proof for any `purpose`, and this reads such a proof as live. `action` is capped at 64 characters (422) and is not echoed back |
 | `POST` | `/me/password` | `require` | Per-**actor** credential-ceremony limiter. Refused (400) for an AD identity. Exempt from the `must_change_password` confinement. MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers gets 403 `enrol an authenticator app first` when it holds no factor with a way past (ADR 0197 Amendment A). That is asked before its current password is read. An account deleted, or whose record fails its integrity seal, while the current password is checked gets at least the wrong-password 403 `current password is incorrect`, audited `auth.password_change_failed` with `reason=bad_password`, or 401 `session ended; sign in again`, audited `reason=session_gone`, where a deletion has already removed the session when the check reads it. Once the current password is checked, the change answers at least these refusals (BACKLOG #5902). An unusable bundled breach corpus gets 503 `password screening is unavailable; ask an administrator to repair it`. An account the change finds gone, when it reads the record before the write or re-reads it after a write that matched no row, gets 401 `session ended; sign in again`, with no `auth.password_changed` row. One deleted after that re-read can get the 409 below instead. A record that fails its integrity seal, or that Vault transit cannot verify, gets 423 and sets nothing. A Vault transit Outage on that record gets 503 and sets nothing. A write that lost to a concurrent change of the account sets nothing. It gets the enrolment 403 where a covered account no longer holds a factor with a way past, and 409 otherwise. Once the write commits, a deletion, or a store refusal of its `auth.password_changed` row, still reports the change. A session revoke that fails past its retries still fails the request, although the change has already committed, so the new password is in effect |
 | `POST` | `/me/notify-email` | `require_paced` | fills a **missing** notification address only (409 when one is set, 400 when blank); the way out of the address confinement, and **not** MFA-exempt, so a session owing its factor gets 403 + `X-MFA-Required` (BACKLOG #1139). Paced, and refused from a host the session has not verified from, like its console twin `POST /ui/account/notify-address` (vault BACKLOG #3052) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given; refuses an `oidc` session with 403 naming `/ui/reauth`, before any verify and charging nothing to the lockout (that session steps up at the IdP) |
@@ -1678,11 +1690,15 @@ One `GET /auth/check/<permission>` per permission, registered in a loop over `Pe
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
 the caller and reads nothing else. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
-yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes the grant row
-a `require(p)` route writes for its permission, which means none for the two PHI-view permissions,
-`messages:view_raw` and `messages:view_summary`: their grants are left to the PHI-access audit row,
-and a check route writes none. The [Permission catalogue](#permission-catalogue-29) counts these
-apart.
+yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
+`auth.permission_granted` row naming its permission wherever a grant of that permission is
+audited (`record_check_grant`). Under `[diagnostics].audit_all_authz`, the default, that is every
+permission, the two PHI views `messages:view_raw` and `messages:view_summary` included: their own
+routes record the grant in the PHI-access row, which a check route has nothing to write. With the
+switch off it is at least the sensitive set `_GRANT_AUDIT_PERMISSIONS`, the two PHI views and
+`files:browse`, which a check route writes although a GET otherwise writes no grant row on that
+trail. One request writes one grant row.
+The [Permission catalogue](#permission-catalogue-29) counts these routes apart.
 
 | Method | Path | Permission | Gate |
 |---|---|---|---|
@@ -7744,7 +7760,7 @@ Every authentication and authorization event is written to the durable `audit_lo
 user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` / `auth.logout` (an unauthenticated sign-out that ends nothing, past its bound, is counted in a row rather than written as its own; see [Session inventory](#session-inventory--targeted-revocation-wp-10)) /
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
-`auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed`, the 6.3.5 events `auth.account_locked` /
+`auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed` / `auth.step_up_status_read`, the 6.3.5 events `auth.account_locked` /
 `auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
