@@ -21,11 +21,13 @@ from messagefoundry.store.base import acquire_pooled, warm_pool_connections
 
 
 class _HandOffPool:
-    """``acquire()`` parks on a hand-off future. ``deaf=True`` models a driver whose acquire swallows
-    a cancel and keeps waiting, so a borrow stays stuck until the test hands a connection over."""
+    """``acquire()`` parks on a hand-off future. ``shape`` picks how the driver's acquire reaches it:
+    ``plain`` returns the future itself; ``deaf`` swallows a cancel and keeps waiting, so a borrow
+    stays stuck until the test hands a connection over; ``yield`` takes one bare step after the
+    hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a gather."""
 
-    def __init__(self, *, deaf: bool = False) -> None:
-        self.deaf = deaf
+    def __init__(self, *, shape: str = "plain") -> None:
+        self.shape = shape
         self.handoffs: list[asyncio.Future[str]] = []
         self.checked_out: list[str] = []
         self.released: list[str] = []
@@ -34,7 +36,7 @@ class _HandOffPool:
     def acquire(self) -> object:
         fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self.handoffs.append(fut)
-        if not self.deaf:
+        if self.shape == "plain":
             return fut
 
         async def _deaf() -> str:
@@ -44,7 +46,19 @@ class _HandOffPool:
                 except asyncio.CancelledError:
                     continue  # a driver that ignores the cancel
 
-        return _deaf()
+        async def _yield() -> str:
+            conn = await fut
+            await asyncio.sleep(0)  # a bare step with the connection already in use
+            return conn
+
+        async def _inner() -> str:
+            return await fut
+
+        async def _gather() -> str:
+            (conn,) = await asyncio.gather(asyncio.ensure_future(_inner()))
+            return conn
+
+        return {"deaf": _deaf, "yield": _yield, "gather": _gather}[self.shape]()
 
     def hand_over(self, index: int = 0) -> None:
         fut = self.handoffs[index]
@@ -130,11 +144,14 @@ async def test_acquire_pooled_cancel_still_stops_a_parked_borrow() -> None:
     assert pool.checked_out == [] and pool.released == []
 
 
-async def test_warm_landed_borrow_is_released_while_a_sibling_borrow_is_stuck() -> None:
+async def test_warm_landed_borrow_is_released_while_a_sibling_borrow_is_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Two abandoned borrows: one lands, the other stays stuck on a pool that ignores the cancel. The
     # landed one must be returned at once, not after the stuck sibling or the cleanup bound, where it
-    # would get no release budget left.
-    pool = _HandOffPool(deaf=True)
+    # would get no release budget left. The bound is lifted so a slow runner cannot lapse it here.
+    monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 3600.0)
+    pool = _HandOffPool(shape="deaf")
     try:
         task = asyncio.create_task(
             warm_pool_connections(pool, target=2, timeout=30.0, backend="stub")
@@ -166,7 +183,7 @@ async def test_warm_borrow_landing_after_the_bound_is_released_exactly_once(
     # A zero bound ends the cleanup with the borrow still pending; the salvage owns it from then on.
     # It is released once, not by both the cleanup and the salvage.
     monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 0.0)
-    pool = _HandOffPool(deaf=True)
+    pool = _HandOffPool(shape="deaf")
     try:
         parked_before = set(base_module._LATE_RELEASES)
         task = asyncio.create_task(
@@ -201,3 +218,55 @@ async def test_the_task_exposes_the_waiter_the_borrow_cancel_reads() -> None:
     assert getattr(task, "_fut_waiter", None) is fut
     fut.set_result("synthetic")
     assert await task == "synthetic"
+
+
+async def test_warm_borrow_taking_a_bare_step_after_the_hand_off_strands_nothing() -> None:
+    # The pool resolves the hand-off and the warm-up is cancelled in the same turn. The borrow's
+    # wake-up runs first, takes the connection and yields with no future, so it is runnable when the
+    # acquire task gives up on it. A cancel there would be thrown in at that bare step.
+    pool = _HandOffPool(shape="yield")
+    task = asyncio.create_task(warm_pool_connections(pool, target=1, timeout=30.0, backend="stub"))
+    await _turns()
+    pool.hand_over()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await _until(lambda: not pool.checked_out), "the borrow's connection was stranded"
+    assert pool.released == pool.issued == ["conn-1"]
+
+
+async def test_acquire_pooled_borrow_on_a_gather_that_refuses_the_cancel_strands_nothing() -> None:
+    # The hand-off lands and the gather's child finishes before the caller's cancel is handled, so
+    # the gather future the borrow waits on is still pending but refuses the cancel. Task.cancel()
+    # would then throw the cancel in place of the gathered connection.
+    pool = _HandOffPool(shape="gather")
+    caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+    await _turns()
+    assert len(pool.handoffs) == 1
+    pool.hand_over()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert await _until(lambda: not pool.checked_out), "the gathered connection was stranded"
+    assert pool.released == ["conn-1"]
+
+
+async def test_acquire_pooled_holds_its_abandoned_borrow_until_it_ends() -> None:
+    # The loop holds tasks weakly, so a borrow nobody awaits is kept in _LATE_RELEASES until it ends;
+    # otherwise it and its salvage callback could be collected before the connection comes back.
+    pool = _HandOffPool(shape="deaf")
+    parked_before = set(base_module._LATE_RELEASES)
+    try:
+        caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+        await _turns()
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert len(base_module._LATE_RELEASES - parked_before) == 1
+        pool.hand_over()
+        assert await _until(lambda: pool.released == ["conn-1"])
+        await _turns()
+        assert base_module._LATE_RELEASES - parked_before == set()
+        assert pool.checked_out == []
+    finally:
+        await pool.unstick()
