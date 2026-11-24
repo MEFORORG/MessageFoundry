@@ -366,6 +366,10 @@ class _Recorder:
     async def audit_gate_refused(self, *_: object, **__: object) -> None:
         self.calls.append(_REFUSED)
 
+    async def factor_binding_is_blocked(self, *_: object, **__: object) -> bool:
+        # _mfa_refusal asks it to word its detail (BACKLOG #1149); it writes no row.
+        return True
+
 
 def _post_request() -> Request:
     app = FastAPI()

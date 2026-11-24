@@ -967,12 +967,17 @@ from typing import Any
 #: ``0cb66e183386b7c8`` to ``10cd6745cb708c1a``, and over the merge with BACKLOG #5646 above, from
 #: ``7c3240bbbaf0605a`` to ``a888b8fed812bbe6``.
 #:
+#: BACKLOG #1149: the console's reauth-only action gate sends a pending session with no factor to
+#: enrolment when a session-ending action refuses it. The snapshot hashes that gate's body, so the
+#: digest moved. No engine surface changed. Re-derived with ``--write``, from
+#: ``a888b8fed812bbe6`` to ``28c252796d4fd6c4``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "a888b8fed812bbe6"
+ENGINE_UI_SEAM: str = "28c252796d4fd6c4"
 
 
 @dataclass(frozen=True, slots=True)

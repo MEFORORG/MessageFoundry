@@ -16465,7 +16465,8 @@ class AuthService:
         # and notice are written at the clear, above.
         return elevation
 
-    #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every
+    #: The step-up actions a pending session may NOT be granted once its account HAS a factor (and,
+    #: for the session-ending ones below, even when it has none). Every
     #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
     #: account with no factor is not locked out of it. For an account that already has one:
     #:
@@ -16489,11 +16490,27 @@ class AuthService:
     #: password re-proof from an MFA-pending session does not count as authenticating again, so
     #: ``POST /me/reauth`` and ``/ui/reauth`` mint that session no grant for it.
     #: ``revoke_all_sessions`` (BACKLOG #2614) is listed for the same reason.
+    #:
+    #: The three session-ending actions in :data:`_PENDING_SESSION_ENDING_ACTIONS` are refused to
+    #: EVERY pending session, the account's factors aside (BACKLOG #1149, ASVS 7.5.2). Under
+    #: ``require_mfa`` a session on an account with no factor is MFA-pending, so it is confined like
+    #: any other pending session: it enrols first, and the confirm that binds its first factor
+    #: satisfies the session. Only the enrolment actions keep the first-enrolment carve-out.
     _PENDING_REFUSED_ACTIONS = frozenset(
         {
             STEP_UP_ACTION_MFA_ENROLL,
             STEP_UP_ACTION_MFA_CONFIRM,
             STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            STEP_UP_ACTION_SESSION_TERMINATE,
+            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
+        }
+    )
+
+    #: The actions of :data:`_PENDING_REFUSED_ACTIONS` that end sessions. Refused to a pending
+    #: session whether or not its account holds a factor (BACKLOG #1149).
+    _PENDING_SESSION_ENDING_ACTIONS = frozenset(
+        {
             STEP_UP_ACTION_SESSION_TERMINATE,
             STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
             STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
@@ -16515,34 +16532,47 @@ class AuthService:
 
         So: if the session has not satisfied its second factor and the account already has one, the
         existing factor must be proven first (``POST /auth/mfa-verify``). First enrolment is
-        untouched: an account with NO factor still enrols, and ends sessions, from a password-only
-        session, which is exactly the deadlock carve-out. Disable/delete actions are NOT listed:
-        they run behind ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        untouched: an account with NO factor still enrols from a password-only session, which is
+        exactly the deadlock carve-out. It no longer ends sessions from one: the session-ending
+        actions are refused to every pending session (BACKLOG #1149), so such an account enrols
+        first, and the enrolment that binds its first factor satisfies the session. Disable/delete
+        actions are NOT listed: they run behind ``require_step_up_action``, which keeps its own
+        ``mfa_satisfied`` check.
         """
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
-        return await self._owes_enrolled_factor(token)
+        return await self._owes_enrolled_factor(
+            token, any_pending=purpose in self._PENDING_SESSION_ENDING_ACTIONS
+        )
 
     async def _factor_binding_is_blocked_hash(self, token_hash: str, purpose: str) -> bool:
         """:meth:`_factor_binding_is_blocked` keyed on the session's hash (see
         :meth:`_elevated_hash`)."""
         if purpose not in self._PENDING_REFUSED_ACTIONS:
             return False
-        return await self._owes_enrolled_factor_hash(token_hash)
+        return await self._owes_enrolled_factor_hash(
+            token_hash, any_pending=purpose in self._PENDING_SESSION_ENDING_ACTIONS
+        )
 
-    async def _owes_enrolled_factor(self, token: str | None, *, local_only: bool = False) -> bool:
+    async def _owes_enrolled_factor(
+        self, token: str | None, *, local_only: bool = False, any_pending: bool = False
+    ) -> bool:
         """Whether the session is MFA-pending on an account that already HAS a second factor.
 
         Fails closed (True) when the session or its user cannot be found. ``local_only`` answers
         False for a directory account, whose password the engine does not hold. It names AD rather
         than excluding everything that is not LOCAL: ``_build_identity`` maps an unrecognized
-        provider back to LOCAL, so the password handler treats that row as local and changes it."""
+        provider back to LOCAL, so the password handler treats that row as local and changes it.
+        ``any_pending`` drops the "HAS a factor" half: True for every pending session, including
+        one on an account with no factor that ``require_mfa`` covers (BACKLOG #1149)."""
         if not token:
             return True  # no session to act on, so fail closed (as below)
-        return await self._owes_enrolled_factor_hash(hash_token(token), local_only=local_only)
+        return await self._owes_enrolled_factor_hash(
+            hash_token(token), local_only=local_only, any_pending=any_pending
+        )
 
     async def _owes_enrolled_factor_hash(
-        self, token_hash: str, *, local_only: bool = False
+        self, token_hash: str, *, local_only: bool = False, any_pending: bool = False
     ) -> bool:
         """:meth:`_owes_enrolled_factor` keyed on the session's hash (see :meth:`_elevated_hash`)."""
         session = await self._load_session(token_hash)
@@ -16551,7 +16581,7 @@ class AuthService:
         satisfied, user = await self._session_satisfaction(session)
         if satisfied:
             return False
-        if user is None:
+        if user is None or any_pending:
             return True
         if local_only and user.auth_provider == AuthProvider.AD.value:
             return False

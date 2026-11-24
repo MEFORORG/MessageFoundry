@@ -49,7 +49,7 @@ from messagefoundry.api.tls_client_cert import (
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.notifications import deadline_utc as deadline_utc  # re-export
-from messagefoundry.auth.service import AuthService, LoginOutcome
+from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService, LoginOutcome
 from messagefoundry.config.tls_policy import HopDisposition
 from messagefoundry.controlchars import scrub_log_argument
 
@@ -185,12 +185,13 @@ _ENROL_FIRST_SUFFIX = "; enrol an authenticator app first"
 # Deliberately NOT exempt: GET /me/sessions and GET /me/security-events. A pending session has proven
 # ONE factor, which is exactly the attacker-holds-the-password case; handing it the victim's session
 # inventory and client-IP history is reconnaissance. ASVS 7.5.2 self-service is a POST-authentication
-# clause, and neither route is on any deadlock-escape path (revocation still works: POST /me/reauth
-# then DELETE /me/sessions, both reachable).
+# clause, and neither route is on any deadlock-escape path.
 #
-# That revocation path serves an account with NO factor, which has nothing to prove at
-# /auth/mfa-verify. An account that HAS one proves it first before that path works (BACKLOG #1951;
-# see AuthService._PENDING_REFUSED_ACTIONS). /me/password is limited the same way (#1954).
+# Ending sessions is not open to a pending session either. An account that HAS a factor proves it
+# first (BACKLOG #1951); one with NO factor that require_mfa covers enrols first, and the confirm
+# that binds the factor satisfies the session (BACKLOG #1149). The terminate routes ride
+# require_reauth_only_action, so AuthService._PENDING_REFUSED_ACTIONS is what refuses them.
+# /me/password is limited for an account that has a factor (#1954).
 _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/auth/logout"),
@@ -1612,13 +1613,38 @@ async def _mfa_refusal(request: Request, auth: AuthService, identity: Identity) 
 
     Writes its ``auth.mfa_denied`` row first, whichever gate refuses (BACKLOG #1197). It is a
     plain :class:`HTTPException`, not a :class:`_GateRefusal`, so :func:`_recorded_decision` writes
-    no second row for it."""
+    no second row for it.
+
+    A pending session on an account that holds NO factor (``require_mfa`` covers it) has nothing to
+    prove at ``/auth/mfa-verify``, so its detail names enrolment instead (BACKLOG #1149). The
+    detail keeps the same leading text and the header stays, so a client that matches either
+    still reads an MFA refusal."""
     await auth.audit_mfa_denied(identity, request.url.path, client=client_ip(request))
     return HTTPException(
         status.HTTP_403_FORBIDDEN,
-        "multi-factor verification required; POST /auth/mfa-verify then retry",
+        _MFA_ENROL_FIRST_DETAIL
+        if await _pending_holds_no_factor(auth, bearer_token(request))
+        else "multi-factor verification required; POST /auth/mfa-verify then retry",
         headers={"X-MFA-Required": "1"},
     )
+
+
+#: The 403 detail for a pending session whose account holds no factor (BACKLOG #1149).
+_MFA_ENROL_FIRST_DETAIL = (
+    "multi-factor verification required; no second factor is enrolled, so enrol one first"
+    " (POST /me/reauth with purpose mfa_enroll, POST /me/mfa/enroll, POST /me/mfa/confirm),"
+    " then retry"
+)
+
+
+async def _pending_holds_no_factor(auth: AuthService, token: str | None) -> bool:
+    """Whether a session already known to be MFA-pending is on an account with no factor.
+
+    Asks the ``mfa_enroll`` factor-binding refusal, which is True for a pending session exactly
+    when its account holds a factor, and fails closed (True) on a session or account it cannot
+    find. So a False here means a found, pending session with no factor; the unknown case keeps
+    the verify wording. No new service member, so the console's seam does not move."""
+    return not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL)
 
 
 async def refuse_from_new_address(request: Request) -> None:
@@ -2268,7 +2294,9 @@ def require_reauth_only_action(
 
     Carries the same ``mfa_gate=False`` opt-out as :func:`require_reauth_only`, for the same reason;
     the session-terminate routes use it too. A pending session on an account that HAS a factor is
-    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), with ``X-MFA-Required`` and not
+    still refused (see ``AuthService._PENDING_REFUSED_ACTIONS``), and on the terminate routes so
+    is one with no factor (BACKLOG #1149), whose detail names enrolment. Both get
+    ``X-MFA-Required`` and not
     a step-up header: a password re-proof mints it nothing, so pointing it at ``POST /me/reauth``
     would loop a client that already typed the right password (BACKLOG #1951)."""
 

@@ -34,7 +34,7 @@ from messagefoundry.api.security import (
     record_ws_gate,
 )
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.auth.webauthn import configured_rp_id
 
@@ -2182,6 +2182,12 @@ def require_ui_reauth_only_action(
         # The JSON twin's rule: a refused request still records the new-IP signal. Only on this
         # branch, because a request let through records it once, later in the base.
         await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
+        # BACKLOG #1149: a session-ending action is refused to a pending session on an account with
+        # NO factor too. It has nothing to give /ui/reauth, which would mint it nothing, so it is
+        # sent to enrol. The mfa_enroll refusal is True exactly when the account holds a factor (and
+        # on an unknown session), the JSON plane's _pending_holds_no_factor reading.
+        if not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL):
+            return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
         return _reauth_redirect(request, continuation(request))
 
     # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
