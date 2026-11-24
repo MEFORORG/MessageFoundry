@@ -62,6 +62,7 @@ to stdout — never written to a persisted file.
 from __future__ import annotations
 
 import inspect
+import math
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -92,6 +93,8 @@ __all__ = ["trace_dry_run"]
 # in full even under --show-phi.
 _MAX_EVENTS = 5000
 _MAX_VALUE_LEN = 120
+# The bound below which an int's decimal form, sign included, fits in _MAX_VALUE_LEN characters.
+_MAX_INT_MAGNITUDE = 10 ** (_MAX_VALUE_LEN - 1)
 
 
 # --- value serialization (PHI-gated) -----------------------------------------
@@ -102,11 +105,18 @@ def _safe_value(value: object, show_phi: bool) -> Any:
 
     Without ``show_phi`` every value collapses to ``"REDACTED"`` (values are message-derived, hence PHI).
     With it, scalars pass through and any other object is ``repr``'d; both are length-capped so a full
-    message body can never be dumped."""
+    message body can never be dumped. A NaN/Infinity float is ``repr``'d and an int longer than the cap
+    becomes a placeholder, because ``json.dumps`` would otherwise write a token RFC 8259 rejects or, past
+    the interpreter's int-to-str digit limit, raise (BACKLOG #6822)."""
     if not show_phi:
         return "REDACTED"
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else repr(value)
+    if isinstance(value, int):
+        # Compared, never str()'d: converting a huge int is itself what raises.
+        return value if abs(value) < _MAX_INT_MAGNITUDE else "<int: too large>"
     if isinstance(value, str):
         text = value
     else:

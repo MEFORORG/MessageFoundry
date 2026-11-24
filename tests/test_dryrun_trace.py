@@ -568,6 +568,51 @@ def test_cli_trace_show_phi(tmp_path: Path, capsys) -> None:
     assert any(w["path"] == "MSH-3" and w["value"] == "FOUNDRY" for w in writes)
 
 
+# --- BACKLOG #6822: --show-phi values must still serialize as RFC 8259 JSON --------------------
+
+
+def handle_non_json_numbers(msg: Message) -> Send:
+    nan = float("nan")
+    pos_inf = float("inf")
+    neg_inf = float("-inf")
+    huge = 10**5000  # past CPython's default 4300-digit int-to-str limit
+    _unused = (nan, pos_inf, neg_inf, huge)
+    return Send("out", msg)
+
+
+def handle_ordinary_numbers(msg: Message) -> Send:
+    count = 42
+    ratio = 0.5
+    big = 1 - 10**119  # 120 characters with the sign: the longest int still kept as a JSON number
+    too_long = -(10**119)  # 121 characters: one past the cap
+    flag = True
+    _unused = (count, ratio, big, too_long, flag)
+    return Send("out", msg)
+
+
+def test_show_phi_values_serialize_as_strict_json() -> None:
+    # Under --show-phi a NaN/Infinity float passed through unchanged, so the CLI's json.dumps wrote the
+    # bare tokens NaN/Infinity (not JSON), and a >4300-digit int made json.dumps raise ValueError.
+    reg = _registry(route_to_h, {"h": handle_non_json_numbers})
+    traced = trace_dry_run(reg, ADT_A01, show_phi=True)
+    text = json.dumps(traced, allow_nan=False)  # raises on NaN/Infinity or an unprintable int
+    assigned = _all_assigned(_handler_invocation(json.loads(text)))
+    assert assigned["nan"] == "nan"
+    assert assigned["pos_inf"] == "inf"
+    assert assigned["neg_inf"] == "-inf"
+    assert assigned["huge"] == "<int: too large>"
+
+
+def test_show_phi_keeps_ordinary_numbers_as_numbers() -> None:
+    reg = _registry(route_to_h, {"h": handle_ordinary_numbers})
+    assigned = _all_assigned(_handler_invocation(trace_dry_run(reg, ADT_A01, show_phi=True)))
+    assert assigned["count"] == 42
+    assert assigned["ratio"] == 0.5
+    assert assigned["big"] == 1 - 10**119
+    assert assigned["too_long"] == "<int: too large>"
+    assert assigned["flag"] is True
+
+
 # --- ADR 0084: an `accepts=` decline is surfaced in the trace ----------------------------------
 
 
