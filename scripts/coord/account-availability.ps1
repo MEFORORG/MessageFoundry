@@ -107,6 +107,22 @@ function Show-One([string]$Root) {
     }
 }
 
+function Assert-ConfigRoot {
+    if (-not (Test-Path -LiteralPath $ConfigDir -PathType Container)) {
+        Write-Host "REFUSED -- no such config root: $ConfigDir" -ForegroundColor Red
+        Write-Host "  This script will not create one, and reads nothing from one. Check the path." -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
+function Assert-MarkerNotDirectory([string]$MarkerPath) {
+    if (Test-Path -LiteralPath $MarkerPath -PathType Container) {
+        Write-Host "REFUSED -- the availability marker path is a directory: $MarkerPath" -ForegroundColor Red
+        Write-Host "  The reader treats this account as UNAVAILABLE (MALFORMED). Remove the directory by hand." -ForegroundColor DarkGray
+        exit 1
+    }
+}
+
 switch ($PSCmdlet.ParameterSetName) {
 
     'Mark' {
@@ -121,11 +137,10 @@ switch ($PSCmdlet.ParameterSetName) {
         # -Force builds every missing ancestor, so a typo'd -ConfigDir would have this command
         # MANUFACTURE a config root nothing can launch from and then declare it cancelled -- a wholly
         # fictional account, recorded as fact, with nothing anywhere reporting a problem.
-        if (-not (Test-Path -LiteralPath $ConfigDir -PathType Container)) {
-            Write-Host "REFUSED -- no such config root: $ConfigDir" -ForegroundColor Red
-            Write-Host "  This script will not create one. Check the path." -ForegroundColor DarkGray
-            exit 1
-        }
+        Assert-ConfigRoot
+        $sd = Get-UsageStateDir $ConfigDir
+        $path = Join-Path $sd $script:UsageUnavailableMarker
+        Assert-MarkerNotDirectory $path
 
         # THE INVARIANT CULTURE, BOTH WAYS, OR THE MARKER IS NOT THE ISO TEXT ITS READERS PARSE. Under
         # th-TH the current culture's Thai Buddhist calendar wrote marked_at in year 2569, so an account
@@ -160,9 +175,7 @@ switch ($PSCmdlet.ParameterSetName) {
             effective_from = $(if ($eff) { $eff } else { $now }).ToString($iso, $inv)
         }
 
-        $sd = Get-UsageStateDir $ConfigDir
         New-Item -ItemType Directory -Force -Path $sd | Out-Null
-        $path = Join-Path $sd $script:UsageUnavailableMarker
         # Temp-then-rename, the same discipline the collector uses: a reader must never observe a
         # half-written marker, and a half-written marker reads as MALFORMED, which fails closed on a
         # live account.
@@ -199,8 +212,14 @@ switch ($PSCmdlet.ParameterSetName) {
     }
 
     'Clear' {
+        # A typo'd root carries no marker, so without this a clear of a fictional account reported
+        # NOTHING TO CLEAR and exit 0, and the real marker stayed in force. BACKLOG #7558.
+        Assert-ConfigRoot
         $sd = Get-UsageStateDir $ConfigDir
         $path = Join-Path $sd $script:UsageUnavailableMarker
+        # A directory at the marker path is not "no marker": the reader takes it as MALFORMED and the
+        # account as UNAVAILABLE, so NOTHING TO CLEAR there was false.
+        Assert-MarkerNotDirectory $path
         Write-Host ""
         if (Test-Path -LiteralPath $path -PathType Leaf) {
             Remove-Item -LiteralPath $path -Force
@@ -239,6 +258,9 @@ switch ($PSCmdlet.ParameterSetName) {
             }
         }
         else {
+            # A typo'd root has no marker and so read AVAILABLE, an all-clear for an account that
+            # does not exist. BACKLOG #7558.
+            Assert-ConfigRoot
             Show-One $ConfigDir
         }
         Write-Host ""

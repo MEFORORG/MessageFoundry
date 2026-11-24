@@ -3810,6 +3810,46 @@ def test_a_root_whose_name_holds_wildcard_characters_is_marked_literally(tmp_pat
     assert not (tmp_path / "acct1" / "mefor-usage").exists()
 
 
+@pytest.mark.parametrize("action", ["-Clear", "-Status"])
+def test_clear_and_status_refuse_a_config_root_that_does_not_exist(
+    tmp_path: Path, action: str
+) -> None:
+    """BACKLOG #7558. Only -Mark refused a typo'd root. -Clear reported NOTHING TO CLEAR and -Status
+    reported AVAILABLE, both exit 0, for an account that does not exist, while the real root's marker
+    stayed in force. Neither may create the root it refuses."""
+    ghost = tmp_path / ".claude-account-99"
+    out = avail(action, "-ConfigDir", str(ghost))
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout
+    assert "AVAILABLE" not in out.stdout
+    assert "NOTHING TO CLEAR" not in out.stdout
+    assert not ghost.exists(), "the refusal created the root it refused"
+
+    # CONTROL: the same action on a root that exists still succeeds.
+    real = tmp_path / ".claude-account-9"
+    real.mkdir()
+    ok = avail(action, "-ConfigDir", str(real))
+    assert ok.returncode == 0, ok.stdout
+
+
+@pytest.mark.parametrize("action", ["-Clear", "-Mark"])
+def test_a_directory_at_the_marker_path_is_refused_by_name(tmp_path: Path, action: str) -> None:
+    """BACKLOG #7558 added items 1 and 2. The reader takes a directory at the marker path as MALFORMED
+    and the account as UNAVAILABLE, yet -Clear printed NOTHING TO CLEAR and -Mark died in File.Move.
+    Both now refuse and say to remove it by hand; neither removes it."""
+    root = tmp_path / ".claude-account-9"
+    marker = root / "mefor-usage" / "unavailable.json"
+    marker.mkdir(parents=True)
+    args = [action, "-ConfigDir", str(root)]
+    if action == "-Mark":
+        args += ["-Reason", "cancelled"]
+    out = avail(*args)
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout and "is a directory" in out.stdout, out.stdout
+    assert "NOTHING TO CLEAR" not in out.stdout
+    assert marker.is_dir()
+
+
 def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
     """The absent-marker arm is the only silent one, and it is the overwhelmingly normal case. If it
     ever stopped meaning AVAILABLE, every root on the box would go dark at once.
