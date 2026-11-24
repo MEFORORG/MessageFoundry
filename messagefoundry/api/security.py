@@ -2382,9 +2382,9 @@ async def step_up_status(
     """``GET /me/step-up``: whether the caller's step-up is fresh, read without spending anything
     (ADR 0215 section 2).
 
-    It first takes what the step-up routes take before their proof: the per-actor pacing
-    :func:`require_step_up` charges, here charged on this GET too, and the new-address refusal
-    (:func:`refuse_from_new_address`). Then ``window_live`` is :func:`step_up_window_live`, and with
+    It first takes what the step-up routes take before their proof: the new-address refusal
+    (:func:`refuse_from_new_address`), then the per-actor pacing :func:`require_step_up` charges,
+    here charged on this GET too, so a refused read spends no budget. Then ``window_live`` is :func:`step_up_window_live`, and with
     ``action``, ``action_proof_live`` is whether :func:`_action_step_up_ok` would admit, with the
     grant left unspent. It does not know which ids a gate names. Each answer writes an
     ``auth.step_up_status_read`` row. docs/SECURITY.md's route row says what follows for a caller.
@@ -2395,8 +2395,8 @@ async def step_up_status(
         return StepUpStatusReply(
             window_live=True, action_proof_live=None if action is None else True
         )
-    _enforce_admin_write_pacing(request, auth, identity, reads_too=True)
     await refuse_from_new_address(request)
+    _enforce_admin_write_pacing(request, auth, identity, reads_too=True)
     token = bearer_token(request)
     window_live = await auth.has_recent_step_up(token)
     proof_live = (

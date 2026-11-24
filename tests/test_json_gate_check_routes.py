@@ -471,3 +471,17 @@ async def test_step_up_status_refuses_a_new_address(engine: Engine) -> None:
         r = await c.get("/me/step-up", headers=_auth(tok))
         assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1", r.text
         assert r.headers.get(STEP_UP_REASON_HEADER) == STEP_UP_REASON_NEW_ADDRESS
+
+
+async def test_a_refused_new_address_status_read_spends_no_budget(engine: Engine) -> None:
+    """The new-address refusal runs before the pacing charge, as in require_paced and
+    require_phi_read, so a token replayed from another host cannot spend the holder's budget."""
+    service = await _service(engine, admin_write_rate_limit_per_actor=1)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service, peer=("10.1.1.1", 4000)) as c:
+        tok = await _login(c, "boss")
+    async with _client(engine, service, peer=("10.2.2.2", 4000)) as c:
+        assert (await c.get("/me/step-up", headers=_auth(tok))).status_code == 403
+    async with _client(engine, service, peer=("10.1.1.1", 4000)) as c:
+        r = await c.get("/me/step-up", headers=_auth(tok))
+        assert r.status_code == 200, r.text
