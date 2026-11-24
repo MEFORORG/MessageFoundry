@@ -30,8 +30,9 @@
   own, and names the open's one-time steps, such as the genesis record, for the earlier open
   alone. `provision-admin` now does the same over an existing store, naming its pre-check's
   open as the earlier one, for a key-resolution, hop, short-schema, key, cipher, keyless-chain,
-  keyless-provision or unauditable-write refusal at or after its write's open, and for a
-  SQLite store failure after that open returned. Other refusals after an open still say nothing was written,
+  keyless-provision or unauditable-write refusal at or after its write's open, for a SQLite
+  store failure at or after that open, and for that open failing the AES-GCM invocation bound's
+  pass, which no longer says no audit row was written. Other refusals after an open still say nothing was written,
   at least a store pin refusal under the host key provider, a refusal about the account itself
   such as a disabled Administrator, and `admin-reset-totp`'s refusals of the replacement itself. (`BACKLOG #5067`)
 - **`provision-admin` would now keep its result when the store fails to close after the grant
