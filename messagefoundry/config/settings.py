@@ -8949,9 +8949,10 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
       trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
       modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
       that name. ``MEFOR_*`` names are the engine's namespace, so a bare section name is refused
-      even though a tool outside the engine could choose one; nothing checks that none does.
-      Decided under the owner's instruction of 2026-11-23 (Manager decision
-      d20261123T172418598-d8ffd6, option (c));
+      even though a tool outside the engine could choose one. Two census tests read the names
+      this repository's own code and deployment files spell; nothing checks the names a tool
+      outside the repository sets. Decided under the owner's delegation of 2026-11-23 (Manager
+      decision d20261123T172418598-d8ffd6, option (c));
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
