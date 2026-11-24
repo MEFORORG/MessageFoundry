@@ -1339,6 +1339,8 @@ def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_
         assert session._proc is not doomed
         assert session._generation == generation + 1
         assert KillCause.REQUEST_WRITE not in session.kill_counts
+        # It died during this dispatch, so the death is recorded, as a write to it would have been.
+        assert session.kill_counts[KillCause.CRASH] == 1
     finally:
         session.close()
 

@@ -1426,7 +1426,7 @@ class SandboxSession:
         self._kill(proc, _UNSOLICITED[when], phase)
         return True
 
-    def _live_worker(self, phase: str) -> subprocess.Popen[bytes]:
+    def _live_worker(self, phase: str, *, before_write: bool = False) -> subprocess.Popen[bytes]:
         """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
 
         The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
@@ -1450,25 +1450,32 @@ class SandboxSession:
 
         A worker spawned in this dispatch and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
-        check asks the process too, the second call included, and it counts toward the bound. A
-        worker kept from an earlier dispatch and found exited is replaced as it always was, with
-        its EOF recorded as :meth:`_drop_unsolicited` says when the EOF is queued first. It cannot see an exit that comes after it, so a worker that
-        exits as its request is written is recorded under another cause, such as
+        check asks the process too, the second call included, and it counts toward the bound. At
+        the second call (``before_write``), a worker kept from an earlier dispatch and found exited
+        died during this dispatch, so it is recorded as :attr:`KillCause.CRASH` and counted, as
+        it would have been had the request been written to it. At the first call such a worker
+        died between dispatches and is replaced with no cause. The check cannot see an exit that
+        comes after it, so a worker that exits as its request is written is recorded under another
+        cause, such as
         :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
         while True:
             if self._proc is None or _has_exited(self._proc):
-                if self._proc is not None and self._generation != self._dispatch_generation:
-                    # Booted in this dispatch and found exited by its second call: a death to
-                    # record and count, not a silent reap in _spawn.
-                    self._kill(self._proc, KillCause.EXITED_AFTER_BOOT, phase)
+                booted = self._generation != self._dispatch_generation
+                if self._proc is not None and (booted or before_write):
+                    # Died during this dispatch: a death to record and count, not a silent reap
+                    # in _spawn.
+                    died = KillCause.EXITED_AFTER_BOOT if booted else KillCause.CRASH
+                    self._kill(self._proc, died, phase)
                     self._count_eof_respawn()
                 self._spawn(phase)
             # Booted in this dispatch, by this call or by the dispatch's first one.
             fresh = self._generation != self._dispatch_generation
-            exited = KillCause.EXITED_AFTER_BOOT if fresh else None
+            exited = (
+                KillCause.EXITED_AFTER_BOOT if fresh else KillCause.CRASH if before_write else None
+            )
             if self._drop_unsolicited(self._proc, "before", phase, exited=exited):
                 if self._stray_retried:
                     raise _unsolicited_error("before")
@@ -1856,7 +1863,7 @@ class SandboxSession:
             # found, so this narrows the AC-10 window by the time the request takes to encode; it
             # does not close it. A worker found exited here, or whose EOF is queued, is replaced as
             # _live_worker says.
-            proc = self._live_worker(phase)
+            proc = self._live_worker(phase, before_write=True)
             assert proc.stdin is not None
             try:
                 _write_frame(proc.stdin, request)

@@ -471,7 +471,10 @@ target, no `pickle` import left to mis-suppress:
   >   cause a forged `memory` answer records.
   >
   >   *Note 2026-11-24 (vault BACKLOG #3135 step 8), not the owner's words:* the inheritance path
-  >   this record names is closed for a process that runs a new program. The worker moves its
+  >   this record names, through fd 0, is closed for a process that runs a new program, except on
+  >   Windows when the worker is started through a virtual environment's `python.exe` launcher,
+  >   which hands the worker a second inheritable handle to the pipe that is not closed. The
+  >   worker moves its
   >   request pipe to a non-inheritable descriptor and points fd 0 at the null device before it
   >   reads the boot frame (`_detach_request_pipe` in `messagefoundry/pipeline/_sandbox_worker.py`),
   >   so a process a Handler starts with `subprocess`, with its descriptors inherited or not, finds
@@ -743,7 +746,10 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   fresh worker, and in the cases AC-10's amendment points to, a failed call too.)
   *Amended 2026-11-24 (vault BACKLOG #3135 step 8):* a grandchild that runs a new program no longer
   inherits the request pipe on fd 0: the worker moves the pipe to a non-inheritable descriptor and
-  points fd 0 at the null device before it reads the boot frame. It still inherits fd 1, and the
+  points fd 0 at the null device before it reads the boot frame. On Windows, a worker started
+  through a virtual environment's `python.exe` launcher also holds a second inheritable handle to
+  the pipe, which is not closed, so a grandchild started with handle inheritance there can still
+  read it. It still inherits fd 1, and the
   rest of this bullet about writing frames stands. A child made by a POSIX `fork` with no `exec`
   still holds the private descriptor. The `/proc` route above now reaches the request pipe at the
   private descriptor's `/proc/<pid>/fd/<n>` rather than `/proc/<pid>/fd/0`, which is the null

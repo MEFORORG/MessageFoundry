@@ -1622,7 +1622,9 @@ it can at least do that, and deny the feed. The grandchild residual in
 [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) says what it can do, and AC-10's 2026-11-09
 amendment there says when.
 *Amended 2026-11-24 (vault BACKLOG #3135 step 8):* a grandchild that runs a new program no longer
-inherits the request pipe; the worker moves it off fd 0 before it reads the boot frame. It still
+inherits the request pipe through fd 0; the worker moves it off fd 0 before it reads the boot
+frame. On Windows, a worker started through a virtual environment's `python.exe` launcher holds a
+second inheritable handle to the pipe, which a grandchild can still inherit. It still
 inherits the response pipe, and other routes to the request pipe remain, which the same residual
 in [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) lists.
 The child's **stderr is captured by the engine, not inherited** (ADR 0176): a Handler that prints is

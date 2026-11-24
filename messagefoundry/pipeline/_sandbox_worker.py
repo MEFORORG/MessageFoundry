@@ -109,10 +109,14 @@ def _detach_request_pipe() -> io.BufferedReader:
     the null device. The old pipe handle is closed by the ``dup2``. An :class:`OSError` here is a
     bootstrap failure, reported as one.
 
-    This closes inheritance across a new program only. Code running in the worker can still read
-    the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps it, and a
-    same-UID process can still reach the pipe by other routes, at least ``/proc/<pid>/fd`` on Linux
-    and handle duplication on Windows (ADR 0087 AC-10). Called before
+    This closes inheritance across a new program through fd 0 only. Code running in the worker
+    can still read the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps
+    it, and a same-UID process can still reach the pipe by other routes, at least
+    ``/proc/<pid>/fd`` on Linux and handle duplication on Windows (ADR 0087 AC-10). On Windows,
+    when the worker is started through a virtual environment's ``python.exe`` launcher, the
+    launcher hands the worker a second, inheritable handle to the request pipe that this does not
+    close, so a process the worker starts with handle inheritance can still read the pipe
+    (measured by review round-4b15e359; unfixed). Called before
     the boot frame is read, so no byte has been buffered from fd 0 yet."""
     private = os.dup(0)
     null = os.open(os.devnull, os.O_RDONLY)
@@ -600,7 +604,9 @@ def main() -> int:
     try:
         stdin = _detach_request_pipe()
     except OSError as exc:
-        # No boot frame is read, so the parent reads this reply in place of the boot reply.
+        # No boot frame is read. The parent may read this reply in place of the boot reply, but
+        # a boot frame larger than the pipe's buffer fails its write first, and the parent then
+        # records a failed boot write instead of this refusal.
         try:  # noqa: SIM105
             _write_frame(stdout, codec.encode_bootfail(_error_text(exc)))
         except (OSError, SandboxError):
