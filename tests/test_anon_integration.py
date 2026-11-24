@@ -30,7 +30,7 @@ from tests._refusal_log_capture import TOKEN, assert_no_token, record_texts
 from tests._tee_seed import SYNTHETIC_ADT
 from tests._tee_seed import seed_capture as _seed_capture
 
-_SALT = "integ-salt-0123456789abcdef"
+_SALT = "integ-salt-0123456789abcdef-0123456789"
 _RAW = SYNTHETIC_ADT
 
 

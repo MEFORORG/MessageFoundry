@@ -37,7 +37,7 @@ from tests.test_anon_core import _field_of
 
 _BOTH = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])
 
-_SALT = "b254-salt-0123456789abcdef"
+_SALT = "b254-salt-0123456789abcdef-0123456789"
 _ACK = "retarget_acknowledged"
 
 # One synthetic patient. Each piece a narrower kind leaves behind is a distinct token below.

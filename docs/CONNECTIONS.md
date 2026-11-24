@@ -290,11 +290,15 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
 > are delivered is unaffected. **Use an ordered container whenever order matters.**
 >
-> A **generator** Handler delivers exactly like a list, but its body runs *after* the execution tracer
-> behind `dryrun --trace` (and the Test Bench that reads it) has detached. That invocation's trace
-> record therefore carries no executed lines and no sends, marked `"lazy_result": true` so the omission
-> is declared rather than read as a handler that did nothing; the run's message-level `sends` are still
-> exact. Return a list or tuple if you want the handler's body traced line-by-line.
+> The execution tracer behind `dryrun --trace` (and the Test Bench that reads it) reports a
+> Handler's per-invocation sends for a single returned value, such as a bare `return Send(...)`, and
+> for an exact `list`, `tuple`, `set` or `frozenset`. Any other iterable return (other than `str`/`bytes`/`bytearray`), such as a generator, a `deque`, a
+> custom iterable or a subclass of one of those four, may be single-pass, so the tracer does not walk
+> it: that invocation's record reports no sends and is marked `"lazy_result": true`, so the omission
+> is declared rather than read as a handler that did nothing (BACKLOG #6823). The run's message-level
+> `sends` are still exact. A **generator** Handler's body also runs *after* the tracer has detached,
+> so its record carries no executed lines either. Return a list or tuple if you want the handler's
+> per-invocation sends and body traced.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
@@ -4441,7 +4445,7 @@ outbound(
 |---|---|
 | Does it beat the instance `[tls]` anchor? | Yes. The connection's own CA wins over `internal_ca_file` in every `trust_anchor_mode` ([ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)). |
 | Does it turn any check off? | No. Chain, host name and expiry checks stay on. It only chooses which CAs do the verifying. |
-| What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking. That CRL file must then carry a CRL from this CA too, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
+| What about `[tls].crl_file`? | On a hop that reads the `[tls]` block, it still applies and turns on leaf revocation checking, or whole-chain checking under `[tls].crl_check_chain`, where each CA in this file must chain to a self-signed root CA also in it. That CRL file must then carry a CRL from this CA too, and under `[tls].crl_check_chain` one from every CA in the server's chain, or every handshake on the hop fails. An inbound `Ftp()` poller reads the `[tls]` block too, since vault BACKLOG #2370, so this applies to it as well. |
 | Does it reach a token endpoint? | Yes. Where a connection signs in through SMART or OAuth2, the token hop trusts the same file, even when `verify_tls = false`. If the authorization server chains to a different CA, put that CA in the same PEM file. That also widens the data hop to it. No separate token-hop setting exists, by decision for now (vault BACKLOG #2370). |
 | What if `verify_tls = false`? | The data hop ignores it, since a verify-off hop trusts nothing. A token hop would still read it, but a connection that signs in through SMART or OAuth2 with `verify_tls = false` is refused at build, because the minted bearer would cross the unverified data hop ([why](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)). So that pairing now matters only over an `http://` data url. |
 | Does it cover SOAP mutual TLS? | Yes. The client-certificate opener verifies the server against the same file. |

@@ -183,6 +183,11 @@ class EngineNode:
         self._env.pop(rigadmin.ADMIN_FACTOR_ENV, None)
         for name, value in rigadmin.SERVE_ENV.items():
             self._env.setdefault(name, value)
+        # The rig's own pollers (connscale's EnginePoller, the batch fleet) read /stats, /status and
+        # /connections every tick as the one rig Administrator, which outruns the per-actor
+        # monitoring-read pace (vault BACKLOG #1191) and would turn samples into 429s. A bench
+        # measures its own engine, so the pace is off here; setdefault, so a scenario can keep it.
+        self._env.setdefault("MEFOR_AUTH_MONITORING_READ_RATE_LIMIT_ENABLED", "false")
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None

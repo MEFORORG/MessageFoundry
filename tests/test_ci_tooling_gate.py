@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: E402
 
 from tests import _tooling_manifest as tooling_manifest  # noqa: E402
+from tests._workflow_contexts import changes_arm_pattern  # noqa: E402
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CI = _ROOT / ".github" / "workflows" / "ci.yml"
@@ -51,18 +52,10 @@ def _gate_regex() -> str:
     comment cannot silently pick up a different arm. If the shape changes, this raises and the file
     goes red -- which is the correct outcome, not a false pass.
     """
-    text = _CI.read_text(encoding="utf-8")
     # `tooling=true` is emitted THREE times: the workflow_dispatch and push early-exits, and the
-    # pull_request path arm. Only the last is a path decision -- the first two are unconditional and
-    # sit ahead of any grep in the step. rfind, deliberately: anchoring on the first match found no
-    # preceding `grep -qE` at all, which is the honest failure this comment exists to prevent
-    # recurring as a silent wrong-arm pickup if the block order ever changes.
-    emit = text.rfind('echo "tooling=true" >> "$GITHUB_OUTPUT"')
-    assert emit > 0, "the tooling arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
-    # the LAST grep -qE before that emission is the path arm
-    matches = list(re.finditer(r"grep -qE '([^']*)'", text[:emit]))
-    assert matches, "no `grep -qE` found before the tooling emission"
-    return matches[-1].group(1)
+    # pull_request path arm. Only the last is a path decision, which is why the shared reader
+    # anchors on the LAST emission; anchoring on the first found no preceding `grep -qE` at all.
+    return changes_arm_pattern("tooling", "tooling_manifest")
 
 
 def gate(changed: list[str]) -> bool:
@@ -125,17 +118,32 @@ _CASES = [
     ([".pre-commit-config.yaml"], True, "an autoupdate PR must face test_lint_scope_parity"),
     (["constraints.lock"], True, "a lock-only ruff bump edits no other file this gate names"),
     # Two negatives, one per way those two alternatives can go wrong, because neither way reds
-    # anything else here. `uv.lock` is the SCOPE guard: ci.yml lists constraints.lock rather than its
-    # two siblings because it is the file the test READS, and a widening (an added sibling, or a
-    # `\.lock$`-shaped alternative) would run this whole tier on every dependency PR while quietly
-    # replacing a reasoned choice. `constraints_lock` is the SHAPE guard: it is not a path and cannot
+    # anything else here. `uv.lock` is the SCOPE guard: ci.yml lists constraints.lock and
+    # requirements.lock because listed tests READ them (requirements.lock since BACKLOG #5472, through
+    # test_ci_venv_pinning's runtime-export sweep), and no listed test reads uv.lock by name. A widening to it
+    # (or a `\.lock$`-shaped alternative) would run this whole tier on every edit of a lock nothing
+    # here reads, while quietly replacing a reasoned choice. `constraints_lock` is the SHAPE guard: it is not a path and cannot
     # become one, which is exactly why it works -- it matches only if `constraints\.lock` loses its
     # backslash, and an unescaped dot reads as correct in review. The leading `\.` of
     # `\.pre-commit-config\.yaml` gets no equivalent probe: under the `^` anchor an unescaped one
     # matches any single leading character, so every candidate is a path nobody would ever add, and a
     # row nobody believes gets deleted the first time it is inconvenient.
-    (["uv.lock"], False, "sibling locks are unlisted: constraints.lock is what the test READS"),
+    (["uv.lock"], False, "no listed test reads uv.lock by name; constraints.lock is what it READS"),
     (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
+    # BACKLOG #5472: each file below is read from the repository by a manifest entry, and before
+    # that row none matched an arm, so a PR editing only one met the test that reads it on no leg.
+    # NOT CLOSED: a listed test that scans every tracked file, such as
+    # test_defaulted_credential_lint, reads paths no arm names, so a PR touching only those meets
+    # it first on push-to-main.
+    ([".gitleaks.toml"], True, "test_merge_gate_controls reads the gitleaks allowlist"),
+    ([".semgrep/messagefoundry.yml"], True, "test_required_contexts scans the semgrep rules"),
+    ([".codex/config.toml"], True, "test_codex_bridge reads the Codex hook config"),
+    (["ci/locks/release-tools.lock"], True, "test_ci_venv_pinning reads the release lock"),
+    (["ci/locks/ci-quality.lock"], True, "test_quality_advisory_invariants reads it"),
+    (["ci/locks/ci-scanners.lock"], True, "a sibling under the same ci/locks/ arm"),
+    (["requirements.lock"], True, "test_ci_venv_pinning sweeps the runtime exports"),
+    (["docker/locks/requirements-core.lock"], True, "one of those runtime exports"),
+    (["security/locks/requirements-harness.lock"], True, "one of those runtime exports"),
     # The CI Python pin. A patch bump edits that one file, and the test that reads it is a manifest
     # entry, so without this arm the bump PR would meet that test on no leg.
     (

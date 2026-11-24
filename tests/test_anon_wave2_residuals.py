@@ -39,7 +39,7 @@ from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 from tests.test_anon_core import _NO_SCANNER
 
-_SALT = "wave2-a-salt-0123456789abcdef"
+_SALT = "wave2-a-salt-0123456789abcdef-0123456789"
 _HEAD = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
 _LEAKS = pytest.mark.parametrize("leak", [engine_leak, tee_leak], ids=["engine", "tee"])
 _SIDES = pytest.mark.parametrize("anon", [engine_anon, tee_anon], ids=["engine", "tee"])

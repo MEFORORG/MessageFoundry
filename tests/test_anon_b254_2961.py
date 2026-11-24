@@ -28,7 +28,7 @@ from tee.anon import anonymize as tee_anonymize
 from tee.anon import anonymize_checked as tee_anonymize_checked
 from tee.anon import surrogates as tee_surrogates
 
-_SALT = "b254-salt-0123456789abcdef"
+_SALT = "b254-salt-0123456789abcdef-0123456789"
 _HEADER = r"MSH|^~\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ORU^R01|MSGCTRL|P|2.5.1"
 _EACH_ADAPTER = pytest.mark.parametrize(
     "adapter", (engine_anonymize, tee_anonymize), ids=("engine", "tee")

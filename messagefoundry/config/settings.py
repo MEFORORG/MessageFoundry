@@ -2240,7 +2240,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2251,6 +2252,12 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
+    # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
+    # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
+    crl_check_chain: bool = False
 
     @field_validator("crl_file")
     @classmethod
@@ -2275,6 +2282,17 @@ class TlsSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_chain_requires_crl_file(self) -> TlsSettings:
+        # With no CRL file the chain check has nothing to check against, so the flag would read as a
+        # control that is on while every hop keeps no revocation check at all.
+        if self.crl_check_chain and not self.crl_file:
+            raise ValueError(
+                "[tls].crl_check_chain = true requires [tls].crl_file: the whole-chain check reads "
+                "the CRLs in that file, and with none set no hop would check revocation"
+            )
+        return self
+
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
         outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
@@ -2287,6 +2305,7 @@ class TlsSettings(_Section):
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
             crl_file=self.crl_file,
+            crl_check_chain=self.crl_check_chain,
         )
 
 
@@ -4039,6 +4058,19 @@ class AuthSettings(_Section):
     # and then refuse every PHI read until a restart. Capped for the same reason.
     phi_read_rate_limit_window_seconds: float = Field(
         default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+    )
+
+    # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
+    # /graph/edges, /status, /stats, /metrics, /metrics/history and /connections, charged at
+    # admission by require_monitoring_read. The default's basis and multiplier are written
+    # once, in docs/SECURITY.md, "Monitoring-read pacing". In-process only, like the PHI-read
+    # throttle. 0 disables that dimension.
+    monitoring_read_rate_limit_enabled: bool = True
+    monitoring_read_rate_limit_per_actor: int = Field(default=600, ge=0)
+    monitoring_read_rate_limit_global: int = Field(default=0, ge=0)  # 0 = off
+    # No nan/inf and capped, for the reason login_rate_limit_window_seconds gives.
+    monitoring_read_rate_limit_window_seconds: float = Field(
+        default=60.0, gt=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the state-changing admin surface (BACKLOG #193, ASVS 2.4.2): a per-actor
@@ -9555,7 +9587,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
     """The ``[auth]`` anti-automation limits, and the other numeric ``[auth]`` knobs that weaken a
     control (vault BACKLOG #2600 step 4), set LOOSER THAN THEIR SHIPPED DEFAULT, as
     ``(switch, risk)`` entries for :func:`security_loosenings`, which always calls this, since sign-in
-    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2 and 7.1.2 each field cites).
+    is always on (BACKLOG #1131; ASVS 6.1.1, 6.3.1, 2.3.2, and the 2.4.1, 2.4.2, 7.1.2 and 15.2.2 each
+    field cites).
 
     **Why the default is the cutoff.** The first pass named only the values the code reads as OFF,
     and a vault re-read then measured near-off values that were just as off in effect and silent: a
@@ -9566,11 +9599,13 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
 
     **The direction is read from each consumer, not from the name.**
 
-    * ``SlidingWindowRateLimiter`` (the sign-in, ceremony, PHI-read and admin-write limiters) treats a
+    * ``SlidingWindowRateLimiter`` (at least the sign-in, ceremony, PHI-read, monitoring-read and
+      admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
       before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count refuses a negative value at load (BACKLOG #3293), so only the others reach here. A NaN or infinite
+      count (BACKLOG #3293) and the two monitoring-read counts (vault BACKLOG #1191) refuse a
+      negative value at load, so only the others reach here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
@@ -9873,6 +9908,41 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             off=(
                 "there is no per-account PHI-read limit, so one signed-in account may read PHI "
                 "as fast as the engine answers (only an all-users limit, if one is set, holds)"
+            ),
+        )
+
+    # --- the monitoring-read limiter (vault BACKLOG #1191, ASVS 15.2.2): per actor, on the six
+    # paced monitoring:read GETs. Its window cannot be 0 or less (gt=0 at load), and the
+    # all-users count ships OFF (0), so neither has an off value to name.
+    if not auth.monitoring_read_rate_limit_enabled:
+        out.append(
+            (
+                "monitoring_read_rate_limit_enabled",
+                "the six paced monitoring reads (the wiring graph, status, stats, metrics, "
+                "metrics history and the connections dashboard) have NO pace on the JSON API -- "
+                "one signed-in account may make the engine rebuild the graph and scan the store "
+                "through them as fast as it answers",
+            )
+        )
+    elif _window(
+        "monitoring_read_rate_limit_window_seconds",
+        auth.monitoring_read_rate_limit_window_seconds,
+        what="the monitoring-read rate-limit window",
+        off=None,
+        counts=(auth.monitoring_read_rate_limit_per_actor, auth.monitoring_read_rate_limit_global),
+    ):
+        _count(
+            "monitoring_read_rate_limit_per_actor",
+            auth.monitoring_read_rate_limit_per_actor,
+            what="the per-account monitoring-read limit",
+            so=(
+                "one signed-in account may make that many paced monitoring reads per "
+                "window before it is refused"
+            ),
+            off=(
+                "there is no per-account monitoring-read limit, so one signed-in account may "
+                "drive the graph rebuild and the store scans through the six JSON routes as fast "
+                "as the engine answers (only an all-users limit, if one is set, holds)"
             ),
         )
 

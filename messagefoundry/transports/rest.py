@@ -74,6 +74,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -3173,6 +3174,16 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if self._ech_sidecar is not None:
+                # Vault BACKLOG #5511: the opener built below is replaced by the sidecar's, so the
+                # whole-chain refusal is worded for an ECH hop before the generic one can fire.
+                refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
+            elif scheme == "http":
+                # The same refusal for an http url (admitted by the cleartext egress gate above),
+                # worded so it does not say the hop verifies its server: the opener makes no TLS
+                # connection to the partner. Its https handler can still serve a TLS leg to an
+                # https forward proxy, where one is set.
+                refuse_chain_check_on_os_roots(anchor, cleartext=True)
             if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
