@@ -224,6 +224,54 @@ def _source_still_holds(source: str, read_st: os.stat_result, data: bytes) -> bo
             log.debug("could not close a re-check descriptor", exc_info=True)
 
 
+def _drop_redundant_archive(
+    source: str, read_st: os.stat_result, data: bytes, dest: str, *, name: str
+) -> bool:
+    """Remove the archive of ``data`` at ``dest`` when the kept ``source`` still holds every byte of it,
+    returning True only once it is gone. Never loses the last copy (#6805).
+
+    ``dest`` is first CLAIMED by renaming it to a unique sibling name, so a peer compressor cannot act
+    on it, and only then are the claimed bytes re-validated and the source re-checked. If either fails
+    (the source went or changed meanwhile, or the claimed file is a peer's different archive), the
+    claim is linked back to ``dest``, which never replaces a file that appeared there; if that fails
+    too, the claim is kept under its name and a WARNING names it. A claim name ends ``.mfclaim``,
+    which no sweep or compression pass touches, so it stays until an operator acts."""
+    if not (_source_still_holds(source, read_st, data) and _verify_archive(dest, data, name=name)):
+        return False
+    claim = f"{dest}.{os.getpid()}-{time.monotonic_ns()}.mfclaim"
+    try:
+        os.rename(dest, claim)
+    except OSError:
+        log.warning(
+            "app-log %r: the redundant archive %r could not be claimed for removal; it is kept",
+            name,
+            os.path.basename(dest),
+        )
+        return False
+    if _verify_archive(claim, data, name=name) and _source_still_holds(source, read_st, data):
+        try:
+            os.remove(claim)
+        except OSError:
+            log.warning(
+                "app-log %r: the redundant archive, claimed as %r, could not be removed",
+                name,
+                os.path.basename(claim),
+            )
+        return True
+    try:
+        os.link(claim, dest)
+    except OSError:
+        log.warning(
+            "app-log %r: the source changed while its archive was being removed, and the archive "
+            "could not be put back; it is KEPT as %r for an operator",
+            name,
+            os.path.basename(claim),
+        )
+        return False
+    _unlink_quietly(claim)
+    return False
+
+
 def _unlink_quietly(path: str) -> None:
     """Best-effort removal of a staging file. A leftover ``*.gz.mftmp`` is inert (never a swept suffix,
     never mistaken for an archive), so a failure here is logged at debug and otherwise ignored."""
@@ -1548,30 +1596,19 @@ class RetentionRunner:
             # removed whenever the kept source still holds every archived byte (same file, `data` as
             # its prefix): it is then redundant and the next pass retries. Otherwise it is kept,
             # because under a replace it may be the only copy of the old content.
-            if _source_still_holds(source, read_st, data) and _verify_archive(
-                dest, data, name=name
-            ):
-                try:
-                    os.remove(dest)
-                except OSError:
-                    log.warning(
-                        "app-log %r: the redundant archive %r could not be removed; the path is "
-                        "skipped until it is",
-                        name,
-                        os.path.basename(dest),
-                    )
-                else:
-                    log.warning(
-                        "app-log %r: the source %s after its archive was placed; the source is kept "
-                        "and holds every archived byte, so the archive was removed and the next pass "
-                        "retries",
-                        name,
-                        change,
-                    )
-                    return None
+            if _drop_redundant_archive(source, read_st, data, dest, name=name):
+                log.warning(
+                    "app-log %r: the source %s after its archive was placed; the source is kept "
+                    "and holds every archived byte, so the archive was removed and the next pass "
+                    "retries",
+                    name,
+                    change,
+                )
+                return None
             log.warning(
                 "app-log %r: the source %s after its archive was placed; the source path is left "
-                "alone and NOT counted as compressed. %r holds the bytes read before that.",
+                "alone and NOT counted as compressed. %r, or a claim name logged above, holds the "
+                "bytes read before that.",
                 name,
                 change,
                 os.path.basename(dest),

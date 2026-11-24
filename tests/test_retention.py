@@ -2035,6 +2035,54 @@ async def test_app_log_compression_never_renames_over_an_archive_that_appeared_m
     assert "an archive appeared meanwhile" in caplog.text
 
 
+async def test_app_log_compression_keeps_the_archive_when_the_source_goes_before_its_removal(
+    store: MessageStore, tmp_path, monkeypatch
+) -> None:
+    """Removing a redundant archive must not lose the last copy: if the source is removed (by a peer
+    compressor, say) between the check that it still holds every archived byte and the archive's
+    removal, the archive survives (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    mutated: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_append(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not mutated:
+            mutated.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    real_holds = retention_mod._source_still_holds
+    calls: list[bool] = []
+
+    def holds_then_peer_removes(source, read_st, data):
+        ok = real_holds(source, read_st, data)
+        if not calls:
+            old_log.unlink()  # the peer archived the longer read elsewhere and removed the source
+        calls.append(ok)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_append)
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_removes)
+
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+
+    assert calls and calls[0] is True  # the branch that removes a redundant archive was reached
+    assert not old_log.exists()
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body  # the last copy survives
+    assert not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+
+
 async def test_app_log_compression_reports_a_source_that_vanished_after_placement(
     store: MessageStore, tmp_path, monkeypatch, caplog
 ) -> None:
