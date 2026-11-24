@@ -1147,6 +1147,34 @@ def test_a_closed_stdout_pipe_leaves_exit_2_at_interpreter_exit(
         assert "Exception ignored" not in err
 
 
+@pytest.mark.parametrize(
+    ("lock", "argv"),
+    [("", ["x.lock"]), (None, [])],
+    ids=["empty-lock-refusal", "usage-error"],
+)
+def test_a_refusal_into_a_closed_pipe_still_exits_2(
+    tmp_path: Path, lock: str | None, argv: list[str]
+) -> None:
+    """R5: with ``2>&1`` into a closed pipe, a refusal's own ``::error::`` line (stderr is line
+    buffered) raised out of ``main``, and argparse's usage error left text to fail at exit."""
+    if lock is not None:
+        (tmp_path / "x.lock").write_text(lock, encoding="utf-8")
+    write_end = _closed_pipe()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "messagefoundry.security.audit_all_platforms", *argv],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            stdout=write_end,
+            stderr=write_end,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+    assert proc.returncode == 2
+
+
 def _seen_by(
     tmp_path: Path, argv: list[str], lock: str = LOCK
 ) -> tuple[int, list[tuple[list[str], str]]]:
