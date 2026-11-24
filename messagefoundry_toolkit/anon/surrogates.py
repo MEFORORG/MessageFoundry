@@ -276,18 +276,45 @@ def _components(rep: str, seps: Seps) -> list[str]:
 
 
 class SurrogateSeparatorRefused(AnonError):
-    """A rule's surrogate would hold a character that splits or ends a field, so writing it would
-    add a field, a line or a component, or start an escape sequence, and move what follows past
-    its rule (BACKLOG #5540). What a surrogate writes itself is judged here, the same on both
-    adapters (:func:`_written`). The whole written field is checked by each adapter as it writes
-    it: the tee raises this class, while the engine adapter's ``Message.set`` refusal comes out
-    as a plain :class:`AnonError` with no address. A ``keep`` on that field does not help: it
+    """A rule's surrogate would hold a character that splits or ends a field, or a C0 control
+    character, so writing it would add a field, a line or a component, start an escape sequence,
+    and move what follows past its rule (BACKLOG #5540), or carry a control byte into the output
+    (BACKLOG #5533 item 14). What a surrogate writes itself is judged here, the same on both
+    adapters (:func:`_written`), and so is the whole field a rule wrote, by
+    :func:`refuse_controls_in_field`, which both adapters call. The engine adapter's
+    ``Message.set`` refusal of the field separator still comes out as a plain :class:`AnonError`
+    with no address; the tee raises this class for it. A ``keep`` on that field does not help: it
     would emit the captured value. ``path`` is the rule's field address, never a value."""
 
     def __init__(self, path: str, cause: str) -> None:
         super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
         self.path = path
         self.cause = cause
+
+
+#: CR, LF, the two MLLP frame bytes and NUL: what the engine's whole-field ``Message.set`` refuses
+#: beside the field separator, so a field a ``keep`` leaves is refused for them on both adapters.
+_STRUCTURE_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
+
+
+def refuse_controls_in_field(path: str, value: str, kind: SurrogateKind, seps: Seps) -> None:
+    """Raise :class:`SurrogateSeparatorRefused` if ``value``, the whole field a rule at ``path``
+    of ``kind`` wrote, holds a C0 control character (0x00 to 0x1F), TAB included, that is not a
+    delimiter the message declares in ``seps``; for a ``keep``, only if it holds a character in
+    :data:`_STRUCTURE_IN_FIELD` (BACKLOG #5533 item 14). Sender text a surrogate copies, such as
+    an identifier's punctuation or a kept CX.4, is checked with the rest. A declared delimiter is
+    the field's structure, not data, so an MSH-2 that names a control character as its component
+    separator still has its components written. A ``keep`` writes nothing of its own, so a control
+    byte in the field it keeps passes as the sender wrote it. Both adapters call this, so they
+    refuse the same bytes with the same cause. DEL (0x7F) is not checked."""
+    reserved = _reserved(seps)
+    if any(char in value for char in _STRUCTURE_IN_FIELD):
+        cause = "a segment separator, an MLLP frame byte or NUL"
+    elif kind != SurrogateKind.KEEP and any(char < " " and char not in reserved for char in value):
+        cause = "a C0 control character"
+    else:
+        return
+    raise SurrogateSeparatorRefused(path, cause)
 
 
 class _HeldDelimiter(AnonError):

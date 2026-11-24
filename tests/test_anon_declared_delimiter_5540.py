@@ -232,8 +232,9 @@ def test_the_guard_refuses_what_the_engine_refuses_under_the_message_delimiters(
 ) -> None:
     """The tee keeps a copy of the engine's whole-field refusal, so this probes both with every C0
     byte, DEL, each default delimiter and each delimiter the probed header declares, under that
-    header's own field separator. A character refused on one side alone would be a new
-    divergence."""
+    header's own field separator, for a field a ``keep`` leaves. A character refused on one side
+    alone would be a new divergence. A field a surrogate rule writes is refused for every C0 byte
+    on both adapters (BACKLOG #5533 item 14)."""
     field_sep = header[3]
     msg = Message.parse(f"{header}\rPID{field_sep}1")
     value = f"A{char}1"
@@ -243,7 +244,13 @@ def test_the_guard_refuses_what_the_engine_refuses_under_the_message_delimiters(
     except ValueError:
         engine_refuses = True
     try:
-        tee_hl7._whole_field("PID-3", value, field_sep)
+        tee_hl7._whole_field(
+            "PID-3",
+            value,
+            field_sep,
+            tee_anon.SurrogateKind.KEEP,
+            tee_surrogates.Seps(field=field_sep),
+        )
         tee_refuses = False
     except tee_anon.AnonError:
         tee_refuses = True

@@ -25,8 +25,10 @@ import tee.anon as tee_anon
 from messagefoundry.parsing.message import Message
 from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
+from tee.anon.surrogates import Seps
 
 _SALT = "b214-5540-salt-0123456789abcdef-0123456789"
+_SEPS_PLUS = Seps(field="+")
 #: A value in a field no rule rewrites, after the scrubbed one, so a shifted field would show.
 _MARK = "AFTERMARK"
 
@@ -95,15 +97,17 @@ def test_the_guard_refuses_each_structure_character(value: str) -> None:
     """CR, LF and the two MLLP frame bytes cannot reach a surrogate today, since the message is split
     on the first two and stripped of the others first; the guard refuses them anyway, as the
     engine's ``Message.set`` does."""
-    with pytest.raises(tee_anon.AnonError):
-        tee_hl7._whole_field("PID-3", value, "+")
+    for kind in (tee_anon.SurrogateKind.MRN, tee_anon.SurrogateKind.KEEP):
+        with pytest.raises(tee_anon.AnonError):
+            tee_hl7._whole_field("PID-3", value, "+", kind, _SEPS_PLUS)
 
 
 @pytest.mark.parametrize("char", [chr(n) for n in (*range(0x20), 0x7F)] + ["|", "^", "~", "\\"])
 def test_the_guard_refuses_exactly_what_the_engine_whole_field_write_refuses(char: str) -> None:
     """The tee cannot import the engine's checks, so it keeps a copy; this probes both with every C0
-    byte, DEL and each default delimiter. A byte refused on one side alone would be a new
-    divergence."""
+    byte, DEL and each default delimiter, for a field a ``keep`` leaves. A byte refused on one side
+    alone would be a new divergence. A field a surrogate rule writes is refused for every C0 byte
+    on both adapters (BACKLOG #5533 item 14): tests/test_anon_c0_surrogate_5533.py."""
     msg = Message.parse("MSH|^~\\&|A|B\rPID|1")
     value = f"A{char}1"
     try:
@@ -112,7 +116,7 @@ def test_the_guard_refuses_exactly_what_the_engine_whole_field_write_refuses(cha
     except ValueError:
         engine_refuses = True
     try:
-        tee_hl7._whole_field("PID-3", value, "|")
+        tee_hl7._whole_field("PID-3", value, "|", tee_anon.SurrogateKind.KEEP, Seps())
         tee_refuses = False
     except tee_anon.AnonError:
         tee_refuses = True
@@ -120,7 +124,9 @@ def test_the_guard_refuses_exactly_what_the_engine_whole_field_write_refuses(cha
 
 
 def test_the_guard_passes_a_value_with_no_structure_character() -> None:
-    assert tee_hl7._whole_field("PID-3", "A^1\x07", "|") == "A^1\x07"
+    keep, mrn = tee_anon.SurrogateKind.KEEP, tee_anon.SurrogateKind.MRN
+    assert tee_hl7._whole_field("PID-3", "A^1\x07", "|", keep, Seps()) == "A^1\x07"
+    assert tee_hl7._whole_field("PID-3", "A^1\x7f", "|", mrn, Seps()) == "A^1\x7f"
 
 
 @_SIDES
@@ -137,7 +143,7 @@ def test_a_nul_kept_by_an_identifier_surrogate_is_refused(anon: ModuleType) -> N
 @pytest.mark.parametrize(
     ("fields", "why"),
     [
-        ({1: "1", 3: "A12\x0734^^^H^MR"}, "a control byte the engine passes, in a ruled field"),
+        ({1: "1", 3: "A12\x7f34^^^H^MR"}, "DEL, which neither side refuses, in a ruled field"),
         ({1: "1", 8: "F\x00M"}, "NUL in a field no rule rewrites"),
     ],
 )
