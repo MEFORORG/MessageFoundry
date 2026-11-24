@@ -33,7 +33,7 @@ import sys
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from messagefoundry.config.secretprovider import SecretProviderError
+from messagefoundry.config.secretprovider import SecretProviderError, log_import_failure
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     assert_hvac_tls_suites,
@@ -111,16 +111,20 @@ def _import_hvac() -> Any:
     :class:`SecretProviderError` naming the extra. ``ImportError`` (not just ``ModuleNotFoundError``) is
     caught so a partially-broken install also fails closed, and so is any other ``Exception`` from
     hvac's or a dependency's top-level code, such as an ``OSError`` (vault BACKLOG #6709). A broken
-    install's refusal names the error's class and says to reinstall. The refusal is raised outside
-    the handler with no chain: an import error's own text can carry a filesystem path, and a
-    rendered traceback would otherwise carry it."""
+    install's refusal names the error's class, says to reinstall, and is logged at WARNING by
+    class. Only a ``ModuleNotFoundError`` for ``hvac`` itself reads as a missing extra; one for an
+    hvac submodule or a dependency is a broken install. The refusal is raised outside the handler
+    with no chain: an import error's own text can carry a filesystem path, and a rendered
+    traceback would otherwise carry it."""
     try:
         # hvac ships no type stubs; the targeted ignore is contained here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
-    except ModuleNotFoundError:
-        failed = None
-    except Exception as exc:
-        failed = type(exc).__name__
+    except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "hvac":
+            failed = None
+        else:
+            failed = type(exc).__name__
+            log_import_failure(f"[secrets].provider={_EXTRA!r}", exc)
     else:
         return hvac
     if failed is None:

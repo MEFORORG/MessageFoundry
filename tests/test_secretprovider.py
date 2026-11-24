@@ -13,6 +13,7 @@ credential, and never with the secret value in the message. It also proves the t
 
 from __future__ import annotations
 
+import logging
 import sys
 from typing import Any
 
@@ -192,8 +193,9 @@ _BROKEN_IMPORTS = [
 
 @pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
 def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text(
-    monkeypatch: pytest.MonkeyPatch, make_error: Any
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
 ) -> None:
+    caplog.set_level(logging.WARNING)
     # Vault BACKLOG #6709 item 1: an SDK that is installed but broken raises a plain ImportError (or
     # another error from the module's top-level code), not ModuleNotFoundError. The
     # dispatch must refuse with SecretProviderError, naming the extra and the error's type, and
@@ -214,11 +216,23 @@ def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text
     assert f"import failed: {type(raised[0]).__name__}" in text
     assert "synthetic" not in text and "0451" not in text and "Client" not in text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+    _assert_one_class_only_warning(caplog, type(raised[0]).__name__)
+
+
+def _assert_one_class_only_warning(caplog: pytest.LogCaptureFixture, type_name: str) -> None:
+    """Round-3 finding 2 on BACKLOG #6709: the dropped cause is logged at WARNING, by its class,
+    with none of its text (a path, a source line or a secret)."""
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert type_name in message
+    assert "synthetic" not in message and "0451" not in message and "Client" not in message
+    assert warnings[0].exc_info is None
 
 
 @pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
 def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
-    monkeypatch: pytest.MonkeyPatch, make_error: Any
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, make_error: Any
 ) -> None:
     # Vault BACKLOG #6709: the vault provider imports hvac lazily, at its first read, so a broken
     # hvac fails there rather than at the dispatch. That import must refuse the same way.
@@ -234,6 +248,7 @@ def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
 
     monkeypatch.setattr(builtins, "__import__", _import)
     provider = secretprovider_vault.build_provider(SecretsSettings())
+    caplog.set_level(logging.WARNING)
     with pytest.raises(SecretProviderError) as caught:
         provider.resolve("mefor/ad")
     text = str(caught.value)
@@ -242,6 +257,38 @@ def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
     assert "reinstall 'messagefoundry[vault]'" in text
     assert "synthetic" not in text and "0451" not in text and "Client" not in text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
+    _assert_one_class_only_warning(caplog, type_name)
+
+
+@pytest.mark.parametrize(
+    ("missing", "remedy"),
+    [
+        pytest.param("hvac", "install 'messagefoundry[vault]'", id="hvac-itself-missing"),
+        # Round-3 finding 3 on BACKLOG #6709: a missing hvac submodule is a broken install of an
+        # hvac that is present, so pip's install would do nothing; it must say reinstall.
+        pytest.param("hvac.v1", "reinstall 'messagefoundry[vault]'", id="hvac-submodule-missing"),
+    ],
+)
+def test_vault_lazy_hvac_import_tells_missing_from_broken_by_module_name(
+    monkeypatch: pytest.MonkeyPatch, missing: str, remedy: str
+) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    with pytest.raises(SecretProviderError) as caught:
+        provider.resolve("mefor/ad")
+    text = str(caught.value)
+    assert remedy in text
+    if missing == "hvac":
+        assert "reinstall" not in text
 
 
 # --- vault backend: mocked KV ------------------------------------------------
