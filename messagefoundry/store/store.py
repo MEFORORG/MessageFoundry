@@ -629,6 +629,9 @@ class _GroupCommitter:
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
+        # The task _on_stopped last handled, so it runs once per task whichever of its two callers
+        # (the done-callback, or aclose) reaches it first.
+        self._reaped: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -643,31 +646,30 @@ class _GroupCommitter:
         no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
         (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
         ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
-        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
-        if task is not self._task:
-            return  # a stale task; a newer one owns the committer now
+        body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
+
+        :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
+        the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
+        finds the task done and returns without yielding, so without the direct call this callback
+        would run only after ``aclose`` cleared ``_task``, read the task as stale, and leave that
+        member pending (BACKLOG #5664)."""
+        if task is not self._task or task is self._reaped:
+            return  # a stale task (a newer one owns the committer now), or one already handled
+        self._reaped = task
         self._closed = True
-        stranded = self._take_pending()
+        stranded, self._pending = self._pending, []
         if task.cancelled() or task.exception() is not None:
             log.warning(
                 "store group committer stopped outside close; rejecting %d pending member(s)",
                 len(stranded),
             )
-        self._reject_stranded(stranded, "group committer stopped")
-
-    def _take_pending(self) -> list[_Member]:
-        stranded, self._pending = self._pending, []
-        return stranded
-
-    @staticmethod
-    def _reject_stranded(stranded: list[_Member], reason: str) -> None:
         for member in stranded:
             if not member.future.done():
-                member.future.set_exception(RuntimeError(reason))
+                member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
-        """Stop the committer, flushing the members it can still reach first. A member left pending
-        once the committer task is gone is rejected with a ``RuntimeError``, not left to park."""
+        """Stop the committer, flushing the members it can still reach first. A member still pending
+        once the committer task has ended is rejected through :meth:`_on_stopped`, not left to park."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -677,20 +679,19 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier has already rejected its members (_on_stopped); that
-                # stale cancel must not abort the store's close. A cancel of OUR task during the
+                # A committer cancelled earlier rejects its members in _on_stopped, called below if
+                # its done-callback has not run yet; that stale cancel must not abort the store's
+                # close. A cancel of OUR task during the
                 # await still propagates; the baseline keeps a caller that already caught an
                 # earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
                     raise
+            # Before clearing _task, so the member a same-turn submit() enrolled is rejected rather
+            # than left to a done-callback that would read the task as stale (see _on_stopped).
+            self._on_stopped(task)
             self._task = None
-        # The committer is gone, so nothing will run what is still pending. A member can be here
-        # when the task ended outside close and a submit() enrolled in the turn before its
-        # _on_stopped ran: awaiting an already-done task does not yield, so that callback runs after
-        # _task is cleared above and returns early as a stale task's (BACKLOG #5664). Refuse it.
-        self._reject_stranded(self._take_pending(), "group committer closed")
 
     async def submit(
         self,
