@@ -127,9 +127,21 @@ switch ($PSCmdlet.ParameterSetName) {
             exit 1
         }
 
+        # THE INVARIANT CULTURE, BOTH WAYS, OR THE MARKER IS NOT THE ISO TEXT ITS READERS PARSE. Under
+        # th-TH the current culture's Thai Buddhist calendar wrote marked_at in year 2569, so an account
+        # marked dead NOW read PENDING for 543 years; under fi-FI the time separator became '.'; under
+        # ar-SA the Um Al Qura calendar refused '2026-10-01' outright. ConvertTo-UtcDateTime parses with
+        # the current culture, so -EffectiveFrom is parsed here instead. A date with no offset is UTC,
+        # as every timestamp this codebase writes is, which makes 2026-10-01 and 2026-10-01T00:00:00Z
+        # the same instant, as the refusal text below says they are.
+        $inv = [cultureinfo]::InvariantCulture
+        $iso = "yyyy-MM-dd'T'HH:mm:ss'Z'"
         $eff = $null
         if ($EffectiveFrom) {
-            $eff = ConvertTo-UtcDateTime $EffectiveFrom
+            $parsed = [System.DateTimeOffset]::MinValue
+            if ([System.DateTimeOffset]::TryParse($EffectiveFrom, $inv, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+                $eff = $parsed.UtcDateTime
+            }
             if ($null -eq $eff) {
                 Write-Host "REFUSED -- -EffectiveFrom is not a date I can read: $EffectiveFrom" -ForegroundColor Red
                 Write-Host "  Use an ISO-8601 date, for example 2026-10-01 or 2026-10-01T00:00:00Z." -ForegroundColor DarkGray
@@ -143,9 +155,9 @@ switch ($PSCmdlet.ParameterSetName) {
         $doc = [ordered]@{
             unavailable    = $true
             reason         = $Reason
-            marked_at      = $now.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            marked_at      = $now.ToString($iso, $inv)
             marked_by      = $By
-            effective_from = $(if ($eff) { $eff.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $now.ToString('yyyy-MM-ddTHH:mm:ssZ') })
+            effective_from = $(if ($eff) { $eff } else { $now }).ToString($iso, $inv)
         }
 
         $sd = Get-UsageStateDir $ConfigDir
@@ -154,9 +166,16 @@ switch ($PSCmdlet.ParameterSetName) {
         # Temp-then-rename, the same discipline the collector uses: a reader must never observe a
         # half-written marker, and a half-written marker reads as MALFORMED, which fails closed on a
         # live account.
+        # The finally removes the temp file a failed write or rename would otherwise leave beside the
+        # marker; after a successful rename it no longer exists, so it removes nothing.
         $tmp = "$path.$PID.tmp"
-        [System.IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [System.Text.Encoding]::UTF8)
-        [System.IO.File]::Move($tmp, $path, $true)
+        try {
+            [System.IO.File]::WriteAllText($tmp, ($doc | ConvertTo-Json -Depth 4), [System.Text.Encoding]::UTF8)
+            [System.IO.File]::Move($tmp, $path, $true)
+        }
+        finally {
+            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        }
 
         $pending = $eff -and $eff -gt $now
         Write-Host ""

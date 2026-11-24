@@ -3709,6 +3709,107 @@ def test_marking_is_reversible_and_clearing_nothing_is_not_an_error(tmp_path: Pa
     assert "NOTHING TO CLEAR" in again.stdout
 
 
+_ISO_UTC = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
+
+
+def avail_in_culture(culture: str, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the script with the current culture set to ``culture`` in the same process.
+
+    The culture line is printed first, with its calendar, so the test can prove the culture TOOK: a
+    host that silently ignored it would run the Gregorian arm and pass for the wrong reason.
+    """
+    # A parameter name stays bare: quoted, '-Mark' binds as a positional string.
+    quoted = " ".join(
+        a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in (str(AVAIL), *args)
+    )
+    command = (
+        f"[cultureinfo]::CurrentCulture = '{culture}'; "
+        "$c = [cultureinfo]::CurrentCulture; "
+        "Write-Output ('CULTURE ' + $c.Name + ' ' + $c.Calendar.GetType().Name); "
+        f"& {quoted}; if (-not $?) {{ exit 1 }}; exit $LASTEXITCODE"
+    )
+    return run_single(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=_env(None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("culture", "calendar"),
+    [
+        ("th-TH", "ThaiBuddhistCalendar"),
+        ("fa-IR", "PersianCalendar"),
+        ("ar-SA", "UmAlQuraCalendar"),
+        ("fi-FI", "GregorianCalendar"),
+    ],
+)
+def test_a_marker_written_under_any_culture_is_iso_utc_text(
+    tmp_path: Path, culture: str, calendar: str
+) -> None:
+    """BACKLOG #7557. The stamps were formatted with the CURRENT culture. Under th-TH that wrote
+    marked_at in Buddhist year 2569, so an account marked dead NOW read PENDING for 543 years; fi-FI
+    wrote '.' for ':'; ar-SA refused the documented ``-EffectiveFrom 2026-10-01`` outright.
+    """
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    state = root / "mefor-usage"
+    state.mkdir()
+    tempting(state)
+    marker = state / "unavailable.json"
+
+    now = avail_in_culture(culture, "-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    assert f"CULTURE {culture} {calendar}" in now.stdout, now.stdout + now.stderr
+    assert now.returncode == 0, now.stdout + now.stderr
+    doc = json.loads(marker.read_text(encoding="utf-8-sig"))
+    year = datetime.now(UTC).year
+    for key in ("marked_at", "effective_from"):
+        assert _ISO_UTC.match(doc[key]), (key, doc[key])
+        assert abs(int(doc[key][:4]) - year) <= 1, (key, doc[key])
+    # The reader, in the default culture, must take a mark made NOW as live now, not PENDING.
+    assert read(state)[0] == UNAVAILABLE
+
+    # A date with no offset is UTC midnight, the same instant the refusal text equates it with.
+    later = avail_in_culture(
+        culture,
+        "-Mark",
+        "-ConfigDir",
+        str(root),
+        "-Reason",
+        "cancelled",
+        "-EffectiveFrom",
+        "2099-01-01",
+    )
+    assert later.returncode == 0, later.stdout + later.stderr
+    doc = json.loads(marker.read_text(encoding="utf-8-sig"))
+    assert doc["effective_from"] == "2099-01-01T00:00:00Z"
+    assert _ISO_UTC.match(doc["marked_at"]), doc["marked_at"]
+
+
+def test_a_failed_marker_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
+    """BACKLOG #7557. A throw from the rename left ``unavailable.json.<pid>.tmp`` beside the marker.
+    A directory at the marker path makes the write fail, whichever line refuses it."""
+    root = tmp_path / ".claude-account-9"
+    (root / "mefor-usage" / "unavailable.json").mkdir(parents=True)
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    assert out.returncode != 0, out.stdout
+    assert not list((root / "mefor-usage").glob("*.tmp"))
+
+
+def test_a_root_whose_name_holds_wildcard_characters_is_marked_literally(tmp_path: Path) -> None:
+    """Pins the reviewed not-a-bug half of BACKLOG #7557: ``New-Item -Path`` was said to expand
+    wildcards. Measured, it does not; a sibling the pattern would match stays untouched."""
+    root = tmp_path / "acct[1]"
+    root.mkdir()
+    (tmp_path / "acct1").mkdir()
+    assert avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled").returncode == 0
+    assert (root / "mefor-usage" / "unavailable.json").is_file()
+    assert not (tmp_path / "acct1" / "mefor-usage").exists()
+
+
 def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
     """The absent-marker arm is the only silent one, and it is the overwhelmingly normal case. If it
     ever stopped meaning AVAILABLE, every root on the box would go dark at once.
