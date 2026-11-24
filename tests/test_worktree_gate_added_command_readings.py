@@ -365,30 +365,34 @@ def test_each_git_question_is_asked_once_across_the_passes(
 
 _STUB_GIT = """
 import os, subprocess, sys
+# A stub that found itself again would start one process per call, without end: refuse instead.
+if os.environ.get("MEFOR_STUB_ACTIVE"):
+    sys.exit(97)
+real = os.environ["MEFOR_STUB_REAL_GIT"]
+here = os.path.dirname(os.path.abspath(__file__))
+if os.path.normcase(os.path.dirname(os.path.abspath(real))) == os.path.normcase(here):
+    sys.exit(98)
 state = os.environ["MEFOR_STUB_STATE"]
 args = sys.argv[1:]
-if "worktree" in args and "list" in args:
+match = os.environ["MEFOR_STUB_MATCH"].split()
+skip = os.environ.get("MEFOR_STUB_SKIP", "")
+if all(m in args for m in match) and not (skip and skip in args):
     n = int(open(state).read() or 0) if os.path.exists(state) else 0
     open(state, "w").write(str(n + 1))
     if n < int(os.environ["MEFOR_STUB_FAILS"]):
         sys.exit(128)
-sys.exit(subprocess.run([os.environ["MEFOR_STUB_REAL_GIT"], *args]).returncode)
+env = dict(os.environ, MEFOR_STUB_ACTIVE="1")
+sys.exit(subprocess.run([real, *args], env=env).returncode)
 """
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the ask counts were measured on Windows")
-@pytest.mark.parametrize("fails", [2, 3])
-def test_a_failed_git_answer_is_asked_again(
-    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: int
-) -> None:
-    """A git that fails its first asks, then answers, is read on the ask origin/main would have made.
+def _install_stub_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: int, match: str, skip: str = ""
+) -> Path:
+    """Put a git first on PATH that fails the first ``fails`` asks naming every word of ``match``.
 
-    Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
-    spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
-    or three failed asks that head allowed the hijack origin/main refused (Manager decision of
-    2026-11-23: a failure is asked again unless its `-C` is a plain absolute path naming no
-    directory). The stub fails the first
-    ``fails`` `worktree list` asks.
+    Returns the file that counts those asks. The real git is found before PATH changes, and the stub
+    refuses to run under itself, so it cannot call itself.
     """
     real = shutil.which("git")
     assert real is not None
@@ -400,9 +404,31 @@ def test_a_failed_git_answer_is_asked_again(
     monkeypatch.setenv("PATH", str(stub) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("MEFOR_STUB_STATE", str(state))
     monkeypatch.setenv("MEFOR_STUB_FAILS", str(fails))
+    monkeypatch.setenv("MEFOR_STUB_MATCH", match)
+    monkeypatch.setenv("MEFOR_STUB_SKIP", skip)
     monkeypatch.setenv("MEFOR_STUB_REAL_GIT", real)
+    return state
+
+
+def _asks(state: Path) -> int:
+    return int(state.read_text(encoding="utf-8")) if state.exists() else 0
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the ask counts were measured on Windows")
+@pytest.mark.parametrize("fails", [2, 3])
+def test_a_failed_git_answer_is_asked_again(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: int
+) -> None:
+    """A git that fails its first asks, then answers, is read on the ask origin/main would have made.
+
+    Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
+    spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
+    or three failed asks that head allowed the hijack origin/main refused. The given pass asks a
+    failure again on every ask (Invoke-GitRead's note). The stub fails the first ``fails`` asks.
+    """
+    state = _install_stub_git(tmp_path, monkeypatch, fails, "worktree list")
     reason = _verdict(rig, ("git -C {wt} checkout {b}", "outside", "Bash"))
-    asks = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    asks = _asks(state)
     assert reason is not None and "LINKED WORKTREE" in reason, (asks, reason)
     assert asks > fails, f"the stub answered no ask ({asks} asks), so this measured nothing"
 
@@ -417,32 +443,90 @@ def test_a_failed_answer_on_a_device_spelling_is_asked_again(
     A failure was kept wherever .NET found no directory, so one failed `worktree list` ask let the
     hijack through that origin/main refused on its second ask. Only a plain absolute path is kept now.
     """
-    real = shutil.which("git")
-    assert real is not None
-    stub = tmp_path / "stub"
-    stub.mkdir()
-    (stub / "stub.py").write_text(_STUB_GIT, encoding="utf-8")
-    (stub / "git.cmd").write_text(f'@"{sys.executable}" "%~dp0stub.py" %*\r\n', encoding="utf-8")
-    state = tmp_path / "asks"
-    monkeypatch.setenv("PATH", str(stub) + os.pathsep + os.environ["PATH"])
-    monkeypatch.setenv("MEFOR_STUB_STATE", str(state))
-    monkeypatch.setenv("MEFOR_STUB_FAILS", "1")
-    monkeypatch.setenv("MEFOR_STUB_REAL_GIT", real)
+    state = _install_stub_git(tmp_path, monkeypatch, 1, "worktree list")
     win = str(rig.wt).replace("/", "\\")
     # `\\?\X:\..\C:\<wt>`, or `\\?\C:/<wt>` when the prefix is the bare device one.
     device = prefix + (win if prefix.endswith("..\\") else win.replace("\\", "/"))
     command = f"git -C {device} checkout {rig.other}"
     result = run_gate(shell(command, rig.outside, "PowerShell"), rig.repos)
-    asks = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    asks = _asks(state)
     assert result is not None, f"ALLOW after {asks} asks: {command}"
     assert "LINKED WORKTREE" in result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert asks > 1, f"the stub was asked {asks} times, so no second ask was measured"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the ask counts were measured on Windows")
+def test_rule_3d_asks_a_failed_common_dir_again(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rule 3d re-asks a relative `--git-common-dir` that failed (Get-CommonDirAnswer -Reask).
+
+    origin/main kept the first failure, so one failed ask allowed `git worktree remove <wt>` from
+    outside (review round 62fa86c0fa measured it). Every base rule 3d tries can only add a deny.
+    """
+    state = _install_stub_git(
+        tmp_path, monkeypatch, 1, "rev-parse --git-common-dir", skip="--path-format=absolute"
+    )
+    reason = _verdict(rig, ("git worktree remove {wt}", "outside", "Bash"))
+    asks = _asks(state)
+    assert reason is not None, f"ALLOW after {asks} asks"
+    assert asks > 1, f"the stub was asked {asks} times, so no second ask was measured"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="device spellings are Windows paths")
+def test_a_failed_absolute_common_dir_is_asked_again(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed `--path-format=absolute` ask is asked again once the candidate has answered.
+
+    Only the absolute form names the primary through `\\\\?\\X:\\..\\<drive path>` (BACKLOG #5454), and
+    origin/main kept its first failure, so one failed ask allowed this disarm (review round
+    62fa86c0fa measured it).
+    """
+    state = _install_stub_git(tmp_path, monkeypatch, 1, "--path-format=absolute --git-common-dir")
+    device = "\\\\?\\X:\\..\\" + str(rig.primary).replace("/", "\\")
+    command = f"git -C {device} config {_DISARM}"
+    result = run_gate(shell(command, rig.outside, "PowerShell"), rig.repos)
+    asks = _asks(state)
+    assert result is not None, f"ALLOW after {asks} asks: {command}"
+    assert asks > 1, f"the stub was asked {asks} times, so no second ask was measured"
+
+
+def test_a_failure_on_a_missing_plain_path_is_asked_once(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `-C` that is a plain absolute path naming no directory keeps its failure for the run.
+
+    Without that, each hoist re-asked the failing questions of the lines before it: 44.1 s for nine
+    lines (review round 2c9e3d7a9b). Git's trace2 log counts the asks per argument list.
+    """
+    trace = tmp_path / "trace2.log"
+    lines = [f"echo line{i} $(git -C {{o}}/m{i} checkout -q y{i})" for i in range(9)]
+    command = _fmt(rig, "echo start\n" + "\n".join(lines))
+    monkeypatch.setenv("GIT_TRACE2", str(trace))
+    monkeypatch.setenv("GIT_TRACE2_BRIEF", "false")
+    result = run_gate(shell(command, rig.wt, "Bash"), rig.repos)
+    monkeypatch.delenv("GIT_TRACE2")
+    monkeypatch.delenv("GIT_TRACE2_BRIEF")
+    assert result is None, result
+    assert trace.exists(), "git wrote no trace2 log, so this measured nothing"
+    starts = [
+        m.group(1).strip()
+        for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        if (m := re.search(r"(?:^|\s)start\s(.*)", line))
+    ]
+    missing = Counter(a for a in starts if re.search(r"[\\/]m\d", a))
+    assert len(missing) >= 9, f"{len(missing)} missing-directory questions: the lines were not read"
+    repeated = {argv: n for argv, n in missing.items() if n > 1}
+    assert not repeated, f"a kept failure was asked again: {repeated}"
 
 
 _FILLER = "abcdefghij " * 2700
 _NINE = range(9)
 #: (shape, template, cwd, tool): the shapes of the Lander's timing probes on 2026-11-23, nine judged
-#: substitutions each, and one from review round 2c9e3d7a9b. Each has 30 KB of text before its
-#: substitutions except the first and the missing-directory one. Every one is allowed.
+#: substitutions each, and two from review rounds 2c9e3d7a9b and 62fa86c0fa. Each has 30 KB of text
+#: before its substitutions except the first and the two from later review rounds. Every one is
+#: allowed.
 TIMED: list[tuple[str, str, str, str]] = [
     (
         "one line, nine hoists, short",
@@ -481,6 +565,15 @@ TIMED: list[tuple[str, str, str, str]] = [
         "Bash",
     ),
     (
+        # Review round 62fa86c0fa: an existing directory that is not a repository fails every ask, and
+        # each string asked it about four times (108 calls, 20.7 s, against 4.6 s at origin/main).
+        "nine lines, an existing non-repository -C each",
+        "echo start\n"
+        + "\n".join(f"echo line{i} $(git -C {{tmp}}/e{i} checkout -q y{i})" for i in _NINE),
+        "wt",
+        "Bash",
+    ),
+    (
         "nine lines, a backtick each",
         f"echo {_FILLER}\n"
         + "\n".join(f"echo line{i} {{bt}}git -C {{o}} checkout -q y{i}{{bt}}" for i in _NINE),
@@ -505,6 +598,8 @@ def test_a_long_command_is_timed_against_the_proof_wait(
     loaded box can pass it, which is a finding to report, not a flake to rerun.
     """
     _shape, template, where, tool = case
+    for i in _NINE:
+        (rig.tmp / f"e{i}").mkdir()  # the existing non-repository directories
     payload = shell(_fmt(rig, template), _cwd(rig, where), tool)
     gates: list[tuple[str, Path]] = [("now", _REPO_ROOT / _HOOK)]
     # PRE_CACHE_HEAD is a commit of this pull request's branch, so a clone of main may not hold it.
