@@ -1481,11 +1481,14 @@ def test_provision_admin_invocation_bound_at_the_write_names_the_pre_check_open(
     text names it and says no longer that no audit row was written (follow-up from PR 3162's
     review).
 
-    Mutation: drop ``after_the_pre_check`` from the write's invocation-bound arm."""
+    Mutation: drop ``after_the_pre_check`` from the write's invocation-bound arm, or let the
+    failure's class word the write's open there."""
     _refused_at_the_write_after_the_pre_check(monkeypatch, _bound_refusal())
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert _PRE_CHECK_OPEN in out, out
-    assert "The write's own open stopped where the AES-GCM invocation bound" in out, out
+    assert f"{_WRITE_OPEN} may also have written to the database" in out.lower(), out
+    assert "may or may not" not in out, out
+    assert "The refusal came where the AES-GCM invocation bound" in out, out
     assert _BOUND_NO_ROW not in out, out
     assert out.count(_SCHEMA) == 1 and out.count(_GENESIS) == 1, out
     assert _UNUSED_ENTRY in out, out
@@ -1530,6 +1533,8 @@ def test_provision_admin_sqlite_failure_at_the_write_open_names_the_pre_check_op
     out = _run(_provision_sqlite(shell), capsys)
     assert "cannot open the store at" in out and "database is locked" in out, out
     assert _PRE_CHECK_OPEN in out, out
+    assert f"{_WRITE_OPEN} may or may not have reached its own writing steps" in out.lower(), out
+    assert "nothing was written" not in out.lower(), out
     assert _UNUSED_ENTRY in out, out
 
 

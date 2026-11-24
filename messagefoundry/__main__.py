@@ -10366,13 +10366,12 @@ def _invocation_bound_provision_refusal(
     ``keyed`` is :func:`_open_is_keyed` under the settings (follow-up from PR 3162's review)."""
     left = None
     if after_the_pre_check:
-        earlier = _two_opens_left_behind(
-            failure, store, keyed=keyed, earlier_open=_PRE_CHECK_OPEN, this_open=_WRITE_OPEN
-        )
+        # The bound's pass runs late in the write's open, after steps that may write, so that open
+        # is described as one that may also have written, whatever the failure's class says.
+        both = _provision_two_opens(failure, store, keyed=keyed, this_open_returned=True)
         left = (
-            f"{_sentence(earlier)} {_capitalized(_WRITE_OPEN)} stopped where the AES-GCM "
-            "invocation bound reads the key's persisted total, and may also have written to the "
-            "database before that read"
+            f"{_sentence(both)} The refusal came where the AES-GCM invocation bound reads the "
+            "key's persisted total"
         )
     text = _invocation_bound_refusal(failure, store, refusing="Refusing to provision. ", left=left)
     return text if kept is None else f"{text}. {_kept_key_sentence(kept)}"
@@ -10402,17 +10401,12 @@ def _provision_left_behind(
     pre-check's open over an existing store had returned. The command then ran two opens, and the
     text names each (:func:`_two_opens_left_behind`), as ``admin-reset-totp``'s does for its own
     two (follow-up from PR 3162's review)."""
-    if after_the_pre_check:
-        return _two_opens_left_behind(
-            exc,
-            store,
-            keyed=keyed,
-            earlier_open=_PRE_CHECK_OPEN,
-            this_open=_WRITE_OPEN,
-            this_open_returned=opened,
-        )
     if opened:
-        return _opened_left_behind(exc, store, keyed=keyed)
+        return _provision_opened_left_behind(
+            exc, store, keyed=keyed, after_the_pre_check=after_the_pre_check
+        )
+    if after_the_pre_check:
+        return _provision_two_opens(exc, store, keyed=keyed)
     return _open_refusal_left_behind(exc, store)
 
 
@@ -10421,10 +10415,24 @@ def _provision_opened_left_behind(
 ) -> str:
     """:func:`_provision_left_behind` for a refusal raised once the open it came at had returned,
     which never leaves nothing behind."""
-    left = _provision_left_behind(
-        exc, store, keyed=keyed, opened=True, after_the_pre_check=after_the_pre_check
+    if after_the_pre_check:
+        return _provision_two_opens(exc, store, keyed=keyed, this_open_returned=True)
+    return _opened_left_behind(exc, store, keyed=keyed)
+
+
+def _provision_two_opens(
+    exc: BaseException, store: StoreSettings, *, keyed: bool, this_open_returned: bool = False
+) -> str:
+    """:func:`_two_opens_left_behind` for ``provision-admin``'s two opens: the pre-check's, then
+    the write's."""
+    return _two_opens_left_behind(
+        exc,
+        store,
+        keyed=keyed,
+        earlier_open=_PRE_CHECK_OPEN,
+        this_open=_WRITE_OPEN,
+        this_open_returned=this_open_returned,
     )
-    return left if left is not None else _open_steps_left_behind(store, keyed=keyed, returned=True)
 
 
 def _provision_open_refusal(
@@ -11474,14 +11482,19 @@ def _provision_admin(args: argparse.Namespace) -> int:
             if precheck_opened:
                 # The pre-check's open, over an existing store, came first and may have written
                 # (follow-up from PR 3162's review).
-                earlier = _two_opens_left_behind(
-                    exc,
+                # A create open can fail partway, after its schema step, so the write's own
+                # open is named as one that may or may not have reached its writing steps.
+                keyed = _open_is_keyed(settings)
+                earlier = _provision_two_opens(exc, settings.store, keyed=keyed)
+                this_open = _open_steps_left_behind(
                     settings.store,
-                    keyed=_open_is_keyed(settings),
-                    earlier_open=_PRE_CHECK_OPEN,
-                    this_open=_WRITE_OPEN,
+                    keyed=keyed,
+                    opener=_WRITE_OPEN,
+                    after_an_earlier_open=True,
                 )
-                before_write = f"{_sentence(unopened)} Refusing to provision. {earlier}"
+                before_write = (
+                    f"{_sentence(unopened)} Refusing to provision. {_sentence(earlier)} {this_open}"
+                )
             _emit_error(after_the_key(unopened, before_write), as_json=args.json)
             return 2
         # After the open returned, such as a lock during the writes: the store opened, so this is
