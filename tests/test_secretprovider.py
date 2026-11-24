@@ -192,8 +192,9 @@ def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text
     monkeypatch: pytest.MonkeyPatch, make_error: Any
 ) -> None:
     # Vault BACKLOG #6709 item 1: an SDK that is installed but broken raises a plain ImportError (or
-    # another error from the module's top-level code), not ModuleNotFoundError. The dispatch must
-    # refuse with SecretProviderError, chained to the original, and must not repeat its text.
+    # an OSError or AttributeError from the module's top-level code), not ModuleNotFoundError. The
+    # dispatch must refuse with SecretProviderError, naming the extra and the error's type, and
+    # must not repeat the error's text, in its own text or through a chain.
     raised: list[BaseException] = []
 
     def _import(_name: str) -> Any:
@@ -206,8 +207,40 @@ def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text
         resolve_secret_provider(SecretsSettings(provider="vault"))
     text = str(caught.value)
     assert "[secrets].provider='vault'" in text
+    assert "messagefoundry[vault]" in text
+    assert f"import failed: {type(raised[0]).__name__}" in text
     assert "synthetic" not in text and "0451" not in text and "Client" not in text
-    assert caught.value.__cause__ is raised[0]
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
+        pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
+        pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
+    ],
+)
+def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, make_error: Any
+) -> None:
+    # Vault BACKLOG #6709: the vault provider imports hvac lazily, at its first read, so a broken
+    # hvac fails there rather than at the dispatch. That import must refuse the same way.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise make_error()
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    provider = secretprovider_vault.build_provider(SecretsSettings())
+    with pytest.raises(SecretProviderError, match=r"install 'messagefoundry\[vault\]'") as caught:
+        provider.resolve("mefor/ad")
+    assert "synthetic" not in str(caught.value) and "0451" not in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
 # --- vault backend: mocked KV ------------------------------------------------

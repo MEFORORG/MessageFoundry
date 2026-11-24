@@ -303,16 +303,17 @@ def _load_external_provider(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
         ) from exc
-    except Exception as exc:
+    except (ImportError, OSError, AttributeError) as exc:
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
         # module itself no longer has. Importing runs the module's top-level code, which can also
-        # fail with an error that is not an ImportError (an OSError from a native library, an
-        # AttributeError), so this clause takes any Exception (vault BACKLOG #6709 item 3); it is
-        # chained, not swallowed. resolve_active_key and resolve_decrypt_keys already refuse
-        # any provider error as a KeyProviderError with a fixed text, so this changes nothing
-        # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
-        # import fails. An ImportError raised later, inside build_provider, is the provider's to
-        # wrap, as keyprovider_vault wraps its lazy hvac import (vault BACKLOG #6709).
+        # fail with an OSError (a native library) or an AttributeError (vault BACKLOG #6709 item
+        # 3). Other classes pass through as they did, so a ValueError or a hop refusal raised at
+        # import keeps the refusal store.base picks for its class. resolve_active_key and
+        # resolve_decrypt_keys replace what reaches them with a fresh fixed-text refusal chosen by
+        # its class, so there these three classes read as a key-provider refusal; this keeps this
+        # seam's own contract, KeyProviderError, for a provider module whose import fails. An
+        # error raised later, inside build_provider or a provider's lazy SDK import, is the
+        # provider's to wrap (vault BACKLOG #6709).
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "

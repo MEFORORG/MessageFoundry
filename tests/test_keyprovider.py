@@ -218,9 +218,13 @@ def test_an_external_provider_that_returns_no_key_fails_closed(
 @pytest.mark.parametrize(
     "make_error",
     [
-        pytest.param(lambda: ImportError("DLL load failed"), id="broken-c-extension"),
         pytest.param(
-            lambda: ImportError("cannot import name 'Client' from 'sdk'"), id="missing-symbol"
+            lambda: ImportError("DLL load failed: synthetic C:/x/_sdk.pyd"),
+            id="broken-c-extension",
+        ),
+        pytest.param(
+            lambda: ImportError("cannot import name 'Client' from 'synthetic_sdk'"),
+            id="missing-symbol",
         ),
         # Vault BACKLOG #6709 item 3: a module's top-level code can fail with an error that is not
         # an ImportError at all.
@@ -253,6 +257,18 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
     with pytest.raises(KeyProviderError):
         resolve_active_key(StoreSettings(key_provider="vault"))
     assert len(raised) == 2 and raised[0] is not raised[1]
+
+
+def test_an_import_time_value_error_keeps_its_own_class(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Vault BACKLOG #6709 item 3 widens the seam to OSError and AttributeError only, so a
+    # ValueError raised at import still reaches store.base as a ValueError, which picks its own
+    # refusal for that class.
+    def _import(_name: str) -> ModuleType:
+        raise ValueError("synthetic")
+
+    monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
+    with pytest.raises(ValueError, match="synthetic"):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
 
 
 @pytest.mark.parametrize(

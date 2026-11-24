@@ -109,16 +109,21 @@ _DEFAULT_FIELD = "value"
 def _import_hvac() -> Any:
     """Lazily import ``hvac`` (the optional ``[vault]`` extra), failing closed with a
     :class:`SecretProviderError` naming the extra. ``ImportError`` (not just ``ModuleNotFoundError``) is
-    caught so a partially-broken install also fails closed."""
+    caught so a partially-broken install also fails closed, and so are an ``OSError`` or an
+    ``AttributeError`` from hvac's or a dependency's top-level code (vault BACKLOG #6709). The
+    refusal is raised outside the handler with no chain: an import error's own text can carry a
+    filesystem path, and a rendered traceback would otherwise carry it."""
     try:
         # hvac ships no type stubs; the targeted ignore is contained here (never a repo-wide ignore).
         import hvac  # type: ignore[import-untyped]  # noqa: PLC0415  (lazy — base install pulls no SDK)
-    except ImportError as exc:
-        raise SecretProviderError(
-            f"[secrets].provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
-            f"importable): install 'messagefoundry[{_EXTRA}]'."
-        ) from exc
-    return hvac
+    except (ImportError, OSError, AttributeError):
+        pass
+    else:
+        return hvac
+    raise SecretProviderError(
+        f"[secrets].provider={_EXTRA!r} requires the optional {_EXTRA!r} extra (hvac not "
+        f"importable): install 'messagefoundry[{_EXTRA}]'."
+    )
 
 
 def _vault_ca_kwargs(addr: str | None) -> dict[str, str]:
