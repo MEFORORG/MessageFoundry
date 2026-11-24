@@ -433,7 +433,10 @@ def test_the_encrypt_reader_sees_each_call_shape_and_skips_prose() -> None:
         "x = await self._aenc(v, aad=a)",
         "x = self._reencrypt_value(v)",
         "x = reseal_unless_tag_failure(c, v)",
-        "async for chunk, vs in seal_chunks(self._cipher, t, c, rows, aad_cols=a):\n        pass",
+        "async for chunk, vs in seal_chunks(\n"
+        "        self._cipher, t, c, rows, aad_cols=a, local_whole_page=True\n"
+        "    ):\n"
+        "        pass",
     )
     for line in seen:
         assert _names_an_encrypt(f"def f(self):\n    {line}\n"), line

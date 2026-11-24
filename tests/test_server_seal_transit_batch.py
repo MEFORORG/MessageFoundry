@@ -420,7 +420,7 @@ async def test_a_server_seal_under_aes_gcm_writes_after_each_encrypt(
     backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An in-process cipher keeps the server stores' shape from before batching: one value per
-    chunk, its write awaited before the next encrypt, so one sealed value is held at a time."""
+    chunk, its write awaited before the next encrypt. It checks that order, not memory held."""
 
     async def no_reservation(*args: Any) -> None:
         return None  # the bound's persisted total needs a real database; this test has none
