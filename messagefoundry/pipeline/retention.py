@@ -227,15 +227,23 @@ def _source_still_holds(source: str, read_st: os.stat_result, data: bytes) -> bo
 def _drop_redundant_archive(
     source: str, read_st: os.stat_result, data: bytes, dest: str, *, name: str
 ) -> bool:
-    """Remove the archive of ``data`` at ``dest`` when the kept ``source`` still holds every byte of it,
-    returning True only once it is gone. Never loses the last copy (#6805).
+    """Remove the archive of ``data`` at ``dest`` when the kept ``source`` still holds every byte of it.
+    Returns True once the claim was taken and its removal attempted. A failed removal is logged and
+    still returns True, leaving the ``.mfclaim`` file in place (#6805).
 
     ``dest`` is first CLAIMED by renaming it to a unique sibling name, so a peer compressor cannot act
     on it, and only then are the claimed bytes re-validated and the source re-checked. If either fails
     (the source went or changed meanwhile, or the claimed file is a peer's different archive), the
     claim is linked back to ``dest``, which never replaces a file that appeared there; if that fails
     too, the claim is kept under its name and a WARNING names it. A claim name ends ``.mfclaim``,
-    which no sweep or compression pass touches, so it stays until an operator acts."""
+    which no sweep or compression pass touches, so it stays until an operator acts.
+
+    What this closes: a source removed between the first check and the claim, which used to leave no
+    copy at all. What it does NOT close, so a copy can still be lost: at least a source truncated or
+    removed, by something other than a compressor that archived it, after the post-claim re-check and
+    before the claim is removed. Two windows in the caller remain open as well: a peer's archive placed
+    between its ``exists(dest)`` check and ``os.replace`` is renamed over, and an append or rotation
+    between its last :func:`_source_change` and ``os.remove(source)`` is deleted."""
     if not (_source_still_holds(source, read_st, data) and _verify_archive(dest, data, name=name)):
         return False
     claim = f"{dest}.{os.getpid()}-{time.monotonic_ns()}.mfclaim"
@@ -1619,7 +1627,7 @@ class RetentionRunner:
         except OSError:
             # The VALIDATED archive is in place but the original could not be removed (locked). Not
             # counted as compressed — the next pass sees `dest` and skips, and the delete window (or the
-            # operator) clears the leftover. Nothing is lost either way.
+            # operator) clears the leftover. Both the archive and the original remain here.
             log.warning("app-log %r archived but the original could not be removed", name)
             return None
         # Measured against the bytes actually archived, the figure that describes what happened.
