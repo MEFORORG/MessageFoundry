@@ -13,7 +13,9 @@ from the cwd it names, or from outside where it names none, so it can differ fro
 test uses; rows with other placeholders, rows no rewrite could act on, and tests with no parametrize
 mark, are not harvested. It also
 checks that each ``DENIED`` row really was an ALLOW there, so a row that pinned nothing new would be
-seen. The differential is skipped in a clone that does not hold ``BASELINE``.
+seen. The differential is skipped in a clone that does not hold ``BASELINE``; on Windows the same
+test still pins each row's verdict at ``PRE_CACHE_HEAD``, the head before the hook cached its git
+calls.
 """
 
 from __future__ import annotations
@@ -327,8 +329,9 @@ def test_each_git_question_is_asked_once_across_the_passes(
     """A hoisted string carries the lines before it, so each pass met their invocations again.
 
     Before Invoke-GitRead cached the hook's git calls, each pass asked git again what an earlier pass
-    had asked, and the Lander measured a 1.7 s command taking 19.9 s. Git's trace2 log records each
-    process the hook starts, with its argument list, so a repeated question shows as a repeated line.
+    had asked; the hook's COST note has the times. Git's trace2 log records each process the hook
+    starts, with its argument list, so a repeated question shows as a repeated line. At
+    PRE_CACHE_HEAD this command made 108 git calls, one of them 90 times (measured 2026-11-23).
     """
     trace = tmp_path / "trace2.log"
     lines = [f"echo line{i} $(git -C {{o}} checkout -q y{i})" for i in range(9)]
@@ -337,6 +340,7 @@ def test_each_git_question_is_asked_once_across_the_passes(
     result = run_gate(shell(command, rig.wt, "Bash"), rig.repos)
     monkeypatch.delenv("GIT_TRACE2")
     assert result is None, result
+    assert trace.exists(), "git wrote no trace2 log, so this measured nothing"
     starts = [
         line.split(" start ", 1)[1].strip()
         for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -349,8 +353,8 @@ def test_each_git_question_is_asked_once_across_the_passes(
 
 _FILLER = "abcdefghij " * 2700
 _NINE = range(9)
-#: (shape, template, cwd, tool): the long commands of the Lander's timing probes on 2026-11-23, nine
-#: judged substitutions each behind about 30 KB of text. Every one is allowed.
+#: (shape, template, cwd, tool): the shapes of the Lander's timing probes on 2026-11-23, nine judged
+#: substitutions each, all but the first behind about 30 KB of text. Every one is allowed.
 TIMED: list[tuple[str, str, str, str]] = [
     (
         "one line, nine hoists, short",
@@ -394,26 +398,29 @@ TIMED: list[tuple[str, str, str, str]] = [
     reason="a wall-clock measurement; set MEFOR_GATE_TIMING=1 to run it",
 )
 @pytest.mark.parametrize("case", TIMED, ids=lambda c: c[0])
-def test_a_long_command_is_judged_well_inside_the_proof_wait(
+def test_a_long_command_is_timed_against_the_proof_wait(
     rig: SimpleNamespace, tmp_path: Path, case: tuple[str, str, str, str]
 ) -> None:
-    """Times the shipped hook, and the hook at PRE_CACHE_HEAD where this clone holds it.
+    """Times the shipped hook, and the hooks at BASELINE and PRE_CACHE_HEAD where this clone holds them.
 
-    Opt-in, because a shared CI runner's load decides a wall-clock number. Run it with ``-s`` to see
-    the times. The bound is the shell entry's 20 s proof wait (scripts/worktree/install-gate.ps1).
+    Opt-in, because the machine's load decides a wall-clock number. Run it with ``-s`` to see the
+    times. The bound is the shell entry's 20 s proof wait (scripts/worktree/install-gate.ps1); a
+    loaded box can pass it, which is a finding to report, not a flake to rerun.
     """
     _shape, template, where, tool = case
     payload = shell(_fmt(rig, template), _cwd(rig, where), tool)
     gates: list[tuple[str, Path | None]] = [("now", None)]
-    probe = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "show", f"{PRE_CACHE_HEAD}:{_HOOK}"],
-        capture_output=True,
-        check=False,
-    )
-    if probe.returncode == 0:
-        before = tmp_path / "worktree_gate_pre_cache.ps1"
-        before.write_bytes(probe.stdout)
-        gates.append((PRE_CACHE_HEAD[:11], before))
+    # PRE_CACHE_HEAD is a commit of this pull request's branch, so a clone of main may not hold it.
+    for commit in (BASELINE, PRE_CACHE_HEAD):
+        probe = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "show", f"{commit}:{_HOOK}"],
+            capture_output=True,
+            check=False,
+        )
+        if probe.returncode == 0:
+            hook = tmp_path / f"worktree_gate_{commit[:11]}.ps1"
+            hook.write_bytes(probe.stdout)
+            gates.append((commit[:11], hook))
     times = {}
     for label, gate in gates:
         start = time.perf_counter()
@@ -421,7 +428,8 @@ def test_a_long_command_is_judged_well_inside_the_proof_wait(
             assert run_gate(payload, rig.repos) is None
         else:
             # Not run_gate: its 45 s launch limit is shorter than this hook took on these commands.
-            subprocess.run(
+            # It also skips run_single's spawn lock, so run this test alone.
+            done = subprocess.run(
                 ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(gate), "-ReposFile"]
                 + [str(rig.repos)],
                 input=json.dumps(payload),
@@ -430,6 +438,7 @@ def test_a_long_command_is_judged_well_inside_the_proof_wait(
                 timeout=600,
                 check=False,
             )
+            assert done.returncode == 0 and not done.stdout.strip(), (label, done.stderr[:500])
         times[label] = round(time.perf_counter() - start, 2)
     print(f"\n{case[0]}: {times}")
     assert times["now"] < 20, times
@@ -606,6 +615,12 @@ def _denied_at_pre_cache_head() -> set[tuple[str, str, str]]:
     return set(own + HARVESTED_DENIED_AT_PRE_CACHE_HEAD)
 
 
+def test_every_pinned_harvested_row_is_still_harvested() -> None:
+    """A pinned row the harvest no longer yields would stop being checked with no failure."""
+    pinned = set(HARVESTED_DENIED_AT_PRE_CACHE_HEAD) | set(HARVESTED_ALLOWED_AT_PRE_CACHE_HEAD)
+    assert pinned <= set(_differential_rows()), sorted(pinned - set(_differential_rows()))
+
+
 @pytest.mark.parametrize("row", _differential_rows(), ids=lambda r: f"{r[2]}-{r[1]}-{r[0]}")
 def test_every_input_the_baseline_denies_is_still_denied(
     rig: SimpleNamespace, baseline: Path | None, row: tuple[str, str, str]
@@ -613,15 +628,18 @@ def test_every_input_the_baseline_denies_is_still_denied(
     """Also: on Windows, where it was measured, each row keeps its verdict at PRE_CACHE_HEAD.
 
     One launch of the shipped hook serves both checks, so the deny-set pin adds no launch per row. A
-    row added to either file since that head has no recorded verdict there, and is not pinned here.
+    row of this file's own lists is pinned to its list's verdict, so a row added there later is pinned
+    too, though PRE_CACHE_HEAD never ran it; a harvested row added later is not pinned.
     """
+    if baseline is None and sys.platform != "win32":
+        pytest.skip(f"this clone does not hold {BASELINE}; fetch it to run the differential")
     after = _verdict(rig, row)
     if sys.platform == "win32":
         allowed = {(r[0], r[1], r[2]) for r in ALLOWED} | set(HARVESTED_ALLOWED_AT_PRE_CACHE_HEAD)
         if row in _denied_at_pre_cache_head():
-            assert after is not None, f"DENY at {PRE_CACHE_HEAD[:11]}, ALLOW now: {row}"
+            assert after is not None, f"pinned DENY (PRE_CACHE_HEAD or its list), ALLOW now: {row}"
         elif row in allowed:
-            assert after is None, f"ALLOW at {PRE_CACHE_HEAD[:11]}, DENY now: {row}"
+            assert after is None, f"pinned ALLOW (PRE_CACHE_HEAD or its list), DENY now: {row}"
     if baseline is None:
         pytest.skip(f"this clone does not hold {BASELINE}; fetch it to run the differential")
     before = _verdict(rig, row, gate=baseline)

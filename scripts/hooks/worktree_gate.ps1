@@ -963,12 +963,13 @@ function Get-ScanRawIndexMap($Seg) {
 # `$gitInvocation` misses, such as `GIT` (an unquoted `.exe` suffix is read in any case since BACKLOG
 # #5655 step 3; a quoted program path ending `git.EXE` is still not, Remove-QuotedSpans says why).
 # On Windows and macOS, Get-AddedCommandReadings spells `GIT` as `git` where it follows the line start,
-# a separator, an opener, `$(` or a backtick, with only blanks and `NAME=value` assignments between, and
-# the walk reads it as code; its note says where that excludes. So `GIT reset --hard` and `GIT config
-# core.hooksPath /nope` from the primary, ALLOWED under the PowerShell tool on Windows on 2026-11-18,
-# are refused, and `if true; then GIT reset --hard; fi` is not rewritten, nor is a `GIT` after `do`,
-# `!`, `time`, `env` or `exec`. On Linux it is not rewritten (a macOS volume formatted case-sensitive
-# gets the rewrite all the same, which costs only a false deny). Also, at least: any line
+# a separator, an opener, `$(` or a backtick, with only blanks and plain `NAME=value` assignments
+# between, and the walk reads it as code; its note says what that excludes. So `GIT reset --hard`
+# and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the PowerShell tool on
+# Windows on 2026-11-18, are refused, and `if true; then GIT reset --hard; fi` is not rewritten,
+# nor is a `GIT` after `do`, `!`, `time`, `env` or `exec`. On Linux it is not rewritten (a macOS
+# volume formatted case-sensitive gets the rewrite all the same, which costs only a false deny).
+# Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
@@ -1193,13 +1194,15 @@ function Test-TrueSeparatorIn([string]$Text) {
 #     `C:/x/git.exe`, and on Windows and macOS `GIT` or `git.EXE`, are rewritten to `git` (`\git -C '<p>'
 #     -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o> log $(\git reset --hard)`) only
 #     where two things hold. The word follows the line start, a separator, an opener, `$(` or a
-#     backtick, with only blanks and `NAME=value` assignments between; so after a keyword or a prefix
-#     command, at least `then`, `do`, `!`, `time`, `env` and `exec`, it is not rewritten (`if true;
-#     then GIT reset --hard; fi`). And the walk reads the word as code outside double quotes: inside
-#     double quotes it is rewritten only within a `"$( )"`, and in an unquoted posix heredoc body it is
-#     not rewritten at all, inside a `$( )` or a backtick there included (`cat <<EOF`, then `$(GIT
-#     reset --hard)`). A path with whitespace in it, which must be quoted to run (`& 'C:\Program
-#     Files\Git\cmd\git.exe'`), is not rewritten.
+#     backtick, with only blanks and plain `NAME=value` assignments between. A value holding a blank,
+#     even a quoted one, `=`, a bracket, `;`, `&` or `|` is not plain, so `X=$(pwd) GIT reset --hard`
+#     and `X=a=b GIT reset --hard` keep `GIT`, and so does the outer reading's `X=_ GIT reset --hard`,
+#     which is not respelled. After a keyword or a prefix command, at least `then`, `do`, `!`, `time`,
+#     `env` and `exec`, it is not rewritten (`if true; then GIT reset --hard; fi`). And the walk reads
+#     the word as code, not as quoted text: inside double quotes it is rewritten only within a
+#     `"$( )"`, and in an unquoted posix heredoc body it is not rewritten at all, inside a `$( )` or a
+#     backtick there included (`cat <<EOF`, then `$(GIT reset --hard)`). A path with whitespace in
+#     it, which must be quoted to run (`& 'C:\Program Files\Git\cmd\git.exe'`), is not rewritten.
 #   * A BACKTICK SUBSTITUTION (posix only; in PowerShell a backtick is the escape character), rewritten
 #     to `$( )`, which the rules already read as an inner invocation (`cd <p> && git -C <o> log
 #     `` `git reset --hard` ``; from the primary, `git -C <o> log `` `git config <key>` ``).
@@ -1221,7 +1224,10 @@ function Test-TrueSeparatorIn([string]$Text) {
 # hoist is not cut down to its own segment: the text before it carries the chdir and the assignments
 # the hoist exists to read (`cd <p> && echo $(date); git -C <o> log $(git reset --hard)`). Before the
 # cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of
-# 2026-11-23). Under the 60 s timeout a slow run blocks the command rather than letting it through
+# 2026-11-23). With it, on one loaded Windows box the same day, the slowest of the five TIMED shapes in
+# tests/test_worktree_gate_added_command_readings.py took 9.9 s, against 2.2 s at origin/main and
+# 18.5 s before the cache: a hoist that names a repository no earlier pass named still costs its own
+# git calls and a pass of the rules. Under the 60 s timeout a slow run blocks the command rather than letting it through
 # (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
@@ -1410,9 +1416,10 @@ function Get-AddedCommandReadings([string]$Cmd, [string]$Convention) {
     $opts = $(if ($IsWindows -or $IsMacOS) { [System.Text.RegularExpressions.RegexOptions]::IgnoreCase } else {
             [System.Text.RegularExpressions.RegexOptions]::None })
     $plain = [System.Text.RegularExpressions.RegexOptions]::None
-    # After the line start, a separator or opener, `$(` or a backtick, then blanks and any `NAME=value`
-    # assignments; not after a keyword or a prefix command such as `then` or `env`. A word ending `/git`
-    # elsewhere, such as a `cd` target, is left alone. Only where the walk reads code (no -InDouble), so
+    # After the line start, a separator or opener, `$(` or a backtick, then blanks and plain `NAME=value`
+    # assignments (the first bullet of the note above says which values are plain); not after a
+    # keyword or a prefix command such as `then` or `env`. A word ending `/git` elsewhere, such as a
+    # `cd` target, is left alone. Only where the walk reads code (no -InDouble), so
     # a `GIT` in double quotes outside a `"$( )"`, or in an unquoted heredoc body, keeps its spelling.
     $at = '(?<=(?:^|[;&|({\r\n`]|\$\()[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|()=]*[ \t]+)*)'
     $qualifier = $(if ($Convention -eq 'posix') { '(?:\\|[^\s;&|(){}''"`$<>=]*[\\/])?' } else { '(?:[^\s;&|(){}''"`$<>=]*[\\/])?' })
@@ -3260,10 +3267,11 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # EVERY GIT CALL THIS HOOK MAKES IS A READ, AND EACH IS ASKED ONCE PER RUN (BACKLOG #5655 step 3 review).
 # Get-AddedCommandReadings hands rules 3c, 3d, 3 and 3b up to eleven strings, and each pass asked git
 # again what an earlier pass had asked: a hoisted string carries the command's earlier lines, so their
-# invocations were resolved once per hoist. On the Lander's 30 KB nine-hoist probe that took a run from
-# 7 s to 43 s. A spawn costs 0.1 s to 0.6 s on Windows, and the answers are not cached by anything else.
-# The cache is keyed by the exact argument list, and it keeps the output lines and the exit code, which
-# it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The hook runs
+# invocations were resolved once per hoist. Its COST note has the measured times. Get-RootCommonDirCmp
+# and Get-CommonDirAnswer kept their own caches before this one, and still do; this one covers every
+# call, theirs included. The cache is keyed by the argument list, with the one fold below, and it keeps
+# the output lines and the exit code, which it puts back in $LASTEXITCODE, so a caller reads what the
+# git call would have given it. The hook runs
 # before the tool call, so nothing it judges has run yet; another process could still change the
 # repository during the run, as it could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3271,7 +3279,15 @@ function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
     # into an empty argument, which git reads differently.
     $GitArgs = @($GitArgs | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
-    $key = $GitArgs -join [char]0
+    # On Windows `C:/x` and `C:\x` name one directory, and rules 3 and 3b ask about both spellings of a
+    # `-C` path, so the key folds the slashes of that one argument. The call itself keeps the spelling.
+    $keyArgs = $GitArgs.Clone()
+    if ($IsWindows) {
+        for ($k = 0; $k -lt $keyArgs.Count - 1; $k++) {
+            if ($keyArgs[$k] -ceq '-C') { $keyArgs[$k + 1] = $keyArgs[$k + 1].Replace('/', '\') }
+        }
+    }
+    $key = $keyArgs -join [char]0
     if (-not $gitReadCache.ContainsKey($key)) {
         $out = @(& git @GitArgs 2>$null)
         $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
@@ -3457,7 +3473,8 @@ function Test-GovernedEitherForm([string]$Path, [string]$Base) {
 # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
 # SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
 #
-# Cached because the roots cannot change within one invocation and each answer costs two git calls. Rule
+# Cached because the roots cannot change within one invocation; Invoke-GitRead caches the two git calls
+# under it as well, so this cache now saves only the path folding. Rule
 # 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
 $rootCommonCache = @{}
 function Get-RootCommonDirCmp($Root) {
