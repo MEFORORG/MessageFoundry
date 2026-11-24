@@ -2611,7 +2611,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         delivery task too and waits for it (BACKLOG #5907), so the startup unwind's cut does not
         leave the drain running after the store closed; a send that outlives the drain's grace is
         still left running (:meth:`_cut_sends`). The security notifier's close cancels its drain
-        too, and then records each notice the cut left unsent in the audit log (BACKLOG #6832),
+        too, and then starts recording, where it has an audit sink, each notice the cut left
+        unsent (BACKLOG #6832); a write that meets the closed store is lost,
         while an undelivered alert is counted by :attr:`undelivered`."""
         drain = self._task
         try:

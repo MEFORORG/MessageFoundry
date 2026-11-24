@@ -75,8 +75,9 @@ log = logging.getLogger(__name__)
 #: states the row. Defined here, not in ``auth/notifications.py``, where every upper-case string is a
 #: notice kind.
 SECURITY_NOTICE_UNDELIVERED_ACTION: Final = "auth.security_notice_undelivered"
-#: How many records may be in flight at once when a queue-full drop starts one; a failed send's
-#: record, held in the same set, takes a slot too. Past it a drop goes unrecorded, so the
+#: How many records may be in flight at once when a queue-full drop starts one. Other records
+#: held in the same set take slots too, at least a failed send's and a cut close's. Past it a
+#: drop goes unrecorded, so the
 #: overload that filled the queue cannot also grow tasks and store writers without bound.
 _MAX_RECORDING: Final = 64
 
@@ -818,8 +819,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         super().start()
 
     async def aclose(self, timeout: float | None = None) -> None:
-        """Drain the queue and stop. A close cut short cancels the drain and, before it returns,
-        records the send it cut and each notice still queued (BACKLOG #6832). ``timeout`` cuts the
+        """Drain the queue and stop. A close cut short cancels the drain and starts recording, with a
+        sink, the send it cut and each notice still queued (BACKLOG #6832). It waits for those
+        writes unless it is cancelled again, which stops only the wait. ``timeout`` cuts the
         wait for the drain from inside, so the shutdown hands this close part of its step's bound
         and the records start before the step itself is cut; a cancel of the caller cuts it the same
         way. The writes are not bounded: past the step's bound the shutdown stops waiting for them,
@@ -828,16 +830,19 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         drain = self._task
         deadline = asyncio.timeout(timeout)
-        cut = True
+        cut = False
         try:
             async with deadline:
                 await super().aclose()
-            cut = False
         except TimeoutError:
             # No line of its own: what was cut is logged below, without the lock notices a bare
             # "cut" line would hint at (BACKLOG #1131).
             if not deadline.expired():
                 raise
+            cut = True
+        except asyncio.CancelledError:
+            cut = True
+            raise
         finally:
             # Taken and logged before any await, so a second cancel cannot leave them untold.
             left = self._take_queued()
@@ -885,13 +890,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             event, send, delivered = pending
             if not send.done() or send.cancelled():
                 # A thread runs on to its own timeout, so the notice may still go out:
-                # "interrupted" says its delivery is unknown.
-                if event.event_type not in LOG_SILENT_EVENT_TYPES:
-                    log.warning(
-                        "%s closed with a security notice's send still running; whether it was "
-                        "delivered is unknown",
-                        type(self).__name__,
-                    )
+                # "interrupted" says its delivery is unknown. No line for it: a cut that leaves
+                # notices queued nearly always has a send in flight, so a line skipped for a lock
+                # notice would say a lock landed (BACKLOG #1131).
                 records.append((event, "interrupted"))
             elif (exc := send.exception()) is not None:
                 # It ended before the cut reached the drain, so its outcome is known.
