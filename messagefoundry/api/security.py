@@ -612,7 +612,8 @@ def _password_change_required(
 ) -> str:
     """The 403 detail for a must-change session, naming the credential's deadline when it has one.
 
-    ``suffix`` names the next step the session can take (the enrol-first step), appended.
+    ``suffix`` names the next step the session can take (``_MUST_CHANGE_NEXT_SUFFIX``: the
+    factor or the enrolment), appended.
 
     A deadline already passed is stated in the past tense with the one remedy left, and no
     ``suffix``: no step the session takes can revive the credential (BACKLOG #2298). The session
@@ -1729,8 +1730,9 @@ async def refuse_from_new_address(request: Request) -> None:
 
     The step-up gates already asked this. The PHI reads and the paced writes did not, so on a
     first deployment a bearer token replayed from a second address would have read message bodies
-    and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
-    :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_admit_reveal``). It gives
+    and started or stopped connections with no signal. Callers include at least
+    :func:`require_phi_read`, :func:`require_paced`, :func:`step_up_status` and the HTTP reveal path
+    in ``api/app.py`` (``_admit_reveal``). It gives
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes

@@ -280,9 +280,9 @@ async def test_a_phi_view_check_route_writes_the_grant_row(engine: Engine) -> No
 async def test_a_narrowed_trail_still_records_the_check_routes_of_audited_grants(
     engine: Engine,
 ) -> None:
-    """With ``[diagnostics].audit_all_authz`` off, a GET writes no grant row, but a check route for
-    a permission whose grant is still audited (the sensitive set, the PHI views, a files browse)
-    writes one. A permission whose grant the narrowed trail drops writes none."""
+    """With ``[security].audit_all_authorization_decisions`` off, a GET writes no grant row, but a
+    check route for a permission whose grant is still audited (the sensitive set, the PHI views, a
+    files browse) writes one. A permission whose grant the narrowed trail drops writes none."""
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     recorded = ("config:deploy", "messages:view_raw", "messages:view_summary", "files:browse")

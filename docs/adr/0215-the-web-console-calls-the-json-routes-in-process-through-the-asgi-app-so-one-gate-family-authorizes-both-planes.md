@@ -138,7 +138,12 @@ confirmation page, sub-requests a new gate-only route. Slice 2 registers one per
 policy table read, not a permission taken from the request. Each runs what `require` runs, in its
 order: the session resolution and idle-clock touch, must-change confinement, the MFA access gate
 with its `auth.mfa_denied` row, the notification-address gate, the permission loop with its denial
-row, and, on a route that names a permission, the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
+row, and, on a route that names a permission, the grant row. *Amended 2026-11-24 (BACKLOG #2603,
+Manager decision on the owner's instruction of 2026-11-23):* a check route also writes the grant
+row where its own gate would not, for any permission whose grant is audited on its own routes. That
+covers the PHI views and, with `audit_all_authz` off, the sensitive set and `files:browse` on a GET.
+Section 3's rules about which grants get a row govern every other route; docs/SECURITY.md (Gate-only
+check routes) states the check-route rule. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
 from must-change confinement, and it names no permission, so it writes no grant row. A check route
 tells a caller nothing it cannot already read from its own `GET /auth/me`, which lists its
 permissions, and a pending session is answered before the permission loop, as `require` does. A form
