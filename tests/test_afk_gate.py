@@ -880,7 +880,8 @@ def test_a_real_burn_halts_however_the_rows_lie(
         pytest.param(80, HALT, "Projected to run out", id="below-the-rung"),
         pytest.param(92, HALT, "Projected to run out", id="at-the-rung"),
         # 1 tick in 0.8 min is 75 percent an hour on main's rate: from 10 percent that runs out in about
-        # 72 minutes, before the reset but past the rung's 60, so main cleared it. Refused, it reviews.
+        # 72 minutes, before the reset but past the rung's 60. Main reviewed it, on its CRITICAL overall
+        # state; refused, it reviews here too, and must not clear.
         pytest.param(
             10, REVIEW, "refused the burn rate on this reading", id="run-out-past-holdmin"
         ),
@@ -891,7 +892,7 @@ def test_a_tick_seconds_apart_halts_as_on_main(
 ) -> None:
     """BACKLOG #5494. usage.ps1 refuses a rate from a span under the minimum, but main's rate over the
     same rows still projects, so a run-out inside the rung halts as it did on main. Reviewing it instead
-    loosened the gate. Short of the rung, the refusal reviews rather than clears."""
+    loosened the gate. Short of the rung, the refusal reviews, as main did, rather than clears."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"

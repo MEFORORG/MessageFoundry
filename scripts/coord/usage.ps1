@@ -38,8 +38,7 @@
          the reading cannot name, too few rows once those dated well after now are set aside, and a
          history that could not be read. A fresh reading then reads UNKNOWN below the ceiling, and
          Get-Rate says why, unless main's unguarded rate over the same rows projects a run-out before
-         the reset: that stays CRITICAL, so no guard turns a stop into a review. No rate Get-Rate
-         returns is below main's.
+         the reset, which stays CRITICAL. Get-Rate's comments say how main's rate is kept as a floor.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -335,10 +334,9 @@ $RateClockSkewMinutes = 5.0
 # burn whatever the rounding, so it is taken at its lower bound, one tick less over the minimum: never
 # refused, and never a rate calmer than the rows prove.
 $RateMinSpanMinutes = 1.0
-# THE READ WIDENS UNTIL IT REACHES ROWS OLDER THAN THE RATE WINDOW, up to this many lines. Foreign rows
-# are skipped, so a fixed tail of them could hold none of this root's rows and leave no rate, which turns
-# a burn into a clear level. Past the bound with the window still not reached, too few of this root's
-# rows is a refusal, never no rate.
+# THE READ WIDENS WHILE FOREIGN ROWS MAY HIDE THIS ROOT'S, up to this many lines. Foreign rows are
+# skipped, so a fixed tail of them could hold none of this root's rows and leave no rate, which turns a
+# burn into a clear level. Past the bound, too few of this root's rows is a refusal, never no rate.
 $RateTailLines = 400
 $RateMaxTailLines = 6400
 function New-RateRefusal([string]$Why) { [pscustomobject]@{ PctPerHour = $null; Refused = $Why; Note = $null; Fallback = $null } }
@@ -375,7 +373,19 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
     $guarded = Get-GuardedRate -CurrentResetEpoch $CurrentResetEpoch -ReadRoot $ReadRoot
     $main = Get-MainRate -CurrentResetEpoch $CurrentResetEpoch
     if ($guarded.Refused) { $guarded.Fallback = $main; return $guarded }
-    if ($null -eq $main -or $main -le 0) { return $guarded }
+    if ($null -eq $main -or $main -le 0) {
+        # MAIN HAD NO RISING RATE, SO ITS LEVEL BACKSTOP STOOD, and a small positive guarded rate would lift
+        # it, turning main's HIT at the level into OK. So a rising guarded rate main did not see, from rows
+        # the widened read reached or from a span main read as 0, is refused with itself as the Fallback:
+        # it still projects, and short of CRITICAL the level backs it as main's did (BACKLOG #5494).
+        if ($guarded -and $guarded.PctPerHour -gt 0) {
+            $r = New-RateRefusal "this root's history rows give a rising rate that the unguarded read of the last 400 rows does not, so it is not taken as a measured rate"
+            $r.Note = $guarded.Note
+            $r.Fallback = $guarded.PctPerHour
+            return $r
+        }
+        return $guarded
+    }
     # Main read a rising rate where the guarded read has none. Main counts rows stamped with another root,
     # which the guarded read skips, so this is not a measured rate of this root's; and it is not no rate
     # either, since main would have projected from it.
@@ -398,33 +408,31 @@ function Get-GuardedRate($CurrentResetEpoch, [string]$ReadRoot) {
         $tail = $RateTailLines
         while ($true) {
             $lines = @(Get-Content -LiteralPath $histPath -Tail $tail -ErrorAction Stop)
-            if ($lines.Count -lt $tail) { $complete = $true; break }
-            # The first line read is the oldest. Rows are appended in time, so once it is older than the
-            # rate window nothing further back can enter the rate.
-            $oldestAge = $null
+            $rows = @()
+            $aheadPct = @()
+            $foreign = 0
             foreach ($line in $lines) {
-                try { $oldestAge = Get-AgeMinutes ($line | ConvertFrom-Json -ErrorAction Stop).at } catch { continue }
-                if ($null -ne $oldestAge) { break }
+                try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                # Carried forward, absent or not a percentage: not an observation. A NaN row would turn the
+                # whole rate into NaN and clear a burn, and a blank row reads as 0 and fakes one.
+                $observed = Get-Percentage $r.seven_day
+                if ($null -eq $observed) { continue }
+                # ANOTHER ROOT'S ROW IS ANOTHER POOL. A collector of another root wired to publish here writes
+                # its rows into this history, stamped with the root that observed them. Skipped by the
+                # window's own test, so an unstamped or unset row still counts (finding S33-100).
+                if (-not (Test-WindowFromRoot $r $ReadRoot)) { $foreign++; continue }
+                if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
+                $age = Get-AgeMinutes $r.at
+                if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
+                if ($age -lt -$RateClockSkewMinutes) { $aheadPct += $observed; continue }
+                $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed; Reset = [string]$r.seven_reset }
             }
-            if ($null -ne $oldestAge -and $oldestAge -gt $RateWindowMinutes) { $complete = $true; break }
-            if ($tail -ge $RateMaxTailLines) { $complete = $false; break }
+            # WIDENED ONLY WHILE FOREIGN ROWS MAY HIDE THIS ROOT'S. Done once two rows of this root's are
+            # in hand, once no row was another root's, or once the file is read whole. No row's date ends
+            # the read, because one wrong date at the boundary would end it early.
+            if ($rows.Count -ge 2 -or -not $foreign -or $lines.Count -lt $tail) { $complete = $true; break }
+            if ($tail -ge $RateMaxTailLines) { break }
             $tail *= 4
-        }
-        foreach ($line in $lines) {
-            try { $r = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-            # Carried forward, absent or not a percentage: not an observation. A NaN row would turn the
-            # whole rate into NaN and clear a burn, and a blank row reads as 0 and fakes one.
-            $observed = Get-Percentage $r.seven_day
-            if ($null -eq $observed) { continue }
-            # ANOTHER ROOT'S ROW IS ANOTHER POOL. A collector of another root wired to publish here writes
-            # its rows into this history, stamped with the root that observed them. Skipped by the
-            # window's own test, so an unstamped or unset row still counts (finding S33-100).
-            if (-not (Test-WindowFromRoot $r $ReadRoot)) { $foreign++; continue }
-            if ($CurrentResetEpoch -and ($r.seven_reset -ne $CurrentResetEpoch)) { continue }  # a previous window
-            $age = Get-AgeMinutes $r.at
-            if ($null -eq $age -or $age -gt $RateWindowMinutes) { continue }
-            if ($age -lt -$RateClockSkewMinutes) { $aheadPct += $observed; continue }
-            $rows += [pscustomobject]@{ AgeMin = $age; Pct = $observed; Reset = [string]$r.seven_reset }
         }
     } catch { return (New-RateRefusal "the history at $histPath could not be read: $($_.Exception.Message)") }
     $note = $null
@@ -432,7 +440,7 @@ function Get-GuardedRate($CurrentResetEpoch, [string]$ReadRoot) {
         $note = "$($aheadPct.Count) history row(s) dated more than $RateClockSkewMinutes min in the FUTURE were left out of the span and kept as a level -- clock skew or a bad timestamp; fixing the clock does not clear a row already written, remove it from $histPath"
     }
     if (-not $complete -and $foreign -and $rows.Count -lt 2) {
-        return (New-RateRefusal "the last $($lines.Count) history rows are all inside the rate window and $foreign of them are stamped with another root, so this root's rows may lie further back; no rate from them")
+        return (New-RateRefusal "$foreign of the last $($lines.Count) history rows are stamped with another root and fewer than two are this root's, so this root's rows may lie further back; no rate from them")
     }
     if ($rows.Count -lt 2) {                                            # one point is a reading, not a rate
         if ($note) { return (New-RateRefusal "$note; fewer than two rows are left, so no rate from them") }
@@ -983,7 +991,10 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         $future = "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it"
         # NOT FRESH, so no rate_refused, which callers read as "a fresh reading with no trustworthy rate".
         # The refusal stays in the reason.
-        if ($o.rate_refused) { $future = "$future; $($o.rate_refused)"; $o.rate_refused = $null }
+        if ($o.rate_refused) {
+            if (-not ([string]$o.reason).Contains($o.rate_refused)) { $future = "$future; $($o.rate_refused)" }
+            $o.rate_refused = $null
+        }
         $o.dated_ahead = $true
         $o.level_floor = $pct
         if ($null -eq $minsToReset -and $null -ne $o.minutes_to_empty -and $pct -lt $CeilingPct) {

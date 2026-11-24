@@ -1736,29 +1736,95 @@ def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) ->
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=1), d
 
 
-def _foreign_rows(state: Path, root: Path, count: int, pct: float, epoch: int) -> None:
-    """Append ``count`` rows stamped with another root, each well inside the rate window."""
+def _foreign_rows(
+    state: Path, root: Path, count: int, pct: float, epoch: int, old_at: int | None = None
+) -> None:
+    """Append ``count`` rows stamped with another root, each well inside the rate window, except the
+    row at index ``old_at``, dated three hours back as by a clock that was behind."""
     other = str(root.parent / "other-root")
     with (state / "history.jsonl").open("a", encoding="utf-8") as f:
         for i in range(count):
-            row = {"at": _minutes_ago(1.0 - i / (count + 1)), "seven_day": pct}
+            mins = 180.0 if i == old_at else 1.0 - i / (count + 1)
+            row = {"at": _minutes_ago(mins), "seven_day": pct}
             f.write(json.dumps({**row, "seven_reset": epoch, "config_root_env": other}) + "\n")
 
 
-def test_four_hundred_foreign_rows_do_not_hide_this_roots_burn(tmp_path: Path) -> None:
+@pytest.mark.parametrize("old_at", [None, 50], ids=["in-window", "old-date-at-the-read-boundary"])
+def test_four_hundred_foreign_rows_do_not_hide_this_roots_burn(
+    tmp_path: Path, old_at: int | None
+) -> None:
     """BACKLOG #5494. 40 to 84 in 25 minutes is this root's run-out. 450 flat rows of another root's,
     written after it, filled the 400-line read; skipped, they left no rate, and 84 percent read on the
-    level alone, clear below the gate's rung. The read widens past them to this root's rows."""
+    level alone, clear below the gate's rung. The read widens past them to this root's rows, and one
+    wrong old date on the 400th line from the end does not end it early."""
     root = tmp_path / "root"
     state = root / "mefor-usage"
     epoch = int(time.time()) + 280000
     publish(state, seven=84.0, seven_epoch=epoch)
     _stamp(state, root)
     write_history(state, [(27.0, 40.0), (2.0, 84.0)], epoch)
-    _foreign_rows(state, root, 450, 10.0, epoch)
+    _foreign_rows(state, root, 450, 10.0, epoch, old_at=old_at)
     code, d = read(state)
     assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(105.6, abs=2), d
+
+
+def test_a_guarded_rate_main_never_saw_keeps_the_level_backstop(tmp_path: Path) -> None:
+    """BACKLOG #5494. 91 to 92 over 83 minutes is a slow burn of this root's, behind 450 flat rows of
+    another root's. Main read only those, had no rising rate and halted on the level at 92 percent. The
+    widened read finds this root's 0.7 percent an hour, which as a rate would lift that backstop and
+    clear the gate, so it is refused and the window reads UNKNOWN, which the gate halts on at its rung."""
+    root = tmp_path / "root"
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 7200
+    publish(state, seven=92.0, seven_epoch=epoch)
+    _stamp(state, root)
+    write_history(state, [(85.0, 91.0), (2.0, 92.0)], epoch)
+    _foreign_rows(state, root, 450, 10.0, epoch)
+    code, d = read(state)
+    assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
+    assert "unguarded read" in d["seven_day"]["rate_refused"], d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+
+
+def test_an_unset_collector_after_a_pinned_one_of_the_same_root_does_not_duplicate(
+    tmp_path: Path,
+) -> None:
+    """The reader counts a row stamped with this root and an unset row alike, so an unset collector's
+    row at the same number after a pinned one's is the flat repeat the collector exists to suppress."""
+    root = tmp_path / "root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 280000
+    payload = {
+        "session_id": "A",
+        "rate_limits": {"seven_day": {"used_percentage": 51.0, "resets_at": epoch}},
+    }
+    for pin in (root, None):
+        proc = run_single(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-StateDir",
+                str(state),
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=_env(pin),
+        )
+        assert proc.returncode == 0, proc.stderr
+        # Both sessions saw 50 published before they read 51, as in a race between them.
+        doc = latest(state)
+        doc["seven_day"]["used_percentage"] = 50.0
+        (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    rows = history(state)
+    assert len(rows) == 1, rows
 
 
 def test_foreign_rows_past_the_read_bound_refuse_the_rate(tmp_path: Path) -> None:

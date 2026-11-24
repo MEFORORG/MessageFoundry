@@ -411,17 +411,19 @@ roster alias of the Lander.
 > refuse it: rows spanning under one minute that climbed one tick or less, which is mostly rounding;
 > rows across a reset when the reading carries none; too few rows once those dated more than 5 minutes
 > after now are set aside; rows stamped with another config root, which are skipped, filling a read
-> that widens to 6400 lines without reaching rows older than the rate window; and a history that cannot
+> that widens to 6400 lines without finding two rows of this root's; and a history that cannot
 > be read. A row set aside for its date keeps its level but not its date, which would stretch the span
 > toward a rate of zero. A refusal is not "no rate": a fresh reading with a refused rate reads UNKNOWN in
 > `usage.ps1` below its ceiling, and the gate then answers REVIEW below its weekly HOLD level and hits
-> at it, as with no rate. **No guard loosens the gate against the code before this amendment.** That
-> code's rate over the same rows, read as it read them, is kept as a floor: no rate `usage.ps1` reports
-> is below it, and a refused rate is still projected from it, so a run-out that rate puts before the
-> reset stays CRITICAL and the gate halts on it inside `HoldMin` as before. Short of a hit, a refused
-> rate answers REVIEW rather than OK. So a single tick seconds apart, and a uniform backward clock step
-> of more than 5 minutes, still halt where that code halted. Where this note and the paragraph above
-> differ, this note wins.
+> at it, as with no rate. **The rate of the code before this amendment is kept as a floor under the
+> guards.** That code's rate over the same rows, read as it read them, is computed beside the guarded
+> one. No rate `usage.ps1` reports is below it, and a refused rate is still projected from it, so a
+> run-out it puts before the reset stays CRITICAL and the gate halts on it inside `HoldMin` as before.
+> Where that rate is not positive and the guarded one is, the guarded rate is refused and projected the
+> same way, so that code's level backstop still stands. Short of a hit, a refused rate answers REVIEW
+> rather than OK. So at least a single tick seconds apart, and a uniform backward clock step of more
+> than 5 minutes, still halt where that code halted. Where this note and the paragraph above differ,
+> this note wins.
 >
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
 > percentage, so no one session's reading is the truth; each is a valid floor. Against a published
