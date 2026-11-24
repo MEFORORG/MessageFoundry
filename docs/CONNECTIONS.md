@@ -3141,7 +3141,7 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
   element with a close tag (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) that
   names a WS-Security code, the fault reads as `MessageExpired` only if that element names it.
   Otherwise it does if `MessageExpired` is anywhere the WS-Security code search looks: after the
-  first Body start tag when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  first Body start tag outside terminated markup when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
   module docstring points here.
 
 ```python
