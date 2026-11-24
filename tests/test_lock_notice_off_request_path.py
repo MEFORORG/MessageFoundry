@@ -882,7 +882,9 @@ async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
         assert await asyncio.to_thread(started.wait, _STALL_SECONDS), "the send never started"
         with pytest.raises(TimeoutError):  # the teardown's bound, cutting the close
             await asyncio.wait_for(relay.aclose(), 0.05)
-        assert relay._queue.qsize() == 1, "the cut close left no stop sentinel to test against"
+        # BACKLOG #6832: the cut close now empties the queue, its stop sentinel too, recording each
+        # notice it took. The property below still binds a start after it.
+        assert relay._queue.qsize() == 0, "the cut close left its sentinel or a notice queued"
         with suppress(RuntimeError):  # refusing is one way to keep the property below
             relay.start()
         late = SecurityEvent(PASSWORD_CHANGED, username="b", email="b@x.test")
