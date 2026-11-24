@@ -7735,7 +7735,7 @@ on every attempt (`reason: session_mint_contended`, BACKLOG #5653), which the ta
 from a reader without `users:manage`. Such a sign-in first writes the same `bad_credentials` row a
 wrong password writes, byte for byte, as a refusal by a lock does, so that reader sees one row
 whichever it was; an administrator reads both rows. The sign-in burst signal counts such a
-sign-in once. That action also records a session ended because its
+sign-in once. The `auth.temp_password_expired` action also records a session ended because its
 temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant

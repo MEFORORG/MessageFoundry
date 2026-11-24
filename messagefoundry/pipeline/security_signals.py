@@ -24,7 +24,10 @@ sign-in row. A refused local credential sign-in writes that row the same way in 
 directory (Kerberos or OIDC) lock refusal writes ``auth.directory_login_locked`` instead (BACKLOG
 #3726), so it is not counted. Refusals that write some other action are not counted either. The
 lock rows themselves are not read, and so an account lock raises no alert: that would show lock
-state to a reader the 2026-09-28 owner ruling withholds it from.
+state to a reader the 2026-09-28 owner ruling withholds it from. A local ``session_mint_contended``
+row weighs 0 (BACKLOG #5653): that sign-in writes two ``auth.login_failed`` rows, the visible
+stand-in a wrong password writes, which counts, and the hidden true row, so counting both would
+weigh one sign-in twice.
 
 **Refused peers are the one input that is not an audit row.** A listener refusing a peer at its
 source allowlist or a connection cap writes a ``connection_event`` row only while the operator's

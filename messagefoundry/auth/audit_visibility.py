@@ -39,11 +39,12 @@ This module is the one place that names the hidden rows. Every API read of the t
 * A local password sign-in that failed on ``session_mint_contended`` (BACKLOG #5653):
   ``auth.login_failed`` with one of the exact details :data:`LOCAL_MINT_CONTENDED_DETAILS` names.
   Only a right password reaches the session insert on that leg, so the row says the password was
-  right (Manager decision, the safer option). It is not written as ``bad_credentials`` instead,
-  which would be a false record: an administrator reads it as it happened. As for a refusal by a
-  lock, the writer first stores the visible ``auth.login_failed`` row a wrong password stores,
-  byte for byte, so the missing row is not itself the oracle; ``bad_credentials`` is the one reason
-  every refused local sign-in records, and the hidden row beside it names the cause. The directory
+  right (Manager decision, the safer option). The hidden row is not written as ``bad_credentials``
+  instead: an administrator reads that row as it happened, and it would say the password was
+  wrong. As for a refusal by a lock (BACKLOG #1131), the writer first stores the visible
+  ``auth.login_failed`` row a wrong password for an existing account stores, byte for byte, which
+  is the case a correct-password contention must be indistinguishable from, so the missing row is
+  not itself the oracle; the hidden row beside it names the cause. The directory
   leg's contended rows are not hidden.
 
 **Considered and left visible:** ``auth.login_after_failures`` (written only on a full sign-in, so

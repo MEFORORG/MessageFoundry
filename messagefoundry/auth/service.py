@@ -6565,9 +6565,10 @@ class AuthService:
             # every reader sees, byte-identical to a wrong credential's, then the true row only
             # ``users:manage`` reads. Only a right password reaches this insert, so without the
             # first a reader without ``users:manage`` would see a missing row where a wrong
-            # password leaves one. The first is not a false record: ``bad_credentials`` is the one
-            # reason every refused local sign-in records (:data:`_LOCAL_REFUSAL_REASON`), and the
-            # administrator reads the row naming the cause beside it.
+            # password leaves one. The first is exactly the row a wrong password for an existing account
+            # writes (:data:`_LOCAL_REFUSAL_REASON`), which is the case a correct-password
+            # contention must be indistinguishable from; the administrator reads the row naming
+            # the cause beside it.
             async def contended_rows() -> None:
                 await self._audit(
                     "auth.login_failed",
