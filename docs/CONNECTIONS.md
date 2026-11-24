@@ -3134,15 +3134,22 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 - A WS-Security auth/expiry fault (`FailedAuthentication` / `InvalidSecurityToken` / `MessageExpired`)
   **dead-letters** (a credential/expiry reject won't fix on a retry), with two exceptions. In a 2xx
   body with `capture_response` on, any fault is captured as a rejected reply instead. And on a
-  connection with OAuth2 client credentials whose transport does not stamp a `UsernameToken`
+  connection with a bearer token provider whose transport does not stamp a `UsernameToken`
   (`ws_security` with `ws_username`), the first HTTP `401` carrying `FailedAuthentication` or
-  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The next such
+  `InvalidSecurityToken` drops the cached bearer and **retries** with a fresh one. The provider is
+  OAuth2 client credentials, or SMART Backend Services: `with_smart_backend` refuses a SOAP spec,
+  but `smart_*` settings written into its settings by hand still build a SMART provider. The next such
   `401` is a **credential fault**: under the default `credential_fault_policy` (`stop`) it stops the lane and keeps the
   queue (ADR 0095), because the credential at fault is one the engine cannot see, at least a
-  `UsernameToken` a Handler writes into its own envelope or a client certificate. Only a 2xx or a
-  `401` that is not a WS-Security fault ends that run; a 5xx, a `407`, any other status or no
-  answer leaves it open. A `401` carrying `MessageExpired` dead-letters on every connection
-  (BACKLOG #5798).
+  `UsernameToken` a Handler writes into its own envelope or a client certificate. A 2xx ends that
+  run unless its body is a WS-Security fault, and so does a `401` that is not a WS-Security fault;
+  a 5xx, a `407`, any other status or no answer leaves it open. A `401` whose fault reads as
+  `MessageExpired` dead-letters on every connection. Where the Fault's first child is a code
+  element with a close tag (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) that
+  names a WS-Security code, the fault reads as `MessageExpired` only if that element names it.
+  Otherwise it does if `MessageExpired` is anywhere the WS-Security code search looks: after the
+  first Body start tag when a Fault follows it, else the whole reply (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  module docstring points here.
 
 ```python
 from messagefoundry import outbound, Soap, env
@@ -5288,7 +5295,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with an OAuth2 bearer, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with a bearer token provider, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |

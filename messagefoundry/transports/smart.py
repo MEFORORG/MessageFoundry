@@ -59,6 +59,7 @@ from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     hop_name_prefix,
 )
+from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -634,6 +635,27 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             raise SmartAuthError(
                 "SMART backend services requires a 'smart_private_key' setting (PEM via env())"
             )
+        # BACKLOG #5800 added item 1: the scope is URL-encoded as strict UTF-8 at each mint, so a
+        # lone surrogate raised UnicodeEncodeError out of send or test_connection; an inline PEM key
+        # and its password are encoded strictly as UTF-8 while the signer loads them below, and
+        # that exception's `object` is the whole value. Refused here, by setting name only, as the
+        # OAuth2 provider refuses its grant values. The client id, audience and key id ride the
+        # JSON assertion, whose encoder escapes a lone surrogate.
+        unencodable = next(
+            (
+                name
+                for name, value in (
+                    ("smart_scope", scope),
+                    # Only inline PEM is encoded; a path goes to open(), which takes one.
+                    ("smart_private_key", private_key if "-----BEGIN" in private_key else None),
+                    ("smart_private_key_password", private_key_password),
+                )
+                if value and has_lone_surrogate(value)
+            ),
+            None,
+        )
+        if unencodable is not None:
+            raise SmartAuthError(f"{unencodable} holds a character UTF-8 cannot encode")
         self.client_id = client_id
         self.scope = scope or None
         if not audience and request_target_as_sent(token_url) != token_url:
@@ -647,6 +669,14 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             )
         # SMART: aud = the token endpoint URL unless the server documents another audience.
         self.audience = audience or token_url
+        # ASVS 4.2.5: the token URL is operator-supplied via env(), so a blob-valued env() is a
+        # config error rather than an opaque IdP failure. BACKLOG #5800 added item 1: this ran at
+        # each mint, where its ValueError escaped send and test_connection unclassified. Measured
+        # here, before _open_token_hop's revocation guard can record a crossing for a build this
+        # refuses. The proxy headers that hop adds are measured after it, so an over-length proxy
+        # credential can still follow a recorded crossing. The message names a header and a
+        # length, never a value.
+        self._refuse_over_length(token_url, {})
         # Loads + validates the key/curve for the algorithm — a bad key fails loud here, before the
         # token hop's revocation guard, as it always has.
         self._signer = CompactJwtSigner(
@@ -669,6 +699,20 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
             trust_anchor=trust_anchor,
             connection=connection,
         )
+        # The signed client assertion rides the FORM body (not a header), so with the URL the
+        # proxy credential is all the gate measures; both are fixed once _open_token_hop has run.
+        self._refuse_over_length(token_url, self._proxy_auth)
+
+    @staticmethod
+    def _refuse_over_length(token_url: str, headers: Mapping[str, str]) -> None:
+        """Refuse a token URL or token-request header over the outbound length limit, as
+        :class:`SmartAuthError` naming a header and a length, never a value."""
+        try:
+            enforce_outbound_length_limits(token_url, dict(headers))
+        except ValueError as exc:
+            raise SmartAuthError(
+                f"SMART token request (smart_token_url and the proxy headers): {exc}"
+            ) from exc
 
     def _assertion_claims(self) -> dict[str, object]:
         """The five SMART-mandated client_assertion claims (iss=sub=client_id, aud, exp, jti)."""
@@ -689,11 +733,6 @@ class SmartBackendTokenProvider(_TokenEndpointProvider):
         if self.scope:
             form["scope"] = self.scope
         data = urllib.parse.urlencode(form).encode("ascii")
-        # ASVS 4.2.5: the token URL is operator-supplied via env(), and the signed client assertion
-        # rides the FORM body (not a header), so only the URL and the proxy credential are measurable
-        # here -- both are config, so a blob-valued env() surfaces as a config error rather than an
-        # opaque IdP failure on the first mint.
-        enforce_outbound_length_limits(self.token_url, dict(self._proxy_auth))
         return self._post_token(
             data,
             {
