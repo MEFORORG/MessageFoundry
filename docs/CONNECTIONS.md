@@ -3804,7 +3804,8 @@ Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
 `pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
-extra** (it stores the object as opaque bytes over the shared `rest.py` HTTP plumbing). Still out of scope:
+extra** (it stores the object as bytes over the shared `rest.py` HTTP plumbing, and reads its
+File Meta SOP Instance UID, by hand, to check a 202). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
 | Setting | Default | Meaning |
@@ -4002,7 +4003,8 @@ The modern HTTP imaging lane — a **STOW-RS** `POST {base}/studies` (or `{base}
 **sibling of the REST destination**: it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener,
 cleartext-credential refusal, the retry/dead-letter classification, the `[egress].allowed_http` gate) and
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
-handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
+handling. It needs **no `[dicom]` extra**: the object rides as bytes, and the one part of it read is
+the File Meta Media Storage SOP Instance UID, by hand, which a 202 is compared with (below).
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4032,13 +4034,17 @@ well-formed FailedSOPSequence with an item); and a
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
 most 64 characters) that equals the **Media Storage SOP Instance UID** (`0002,0003`) in the File
-Meta group of the object sent, an empty 202 included (code `unconfirmed-202`). A 202 is refused the
-same way, whatever its reply names, when the object sent has no such UID to compare: no `DICM`
-magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group before the first element
-outside group `0002`, a `(0002,0003)` whose VR is not `UI`, or a value that runs past the end of the
-object, is not ASCII, or is not in the UID grammar once its padding is dropped (BACKLOG #5914,
-decision of 2026-11-23). The File Meta group is read as Explicit VR Little Endian, as PS3.10
-requires, without `pydicom`. A ReferencedSOPSequence that is not an object, has a `Value` that
+Meta group of the object sent, an empty 202 included (code `unconfirmed-202`). A 202 that none of
+the rules above refuses is also `unconfirmed-202`, whatever its reply names, when the object sent
+has no such UID to compare. At least these leave none: no `DICM` magic after the 128-byte preamble,
+no `(0002,0003)` in the File Meta group before the first element outside group `0002`, a
+`(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
+the end of the object, and a value that is not ASCII or is not in the UID grammar once its padding
+is dropped (BACKLOG #5914, decision of 2026-11-23). The File Meta group is read as Explicit VR
+Little Endian, as PS3.10 requires, without `pydicom`. The compared UID is the File Meta one, not
+the data set's SOP Instance UID (`0008,0018`), which a server builds its reply from: an object whose
+data set was given a new SOP Instance UID without its File Meta being rewritten, or a server that
+assigns a new UID on a 202, is dead-lettered on every 202 although the server may hold it. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
 required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200

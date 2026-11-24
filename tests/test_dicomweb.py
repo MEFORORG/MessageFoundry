@@ -532,7 +532,8 @@ def _uid_body(uid: object) -> str:
 
 
 # ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
-# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element.
+# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element. Each
+# shape case carries SENT_UID, so only the shape check, not the comparison, can refuse it.
 _UNCONFIRMING_BODIES = [
     pytest.param(_uid_body(uid), id=f"uid-{name}")
     for name, uid in [
@@ -547,21 +548,29 @@ _UNCONFIRMING_BODIES = [
         ("not-a-uid", {"vr": "UI", "Value": ["N/A"]}),
         ("empty-component", {"vr": "UI", "Value": ["1..2"]}),
         ("over-64", {"vr": "UI", "Value": ["1." * 32 + "1"]}),
-        ("two-values", {"vr": "UI", "Value": ["1.2", "3.4"]}),
-        ("one-blank-of-two", {"vr": "UI", "Value": ["1.2.3", ""]}),
+        ("two-values", {"vr": "UI", "Value": [SENT_UID, "3.4"]}),
+        ("one-blank-of-two", {"vr": "UI", "Value": [SENT_UID, ""]}),
         ("non-string", {"vr": "UI", "Value": [42]}),
-        ("value-not-array", {"vr": "UI", "Value": "1.2.3.4.5"}),
-        ("element-not-object", "1.2.3.4.5"),
-        ("bulk-uri", {"vr": "UI", "Value": ["1.2"], "BulkDataURI": "x"}),
-        ("misspelt-value", {"vr": "UI", "value": ["1.2"]}),
-        ("wrong-vr", {"vr": "SQ", "Value": ["1.2"]}),
-        ("no-vr", {"Value": ["1.2"]}),
+        ("value-not-array", {"vr": "UI", "Value": SENT_UID}),
+        ("element-not-object", SENT_UID),
+        ("bulk-uri", {"vr": "UI", "Value": [SENT_UID], "BulkDataURI": "x"}),
+        ("misspelt-value", {"vr": "UI", "value": [SENT_UID]}),
+        ("wrong-vr", {"vr": "SQ", "Value": [SENT_UID]}),
+        ("no-vr", {"Value": [SENT_UID]}),
     ]
 ] + [
     pytest.param(json.dumps({"00081199": seq}), id=f"seq-{name}")
     for name, seq in [
         ("bulk-uri", {"vr": "SQ", "BulkDataURI": "https://pacs.example.test/bulk/1"}),
         ("inline-binary", {"vr": "SQ", "InlineBinary": "AAAA"}),
+        (
+            "value-and-inline-binary",
+            {
+                "vr": "SQ",
+                "Value": [{"00081155": {"vr": "UI", "Value": [SENT_UID]}}],
+                "InlineBinary": "AAAA",
+            },
+        ),
     ]
 ]
 
@@ -718,22 +727,58 @@ _NO_COMPARABLE_UID = [
     pytest.param(_part10(SENT_UID, value=b"1.2.3.4.5\xff"), id="non-ascii"),
     pytest.param(_part10(SENT_UID, value=b"1." * 32 + b"12"), id="over-64"),
     pytest.param(_TRUNCATED, id="truncated"),
+    # An earlier File Meta element whose declared length runs past the end of the object.
+    pytest.param(
+        OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:8] + struct.pack("<I", 1 << 20),
+        id="earlier-element-overruns",
+    ),
 ]
 
 
+def _with_meta_element_before_0003(vr: bytes, value: bytes) -> bytes:
+    """OBJECT with one more File Meta element, (0002,0002) in ``vr``'s long form, before (0002,0003)."""
+    at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
+    extra = (
+        struct.pack("<HH", 0x0002, 0x0002) + vr + b"\0\0" + struct.pack("<I", len(value)) + value
+    )
+    return OBJECT[:at] + extra + OBJECT[at:]
+
+
+@pytest.mark.parametrize("vr", [b"UV", b"ZZ"], ids=["newer-long-form", "unknown"])
+async def test_dicomweb_file_meta_reader_takes_any_vr_it_does_not_know_as_long_form(
+    vr: bytes,
+) -> None:
+    # PS3.5: a reader assumes the long form for a VR it does not know. A 2-byte read would land the
+    # walk inside the value and miss (0002,0003), refusing a 202 that names the instance sent.
+    obj = _with_meta_element_before_0003(vr, b"\x01\x02\x03\x04\x05\x06\x07\x08")
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
 @pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(STORED_OK, id="reply-names-an-instance"),
+        pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}), id="reply-names-none"),
+    ],
+)
 @pytest.mark.parametrize("obj", _NO_COMPARABLE_UID)
 async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
-    obj: bytes, capture: bool
+    obj: bytes, body: str, capture: bool
 ) -> None:
-    # The decision of 2026-11-23: with no File Meta UID to compare, the 202 confirms nothing, even
-    # when the reply names a well-formed instance -- here, the one SENT_UID names.
+    # The decision of 2026-11-23: with no File Meta UID to compare, the 202 confirms nothing,
+    # whether the reply names a well-formed instance -- the one SENT_UID names -- or none.
     dest = _dest(capture_response=capture)
-    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
     assert exc.value.permanent is True
     assert exc.value.code == "unconfirmed-202"
+    # Its own reason, carrying the replay advice, and naming no UID.
+    assert "(0002,0003)" in str(exc.value)
+    assert "before a replay" in str(exc.value)
     assert SENT_UID not in str(exc.value)
 
 

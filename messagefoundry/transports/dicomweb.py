@@ -113,15 +113,19 @@ _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
 # ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914);
-# see _named_instance and _sent_instance_uid.
+# see _names_sent_instance and _sent_instance_uid.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
 # PS3.10 section 7.1: a 128-byte preamble, then "DICM", then the File Meta group in Explicit VR
-# Little Endian. These VRs take the long form: two reserved bytes, then a 4-byte length (PS3.5
-# section 7.1.2).
+# Little Endian. These VRs take the short form, a 2-byte length (PS3.5 section 7.1.2). Every other
+# VR, an unknown one included, takes the long form: two reserved bytes, then a 4-byte length, as
+# PS3.5 tells a reader to assume for a VR it does not know.
 _PART10_PREAMBLE = 128
-_LONG_FORM_VRS = frozenset(
-    {b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"SQ", b"SV", b"UC", b"UN", b"UR", b"UT", b"UV"}
+_SHORT_FORM_VRS = frozenset(
+    {
+        *(b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FL", b"FD", b"IS", b"LO"),
+        *(b"LT", b"PN", b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US"),
+    }
 )
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
@@ -359,10 +363,11 @@ def _sent_instance_uid(obj: bytes) -> str | None:
 
     Read by hand, so the destination still needs no ``pydicom``: after the 128-byte preamble and
     ``DICM``, the File Meta elements are always Explicit VR Little Endian (PS3.10 section 7.1). The
-    walk stops at the first element outside group ``0002``. ``None`` for no ``DICM`` magic, no
-    ``(0002,0003)``, one whose VR is not ``UI``, an element that runs past the end of the object,
-    or a value that is not ASCII or does not pass :func:`_is_uid` once its trailing NUL or space
-    padding is dropped. The UID is never logged (PHI-safe)."""
+    walk stops at the first element outside group ``0002``. At least these give ``None``: no
+    ``DICM`` magic, no ``(0002,0003)``, one whose VR is not ``UI``, any File Meta element up to it
+    whose header or value runs past the end of the object, and a value that is not ASCII or does
+    not pass :func:`_is_uid` once its trailing NUL or space padding is dropped. The UID is never
+    logged (PHI-safe)."""
     if obj[_PART10_PREAMBLE : _PART10_PREAMBLE + 4] != b"DICM":
         return None
     pos, size = _PART10_PREAMBLE + 4, len(obj)
@@ -371,51 +376,46 @@ def _sent_instance_uid(obj: bytes) -> str | None:
         if group != 0x0002:
             return None
         vr = obj[pos + 4 : pos + 6]
-        if vr in _LONG_FORM_VRS:
+        if vr in _SHORT_FORM_VRS:
+            (length,) = struct.unpack_from("<H", obj, pos + 6)
+            start = pos + 8
+        else:
             if pos + 12 > size:
                 return None
             (length,) = struct.unpack_from("<I", obj, pos + 8)
             start = pos + 12
-        else:
-            (length,) = struct.unpack_from("<H", obj, pos + 6)
-            start = pos + 8
         end = start + length  # an undefined length (0xFFFFFFFF) runs past the end, so is refused
         if end > size:
             return None
         if element == 0x0003:
-            if vr != b"UI":
+            raw = obj[start:end]
+            if vr != b"UI" or not raw.isascii():
                 return None
-            try:
-                uid = obj[start:end].decode("ascii").rstrip("\0 ")
-            except UnicodeDecodeError:
-                return None
+            uid = raw.decode("ascii").rstrip("\0 ")
             return uid if _is_uid(uid) else None
         pos = end
     return None
 
 
-def _named_instance(item: Any) -> str | None:
-    """The instance a ReferencedSOPSequence item names, or ``None`` when it names none.
-
-    It names one when it is a dataset whose ReferencedSOPInstanceUID element has ``vr`` ``UI``,
-    passes :func:`_element_values`, and holds exactly one value (the attribute's VM is 1): a string
-    that passes :func:`_is_uid` once trailing NUL or space padding, which a binary-to-JSON converter
-    can leave, is dropped; that unpadded string is returned. Anything else names nothing (BACKLOG
-    #5914): no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one
-    entry. The UID is compared, never logged (PHI-safe)."""
+def _names_sent_instance(item: Any, sent_uid: str) -> bool:
+    """True when a ReferencedSOPSequence item names the instance sent: a dataset whose
+    ReferencedSOPInstanceUID element has ``vr`` ``UI``, passes :func:`_element_values`, and holds
+    exactly one value (the attribute's VM is 1), a string equal to ``sent_uid`` once trailing NUL
+    or space padding, which a binary-to-JSON converter can leave, is dropped. ``sent_uid`` has
+    passed :func:`_is_uid`, so equality also holds the reply's UID to that grammar. Anything else
+    confirms nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
     if not isinstance(item, dict):
-        return None
+        return False
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
     if not isinstance(element, dict) or element.get("vr") != "UI":
-        return None
+        return False
     value = _element_values(element)
     if value is None or len(value) != 1 or not isinstance(value[0], str):
-        return None
-    uid = value[0].rstrip("\0 ")
-    return uid if _is_uid(uid) else None
+        return False
+    return value[0].rstrip("\0 ") == sent_uid
 
 
-def _stowrs_refusal(body: str, status: int, sent_uid: str | None) -> tuple[str, str] | None:
+def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | None:
     """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
     that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
     re-send would get the same reply.
@@ -429,15 +429,15 @@ def _stowrs_refusal(body: str, status: int, sent_uid: str | None) -> tuple[str, 
       proves no rejection (BACKLOG #5914).
     - ``failed-sop``: a well-formed FailedSOPSequence (``00081198``) with an item, in any of the
       datasets, a proven rejection.
-    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply does
-      not name the instance sent: no ReferencedSOPSequence (``00081199``) item whose
-      ReferencedSOPInstanceUID (``00081155``; :func:`_named_instance`) equals ``sent_uid``, the
-      Media Storage SOP Instance UID of the object sent (:func:`_sent_instance_uid`). An empty 202
-      is one, and so is any 202 when ``sent_uid`` is ``None``, since there is no UID to compare
-      (BACKLOG #5914, decision of 2026-11-23).
+    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) not refused
+      above whose reply does not name the instance sent: no ReferencedSOPSequence (``00081199``)
+      item that names (:func:`_names_sent_instance`) the Media Storage SOP Instance UID of
+      ``sent``, the object sent (:func:`_sent_instance_uid`). An empty 202 is one. When ``sent``
+      has no such UID there is nothing to compare, so a 202 not refused above is one whatever its
+      reply names, with its own reason (BACKLOG #5914, decision of 2026-11-23).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule or compared with ``sent_uid`` (BACKLOG #5914 ruling), so a 200
+    the ReferencedSOPSequence rule and its ``sent`` is not read (BACKLOG #5914 ruling), so a 200
     dataset that confirms nothing and is not refused above, ``{}`` included, is delivered.
     docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states the rule in full.
 
@@ -467,6 +467,7 @@ def _stowrs_refusal(body: str, status: int, sent_uid: str | None) -> tuple[str, 
             f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
         )
     if status == 202:
+        sent_uid = _sent_instance_uid(sent)
         if sent_uid is None:
             return (
                 "unconfirmed-202",
@@ -474,7 +475,7 @@ def _stowrs_refusal(body: str, status: int, sent_uid: str | None) -> tuple[str, 
                 f"with the reply; {_NOT_SENT}",
             )
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
-        if not any(_named_instance(i) == sent_uid for i in referenced):
+        if not any(_names_sent_instance(i, sent_uid) for i in referenced):
             return unconfirmed
     return None
 
@@ -837,10 +838,7 @@ class DicomWebDestination(DestinationConnector):
         # here, and with no handler active no decode error -- which holds the whole body -- rides
         # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
         # text names no reply content.
-        # Only a 202 is compared with the instance sent, so its File Meta is read only then.
-        refused = _stowrs_refusal(
-            body, status, _sent_instance_uid(dicom_bytes) if status == 202 else None
-        )
+        refused = _stowrs_refusal(body, status, dicom_bytes)
         if refused is not None:
             code, reason = refused
             raise NegativeAckError(
