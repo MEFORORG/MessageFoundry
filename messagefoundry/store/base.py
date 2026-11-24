@@ -5564,7 +5564,9 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
     loop's task type). On a task without it nothing can be checked, so the borrow is cancelled at
-    once, as before this check existed, and one WARNING says the check is off.
+    once, and one WARNING says the check is off. That matches origin/main's acquire_pooled, but not
+    origin/main's warm-up, which put its cancel off one turn: on such a task type a hand-over in
+    flight in the cancel's turn can be lost on either path.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5595,7 +5597,7 @@ def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
     cancelled is not in flight, since no value is on its way. Outside the check, at least: a gather
     with a child done with a value beside a pending child (its cancel discards that value), a shield
     or another combinator, and a future that ignores its cancel; each counts as not in flight. The
-    gather check reads ``_children``, a CPython detail no test pins."""
+    gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour."""
     if fut.done():
         return not fut.cancelled() and fut.exception() is None
     if isinstance(fut, asyncio.Task):
@@ -5639,9 +5641,9 @@ async def acquire_pooled(
     A bare ``asyncio.wait_for(pool.acquire(), timeout)`` cancels the borrow at the instant the timer
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
-    per retry. That cancel
-    goes through :func:`_cancel_borrow`, which puts it off while a value is on its way into the
-    borrow. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
+    per retry. That cancel goes through :func:`_cancel_borrow`, which on CPython puts it off while a
+    value is on its way into the borrow (on a task type it cannot read, it cancels at once).
+    Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
     borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
     not check is lost before the borrow ends. The caller's own cancellation takes the same path — it must, or a
     shutdown mid-borrow would strand a slot the pool never recovers."""
