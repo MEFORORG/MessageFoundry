@@ -617,3 +617,106 @@ def test_lane_level_reads_seats_from_the_shared_root(dispatcher_repo: Path, shar
 def test_lane_level_skips_with_a_note_when_the_root_is_down(dispatcher_repo: Path) -> None:
     text = _lane_level(dispatcher_repo, DEAD_UNC)
     assert text.startswith("[lane] SKIPPED: the coordination root did not resolve"), text
+
+
+# ------------------------------------------------------------- writer exit codes and the pool epoch
+
+
+# BACKLOG #7593: a CLI writer verb that writes nothing must exit non-zero; the hook path stays 0.
+@pytest.mark.parametrize(
+    ("verb", "expected"),
+    [
+        (("-Declare", "-Seat", "builder", "-Goal", "g"), 1),
+        (("-Close",), 1),
+        (("-BumpEpoch",), 1),
+        (("-Record",), 0),
+    ],
+)
+def test_an_unresolved_worktree_fails_a_cli_verb_but_not_the_hook(
+    tmp_path: Path, shared: Path, verb: tuple[str, ...], expected: int
+) -> None:
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    proc = _ps(
+        COORD / "seat.ps1",
+        not_a_repo,
+        *verb,
+        "-Worktree",
+        str(not_a_repo),
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-nowt"),
+    )
+    assert proc.returncode == expected, proc.stderr
+    assert not (shared / "seats").exists()
+
+
+def _bump(repo: Path, shared: Path) -> subprocess.CompletedProcess[str]:
+    return _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-BumpEpoch",
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-bump"),
+    )
+
+
+def test_bump_epoch_starts_an_absent_epoch_at_two_and_increments_an_existing_one(
+    repo: Path, shared: Path
+) -> None:
+    proc = _bump(repo, shared)
+    assert proc.returncode == 0, proc.stderr
+    epoch = shared / "seats" / ".pool-epoch"
+    assert epoch.read_text(encoding="utf-8-sig").strip() == "2"
+    epoch.write_text("41", encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 0, proc.stderr
+    assert epoch.read_text(encoding="utf-8-sig").strip() == "42"
+    assert "pool epoch is now 42" in proc.stdout
+    # The mutex and the temp file are gone afterwards.
+    assert sorted(p.name for p in (shared / "seats").glob(".pool-epoch*")) == [".pool-epoch"]
+
+
+# BACKLOG #7594, reached through the top-level catch, which must exit non-zero for a CLI verb
+# (BACKLOG #7593).
+def test_bump_epoch_refuses_an_unreadable_epoch_rather_than_resetting_it(
+    repo: Path, shared: Path
+) -> None:
+    epoch = shared / "seats" / ".pool-epoch"
+    epoch.parent.mkdir(parents=True)
+    epoch.write_text("not-a-number", encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 1, proc.stdout
+    assert "could not be read, so it was not bumped" in proc.stderr
+    assert epoch.read_text(encoding="utf-8") == "not-a-number"
+
+
+def test_the_record_hook_keeps_the_epoch_fallback_for_an_unreadable_file(
+    repo: Path, shared: Path
+) -> None:
+    epoch = shared / "seats" / ".pool-epoch"
+    epoch.parent.mkdir(parents=True)
+    epoch.write_text("not-a-number", encoding="utf-8")
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-Record",
+        "-Worktree",
+        top,
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-rec-epoch"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    recs = list((shared / "seats").rglob("sess-rec-epoch.json"))
+    assert len(recs) == 1, proc.stdout + proc.stderr
+    assert json.loads(recs[0].read_text(encoding="utf-8-sig"))["poolEpoch"] == 1
+
+
+def test_bump_epoch_waits_on_a_held_mutex_and_never_steals_it(repo: Path, shared: Path) -> None:
+    seats = shared / "seats"
+    seats.mkdir(parents=True)
+    (seats / ".pool-epoch").write_text("7", encoding="utf-8")
+    lock = seats / ".pool-epoch.lock"
+    lock.write_text("pid=1 host=elsewhere", encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 1, proc.stdout
+    assert "timed out" in proc.stderr and "Not stealing it" in proc.stderr
+    assert (seats / ".pool-epoch").read_text(encoding="utf-8") == "7"
+    assert lock.read_text(encoding="utf-8") == "pid=1 host=elsewhere"
