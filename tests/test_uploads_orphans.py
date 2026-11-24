@@ -15,14 +15,20 @@ the one that matters — a write that is happening right now all have to survive
 from __future__ import annotations
 
 import asyncio
+import errno
+import logging
 import os
 import secrets
 import threading
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from messagefoundry import path_reach
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.uploads import (
     _BLOB_SUFFIX,
@@ -150,6 +156,33 @@ async def test_the_sweep_removes_both_leftover_shapes_and_counts_them(tmp_path: 
     assert await store.prune_expired() == PruneResult()
 
 
+def test_the_removal_warning_is_true_for_each_kind(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A temp is removed with no sidecar check, so its message must not claim one read as absent."""
+    store = _store(tmp_path)
+    root = tmp_path / "uploads"
+    root.mkdir(mode=0o700, parents=True)
+    tmp_name = f".{secrets.token_hex(16)}{_BLOB_SUFFIX}.{secrets.token_hex(4)}.tmp"
+    body_name = f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    for leftover in (root / tmp_name, root / body_name):
+        leftover.write_text("x", encoding="utf-8")
+        _backdate(leftover, seconds=2 * _ORPHAN_MIN_AGE_SECONDS)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 2
+
+    messages = {r.getMessage() for r in caplog.records if "orphan sweep removed" in r.getMessage()}
+    assert (
+        f"uploaded-logs orphan sweep removed temp file {tmp_name}: past the age floor" in messages
+    )
+    assert (
+        f"uploaded-logs orphan sweep removed body with no sidecar {body_name}: "
+        "past the age floor, and its sidecar read as absent"
+    ) in messages
+    assert not any("sidecar" in m for m in messages if tmp_name in m)
+
+
 def test_an_aborted_sweep_stops_before_its_next_entry(tmp_path: Path) -> None:
     """BACKLOG #2264, code review. A pass writes its audit rows only once the orphan sweep returns,
     so a slow sweep over a large dir must stop on the pass's abort rather than hold those rows past
@@ -213,8 +246,8 @@ async def test_the_sweep_never_unlinks_a_file_that_is_not_ours(tmp_path: Path, n
 
 
 async def test_a_body_whose_sidecar_will_not_decrypt_is_kept(tmp_path: Path) -> None:
-    """A rotated-away key must not let this pass destroy a live pair. ``_iter_sidecars`` yields a
-    sidecar WITHOUT opening it, so an undecryptable one still makes its body reachable."""
+    """A rotated-away key must not let this pass destroy a live pair. The sweep checks a sidecar's
+    NAME without opening it, so an undecryptable one still makes its body reachable."""
     store = _store(tmp_path)
     root = tmp_path / "uploads"
     meta = await store.save(data=_TXT, filename="a.txt", uploader="op", uploader_id="u1")
@@ -301,6 +334,363 @@ async def test_the_sweep_does_not_remove_a_body_still_waiting_for_its_sidecar(
     assert len(listed) == 1
     assert (root / f"{listed[0].file_id}{_BLOB_SUFFIX}").exists()
     assert await store.read_bytes(listed[0].file_id) == _TXT
+
+
+# --- a read fault whose code is not absence keeps the body (BACKLOG #6575) -----------------------
+
+
+_ORPHAN_TEXT = "SYNTHETIC-ORPHAN-BODY-TEXT"
+
+
+def _aged_orphan(store: UploadStore) -> Path:
+    """A ``.blob`` with no sidecar, past the floor: exactly what the sweep exists to remove."""
+    store._root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    body = store._root / f"{secrets.token_hex(16)}{_BLOB_SUFFIX}"
+    body.write_text(_ORPHAN_TEXT, encoding="utf-8")
+    _backdate(body, seconds=2 * _ORPHAN_MIN_AGE_SECONDS)
+    return body
+
+
+async def _aged_live_body(store: UploadStore) -> Path:
+    """The body of a real pair, past the floor, so only its sidecar keeps the sweep off it."""
+    meta = await store.save(data=_TXT, filename="live.txt", uploader="op", uploader_id="u1")
+    body = store._root / f"{meta.file_id}{_BLOB_SUFFIX}"
+    _backdate(body, seconds=2 * _ORPHAN_MIN_AGE_SECONDS)
+    return body
+
+
+def _on_root_listing(
+    monkeypatch: pytest.MonkeyPatch,
+    store: UploadStore,
+    hook: Callable[[int], object] = lambda _: None,
+) -> list[int]:
+    """Call ``hook`` with the listing's number after each real read of the store's root, and
+    return the numbers seen, so a test can fail or race one particular listing."""
+    real = Path.iterdir
+    seen: list[int] = []
+
+    def _listed(self: Path) -> Iterator[Path]:
+        listed = real(self)
+        if self == store._root:
+            seen.append(len(seen) + 1)
+            hook(seen[-1])
+        return listed
+
+    monkeypatch.setattr(Path, "iterdir", _listed)
+    return seen
+
+
+def _win_not_found(code: int) -> FileNotFoundError:
+    """A ``FileNotFoundError`` carrying a Windows error code, on any platform. Windows maps at
+    least a missing parent (3) and an unreachable share (53) to this class, so the class alone
+    does not say the file is absent."""
+
+    class _WinNotFound(FileNotFoundError):
+        winerror = code
+
+    return _WinNotFound(2, "not found")
+
+
+@pytest.mark.parametrize("flaky", [False, True], ids=["control", "transient-stat-failure"])
+async def test_a_transient_stat_failure_does_not_read_as_no_sidecars(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flaky: bool
+) -> None:
+    """``Path.is_dir`` returns False on a swallowed ``OSError``. The sweep's known-sidecar set used
+    to come from a reader gated on it, while its delete loop listed the root again, so one failed
+    stat would have read as no sidecars and removed every body past the floor. The control is the
+    same directory with no fault: the real orphan goes and the live body stays either way."""
+    store = _store(tmp_path)
+    live = await _aged_live_body(store)
+    orphan = _aged_orphan(store)
+    if flaky:
+        real = Path.is_dir
+        checks = 0
+
+        def _second_check_fails(self: Path, *, follow_symlinks: bool = True) -> bool:
+            nonlocal checks
+            if self == store._root:
+                checks += 1
+                if checks > 1:
+                    return False
+            return real(self, follow_symlinks=follow_symlinks)
+
+        monkeypatch.setattr(Path, "is_dir", _second_check_fails)
+
+    assert store._sweep_orphans_sync(now=time.time()) == 1
+    assert live.exists(), "a body with a sidecar was removed"
+    assert not orphan.exists(), "the real orphan was not removed"
+    if flaky:
+        assert checks == 0, "the sweep asked a check that swallows a read fault"
+
+
+@pytest.mark.parametrize("partway", [False, True], ids=["at-the-call", "partway-through"])
+async def test_a_listing_that_fails_aborts_the_sweep_and_deletes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, partway: bool
+) -> None:
+    """``Path.iterdir`` reads the whole directory inside the call on 3.14, and the partway case
+    holds the sweep to reading it whole first whichever way a later version does it."""
+    store = _store(tmp_path)
+    live = await _aged_live_body(store)
+    orphan = _aged_orphan(store)
+    real = Path.iterdir
+
+    def _fails(self: Path) -> Iterator[Path]:
+        if self != store._root:
+            return real(self)
+        if not partway:
+            raise OSError(5, "Input/output error")
+
+        def _entries() -> Iterator[Path]:
+            yield orphan
+            raise OSError(5, "Input/output error")
+
+        return _entries()
+
+    monkeypatch.setattr(Path, "iterdir", _fails)
+    with pytest.raises(OSError, match="Input/output error"):
+        store._sweep_orphans_sync(now=time.time())
+    assert orphan.exists() and live.exists()
+
+
+async def test_a_root_not_created_yet_is_an_empty_sweep(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert not store._root.exists()
+    assert store._sweep_orphans_sync(now=time.time()) == 0
+
+
+async def test_an_unreachable_root_is_not_read_as_a_missing_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The class is ``FileNotFoundError`` either way, and only a root that is really not there may
+    end the pass quietly. An unreachable one raises, so ``prune_expired`` logs it."""
+    store = _store(tmp_path)
+    orphan = _aged_orphan(store)
+
+    def _unreachable(_listing: int) -> None:
+        raise _win_not_found(53)
+
+    _on_root_listing(monkeypatch, store, _unreachable)
+    with pytest.raises(FileNotFoundError):
+        store._sweep_orphans_sync(now=time.time())
+    assert orphan.exists()
+
+
+async def test_an_aborted_sweep_keeps_the_passes_result_and_logs_no_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What ``prune_expired`` does with the abort: the pairs it already removed stay reported, the
+    orphan count is zero because nothing was swept, and the failure is an ERROR with no body in it."""
+    store = _store(tmp_path)
+    expired = await _aged_live_body(store)
+    orphan = _aged_orphan(store)
+
+    def _sweeps_listing_fails(listing: int) -> None:
+        if listing > 1:  # the first is the pass's own sidecar scan
+            raise OSError(5, "Input/output error")
+
+    _on_root_listing(monkeypatch, store, _sweeps_listing_fails)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        result = await store.prune_expired(now=time.time() + 31 * 86_400)
+
+    assert [f"{m.file_id}{_BLOB_SUFFIX}" for m in result.pruned] == [expired.name]
+    assert result.orphans_removed == 0
+    assert orphan.exists()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == [
+        "uploaded-logs orphan sweep failed; will retry next pass"
+    ]
+    assert _ORPHAN_TEXT not in caplog.text
+
+
+async def test_the_sweep_lists_the_root_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    orphan = _aged_orphan(store)
+    listings = _on_root_listing(monkeypatch, store)
+    assert store._sweep_orphans_sync(now=time.time()) == 1
+    assert len(listings) == 1
+    assert not orphan.exists()
+
+
+async def test_a_sidecar_the_listing_did_not_show_keeps_its_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The listing is a snapshot. A sidecar can land after it, or a share can return a short
+    listing with no error, so the listing alone never authorises the unlink."""
+    store = _store(tmp_path)
+    body = _aged_orphan(store)
+    sidecar = body.with_suffix(_META_SUFFIX)
+    _on_root_listing(monkeypatch, store, lambda _: sidecar.write_text("landed", encoding="utf-8"))
+    assert store._sweep_orphans_sync(now=time.time()) == 0
+    assert body.exists()
+
+
+async def test_a_sidecar_landing_during_the_age_check_keeps_its_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sidecar check is the last read before the unlink, so the age check is not a gap."""
+    store = _store(tmp_path)
+    body = _aged_orphan(store)
+    sidecar = body.with_suffix(_META_SUFFIX)
+    real = Path.stat
+
+    def _lands_during_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        result = real(self, follow_symlinks=follow_symlinks)
+        if self == body:
+            sidecar.write_text("landed", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(Path, "stat", _lands_during_stat)
+    assert store._sweep_orphans_sync(now=time.time()) == 0
+    assert body.exists()
+
+
+_ONE_ENTRY_FAULTS: list[Callable[[], OSError]] = [
+    lambda: PermissionError(13, "Permission denied"),
+    lambda: OSError(errno.ESTALE, "Stale file handle"),
+    lambda: _win_not_found(53),
+    lambda: _win_not_found(3),
+]
+_ONE_ENTRY_FAULT_IDS = ["denied", "stale-handle", "unreachable-share", "missing-parent"]
+
+
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
+async def test_a_body_stat_fault_leaves_only_that_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: Callable[[], OSError]
+) -> None:
+    """A dangling link named like a body can raise the codes a lost share does, from its target. With
+    the root still answering, that entry is skipped and the orphans listed after it still go."""
+    store = _store(tmp_path)
+    bodies = [_aged_orphan(store) for _ in range(3)]
+    real = Path.stat
+
+    def _one_body_faults(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == bodies[0]:
+            raise fault()
+        return real(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _one_body_faults)
+    assert store._sweep_orphans_sync(now=time.time()) == 2
+    assert [body.exists() for body in bodies] == [True, False, False]
+
+
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
+async def test_a_fault_on_one_sidecar_leaves_only_that_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], OSError],
+) -> None:
+    """A lasting fault on one name must not stop the sweep at that name on every pass, or nothing
+    listed after it would ever be reclaimed. Its body stays, and it is named once an interval."""
+    store = _store(tmp_path)
+    bodies = [_aged_orphan(store) for _ in range(3)]
+    denied = bodies[0].with_suffix(_META_SUFFIX).name
+    real = os.lstat
+
+    def _one_sidecar_denied(path: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == denied:
+            raise fault()
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _one_sidecar_denied)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 2
+        assert store._sweep_orphans_sync(now=time.time()) == 0
+
+    assert [body.exists() for body in bodies] == [True, False, False]
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+    named = [r for r in caplog.records if "left" in r.getMessage()]
+    assert len(named) == 1 and bodies[0].name in named[0].getMessage()
+    assert _ORPHAN_TEXT not in caplog.text
+
+
+async def test_a_young_body_with_a_faulting_sidecar_costs_the_pass_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body under the floor is not a removal candidate, so its sidecar is never asked about."""
+    store = _store(tmp_path)
+    aged = _aged_orphan(store)
+    young = _aged_orphan(store)
+    _backdate(young, seconds=_ORPHAN_MIN_AGE_SECONDS / 2)
+    young_sidecar = young.with_suffix(_META_SUFFIX).name
+    real = os.lstat
+
+    def _young_sidecar_faults(path: Any, **kwargs: Any) -> os.stat_result:
+        if Path(path).name == young_sidecar:
+            raise OSError(errno.ESTALE, "Stale file handle")
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", _young_sidecar_faults)
+    assert store._sweep_orphans_sync(now=time.time()) == 1
+    assert young.exists() and not aged.exists()
+
+
+@pytest.mark.parametrize("fault", _ONE_ENTRY_FAULTS, ids=_ONE_ENTRY_FAULT_IDS)
+async def test_a_root_that_stops_answering_stops_the_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: Callable[[], OSError],
+) -> None:
+    """A sidecar check that raises never lets a body go. The fault lands on the second orphan's
+    sidecar and the root then fails its own ``stat``: the first orphan was already confirmed and
+    removed and stays counted, and the third is never reached, which tells stopping from skipping.
+    The ERROR names the root's own fault, not the entry's."""
+    store = _store(tmp_path)
+    bodies = [_aged_orphan(store) for _ in range(3)]
+    real = os.lstat
+    real_stat = Path.stat
+    sidecars = 0
+
+    def _second_sidecar_faults(path: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal sidecars
+        if str(path).endswith(_META_SUFFIX):
+            sidecars += 1
+            if sidecars == 2:
+                raise fault()
+        return real(path, **kwargs)
+
+    def _root_lost_after_it(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if sidecars >= 2 and self == store._root:
+            raise OSError(errno.EIO, "Input/output error")
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(os, "lstat", _second_sidecar_faults)
+    monkeypatch.setattr(Path, "stat", _root_lost_after_it)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
+        assert store._sweep_orphans_sync(now=time.time()) == 1
+
+    assert sum(body.exists() for body in bodies) == 2
+    assert sidecars == 2
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    message = errors[0].getMessage()
+    assert "orphan sweep stopped" in message
+    assert "Input/output error" in message, "the ERROR must name the root's own fault"
+    assert str(fault().strerror) not in message, "the ERROR named the entry's fault"
+    assert _ORPHAN_TEXT not in caplog.text
+
+
+@pytest.mark.parametrize(("platform", "absent"), [("win32", False), ("linux", True)])
+def test_a_not_found_error_with_no_windows_code(
+    monkeypatch: pytest.MonkeyPatch, platform: str, absent: bool
+) -> None:
+    """A Windows lookup failure carries a code, so one with none proves nothing and must not
+    authorise an unlink. POSIX has no such code, so there the class is the whole answer."""
+    monkeypatch.setattr(path_reach, "sys", SimpleNamespace(platform=platform))
+    assert path_reach.is_name_absent(FileNotFoundError(errno.ENOENT, "not found")) is absent
+
+
+def test_a_not_found_error_with_a_network_loss_code_is_not_a_missing_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``is_name_absent`` narrows ``is_absent``, so what that calls unreachable is never absence."""
+    monkeypatch.setattr(path_reach, "sys", SimpleNamespace(platform="linux"))
+    exc = FileNotFoundError(errno.ESTALE, "Stale file handle")
+    assert not path_reach.is_absent(exc)
+    assert not path_reach.is_name_absent(exc)
 
 
 # --- drift guard --------------------------------------------------------------------------------

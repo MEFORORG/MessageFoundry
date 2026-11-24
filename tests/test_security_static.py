@@ -713,14 +713,18 @@ _UNSCANNABLE_RE_PATTERNS = {
     # cannot start with. Every widened branch takes it through ``_DSN_WIDE_SEGMENT``, an atomic
     # group whose first alternative is one bracketed or angled word of letters with "@" after it,
     # possessive as a group, then the segment. The stopwatch for these shapes is
-    # ``tests/test_b532w3_redaction_5386.py``.
+    # ``tests/test_b532w3_redaction_5386.py``. The run after every branch is ``_DSN_RUN``, and
+    # where the user's first segment is a placeholder (a conditional on its named group
+    # ``dsn_placeholder``) the run is followed by tail groups (``_DSN_TAIL``), each an "@" then a
+    # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before the
+    # next "@", so the repeats tile the text; the final "@" follows the tail.
     "messagefoundry/secretscrub.py": (
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')'",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_])|@)' + _DSN_WIDE_SEGMENT + '|(?:(?<=//:)' + _DSN_WIDE_SEGMENT + '|(?<!//:)(?:(?P<lead>@++)' + _DSN_WIDE_SEGMENT + '|' + _DSN_USER_FIRST_SEGMENT + ')))' + _DSN_RUN + _DSN_TAIL + '@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),
@@ -1530,6 +1534,13 @@ _XML_PARSER_ALLOWLIST = {
     "messagefoundry/parsing/xml/_deps.py": (
         "the single lazy loader for the [xml] extra (lxml, xmlschema, signxml) — every consumer in "
         "parsing/xml/ goes through it, and lxml parsing is hardened once in harden.py"
+    ),
+    "messagefoundry/parsing/x12/_deps.py": (
+        "the vendored defusedxml copy's ElementTree.parse with forbid_dtd/forbid_entities/"
+        "forbid_external, isolated in _parse_map_xml() so tests/test_xml_parser_consistency.py "
+        "drives THAT surface directly (the reader around it turns a refusal into an empty set). Its "
+        "input is the map XML inside the installed pyx12 package, never interchange data; the "
+        "ParseError import beside it is the exception type"
     ),
     "messagefoundry/transports/soap.py": (
         "xml.sax well-formedness gate with external general/parameter entities off; it has no "

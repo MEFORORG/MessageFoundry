@@ -640,6 +640,52 @@ async def test_start_row_resolves_an_env_dialect_as_the_route_does(engine: Engin
     assert "generic_odbc_tls_unenforced" in await start_row({"db_dialect": "generic"})
 
 
+async def test_start_row_reads_an_env_url_query_credential_against_its_snapshot_values(
+    engine: Engine,
+) -> None:
+    """Vault BACKLOG #3766 item 37: the start's ``config_loaded`` row records the
+    ``url_query_credential`` entry from the values its snapshot took, as the route reads the
+    runner's. The URL is an ``env()`` with no default, so a row read with no values would never
+    list it; a benign value is the control."""
+    import json
+
+    from messagefoundry.api import app as app_module
+    from messagefoundry.api import create_app
+    from messagefoundry.config.models import ConnectorType
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        EnvRef,
+        Registry,
+        build_outbound_connection,
+    )
+
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection(
+            "OB_Q_START",
+            ConnectionSpec(type=ConnectorType.REST, settings={"url": EnvRef("q_start_url")}),
+        )
+    )
+    runner = engine.add_registry(reg)
+    app = create_app(engine, allow_no_auth=True)
+
+    async def start_row(url: str) -> list[str]:
+        runner.set_env_values({"q_start_url": url})
+        loaded = app_module._LoadedConfig.read(engine)
+        assert loaded is not None and loaded.env_values == {"q_start_url": url}
+        # The live values move on after the snapshot, so a row read from them would differ.
+        runner.set_env_values({"q_start_url": "https://p.example.invalid/x?fmt=moved"})
+        before = len(await engine.store.list_audit(action="config_loaded"))
+        await app_module._record_start_audit(app, engine, loaded=loaded)
+        rows = await engine.store.list_audit(action="config_loaded")
+        assert len(rows) == before + 1
+        switches: list[str] = json.loads(rows[0]["detail"])["loosenings"]
+        return switches
+
+    assert "url_query_credential" in await start_row("https://p.example.invalid/x?key=SYNTH-37")
+    assert "url_query_credential" not in await start_row("https://p.example.invalid/x?fmt=json")
+
+
 async def test_posture_route_scope_names_every_connection_deviation(engine: Engine) -> None:
     """With no graph the route cannot see ANY per-connection declaration, and the marker must name
     each of them. Naming only ``cleartext_accepted`` made the DECLARED scope itself incomplete — the same

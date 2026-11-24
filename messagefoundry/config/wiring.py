@@ -54,7 +54,15 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -349,6 +357,9 @@ class EnvRef:
         # connector's own check saw only the cast's result. The same swap, for the same reason.
         elif self.cast is int:
             object.__setattr__(self, "cast", _cast_int)
+        # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
+        elif self.cast is float:
+            object.__setattr__(self, "cast", _cast_float)
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -409,7 +420,11 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
     made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
-    (vault BACKLOG #1650, :func:`_cast_int`). Any other callable runs as given. On a boolean
+    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
+    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
+    type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
+    included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
+    sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -523,12 +538,31 @@ def _cast_int(raw: Any) -> int:
 _cast_int.__name__ = "int"
 
 
+def _cast_float(raw: Any) -> float:
+    """Read an environment value as a number: the ``cast = "float"`` named cast, and what a
+    code-first ``env(..., cast=float)`` runs, since :class:`EnvRef` swaps the builtin ``float`` for
+    it (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1.0, and a TOML ``true`` in ``environments/<env>.toml`` reaches
+    the cast typed. It also takes ``"nan"`` and ``"inf"``, and rounds ``"1e-400"`` to 0.0, so a
+    float cap read through the cast could turn off from a value nobody wrote as zero. So the value
+    is read by the rule ``transports.base.float_setting`` holds, which refuses each of those with a
+    ``ValueError`` that withholds the value, by the rule :func:`_cast_bool` states."""
+    from messagefoundry.transports.base import float_setting
+
+    return float_setting(raw, knob="value", transport="env()")
+
+
+# Named "float" for the reason ``_cast_bool`` is named "bool".
+_cast_float.__name__ = "float"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
     "int": _cast_int,
-    "float": float,
+    "float": _cast_float,
     "bool": _cast_bool,
     "str": str,
 }
@@ -967,7 +1001,8 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 def _tls_off_reason(tls: object) -> str | None:
     """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
     :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
-    ``tls`` is truthy, so it reads as on until it resolves."""
+    ``tls`` reads as on until it resolves, by ``unread_ca_reason``'s own rule, since
+    ``bool_setting`` refuses one."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
@@ -975,8 +1010,9 @@ def _tls_off_reason(tls: object) -> str | None:
 
 def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
     """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
-    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
-    reason reads it by truthiness."""
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, so the refusal names
+    the factory: the unread reason reads ``tls`` strictly and would raise a bare ``ValueError``
+    that does not (vault BACKLOG #3234)."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
         refuse_bool_literals({"tls": tls}, factory)
@@ -6160,6 +6196,57 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+# The verdict types :func:`accepts_verdict` refuses unless the class has a truth value of its own:
+# each otherwise reads as True without being awaited or iterated.
+_ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
+
+
+def accepts_verdict(hname: str, verdict: object) -> bool:
+    """The truth value of ``verdict``, the value an ``accepts=`` predicate returned, or
+    :class:`TypeError` when it is an awaitable, an iterator or an async iterator (BACKLOG #5514).
+
+    The router stage reads the verdict as a truth value without awaiting or iterating it. A coroutine,
+    a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
+    True, so the handler would accept every message. The static check in
+    :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The text names
+    the handler and the verdict's type, never its value. Every mode applies this one rule, so
+    ``[sandbox].mode`` does not change the verdict (ADR 0087).
+
+    The refusal neither consumes nor closes the object, because the predicate may share it, for
+    example a module-level generator, and closing it would end it for its other holders. It drops its
+    own reference before raising. ``dryrun._accepted`` and the sandbox worker pass the verdict straight
+    in rather than binding it to a local, so on those paths an object the predicate made for this
+    call, and that is in no reference cycle, is collected before the error leaves this function, on
+    the calling thread and inside whatever run context the caller holds. The dry-run tracer's
+    recorder keeps the predicate's frame, so on the traced path the object waits for the cyclic
+    collector, as does an object in a cycle on any path. When Python finalizes it, a started
+    generator's ``finally`` runs, a raise from that ``finally`` goes to Python's unraisable-exception
+    hook rather than into this error, and a coroutine draws Python's "never awaited" warning.
+
+    An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
+    read by that value as before, iterator or not."""
+    if verdict is None or type(verdict) is bool:  # the contract's shapes: the routing hot path
+        return bool(verdict)
+    cls = type(verdict)
+    if (
+        isinstance(verdict, _ALWAYS_TRUE_VERDICT_TYPES)
+        and not hasattr(cls, "__bool__")
+        and not hasattr(cls, "__len__")
+    ):
+        # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
+        # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
+        type_name = scrub_log_argument(cls.__name__)
+        del verdict, cls  # see the docstring: the traceback must not keep the verdict alive
+        raise TypeError(
+            f"accepts= predicate for handler {hname!r} returned an object of type "
+            f"{type_name}, which the router stage cannot await or iterate "
+            "and would read as True; it must return a value whose truth value is the verdict, "
+            "such as a bool"
+        )
+    return bool(verdict)
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
@@ -6172,7 +6259,9 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
     * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
-      an awaitable is not seen.
+      an awaitable, an iterator or an async iterator is not seen here; :func:`accepts_verdict`
+      refuses such a verdict at run time instead, as a router-stage error, unless its class has a
+      truth value of its own.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
@@ -7178,7 +7267,11 @@ class Registry:
         ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
         ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
         check after resolution refuses it then."""
-        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+        from messagefoundry.auth.trust_anchors import (
+            unread_ca_flags_refused,
+            unread_ca_reason,
+            unread_pin_message,
+        )
 
         dialling = [
             ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
@@ -7192,6 +7285,11 @@ class Registry:
         problems: list[str] = []
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if unread_ca_flags_refused(settings):
+                # The strict read in unread_ca_reason may raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal. The skip covers all four
+                # flags, read or not, so an unread-CA problem here shows once the literal is fixed.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7849,10 +7947,16 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+    # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
+    # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
+    # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
+    # read listed. That is a deliberate second reading beside bool_setting's: the connectors refuse
+    # a non-bool where they read the key, and a Registry build refuses one, but the settings dict
+    # stays mutable after the build, so this reader can still meet one and must not raise on it.
+    value = settings.get("tls_check_hostname")
+    if isinstance(value, EnvRef):
         return True
-    return not bool_setting(settings, "tls_check_hostname", default=True)
+    return value is not None and not (isinstance(value, str) and value == "") and not bool(value)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:

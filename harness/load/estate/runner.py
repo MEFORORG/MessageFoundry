@@ -493,7 +493,8 @@ def _reconcile(
     nothing delivered, a timed-out drain (``drain_seconds`` None), rows still in some stage, or
     engine counters that reset mid-step (``counter_reset``, from
     :func:`harness.load.report._counter_reset`). Both are required, with no default, so a caller
-    that forgets one cannot pass by omission.
+    that forgets one cannot pass by omission. This copy adds one shape the load copy lacks: an
+    outbound dead count that fell during the step (BACKLOG #5436).
     """
     sent = c.sent
     sink_received = c.sink_received
@@ -503,12 +504,14 @@ def _reconcile(
     # reading" (the batch-box aggregate reads the -1).
     metrics_missing = base is None or final is None
     if base is None or final is None:
-        read, written, backlog = 0, 0, -1
+        read, written, backlog, out_dead = 0, 0, -1, 0
     else:
         read = final.read - base.read
         written = final.written - base.written
         # The whole pipeline, not the outbound queue alone: see EngineSample.backlog (BACKLOG #5435).
         backlog = final.backlog
+        # A delta, so dead rows from before this step do not count against it (BACKLOG #5436).
+        out_dead = final.out_dead - base.out_dead
     # A restart, a stats reset or a purge makes final - baseline no run total, so no arm that reads
     # the engine deltas may rest on it; the load copy's reasoning is the source of record. The
     # stranding budget reads only client counters, so it still proves a loss across it. A negative
@@ -539,7 +542,9 @@ def _reconcile(
     floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0
+    # Outbound dead-letters only: `out_dead` sums the outbound connections' dead rows, so an ingress
+    # or routed dead-letter is not in it and this check does not see one (BACKLOG #5436).
+    engine_lost = read_short > 0 or floor_short > 0 or deliver_short > 0 or out_dead > 0
     lost = (engine_judged and engine_lost) or over_budget
     # Reasons the step cannot CLEAR itself although no arm proved a loss (BACKLOG #5574), as in
     # harness/load/report.py's copy: every arm above is an inequality that an empty, unsettled or
@@ -561,6 +566,13 @@ def _reconcile(
         )
     if drain_seconds is None:
         unproven.append("the drain timed out — the final counts are an unsettled snapshot")
+    # `out_dead` is a current count, so at least a replay or a stats reset lowers it, and
+    # `_counter_reset` does not watch it. A fall can hide new dead-letters (BACKLOG #5436).
+    if engine_judged and out_dead < 0:
+        unproven.append(
+            f"the outbound dead count fell by {-out_dead} during the step (for example a replay "
+            f"or a stats reset) — new dead-letters cannot be told from the removed rows"
+        )
     ok = not lost and drained and not unproven
     parts: list[str] = []
     if engine_judged and read_short > 0:
@@ -576,6 +588,8 @@ def _reconcile(
         parts.append(
             f"sink_received {sink_received} < engine_written {written} (lost {deliver_short})"
         )
+    if engine_judged and out_dead > 0:
+        parts.append(f"{out_dead} outbound row(s) dead-lettered during the step")
     if not drained and final is not None:
         parts.append(
             f"backlog {backlog} not drained (outbound {final.pending + final.inflight}, "

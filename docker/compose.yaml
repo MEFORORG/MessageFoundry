@@ -11,31 +11,69 @@
 
 # The API revocation attestation every serving engine below needs, as a required compose
 # substitution with no default. The default `engine` service's comment says why; this key only
-# holds the value once so every service that reads it, at least the three engines and the
-# revocation-attestation-check service, aliases one copy.
+# holds the value once so every service that reads it, at least the three engines and the two
+# revocation-attestation-check services, aliases one copy.
 # The required substitutions in this file, at least this one and the Postgres password, read the
 # same sources, and their messages name them in the same words. Supply them from one place:
 # --env-file replaces the .env beside compose.yaml, so a value kept in that .env goes unread once
 # you pass it.
 x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
 
-# The engine image, named once: the revocation-attestation-check service must run the same image
-# as the engines so it reads the value with the same parser. Change it here, for example to
-# messagefoundry:sqlserver or a config-baked derived image.
+# The default engine's image, named once: the revocation-attestation-check service must run the
+# same image as that engine so it reads the value with the same parser. Change it here, for example to
+# messagefoundry:sqlserver or a config-baked derived image. It does NOT set the `ha` engines'
+# image: x-ha-engine-image below names theirs.
 x-engine-image: &engine-image messagefoundry:latest
+
+# The `ha` engines' image, the runtime-postgres variant, named once for the same reason: the
+# revocation-attestation-check-ha service must run it too. Change it here, never on one service.
+x-ha-engine-image: &ha-engine-image messagefoundry:postgres
+
+# The one-shot attestation check, every key but the image and profile, held once so the two check
+# services below run the same command with the same hardening. The revocation-attestation-check
+# service's comment says what it does and which commands skip it.
+x-revocation-attestation-check: &revocation-attestation-check
+  entrypoint:
+    - "tini"
+    - "--"
+    - "/opt/venv/bin/python"
+    - "-I"
+    - "-X"
+    - "disable-remote-debug"
+    - "-B"
+    - "-c"
+    - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the containers this check gates: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
+  environment:
+    MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
+  network_mode: none
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  # The image HEALTHCHECK probes the engine API, which this one-shot never serves.
+  healthcheck:
+    disable: true
+  restart: "no"
 
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
 # extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose
 # ignores `x-` keys. They are merged into the two services below via the `<<:` merge key.
 x-ha-engine: &ha-engine
   profiles: ["ha"]
-  image: *engine-image
+  # The Postgres variant: the slim *engine-image above carries no asyncpg, so the Postgres store
+  # below could not open on it. Build it from the repository root with:
+  #   docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
+  # So the x-engine-image anchor above does NOT set these engines' image; x-ha-engine-image does,
+  # and revocation-attestation-check-ha runs the same one, so it reads the attestation with the
+  # parser these engines run.
+  image: *ha-engine-image
   depends_on:
     postgres:
       condition: service_healthy
     schema-provision:
       condition: service_completed_successfully
-    revocation-attestation-check:
+    revocation-attestation-check-ha:
       condition: service_completed_successfully
   command: ["serve", "--config", "/config", "--env", "prod"]
   env_file:
@@ -268,43 +306,34 @@ services:
     # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
 
   # One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or without
-  # the ha profile, runs it before it starts any serving engine; at least the commands listed below
-  # skip it. The required substitution above refuses only an unset or empty value, and a value the
-  # engine reads as false, such as 0, would otherwise start an engine that exits 2 at the
-  # revocation gate and restarts forever. This reads the value with serve's own parser
+  # the ha profile, runs it before it starts the default engine, and runs
+  # revocation-attestation-check-ha below before it starts an `ha` engine; at least the commands
+  # listed below skip them. The required substitution above refuses only an unset or empty value,
+  # and a value the engine reads as false, such as 0, would otherwise start an engine that exits 2
+  # at the revocation gate and restarts forever. This reads the value with serve's own parser
   # (tls_revocation_attested), in the same image, exits 1 naming the gate when it does not read as
   # true, and an `up` without `--no-deps` stops there. It does not read the bind, so it refuses a
-  # false value even where serve's gate would not apply. It has no profile, so the `ha` engines
-  # wait on it too. down and logs never run it, which keeps the =0 path above working.
+  # false value even where serve's gate would not apply. It has no profile, so it runs for the
+  # default engine under any profile; the `ha` engines run another image and wait instead on
+  # revocation-attestation-check-ha below, the same check in their image. down and logs never run
+  # either, which keeps the =0 path above working.
   # `docker compose run` of an engine service, for an admin command such as gen-key, does run it.
   # At least two commands skip it: `docker compose run --no-deps` and
   # `docker compose up --no-deps <engine>`. The second starts that engine with no check, so a false
   # value there would exit 2 and restart forever; never use it to start a serving engine. It writes
   # nothing and needs no network.
   revocation-attestation-check:
+    <<: *revocation-attestation-check
     image: *engine-image
-    entrypoint:
-      - "tini"
-      - "--"
-      - "/opt/venv/bin/python"
-      - "-I"
-      - "-X"
-      - "disable-remote-debug"
-      - "-B"
-      - "-c"
-      - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start any engine: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
-    environment:
-      MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
-    network_mode: none
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    # The image HEALTHCHECK probes the engine API, which this one-shot never serves.
-    healthcheck:
-      disable: true
-    restart: "no"
+
+  # The same one-shot check in the `ha` engines' image, so they read the attestation with their own
+  # parser and the ha pair alone never needs the default image built. Its profile keeps a plain `up`
+  # from pulling an image a default-only user never built. The notes above on the commands that
+  # skip a check, and on down and logs, apply to it too.
+  revocation-attestation-check-ha:
+    <<: *revocation-attestation-check
+    profiles: ["ha"]
+    image: *ha-engine-image
 
   # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------
   # A local Postgres + a PAIR of clustered engines so you can exercise the ACTIVE-PASSIVE HA shape
@@ -337,14 +366,68 @@ services:
     #   sudo chown -R 999:999 ./pg-tls && sudo chmod 0600 ./pg-tls/server.key
     # Under rootless Docker, Podman or userns-remap, chown to the host uid that container uid 999
     # maps to instead. A Docker-Desktop-on-Windows bind mount surfaces as 0o777 and is refused.
-    # Without them Postgres does not start, so no ha engine does. A first start without them
-    # still initializes the mefor-pg volume but never creates the messagefoundry database, and a
-    # later start skips initialization (the health check still passes; schema-provision then
-    # fails). So after fixing them, remove that one volume, never `down -v`, which also removes
-    # the default engine's store: docker compose --profile ha down, then
+    # Without them Postgres does not start, so no ha engine does. The entrypoint below checks
+    # them first and exits naming what is wrong, before the image's own entrypoint runs: at
+    # least a missing or empty file, an encrypted key, a key whose owner or mode Postgres
+    # refuses, and a file the postgres account cannot read. A start it refuses initializes
+    # nothing, so fix the files and start again (`docker compose logs postgres` shows why).
+    # The check is not Postgres's own, and a file Postgres refuses for another reason passes
+    # it, at least a key that does not match the certificate and a file that is not PEM. That
+    # start still initializes the mefor-pg volume without creating the messagefoundry
+    # database. The health check then never passes, because it queries that database, so no
+    # engine starts against it. Recover by removing that one volume, never `down -v`, which
+    # also removes the default engine's store: docker compose --profile ha down, then
     #   docker volume rm <project>_mefor-pg
     # This server still accepts a plaintext session from another client on the compose network;
     # the engines never open one.
+    # Reads the certificate and key paths from the command's ssl_cert_file and ssl_key_file, so
+    # the check reads the files the server is told to load, and reads the key's owner and mode
+    # as the postgres account, as the server does. A command that does not start the server,
+    # such as `docker compose run postgres psql ...` or `postgres -V`, goes straight to the
+    # image's entrypoint, as it did before. `$$` is a literal `$` to compose.
+    entrypoint:
+      - "sh"
+      - "-c"
+      - |
+        set -eu
+        die() { echo "error: refusing to start Postgres before the image's entrypoint runs: $$*. The postgres service's comment in docker/compose.yaml says what ./pg-tls and the command must hold." >&2; exit 1; }
+        case "$${1:-}" in
+          postgres|-*|"") ;;
+          *) exec docker-entrypoint.sh "$$@" ;;
+        esac
+        crt=; key=; pass=
+        for a in "$$@"; do
+          case "$$a" in
+            -V|--version|--help|-\?|-C|--describe-config) exec docker-entrypoint.sh "$$@" ;;
+            ssl_cert_file=*|--ssl_cert_file=*|--ssl-cert-file=*) crt="$${a#*=}" ;;
+            ssl_key_file=*|--ssl_key_file=*|--ssl-key-file=*) key="$${a#*=}" ;;
+            ssl_passphrase_command=*|--ssl_passphrase_command=*|--ssl-passphrase-command=*) pass=1 ;;
+          esac
+        done
+        [ -n "$$crt" ] && [ -n "$$key" ] || die "the command names no ssl_cert_file or no ssl_key_file"
+        for f in "$$crt" "$$key"; do
+          [ -f "$$f" ] && [ -s "$$f" ] || die "$$f is missing or empty"
+          gosu postgres test -r "$$f" || die "the postgres account cannot read $$f"
+        done
+        pg=$$(id -u postgres) || die "the image has no postgres account"
+        st=$$(gosu postgres stat -L -c '%u %a' "$$key") || die "the postgres account cannot stat $$key"
+        owner=$${st% *}; mode=$${st#* }
+        if [ "$$owner" = "$$pg" ]; then
+          bad=$$(( 0$$mode & 077 ))
+        elif [ "$$owner" = 0 ]; then
+          bad=$$(( 0$$mode & 037 ))
+        else
+          die "$$key is owned by uid $$owner, neither the postgres account ($$pg) nor root"
+        fi
+        [ "$$bad" -eq 0 ] || die "$$key has mode $$mode, wider than Postgres allows for its owner: at most 0600 owned by uid $$pg, or 0640 owned by root"
+        if [ -z "$$pass" ]; then
+          rc=0
+          gosu postgres grep -q ENCRYPTED "$$key" || rc=$$?
+          [ "$$rc" -ne 0 ] || die "$$key is encrypted, and the command sets no ssl_passphrase_command"
+          [ "$$rc" -eq 1 ] || die "the postgres account cannot read $$key"
+        fi
+        exec docker-entrypoint.sh "$$@"
+      - "pg-tls-check"
     command:
       - "postgres"
       - "-c"
@@ -365,8 +448,14 @@ services:
     volumes:
       - mefor-pg:/var/lib/postgresql/data
       - ./pg-tls:/etc/postgresql/tls:ro
+    # Over TCP, not the Unix socket: during initialization the image runs a temporary server on
+    # the socket alone, which a socket probe reports ready. The query also fails when the
+    # messagefoundry database is missing, which pg_isready alone does not see. The image trusts
+    # a 127.0.0.1 login, so the probe needs no password. The probe fails for the whole first
+    # initialization, so start_period keeps those failures from counting toward retries.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mefor -d messagefoundry"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U mefor -d messagefoundry && psql -h 127.0.0.1 -U mefor -d messagefoundry -XtAqc 'select 1' >/dev/null"]
+      start_period: 120s
       interval: 5s
       timeout: 3s
       retries: 10

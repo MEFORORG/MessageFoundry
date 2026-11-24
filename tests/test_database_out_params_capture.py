@@ -20,6 +20,7 @@ from messagefoundry.config.wiring import Database, WiringError, build_outbound_c
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.database import DatabaseDestination
+from tests._fake_dbapi_driver import DriverError
 
 # `{ ? = CALL proc }` ODBC escape with a :name bind (translated to positional ? by the connector).
 PROC = "{ ? = CALL dbo.ingest(:mrn) }"
@@ -214,11 +215,11 @@ async def test_send_captures_out_params_pre_commit() -> None:
 # pyodbc's shape: ``args == (sqlstate, message)``. 40001 is SQL Server's deadlock victim, 42000 a
 # RAISERROR from a later statement in the proc's batch.
 def _deadlock() -> Exception:
-    return Exception("40001", "[40001] deadlock victim (1205) (SQLFetch)")
+    return DriverError("40001", "[40001] deadlock victim (1205) (SQLFetch)")
 
 
 def _proc_error() -> Exception:
-    return Exception("42000", "[42000] proc failed (50000) (SQLMoreResults)")
+    return DriverError("42000", "[42000] proc failed (50000) (SQLMoreResults)")
 
 
 class _FaultCursor(_SendCursor):
@@ -329,12 +330,12 @@ async def test_a_client_conversion_state_on_fetch_is_a_capture_problem() -> None
     cur = _FaultCursor(
         [([(1,)], [("id",)])],
         fetch_raises_on=0,
-        fetch_error=lambda: Exception("07006", "[07006] restricted data type (0) (SQLGetData)"),
+        fetch_error=lambda: DriverError("07006", "[07006] restricted data type (0) (SQLGetData)"),
     )
     d, conn = _send_dest(cur)
     resp = await d.send('{"mrn": "42"}')
     assert resp is not None and resp.outcome == "unparseable"
-    assert resp.detail == "result-set not readable (Exception [07006])"
+    assert resp.detail == "result-set not readable (DriverError [07006])"
     assert conn.committed and not conn.rolledback
 
 
@@ -345,7 +346,7 @@ async def test_a_driver_that_cannot_advance_keeps_what_it_read(state: str) -> No
     cur = _FaultCursor(
         [([(7,)], [("status",)]), ([(0,)], [("x",)])],
         nextset_raises_on=0,
-        nextset_error=lambda: Exception(state, f"[{state}] not supported (0) (SQLMoreResults)"),
+        nextset_error=lambda: DriverError(state, f"[{state}] not supported (0) (SQLMoreResults)"),
     )
     d, conn = _send_dest(cur)
     resp = await d.send('{"mrn": "42"}')

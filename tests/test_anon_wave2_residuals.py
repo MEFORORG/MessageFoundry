@@ -543,10 +543,14 @@ def test_an_allowed_dotted_ipv6_form_is_no_hit(leak: ModuleType, value: str) -> 
 
 
 @_LEAKS
-@pytest.mark.parametrize("value", ["1.2.3::a", "fe80::1.2::3", "1.2.2600::1", "fe80::1.2600::1"])
-def test_a_dot_joined_non_address_is_no_hit(leak: ModuleType, value: str) -> None:
-    """origin/main passed these, which hold no address; a run is not split at a dot that has a
-    colon after it, so ``3::a`` or ``2600::1`` is never judged on its own."""
+@pytest.mark.parametrize("value", ["1.2.3::a", "1.2.2600::1"])
+def test_a_run_after_dotted_groups_alone_is_not_cut(leak: ModuleType, value: str) -> None:
+    """origin/main passed these; a run is not cut at a dot with no colon before it, so ``3::a``
+    or ``2600::1`` is not judged on its own. That keeps a version number before ``::`` from
+    refusing, and is a miss docs/PHI.md section 9 names for a routable address such as
+    ``2600::1``. A dot after a colon, as in ``fe80::1.2600::1``, does cut; the cut
+    itself is pinned there for ``fe80::1.<global address>``, in
+    tests/test_anon_b224_5654.py."""
     assert leak.structural_phi_hits(_zpd(value), {"PID-3", "PID-5"}) == []
     # The control: a routable address in the same field is a hit.
     hits = leak.structural_phi_hits(_zpd("4000:a1::5"), {"PID-3", "PID-5"})

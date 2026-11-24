@@ -89,7 +89,8 @@
   That holds whatever the directory returns, so on a directory that now returns `objectGUID` the
   federated refusal is this one and no longer `directory_identity_conflict`; a Windows SSO sign-in
   there is still refused as `directory_identity_conflict`. `reconcile_directory_sessions` skips the
-  row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason once per account per process.
+  row, and audits `auth.ad_reconcile_binding_unkeyed` with that reason (when the report repeats is
+  stated once, in the `_report_unkeyed_bindings` docstring in `messagefoundry/auth/service.py`).
   On a directory that returns no readable `objectGUID`, a Windows SSO sign-in still finds an id-less
   row by its name, bound or not, as BACKLOG #1471 leaves every id-less row there. The lock-out
   slice C avoided falls on nobody, under section 0. **The cost:** AC-5's second clause cannot hold

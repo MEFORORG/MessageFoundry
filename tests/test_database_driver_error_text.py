@@ -21,6 +21,7 @@ import pytest
 from messagefoundry.redaction import raised_by_a_driver, safe_traceback
 from messagefoundry.transports import database
 from messagefoundry.transports.base import NegativeAckError
+from tests._fake_dbapi_driver import DriverError
 from tests.test_database_transport import (
     _dest,
     _FakeConn,
@@ -85,7 +86,7 @@ def test_a_word_or_a_codec_name_is_not_read_as_a_sqlstate(exc: BaseException) ->
 @pytest.mark.parametrize("state", ["23000", "08S01", "HYT00", "42S02", "01000"])
 def test_a_sqlstate_still_reads(state: str) -> None:
     """Control: SQLSTATEs of the SQL alphabet still read."""
-    assert database._sqlstate(Exception(state, "synthetic")) == state
+    assert database._sqlstate(DriverError(state, "synthetic")) == state
 
 
 @pytest.mark.parametrize("codec", ["ascii", "UTF16"])
@@ -125,7 +126,7 @@ async def test_a_non_driver_error_in_a_send_still_propagates(failure: Exception)
 
 async def test_a_driver_error_in_a_send_is_still_rejected() -> None:
     """Control: a driver error with a SQLSTATE is still a permanent rejection naming it."""
-    conn = _FakeConn(_FakeCursor(Exception("23000", "synthetic")))
+    conn = _FakeConn(_FakeCursor(DriverError("23000", "synthetic")))
     dest = _dest()
     dest._pool = _FakePool(conn)
     with pytest.raises(NegativeAckError, match=r"\[23000\]"):

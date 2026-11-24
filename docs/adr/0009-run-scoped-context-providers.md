@@ -10,6 +10,10 @@
   and the dry-run path ([`pipeline/dryrun.py`](../../messagefoundry/pipeline/dryrun.py)) now activate
   run-scoped state through `run_contexts(...)` instead of hand-written `with (activated(...), …)` tuples.
   Behaviour is byte-identical, proven by the existing suite.
+- **Amended 2026-11-23 (BACKLOG #5780):** `run_contexts` refuses a phase that is not a run phase.
+  `phase` is typed `RunPhase` (`"router"` or `"transform"`), and any other value raises
+  `ValueError` instead of silently entering no provider, so a dispatch-level phase such as the
+  sandbox's `"accepts"` must be mapped to a run phase first.
 - **Related:** [ADR 0001](0001-staged-pipeline-architecture.md) (the at-least-once / pure-re-run
   invariant every provider must preserve), [ADR 0005](0005-transform-accessible-state.md) and
   [ADR 0006](0006-external-data-lookups.md) (the `state`/`reference` read-side accessors this generalizes),

@@ -202,8 +202,12 @@ below), containing:
   `make_cipher`) is a **per-value string cipher** — `encrypt(plaintext: str) -> str` over a single in-memory
   buffer behind the `mfenc:` marker. It **cannot** stream a multi-GB archive (it would base64-expand the whole
   file in RAM). So the archive uses a **new chunked AES-256-GCM streaming framing** — a `.mfbak` magic +
-  version header, then fixed-size chunks each sealed with `cryptography`'s `AESGCM` under the resolved DEK with
-  a per-chunk nonce + a monotonic frame counter (so chunk reordering/truncation fails the tag). This codec
+  version header, then fixed-size chunks each sealed with `cryptography`'s `AESGCM` under the resolved DEK
+  (since ADR 0196, under a sub-key derived from it when the header carries a salt) with a per-chunk nonce + a
+  monotonic frame counter (so chunk reordering/truncation within one archive fails the tag). The AAD carries
+  no per-archive id, so frames splice between archives that share a header, and a splice can cut an archive
+  short or extend it without failing a tag; the codec's module docstring says which archives share one.
+  Whether the format gains a per-archive id is open under *To resolve on acceptance*. This codec
   runs in the **worker thread over the archive stream**, never loading the whole store into one buffer and
   never on the event loop. It is **net-new code** (acknowledged in *Consequences*) and, because it imports
   `cryptography` / `AESGCM`, the new module **must be registered in
@@ -603,7 +607,9 @@ here:
       schedule) vs. defaulting a very-large-store deployment to `online_backup` (low-contention).
 - [ ] **Lock the `.mfbak` archive format** (the net-new crypto deliverable): tar container + the chunked
       AES-256-GCM frame (magic + version header, fixed chunk size, per-chunk nonce + monotonic frame counter so
-      reorder/truncation fails the tag); confirm the new codec module is registered in
+      reorder/truncation within one archive fails the tag; no per-archive id yet, so frames splice between
+      archives that share a header: decide whether the format gains one before it is locked); confirm the new
+      codec module is registered in
       `scripts/security/crypto_inventory_check.py` INVENTORY (ASVS 11.1.3). The format version must let a future
       bump and ADR 0048's reader agree.
 - [ ] Settle the **DR-site key-availability contract** with ADR 0048/#61: env-key/external-provider **required**

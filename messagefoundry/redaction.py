@@ -94,18 +94,23 @@ from types import (
     TracebackType,
     WrapperDescriptorType,
 )
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 
 __all__ = [
     "RepeatedKeyError",
+    "args_hold_a_message",
     "clamp_untrusted",
     "codec_safe_line",
     "codec_safe_str",
+    "driver_sqlstate_of",
+    "is_a_sqlite_error",
+    "known_driver_error",
     "json_loads_or_refusal",
     "log_timestamp",
     "prepare_log_record",
     "prints_a_codec_error",
     "raised_by_a_driver",
+    "reads_as_a_sqlstate",
     "redact",
     "redact_binary_carriage",
     "redact_untrusted",
@@ -117,6 +122,8 @@ __all__ = [
     "safe_text",
     "safe_text_bound",
     "safe_traceback",
+    "sqlite_errorname_of",
+    "sqlstate_text",
 ]
 
 _REDACTED = "[redacted]"
@@ -826,9 +833,9 @@ def _clamp_marker(dropped: int) -> str:
     ``[^\\r\\n]*`` — to end of LINE, not to end of token — so a clamped head that opens a segment-like
     line swallows a space-joined note into its own ``[redacted]``. Measured while building this, on a
     record of unbroken ``PID|…`` text: an 8 MiB message rendered as ``PID|[redacted]`` with no sign it
-    had been cut. A newline is outside that class and ends the match. :func:`safe_text` appends AFTER
-    redaction, where nothing can reach the note, and uses a space so a stored ``last_error`` stays one
-    line."""
+    had been cut. A newline is outside that class and ends the match. :func:`safe_text` appends its
+    note AFTER redaction, where no pass reads it, and uses a space so a stored ``last_error`` stays
+    one line."""
     return f"[redaction bound: dropped {dropped:_d} more chars unscanned]"
 
 
@@ -1743,7 +1750,7 @@ def _xml_text(chunk: str, policy: int) -> str:
     return f"{chunk[:lead]}{_REDACTED}{chunk[len(chunk.rstrip()) :]}"
 
 
-def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
+def _end_tag_rest(text: str, start: int, stop: int, mask: bool, *, noted: bool = False) -> str:
     """The rest of an end tag, ``text[start:stop]``, with the words on the tag's own line masked in
     place where masking them is not expected to change another pass's reading (BACKLOG #5925).
 
@@ -1768,7 +1775,8 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     both share). Where only whitespace follows the line, :func:`_maskable_rest` decides with its
     rules for an answer's end, and also with its rules for a value glued to what follows where that
     whitespace opens with a line break, the only whitespace the line leaves after it (``</family
-    Li`` then a line break keeps ``Li``); :func:`_ends_in_camel_head` can refuse the last word too. Where
+    Li`` then a line break, and no bound note, keeps ``Li``); :func:`_ends_in_camel_head` can refuse
+    the last word too, except behind a bound note (``noted``, below). Where
     the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
     word is refused too, and a surname such as ``Johnson`` is masked there.
 
@@ -1787,10 +1795,20 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     no backstop opener when that run read it, so it keeps at least what these rules refuse on that
     text, while a run that took the
     name of an end tag outside the vocabulary leaves its rest as it stood, even inside a vocabulary
-    element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text, every
-    refusal :func:`_maskable_rest` makes there, a last word with a digit or ending in ``m``, ``b``,
-    ``f`` or ``n`` among them, and every last word :func:`_ends_in_camel_head` refuses (``</family
-    zqxP``)."""
+    element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text with no
+    bound note after it, every refusal :func:`_maskable_rest` makes there, a last word with a digit
+    or ending in ``m``, ``b``, ``f`` or ``n`` among them, and every last word
+    :func:`_ends_in_camel_head` refuses (``</family zqxP``).
+
+    **A rest this module's trailing bound note follows does not end the text** (``noted``, BACKLOG
+    #5925): the XML pass reads the text with the note set aside, but no caller's text can be glued
+    to the rest there, so the end-of-text refusals and :func:`_ends_in_camel_head` do not apply,
+    nor do the rules for a value glued to what follows where only whitespace stands between the
+    rest and the notes (:func:`_maskable_rest` says why). Where only whitespace stands there, the
+    whole-word rule for a rest the tag's ``>`` ends is not applied either: a boundary-free word such
+    as ``MSH`` needs a non-space separator after it (:data:`_MSH_DELIMITERS`). A rest the tag's
+    ``>`` ends is judged as before, note or not (``</family ZqMSH>`` keeps ``ZqMSH``). Before the
+    root fix ``</family Kim`` then the note printed ``Kim``."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
@@ -1799,14 +1817,18 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     if end - start > _GLUED_VALUE_MAX:
         return text[start:stop]
     if _TRAILING_SPACE.match(text, end) is not None:
-        rest = _maskable_rest(text, start, end, _HL7_FIELD_RUN, credential=False)
+        rest = _maskable_rest(text, start, end, _HL7_FIELD_RUN, credential=False, noted=noted)
+        # Behind a bound note no caller's text can complete the last word, so the camelCase-head
+        # rule, like the end-of-text rules, does not apply there.
         if rest is not None and (
-            _ends_in_camel_head(rest) or _rest_words(rest, camel=True) is None
+            (not noted and _ends_in_camel_head(rest))
+            or _holds_camel_label(_GLUED_WORD.findall(rest.lower()))
         ):
             rest = None
     else:
-        words = _rest_words(text[start:end], camel=True)
-        rest = None if words is None or words[-1].endswith(_UNBOUNDED_WORDS) else text[start:end]
+        rest = text[start:end]
+        if _rest_words(rest, camel=True) is None or _ends_in_unbounded_word(rest):
+            rest = None
     if rest is None:
         return text[start:stop]
     return rest.translate(_SHAPE) + text[end:stop]
@@ -1822,9 +1844,22 @@ def _rest_words(rest: str, *, camel: bool) -> list[str] | None:
     words = _GLUED_WORD.findall(rest.lower())
     if not words or any(word in _ANCHOR_PREFIXES for word in words) or _DATE_RUN.search(rest):
         return None
-    if camel and any(label in word for word in words for label in _CAMEL_LABEL_WORDS):
+    if camel and _holds_camel_label(words):
         return None
     return words
+
+
+def _holds_camel_label(words: list[str]) -> bool:
+    """Whether any of ``words``, lower-cased, holds a credential label word anywhere in it, as a
+    camelCase label such as ``userPwd`` does (:data:`_CAMEL_LABEL_WORDS`)."""
+    return any(label in word for word in words for label in _CAMEL_LABEL_WORDS)
+
+
+def _ends_in_unbounded_word(rest: str) -> bool:
+    """Whether ``rest``'s last word ends in a whole word some pass reads with no boundary before it
+    (:data:`_UNBOUNDED_WORDS`), compared lower-cased."""
+    last: str = _GLUED_WORD.findall(rest)[-1]
+    return last.lower().endswith(_UNBOUNDED_WORDS)
 
 
 def _ends_in_camel_head(rest: str) -> bool:
@@ -1841,10 +1876,10 @@ def _ends_in_camel_head(rest: str) -> bool:
 
 
 def _scrub_xml_element(
-    text: str, match: re.Match[str], last_close: dict[str, int], mask: bool
+    text: str, match: re.Match[str], last_close: dict[str, int], mask: bool, *, noted: bool
 ) -> tuple[str, int]:
-    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``mask`` says
-    whether an end tag's rest may be masked (:func:`_end_tag_rest`)."""
+    """``(replacement, end)`` for the vocabulary element starting at ``match``; ``mask`` and
+    ``noted`` are :func:`_end_tag_rest`'s."""
     out = [match.group()]
     policy = _VALUE_TOP if match.group(2) in _PHI_VALUE_KEYS else _LEAF
     pos, how, attributed = _walk_xml_tag(text, match.end(), policy, out)
@@ -1872,7 +1907,7 @@ def _scrub_xml_element(
             rest = _XML_END_TAG_REST.match(text, tag.end())
             pos = rest.end() if rest is not None else tag.end()
             out.append(tag.group())
-            out.append(_end_tag_rest(text, tag.end(), pos, mask))
+            out.append(_end_tag_rest(text, tag.end(), pos, mask, noted=noted))
             if open_names.get(qname):
                 while stack:
                     name, _ = stack.pop()
@@ -1892,7 +1927,7 @@ def _scrub_xml_element(
     return "".join(out), pos
 
 
-def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
+def _redact_xml_elements(text: str, *, masks: bool = True, noted: bool = False) -> str:
     """Scrub the content and attribute values of every vocabulary element in an XML payload -- FHIR's
     ``<family value="..."/>``, a text-content ``<family>...</family>``, with or without a namespace
     prefix -- keeping every tag name, and inside ``<identifier>``/``<telecom>`` keeping everything but
@@ -1911,7 +1946,9 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
     in place in a walked element, and outside one only after a vocabulary end tag
     (:func:`_mask_stray_end_tags`), where the rules expect that to change no other pass's reading
     (:func:`_end_tag_rest`); other such words are kept as they stood. ``masks`` False keeps every
-    one as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`)."""
+    one as it stood, which is this pass as it was before BACKLOG #5925 (:func:`_masked_only`).
+    ``noted`` says this module's trailing bound note was set aside after ``text``
+    (:func:`_maskable_rest`)."""
     if "<" not in text:
         return text
     out: list[str] = []
@@ -1926,8 +1963,8 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
         if last_close is None:
             last_close = {close.group(1): close.start() for close in _XML_PHI_END.finditer(text)}
             mask = masks and _USERINFO_OPENER not in text
-        replacement, end = _scrub_xml_element(text, match, last_close, mask)
-        out.append(_mask_stray_end_tags(text, pos, match.start(), mask))
+        replacement, end = _scrub_xml_element(text, match, last_close, mask, noted=noted)
+        out.append(_mask_stray_end_tags(text, pos, match.start(), mask, noted=noted))
         out.append(replacement)
         pos = end
     if not out:
@@ -1936,11 +1973,11 @@ def _redact_xml_elements(text: str, *, masks: bool = True) -> str:
         if _USERINFO_OPENER in text:
             return text
         mask = True
-    out.append(_mask_stray_end_tags(text, pos, len(text), mask))
+    out.append(_mask_stray_end_tags(text, pos, len(text), mask, noted=noted))
     return "".join(out)
 
 
-def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
+def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool, *, noted: bool) -> str:
     """``text[lo:hi]``, text outside every walked element, with the rest of each vocabulary end tag
     in it masked as :func:`_end_tag_rest` masks one inside: a second ``</family Zqxdoe>`` after the
     element closed, one whose start tag a cut removed, or one after an element read as prose.
@@ -1948,7 +1985,7 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
     **Only a vocabulary end tag, where the walk masks after any end tag.** Inside a walked element
     every tag is that element's markup; outside one, ``</b Zqxdoe>`` is read as prose and kept. The
     cost is over-masking prose that names a vocabulary tag: ``missing </name element`` prints as
-    ``missing </name xxxxxxx``. ``mask`` is :func:`_end_tag_rest`'s."""
+    ``missing </name xxxxxxx``. ``mask`` and ``noted`` are :func:`_end_tag_rest`'s."""
     if not mask or text.find("</", lo, hi) == -1:
         return text[lo:hi]
     out: list[str] = []
@@ -1957,7 +1994,7 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
         rest = _XML_END_TAG_REST.match(text, tag.end(), hi)
         stop = rest.end() if rest is not None else tag.end()
         out.append(text[pos : tag.end()])
-        out.append(_end_tag_rest(text, tag.end(), stop, mask))
+        out.append(_end_tag_rest(text, tag.end(), stop, mask, noted=noted))
         pos = stop
     out.append(text[pos:hi])
     return "".join(out)
@@ -1971,7 +2008,7 @@ def _redact_structured(text: str, *, widened: bool, masks: bool = True) -> str:
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
-    return _redact_xml_elements(body, masks=masks) + tail
+    return _redact_xml_elements(body, masks=masks, noted=bool(tail)) + tail
 
 
 def redact(text: str) -> str:
@@ -2322,8 +2359,8 @@ _UNBOUNDED_HEADS = tuple(
 #: The credential label words a camelCase start opens on, which the credential filters read inside
 #: a longer word (``userPwd=``, ``clientSecret=``), lower-cased: the glued-label words and the
 #: compound key words. That module imports this one, so they are spelled here; a test holds this set
-#: to its ``_CAMEL_WORDS``. Read for end-tag rests only, by :func:`_rest_words` with ``camel`` and
-#: by :func:`_ends_in_camel_head`.
+#: to its ``_CAMEL_WORDS``. Read for end-tag rests, at least by :func:`_holds_camel_label` and
+#: :func:`_ends_in_camel_head`.
 _CAMEL_LABEL_WORDS = (
     *_GLUED_CREDENTIAL_WORDS,
     "sharedaccesskey",
@@ -2357,15 +2394,16 @@ def _glued_value(
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
     end after it). A defect found in the #5925 review: with both read on ``text``, such a value
-    printed whole behind a clamp. A value that ends exactly where ``body`` ends, with the note's
-    line break right after it, is then judged on ``body``, as a value that ends the text: its
-    end-of-text refusals apply, so a PHI value holding a digit, or a credential value opening with
-    one, still prints there, as on main (``a|b|mrn: 12345`` cut by a clamp right after it). Every
-    other value is judged on ``text``, as before. Judged on ``text`` there, the value read as
-    glued to the line break, and a last word of two characters or fewer was refused (``a|b|mrn:
-    qw``). Judged on ``body`` anywhere else, a value followed by whitespace and then the note, or by
-    a space-joined note, would read as ending the text, and the end-of-text refusals would keep
-    values the earlier answer masked (``a|b|password: 4455`` then two spaces and a clamp).
+    printed whole behind a clamp. A value that ends exactly where ``body`` ends, with a note's
+    joiner of either kind right after it, is then judged on ``body`` with ``noted`` set
+    (:func:`_maskable_rest`), so a PHI value holding a digit, or a credential value opening with
+    one, is masked there too (``a|b|mrn: 12345`` cut by a clamp right after it; before the BACKLOG
+    #5925 root fix it printed). Every other value is judged on ``text``, as before. Judged on
+    ``text`` there, the value read as glued to the line break, and a last word of two characters or
+    fewer was refused (``a|b|mrn: qw``). Judged on ``body`` without ``noted`` anywhere else, a value
+    followed by whitespace and then the note would read as ending the text, and the end-of-text
+    refusals would keep values the earlier answer masked (``a|b|password: 4455`` then two spaces
+    and a clamp).
 
     The PHI arms answer first, as they did before BACKLOG #2968, apart from the clamp-note rule
     above. Where they decline, a token
@@ -2374,15 +2412,17 @@ def _glued_value(
     decline does a credential label at the token's end mask the next word, so the credential arm
     adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
-    # Only a value whose last character ends body sits right before the note's line break.
-    note_follows = len(body) < len(text) and text.startswith("\n", len(body))
+    # Only a value whose last character ends body sits right before a note's joiner.
+    noted = len(body) < len(text)
     stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
-        judged = body if note_follows and stop == len(body) else text
-        rest = _maskable_rest(judged, end, stop, field_run, credential=False)
+        on_body = noted and stop == len(body)
+        rest = _maskable_rest(
+            body if on_body else text, end, stop, field_run, credential=False, noted=on_body
+        )
         if rest is not None:
             return rest
-    rest = _glued_end_tag_rest(body, token, end, field_run)
+    rest = _glued_end_tag_rest(body, token, end, field_run, noted=noted)
     if rest is not None:
         return rest
     if not _ends_in_credential_label(token):
@@ -2390,11 +2430,15 @@ def _glued_value(
     bare = _GLUED_BARE_VALUE.match(body, end)
     if bare is None:
         return None
-    judged = body if note_follows and bare.end() == len(body) else text
-    return _maskable_rest(judged, end, bare.end(), field_run, credential=True)
+    on_body = noted and bare.end() == len(body)
+    return _maskable_rest(
+        body if on_body else text, end, bare.end(), field_run, credential=True, noted=on_body
+    )
 
 
-def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[str]) -> str | None:
+def _glued_end_tag_rest(
+    body: str, token: str, end: int, field_run: re.Pattern[str], *, noted: bool
+) -> str | None:
     """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
     these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text with this module's
@@ -2416,13 +2460,14 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     glued to what follows is not applied by this arm itself: it guards a string prefix before a
     quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). :func:`_end_tag_rest`
     still applies it where only whitespace follows the rest and that whitespace opens with a line
-    break (``a|b|</family Li`` then a line break keeps ``Li``).
+    break, short of a bound note (``a|b|</family Li`` then a line break keeps ``Li``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
     read on ``text`` ran into the note, took its punctuation, and was refused where the walk masks
     the same words. A note joined by a line break is not on the line, but read on ``text`` the rest
-    is followed by that line break rather than ending the text, so the end-of-text refusals did not
-    apply and the arm masked words the walk keeps (``zqxP``, ``Kim``). ``body`` is found once per
+    is followed by that line break, which the walk, reading ``body``, does not see. So the arm reads
+    ``body`` and is told a note followed (``noted``), as the walk is: both then apply the rules for
+    a rest a bound note follows (:func:`_end_tag_rest`), and give one answer. ``body`` is found once per
     :func:`_scrub_field_runs` call. Finding it once per token, as an earlier attempt did, made the
     cost grow with the square of the text's tokens.
 
@@ -2445,7 +2490,7 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     stop = line.end()
     rest = body[end:stop]
     masked = rest.translate(_SHAPE)
-    if masked == rest or _end_tag_rest(body, end, stop, True) != masked:
+    if masked == rest or _end_tag_rest(body, end, stop, True, noted=noted) != masked:
         return None
     last = _GLUED_WORD.findall(rest)[-1]  # a rest the mask changed holds a word
     if not rest.endswith(" ") and field_run.match(body, stop - len(last)) is not None:
@@ -2456,7 +2501,12 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
 def _without_trailing_note(text: str) -> str:
     """``text`` without this module's trailing bound note and its joiner (:data:`_TRAILING_NOTES`).
     :func:`_redact_structured` sets the same note aside before its passes, the JSON pass first and
-    the XML pass last; those passes then read what the earlier ones left."""
+    the XML pass last; those passes then read what the earlier ones left.
+
+    Only the last note goes. Setting a whole run of stacked notes aside was tried under BACKLOG
+    #5925 and dropped: an earlier note the passes read as text can change a structured pass, which
+    runs another round, and a differential found a credential the backstop scrubbed only in that
+    round print without it."""
     if not text.endswith("unscanned]"):  # a cheap test before a search of the whole text
         return text
     note = _TRAILING_NOTES.search(text)
@@ -2499,16 +2549,31 @@ def _glued_phi_value_end(text: str, body: str, token: str, end: int) -> int | No
 
 
 def _maskable_rest(
-    text: str, end: int, stop: int, field_run: re.Pattern[str], *, credential: bool
+    text: str,
+    end: int,
+    stop: int,
+    field_run: re.Pattern[str],
+    *,
+    credential: bool,
+    noted: bool = False,
 ) -> str | None:
-    """``text[end:stop]`` when the rules below allow masking it, else ``None``."""
+    """``text[end:stop]`` when the rules below allow masking it, else ``None``.
+
+    ``noted`` says this module's trailing bound note followed ``text`` and was set aside
+    (:func:`_without_trailing_note`). The text then goes on past ``text``'s end, with the note's
+    joiner and the note, so a caller's text cannot be glued to the value there: the rules for a
+    value that ends the answer do not apply, and nor do those for a value glued to what follows
+    where only whitespace stands between the value and the notes (BACKLOG #5925). Before this, a
+    value right at the note was judged as ending the text, and one holding a digit printed whole
+    behind a clamp."""
     rest = text[end:stop]
     words = _rest_words(rest, camel=False)
     if words is None:
         return None
     last = words[-1]
-    ends = _TRAILING_SPACE.match(text, stop) is not None
-    glued = not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
+    # Every caller that sets `noted` passes a value only whitespace follows to the text's end.
+    ends = not noted and _TRAILING_SPACE.match(text, stop) is not None
+    glued = not noted and not rest.endswith(" ") and text[stop : stop + 1] not in ("", " ")
     # Punctuation after the last word, a caller's or the terminator, could complete a word read
     # with no boundary: ``ZqMSH"]},`` declares delimiters once a JSON log escapes the quote.
     heads = _CREDENTIAL_UNBOUNDED_HEADS if credential else _UNBOUNDED_HEADS
@@ -2741,7 +2806,14 @@ def safe_text(text: str, *, limit: int = _DEFAULT_LIMIT) -> str:
     (BACKLOG #2079) a JSON ``name``/``address`` key that ``limit`` leaves last has the count read as its
     value by a further pass, so ``{"name":…(+316 chars)`` becomes ``{"name":…([redacted] [redacted])``
     and loses how much was cut. Before BACKLOG #1797 the limit cut the kept string itself and left it
-    unterminated, which a further pass scrubbed the same way."""
+    unterminated, which a further pass scrubbed the same way.
+
+    **The head is redacted without the note this call appends after it**, so a value the bound
+    left last is judged as ending the text, and a digit-bearing one prints in front of the note
+    (``a|b|mrn: 12345`` cut by the bound). Reading a stand-in note after the head was tried under
+    BACKLOG #5925 and withdrawn: the stand-in's line break let a whole-text gate in
+    :func:`_redact_unguarded` read a final ``bearer`` as a scheme, which switched off a scrub the
+    answer without it made."""
     head, note = safe_text_bound(text)
     message = _held_back(redact(head).strip(), limit)
     return f"{message}{note}"
@@ -3095,19 +3167,135 @@ def _a_driver_class(kind: type) -> bool:
     )
 
 
-#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters.
+#: Driver packages whose error holds its MESSAGE in ``args[0]``, never a SQLSTATE: at least
+#: asyncpg, which names its state in a ``sqlstate`` attribute when it names one. Not a complete
+#: list of such drivers; SQLite is tested apart (:func:`is_a_sqlite_error`). What each reader does
+#: with such an error is in :func:`args_hold_a_message`.
+_MESSAGE_IN_ARGS_DRIVERS = frozenset({"asyncpg"})
+
+
+def args_hold_a_message(exc: BaseException) -> bool:
+    """Whether ``exc``'s class, or a class it inherits, is from a package in
+    :data:`_MESSAGE_IN_ARGS_DRIVERS`, so its ``args[0]`` is its message. :func:`driver_sqlstate_of`,
+    the traceback line's reader, reads no state from such an ``args[0]``, and the DATABASE
+    connector's ``_shown_state`` names a state for it only from the error's own ``sqlstate``
+    attribute, as a copy of its data (:func:`sqlstate_text`), and only when that equals the state
+    it was asked about. The connector still CLASSIFIES such an error by the shape of ``args[0]``,
+    and the store's ``driver_sqlstate`` does not call this, so it still reads and prints that
+    ``args[0]``. A class that cannot be read answers ``False``, so it is read by shape, as any other
+    error is; that does not raise, so this runs on every link of a traceback."""
+    try:
+        return any(
+            isinstance(kind.__module__, str)
+            and kind.__module__.split(".")[0] in _MESSAGE_IN_ARGS_DRIVERS
+            for kind in type(exc).__mro__
+        )
+    except Exception:  # noqa: BLE001 - an unreadable class is read by shape, as the docstring says
+        return False
+
+
+#: A SQLSTATE as SQL defines one: five digits or uppercase Latin letters. Lowercase is refused, so
+#: a word such as ``OSError('reset')``'s or a codec name such as ``ascii`` does not read as one.
 _DRIVER_SQLSTATE = re.compile(r"[0-9A-Z]{5}")
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``.
+#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
+#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
 _SQLITE_ERRORNAME = re.compile(r"SQLITE_[A-Z_]{1,40}")
+
+
+def known_driver_error(exc: BaseException) -> bool:
+    """:func:`raised_by_a_driver`, except that a class whose driver test raises answers ``False``.
+    For a caller that would NAME something a driver's error carries, where the safe answer for a
+    class that cannot be classed is no (engine PR 3150, finding 1)."""
+    try:
+        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+    except Exception:  # noqa: BLE001 - fail closed for naming: an unclassable error names nothing
+        return False
+
+
+def is_a_sqlite_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is one of ``sqlite3``'s own errors or warnings. The class is read with
+    ``type()``, not ``isinstance``, which falls back to ``exc.__class__``, an attribute a class can
+    define to raise; an error arm calls this before its cleanup (engine PR 3163)."""
+    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
+    # and the CLI defers loading it (tests/test_startup_import_budget.py).
+    sqlite = sys.modules.get("sqlite3")
+    return sqlite is not None and issubclass(type(exc), (sqlite.Error, sqlite.Warning))
+
+
+def reads_as_a_sqlstate(value: object) -> TypeGuard[str]:
+    """Whether ``value`` is text of a SQLSTATE's shape: five digits or uppercase Latin letters.
+    Exactly ``str``: a subclass's ``__str__`` can print anything, such as a value from the
+    message, however its data matches (engine PR 3163); :func:`sqlstate_text` reads a subclass by
+    its data. A ``TypeGuard``, not a ``TypeIs``: a
+    ``False`` answer does not say ``value`` is no ``str``."""
+    return type(value) is str and _DRIVER_SQLSTATE.fullmatch(value) is not None
+
+
+def sqlstate_text(value: object) -> str | None:
+    """``value`` as an exact ``str`` copy of its data when that data has a SQLSTATE's shape, else
+    None. A ``str`` subclass is read by its data, as before, so it classifies an error as it did,
+    but what is returned is ``str``'s own copy, so no reader prints the subclass's ``__str__``
+    (engine PR 3163). ``str.__str__`` is called on ``str`` itself, which a subclass cannot
+    override. The type is read with ``type()``, not ``isinstance``, which an object faking
+    ``__class__`` would pass; and the length is read first, so a long message is never copied.
+    It does not raise for any value."""
+    if not issubclass(type(value), str) or str.__len__(value) != 5:  # type: ignore[arg-type]
+        return None
+    text = str.__str__(value)
+    return text if reads_as_a_sqlstate(text) else None
+
+
+def driver_sqlstate_of(
+    exc: BaseException, *, attribute: bool = True, past_attribute: bool = False
+) -> str | None:
+    """The SQLSTATE a known driver's own error (:func:`known_driver_error`) names, read in this
+    order, each as :func:`sqlstate_text` returns it. When ``attribute`` is true, the ``sqlstate``
+    attribute of any such driver's error, if it has a SQLSTATE's shape; an attribute that is set
+    but is no SQLSTATE then ends the read with None unless ``past_attribute`` is true. Then None
+    for an error from a package in :func:`args_hold_a_message`, at least asyncpg, whose
+    ``args[0]`` is its message. Otherwise ``args[0]``, if it reads as a SQLSTATE, as pyodbc's
+    does. None for any error that is no known driver's, so a ``KeyError('MRN42')`` is never read
+    as one, and None for a SQLite error, whose ``args[0]`` is its message (vault BACKLOG #1661).
+    :func:`safe_traceback` names a driver error's SQLSTATE by it. The DATABASE connector reads its
+    own state, which can differ from this one.
+
+    A class whose driver test raises counts as no driver's here, where :func:`raised_by_a_driver`
+    answers ``True`` to withhold its text: here ``True`` would read its argument as a SQLSTATE. A
+    ``sqlstate`` attribute that raises when read propagates; ``attribute=False`` never reads it.
+    ``args`` is read with ``getattr`` and a default, so a missing one reads as empty."""
+    if not known_driver_error(exc) or is_a_sqlite_error(exc):
+        return None
+    if attribute:
+        state = getattr(exc, "sqlstate", None)
+        text = sqlstate_text(state)
+        if text is not None:
+            return text
+        if state is not None and not past_attribute:
+            return None
+    if args_hold_a_message(exc):
+        return None
+    args = getattr(exc, "args", ())
+    return sqlstate_text(args[0] if isinstance(args, tuple) and args else None)
+
+
+def sqlite_errorname_of(exc: BaseException) -> str | None:
+    """SQLite's result-code name for one of ``sqlite3``'s errors, such as
+    ``SQLITE_CONSTRAINT_UNIQUE``, or None. SQLite has no SQLSTATE, so this fixed word is its only
+    diagnostic free of the statement's values."""
+    if not is_a_sqlite_error(exc):
+        return None
+    name = getattr(exc, "sqlite_errorname", None)
+    return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
 def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
     link (vault BACKLOG #1661, added item 3). A driver's message can quote a value the statement
-    carried, such as a duplicate key, so it is withheld. A driver error keeps its SQLSTATE,
-    asyncpg's ``sqlstate`` or else ``args[0]``, when that is five characters of SQL's alphabet; a
-    SQLite error keeps only its result-code name, since its ``args[0]`` is its message. A
+    carried, such as a duplicate key, so it is withheld. A driver error keeps the SQLSTATE
+    :func:`driver_sqlstate_of` reads, with its defaults, which says which attribute or argument
+    that is for which drivers; a SQLite error keeps only its result-code name, since its
+    ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
     builtin one its codec raised, whose text can quote the value too. An attribute that raises
     when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
@@ -3126,25 +3314,11 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
 
 def _driver_code(exc: BaseException) -> str | None:
     """:func:`_driver_line` for a driver error that names a SQLSTATE or SQLite's result code."""
-    # Read from sys.modules, not imported here: a sqlite3 error exists only once sqlite3 is loaded,
-    # and the CLI defers loading it (tests/test_startup_import_budget.py).
-    sqlite = sys.modules.get("sqlite3")
-    if sqlite is not None and isinstance(exc, (sqlite.Error, sqlite.Warning)):
-        # SQLite has no SQLSTATE, and its args[0] is the message itself, which can be a value as
-        # short as five characters; only its result-code name, a fixed word, is read.
-        name = getattr(exc, "sqlite_errorname", None)
-        if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
-            return f"[driver message withheld {name}]"
-        return None
-    state = getattr(exc, "sqlstate", None)
-    if state is None and exc.args:
-        state = exc.args[0]
-    if isinstance(state, str) and _DRIVER_SQLSTATE.fullmatch(state):
-        return f"[{state}] [driver message withheld]"
-    name = getattr(exc, "sqlite_errorname", None)
-    if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name):
+    name = sqlite_errorname_of(exc)
+    if name is not None:
         return f"[driver message withheld {name}]"
-    return None
+    state = driver_sqlstate_of(exc)
+    return f"[{state}] [driver message withheld]" if state is not None else None
 
 
 def safe_traceback(ei: ExcInfo) -> str:

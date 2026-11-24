@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #1497: ``serve`` logs the SQL Server renew-bound warning once logging is configured.
 
-This seam test lives apart from ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py`` because that
-file runs in the SQL Server catch-all step of ``.github/workflows/ci.yml``. Every engine source a
-server-gated suite imports must match the ``serverdb`` change-detection regex
-(``tests/test_serverdb_ci_coverage.py``), and importing ``messagefoundry.__main__`` there would pull
-in ``messagefoundry/__init__.py``, which that regex does not admit. Nothing here needs a database.
+This seam test lives apart from ``tests/test_adr0157_b1497_sqlserver_renew_clamp.py``, which runs
+in the SQL Server catch-all step of ``.github/workflows/ci.yml``. In a server-gated suite, the
+spelling used here, ``from messagefoundry import __main__``, reds the ``serverdb`` path gate on
+``messagefoundry/__init__.py``. What that gate records is stated once, in the
+``_engine_modules_imported_by`` docstring in ``tests/test_serverdb_ci_coverage.py``. Nothing here
+needs a database.
 """
 
 from __future__ import annotations

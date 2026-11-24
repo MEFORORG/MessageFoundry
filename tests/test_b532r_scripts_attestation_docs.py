@@ -210,8 +210,10 @@ def test_the_readme_topology_a_bullet_names_the_skips() -> None:
     bullet = text[start : text.index(" - **(B)", start)]
     assert (
         "`docker compose up` and `docker compose --profile ha up` run that check before they start"
-        " any serving engine" in bullet
+        " the default `engine`" in bullet
     ), bullet
+    # The ha engines run another image, so another check gates them; the bullet must name it.
+    assert "they wait instead on `revocation-attestation-check-ha`" in bullet, bullet
     assert _SKIPS in bullet, bullet
     assert "Never start a serving engine with `--no-deps`" in bullet, bullet
 
@@ -220,6 +222,7 @@ def test_the_check_comment_opens_with_what_runs_it() -> None:
     comment = _check_comment()
     assert comment.startswith(
         "One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or"
-        " without the ha profile, runs it before it starts any serving engine; at least the commands"
-        " listed below skip it."
+        " without the ha profile, runs it before it starts the default engine, and runs"
+        " revocation-attestation-check-ha below before it starts an `ha` engine; at least the"
+        " commands listed below skip them."
     ), comment[:200]

@@ -47,9 +47,12 @@ import os
 import sys
 import threading
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.logging_setup import configure_stderr_logging
+
+if TYPE_CHECKING:
+    from messagefoundry.config.run_context import RunPhase
 
 # stdout is the IPC channel, so the root logger goes to stderr — a stray log line there cannot corrupt
 # a frame. It is `configure_stderr_logging` rather than a bare `basicConfig` because redaction is a
@@ -341,7 +344,7 @@ def _run_one(
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
     from messagefoundry.config.run_context import run_contexts
-    from messagefoundry.config.wiring import handler_result_items
+    from messagefoundry.config.wiring import accepts_verdict, handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
     phase = req.phase
@@ -354,6 +357,7 @@ def _run_one(
         req.run_context, code_sets=registry.code_sets if code_sets is None else code_sets
     )
 
+    phase_key: RunPhase
     if phase == "router":
         fn = registry.routers.get(name)
         phase_key = "router"
@@ -385,7 +389,21 @@ def _run_one(
             db_lookup_mod.activated(db_runner),
             fhir_lookup_mod.activated(fhir_runner),
         ):
-            result = fn(req.payload)
+            if phase == "accepts":
+                # HandlerAccepts is contractually ``(msg) -> bool``, and at mode=off the parent reads
+                # the verdict through ``accepts_verdict`` (dryrun._accepted). Apply the same rule HERE,
+                # BEFORE the result is described back: a predicate that returns a truthy NON-bool
+                # (e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's
+                # strict JSON-bool slot, content-dependently, since a non-match returns None, and a
+                # verdict ``accepts_verdict`` refuses raises as at mode=off (BACKLOG #5514). It runs
+                # inside the run context, as at mode=off, because a verdict's ``__bool__`` is user
+                # code, and so does the collection of a refused verdict, whose ``finally`` is user
+                # code too: the verdict goes straight in, never bound to a local here, so nothing in
+                # this frame keeps it alive past the refusal. One rule in both places is what keeps
+                # ``[sandbox].mode`` from changing the routing decision (ADR 0087).
+                result: Any = accepts_verdict(name, fn(req.payload))
+            else:
+                result = fn(req.payload)
             if phase == "transform":
                 # Materialise a CONTAINER return here, INSIDE the run context (BACKLOG #341). A
                 # generator Handler's body runs lazily, at whatever point something iterates it — and
@@ -415,15 +433,6 @@ def _run_one(
                     pass
                 else:
                     result = list(names)
-        if phase == "accepts":
-            # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
-            # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a
-            # predicate that returns a truthy NON-bool (a natural shape the parent's ``bool()`` sanctions,
-            # e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's strict
-            # JSON-bool slot — content-dependent, since a non-match returns None. Coercing to the
-            # contract type here is what lets the parent demand a strict bool, and makes
-            # ``[sandbox].mode`` never change the routing decision (ADR 0087).
-            result = bool(result)
     except (DbLookupError, FhirLookupError) as exc:
         if broker is not None:
             # mode=isolated: the lookup ran, or was refused, through the parent, so its error is the
