@@ -10221,7 +10221,8 @@ def _two_opens_left_behind(
     keyed: bool,
     earlier_open: str,
     this_open: str,
-    this_open_returned: bool = False,
+    this_open_may_have_written: bool = False,
+    settings_keying_counts: bool = False,
 ) -> str:
     """What a refusal at, or after, a command's second store open left behind, once its first
     open had returned (BACKLOG #5067, PR 3162 hold 3): sentences, the last with no full stop, as
@@ -10232,19 +10233,27 @@ def _two_opens_left_behind(
     where it says (:func:`_refused_open_keying`), since both opens ran under the same settings,
     and from ``keyed`` otherwise. That open ran the one-time steps, so they are named once, for
     it, and ``this_open`` is described with none of them, and with no claim about this command's
-    rows. ``this_open_returned`` says the caller knows ``this_open`` returned before the
-    refusal: then it may also have written, whatever the class says. Otherwise a refusal whose
-    class says nothing names the earlier open alone: it may have come before ``this_open``
-    touched the database."""
+    rows. ``this_open_may_have_written`` says the caller knows ``this_open`` reached its own
+    writing steps before the refusal, whether or not it returned: then it may also have written,
+    whatever the class says. Otherwise a refusal whose class says nothing names the earlier open
+    alone: it may have come before ``this_open`` touched the database.
+
+    ``settings_keying_counts`` says each open resolves the key itself, so the two can differ: a
+    keyless refusal at ``this_open`` then does not show that the earlier open was keyless, and
+    keyed settings still name the salt record and the genesis record for it."""
     keying = _refused_open_keying(exc)
+    if keying is None or (settings_keying_counts and keyed and not keying.keyed):
+        earlier_keyed, earlier_genesis = keyed, None
+    else:
+        earlier_keyed, earlier_genesis = keying.keyed, keying.genesis
     left = _open_steps_left_behind(
         store,
-        keyed=keyed if keying is None else keying.keyed,
-        genesis=None if keying is None else keying.genesis,
+        keyed=earlier_keyed,
+        genesis=earlier_genesis,
         returned=True,
         opener=earlier_open,
     )
-    if this_open_returned:
+    if this_open_may_have_written:
         this_left: str | None = _open_steps_left_behind(
             store, keyed=keyed, returned=True, opener=this_open, after_an_earlier_open=True
         )
@@ -10356,19 +10365,19 @@ def _invocation_bound_provision_refusal(
     *,
     kept: Path | None = None,
     after_the_pre_check: bool = False,
-    keyed: bool = True,
 ) -> str:
     """``provision-admin``'s :func:`_invocation_bound_refusal`. ``kept`` is the store key a failed
     create kept, as for :func:`_provision_open_refusal`. ``after_the_pre_check`` says the
     pre-check's open over an existing store returned before the write's open failed the bound's
     pass: that earlier open may have run the one-time steps, the genesis record included, so the
-    text names it (:func:`_two_opens_left_behind`) and claims no audit row for the command;
-    ``keyed`` is :func:`_open_is_keyed` under the settings (follow-up from PR 3162's review)."""
+    text names it (:func:`_two_opens_left_behind`) and claims no audit row for the command. Only a
+    keyed open reaches the bound's pass, so that earlier open is described as keyed, whatever the
+    settings say (follow-up from PR 3162's review)."""
     left = None
     if after_the_pre_check:
         # The bound's pass runs late in the write's open, after steps that may write, so that open
         # is described as one that may also have written, whatever the failure's class says.
-        both = _provision_two_opens(failure, store, keyed=keyed, this_open_returned=True)
+        both = _provision_two_opens(failure, store, keyed=True, this_open_may_have_written=True)
         left = (
             f"{_sentence(both)} The refusal came where the AES-GCM invocation bound reads the "
             "key's persisted total"
@@ -10399,8 +10408,9 @@ def _provision_left_behind(
 
     ``after_the_pre_check`` says the refusal came at, or after, the write's open, once the
     pre-check's open over an existing store had returned. The command then ran two opens, and the
-    text names each (:func:`_two_opens_left_behind`), as ``admin-reset-totp``'s does for its own
-    two (follow-up from PR 3162's review)."""
+    text names each (:func:`_two_opens_left_behind`, follow-up from PR 3162's review). Each open
+    resolves the key itself, so keyed settings name the salt record and the genesis record for the
+    pre-check's open even after a keyless refusal at the write's."""
     if opened:
         return _provision_opened_left_behind(
             exc, store, keyed=keyed, after_the_pre_check=after_the_pre_check
@@ -10416,22 +10426,27 @@ def _provision_opened_left_behind(
     """:func:`_provision_left_behind` for a refusal raised once the open it came at had returned,
     which never leaves nothing behind."""
     if after_the_pre_check:
-        return _provision_two_opens(exc, store, keyed=keyed, this_open_returned=True)
+        return _provision_two_opens(exc, store, keyed=keyed, this_open_may_have_written=True)
     return _opened_left_behind(exc, store, keyed=keyed)
 
 
 def _provision_two_opens(
-    exc: BaseException, store: StoreSettings, *, keyed: bool, this_open_returned: bool = False
+    exc: BaseException,
+    store: StoreSettings,
+    *,
+    keyed: bool,
+    this_open_may_have_written: bool = False,
 ) -> str:
     """:func:`_two_opens_left_behind` for ``provision-admin``'s two opens: the pre-check's, then
-    the write's."""
+    the write's, each resolving the key itself."""
     return _two_opens_left_behind(
         exc,
         store,
         keyed=keyed,
         earlier_open=_PRE_CHECK_OPEN,
         this_open=_WRITE_OPEN,
-        this_open_returned=this_open_returned,
+        this_open_may_have_written=this_open_may_have_written,
+        settings_keying_counts=True,
     )
 
 
@@ -11463,7 +11478,6 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 settings.store,
                 kept=kept_key,
                 after_the_pre_check=precheck_opened,
-                keyed=_open_is_keyed(settings),
             ),
         )
         _emit_error(text, as_json=args.json)

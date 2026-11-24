@@ -28,8 +28,8 @@
   replacement's own open, or after it but before the replacement is tried, names the earlier
   open, the one that checked the account before the key was shown, apart from the replacement's
   own, and names the open's one-time steps, such as the genesis record, for the earlier open
-  alone. `provision-admin` now does the same over an existing store, naming its pre-check's
-  open as the earlier one, for a key-resolution, hop, short-schema, key, cipher, keyless-chain,
+  alone. `provision-admin` now does the same over an existing store, before its write starts,
+  naming its pre-check's open as the earlier one, for a key-resolution, hop, short-schema, key, cipher, keyless-chain,
   keyless-provision or unauditable-write refusal at or after its write's open, for a SQLite
   store failure other than an integrity refusal at or after that open, and for that open failing
   the AES-GCM invocation bound's pass, which no longer says no audit row was written. Other refusals after an open still say nothing was written,
