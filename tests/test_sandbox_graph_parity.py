@@ -32,6 +32,7 @@ from messagefoundry.pipeline.sandbox import (
     SandboxMode,
     SandboxPolicy,
     SandboxSession,
+    SandboxWorkerRefused,
     graph_differences,
     graph_shape,
 )
@@ -295,6 +296,71 @@ def test_a_refused_worker_is_not_started_again_for_the_same_graph(
         serving[0] = graph_shape(load_config(config_dir))
         session._spawn()
         assert session._generation == 2
+    finally:
+        session.close()
+
+
+def test_an_equal_engine_graph_is_refused_from_the_cache(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cache means "the same graph", so a graph callable that builds an equal but distinct
+    shape at each call still hits it (BACKLOG #6830): no second worker, and the second refusal is
+    not the first, so the runner does not raise its alert again."""
+    monkeypatch.setenv(_VARIABLE, "3")
+    registry = load_config(config_dir)
+    session = SandboxSession(
+        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: graph_shape(registry),  # unmemoized: a new, equal object at each call
+    )
+    try:
+        assert session._graph is not None and session._graph() is not session._graph()
+        with pytest.raises(SandboxWorkerRefused) as first:
+            session._spawn()
+        assert first.value.first
+        with pytest.raises(SandboxWorkerRefused) as second:
+            session._spawn()
+        assert session._generation == 1  # no second worker was started
+        assert not second.value.first
+        assert str(second.value) == str(first.value)
+    finally:
+        session.close()
+
+
+def test_a_config_file_mid_write_on_disk_does_not_reach_a_respawned_worker(
+    config_dir: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session's workers run the snapshot the engine loaded and never read the directory, so a
+    config file caught half-written on disk cannot make a worker's graph differ, at a first spawn or
+    at a respawn, and there is no transient mismatch for the refusal cache to keep (BACKLOG #6830).
+    The control: the same half-written directory, loaded, builds no graph at all."""
+    monkeypatch.setenv(_VARIABLE, "3")
+    registry = load_config(config_dir)
+    assert registry.config_snapshot is not None
+    (Path(config_dir) / "graph.py").write_text(_GRAPH[: len(_GRAPH) // 2], encoding="utf-8")
+    with pytest.raises(Exception):  # noqa: B017 -- any load failure is the control's point
+        load_config(config_dir)
+    session = SandboxSession(
+        SandboxPolicy(
+            mode=SandboxMode.SUBPROCESS, wall_seconds=30.0, pass_environment=(_VARIABLE,)
+        ),
+        inbound="IB_PARITY",
+        config_dir=config_dir,
+        env=None,
+        graph=lambda: graph_shape(registry),
+        snapshot=registry.config_snapshot,
+    )
+    try:
+        session._spawn()
+        assert session._refused is None
+        proc = session._proc
+        assert proc is not None
+        proc.kill()
+        proc.wait(timeout=30)
+        session._spawn()  # a respawn, with the disk still half-written
+        assert session._refused is None and session._generation == 2
     finally:
         session.close()
 

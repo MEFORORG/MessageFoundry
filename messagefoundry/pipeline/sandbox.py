@@ -1048,7 +1048,10 @@ class SandboxSession:
         # survive. A no-op on the first spawn and whenever there is no proc.
         self._reap(self._proc)
         engine_graph = self._graph() if self._graph is not None else None
-        if self._refused is not None and self._refused[0] is engine_graph:
+        # Compared by value: the cache means "the same graph", and a graph callable need not return
+        # one object per graph (BACKLOG #6830). A hit only ever refuses, so it cannot let a
+        # mismatched worker up.
+        if self._refused is not None and self._refused[0] == engine_graph:
             raise SandboxWorkerRefused(
                 self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
             )
