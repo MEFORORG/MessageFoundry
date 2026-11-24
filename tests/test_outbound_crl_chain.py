@@ -40,7 +40,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.pipeline import crl_reload
-from messagefoundry.pki import cas_not_reaching_a_root
+from messagefoundry.pki import OUTBOUND_HTTP_URL_CASE, cas_not_reaching_a_root, own_crl_refusal
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import opener_tls_context
@@ -450,6 +450,34 @@ def test_an_http_family_hop_builds_on_the_remedies_its_refusal_names(
             crl_check_chain=True,
         ),
         {},
+    )
+
+
+@_HTTP_FAMILY
+def test_an_http_hop_on_its_ca_file_remedy_is_told_it_checks_no_server_chain(
+    two_tier: _TwoTier, kind: str, tmp_path: Path
+) -> None:
+    """Red on a1f268bad59: an http hop that follows the tls_ca_file remedy still meets the own-CRL
+    and rooted-CA refusals, which said only that the whole server chain is checked. Each now
+    scopes that to a hop over TLS and names the http case."""
+    root_crl_missing = tmp_path / "inter-crl-only.pem"
+    root_crl_missing.write_bytes(two_tier.inter_crl_file.read_bytes())
+    for crl, ca_file, said in (
+        (root_crl_missing, two_tier.root_file, "the CA(s) 'CN=Client Root'"),
+        (two_tier.revokes_nothing, two_tier.inter_file, "do not chain to a self-signed root"),
+    ):
+        with pytest.raises(ValueError) as refused:
+            _http_family(
+                kind,
+                TrustAnchorPolicy(crl_file=str(crl), crl_check_chain=True),
+                {"tls_ca_file": str(ca_file)},
+            )
+        text = str(refused.value)
+        assert said in text
+        assert OUTBOUND_HTTP_URL_CASE in text
+        assert "checks the whole server chain against this file\n" not in text
+    assert "on a hop that sends to its server over TLS" in own_crl_refusal(
+        [("CN=Client Root", 1)], outbound=True
     )
 
 

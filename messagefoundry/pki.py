@@ -1479,6 +1479,16 @@ _OUTBOUND_CA_SETTINGS = (
     "[tls].internal_ca_file under trust_anchor_mode = 'pinned'"
 )
 
+#: The http case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection whose url
+#: is http still builds an https handler from its CA setting, so the same rules refuse it, though
+#: it sends to its partner without TLS and no CRL is checked against the partner there. This
+#: refusal and the rooted-CA refusals in tls_policy carry it.
+OUTBOUND_HTTP_URL_CASE = (
+    "A connection with an http url sends to its partner without TLS, so no CRL is checked "
+    "against the partner there, but the engine still builds an https handler from its CA "
+    "setting and refuses it the same way"
+)
+
 
 def own_crl_reason(
     ca_ders: Iterable[bytes], crl_pem: bytes, *, outbound: bool = False
@@ -1515,17 +1525,22 @@ def own_crl_refusal(missing: Iterable[tuple[str, int]], *, outbound: bool = Fals
     if outbound:
         who = f"the CA(s) {named}, loaded from this hop's CA setting ({_OUTBOUND_CA_SETTINGS}),"
         peers = "servers"
-        checked = "[tls].crl_check_chain checks the whole server chain against this file"
+        checked = (
+            "[tls].crl_check_chain checks the whole server chain against this file on a hop "
+            "that sends to its server over TLS"
+        )
+        http_case = f"{OUTBOUND_HTTP_URL_CASE}. "
     else:
         who = f"the loaded client CA(s) {named}"
         peers = "clients"
         checked = "The whole client chain is checked against this file"
+        http_case = ""
     return (
         f"{who} have no CRL of their own in it. Each needs a CRL that "
         "carries its name and that its key signed, and every other CRL under its name that it "
         f"fits must be signed by it too, since OpenSSL may judge its {peers} by any of them. "
         f"{checked}, so every {peers[:-1]} under such a CA would "
-        "be refused. Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
+        f"be refused. {http_case}Add each one's CRL. Where two loaded CAs share a name, give each CRL an "
         "authority key identifier that rules the other CA out: one naming the signing CA's key "
         "separates two CAs that each carry a subject key identifier, and one naming the signing "
         "CA's issuer and serial number separates two CAs unless they share both. A CA with no "
