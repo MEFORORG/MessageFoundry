@@ -284,8 +284,9 @@ def _follow_installer_clause(
     # The clause must add no line back: its add-back step put back a store key below a
     # directory line and a line of a joined group's value (the Lander's hold on PR 3142,
     # comment 7125522135).
-    # Any wording that adds a line back fails here, each phrasing the clause has used among
-    # them (code review round 1 on the repair of that hold).
+    # Each phrasing the clause has used to add a line back fails here (code review round 1 on
+    # the repair of that hold). It is a word match, so a rewording such as "restore each other
+    # line" may pass it.
     assert "entry of its own" not in clause, clause
     assert not re.search(r"\badd\b[^,;.]*\bback\b", clause), clause
     for where, string in list(registry.entries):
