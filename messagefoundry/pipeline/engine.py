@@ -2380,8 +2380,9 @@ class Engine:
                     self._reference_runner = self._make_reference_runner()
                 self._reference_runner.start()
         # Retention/purge is independent of the message graph (a store-level maintenance task), so it
-        # runs whether or not a graph is wired and survives config reloads. The runner is a no-op when
-        # nothing is configured, so this only spawns a task when [retention] is actually set. It is a
+        # runs whether or not a graph is wired and survives config reloads. Per-connection windows come
+        # from the live graph, so the loop is spawned even when nothing is configured yet, and idles
+        # until a reload sets one (BACKLOG #6804); a pass runs only while something is set. It is a
         # leader-only WRITE singleton (purges bodies + writes audit rows), so it is gated on the
         # coordinator: in a cluster a follower's runner ticks but no-ops; single-node always leads.
         if self._retention_settings is not None:
@@ -3925,12 +3926,6 @@ class Engine:
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
             failures.append(_outbound_close_failure(close_failures))
-        # Retention (BACKLOG #6804): the runner spawns its loop only when something is configured,
-        # and per-connection windows (messages_days, dead_letter_days, prune_documents_after) come
-        # from the graph. A graph that first sets one would otherwise wait for a restart. start() is
-        # idempotent: a running loop is left alone, and a graph that still sets nothing starts none.
-        if self._retention_runner is not None and not self._stopping:
-            self._retention_runner.start()
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.

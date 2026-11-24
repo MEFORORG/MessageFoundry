@@ -410,6 +410,8 @@ class RetentionRunner:
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # Whether the last check of `enabled` found something to do; the loop logs when it flips.
+        self._active = False
         # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
         # marker is a `monotonic` reading. It starts as None, not 0.0, so the first pass truncates
         # whatever the monotonic clock reads, which can be under the cadence just after boot.
@@ -418,8 +420,9 @@ class RetentionRunner:
 
     @property
     def enabled(self) -> bool:
-        """True when any window/threshold/maintenance knob is configured. When False, :meth:`start`
-        spawns no task. Every purge window is off by default, but the low-disk floor
+        """True when any window/threshold/maintenance knob is configured. When False, a pass does
+        nothing worth running, so the loop skips it (and :meth:`start` spawns no loop at all when no
+        registry is wired, since nothing can change the answer then). Every purge window is off by default, but the low-disk floor
         (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
         vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
         settings to run those two. The audit-log growth warning (``audit_log_warn_rows``, BACKLOG
@@ -429,9 +432,9 @@ class RetentionRunner:
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
         per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
         even if no global window is configured. So must a per-connection ``messages_days`` or
-        ``dead_letter_days`` override. The registry is consulted via ``_registry_source`` (None when no
-        registry is wired); a reload that first sets one starts the runner through the engine's reload
-        path (BACKLOG #6804)."""
+        ``dead_letter_days`` window above 0 (0 keeps forever, which no pass acts on). The registry is
+        consulted via ``_registry_source`` (None when no registry is wired) and read live, because a
+        config reload can set or clear these (BACKLOG #6804)."""
         s = self._settings
         if (
             s.messages_days
@@ -454,27 +457,41 @@ class RetentionRunner:
         if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
-        if registry is not None and any(
-            ic.prune_documents_after is not None for ic in registry.inbound.values()
-        ):
-            return True
-        # A per-connection messages_days/dead_letter_days override purges even with the global
-        # window off (run_once runs the purge whenever an override exists), so it must start the
-        # runner too (BACKLOG #6804).
-        messages_overrides, dead_overrides = self._resolve_overrides()
-        return bool(messages_overrides or dead_overrides)
+        if registry is None:
+            return False
+        # This engine shard's own graph: a window on another engine shard's connection starts that
+        # shard's runner, whose purge already spans the unified store.
+        return any(
+            ic.prune_documents_after is not None or (ic.messages_days or 0) > 0
+            for ic in registry.inbound.values()
+        ) or any((oc.dead_letter_days or 0) > 0 for oc in registry.outbound.values())
 
     # --- lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        """Spawn the supervised purge/maintenance loop (no-op when nothing is configured)."""
+        """Spawn the supervised purge/maintenance loop (idempotent).
+
+        With a registry wired the loop is spawned even when nothing is configured yet, and idles:
+        each interval it re-reads :attr:`enabled` and runs a pass only when that is True. A config
+        reload can set a per-connection window on a graph that started with none, and a loop decided
+        once here would leave that window unenforced until a restart (BACKLOG #6804). With no
+        registry nothing can change :attr:`enabled`, so a disabled runner spawns no loop."""
         if self._task is not None:
             return
-        if not self.enabled:
-            log.debug("retention disabled (no [retention] windows configured); not starting")
+        active = self.enabled
+        if not active and self._registry_source is None:
+            log.debug("retention disabled (nothing configured); not starting")
             return
         self._stop.clear()
+        self._active = active
         self._task = asyncio.create_task(self._run())
+        if not active:
+            log.debug(
+                "retention idle: nothing configured yet; re-checked every %gs, so a config reload "
+                "that sets a per-connection window takes effect without a restart",
+                self._settings.purge_interval_seconds,
+            )
+            return
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
             "min_free_disk_mb=%d audit_log_warn_rows=%d wal_checkpoint_seconds=%g vacuum_at=%r "
@@ -511,12 +528,25 @@ class RetentionRunner:
         # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
             try:
-                await self.run_once()
+                if self._refresh_active():
+                    await self.run_once()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("retention pass failed; will retry next interval")
             await self._sleep(self._settings.purge_interval_seconds)
+
+    def _refresh_active(self) -> bool:
+        """Re-read :attr:`enabled` for this interval and log a change, so an operator can see a
+        reload turn retention on or off (BACKLOG #6804)."""
+        active = self.enabled
+        if active != self._active:
+            self._active = active
+            if active:
+                log.info("retention active: the configuration now sets something for it to do")
+            else:
+                log.info("retention idle: the configuration no longer sets anything for it to do")
+        return active
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
