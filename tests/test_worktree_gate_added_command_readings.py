@@ -334,8 +334,8 @@ def test_each_git_question_is_asked_once_across_the_passes(
     PRE_CACHE_HEAD a command of this shape, with one `-C` on every line, made 108 git calls, one of
     them 90 times (measured 2026-11-23). Each line here names its own directory, so each hoist has a
     question of its own. The directories exist, so every question succeeds. A failed question is
-    asked again unless its `-C` names no directory (Invoke-GitRead's note), and this test does not
-    bound how often.
+    asked again unless its `-C` is a plain absolute path that names no directory (Invoke-GitRead's
+    note), and this test does not bound how often.
     """
     trace = tmp_path / "trace2.log"
     for i in range(9):
@@ -386,7 +386,8 @@ def test_a_failed_git_answer_is_asked_again(
     Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
     spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
     or three failed asks that head allowed the hijack origin/main refused (Manager decision of
-    2026-11-23: a failure is asked again where the directory exists). The stub fails the first
+    2026-11-23: a failure is asked again unless its `-C` is a plain absolute path naming no
+    directory). The stub fails the first
     ``fails`` `worktree list` asks.
     """
     real = shutil.which("git")
@@ -472,7 +473,7 @@ TIMED: list[tuple[str, str, str, str]] = [
     ),
     (
         # Review round 2c9e3d7a9b: each hoist carries the lines before it, so a question that fails
-        # was asked once per hoist (44.1 s, against 9.9 s at BASELINE).
+        # was asked again in every hoist (44.1 s, against 9.9 s at BASELINE).
         "nine lines, a missing -C directory each",
         "echo start\n"
         + "\n".join(f"echo line{i} $(git -C {{o}}/m{i} checkout -q y{i})" for i in _NINE),

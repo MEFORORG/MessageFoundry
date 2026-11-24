@@ -1237,9 +1237,11 @@ function Test-TrueSeparatorIn([string]$Text) {
 # round 2c9e3d7a9b had timed at 44.1 s when no failure was kept; and 2.5 s to 2.9 s (2.9 s to
 # 12.4 s, 31.4 s to 50.4 s) for the other three. The one-line shapes stay slower than BASELINE: each
 # hoist asks git about a `-C` no earlier pass named, and every hoist costs a pass of the rules over the
-# text before its cut. A failing question that is not kept is asked once per hoist: review round
-# a9c38332ff measured nine lines whose `-C` names an existing directory that is not a repository at
-# 108 git calls and 12.1 s. These are single runs on one box, not bounds.
+# text before its cut. A failing question that is not kept is asked again in every string that
+# carries it, about four times per string (two spellings, two path forms): review round 62fa86c0fa
+# measured nine lines whose `-C` names an existing directory that is not a repository at 108 git
+# calls, one question 36 times, and 20.7 s, against 20 calls and 4.6 s at origin/main, past the
+# proof wait below. These are single runs on one box, not bounds.
 # A run past the shell entry's 20 s proof wait makes the entry start its own gate run, so the wait
 # and that run share the 60 s timeout, and past it a slow run blocks the command rather than letting
 # it through (install-gate.ps1 installs `onFailure = block`).
@@ -3285,8 +3287,10 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # keyed by the argument list, with the one fold below, and it keeps the output lines and the exit code,
 # which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
 # rule for a failed answer is in the function's note. The hook runs before the tool call, so nothing
-# it judges has run yet; another process could still change the repository during the run, as it
-# could between two uncached calls.
+# it judges has run yet; another process could still change the repository during the run. A kept
+# answer hides such a change from later asks, which uncached calls would have seen: a kept success,
+# and a failure kept on a missing plain path that becomes reachable during the run, for example a
+# mapped drive that reconnects (review round 62fa86c0fa).
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
