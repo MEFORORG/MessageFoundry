@@ -4054,7 +4054,9 @@ outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` i
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
 SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
-while it reads, writing none of them. An object the codec cannot parse is read as no data set
+while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only before
+a `sent-uid-unread` refusal (below); otherwise it writes none. `pydicom`'s own copy of such a line
+as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
 UID, and the object is still sent. The codec takes at least the exception classes it lists for a
 malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
 way: the object is sent, and a 202 that names only its data set UID is then refused after the

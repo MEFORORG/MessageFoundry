@@ -79,6 +79,7 @@ from messagefoundry.transports.bounded_read import (
 from messagefoundry.transports.dicom import (
     _ignore_pydicom_value_warnings,
     _logs_held,
+    _write_held,
     recover_dicom_object_bytes,
 )
 
@@ -498,10 +499,12 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     turn into an error included, raises :func:`_sent_uids_unread`'s refusal. It is raised outside
     the handler, so the fault, whose text can carry a value, rides neither its ``__cause__`` nor its
     ``__context__``. The SCU's ignores for pydicom's value warnings, which name a value, are put
-    back first, and pydicom's log lines from the parse are held and not written
-    (:func:`~messagefoundry.transports.dicom._logs_held`): the object is sent as bytes, so a line on
-    how pydicom read it says nothing about the send. A parse failure is logged by exception class
-    only, never the UID or the bytes (PHI-safe)."""
+    back first. pydicom's log lines from the parse are held, as the SCP holds its reads' lines
+    (:func:`~messagefoundry.transports.dicom._logs_held`), and written, through the same redacting
+    filter, only before that refusal, where they may say why; otherwise none is written, since the
+    object is sent as bytes and a line on how pydicom read it says nothing about the send.
+    pydicom's own copy of such a line as a Python warning is not held. A parse failure is logged by
+    exception class only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
         logger.debug(
             "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
@@ -512,17 +515,18 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     load_header_readers()
     parse_fault: str | None = None
     uid: str | None = None
-    try:
-        with _logs_held():
+    with _logs_held() as held:
+        try:
             uid = DicomPeek.parse(obj).sop_instance_uid
-    except DicomError as exc:
-        logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
-        return None
-    except MemoryError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - pydicom's faults on an object share no base
-        parse_fault = type(exc).__name__
+        except DicomError as exc:
+            logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
+            return None
+        except MemoryError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - pydicom's faults on an object share no base
+            parse_fault = type(exc).__name__
     if parse_fault is not None:
+        _write_held(held)
         raise _sent_uids_unread(parse_fault, base_url)
     if uid is None:
         return None

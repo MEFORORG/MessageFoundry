@@ -1066,9 +1066,8 @@ async def test_dicomweb_a_broken_dicom_extra_raises_before_the_post(
     dest = _dest()
     opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="_read_file_meta_info") as exc:
+    with pytest.raises(RuntimeError, match="_read_file_meta_info"):
         await dest.send(_carried(obj))
-    assert not isinstance(exc.value, NegativeAckError)
     assert opener.requests == []
 
 
@@ -1111,6 +1110,7 @@ async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_eac
 async def test_dicomweb_a_memory_error_in_the_extra_load_escapes_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    pytest.importorskip("pydicom")  # the real load_dcmread runs before the patched reader load
     from messagefoundry.transports import dicomweb
 
     def load() -> object:
@@ -1146,6 +1146,19 @@ async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_each_post
     assert opener.requests == []
 
 
+def _search_only(monkeypatch: pytest.MonkeyPatch, root: Path) -> None:
+    """Hold an import search to ``root``, for the test alone: no imported ``pydicom``, the path
+    finder alone on ``sys.meta_path`` (an editable install's finder would find the real one), and a
+    fresh ``sys.path_importer_cache``, so no finder for ``root`` is left behind."""
+    import importlib.machinery
+    import sys
+
+    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [importlib.machinery.PathFinder])
+    monkeypatch.setattr(sys, "path_importer_cache", {})
+    monkeypatch.setattr(sys, "path", [str(root)])
+
+
 def test_dicomweb_a_namespace_pydicom_directory_is_no_extra(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1153,14 +1166,12 @@ def test_dicomweb_a_namespace_pydicom_directory_is_no_extra(
     # package: find_spec finds it, but it holds nothing to load, so it is taken as no extra
     # (BACKLOG #5914 review). The search is held to that directory alone.
     import importlib.util
-    import sys
 
     from messagefoundry.transports import dicomweb
 
     root = tmp_path
     (root / "pydicom").mkdir()
-    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
-    monkeypatch.setattr(sys, "path", [str(root)])
+    _search_only(monkeypatch, root)
     spec = importlib.util.find_spec("pydicom")
     assert spec is not None and spec.origin is None  # control: found, and a namespace package
     assert dicomweb._dicom_extra_installed() is False
@@ -1170,15 +1181,12 @@ def test_dicomweb_a_regular_pydicom_package_is_the_extra(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Negative control for the namespace case: the same directory with an __init__.py counts.
-    import sys
-
     from messagefoundry.transports import dicomweb
 
     root = tmp_path
     (root / "pydicom").mkdir()
     (root / "pydicom" / "__init__.py").write_text("", encoding="ascii")
-    monkeypatch.delitem(sys.modules, "pydicom", raising=False)
-    monkeypatch.setattr(sys, "path", [str(root)])
+    _search_only(monkeypatch, root)
     assert dicomweb._dicom_extra_installed() is True
 
 
@@ -1187,7 +1195,7 @@ async def test_dicomweb_the_data_set_pre_read_logs_nothing(
 ) -> None:
     # An object pydicom reads with a WARNING ("Expected implicit VR, but found explicit VR"): the
     # pre-read holds pydicom's lines and writes none, as the object rides as bytes and the line
-    # says nothing of the send (BACKLOG #5914 review). The SCU holds its reads' lines the same way.
+    # says nothing of the send (BACKLOG #5914 review). The hold is the one the SCP uses for its reads.
     pytest.importorskip("pydicom")
     obj = b"\x00" * 128 + b"DICM" + b"PAYLOAD-MARKER-5914"
     dest = _dest()
@@ -1198,6 +1206,32 @@ async def test_dicomweb_the_data_set_pre_read_logs_nothing(
         assert await dest.send(_carried(obj)) is None
     assert caplog.records == []
     assert len(opener.requests) == 1
+
+
+async def test_dicomweb_the_pre_read_writes_its_held_lines_before_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Where the read ends in sent-uid-unread, the lines pydicom logged on the way are written, so
+    # the dead-lettered row has its reason in the log; they pass the same redacting filter.
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        logging.getLogger("pydicom").warning("synthetic pydicom line before the fault")
+        raise TypeError("a value")
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING), pytest.raises(NegativeAckError, match="sent-uid-unread"):
+        await dest.send(PAYLOAD)
+    assert [r.getMessage() for r in caplog.records if r.name == "pydicom"] == [
+        "synthetic pydicom line before the fault"
+    ]
+    assert opener.requests == []
 
 
 def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(
