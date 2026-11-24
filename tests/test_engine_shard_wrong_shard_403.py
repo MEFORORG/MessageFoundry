@@ -25,6 +25,8 @@ Two answers are pinned:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -40,7 +42,6 @@ from messagefoundry.config.wiring import ConnectionSpec, Registry, build_inbound
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from tests.test_channel_rbac import _add, _client, _login, _probe, _service
-from tests.test_dual_control_reload import _settle_unlanded
 
 _A_OWN = "IB_SHARD_A"  # held by engine shard a, in the operator's scope
 _A_OUT = "IB_SHARD_A_OUT"  # held by engine shard a, outside the operator's scope
@@ -62,23 +63,32 @@ def _whole_config(tmp_path: Path) -> Registry:
     return reg
 
 
+async def _settle_this_loops_row_writes() -> None:
+    """Let the row writes this test's loop left running end, so none outlives the engines. Only this
+    loop's: a write an earlier test's closed loop left in the set never ends."""
+    from messagefoundry.api.app import _UNLANDED_ROW_WRITES
+
+    loop = asyncio.get_running_loop()
+    mine = {task for task in _UNLANDED_ROW_WRITES if task.get_loop() is loop}
+    if mine:
+        await asyncio.wait(mine, timeout=2.0)
+
+
 @pytest.fixture
 async def shards(tmp_path: Path) -> AsyncIterator[tuple[Engine, Engine]]:
     whole = _whole_config(tmp_path)
     db = tmp_path / "shared.db"  # ONE store, as every engine shard of a config shares (ADR 0063)
-    engines: list[Engine] = []
-    try:
+    async with contextlib.AsyncExitStack() as stack:  # each stop runs even if another raises
+        engines: list[Engine] = []
         for shard in ("a", "b"):
             eng = await Engine.create(
                 db, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False)
             )
+            stack.push_async_callback(eng.stop)
             engines.append(eng)
             eng.add_registry(filter_registry_for_shard(whole, shard))
+        stack.push_async_callback(_settle_this_loops_row_writes)  # runs before the stops
         yield engines[0], engines[1]
-    finally:
-        await _settle_unlanded()
-        for eng in reversed(engines):
-            await eng.stop()
 
 
 async def test_the_engine_shard_graphs_are_the_filtered_views(
@@ -105,7 +115,14 @@ async def test_a_scoped_caller_asking_the_wrong_engine_shard_gets_the_403_and_a_
     wide = await _add(service_a, "boss", Role.OPERATOR)
     await service_a.set_channel_scope(wide, [ALL_CHANNELS], actor="admin")
 
-    async with _client(a, service_a) as ca, _client(b, service_b) as cb:
+    async with (
+        contextlib.AsyncExitStack() as stack,
+        _client(a, service_a) as ca,
+        _client(b, service_b) as cb,
+    ):
+        # Before the fixture stops the engines, pass or fail (AuthService.drain_background).
+        stack.push_async_callback(service_a.close_background)
+        stack.push_async_callback(service_b.close_background)
         ha, hb = await _login(ca, "op"), await _login(cb, "op")
         # Controls: each engine shard answers for its own in-scope inbound.
         assert (await ca.get(f"/connections/{_A_OWN}/metadata", headers=ha)).status_code == 200
@@ -134,14 +151,14 @@ async def test_a_scoped_caller_asking_the_wrong_engine_shard_gets_the_403_and_a_
         assert status == 404
         assert not [x for x in audit if x[0] == "auth.channel_denied"], audit
 
-    await service_a.close_background()
-    await service_b.close_background()
-    # The rows are in the ONE store both engine shards share, and say nothing of which one answered:
-    # each detail names its channel and nothing else.
+    # The rows are in the ONE store both engine shards share. Checked here: each detail names its
+    # channel and nothing else, and the rows engine shard a wrote and the one b wrote carry the same
+    # actor and client, so none of those fields says which engine shard answered.
     rows = await b.store.list_audit(actor="op", action="auth.channel_denied")
     assert {r["channel_id"] for r in rows} == {_A_OWN, _A_OUT, _B_OWN}
     for row in rows:
         assert json.loads(str(row["detail"])) == {"channel": row["channel_id"]}, row
+    assert len({(r["actor"], r["client"]) for r in rows}) == 1, rows
 
 
 async def test_the_flag_route_on_the_wrong_engine_shard_writes_the_flag(
@@ -154,7 +171,8 @@ async def test_the_flag_route_on_the_wrong_engine_shard_writes_the_flag(
     service = await _service(a, admin_write_rate_limit=False)
     uid = await _add(service, "dep", Role.DEPLOYMENT)
     await service.set_channel_scope(uid, [_A_OWN, _B_OWN, "IB_NOWHERE"], actor="admin")
-    async with _client(a, service) as ca:
+    async with contextlib.AsyncExitStack() as stack, _client(a, service) as ca:
+        stack.push_async_callback(service.close_background)
         h = await _login(ca, "dep")
         body = {"direction": "inbound", "flagged": True}
         status, reply, audit = await _probe(
@@ -168,5 +186,4 @@ async def test_the_flag_route_on_the_wrong_engine_shard_writes_the_flag(
         )
         assert (status, reply) == (403, {"detail": CONNECTION_DENIED_DETAIL})
         assert ("auth.channel_denied", "IB_NOWHERE") in audit
-    await service.close_background()
     assert await a.store.list_connection_flags() == {(_B_OWN, "inbound")}
