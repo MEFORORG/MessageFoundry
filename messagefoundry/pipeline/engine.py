@@ -1885,19 +1885,23 @@ class Engine:
         reload's swapped declarations, and a value it adds or rotates, are picked up without
         rebuilding it (vault BACKLOG #5698).
 
-        The values are the engine's applied ones, set only once a reload has committed, never the
-        registry runner's, which hold a reload's values before it can still be refused. A sync
-        during a reload can still pair the specs of one graph with the other graph's values, and
-        fail that set; the sync after the reload corrects it."""
+        The specs and values are the last COMMITTED graph's, with its generation, so a pass during
+        a reload never loads a graph or values that reload can still refuse, and never pairs one
+        graph's specs with the other's values (BACKLOG #5892)."""
         return ReferenceSyncRunner(
             self.store,
             lambda: (
-                self._registry_runner.registry.references.values()
+                self._registry_runner.committed_graph()[1].references.values()
                 if self._registry_runner is not None
                 else []
             ),
             self._reference_settings or ReferenceSettings(),
-            env_values=lambda: self._env_values,
+            graph_generation=lambda: (
+                self._registry_runner.committed_graph()[0]
+                if self._registry_runner is not None
+                else None
+            ),
+            env_values=self._committed_reference_values,
             egress=self._egress_settings,
             alert_sink=self._alert_sink,
             # Track B Step 6: gate materialize-from-source on the leader; every node still converges its
@@ -1908,6 +1912,12 @@ class Engine:
             # #3533 item 2 none of them reads it: the weakened-TLS refusal holds at every posture.
             hop_posture=self._hop_posture,
         )
+
+    def _committed_reference_values(self) -> Mapping[str, Any]:
+        # A committed reload's values, which reach self._env_values only once reload returns.
+        runner = self._registry_runner
+        values = None if runner is None else runner.committed_graph()[2]
+        return self._env_values if values is None else values
 
     async def _reconcile_reference_sync(self, *, startup: bool) -> None:
         """Ensure the reference runner exists, materialize the declared sets, and (re-)arm the loop.
@@ -3928,7 +3938,7 @@ class Engine:
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
-        # CANNOT move before the swap: the runner reads its specs LIVE off _registry_runner.registry
+        # CANNOT move before the swap: the runner reads its specs off the committed graph
         # (see _make_reference_runner), so pre-swap it would materialize the OLD graph's sets and a
         # reload that ADDS a set would leave it unarmed.
         try:
