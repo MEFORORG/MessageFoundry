@@ -7,8 +7,11 @@
 
 .DESCRIPTION
     Idempotent. MERGES (never clobbers) a SessionStart hook that runs the shared worktree-selfheal.ps1;
-    existing hooks and top-level keys are preserved. Backs up settings.json, validates the written JSON,
-    and rolls back on any failure.
+    existing hooks and top-level keys are preserved. Parses the new JSON before writing settings.json,
+    backs it up, writes it in place, and reads it back. On a failed write or read-back it restores the
+    backup this run made; if settings.json did not exist at the start, it removes any file the failed
+    write left, and never restores a .bak-selfheal from an earlier run. The shared hook
+    script is copied earlier, before that parse. It does not create the allowlist; install-gate.ps1 owns that.
 
     Run once per config dir a session can use. On this box (a subscription-swap setup) that is:
       ~/.claude                (the Desktop app; CLAUDE_CONFIG_DIR unset)
@@ -46,22 +49,40 @@ if ($env:CLAUDECODE -eq '1') {
 $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 if (-not $HookPath) { $HookPath = Join-Path $homeDir '.claude-hooks/worktree-selfheal.ps1' }
 
+# The path goes into a double-quoted shell command below. A `$` or backtick there would be expanded by
+# whichever shell runs the hook, and a double quote would end the argument, so the wired command would
+# name a different file. Refuse rather than escape on a guess about which shell that is. This refuses
+# those three only: a doubled backslash (bash collapses it) or a %NAME% segment (cmd expands it) is not
+# caught here.
+if ($HookPath -match '[$`"]') {
+    throw "Refusing a HookPath containing a dollar sign, backtick or double quote: $HookPath"
+}
+
 if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config dir not found: $ConfigDir" }
 $settingsPath = Join-Path $ConfigDir 'settings.json'
 
-# --- Ensure the shared, account-agnostic hook script + allowlist exist (idempotent) ---------------
+# --- Ensure the shared, account-agnostic hook script exists (idempotent) --------------------------
 # One script copy, referenced by every config dir's wiring, so an account swap can't drop it.
 $sharedDir = Split-Path -Parent $HookPath
 New-Item -ItemType Directory -Force -Path $sharedDir | Out-Null
 $canonical = Join-Path $PSScriptRoot 'worktree-selfheal.ps1'
 if (Test-Path -LiteralPath $canonical) { Copy-Item -LiteralPath $canonical -Destination $HookPath -Force }
 elseif (-not (Test-Path -LiteralPath $HookPath)) { throw "worktree-selfheal.ps1 not found beside this installer or at $HookPath." }
-$reposFile = Join-Path $sharedDir 'worktree-gate.repos.txt'
-if (-not (Test-Path -LiteralPath $reposFile)) {
-    # Seed from the worktree gate's existing allowlist if present; else a commented template.
-    $gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
-    if (Test-Path -LiteralPath $gateRepos) { Copy-Item -LiteralPath $gateRepos -Destination $reposFile -Force }
-    else { Set-Content -LiteralPath $reposFile -Encoding utf8 -Value '# Primaries guarded by the SessionStart backstop. One absolute path per line. Delete to disable.' }
+
+# The allowlist is NOT created here. The backstop reads the gate's ~/.claude/hooks/worktree-gate.repos.txt
+# first and ~/.claude-hooks/worktree-gate.repos.txt only as a legacy fallback (worktree-selfheal.ps1). A
+# copy seeded into the legacy place would outlive `install-gate.ps1 -Uninstall` and keep the backstop
+# running `git checkout` on the primary after the gate's allowlist was gone. install-gate.ps1 owns the one
+# allowlist. An existing legacy file is left as it is.
+$gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
+# The backstop's legacy fallback is under the home, whatever -HookPath says (worktree-selfheal.ps1).
+$legacyRepos = Join-Path $homeDir '.claude-hooks/worktree-gate.repos.txt'
+if (-not (Test-Path -LiteralPath $gateRepos)) {
+    if (Test-Path -LiteralPath $legacyRepos) {
+        Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop reads the legacy $legacyRepos. install-gate.ps1 writes the gate's allowlist; delete the legacy file to stop that fallback."
+    } else {
+        Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop guards nothing until install-gate.ps1 writes it."
+    }
 }
 
 $raw = if (Test-Path -LiteralPath $settingsPath) { Get-Content -LiteralPath $settingsPath -Raw } else { '{}' }
@@ -82,7 +103,8 @@ if (($cfg.hooks.PSObject.Properties.Name -contains 'SessionStart') -and $cfg.hoo
 # Idempotency: bail if any SessionStart hook already runs our script.
 foreach ($g in $groups) {
     foreach ($h in @($g.hooks)) {
-        if ("$($h.command)" -match 'worktree-selfheal') {
+        # An exec-form hook names the script in args rather than command; it is the same wiring.
+        if ("$($h.command) $(@($h.args) -join ' ')" -match 'worktree-selfheal') {
             Write-Host "[$ConfigDir] already wired -- no change."
             return
         }
@@ -93,7 +115,7 @@ foreach ($g in $groups) {
 $entry = [pscustomobject]@{
     hooks = @([pscustomobject]@{
             type          = 'command'
-            command       = "pwsh -NoProfile -File `"$HookPath`""
+            command       = "pwsh -NoProfile -NonInteractive -File `"$HookPath`""
             timeout       = 30
             statusMessage = 'Worktree self-heal'
         })
@@ -101,18 +123,44 @@ $entry = [pscustomobject]@{
 $groups = @($groups) + $entry
 $cfg.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue $groups -Force
 
-# Backup -> write -> validate -> roll back on failure.
-if (Test-Path -LiteralPath $settingsPath) {
-    Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
-}
+# Validate -> backup -> write -> read back, rolling back on failure. The text is parsed BEFORE
+# settings.json is touched, so a failed parse leaves the live file byte-identical and exits non-zero. What the parse catches: text ConvertTo-Json
+# emitted that ConvertFrom-Json cannot read back. What it does not: anything ConvertTo-Json emits as
+# valid JSON, including objects nested past -Depth 40, which it turns into strings with only a warning.
+# The write is in place, as before, so it goes through a symlinked or hard-linked settings.json and
+# keeps the file's ACL; a reader during the write can still see a partial file.
 $json = $cfg | ConvertTo-Json -Depth 40
-Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
 try {
+    $null = $json | ConvertFrom-Json
+} catch {
+    throw "[$ConfigDir] produced invalid JSON; settings.json left untouched. $_"
+}
+# Roll back only to a backup THIS run made. A .bak-selfheal left by an earlier run is never restored:
+# with no settings.json at the start there is nothing to go back to, so the failed write is removed and
+# the stale backup is left as it is.
+$backupPath = "$settingsPath.bak-selfheal"
+$madeBackup = $false
+if (Test-Path -LiteralPath $settingsPath) {
+    Copy-Item -LiteralPath $settingsPath -Destination $backupPath -Force
+    $madeBackup = $true
+}
+try {
+    Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
     $null = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Write-Host "[$ConfigDir] wired + valid JSON."
 } catch {
-    if (Test-Path -LiteralPath "$settingsPath.bak-selfheal") {
-        Copy-Item -LiteralPath "$settingsPath.bak-selfheal" -Destination $settingsPath -Force
+    $writeError = $_
+    try {
+        if ($madeBackup) {
+            Copy-Item -LiteralPath $backupPath -Destination $settingsPath -Force
+            $outcome = "restored from $backupPath"
+        } else {
+            if (Test-Path -LiteralPath $settingsPath) { Remove-Item -LiteralPath $settingsPath -Force }
+            $outcome = 'there was no settings.json before this run, so any file the failed write left was removed'
+        }
+    } catch {
+        $backupNote = if ($madeBackup) { "this run's backup is $backupPath" } else { "this run made no backup; any existing $backupPath is from an earlier run and was not used" }
+        throw "[$ConfigDir] the write or its read-back failed ($writeError), and the rollback failed too ($_). settings.json may be damaged; $backupNote."
     }
-    throw "[$ConfigDir] produced invalid JSON; rolled back. $_"
+    throw "[$ConfigDir] the write or its read-back failed; $outcome. $writeError"
 }
