@@ -508,7 +508,7 @@ def _warn_extra_unusable(fault: str) -> None:
         return
     logger.warning(
         "DICOMweb: the [dicom] extra (pydicom) on this host is installed but does not load (%s), "
-        "so a 202 is compared with the File Meta SOP Instance UID alone, as without the extra; "
+        "so a 202 is compared with the file meta SOP Instance UID alone, as without the extra; "
         "repair or remove the extra, then restart the engine",
         fault,
     )
@@ -526,7 +526,7 @@ def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
     logger.warning(
         "DICOMweb: reading an object's data set with the [dicom] extra (pydicom) raised %s before "
         "it was sent, so its data set SOP Instance UID is not compared: a 202 is compared with the "
-        "File Meta SOP Instance UID alone, or, for an object with none, confirmed by any UID it "
+        "file meta SOP Instance UID alone, or, for an object with none, confirmed by any UID it "
         "names; this is written once per process, and the extra may be broken",
         fault,
     )
