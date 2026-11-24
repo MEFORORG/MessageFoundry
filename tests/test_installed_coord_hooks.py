@@ -1894,6 +1894,36 @@ def test_a_hookspath_outside_this_repos_local_config_is_refused(tmp_path: Path, 
 
 
 @_NEEDS_PWSH
+def test_a_worktree_scope_refusal_names_the_unset_at_that_scope(tmp_path: Path) -> None:
+    """Worktree config beats local config, so the remedy must not offer a local override."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    for args in (
+        ("config", "extensions.worktreeConfig", "true"),
+        ("config", "--worktree", "core.hooksPath", (tmp_path / "wt-hooks").as_posix()),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, env=env, capture_output=True)
+    result = _run_git_hooks_installer(repo, env)
+    assert result.returncode != 0
+    squashed = _squashed(result)
+    assert _squash("git config --worktree --unset core.hooksPath") in squashed, squashed
+    assert _squash("in this repository's local config overrides it") not in squashed, squashed
+
+
+@_NEEDS_PWSH
+def test_status_with_uninstall_is_refused_before_anything_runs(tmp_path: Path) -> None:
+    """-Status is read-only; with -Uninstall the script must refuse, not report and skip."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "commit-msg").write_text("#!/bin/sh\n# MessageFoundry claim gate\n", encoding="utf-8")
+    result = _run_git_hooks_installer(repo, env, "-Status", "-Uninstall")
+    assert result.returncode != 0
+    assert _squash("cannot be used together") in _squashed(result)
+    assert "hooks dir" not in result.stdout, "the status report ran"
+    assert (hooks / "commit-msg").exists(), "the uninstall ran"
+
+
+@_NEEDS_PWSH
 def test_uninstall_still_removes_our_hooks_from_a_refused_hookspath(tmp_path: Path) -> None:
     """-Uninstall removes only marker-bearing files, so a refusal must not strand an older install."""
     repo, env = _hookspath_clone(tmp_path, None)

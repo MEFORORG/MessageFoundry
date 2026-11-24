@@ -55,6 +55,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# -Status is read-only and -Uninstall writes; together the script would print one and do the other.
+if ($Status -and $Uninstall) {
+    throw "-Status and -Uninstall cannot be used together: -Status is read-only. Run one of them."
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $common = (& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir).Trim()
 if (-not $common) { throw "Not inside a git repository." }
@@ -87,7 +92,14 @@ if ($hooksPathExit -ne 0 -and $hooksPathExit -ne 1) {
 if ($hooksPathExit -eq 0) {
     $hooksPathScope, $hooksPath = "$hooksPathScoped" -split "`t", 2
     $refusal = $null
-    if ($hooksPathScope -ne 'local') {
+    if ($hooksPathScope -eq 'worktree' -or $hooksPathScope -eq 'command') {
+        # These scopes beat local config, so a local value would NOT override them; name the real fix.
+        $fix = if ($hooksPathScope -eq 'worktree') { "git config --worktree --unset core.hooksPath" }
+               else { "drop the -c core.hooksPath option or the GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT override" }
+        $refusal = ("hooks dir UNRESOLVABLE -- core.hooksPath '$hooksPath' is set in $hooksPathScope config, not in this " +
+            "repository's local config, so it is not the install every worktree shares. Refusing. Remove it at that " +
+            "scope ($fix), then re-run.")
+    } elseif ($hooksPathScope -ne 'local') {
         $refusal = ("hooks dir UNRESOLVABLE -- core.hooksPath '$hooksPath' is set in $hooksPathScope config, not in this " +
             "repository's local config. Refusing to install this repository's gates where every repository using that " +
             "scope would run them. An absolute core.hooksPath in this repository's local config overrides it, but this " +
