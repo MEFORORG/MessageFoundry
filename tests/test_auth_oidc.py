@@ -447,7 +447,7 @@ def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> Non
 # OpenID Connect Core 1.0, ID Token Validation, item 5 (a SHOULD, and narrowed by errata set 2): a
 # present azp is our client_id. The engine takes the stricter reading and refuses any other azp,
 # whatever the audience count. RFC 7519 section 4.1.3: aud is a string or an array of strings, so a
-# non-string or empty element is malformed.
+# non-string element is malformed; the engine also refuses an empty audience, by choice.
 
 _ABSENT = object()
 
@@ -523,6 +523,8 @@ def test_a_malformed_aud_is_refused_even_when_it_names_our_client(
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert exc.value.reason == "claim_aud"
     assert exc.value.reason in oidc.REASONS
+    # The detail tells the shape check from the membership check, which also says claim_aud.
+    assert str(exc.value) == "aud is malformed"
 
 
 # --- claims: a malformed nonce rejects as an audited ClaimsError, not a 500 (BACKLOG #1016) ---------
@@ -549,8 +551,9 @@ def test_the_malformed_shape_guards_do_not_over_reject_a_valid_token(
 ) -> None:
     """Negative control (guard-the-guard): the nonce-encoding guard and the aud shape check must not
     reject an ordinary valid token — an ASCII nonce equal to the policy nonce and a plain str aud
-    validate byte-identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
-    routes to ``nonce_mismatch``, so the encoding guard does not swallow real mismatches."""
+    validate byte-identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII
+    wrong-nonce still routes to ``nonce_mismatch``, so the encoding guard does not swallow real
+    mismatches."""
     jws = _mint(rsa_key, "k1", _good_claims())
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"

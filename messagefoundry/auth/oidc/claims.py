@@ -261,11 +261,12 @@ def _check_core_claims(
         raise ClaimsError("claim_iss", "iss does not match the pinned issuer")
 
     aud = claims.get("aud")
-    # RFC 7519 section 4.1.3: ``aud`` is a string or an array of strings. An array carrying a
-    # non-string or an empty element, or an empty string, is malformed and is refused even when the
-    # claim also names our client_id, rather than the stray element being silently ignored (BACKLOG
-    # #5339). Checking the elements first also keeps an unhashable one (a nested list or a dict) away
-    # from ``set()``, whose TypeError would otherwise escape as a 500 with no closed-set audit row.
+    # RFC 7519 section 4.1.3: ``aud`` is a string or an array of strings, so an array carrying a
+    # non-string element is malformed. The RFC allows an empty string; this engine refuses an empty
+    # audience too, by choice. Either is refused even when the claim also names our client_id,
+    # rather than the stray element being silently ignored (BACKLOG #5339). Checking the elements
+    # first also keeps an unhashable one (a nested list or a dict) away from ``set()``, whose
+    # TypeError would otherwise escape as a 500 with no closed-set audit row.
     # Any other shape (absent, a number, an object) reads as no audience and meets the membership
     # refusal below.
     entries: list[object] = [aud] if isinstance(aud, str) else aud if isinstance(aud, list) else []
@@ -274,11 +275,11 @@ def _check_core_claims(
     audiences = set(entries)
     if policy.client_id not in audiences:
         raise ClaimsError("claim_aud", "aud does not contain the client_id")
-    # With multiple audiences, azp MUST be present and equal to our client_id (OIDC core 3.1.3.7/2).
-    # A present azp must equal our client_id with a single audience too (BACKLOG #5339). OIDC Core
-    # 1.0 states both as SHOULD (ID Token Validation, items 4 and 5), and its errata set 2 narrows
-    # azp to extensions and lets a client ignore it; this engine deliberately takes the stricter
-    # reading and refuses an azp that names anyone but us. ``in`` rather than ``get``, so an azp
+    # OIDC core 3.1.3.7/4 and /5 (ID Token Validation): both SHOULD; this engine is stricter.
+    # Item 4: with multiple audiences, azp should be present. Item 5: a present azp should be our
+    # client_id. Errata set 2 narrows azp to extensions and lets a client ignore it. This engine
+    # requires azp with multiple audiences and refuses a present azp naming anyone but us, whatever
+    # the audience count (BACKLOG #5339). ``in`` rather than ``get``, so an azp
     # present as null is refused rather than read as absent.
     if "azp" in claims:
         if claims["azp"] != policy.client_id:
