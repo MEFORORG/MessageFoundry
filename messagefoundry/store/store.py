@@ -1691,7 +1691,8 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.global_epoch,
         new.seal,
         old.token_hash,
-        # The seal cell as read, so a BLOB cell still matches (SessionRecord.from_mapping).
+        # The seal cell as read, so a non-empty BLOB cell still matches and an empty one does not,
+        # each as on main (SessionRecord.from_mapping).
         getattr(old, "_seal_cell", old.seal),
     )
 
