@@ -411,6 +411,46 @@ async def test_a_refusal_overtaken_by_a_graph_change_alerts_when_the_graph_retur
         await store.close()
 
 
+async def test_a_failed_close_of_an_overtaken_session_still_re_pends(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The graph-overtaken branch closes the session it discards. A close that raises is logged
+    and the refusal is still raised as a close, so the message is re-pended rather than
+    dead-lettered as a Router or Handler fault (BACKLOG #6830)."""
+    registry = Registry(code_digest=_SOME_DIGEST)
+    sink = _Recorder()
+    other = graph_shape(Registry(code_digest="1" * 64))
+
+    def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+        raise SandboxWorkerRefused("refused", first=True, content_only=False, graph=other)
+
+    def failing_close() -> None:
+        raise OSError("close failed")
+
+    store = await MessageStore.open(tmp_path / "close_fails.db")
+    try:
+        runner = _runner(registry, store, tmp_path, cast(Any, sink))
+        try:
+            session = runner._sandbox_for("IB_X")
+            assert session is not None
+            session.close = failing_close  # type: ignore[method-assign]
+            with (
+                caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.wiring_runner"),
+                pytest.raises(SandboxSessionClosed) as closed,
+            ):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert isinstance(closed.value.__cause__, SandboxWorkerRefused)
+            assert sink.refused == []
+            assert any(
+                "IB_X" in r.getMessage() and "close" in r.getMessage() for r in caplog.records
+            )
+        finally:
+            runner._sandbox_sessions.clear()
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
 async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(
     edited_config: Path, tmp_path: Path
 ) -> None:

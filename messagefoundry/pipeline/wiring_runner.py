@@ -7532,9 +7532,19 @@ class RegistryRunner:
                 raise
             if serving:
                 del self._sandbox_sessions[name]
-                await asyncio.to_thread(session.close)
+                try:
+                    await asyncio.to_thread(session.close)
+                except Exception:  # noqa: BLE001 - logged; must not turn the close into a fault
+                    # The session is already dropped, so a failed close leaves at most a worker
+                    # for the collector. Raising it instead would dead-letter the message as a
+                    # Router or Handler fault, which an overtaken refusal is not.
+                    log.warning(
+                        "inbound %r: could not close the sandbox session a graph change overtook",
+                        name,
+                    )
             raise SandboxSessionClosed(
-                f"inbound {name!r}: a reload overtook its sandbox worker's refusal"
+                f"inbound {name!r}: its sandbox worker's refusal was overtaken: its session was "
+                "discarded or the graph it was compared with is no longer served"
             ) from exc
 
     async def stop(
