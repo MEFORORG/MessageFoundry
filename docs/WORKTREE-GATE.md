@@ -247,7 +247,9 @@ Each means something other than the installer may have written it. The refusal n
 hashes, and changes nothing. A missing receipt refuses too, because the receipt is not protected by
 the gate and deleting it must not silence the check; a box with no installed gate installs as before.
 Find out who wrote the gate, then pass `-OverwriteUnexplained`; the new receipt records the
-overwritten hash under `overwroteUnexplained`. The receipt is a convenience record, never attestation.
+overwritten hash under `overwroteUnexplained`, and its bytes are kept as
+`worktree_gate.ps1.unexplained-<sha12>`. `-Status` reports the same check. The receipt is a
+convenience record, never attestation, and the gate does not protect it from an edit.
 
 Two structural choices worth understanding:
 

@@ -34,7 +34,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -90,7 +90,7 @@ def _run(
     home: Path,
     source_age_days: int = 6,
     *,
-    receipt: str = "match",
+    receipt: Literal["match", "mismatch", "garbage", "nohash", "none", "nogate"] = "match",
     override: bool = False,
     expect_ok: bool = True,
 ) -> dict[str, Any]:
@@ -127,8 +127,6 @@ def _run(
         receipt_path.write_text("{ not json", encoding="utf-8")
     elif receipt == "nohash":
         receipt_path.write_text(json.dumps({"note": "no hash"}), encoding="utf-8")
-    if receipt == "nogate":
-        receipt_path.unlink(missing_ok=True)
 
     script = "\n".join(
         [
@@ -139,6 +137,7 @@ def _run(
             f"$DispatchDst = '{(hooks / 'shell-guard-dispatch.ps1').as_posix()}'",
             "$ConfigDir = @('c:/fixture/.claude')",
             f"$OverwriteUnexplained = ${'true' if override else 'false'}",
+            f"$checkedSha = '{_content_sha(src.read_bytes())}'",
             _function("Get-GateVersion"),
             _function("Get-GateHash"),
             _function("Get-UnexplainedGate"),
@@ -240,9 +239,7 @@ def test_the_install_leaves_a_receipt_whose_hash_matches_what_was_installed(tmp_
     # each CRLF pair before hashing. That is deliberate -- git's clean filter stores LF while
     # core.autocrlf checks out CRLF, and Copy-Item translates nothing, so a byte hash made every
     # Windows checkout read as STALE. Hashing raw bytes here would fail against correct code.
-    folded = Path(r["dst"]).read_bytes().replace(b"\r\n", b"\n")
-    on_disk = hashlib.sha256(folded).hexdigest()
-    assert str(data["gateSha256"]).lower() == on_disk.lower(), (
+    assert str(data["gateSha256"]).upper() == _content_sha(Path(r["dst"]).read_bytes()), (
         "the receipt's hash does not match the file it claims to describe, so it is not checkable"
     )
 
@@ -262,7 +259,7 @@ def test_the_receipt_says_it_is_not_attestation(tmp_path: Path) -> None:
 # ------------------------------------------------------------- the installed gate matches its receipt
 
 
-def _refused(r: dict[str, Any]) -> str:
+def _refused(r: dict[str, Any], receipt_before: bytes | None = None) -> str:
     proc = r["proc"]
     both = str(proc.stdout) + str(proc.stderr)
     assert proc.returncode != 0, f"the install was not refused:\n{both}"
@@ -272,6 +269,8 @@ def _refused(r: dict[str, Any]) -> str:
     assert r["dst"].read_bytes() == _INSTALLED_GATE.encode("utf-8")
     assert not r["bak"].exists(), "a refusal must not have reached the backup"
     assert not r["dispatch_dst"].exists(), "a refusal must not have reached the copy"
+    if receipt_before is not None:
+        assert r["receipt"].read_bytes() == receipt_before, "a refusal must not rewrite the receipt"
     return both
 
 
@@ -293,7 +292,8 @@ def test_a_first_install_with_no_gate_installs(tmp_path: Path) -> None:
 
 def test_a_gate_that_does_not_match_its_receipt_is_not_overwritten(tmp_path: Path) -> None:
     r = _run(tmp_path, receipt="mismatch", expect_ok=False)
-    both = _refused(r)
+    expected = json.dumps({"gateSha256": _content_sha(b"# some other gate\n")}).encode("utf-8")
+    both = _refused(r, receipt_before=expected)
     # Name the file and both hashes, so the operator can tell what changed.
     assert str(r["dst"].as_posix()) in both.replace("\\", "/"), both
     assert _content_sha(_INSTALLED_GATE.encode("utf-8")) in both, both
@@ -301,8 +301,8 @@ def test_a_gate_that_does_not_match_its_receipt_is_not_overwritten(tmp_path: Pat
 
 
 def test_an_unreadable_receipt_refuses(tmp_path: Path) -> None:
-    both = _refused(_run(tmp_path, receipt="garbage", expect_ok=False))
-    assert "cannot be read" in both, both
+    both = _refused(_run(tmp_path, receipt="garbage", expect_ok=False), b"{ not json")
+    assert "cannot be read" in both and "(unreadable)" in both, both
 
 
 def test_a_receipt_with_no_hash_refuses(tmp_path: Path) -> None:
@@ -320,6 +320,11 @@ def test_the_override_installs_and_records_what_it_overwrote(tmp_path: Path) -> 
     r = _run(tmp_path, receipt="mismatch", override=True)
     assert r["dst"].read_bytes() == r["src"].read_bytes()
     assert r["bak"].read_bytes() == _INSTALLED_GATE.encode("utf-8")
+    sha12 = _content_sha(_INSTALLED_GATE.encode("utf-8"))[:12].lower()
+    kept = Path(f"{r['dst']}.unexplained-{sha12}")
+    assert kept.read_bytes() == _INSTALLED_GATE.encode("utf-8"), (
+        "the overridden gate's bytes were not kept"
+    )
     assert "WARNING" in r["proc"].stdout, r["proc"].stdout
     data = json.loads(r["receipt"].read_text(encoding="utf-8-sig"))
     over = data["overwroteUnexplained"]
