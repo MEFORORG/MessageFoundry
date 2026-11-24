@@ -240,10 +240,11 @@ def test_a_gone_holder_outside_any_repository_is_never_judged_here(
     assert "is in no git repository" in row["why"], row
 
 
+@pytest.mark.parametrize("variable", ["GIT_DIR", "GIT_COMMON_DIR"])
 def test_git_dir_in_the_environment_cannot_tie_a_foreign_holder_here(
-    repo: Path, tmp_path: Path
+    repo: Path, tmp_path: Path, variable: str
 ) -> None:
-    """BACKLOG #7564: with GIT_DIR set, git answers for that repository whatever -C names.
+    """BACKLOG #7564: with GIT_DIR or GIT_COMMON_DIR set, git answers for it whatever -C names.
 
     Every directory would then resolve to this repository's common dir, so the check refuses to
     tie any gone holder rather than pass the foreign one.
@@ -252,7 +253,7 @@ def test_git_dir_in_the_environment_cannot_tie_a_foreign_holder_here(
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True)
     landed_branch(repo, "shared-name")
     write_claim(repo, "k-foreign", other / ".claude" / "worktrees" / "gone", "shared-name")
-    env = {**os.environ, "GIT_DIR": str(repo / ".git")}
+    env = {**os.environ, variable: str(repo / ".git")}
     proc = reconcile(repo, "-Json", "-NoPullRequests", env=env)
     assert proc.returncode == 0, proc.stderr
     row = json.loads(proc.stdout)["claims"][0]
