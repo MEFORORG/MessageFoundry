@@ -756,6 +756,20 @@ def canonical_group_dn(text: str) -> str | None:
     the store's own ``strip().lower()`` is a no-op on it. Linear apart from sorting a multi-valued RDN's parts, so
     operator text cannot make it backtrack.
     """
+    rdns = _canonical_rdns(text)
+    if rdns is None or len(rdns) < _GROUP_DN_MIN_RDNS:
+        return None
+    return ",".join("+".join(rdn) for rdn in rdns)
+
+
+def _canonical_rdns(text: str) -> list[list[str]] | None:
+    """``text`` parsed into RDNs of canonical ``type=value`` parts, or ``None`` if it is no DN.
+
+    The parser behind :func:`canonical_group_dn`, which states the canonical form and what is
+    refused, apart from the minimum RDN count, which is that function's alone. Each RDN's parts
+    are sorted. :func:`_dn_realm` reads a user entry's DN through it too, so the two never
+    disagree on how a DN is split.
+    """
     try:
         text.encode("utf-8")
     except UnicodeEncodeError:
@@ -817,9 +831,28 @@ def canonical_group_dn(text: str) -> str | None:
     if not close_ava():
         return None
     rdns.append(sorted(avas))
-    if len(rdns) < _GROUP_DN_MIN_RDNS:
+    return rdns
+
+
+def _dn_realm(dn: str) -> str | None:
+    """The DNS domain the ``DC=`` RDNs at the end of ``dn`` name, lower-case, or ``None``.
+
+    BACKLOG #4846. ``CN=alice,OU=Staff,DC=child,DC=corp,DC=example`` gives
+    ``child.corp.example``. Only the trailing run of single-valued ``dc`` RDNs counts, so a ``DC=``
+    higher up the DN, or one inside a multi-valued RDN, adds nothing. ``None`` when ``dn`` does
+    not parse or ends in no ``DC=`` RDN. The value is canonical (:func:`_canonical_value`), so ASCII
+    letters are lower-case and any other character is a ``\\xx`` escape that no realm, which is
+    printable ASCII (``check_kerberos_realm``), can equal.
+    """
+    rdns = _canonical_rdns(dn)
+    if rdns is None:
         return None
-    return ",".join("+".join(rdn) for rdn in rdns)
+    labels: list[str] = []
+    for rdn in reversed(rdns):
+        if len(rdn) != 1 or not rdn[0].startswith("dc="):
+            break
+        labels.append(rdn[0][3:])
+    return ".".join(reversed(labels)) or None
 
 
 def is_group_dn(value: str) -> bool:
@@ -1955,6 +1988,7 @@ class LdapAuthenticator:
         fallback_username: str,
         expected_object_id: str | None = None,
         tie_break_object_id: str | None = None,
+        kerberos_realm: str | None = None,
     ) -> _Lookup:
         """Run one user search and extract the entry. ``info`` is ``None`` for no match, more than
         one match (``AMBIGUOUS``, vault BACKLOG #2778), a disabled account or an undetermined one,
@@ -1969,6 +2003,10 @@ class LdapAuthenticator:
         ``expected_object_id``, the canonical id an id-keyed search asked for, makes an entry that
         does not read it back a no-match, before its account state is read (BACKLOG #2027). See
         :meth:`_lookup_by_object_id`.
+
+        ``kerberos_realm``, the configured realm a Kerberos ticket was checked against, keeps only
+        the entries that ticket can name, before anything else reads them (BACKLOG #4846,
+        :meth:`_kerberos_holders`). Only the Kerberos lookup passes it.
 
         The filter is the caller's; everything after it -- the attribute list, the ACCOUNTDISABLE
         rejection and the extraction -- is shared by both lookups on purpose. **The two lookups differ
@@ -1998,11 +2036,14 @@ class LdapAuthenticator:
                 _UAC_ATTR,
             ],
         )
-        if not conn.entries:
+        entries = list(conn.entries)
+        if kerberos_realm is not None:
+            entries = self._kerberos_holders(entries, fallback_username, kerberos_realm)
+        if not entries:
             return _Lookup(DirectoryAnswer.NOT_FOUND)
-        e = conn.entries[0]
+        e = entries[0]
         own: str | None = None
-        if len(conn.entries) > 1:
+        if len(entries) > 1:
             # Vault BACKLOG #2778. The name filter matches sAMAccountName OR userPrincipalName, and
             # a directory may legally give one account a UPN prefix equal to another's
             # sAMAccountName. Taking entries[0] would let the server's result order pick which
@@ -2015,29 +2056,27 @@ class LdapAuthenticator:
             # Refusing it too let anyone able to write a colliding entry lock the account out. No
             # match, or more than one, still proves nothing, so it is refused as before.
             #
-            # THE CHOSEN ENTRY MUST BE THE ONLY MATCH HOLDING THE NAME AS ITS sAMAccountName. The
-            # Kerberos caller passes the ticket's name with its realm checked against
-            # [auth].kerberos_realm and then dropped (BACKLOG #2610), so the ticket proves only that
-            # its holder has this sAMAccountName in that realm, while the search base may span more.
+            # THE CHOSEN ENTRY MUST BE THE ONLY MATCH HOLDING THE NAME AS ITS sAMAccountName. A
+            # ticket proves only that its holder has this sAMAccountName in [auth].kerberos_realm
+            # (BACKLOG #2610). The Kerberos lookup keeps only such entries in that realm before
+            # this point (_kerberos_holders, BACKLOG #4846); for the other name-keyed callers:
             # - An entry that matched only through its UPN is not that holder. Choosing it would let
             #   a renamed account that kept its old UPN be signed in by whoever was later given the
             #   old name.
             # - Two entries holding the name, as same-named accounts in two domains under one
-            #   search base would, cannot be told apart by the ticket, so the id does not choose.
+            #   search base would, cannot be told apart by the name, so the id does not choose.
             # The id must also be on that entry alone: an id on two entries names neither.
             # Compared with lower(), not casefold(), so "straße" does not equal "strasse".
             # The `is not None` test is load-bearing: an entry with no readable id reads back
             # None, which must never match a caller that holds no id.
             label = safe_name(fallback_username)
             name = fallback_username.lower()
-            holders = [
-                x for x in conn.entries if (_attr(x, "sAMAccountName") or "").lower() == name
-            ]
+            holders = [x for x in entries if (_attr(x, "sAMAccountName") or "").lower() == name]
             chosen = (
                 tie_break_object_id is not None
                 and len(holders) == 1
                 # Identity, not ==: the one entry carrying the id must be the holder itself.
-                and [id(x) for x in conn.entries if _object_guid(x) == tie_break_object_id]
+                and [id(x) for x in entries if _object_guid(x) == tie_break_object_id]
                 == [id(holders[0])]
             )
             # Reported either way: the collision is in the directory, and an operator should clear it.
@@ -2045,7 +2084,7 @@ class LdapAuthenticator:
                 f"ambiguous-chosen:{label}" if chosen else f"ambiguous:{label}",
                 "AD user search for %s matched %d directory entries; %s (logged once per name)",
                 label,
-                len(conn.entries),
+                len(entries),
                 f"using the one carrying the account's stored {_OBJECT_GUID_ATTR}"
                 if chosen
                 else "refusing it as ambiguous",
@@ -2087,11 +2126,56 @@ class LdapAuthenticator:
             },
         )
 
+    @staticmethod
+    def _kerberos_holders(entries: list[Any], name: str, realm: str) -> list[Any]:
+        """The entries a ticket for ``name`` in ``realm`` can name (BACKLOG #4846).
+
+        A ticket proves its holder has the ``sAMAccountName`` ``name`` in the domain ``realm``
+        names. An entry is kept only when both hold for it:
+
+        - its own ``sAMAccountName`` is ``name``, compared with ``lower()`` as the ambiguity check
+          does. The Kerberos filter asks for nothing else, so this only re-reads what the directory
+          answered; an entry with no readable name is not shown to be the holder;
+        - the ``DC=`` suffix of its DN is the realm's domain (:func:`_dn_realm`), up to ASCII case,
+          as the ticket's realm was compared (:func:`_account_in_realm`). Under a forest-wide base
+          or the global catalog, ``alice`` in a child domain is another account than ``alice`` in
+          the realm, and the ticket names only the second.
+
+        This binds the realm to the entry on Active Directory, where a domain's realm is its DNS
+        name and its naming context is that name's ``DC=`` RDNs. A directory whose DNs do not follow
+        that, such as a realm trusted from outside AD, matches no entry, which fails closed.
+        A dropped entry is logged once per name, with a label for it and the counts only.
+        """
+        domain = realm.lower()
+        held = name.lower()
+        kept = [
+            x
+            for x in entries
+            if (_attr(x, "sAMAccountName") or "").lower() == held
+            and _dn_realm(str(x.entry_dn)) == domain
+        ]
+        if len(kept) < len(entries):
+            label = safe_name(name)
+            _warn_once(
+                f"kerberos-outside-realm:{label}",
+                "Kerberos lookup for %s kept %d of %d directory entries; the rest are outside "
+                "[auth].kerberos_realm's domain or do not hold the name (logged once per name)",
+                label,
+                len(kept),
+                len(entries),
+            )
+        return kept
+
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
         return self._lookup_by_name(conn, username).info
 
     def _lookup_by_name(
-        self, conn: Any, username: str, *, tie_break_object_id: str | None = None
+        self,
+        conn: Any,
+        username: str,
+        *,
+        tie_break_object_id: str | None = None,
+        kerberos: bool = False,
     ) -> _Lookup:
         """Find a user by name. ``tie_break_object_id`` only chooses among several matches.
 
@@ -2100,7 +2184,41 @@ class LdapAuthenticator:
         after the name passed to someone else. For the same reason the tie-break only accepts the
         one entry whose own ``sAMAccountName`` is the name (:meth:`_search_user`). The id is
         normalised here, the one place it enters this lookup; one that cannot be read breaks no tie.
+
+        **``kerberos`` asks the narrower question a ticket answers (BACKLOG #4846).** A ticket for
+        ``alice`` in ``[auth].kerberos_realm`` proves only that its holder is the person account
+        whose ``sAMAccountName`` is ``alice`` in that realm's domain, so the lookup asks for that
+        and nothing wider:
+
+        - the filter has no ``userPrincipalName`` arm. With one, a single entry holding the UPN
+          ``alice@<ad_domain>`` and another name answered the ticket alone, so a renamed account
+          that kept its old UPN signed in for whoever was later given the old name;
+        - the filter asks for ``objectCategory=person`` and ``objectClass=user``. A computer object
+          is a ``user`` by class but not a person by category, so a machine's ticket
+          (``WS01$@REALM``) finds nothing, and neither does a managed service account's or a
+          contact's;
+        - a name ending in ``$`` is answered NOT_FOUND before any search. An interdomain trust
+          account is a person-category ``user`` named ``CHILD$``, so the filter alone would find it.
+          No person account's name needs the ``$``;
+        - only entries in the realm's domain, holding the name, are read (:meth:`_kerberos_holders`).
+
+        The realm is read from this authenticator's own settings, as :func:`kerberos_principal`
+        reads it, and an unset one raises :class:`LdapError` rather than dropping the check.
         """
+        if kerberos:
+            realm = _configured_kerberos_realm(self._s)
+            if username.endswith("$"):
+                return _Lookup(DirectoryAnswer.NOT_FOUND)
+            return self._search_user(
+                conn,
+                (
+                    "(&(objectCategory=person)(objectClass=user)"
+                    f"(sAMAccountName={_escape_filter(username)}))"
+                ),
+                fallback_username=username,
+                tie_break_object_id=normalise_object_guid(tie_break_object_id),
+                kerberos_realm=realm,
+            )
         upn = f"{username}@{self._s.ad_domain}" if self._s.ad_domain else username
         return self._search_user(
             conn,
@@ -2286,6 +2404,7 @@ class LdapAuthenticator:
         *,
         object_id: str | None = None,
         tie_break_object_id: str | None = None,
+        kerberos: bool = False,
     ) -> AdPrincipal | None:
         """Look a user up + resolve groups *without* a password. Uses the service-account bind only.
 
@@ -2313,9 +2432,17 @@ class LdapAuthenticator:
         ``objectGUID``: when the name matches several entries, the one carrying that id is used
         (vault BACKLOG #3228, :meth:`_lookup_by_name`). Passing it with ``object_id`` is a
         programming error and raises :class:`ValueError`: an id-keyed search has no tie to break.
+
+        ``kerberos`` is for the Kerberos sign-in alone: ``username`` is a ticket's account name, and
+        the lookup asks only what that ticket proves (BACKLOG #4846, :meth:`_lookup_by_name`).
+        Passing it with ``object_id`` raises :class:`ValueError` too, because an id-keyed search
+        would skip that narrowing.
         """
         return self.probe_principal(
-            username, object_id=object_id, tie_break_object_id=tie_break_object_id
+            username,
+            object_id=object_id,
+            tie_break_object_id=tie_break_object_id,
+            kerberos=kerberos,
         ).principal
 
     def probe_principal(
@@ -2324,6 +2451,7 @@ class LdapAuthenticator:
         *,
         object_id: str | None = None,
         tie_break_object_id: str | None = None,
+        kerberos: bool = False,
     ) -> DirectoryProbe:
         """:meth:`resolve_principal`, also saying WHY an account did not resolve (ADR 0195).
 
@@ -2340,13 +2468,15 @@ class LdapAuthenticator:
 
         if object_id is not None and tie_break_object_id is not None:
             raise ValueError("pass object_id or tie_break_object_id, not both")
+        if object_id is not None and kerberos:
+            raise ValueError("pass object_id or kerberos, not both")
         try:
             with self._service_session() as svc:
                 found = (
                     self._lookup_by_object_id(svc, object_id, fallback_username=username)
                     if object_id is not None
                     else self._lookup_by_name(
-                        svc, username, tie_break_object_id=tie_break_object_id
+                        svc, username, tie_break_object_id=tie_break_object_id, kerberos=kerberos
                     )
                 )
                 info = found.info
@@ -2527,7 +2657,9 @@ def kerberos_principal(token: bytes, settings: AuthSettings) -> str | None:
     NTLM fallback, no mutual-auth response token, no multi-leg challenge handshake. The server must
     have a usable keytab/credential for ``kerberos_spn`` in its environment. The principal must be
     ``user@REALM`` with ``REALM`` equal to ``kerberos_realm``; :func:`_account_in_realm` says what
-    else it refuses (BACKLOG #2610).
+    else it refuses (BACKLOG #2610). The realm is dropped from the answer, so the caller must look
+    the name up with ``kerberos=True`` (:meth:`LdapAuthenticator.resolve_principal`), which binds
+    it to an entry in that realm's domain again (BACKLOG #4846).
 
     ``None`` unless :func:`_kerberos_context_complete` says the context finished (BACKLOG #2610
     review point c), so no provider can hand back a principal from a half-done exchange. That is

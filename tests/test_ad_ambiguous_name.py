@@ -318,7 +318,11 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     The real ``LdapAuthenticator`` over a faked ``ldap3``; only the SPNEGO acceptor is replaced. The
     first sign-in finds X alone, and the row it creates is bound to X's id. Then V's UPN collides
     with the name. The sign-in must land on X's row, the one the engine already holds, and a
-    ticket for a name with no row must still be refused."""
+    ticket for a name with no row must still be refused.
+
+    Since BACKLOG #4846 the Kerberos lookup drops V before the tie-break, because V holds the name
+    only as a UPN, so this is still green with #3228 reverted. The realm is ``X`` because the
+    entries sit under ``DC=x``: that lookup keeps only entries in the realm's domain."""
     from messagefoundry.auth.service import AuthService
     from messagefoundry.store.store import MessageStore
 
@@ -335,7 +339,7 @@ async def test_windows_sso_signs_a_bound_account_in_past_a_colliding_entry(
     _install_directory(monkeypatch, [], answer)
     store = await MessageStore.open(tmp_path / "tie-break.db")
     try:
-        settings = _settings(kerberos_enabled=True, kerberos_realm="EXAMPLE.COM")
+        settings = _settings(kerberos_enabled=True, kerberos_realm="X")
         service = AuthService(store, settings, ldap=LdapAuthenticator(settings))
         await service.initialize()
         await service.set_ad_group_map([(group.lower(), "operator")], actor="admin")
