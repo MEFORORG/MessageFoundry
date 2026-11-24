@@ -1748,8 +1748,9 @@ entries this way, but refuses an IPv6 entry at load, never lists a `server` hold
 compares the port the connection string sends, not the `port` setting alone
 ([CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds)).
 
-Each list that *How a host list's entry is read* names reads its entries as that paragraph and the
-next one say, and its row below does not repeat it.
+Each entry of `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`, `allowed_remote`,
+`allowed_smtp`, `allowed_direct`, `allowed_syslog` and `allowed_proxy` names a host, and optionally
+a port, as the two paragraphs above say.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -1863,26 +1864,13 @@ next one say, and its row below does not repeat it.
      without removing or changing `Accept-Encoding`. The engine decodes no content coding, so at
      least some coded 2xx delivery replies are refused or have their body dropped (BACKLOG #5910);
      the REST section of [CONNECTIONS.md](CONNECTIONS.md#rest--rest) says which, under *A 2xx reply body in a content
-     coding*.
+     coding*. An `Accept-Encoding` header you set yourself is not overridden; the same
+     section says so, under *An `Accept-Encoding` header you set*.
 
 The engine checks its own hop. Its reply reader refuses an ambiguous reply
 (`transports/bounded_read.py`), but it cannot see what the proxy received from the partner. The
 same rules for a proxy in front of the engine's API are in
 [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses).
-
-#### An `Accept-Encoding` header you set
-
-**An `Accept-Encoding` request header you set is not overridden, proxy or no proxy,** whether in
-the connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
-message from a Handler through an `http.header.` metadata key. That holds where the engine sends
-the header at all: on an `https://` hop with `verify_tls = false`, `Accept-Encoding` is off the
-header allowlist that
-[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
-states. In the connection's headers it refuses the connection when it is built, and stamped per
-message it refuses that send, and the message dead-letters; neither drops the header. With none
-set, a delivery request asks for `identity`. A partner that honours yours and codes its reply gets
-the treatment the REST section of [CONNECTIONS.md](CONNECTIONS.md#rest--rest) describes under
-*A 2xx reply body in a content coding*, so leave `Accept-Encoding` unset.
 
 #### `serve` names an environment proxy at start
 

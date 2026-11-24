@@ -1868,6 +1868,19 @@ bytes to misread. An empty chunked or close-framed body labelled with a coding s
 misframed, because its emptiness is known only after the read.
 ADR 0095 Amendment B.1 does not record this case; BACKLOG #5910 added it.
 
+**An `Accept-Encoding` header you set.** It is not overridden, proxy or no proxy, whether in the
+connection's headers or, on a REST or FHIR connection that sets `dynamic_headers = true`, per
+message from a Handler through an `http.header.` metadata key. That holds where the engine sends
+the header at all: on an `https://` hop with `verify_tls = false`, `Accept-Encoding` is off the
+header allowlist that
+[SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
+states. In the connection's headers it refuses the connection when it is built, and stamped per
+message it refuses that send, and the message dead-letters; neither drops the header. With none
+set, a delivery request asks for `identity`. A partner that honours yours may code its reply,
+and the engine decodes no content coding, so leave `Accept-Encoding` unset; the paragraph above
+says what happens to a coded 2xx delivery reply. A forward proxy must not change the header either
+([CONFIGURATION.md](CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries), item 4).
+
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
 scheme is constrained to `http`/`https`, and the outbound host is gated by the fail-closed
 `[egress].allowed_http` allowlist (WP-11c). Standard library only (`urllib`) — no new dependency.
