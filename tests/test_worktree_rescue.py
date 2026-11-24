@@ -25,6 +25,7 @@ from tests._no_prompt import run_holding_stdin_open
 from tests._spawn_lock import single_spawn
 
 _RESCUE = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "rescue.ps1"
+_GATES = _RESCUE.with_name("worktree-gates.ps1")
 
 pytestmark = pytest.mark.skipif(
     shutil.which("pwsh") is None or os.name != "nt",
@@ -33,7 +34,8 @@ pytestmark = pytest.mark.skipif(
 
 
 # An inherited GIT_DIR or GIT_WORK_TREE would point every git call here, and the copied script's, at the
-# repository it names instead of the throwaway one; strip them so the real checkout stays out of reach.
+# repository it names instead of the throwaway one, and rescue.ps1 refuses any GIT_CONFIG carrier; strip
+# every GIT_* so the real checkout stays out of reach and the script runs.
 _ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
 
@@ -95,6 +97,7 @@ def _seed(repo: Path) -> None:
     """A primary checkout holding rescue.ps1 and the stand-in new.ps1, not yet committed."""
     (repo / "scripts" / "worktree").mkdir(parents=True)
     shutil.copy2(_RESCUE, repo / "scripts" / "worktree" / "rescue.ps1")
+    shutil.copy2(_GATES, repo / "scripts" / "worktree" / "worktree-gates.ps1")
     (repo / "scripts" / "worktree" / "new.ps1").write_text(_FAKE_NEW, encoding="utf-8")
     (repo / "base.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "init", "-q", "-b", "main")
@@ -174,6 +177,9 @@ def test_a_foreign_entry_already_on_the_stack_is_left_alone(tmp_path: Path) -> N
     assert (target / "base.txt").read_text(encoding="utf-8") == "rescued edit\n"
     assert _git(repo, "status", "--porcelain") == ""
     assert _stash_entries(repo) == [(foreign, "On main: foreign earlier")]
+    assert _git(repo, "for-each-ref", "refs/worktree-rescue") == "", (
+        "the anchor ref was left behind"
+    )
 
 
 def test_an_entry_pushed_during_the_window_is_not_popped_into_the_worktree(tmp_path: Path) -> None:
@@ -211,6 +217,7 @@ def test_a_push_that_creates_no_entry_is_refused_and_touches_nothing(tmp_path: P
     _git(nested, "init", "-q", "-b", "main")
     _git(nested, "config", "user.email", "t@example.invalid")
     _git(nested, "config", "user.name", "t")
+    _git(nested, "config", "core.hooksPath", ".git/no-hooks")
     (nested / "x.txt").write_text("x\n", encoding="utf-8")
     _git(nested, "add", "x.txt")
     _git(nested, "commit", "-qm", "n", "--no-verify")
@@ -221,7 +228,7 @@ def test_a_push_that_creates_no_entry_is_refused_and_touches_nothing(tmp_path: P
 
     proc = _rescue(repo, "empty")
     assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "created no entry" in proc.stderr + proc.stdout
+    assert "git stash push created no entry although status reported" in proc.stderr + proc.stdout
     assert not (tmp_path / "repo-empty").exists()
     assert _stash_entries(repo) == [(foreign, "On main: foreign earlier")]
     assert (nested / "x.txt").read_text(encoding="utf-8") == "edited inside the nested repository\n"
@@ -271,3 +278,30 @@ def test_an_inherited_git_redirect_is_refused(tmp_path: Path) -> None:
     assert "GIT_DIR" in proc.stderr + proc.stdout
     assert _stash_entries(repo) == []
     assert (repo / "work.txt").is_file()
+
+
+def test_changes_stash_cannot_carry_are_reported_as_left_behind(tmp_path: Path) -> None:
+    """A tracked edit moves; an edit inside a nested repository cannot, and the script must say so."""
+    repo = tmp_path / "repo"
+    _seed(repo)
+    nested = repo / "nested"
+    nested.mkdir()
+    _git(nested, "init", "-q", "-b", "main")
+    _git(nested, "config", "user.email", "t@example.invalid")
+    _git(nested, "config", "user.name", "t")
+    _git(nested, "config", "core.hooksPath", ".git/no-hooks")
+    (nested / "x.txt").write_text("x\n", encoding="utf-8")
+    _git(nested, "add", "x.txt")
+    _git(nested, "commit", "-qm", "n", "--no-verify")
+    _commit_all(repo)
+    _make_work(repo)
+    (nested / "x.txt").write_text("edited inside the nested repository\n", encoding="utf-8")
+
+    proc = _rescue(repo, "partial")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    out = proc.stdout + proc.stderr
+    assert "STILL in the primary" in out
+    assert "nested" in out
+    assert "The primary checkout is clean again" not in out
+    assert (tmp_path / "repo-partial" / "work.txt").read_text(encoding="utf-8") == "rescued work\n"
+    assert _stash_entries(repo) == []

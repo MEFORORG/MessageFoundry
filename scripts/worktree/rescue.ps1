@@ -11,16 +11,18 @@
 
     It stashes the primary's uncommitted work (tracked AND untracked), creates a worktree branched off the
     primary's CURRENT commit -- not origin/main, so the stash applies cleanly -- and applies that stash
-    there BY ITS COMMIT ID, then drops it.
+    there BY ITS COMMIT ID.
 
     THE STASH STACK IS CLONE-WIDE: every worktree and every session on this clone pushes and pops the same
     one, so "the top entry" is not "my entry" (BACKLOG #5957). The push carries a unique tag, the entry's
-    commit id is read back by that tag straight away, and everything after that names the id -- never
-    stash@{0}, never a bare pop. A push that created no entry is refused before anything else runs, since
-    the only entry a later step could find would be someone else's.
+    commit id is read back by that tag straight away, anchored under a private ref
+    (refs/worktree-rescue/<id>), and taken off the shared stack at once; everything after that names the
+    id -- never stash@{0}, never a bare pop. A push that created no entry is refused before anything else
+    runs, since the only entry a later step could find would be someone else's.
 
-    The stash is the safety net: if the apply fails for any reason, the work is still in `git stash list`
-    and this script prints the exact id to restore. Nothing is ever discarded.
+    The anchor is the safety net: if a later step fails, the work is still held under that ref and this
+    script prints the exact commands to restore it. Changes git stash cannot carry at all (edits inside a
+    nested repository) are never moved, and the script says so.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\worktree\rescue.ps1 -Name alerts-fix
@@ -44,14 +46,19 @@ if (-not $Name) { throw "rescue.ps1 needs -Name <slug> for the new worktree. Not
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
+# $GIT_REDIRECT_NAMES and Get-GitConfigCarriers, the lists remove.ps1 refuses, so the two cannot drift.
+. "$PSScriptRoot\worktree-gates.ps1"
+
 # An inherited GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE points every `git -C $RepoRoot`
-# below at another repository, tree or index -- it would also pass a linked copy off as the primary. The
-# same list remove.ps1 refuses ($GIT_REDIRECT_NAMES in worktree-gates.ps1); inlined so this script stands
-# alone.
-$redirects = @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE') |
-    Where-Object { [Environment]::GetEnvironmentVariable($_) }
-if ($redirects) {
-    throw "rescue.ps1 refuses: $($redirects -join ', ') is set, so git could read another repository, tree or index. Unset it and re-run. Nothing was moved."
+# below at another repository, tree or index, and would also pass a linked copy off as the primary. The
+# two object-store names are refused as remove.ps1 -Discard refuses them, because this script WRITES
+# objects (the stash commit), and a redirected store would park the only copy of the work outside the
+# clone. Config carried in the environment steers every read below (for example status.showUntrackedFiles
+# or a core.fsmonitor hook). Before any git call.
+$refused = @(@($GIT_REDIRECT_NAMES) + @('GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES') |
+    Where-Object { [Environment]::GetEnvironmentVariable($_) }) + @(Get-GitConfigCarriers)
+if ($refused.Count -gt 0) {
+    throw "rescue.ps1 refuses: $($refused -join ', ') is set, so git could read or write another repository, tree, index, object store or config. Unset it and re-run. Nothing was moved."
 }
 
 # THE PRIMARY, AND ONLY THE PRIMARY. This script anchors on its own path, so the copy inside a LINKED
@@ -73,16 +80,28 @@ $Parent   = Split-Path $RepoRoot -Parent
 $Target   = Join-Path $Parent ("{0}-{1}" -f (Split-Path $RepoRoot -Leaf), $Name)
 
 if (Test-Path $Target) { throw "Worktree path already exists: $Target  (pick another -Name, or just work in it)" }
-# new.ps1 REUSES an existing branch and ignores -Base, so the stash would land on that branch's old tip
-# instead of the commit it was made from.
-if (@(& git -C $RepoRoot branch --list $Name).Count -gt 0) {
+# Everything new.ps1 would refuse or misread about the branch is refused HERE, before the primary is
+# touched. It refuses a leading '-' and a name git's refname grammar rejects; and it REUSES an existing
+# branch, ignoring -Base, so the work would land on that branch's old tip instead of the commit it came from.
+if ($Name.StartsWith('-')) { throw "-Name may not start with '-': '$Name'. Nothing was moved." }
+& git -C $RepoRoot check-ref-format --branch $Name *> $null
+if ($LASTEXITCODE -ne 0) { throw "-Name '$Name' is not a valid git branch name. Nothing was moved." }
+$existing = @(& git -C $RepoRoot branch --list $Name)
+if ($LASTEXITCODE -ne 0) { throw "git branch --list failed (exit $LASTEXITCODE). Nothing was moved." }
+if ($existing.Count -gt 0) {
     throw "A branch named '$Name' already exists, so the work would not land on the commit it came from. Pick another -Name. Nothing was moved."
 }
 
-$dirty = @(& git -C $RepoRoot status --porcelain)
-# A failed status prints nothing, which would read as "clean" below and send the caller away with work left
-# in the primary.
-if ($LASTEXITCODE -ne 0) { throw "git status failed in $RepoRoot (exit $LASTEXITCODE). Nothing was moved." }
+# Explicit flags, so a config such as status.showUntrackedFiles=no or a submodule ignore setting cannot
+# make a dirty primary read clean.
+function Get-PrimaryStatus {
+    $lines = @(& git -C $RepoRoot status --porcelain --untracked-files=all --ignore-submodules=none)
+    # A failed status prints nothing, which would read as "clean" and send the caller away with work left.
+    if ($LASTEXITCODE -ne 0) { throw "git status failed in $RepoRoot (exit $LASTEXITCODE)." }
+    $lines
+}
+
+$dirty = @(Get-PrimaryStatus)
 if ($dirty.Count -eq 0) {
     Write-Host "Nothing to rescue: $RepoRoot is clean." -ForegroundColor Yellow
     Write-Host "You want a plain new worktree instead:  scripts\worktree\new.ps1 -Name $Name"
@@ -94,36 +113,80 @@ Write-Host "Rescuing $($dirty.Count) change(s) from $RepoRoot (at $($sha.Substri
 $dirty | Select-Object -First 12 | ForEach-Object { Write-Host "  $_" }
 if ($dirty.Count -gt 12) { Write-Host "  ... and $($dirty.Count - 12) more" }
 
-# The commit id of every entry on the clone-wide stack whose reflog subject ends with $Tag. Read fresh each
-# time, because another session can push or drop between any two reads.
-function Find-StashByTag([string]$Tag) {
+# Every entry on the clone-wide stack, as (commit id, reflog subject). Read fresh each time it is needed,
+# because another session can push or drop between any two reads.
+function Get-StashEntries {
     $lines = @(& git -C $RepoRoot stash list --format='%H%x09%gs')
     if ($LASTEXITCODE -ne 0) { throw "git stash list failed in $RepoRoot (exit $LASTEXITCODE)" }
     foreach ($line in $lines) {
         $id, $subject = $line -split "`t", 2
-        if ($subject -and $subject.EndsWith(": $Tag", [StringComparison]::Ordinal)) { $id }
+        [pscustomobject]@{ Sha = $id; Subject = "$subject" }
+    }
+}
+
+# Take this run's entry off the shared stack, by id. git stash drop takes a POSITION, which another
+# session's push or drop can shift at any moment, so: re-find the position by id, confirm it still holds
+# that id, run the drop under the C locale so its "Dropped ... (<id>)" line parses, and store back, under
+# its own subject, any other entry a shifted position dropped. Warns, never throws: the work is anchored
+# under a private ref by now, so a failure here leaves a spare copy, never a loss.
+function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
+    try {
+        $listed = @(Get-StashEntries)
+        $at = [array]::IndexOf([string[]]@($listed | ForEach-Object Sha), $Id)
+        if ($at -lt 0) {
+            Write-Warning ("Stash commit $Id was already taken off the stash list by another session, most likely " +
+                "by a bare pop that ALSO applied this work into that session's tree. It is still held under $Anchor.")
+            return
+        }
+        if ((& git -C $RepoRoot rev-parse "stash@{$at}") -ne $Id) {
+            Write-Warning "The stash list moved under this run; stash commit $Id stays listed as a spare copy (it is also held under $Anchor)."
+            return
+        }
+        $savedLcAll = $env:LC_ALL
+        $env:LC_ALL = 'C'
+        try { $dropOut = (@(& git -C $RepoRoot stash drop "stash@{$at}") -join "`n"); $dropRc = $LASTEXITCODE }
+        finally { $env:LC_ALL = $savedLcAll }
+        $dropped = if ($dropOut -match '\(([0-9a-f]{40,64})\)') { $Matches[1] } else { $null }
+        if ($dropRc -ne 0) {
+            Write-Warning "Could not drop stash commit $Id (exit $dropRc); it stays listed as a spare copy."
+        } elseif (-not $dropped) {
+            Write-Warning "Could not read which entry the drop removed ($dropOut). Check git stash list against: $(@($listed | ForEach-Object { "$($_.Sha) $($_.Subject)" }) -join '; ')"
+        } elseif ($dropped -ne $Id) {
+            $subject = @($listed | Where-Object Sha -eq $dropped | ForEach-Object Subject | Select-Object -First 1)
+            $subject = if ($subject) { $subject[0] } else { "restored by rescue.ps1 after a shifted drop" }
+            & git -C $RepoRoot stash store -m $subject $dropped
+            if ($LASTEXITCODE -eq 0) {
+                Write-Warning "The stash list moved during the drop; another session's entry $dropped was dropped and has been stored back (at the top). Stash commit $Id stays listed as a spare copy."
+            } else {
+                Write-Warning "The stash list moved during the drop and another session's entry was dropped; storing it back FAILED. Restore it with: git -C `"$RepoRoot`" stash store -m `"$subject`" $dropped"
+            }
+        }
+    } catch {
+        Write-Warning "Taking stash commit $Id off the stash list failed ($_); it may still be listed as a spare copy."
     }
 }
 
 # -u carries untracked files too; without it they would be left behind in the primary and silently
 # duplicated once the worktree recreated them. The GUID makes the tag this run's alone, so the entry can be
 # found by tag even when a concurrent push lands on top of it before the read-back.
-$stashMsg = "rescue -> $Name [$([guid]::NewGuid().ToString('N'))]"
+$guid      = [guid]::NewGuid().ToString('N')
+$stashMsg  = "rescue -> $Name [$guid]"
+$anchorRef = "refs/worktree-rescue/$guid"
 & git -C $RepoRoot stash push --include-untracked -m $stashMsg
 $pushRc = $LASTEXITCODE
 try {
-    $stashSha = @(Find-StashByTag $stashMsg) | Select-Object -First 1
+    $stashSha = @(Get-StashEntries | Where-Object { $_.Subject.EndsWith(": $stashMsg", [StringComparison]::Ordinal) } | ForEach-Object Sha) | Select-Object -First 1
 } catch {
-    throw "$_ -- after the stash push (exit $pushRc). If the primary is now clean, your work is in the stash under: $stashMsg"
+    throw "$_ -- after the stash push (exit $pushRc). If the primary is now clean, the work is in the stash under: $stashMsg"
 }
 if (-not $stashSha) {
-    $now = @(& git -C $RepoRoot status --porcelain)
-    if ($LASTEXITCODE -eq 0 -and $now.Count -eq 0) {
-        # The push saved and cleaned, then the entry vanished: another session popped or dropped the top
-        # of the shared stack in between. Its commit is still in the stash reflog's dangling objects.
-        throw ("The stash push saved your work but its entry ($stashMsg) was taken off the stash list by " +
-            "another session before this script could read it. The primary is now clean; the work was most " +
-            "likely applied into that session's tree. Find it with: git -C `"$RepoRoot`" fsck --unreachable | Select-String commit")
+    $now = @(Get-PrimaryStatus)
+    if ($now.Count -eq 0) {
+        # The changes are gone from the primary but no entry carries this run's tag. Either a concurrent
+        # push (a second rescue, say) took them first, or this run's entry was popped before the read-back.
+        throw ("The primary is now clean, but no stash entry carries this run's tag ($stashMsg). Another " +
+            "session either stashed these changes first (look in: git -C `"$RepoRoot`" stash list) or popped " +
+            "this run's entry before it could be read, which applied it into that session's tree. Nothing more was moved.")
     }
     if ($pushRc -ne 0) { throw "git stash push failed (exit $pushRc) and created no entry -- nothing was moved." }
     # Exit 0 with no entry is real: git stash prints "No local changes to save" for a change it cannot
@@ -133,13 +196,25 @@ if (-not $stashSha) {
         "commit or move them by hand. The stash stack was not touched.")
 }
 
+# ANCHOR, then leave the shared stack at once. Held under a private ref, the work cannot be popped by
+# another session during new.ps1 (fetch, worktree add, venv build: minutes), and dropping now, while the
+# entry is almost certainly still on top, keeps the position race to milliseconds instead of minutes.
+& git -C $RepoRoot update-ref $anchorRef $stashSha
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not anchor stash commit $stashSha under $anchorRef (exit $LASTEXITCODE). YOUR WORK IS SAFE in the stash, tagged: $stashMsg"
+}
+
 $stashed = $true
 try {
-    # An entry exists, so a failed push still leaves the work in it; the finally block says how to restore.
-    if ($pushRc -ne 0) { throw "git stash push failed (exit $pushRc) but recorded entry $stashSha" }
+    if ($pushRc -ne 0) {
+        # The entry exists, but git stash stops cleaning the tree when a step fails, so the primary may still
+        # hold part of the work. The entry stays listed; the finally block says how to restore.
+        throw "git stash push failed (exit $pushRc) after recording $stashSha; the primary may be only partly cleaned"
+    }
+    Remove-OwnStashEntry -Id $stashSha -Anchor $anchorRef
 
     # Changes git stash could not carry (edits inside a nested repository) are still in the primary.
-    $left = @(& git -C $RepoRoot status --porcelain)
+    $left = @(Get-PrimaryStatus)
     if ($left.Count -gt 0) {
         Write-Warning "These changes could not be stashed and are STILL in the primary; move them by hand:"
         $left | ForEach-Object { Write-Warning "  $_" }
@@ -153,47 +228,14 @@ try {
     & pwsh @newArgs
     if ($LASTEXITCODE -ne 0) { throw "new.ps1 failed (exit $LASTEXITCODE)" }
 
-    # APPLY BY ID, never pop: a pop takes whatever is on top of the shared stack now, and new.ps1 (fetch,
-    # worktree add, venv build) is a window of minutes for another session to push on top of ours.
-    & git -C $Target stash apply $stashSha
-    if ($LASTEXITCODE -ne 0) { throw "git stash apply $stashSha failed in $Target (exit $LASTEXITCODE)" }
+    # BY ID, never a pop. --index keeps what was staged apart from what was not; the worktree sits on the
+    # stash's own base commit, so it applies cleanly.
+    & git -C $Target stash apply --index $stashSha
+    if ($LASTEXITCODE -ne 0) { throw "git stash apply --index $stashSha failed in $Target (exit $LASTEXITCODE)" }
     $stashed = $false
 
-    # The work is in the worktree now, so nothing below may fail the rescue: a failed drop only leaves a
-    # spare copy behind. git stash drop takes a POSITION, which another session's push or drop can shift
-    # at any moment, so re-find ours by tag, confirm the position still holds it, and read back which
-    # commit the drop removed. A wrong one is stored straight back (at the top: git stash store cannot
-    # put it anywhere else) and its id printed.
-    try {
-        $all = @(& git -C $RepoRoot stash list --format='%H')
-        if ($LASTEXITCODE -ne 0) { throw "git stash list failed (exit $LASTEXITCODE)" }
-        $at = [array]::IndexOf([string[]]$all, $stashSha)
-        if ($at -lt 0) {
-            Write-Warning ("Stash commit $stashSha was already taken off the stash list by another session, " +
-                "most likely by a bare pop that ALSO applied your rescued work into that session's tree. Your " +
-                "work is in $Target; tell whoever popped it.")
-        } elseif ((& git -C $RepoRoot rev-parse "stash@{$at}") -ne $stashSha) {
-            Write-Warning "The stash list moved before the drop; stash commit $stashSha is left as a spare copy. Drop it by hand once its index is re-read."
-        } else {
-            $dropOut = (@(& git -C $RepoRoot stash drop "stash@{$at}") -join "`n")
-            $dropRc = $LASTEXITCODE
-            $dropped = if ($dropOut -match '\(([0-9a-f]{40,64})\)') { $Matches[1] } else { $null }
-            if ($dropRc -ne 0) {
-                Write-Warning "Could not drop stash commit $stashSha (exit $dropRc); it is a spare copy and safe to drop by hand."
-            } elseif ($dropped -and $dropped -ne $stashSha) {
-                & git -C $RepoRoot stash store -m "restored by rescue.ps1 after a shifted drop" $dropped
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Warning "The stash list moved during the drop; another session's entry $dropped was dropped and has been stored back at the top. Stash commit $stashSha is left as a spare copy."
-                } else {
-                    Write-Warning "The stash list moved during the drop and another session's entry was dropped; storing it back FAILED. Restore it with: git -C `"$RepoRoot`" stash store $dropped"
-                }
-            } elseif (-not $dropped) {
-                Write-Warning "Could not read which entry the drop removed ($dropOut). Check git stash list."
-            }
-        }
-    } catch {
-        Write-Warning "Dropping the spare stash entry failed ($_); stash commit $stashSha may still be listed."
-    }
+    & git -C $RepoRoot update-ref -d $anchorRef $stashSha
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete the anchor $anchorRef (exit $LASTEXITCODE); it is a spare copy, safe to delete." }
 
     Write-Host ""
     Write-Host "Rescued into $Target (branch '$Name', off $($sha.Substring(0,7)))." -ForegroundColor Green
@@ -204,10 +246,10 @@ try {
 }
 finally {
     if ($stashed) {
-        Write-Warning "Rescue did not complete. YOUR WORK IS SAFE -- it is in the stash as commit $stashSha :"
-        Write-Warning "    git -C `"$RepoRoot`" stash list        # look for: $stashMsg"
-        Write-Warning "    git -C `"$RepoRoot`" stash apply $stashSha    # put it back in the primary (by id, never a bare pop)"
-        Write-Warning "Then drop that one entry: re-read its stash@{n} by the tag above, and git stash drop stash@{n}."
+        Write-Warning "Rescue did not complete. YOUR WORK IS SAFE -- it is stash commit $stashSha, held under $anchorRef :"
+        Write-Warning "    git -C `"$RepoRoot`" stash apply --index $stashSha    # put it back (by id, never a bare pop)"
+        Write-Warning "    git -C `"$RepoRoot`" update-ref -d $anchorRef          # then release the anchor"
+        Write-Warning "If the primary still holds part of the work (a failed push), move that aside before the apply."
         Write-Warning "Nothing was discarded. Resolve the failure above, then retry or apply it by hand."
     }
 }
