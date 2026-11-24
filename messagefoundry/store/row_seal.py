@@ -606,16 +606,22 @@ async def seal_chunks(
     writes a chunk's rows before the next chunk is encrypted.
 
     The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
-    :func:`cell_aad` over ``aad_cols``. For a :class:`BatchCipher`, a chunk is cut at
-    :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64. That is the cost
-    ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch is
-    one request. A value over the character bound is a chunk of its own. A chunk Transit refuses,
-    or any chunk once the cipher sends values alone, can take up to one request per value more, so
-    a cancelled seal can leave up to :data:`BATCH_MAX_ITEMS` values running on in the Transit pool,
-    and the seal's transaction waits across those requests. Any other cipher gets one
-    value per chunk, so each call is followed by its write and no sizing copy of the plaintext is
-    made. Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as
-    that does."""
+    :func:`cell_aad` over ``aad_cols``. The cut is chosen per chunk:
+
+    - A :class:`BatchCipher` that still batches (its ``batches_now``, True when it has none) is
+      cut at :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64, the cost
+      ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch
+      is one request. A value over the character bound is a chunk of its own. A chunk Transit
+      answers with HTTP 400 is sent value by value, up to one request per value more, while the
+      seal's transaction waits.
+    - A cipher whose calls wait on I/O and that sends values alone gets one value per chunk, so
+      each request is followed by its write.
+    - Any other cipher, such as in-process AES-GCM, is cut at :data:`BATCH_MAX_ITEMS` values, so a
+      store writes a page of rows per call. Neither of the last two is sized, so no sizing copy of
+      its plaintext is made.
+
+    Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as that
+    does."""
     items = [
         (
             r["v"],
@@ -623,18 +629,20 @@ async def seal_chunks(
         )
         for r in rows
     ]
-    batching = isinstance(cipher, BatchCipher)
     start = 0
     while start < len(items):
-        end = start + 1
-        if batching:
-            size = _batch_cost(*items[start])
+        if isinstance(cipher, BatchCipher) and getattr(cipher, "batches_now", True):
+            end, size = start + 1, _batch_cost(*items[start])
             while end < len(items) and end - start < BATCH_MAX_ITEMS:
                 cost = _batch_cost(*items[end])
                 if size + cost > BATCH_MAX_CHARS:
                     break
                 size += cost
                 end += 1
+        elif cipher_blocks_on_io(cipher):
+            end = start + 1
+        else:
+            end = min(start + BATCH_MAX_ITEMS, len(items))
         if start:
             await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
         yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])

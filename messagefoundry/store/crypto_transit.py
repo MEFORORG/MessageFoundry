@@ -777,6 +777,13 @@ class TransitCipher(_UnmarkedPolicy):
             )
         self._batch_alone = True
 
+    @property
+    def batches_now(self) -> bool:
+        """Whether :meth:`encrypt_many` and :meth:`decrypt_many` still send batches: False once
+        this cipher sends every value alone (BACKLOG #6706). A batch Transit answers with HTTP 400
+        is sent value by value without turning batching off, so this stays True then."""
+        return not self._batch_alone
+
     def decrypt_many(self, items: Sequence[CipherItem]) -> list[str | CipherError]:
         """Each ``(stored, aad)`` of ``items`` opened, in order, in as few Transit ``decrypt``
         requests as the batch bounds allow (BACKLOG #6706). Each result is the plaintext or a

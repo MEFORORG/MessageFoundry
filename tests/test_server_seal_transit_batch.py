@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -22,12 +23,15 @@ import pytest
 pytest.importorskip("requests", reason="Transit batch tests need the [vault] extra")
 pytest.importorskip("hvac", reason="Transit batch tests need the [vault] extra")
 
+from hvac.exceptions import InvalidRequest, UnexpectedError  # type: ignore[import-untyped]
+
 from messagefoundry.store import row_seal
 from messagefoundry.store.crypto import BATCH_MAX_ITEMS, AesGcmCipher, cell_aad
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.row_seal import seal_chunks
 from messagefoundry.store.sqlserver import SqlServerStore
-from tests.test_transit_batch import _BatchTransit, _cipher
+from messagefoundry.store.store import MessageStore
+from tests.test_transit_batch import _BatchTransit, _cipher, _write_messages
 
 _ROWS = 200
 _LIKE = "mfenc:%"
@@ -280,7 +284,10 @@ async def test_chunks_cost_no_more_transit_requests_than_one_call_over_the_page(
 
 
 class _SingleValueCipher:
-    """A cipher with no batch path, logging each encrypt into a log the writes share."""
+    """A cipher with no batch path whose calls wait on I/O, logging each encrypt into a log the
+    writes share."""
+
+    blocks_on_io = True
 
     def __init__(self, log: list[str]) -> None:
         self.log = log
@@ -342,9 +349,70 @@ async def test_an_aes_gcm_page_makes_no_sizing_copy(monkeypatch: pytest.MonkeyPa
         return 0
 
     for name in ("b64_chars", "batch_chars", "_batch_cost"):
-        monkeypatch.setattr(row_seal, name, counted, raising=False)
+        monkeypatch.setattr(row_seal, name, counted)
     cipher = AesGcmCipher(bytearray(os.urandom(32)), write_v2=True)
     rows = _pending(_legacy_rows(), _ROWS)
     chunks = await _chunks(cipher, rows)
     assert sized == []
-    assert sum(n for n, _ in chunks) == _ROWS
+    assert [n for n, _ in chunks] == [BATCH_MAX_ITEMS, _ROWS - BATCH_MAX_ITEMS]
+    # Control: a batch cipher's page is sized through the same patched names.
+    await _chunks(_cipher(_BatchTransit()), rows)
+    assert len(sized) >= _ROWS
+
+
+def _refusing(transit: _BatchTransit, error: Exception) -> None:
+    """Make ``transit`` answer every batch encrypt with ``error`` and serve single values."""
+    real = transit.encrypt_data
+
+    def answer(**kw: Any) -> dict[str, Any]:
+        if kw.get("batch_input") is not None:
+            transit.encrypt_requests += 1
+            raise error
+        return real(**kw)
+
+    transit.encrypt_data = answer  # type: ignore[method-assign]
+
+
+async def test_a_transit_cipher_sending_alone_gets_one_value_per_chunk() -> None:
+    """Once Transit refuses a batch other than with a 400, the cipher sends values alone, and
+    every later chunk is one value, so each request is followed by its write."""
+    transit = _BatchTransit()
+    _refusing(transit, UnexpectedError("413 Request Entity Too Large"))
+    cipher = _cipher(transit)
+    assert cipher.batches_now
+    chunks = await _chunks(cipher, _pending(_legacy_rows(), _ROWS))
+    assert not cipher.batches_now
+    assert [n for n, _ in chunks] == [BATCH_MAX_ITEMS] + [1] * (_ROWS - BATCH_MAX_ITEMS)
+
+
+async def test_a_vault_400_leaves_batching_on_and_chunks_batched() -> None:
+    """Vault's 400 to a batch is sent value by value, but batching stays on, so later chunks are
+    still cut as batches."""
+    transit = _BatchTransit()
+    _refusing(transit, InvalidRequest("synthetic batch 400"))
+    cipher = _cipher(transit)
+    chunks = await _chunks(cipher, _pending(_legacy_rows(), _ROWS))
+    assert cipher.batches_now
+    assert [n for n, _ in chunks] == [BATCH_MAX_ITEMS, _ROWS - BATCH_MAX_ITEMS]
+    assert transit.encrypt_requests == 2 + _ROWS
+
+
+async def test_the_sqlite_seal_writes_a_page_of_rows_per_update_under_aes_gcm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-process cipher is cut by count, so the SQLite seal writes up to ``BATCH_MAX_ITEMS``
+    rows per ``_update_every_row`` call, not one."""
+    db = tmp_path / "store.db"
+    await _write_messages(db, _ROWS)  # keyless: legacy plaintext the keyed open seals
+    sizes: list[int] = []
+    real = MessageStore._update_every_row
+
+    async def counted(self: MessageStore, sql: str, params: Any, *args: Any, **kw: Any) -> None:
+        sizes.append(len(params))
+        await real(self, sql, params, *args, **kw)
+
+    monkeypatch.setattr(MessageStore, "_update_every_row", counted)
+    store = await MessageStore.open(db, cipher=AesGcmCipher(bytearray(os.urandom(32))))
+    await store.close()
+    assert sizes
+    assert max(sizes) == BATCH_MAX_ITEMS
