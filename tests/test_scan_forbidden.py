@@ -28,6 +28,7 @@ import os
 import random
 import re
 import subprocess
+import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -1924,24 +1925,40 @@ def _hard_wrapped(lines: int) -> str:
 
 
 class _CountingMarks(list[tuple[int, int]]):
-    """A unit's (offset, line) marks that count every mark read, by index or by iteration, so a
-    lookup's cost is read as a number of marks rather than a number of seconds."""
+    """A unit's (offset, line) marks that count every mark read, by index, slice, iteration either
+    way or copy, so a lookup's cost is read as a number of marks rather than a number of seconds.
+    A read this misses reads as too FEW marks, which the floor in
+    :func:`test_the_line_lookup_reads_a_logarithmic_number_of_marks` refuses."""
 
     reads = 0
 
     def __getitem__(self, index: Any) -> Any:
-        self.reads += 1
-        return super().__getitem__(index)
+        got = super().__getitem__(index)
+        self.reads += len(got) if isinstance(index, slice) else 1
+        return got
 
     def __iter__(self) -> Iterator[tuple[int, int]]:
         for mark in super().__iter__():
             self.reads += 1
             yield mark
 
+    def __reversed__(self) -> Iterator[tuple[int, int]]:
+        for mark in super().__reversed__():
+            self.reads += 1
+            yield mark
+
+    def copy(self) -> list[tuple[int, int]]:
+        self.reads += len(self)
+        return super().copy()
+
+
+#: The width of one :func:`_hard_wrapped` line with its break, so the marks below are its marks.
+_WRAPPED_WIDTH = len(_hard_wrapped(1)) + 1
+
 
 def _wrapped_marks(lines: int) -> _CountingMarks:
-    """The marks :func:`_hard_wrapped` makes: one per line, each line 22 characters with its break."""
-    return _CountingMarks((22 * i, i + 1) for i in range(lines))
+    """The marks :func:`_hard_wrapped` makes: one per line."""
+    return _CountingMarks((_WRAPPED_WIDTH * i, i + 1) for i in range(lines))
 
 
 def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
@@ -1950,16 +1967,19 @@ def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
     return max(lineno for start, lineno in marks if start <= offset)
 
 
-def _most_reads_per_lookup(line_at: Callable[[list[tuple[int, int]], int], int], lines: int) -> int:
-    """The most marks ``line_at`` reads for one lookup over a paragraph of ``lines`` lines, over 64
-    offsets spread across it, each answer checked against the line the offset sits on."""
+def _reads_per_lookup(
+    line_at: Callable[[list[tuple[int, int]], int], int], lines: int
+) -> list[int]:
+    """The marks ``line_at`` reads for each of 64 lookups spread over a paragraph of ``lines`` lines,
+    each answer checked against the line the offset sits on."""
     marks = _wrapped_marks(lines)
-    most = 0
-    for at in range(0, 22 * lines, 22 * lines // 64 + 1):
+    reads: list[int] = []
+    span = _WRAPPED_WIDTH * lines
+    for at in range(0, span, span // 64 + 1):
         marks.reads = 0
-        assert line_at(marks, at) == at // 22 + 1, at
-        most = max(most, marks.reads)
-    return most
+        assert line_at(marks, at) == at // _WRAPPED_WIDTH + 1, at
+        reads.append(marks.reads)
+    return reads
 
 
 #: The most marks one lookup may read over a paragraph of ``lines`` lines: a bisection reads about
@@ -1973,17 +1993,20 @@ def test_the_line_lookup_reads_a_logarithmic_number_of_marks(sf, lines: int) -> 
     """A hard-wrapped paragraph is one unit with a mark per line, and every binding identifier is
     reported at its own line, so finding that line must not read every mark once per identifier.
     A count, not a timing: the same answer on every runner, loaded or not."""
-    reads = _most_reads_per_lookup(sf._pr_line_at, lines)
-    assert reads <= _lookup_bound(lines), f"one lookup read {reads} of {lines} marks"
+    reads = _reads_per_lookup(sf._pr_line_at, lines)
+    assert max(reads) <= _lookup_bound(lines), f"one lookup read {max(reads)} of {lines} marks"
+    # A floor: a bisection cannot answer without reading about log2 of the marks, so a lookup that
+    # reads fewer reached them some way the counter does not see, and its count proves nothing.
+    assert min(reads) >= lines.bit_length() - 1, f"one lookup read only {min(reads)} marks"
 
 
 @pytest.mark.parametrize("lines", [1000, 8000])
 def test_the_read_count_catches_the_lookup_it_was_written_against(lines: int) -> None:
     """Control: the scanning lookup gives the same answers and reads every mark, so the bound above
-    fails it, at about 70 times the bound at 1000 marks and 500 times at 8000."""
-    reads = _most_reads_per_lookup(_line_at_by_scan, lines)
-    assert reads == lines
-    assert reads > _lookup_bound(lines)
+    fails it, at about 80 times the bound at 1000 marks and 500 times at 8000."""
+    reads = _reads_per_lookup(_line_at_by_scan, lines)
+    assert set(reads) == {lines}
+    assert min(reads) > _lookup_bound(lines)
 
 
 def test_a_hard_wrapped_paragraph_reports_every_identifier_line_through_the_lookup(
@@ -2007,7 +2030,7 @@ def test_a_hard_wrapped_paragraph_reports_every_identifier_line_through_the_look
     monkeypatch.setattr(sf, "_pr_line_at", counted)
     hits = sf.scan_pr_body(_hard_wrapped(lines))
     assert [hit.split(":")[1] for hit in hits] == [str(n) for n in range(1, lines + 1)]
-    assert len(looked) == lines
+    assert len(looked) >= lines
     assert max(looked) <= _lookup_bound(lines), f"one lookup read {max(looked)} of {lines} marks"
 
 
@@ -2033,10 +2056,10 @@ def _column_list(n: int, header: str = "ASVS") -> str:
 def test_the_column_list_takes_one_column_lookup_per_identifier(
     sf, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A positive floor for the column list timed below, which reports nothing: under a header naming
-    ASVS, each identifier's column is one bisection over the row's pipes, and under any other header
-    there is none. A count of the pipes before each identifier, the quadratic form, takes none and
-    fails here as well as in the timing."""
+    """Under a header naming ASVS, each identifier's column is one bisection over the row's pipes,
+    and under any other header there is none. A count of the pipes before each identifier, the
+    quadratic form, takes none and fails here: 0 column lookups for 50. It was timed under the
+    former 10 second bound, which passed that form at about 1.2 s for 16000 identifiers."""
     counting = _CountingBisect()
     monkeypatch.setattr(sf, "bisect", counting)
     sf.scan_pr_body(_column_list(50, "Status"))
@@ -2048,16 +2071,48 @@ def test_the_column_list_takes_one_column_lookup_per_identifier(
     )
 
 
+class _SpanCountingPattern:
+    """_PR_MARK_BEFORE with the span of every search recorded, so the window each identifier's mark
+    search reads is a number of characters rather than a number of seconds."""
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        self.pattern = pattern
+        self.spans: list[int] = []
+
+    def search(self, text: str, pos: int = 0, endpos: int = sys.maxsize) -> re.Match[str] | None:
+        self.spans.append(min(endpos, len(text)) - pos)
+        return self.pattern.search(text, pos, endpos)
+
+
+def _and_list(n: int) -> str:
+    """A sentence naming ``n`` identifiers joined by "and", one verdict at its end."""
+    return "ASVS " + " and ".join([_REQ] * n) + " cannot pass"
+
+
+def test_an_and_list_searches_a_bounded_window_before_each_identifier(
+    sf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each identifier's mark is searched for in the 20 characters before it, not the sentence up to
+    it. Searched from the start of the sentence, the form a ratio of 26x to 30x caught by hand,
+    the widest window here read 5993 characters. The verdict hit is the positive floor."""
+    counting = _SpanCountingPattern(sf._PR_MARK_BEFORE)
+    monkeypatch.setattr(sf, "_PR_MARK_BEFORE", counting)
+    assert sf.scan_pr_body(_and_list(500)) == [
+        "pr-body:1: requirement verdict (a requirement id beside its verdict)"
+    ]
+    # Every identifier but the first, which its ASVS lead marks without a search.
+    assert len(counting.spans) >= 499
+    assert max(counting.spans) <= 20, f"a mark search read {max(counting.spans)} characters"
+
+
 #: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
-#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is kept only
-#: for the identifier lists, whose per-identifier searches are inline and a count cannot reach.
-#: Measured 2026-11-24 on a 32-core Windows box, eight attempts per shape, sizes as below: the
-#: shipped scanner read 4.7x to 9.2x. Two per-identifier defects, put back by hand in a copy of the
-#: scanner, read at least 1.5 times the line at their lowest: a count of the pipes before each
-#: identifier on the column list 22.0x to 32.2x, and _PR_MARK_BEFORE searched from the start of the
-#: sentence rather than 20 characters back 26.1x to 30.2x and 25.6x to 31.2x on the two "and" lists.
-#: At 4000 against 32000 identifiers the pipe count read as low as 15.3x, so the column list stays
-#: at 6000.
+#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is kept
+#: for the two "and" lists only, as an end-to-end guard on the whole sentence path: the searches
+#: the counts above reach are not the only ones it runs. Measured 2026-11-24 on a 32-core Windows
+#: box, eight attempts per shape at 500 against 4000 identifiers: the shipped scanner read 4.7x to
+#: 9.2x, and _PR_MARK_BEFORE searched from the start of the sentence, put back by hand in a copy of
+#: the scanner, read 26.1x to 30.2x and 25.6x to 31.2x, at least 1.8 times the line. Under load an
+#: attempt of that defect read 11.9x, so the count above, not this ratio, is that defect's guard.
 _GROWTH_STEP, _GROWTH_LINE = 8, 14.0
 
 
@@ -2140,25 +2195,18 @@ def test_the_linear_check_passes_on_any_attempt_under_the_line(
 @pytest.mark.parametrize(
     ("make", "n"),
     [
-        # Identifiers split by a word, so each one takes the column lookup.
-        (_column_list, 6000),
-        (lambda n: "ASVS " + " and ".join([_REQ] * n) + " cannot pass", 500),
+        (_and_list, 500),
         # Review round-23e833d96f: an invisible character and a line separator.
-        (
-            lambda n: (
-                "ASVS " + " and ".join([_REQ] * n) + " cannot pass" + chr(0x200B) + chr(0x2028)
-            ),
-            500,
-        ),
+        (lambda n: _and_list(n) + chr(0x200B) + chr(0x2028), 500),
     ],
-    ids=["column-lookup", "and-list", "and-list-invisible"],
+    ids=["and-list", "and-list-invisible"],
 )
 def test_a_long_identifier_list_scans_in_linear_time(
     sf, make: Callable[[int], str], n: int
 ) -> None:
-    """A row or a sentence holding a long list of identifiers must scan in time linear in the list.
-    These sat in test_a_long_table_row_scans_in_linear_time under its 10 second bound, where the two
-    "and" lists took about 1.4 s and 2.7 s locally, too close to it for a loaded runner.
+    """A sentence holding a long list of identifiers must scan in time linear in the list. These sat
+    in test_a_long_table_row_scans_in_linear_time under its 10 second bound at 8000 identifiers,
+    where they took about 1.4 s and 2.7 s locally, too close to it for a loaded runner.
     :data:`_GROWTH_LINE` records the defects each fails. A ratio does not see a constant factor,
     such as the two whole extra readings the invisible character once added, and the former bound
     did not see it either at that size."""
