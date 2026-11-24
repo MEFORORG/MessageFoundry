@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A keyless store's record builders refuse a float that is not finite (BACKLOG #6717 item 9).
+"""A keyless store's session, user and approval record builders refuse a float that is not finite
+(BACKLOG #6717 item 9).
 
 With a sealer, :meth:`RowSealer.seal` refuses a NaN or an infinity, because SQLite stores a NaN as
 ``NULL``. With no sealer the builders wrote an empty seal and let the value through, so a keyless
