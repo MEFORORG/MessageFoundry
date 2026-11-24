@@ -6496,13 +6496,23 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
     top) and returns the loaded flag. When no settings load (no file, or one that won't
     parse/validate), fall back to the **Settings-model default (True)** — the posture of exactly the
     default, un-overridden engine — never a hardcoded ``False``, which would make the preview diverge
-    from the engine this command exists to mirror (ADR 0104 §8.1)."""
+    from the engine this command exists to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for the caller to
+    report rather than fall back on."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import PipelineSettings, load_settings
+    from messagefoundry.config.settings import (
+        PipelineSettings,
+        SectionNameEnvError,
+        load_settings,
+    )
 
     try:
         return load_settings(config_path=service_config).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        # Raised for the caller to report: before vault BACKLOG #2600 that variable loaded with a
+        # warning and the preview read the file's flag, so a silent default here would be new.
+        raise
     except (FileNotFoundError, ValueError, ValidationError, OSError):
         return PipelineSettings().snapshot_on_send
 
@@ -6530,6 +6540,7 @@ def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
 
 
 def _dryrun(args: argparse.Namespace) -> int:
+    from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
@@ -6559,7 +6570,10 @@ def _dryrun(args: argparse.Namespace) -> int:
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture, resolved from the service
     # settings serve would load, so a site's [pipeline] value reaches the preview; the library default,
     # True, is the PipelineSettings default and applies only where nothing is passed (BACKLOG #5794).
-    snapshot_on_send = _snapshot_on_send_setting(service_config)
+    try:
+        snapshot_on_send = _snapshot_on_send_setting(service_config)
+    except SectionNameEnvError as exc:
+        return _emit_error(str(exc), as_json=args.json)
 
     show_phi: bool = args.show_phi
     if not show_phi:
@@ -14931,7 +14945,7 @@ def _alert(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from messagefoundry.config import alerts_edit
-    from messagefoundry.config.settings import AlertRule, load_settings
+    from messagefoundry.config.settings import AlertRule, SectionNameEnvError, load_settings
     from messagefoundry.pipeline.alert_sinks import (
         check_rule_recipients,
         configured_alert_transport_names,
@@ -14974,6 +14988,10 @@ def _alert(args: argparse.Namespace) -> int:
                     configured = configured_alert_transport_names(
                         load_settings(config_path=path).alerts
                     )
+                except SectionNameEnvError:
+                    # Reported by the handler below, not read as "nothing configured": before
+                    # vault BACKLOG #2600 that variable loaded with a warning (as for the next check).
+                    raise
                 except (OSError, ValueError):
                     configured = (
                         set()
@@ -14992,6 +15010,10 @@ def _alert(args: argparse.Namespace) -> int:
             if new_rule.recipients or any(step.recipients for step in new_rule.escalate):
                 try:
                     alerts = load_settings(config_path=path).alerts
+                except SectionNameEnvError:
+                    # Before vault BACKLOG #2600 that variable loaded with a warning and this check
+                    # ran; read as "no settings yet" it would skip the check, so it is reported.
+                    raise
                 except (OSError, ValueError):
                     alerts = None  # no settings yet, so no email transport sends the override
                 if (

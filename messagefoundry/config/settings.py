@@ -176,6 +176,7 @@ __all__ = [
     "DrActivationMode",
     "ServiceSettings",
     "load_settings",
+    "SectionNameEnvError",
     "store_path_refusal",
     "settings_file_path",
     "settings_error_detail",
@@ -8965,6 +8966,16 @@ def _how_to_set_in(section: str) -> str:
     return "that section has no environment layer; set it in the file"
 
 
+class SectionNameEnvError(ValueError):
+    """The refusal :func:`_reject_unknown_env_keys` raises when at least one variable it refuses is
+    a modelled section's name alone (:func:`_section_named_alone`, vault BACKLOG #2600).
+
+    A ``ValueError``, so a caller that reports a load error reports this one too. Its own class so
+    a caller that falls back to a default on a load error can tell this refusal apart and report
+    it instead: before #2600 such a variable loaded with a warning, so falling back on it would be
+    a new silent outcome on that caller's path."""
+
+
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable that names a
     modelled section and no setting in it (vault BACKLOG #2600).
@@ -9024,9 +9035,11 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     no_env_layer = sorted(set(models) - set(_SECTIONS), key=len, reverse=True)
     referenced = _env_secret_reference_names(data)
     offenders: list[str] = []
+    named_alone = False
     for name, rest in _unspared_env_names(environ, referenced):
         alone = _section_named_alone(rest, models)
         if alone is not None:
+            named_alone = True
             offenders.append(
                 f"{_printable(name)} (names the [{alone}] section and no setting; "
                 f"{_how_to_set_in(alone)})"
@@ -9050,7 +9063,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
         near = _near_env_name(section, key, model)
         offenders.append(_printable(name) + (f" (did you mean {near})" if near else ""))
     if offenders:
-        raise ValueError(
+        refusal = SectionNameEnvError if named_alone else ValueError
+        raise refusal(
             f"unrecognized environment variable(s): {', '.join(offenders)}. Each names a config "
             "section and no setting the environment can give it. It is REFUSED, not ignored — a "
             "dropped one leaves the setting it was meant to apply silently un-applied. Check the "

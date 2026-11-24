@@ -1917,8 +1917,10 @@ def _resolve_snapshot_on_send(
     loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
     **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
     never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
-    to mirror (ADR 0104 §8.1)."""
-    from messagefoundry.config.settings import PipelineSettings
+    to mirror (ADR 0104 §8.1). The exception is
+    :class:`~messagefoundry.config.settings.SectionNameEnvError`, which is raised for
+    :func:`_check_dryrun` to fail its leg with rather than fall back on."""
+    from messagefoundry.config.settings import PipelineSettings, SectionNameEnvError
 
     toml, env_only = _settings_source(
         config_dir, service_config=service_config, suppress_search=suppress_search, env=env
@@ -1929,6 +1931,10 @@ def _resolve_snapshot_on_send(
         # An instance declared in the environment alone previews its own MEFOR_PIPELINE_* value
         # (vault BACKLOG #2355), exactly as the settings legs read it.
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
+    except SectionNameEnvError:
+        # Raised for _check_dryrun to fail the leg with: before vault BACKLOG #2600 that variable
+        # loaded with a warning and the preview read the file's flag, so a silent default is new.
+        raise
     except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 
@@ -1941,6 +1947,7 @@ def _check_dryrun(
     suppress_search: bool = False,
     env: str | None = None,
 ) -> CheckResult:
+    from messagefoundry.config.settings import SectionNameEnvError
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import (
@@ -2022,9 +2029,12 @@ def _check_dryrun(
         return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
     # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
-    snapshot_on_send = _resolve_snapshot_on_send(
-        config_dir, service_config=service_config, suppress_search=suppress_search, env=env
-    )
+    try:
+        snapshot_on_send = _resolve_snapshot_on_send(
+            config_dir, service_config=service_config, suppress_search=suppress_search, env=env
+        )
+    except SectionNameEnvError as exc:
+        return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
     errors: list[str] = []
     total = 0
     pinned = 0
