@@ -2358,7 +2358,8 @@ the same permission set on the same method reds CI until it is listed here.
 > least some rows that name no channel carry `"operation"` in their detail, naming the operation
 > refused: a channel-scoped caller's config reload is one, and a web console bulk selection whose
 > name fails the rule is another. `DeniedOperation` in the same file lists the values. Some such
-> rows carry none, at least one from a per-name connection route (vault BACKLOG #3748 item 7).
+> rows carry none, at least a refused message read whose integrity tag names no channel (vault
+> BACKLOG #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -2714,8 +2715,7 @@ reload or purge whose requester has since been channel-scoped. That standing is 
 queue is listed, by the rule the release applies, so a change after the listing, or a standing
 the listing could not read, is met only at release. A `null` does not promise a release: at least
 the self-approval refusal, the expiry, the dwell floor, the row's seal and the operation's own
-refusals are met only then. The console's Approvals
-page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
+refusals are met only then. The console's Approvals page keys on `release_blocked`, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
 as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or

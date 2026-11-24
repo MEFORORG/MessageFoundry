@@ -45,10 +45,11 @@ _log = logging.getLogger(__name__)
 #: console's flag route answer with one text (BACKLOG #3378).
 CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
-#: What a refusal that names no channel by design was refusing (vault BACKLOG #3748 item 7). Each
-#: value is the audit action the operation writes when it runs, so a denial row and the row the
-#: operation would have written read alike: a config reload, its dry run, a reset of every
-#: statistic, a replay of every channel's dead letters, a purge, and a start, stop or restart.
+#: What a refused request whose row names no channel was asking for (vault BACKLOG #3748 item 7):
+#: a config reload, its dry run, a reset of every statistic, a replay of every channel's dead
+#: letters, a purge, and a start, stop or restart. Each value is the name of the audit action
+#: that operation writes when it runs and has an effect. A row names no channel either by design or
+#: because the name failed the connection-name rule, which ``"malformed_name"`` marks.
 DeniedOperation = Literal[
     "config_reload",
     "config_reload_check",
@@ -73,8 +74,8 @@ async def audit_channel_denied(
 
     ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
     wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
-    callback (``audit_channel_denied=``), which has no request in hand; there it stays NULL rather than
-    inheriting some other caller's address.
+    callback (``audit_channel_denied=``). The console's callers pass the browser's address; a caller
+    that passes none leaves it NULL rather than inheriting some other caller's address.
 
     A ``channel`` that fails the connection-name rule is recorded as no channel (BACKLOG #3031).
     Some callers pass a caller-chosen name, and at least the core handlers the console seam calls
@@ -90,26 +91,29 @@ async def audit_channel_denied(
     scope, and without the marker it would read like a request asked of the wrong engine shard. The
     direction itself is not recorded, since the console's form carries it as caller text.
 
-    ``operation`` names what a refusal that names no channel was refusing (vault BACKLOG #3748 item
-    7). The detail then carries ``"operation"`` with one of the :data:`DeniedOperation` values, so
-    two such rows from one actor are told apart. A value outside them is left out of the row and
-    logged, rather than refusing the audit: the console hands this helper its keyword through an
-    untyped seam callback. At least these rows carry none: a refusal that names a channel; a name
-    that fails the connection-name rule from a caller that passes no operation, such as the
-    per-name connection routes; and an out-of-scope message whose integrity tag names no channel."""
+    ``operation`` names what was refused when the row names no channel (vault BACKLOG #3748 item
+    7). The detail then carries ``"operation"`` with one of the :data:`DeniedOperation` values. It
+    is written only on a row that names no channel, so a row naming a channel never carries one. A
+    value outside them is left out of the row and logged, rather than refusing the audit: the
+    console hands this helper its keyword through an untyped seam callback. At least these rows
+    name no channel and carry no operation: a refused message read whose integrity tag names no
+    channel, and one whose stored row names none (:func:`read_scoped_message`)."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
         detail = {"channel": None, "malformed_name": True}
     if flag_direction_not_inbound:
         detail["flag_direction_not_inbound"] = True
-    if operation is not None:
+    if operation is not None and channel is None:
         # isinstance first: the console's value arrives untyped, and an unhashable one would
         # raise in the set test and lose the row.
         if isinstance(operation, str) and operation in _DENIED_OPERATIONS:
             detail["operation"] = operation
         else:
-            _log.warning("a channel denial named an unknown operation; the row omits it")
+            _log.warning(
+                "a channel denial for %s named an unknown operation; the row omits it",
+                identity.username,
+            )
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

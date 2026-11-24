@@ -7535,13 +7535,13 @@ def create_app(
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
             # A replay of every channel names none, so its row names the operation instead (vault
-            # BACKLOG #3748 item 7).
+            # BACKLOG #3748 item 7); the helper writes it only on a row with no channel.
             await _audit_channel_denied(
                 engine,
                 identity,
                 req.channel_id,
                 client_ip(request),
-                operation="dead_letter_replay" if req.channel_id is None else None,
+                operation="dead_letter_replay",
             )
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (

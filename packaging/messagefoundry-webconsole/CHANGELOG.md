@@ -145,8 +145,10 @@ this line.**
   destination and scope selection across the re-auth, up to the 512-character cap on `next`.
   (vault BACKLOG #3241, added item 2 and step 1)
 - **A console channel denial that names no channel says which operation it refused.** The bulk
-  start, stop and restart, the bulk purge and its confirm page write their `auth.channel_denied`
-  row with `"operation"` in its detail (`connection_control` or `connection_purge`). A bulk
+  start, stop and restart, the bulk purge and its confirm page write the `auth.channel_denied`
+  rows that name no channel with `"operation"` in their detail (`connection_control` or
+  `connection_purge`). A row the engine writes for a well-formed name it refuses names that
+  channel and carries no operation. A bulk
   selection whose name fails the connection-name rule is handed to the engine's helper, which
   writes no channel for it and marks it `"malformed_name": true`, so it is told apart from the
   confirm page's refusal. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes

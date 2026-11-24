@@ -718,7 +718,14 @@ async def test_an_unknown_denied_operation_is_left_out_and_the_row_is_still_writ
     unknown = [r for r in caplog.records if "unknown operation" in r.getMessage()]
     assert len(unknown) == 2
     await audit_channel_denied(engine, scoped, None, None, operation="connection_purge")
+    # A row that names a channel never carries an operation, whatever the caller passed.
+    await audit_channel_denied(engine, scoped, THEIRS, None, operation="connection_purge")
     assert sorted(await _denial_details(engine, actor), key=str) == sorted(
-        [{"channel": None}, {"channel": None}, {"channel": None, "operation": "connection_purge"}],
+        [
+            {"channel": None},
+            {"channel": None},
+            {"channel": None, "operation": "connection_purge"},
+            {"channel": THEIRS},
+        ],
         key=str,
     )

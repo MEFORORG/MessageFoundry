@@ -822,7 +822,13 @@ async def test_console_denials_naming_no_channel_name_their_operation(
         r = await _post_pairs(
             c,
             "/ui/connections/bulk-control",
-            [("action", "stop"), ("sel", _rowkey("source", "bad name"))],
+            [
+                ("action", "stop"),
+                ("sel", _rowkey("source", "bad name")),
+                # The control: a well-formed name the engine refuses names its channel and carries
+                # no operation.
+                ("sel", _rowkey("destination", "in1", "out1")),
+            ],
         )
         assert r.status_code == 200, r.text
         await _mint_action(c, "/ui/connections/purge-confirm")
@@ -834,7 +840,7 @@ async def test_console_denials_naming_no_channel_name_their_operation(
         assert r.status_code == 200, r.text
         assert "not applied: not a valid connection name" in r.text
     rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
-    assert [row["channel_id"] for row in rows] == [None, None, None]
+    assert sorted(row["channel_id"] or "" for row in rows) == ["", "", "", "out1"]
     details = sorted((json.loads(str(row["detail"])) for row in rows), key=str)
     # The malformed bulk selections are marked, so the bulk purge's is told apart from the confirm
     # page's refusal, which names no channel by design.
@@ -843,6 +849,7 @@ async def test_console_denials_naming_no_channel_name_their_operation(
             {"channel": None, "malformed_name": True, "operation": "connection_control"},
             {"channel": None, "malformed_name": True, "operation": "connection_purge"},
             {"channel": None, "operation": "connection_purge"},
+            {"channel": "out1"},
         ],
         key=str,
     )
