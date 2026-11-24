@@ -25,7 +25,9 @@ from messagefoundry_toolkit.anon import Keyer, anonymize_checked, load_rules
 from messagefoundry_toolkit.anon.leak import CoverageTally
 from tests._mllp_over_cap import send_over_cap, send_valid_then_over_cap
 
-_ANON_SALT = "capture-salt-0123456789abcdef"  # synthetic; long enough for the Keyer's floor
+_ANON_SALT = (
+    "capture-salt-0123456789abcdef-0123456789"  # synthetic; long enough for the Keyer's floor
+)
 # The same skip tests/test_anon_core.py carries: the leak-check loads this script by path, and an
 # installed wheel has no scripts/ tree.
 _LEAK_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "security" / "scan_forbidden.py"

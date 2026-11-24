@@ -134,7 +134,7 @@ def test_a_whole_component_mr_anywhere_is_a_hit(leak: ModuleType, value: str) ->
 @_SIDES
 def test_anonymize_checked_passes_an_unescaped_modality(anon: ModuleType) -> None:
     text = f"{_HEAD}\rOBR|1|ORD1||70553^PET&MR^C4"
-    assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef")
+    assert anon.anonymize_checked(text, salt="b224-5654-salt-0123456789abcdef-0123456789")
 
 
 @_LEAKS
@@ -175,7 +175,8 @@ def test_the_same_mr_subcomponent_beside_component_5_is_no_hit(
 def test_anonymize_checked_refuses_an_mr_subcomponent_in_component_5(anon: ModuleType) -> None:
     with pytest.raises(anon.LeakError, match=r"MRN-typed identifier in OBR-4(?!\d)"):
         anon.anonymize_checked(
-            f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}", salt="b224-5654-salt-0123456789abcdef"
+            f"{_HEAD}\r{_CODED_MR_IN_COMPONENT_5}",
+            salt="b224-5654-salt-0123456789abcdef-0123456789",
         )
 
 
@@ -219,7 +220,9 @@ def test_the_word_mr_in_ordinary_escaped_text_is_no_mrn(leak: ModuleType, segmen
 @_SIDES
 @_ORDINARY_MR_TEXT
 def test_anonymize_checked_passes_ordinary_mr_text(anon: ModuleType, segment: str) -> None:
-    assert anon.anonymize_checked(f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef")
+    assert anon.anonymize_checked(
+        f"{_HEAD}\r{segment}", salt="b224-5654-salt-0123456789abcdef-0123456789"
+    )
 
 
 def test_a_message_subcomponent_read_sees_the_type() -> None:
