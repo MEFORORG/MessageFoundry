@@ -9,15 +9,34 @@
     A rescue ref is consulted once, in the moment the original is already gone. That is the whole
     hazard: it is the one instrument whose failure surfaces only when it is too late to fix.
 
-    AND THE SECOND HAZARD IS THAT A TIDY-UP CAN DESTROY THEM, WITH NO REMOTE COPY TO RESTORE FROM.
-    A rescue ref is UNPUSHABLE BY DESIGN: `scripts/hooks/push_guard.py` carries an allowlist,
-    `PUSHABLE_NAMESPACES = ("refs/heads/", "refs/tags/")`, and refuses everything else. So a ref
-    under `refs/rescue/` has never left this machine. Deleting one and then running `gc` is
-    unrecoverable loss of the only copy, and nothing reports it.
+    AND THE SECOND HAZARD IS THAT A TIDY-UP CAN DESTROY THEM, OFTEN WITH NO REMOTE COPY TO RESTORE
+    FROM. A REF UNDER `refs/rescue/` USUALLY HAS NO REMOTE COPY, AND NOTHING HERE GUARANTEES EITHER
+    WAY. Guard A in `scripts/hooks/push_guard.py` refuses a push whose REMOTE ref name is outside
+    its allowlist (`PUSHABLE_NAMESPACES`, read it there), so an ordinary `git push` of
+    `refs/rescue/<x>` to the same name is refused where that hook is installed. It does NOT stop at
+    least: a push with `--no-verify`; a push from a clone where `install-git-hooks.ps1` never ran
+    (the hook is local); a refspec that maps the ref into an allowed name, such as
+    `refs/rescue/<x>:refs/heads/<x>`, since Guard A reads only the remote name; and a copy made by
+    anything other than `git push`. So do not assume a remote copy exists. Deleting one and then
+    running `gc` can be unrecoverable loss of the only copy, and nothing reports it.
 
-    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A `refs/rescue/` REF. Measured 2026-09-20: this
-    checkout holds 328 of them, at least one being the sole remaining copy of files deleted from the
-    working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
+    AND THE TAGS `-Anchor` WRITES ARE PUSHABLE, WHICH IS A PUBLICATION RISK, NOT A BACKUP. `-Anchor`
+    writes the local annotated tag `refs/tags/rescue/<slug>`, which is inside the allowlist. A
+    `git push --tags` or `--follow-tags` (or `push.followTags`) can sweep it to whatever remote the
+    push names, the public one included, with its message, which carries the local worktree path.
+    The same holds for any other rescue tag that lands under local `refs/tags/rescue/`, for example
+    by a fetch's tag auto-follow. Local rescue tags under `refs/tags/rescue/` include the durability
+    hook's captures, brought back by tag auto-follow, so `git push --tags` would sweep them too. An
+    `-Anchor` tag is usually local only, and must not be treated as backed up.
+
+    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits,
+    which includes at least `refs/rescue/`, `refs/tags/rescue/`, `refs/remotes/<r>/rescuetags/` and
+    `refs/remotes/<r>/rescue/` (`Get-RescueNamespaces` is the list). A `git fetch --prune` deletes a
+    remote-tracking one whose server copy is gone, which is when it may be the last copy, and
+    `--prune-tags` or `fetch.pruneTags` deletes a local tag the remote lacks, which includes every
+    `-Anchor` tag never pushed. Measured 2026-09-20: this checkout held 328 refs under
+    `refs/rescue/` alone, not a total across the namespaces above, at least one being the sole
+    remaining copy of files deleted from the working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
 
     AN AGE HEURISTIC IS NOT A SAFE FILTER, AND IT IS THE FIRST THING SUCH A TOOL REACHES FOR. Most of
@@ -105,7 +124,8 @@
 #>
 [CmdletBinding(DefaultParameterSetName = 'Check')]
 param(
-    # Write a rescue ref under refs/rescue/<slug>, capturing HEAD unless -Sha says otherwise.
+    # Write a rescue ref, the annotated tag refs/tags/rescue/<slug>, capturing HEAD unless -Sha
+    # says otherwise.
     # NOT Mandatory, ON PURPOSE: `-Sha <commit>` alone binds this set, and a Mandatory prompt there
     # hangs a caller with stdin open (tests/_no_prompt.py, vault BACKLOG #3627). The refusal is
     # right after this param block.
@@ -159,7 +179,12 @@ function Get-RescueNamespaces {
     $ns = [ordered]@{}
     $ns['refs/rescue'] = $SNAPSHOT
     $ns['refs/tags/rescue'] = $SNAPSHOT
-    foreach ($remote in (& git -C $repo remote)) {
+    # BACKLOG #7591: $LASTEXITCODE IS READ, AS THE rev-list PAIR BELOW ALREADY DID. A failed `git remote`
+    # prints nothing, which would read as "no remotes" and drop every push-updated namespace from
+    # the coverage without a word.
+    $remotes = @(& git -C $repo remote)
+    if ($LASTEXITCODE -ne 0) { throw "git remote failed (exit $LASTEXITCODE) in $repo; nothing was audited." }
+    foreach ($remote in $remotes) {
         $r = "$remote".Trim()
         if (-not $r) { continue }
         # `rescuetags` is what remote.<r>.fetch remaps refs/tags/rescue/* into here; `rescue` covers
@@ -195,6 +220,8 @@ function Get-RescueRecords {
     $prefixes = @($Namespaces.Keys)
     $fmt = "%(refname)$FS%(objectname)$FS%(*objectname)$FS%(contents)$RS"
     $raw = (& git -C $repo for-each-ref --format=$fmt $prefixes) -join "`n"
+    # A failed read is empty output, which would report zero refs examined (BACKLOG #7591).
+    if ($LASTEXITCODE -ne 0) { throw "git for-each-ref failed (exit $LASTEXITCODE) reading the rescue refs in $repo; nothing was audited." }
     foreach ($rec in ($raw -split [regex]::Escape($RS))) {
         if (-not $rec.Trim()) { continue }
         $f = $rec -split [regex]::Escape($FS)
@@ -221,8 +248,12 @@ function Get-RescueRecords {
 function Get-LocalBranchTips {
     # Read every branch tip ONCE into a lookup, for the same spawn-cost reason. A per-ref
     # `rev-parse --verify refs/heads/<name>` would reintroduce exactly the cost just removed.
+    # A failed read is an empty map, which would send every ref down the branch-gone arms as if
+    # every branch had been deleted (BACKLOG #7591).
     $map = @{}
-    foreach ($line in (& git -C $repo for-each-ref --format="%(refname:short)$FS%(objectname)" refs/heads)) {
+    $lines = @(& git -C $repo for-each-ref --format="%(refname:short)$FS%(objectname)" refs/heads)
+    if ($LASTEXITCODE -ne 0) { throw "git for-each-ref failed (exit $LASTEXITCODE) reading the branch tips in $repo; nothing was audited." }
+    foreach ($line in $lines) {
         $p = $line -split [regex]::Escape($FS)
         if ($p.Count -ge 2) { $map[$p[0].Trim()] = $p[1].Trim() }
     }
