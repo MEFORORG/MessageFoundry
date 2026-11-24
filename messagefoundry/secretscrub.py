@@ -1132,8 +1132,11 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # through :func:`scrub_credentials` alone, a line where the camelCase reading hides a member key's
 # ";" (``userPwd='a;PWD=b'``) leaves at least a PEM body on another line of that text unmasked,
 # before that line or after it. A plain member key (``Server=x;PWD=b``) does not trigger it.
-# :func:`mask_private_key_blocks_then` and ``support.redact.redact_log_text`` masked the body on
-# both orders when measured, since their key-block mask runs before this pass.
+# :func:`mask_private_key_blocks_then` over :func:`scrub_credentials` masked the body on both
+# orders when measured, since its key-block mask runs before this pass. Not so
+# ``support.redact.redact_log_text``: it splits the text at line breaks first, so the key-block
+# mask cannot match a block with real line breaks there, and a body line too short for its
+# long-base64 sweep prints, with or without the member key.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.

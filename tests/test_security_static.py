@@ -325,12 +325,15 @@ def _imported_constants(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
 
     The first holds each ``str`` imported that way. ``shadowed`` holds each name imported that way
     that the file also binds some other way, or whose value is not a ``str``; :func:`_string_constants`
-    resolves such a name to nothing, so a pattern built on it stays unresolved and pinned rather
-    than being scanned as the imported text or as the other binding's literal. Other bindings seen
+    never maps such a name, so a pattern it composes into stays unresolved and pinned rather than
+    being scanned as the imported text or as the other binding's literal. The collection, iteration
+    and bytes maps do not read ``shadowed``: a shadowed name also bound to a literal list, a bytes
+    literal or a loop over a table still resolves to that binding there. Other bindings seen
     are at least: a store, augmented-assign or ``del`` target, a parameter, a ``def`` or ``class``
     name, a type parameter, an ``except ... as`` name, a ``match`` capture, another import, and any
     attribute sharing the name, since :func:`_static_str` reads ``obj.NAME`` loosely as ``NAME``.
-    Dynamic bindings, such as ``globals()`` writes, are not seen.
+    Not seen: at least a name a star import binds, and dynamic bindings such as ``globals()``
+    writes.
     """
     values: dict[str, str] = {}
     listed: set[str] = set()
