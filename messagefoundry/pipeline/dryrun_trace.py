@@ -344,24 +344,21 @@ class _Recorder:
     # terminal classification --------------------------------------------------
 
     def record_return(self, result: object) -> None:
-        if self.kind in ("router", "handler"):
-            # A generator function returns WITHOUT running its body, so this record is structurally
-            # incomplete (no line events, no measurable sends/routed_to) — declare that rather than
-            # let a consumer read an empty record as "this handler did nothing". Set for BOTH halves:
-            # the Router gap is long-standing, the Handler gap was opened by BACKLOG #341 widening
-            # `_partition` so a generator Handler now delivers.
-            self.lazy_result = isinstance(result, Iterator)
+        # A generator function returns WITHOUT running its body, so this record is structurally
+        # incomplete (no line events, no measurable sends/routed_to) — declare that rather than let a
+        # consumer read an empty record as "this handler did nothing". Set for BOTH halves: the Router
+        # gap is long-standing, the Handler gap was opened by BACKLOG #341 widening `_partition` so a
+        # generator Handler now delivers.
         if self.kind == "router":
             # Widen the declaration for the Router half: `_routed_from` walks an allowlist, so a
             # single-pass custom iterable or a `__getitem__`-only sequence is equally untraced and
             # must say so.
-            self.lazy_result = self.lazy_result or _router_return_is_untraceable(result)
+            self.lazy_result = isinstance(result, Iterator) or _router_return_is_untraceable(result)
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
-            # The Handler half walks the same allowlist, so its declaration widens the same way
-            # (BACKLOG #6823): a single-pass custom iterable is untraced, not "sent nothing". The
-            # predicate also covers a generator, and replaces the Iterator test so the flag and
-            # `_sends_from` cannot disagree on an Iterator that subclasses a builtin container.
+            # The Handler half walks the exact types in the same allowlist (BACKLOG #6823), so a
+            # single-pass custom iterable or container subclass is untraced, not "sent nothing". The
+            # predicate also covers a generator, so the flag and `_sends_from` share one rule.
             self.lazy_result = _handler_return_is_untraceable(result)
             self.sends = _sends_from(result)
         # An "accepts" predicate (ADR 0084) returns a bool — it has neither routed_to nor sends, and its
