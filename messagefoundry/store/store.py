@@ -155,7 +155,6 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
-    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -227,6 +226,7 @@ from messagefoundry.store.row_seal import (
     revoke_seal_refusals,
     row_sealer_for_cipher,
     seal_bytes,
+    seal_chunks,
     seal_row_ref,
     transit_seal_refusals,
 )
@@ -13136,30 +13136,24 @@ class MessageStore:
                 rows = list(await cur.fetchall())
                 if not rows:
                     break
-                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
-                sealed_values = await cipher_call(
+                async for chunk, sealed_values in seal_chunks(
                     self._cipher,
-                    encrypt_many,
-                    self._cipher,
-                    [
-                        (
-                            r["v"],
-                            aad_of(r)
-                            if aad_of is not None
-                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
-                        )
-                        for r in rows
-                    ],
-                )
-                await self._update_every_row(
-                    f"UPDATE {table} SET {column}=? WHERE {where_keys}",
-                    [
-                        (value, *(r[c] for c in keys))
-                        for value, r in zip(sealed_values, rows, strict=True)
-                    ],
-                    f"{table}.{column}",
-                    exact=True,
-                )
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=True,
+                ):
+                    await self._update_every_row(
+                        f"UPDATE {table} SET {column}=? WHERE {where_keys}",
+                        [
+                            (value, *(r[c] for c in keys))
+                            for value, r in zip(sealed_values, chunk, strict=True)
+                        ],
+                        f"{table}.{column}",
+                        exact=True,
+                    )
                 sealed += len(rows)
             await self._commit()
         except BaseException as exc:
