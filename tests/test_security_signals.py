@@ -206,6 +206,28 @@ def test_a_read_that_returned_no_body_does_not_count(action: str, detail: str) -
     assert sink.signals == []
 
 
+def test_a_contended_local_sign_in_counts_once_as_a_wrong_password_does() -> None:
+    """BACKLOG #5653: a contended local sign-in writes the visible ``bad_credentials`` stand-in and
+    the hidden true row, both ``auth.login_failed``. Only the stand-in counts, so the burst signal
+    counts the sign-in once, as it counts a wrong password. RED on the head that counted both."""
+    from messagefoundry.auth.audit_visibility import LOCAL_MINT_CONTENDED_DETAILS
+
+    det, sink, _ = _detector(signin_failures=3)
+    for detail in sorted(LOCAL_MINT_CONTENDED_DETAILS):
+        _rows(det, "auth.login_failed", 3, detail=detail)
+    assert sink.signals == []  # the hidden rows alone never trip it
+    _rows(det, "auth.login_failed", 3, detail=json.dumps({"reason": "bad_credentials"}))
+    assert [c for _s, _n, c, _d in sink.signals] == [3]
+    # The directory leg's contended row is visible and has no stand-in, so it still counts.
+    det, sink, _ = _detector(signin_failures=3)
+    ad = json.dumps(
+        {"contention": "busy", "provider": "ad", "reason": "session_mint_contended"},
+        sort_keys=True,
+    )
+    _rows(det, "auth.login_failed", 3, detail=ad)
+    assert [c for _s, _n, c, _d in sink.signals] == [3]
+
+
 def test_the_withheld_directory_lock_refusal_is_not_counted() -> None:
     assert _DIRECTORY_LOCKED_DETAIL == DIRECTORY_LOCKED_REFUSAL_DETAIL
     det, sink, _ = _detector(signin_failures=3)

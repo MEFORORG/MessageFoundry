@@ -24,7 +24,7 @@ from messagefoundry_toolkit.anon import leak as engine_leak
 from tee.anon import leak as tee_leak
 from tests.test_anon_core import _NO_SCANNER
 
-_SALT = "b455-3465-salt-0123456789abcdef"
+_SALT = "b455-3465-salt-0123456789abcdef-0123456789"
 _SSN = "123-45-6789"
 #: The header and a PID under a field separator of ``-``. MSH-7 is a date, MSH-12 the version.
 _DASH_HEAD = "MSH-^~\\&-A-B-C-D-20260101--ORU^R01-M1-P-2.5.1\rPID-1--1^^^H^MR--X^Y"

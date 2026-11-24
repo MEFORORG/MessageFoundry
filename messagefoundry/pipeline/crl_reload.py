@@ -136,6 +136,7 @@ from messagefoundry.config.loaded_crls import (
     replace_held_copy,
 )
 from messagefoundry.config.tls_policy import (
+    OUTBOUND_CRL_SETTING,
     context_checks_chain_revocation,
     crl_in_effect,
     crl_label,
@@ -901,7 +902,8 @@ def _load(
     wait. A context that passes every file check and only waits takes them once the wait lifts."""
     reloaded = timed = 0
     signatures: dict[frozenset[bytes], CrlSignatureFinding | None] = {}
-    unowned: dict[frozenset[bytes], str | None] = {}  # why the own-CRL rule refuses, if it does
+    # Why the own-CRL rule refuses, if it does, per CA list and per wording (vault BACKLOG #5511).
+    unowned: dict[tuple[frozenset[bytes], bool], str | None] = {}
     for ctx, held, held_back in ready:
         if held_back is not None:
             # :data:`_RANK` picks the refusal reported, whatever the order: order only breaks a
@@ -932,9 +934,10 @@ def _load(
                 # Vault BACKLOG #5627: the rule a start applies to a hop checking the whole chain,
                 # so a CRL OpenSSL may judge a CA's clients by, and that CA did not sign, never
                 # loads live.
-                if anchors not in unowned:
-                    unowned[anchors] = own_crl_reason(anchors, pem)
-                if (unowned_why := unowned[anchors]) is not None:
+                key = (anchors, held.setting == OUTBOUND_CRL_SETTING)
+                if key not in unowned:
+                    unowned[key] = own_crl_reason(anchors, pem, outbound=key[1])
+                if (unowned_why := unowned[key]) is not None:
                     refusals.add(f"{label}: {unowned_why}", FIX)
                     continue
             if unsigned is not None:

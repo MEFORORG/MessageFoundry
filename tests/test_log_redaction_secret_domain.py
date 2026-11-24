@@ -81,14 +81,18 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import logging_setup as logging_mod
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.logging_setup import CredentialScrubFilter, _install_phi_filters
 from messagefoundry.redaction import redact_untrusted, safe_text
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
+from messagefoundry.tray import logscrub as tray_logscrub
+from messagefoundry.verify_leaf import safe_detail_text
 from tests._ast_sites import named_func
 from tests._growth import _growth_between
+from tests._pem_fixture import b64_run, pem_block, pem_marker
 
 #: A pattern that can never match, used to disable one redactor pattern for the mutation fixture.
 NEVER_MATCHES = re.compile(r"(?!x)x")
@@ -100,6 +104,10 @@ NOT_A_SECRET_PATTERN = {
     # a secret, so no secret family can or should claim it.
     "_LEADING_TS",
 }
+
+
+#: The private-key family's short body line, generated (``tests/_pem_fixture.py`` says why).
+_FAMILY_KEY_LINE = b64_run(5, 10)
 
 
 @dataclass(frozen=True)
@@ -454,6 +462,17 @@ FAMILIES: tuple[Family, ...] = (
         secret="ek-Upr_Key-12",
         patterns=("_KEY_MATERIAL",),
     ),
+    Family(
+        # A PRIVATE KEY block whose body no label pattern reads (BACKLOG #5550), on one line with
+        # escaped breaks as a log line holds it. Its last body line is short, so the long-base64
+        # sweep does not reach it.
+        name="private_key_block",
+        line="key load failed "
+        + pem_block("RSA PRIVATE KEY", "\\n", _FAMILY_KEY_LINE + "==")
+        + " for svc",
+        secret=_FAMILY_KEY_LINE,
+        patterns=("_PRIVATE_KEY_BLOCK",),
+    ),
     *QUOTED_FAMILIES,
 )
 
@@ -589,6 +608,9 @@ def test_every_secret_family_value_is_redacted(fam: Family) -> None:
     # reads the same separators (BACKLOG #5030); that word after the "=" is its mark.
     member_only = fam.patterns == ("_CONNECTION_STRING_MEMBER",)
     marker = f"={scrub_mod._MEMBER_MASK}" if member_only else REDACTION_PLACEHOLDER
+    if fam.patterns == ("_PRIVATE_KEY_BLOCK",):
+        # A key body is masked one character for one (BACKLOG #5550), so its mark is the "x" run.
+        marker = "x" * len(fam.secret)
     assert marker in out, f"{fam.name}: nothing was marked redacted -- got {out!r}"
 
 
@@ -2499,7 +2521,26 @@ def _gated_keywords() -> tuple[str, ...]:
     ``pwd``, ``://``) hold none of the folded letters and so yield no line."""
     gates = _applied_gate_names(scrub_mod, "_run")
     assert "_CREDENTIAL_HINT" in gates and len(gates) >= 6, sorted(gates)
+    # The key-block gate (BACKLOG #5550) keys on a marker, not a label with a value after it, so
+    # its fold lines are built by ``test_the_key_block_gate_admits_a_marker_spelled_with_a_fold``.
+    gates.discard("_KEY_BLOCK_HINT")
     return tuple(sorted({word for name in gates for word in getattr(scrub_mod, name)}))
+
+
+def test_the_key_block_gate_admits_a_marker_spelled_with_a_fold() -> None:
+    """A BEGIN marker spelled with a character ``(?i)`` reads as an ASCII letter is still a marker
+    the key-block pass matches, so the gate must admit it and the body must be masked."""
+    for fold in (chr(0x0130), chr(0x0131)):
+        body = b64_run(7, 8)
+        line = "\n".join(
+            (
+                pem_marker(f"BEG{fold}N", f"RSA PR{fold}VATE KEY"),
+                body,
+                pem_marker("END", "RSA PRIVATE KEY"),
+            )
+        )
+        assert scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, None) == scrub_credentials(line)
+        assert body not in scrub_credentials(line), ascii(line)
 
 
 @cache
@@ -4508,3 +4549,315 @@ def test_a_token_quoted_key_takes_no_braced_value() -> None:
         line = key_shape + '{"u": "x"} tail'
         out = scrub_credentials(line)
         assert out.endswith(f'session={CREDENTIAL_PLACEHOLDER}"u": "x"}} tail'), out
+
+
+# --- BACKLOG #5546, #5547, #5548, #5550: the masked tails are mask-only ---------------------------
+#
+# Each tail is written back masked, one character for one, after a match the tail leaves as it was.
+# So against the patterns without the tails, which ``_strip_tails``' swaps rebuild here, every
+# surface must print a line of the same length that differs only where it now reads "x". Three
+# earlier designs for these rows failed exactly that: a widened value took a later label's head, a
+# later stage shortened the line, and written spaces split an HL7 field run. The refusal criterion
+# is the design's: one corpus line of another length, or differing at a character that is not "x",
+# and the design is refuted.
+
+#: Shapes each tail takes, then shapes each refuses, with ``vq`` atoms. The last three are the guard
+#: lines the controls below need: a bytes literal holding a label, padding after a label word, and a
+#: token run glued to a camelCase label.
+_TAKEN_TAIL_SHAPES = (
+    '{"Authorization": "Basic vq1vq2=="}',
+    "{'Authorization': 'Bearer vq1.vq2-vq3=='}",
+    '{"authorization": "basic vq1+vq2/vq3=", "x": 1}',
+    "password=b'vq1 vq2'",
+    'token=b"vq1 vq2" rest',
+    "MEFOR_STORE_PW=b'vq1 vq2'",
+    "private_key=b'vq1|vq2'",
+    'Authorization: Digest username="vq1", realm="r@h", nonce="vq2", nc=00000001, response="vq3"',
+    'authorization: digest username="vq1", uri="/a:b", qop=auth',
+    pem_block("RSA PRIVATE KEY", "\n", "vq1vq2vq3+/==", "vq4vq5"),
+    pem_block("OPENSSH PRIVATE KEY", "\\n", "vq1vq2", "vq3=="),
+    pem_block(
+        "ENCRYPTED PRIVATE KEY",
+        "\n",
+        "Proc-Type: 4,ENCRYPTED",
+        "DEK-Info: AES-128-CBC,0A1B",
+        "",
+        "vq1",
+        end=False,
+    ),
+    pem_block("EC PRIVATE KEY", "\n", "vq1vq2", "trailing words vq3", end=False),
+)
+#: A query key only the installed chain's query filter reads, so only that surface masks it.
+_QUERY_TAIL_SHAPE = "code=b'vq1 vq2'&state=b\"vq3\""
+_REFUSED_TAIL_SHAPES = (
+    pem_block("PRIVATE KEY", "\n", "vq1vq2password==", "vq3"),
+    pem_block("CERTIFICATE", "\n", "vq1vq2"),
+    "password=b'vq1:vq2'",
+    '{"Authorization": "Basic vq1==;vq2"}',
+    'Authorization: Digest username="vq1"; vq2',
+    'MEFOR_X=vq0;authorization:"Basic vq1vq2=="',
+    "password=b'vq1 private_key=vq2 vq3'",
+    '{"Authorization": "Basic vq1.password=="}',
+    '{"Authorization": "Basic vq1Password:vq2"}',
+)
+
+
+_TAIL_SURFACES: tuple[tuple[str, Callable[[str], str]], ...] = (
+    ("scrub_credentials", scrub_credentials),
+    ("redact_log_line", redact_log_line),
+    ("installed chain", _through_the_installed_chain),
+    ("scrub_log_text", logging_mod.scrub_log_text),
+    ("tray chain", tray_logscrub._scrub_text),
+    ("verify detail", safe_detail_text),
+)
+
+
+def _tail_swaps() -> tuple[tuple[str, str], ...]:
+    """Every swap that takes the tails out: ``secretscrub``'s own list, and the bundle copy's marker
+    on ``digest`` put back as the copy shipped it."""
+    return (
+        *scrub_mod._TAIL_FRAGMENTS,
+        (redact_mod._MARKED_SCHEME_WORDS, redact_mod._SCHEME_WORDS),
+    )
+
+
+def _swapped(source: str, swaps: tuple[tuple[str, str], ...]) -> str:
+    """``source`` with each of ``swaps`` applied in order, by exact replace."""
+    for old, new in swaps:
+        source = source.replace(old, new)
+    return source
+
+
+def _mutated_many(
+    swaps: tuple[tuple[str, str], ...],
+) -> dict[ModuleType, dict[str, re.Pattern[str]]]:
+    """:func:`_mutated` for several swaps, each given as its text, over both copies."""
+    mutated: dict[ModuleType, dict[str, re.Pattern[str]]] = {}
+    for module in (scrub_mod, redact_mod):
+        by_name = {}
+        for name in _STOPPED_PATTERNS:
+            pattern: re.Pattern[str] = getattr(module, name)
+            by_name[name] = re.compile(_swapped(pattern.pattern, swaps), pattern.flags)
+        mutated[module] = by_name
+    return mutated
+
+
+def _patch_patterns(
+    monkeypatch: pytest.MonkeyPatch,
+    swaps: tuple[tuple[str, str], ...],
+    *,
+    key_block: re.Pattern[str],
+) -> None:
+    """``swaps`` applied to every stopped pattern of both copies and to the query filter, and
+    ``key_block`` patched in for the key-block pass."""
+    for module, by_name in _mutated_many(swaps).items():
+        for name, pattern in by_name.items():
+            monkeypatch.setattr(module, name, pattern)
+    query = logging_mod._CREDENTIAL_QUERY_RE
+    monkeypatch.setattr(
+        logging_mod, "_CREDENTIAL_QUERY_RE", re.compile(_swapped(query.pattern, swaps), query.flags)
+    )
+    monkeypatch.setattr(scrub_mod, "_PRIVATE_KEY_BLOCK", key_block)
+    monkeypatch.setattr(redact_mod, "_PRIVATE_KEY_BLOCK", key_block)
+
+
+def _tail_outputs(corpus: list[str]) -> dict[str, list[str]]:
+    return {surface: [apply(line) for line in corpus] for surface, apply in _TAIL_SURFACES}
+
+
+def _before_the_tails(monkeypatch: pytest.MonkeyPatch, corpus: list[str]) -> dict[str, list[str]]:
+    """Each surface's output over ``corpus`` with every tail and the key-block pass taken out."""
+    with monkeypatch.context() as patch:
+        _patch_patterns(patch, _tail_swaps(), key_block=NEVER_MATCHES)
+        return _tail_outputs(corpus)
+
+
+#: Shapes a review of the first tail build found breaking the invariant on some surface, kept so
+#: none comes back. Each is a later label's quote taken as a closer, a spaced label after a token,
+#: a PHI run a masked token cut short, a PEM marker after a scheme word, or a Digest label.
+_TAIL_REVIEW_SHAPES = (
+    "token=b'x+pwd'='vq1 vq2'",
+    "code=b'pwd'=vq3PID|vq4",
+    "state=b'secret'=vq5",
+    '{"Authorization": "Basic abc.password = \'vq1 vq2\'"}',
+    "Authorization: Bearer b'x(secret'={vq1 vq2}",
+    " MEFOR_X=b'pwd'=DOE JANE vq1",
+    '{"Authorization": "Basic SMITH JOHN Q',
+    "password=b'PID|x': vq1",
+    'api_key: "Basic ' + pem_block("RSA PRIVATE KEY", "\\n", "AAAA"),
+    'Authorization: Digest username="u", password="vq1 vq2" tail',
+    'Authorization: "Basic u="vq0"; password="vq1 vq2"',
+    pem_marker("BEGIN", "RSA PRIVATE KEY")
+    + " \nvq1vq2 \nvq3\n"
+    + pem_marker("END", "RSA PRIVATE KEY"),
+    # Round two: a body line ending in a label word, its value on the next line; control
+    # characters and a carriage marker inside a tail; a sweep joining masked runs.
+    pem_marker("BEGIN", "PRIVATE KEY") + "\ntoken\n: vq1 more",
+    pem_marker("BEGIN", "PRIVATE KEY") + "\nAAAA/Bearer\nvq2-tok rest",
+    pem_marker("BEGIN", "PRIVATE KEY") + "\r\nAAAA/password\r\n= vq3",
+    "vq0:pwd: b'a/b vq2'",
+    "token=b'a\x1bb'",
+    "code=b'+\x00\x00'}",
+    'Authorization: Digest username="u", nonce="mfb64:v1:QUJDREVGR0hJSktMTU5PUFFSU1RVVldY"',
+    'api_key = b"mfb64%3Av1%3AQUJD"',
+    "password=b'hunter2.abcdefghijklmnopqrstuvwxyz0123'",
+    pem_block("RSA PRIVATE KEY", "\\n", b64_run(11, 64), b64_run(12, 30) + "=="),
+)
+
+#: The pieces the tail-aware corpus joins: every tail's trigger and closers, label heads, PHI
+#: shapes and the separators between them. The two seeded corpora above hold none of the triggers,
+#: so over them alone a tail never fires (found by code review).
+_TAIL_FUZZ_PIECES = (
+    *('"Basic ', "'Bearer ", '"bearer ', "b'", 'b"', "Digest ", 'username="', ', nonce="'),
+    *(pem_marker("BEGIN", "RSA PRIVATE KEY"), pem_marker("END", "RSA PRIVATE KEY")),
+    *("\n", "\\n", "==", "=", ":", " = ", "'", '"', "'", '"', " ", " ", ",", ";", "{", "}"),
+    *("password", "pwd", "token", "private_key", "MEFOR_X", "Authorization: ", "code"),
+    *("SMITH JOHN ", "DOE JANE", "PID|", "|", "^", "2024-01-01", ".", "+", "/", "-", "AAAA"),
+    *("\n: ", "\n= ", "/Bearer", "Password", "\x1b", "mfb64:v1:", "[REDACTED]", "<redacted>"),
+)
+
+
+def _tail_fuzz_lines(count: int) -> list[str]:
+    """``count`` lines from :data:`_TAIL_FUZZ_PIECES` and ``vq`` atoms, seeded."""
+    rng = random.Random(5546)
+    return [
+        "".join(
+            f"vq{j}" if rng.random() < 0.25 else rng.choice(_TAIL_FUZZ_PIECES)
+            for j in range(rng.randint(3, 16))
+        )
+        for _ in range(count)
+    ]
+
+
+def _tail_corpus() -> list[str]:
+    return [
+        *_REVIEW_SHAPES,
+        *_TAKEN_TAIL_SHAPES,
+        _QUERY_TAIL_SHAPE,
+        *_REFUSED_TAIL_SHAPES,
+        *_TAIL_REVIEW_SHAPES,
+        *_tail_fuzz_lines(3000),
+        *_fuzz_lines(2000),
+        *_structured_lines(2000),
+    ]
+
+
+def _without_the_comparison(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Take out the comparison that keeps the output without the tails wherever the tailed one is
+    not mask-only, on every surface, so a control sees what the tail grammar alone does."""
+    for module in (scrub_mod, redact_mod, logging_mod):
+        monkeypatch.setattr(module, "_mask_only", lambda _before, _after: True)
+
+
+def _mask_only_breaches(
+    monkeypatch: pytest.MonkeyPatch,
+    shipped_swaps: tuple[tuple[str, str], ...] = (),
+    *,
+    compare: bool = True,
+) -> list[str]:
+    """Every corpus line and surface where the shipped output, with ``shipped_swaps`` applied and the
+    comparison taken out unless ``compare``, is not the output without the tails with some of its
+    characters written as "x"."""
+    corpus = _tail_corpus()
+    key_block = _swapped(scrub_mod._PRIVATE_KEY_BLOCK.pattern, shipped_swaps)
+    fragments = tuple((_swapped(f, shipped_swaps), b) for f, b in scrub_mod._TAIL_FRAGMENTS)
+    with monkeypatch.context() as patch:
+        _patch_patterns(
+            patch,
+            shipped_swaps,
+            key_block=re.compile(key_block, scrub_mod._PRIVATE_KEY_BLOCK.flags),
+        )
+        # So ``_pre_camel`` and ``_without_tails`` strip the loosened tails, as the shipped ones.
+        patch.setattr(scrub_mod, "_TAIL_FRAGMENTS", fragments)
+        if not compare:
+            _without_the_comparison(patch)
+        new = _tail_outputs(corpus)
+    old = _before_the_tails(monkeypatch, corpus)
+    breaches = []
+    for surface, _apply in _TAIL_SURFACES:
+        for line, before, after in zip(corpus, old[surface], new[surface], strict=True):
+            if len(before) != len(after) or any(
+                b != a and a != "x" for b, a in zip(before, after, strict=True)
+            ):
+                breaches.append(f"{surface}: {line!r}\n  before {before!r}\n  after  {after!r}")
+    return breaches
+
+
+def test_every_tail_is_mask_only_on_every_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE INVARIANT. Over the review shapes, the tail shapes and both seeded corpora, on
+    ``scrub_credentials``, ``redact_log_line`` and the installed chain: each output has the length
+    of the output without the tails, and differs from it only at an "x"."""
+    breaches = _mask_only_breaches(monkeypatch)
+    assert not breaches, f"{len(breaches)} breaches, first: {breaches[:3]}"
+
+
+def test_each_taken_tail_shape_is_masked_on_every_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The invariant is vacuous if no tail fires: each taken shape must differ from its output
+    without the tails, on every surface."""
+    corpus = list(_TAKEN_TAIL_SHAPES)
+    assert len(corpus) >= 1
+    old = _before_the_tails(monkeypatch, corpus)
+    new = _tail_outputs(corpus)
+    for surface, _apply in _TAIL_SURFACES:
+        if surface in ("verify detail", "scrub_log_text"):
+            # Each reads without the tails on purpose; verify_leaf and scrub_log_text say why. So
+            # each must print what it printed before them.
+            assert new[surface] == old[surface], surface
+            continue
+        same = [
+            line for line, a, b in zip(corpus, old[surface], new[surface], strict=True) if a == b
+        ]
+        assert not same, f"{surface} masked nothing on {same}"
+    chain = _through_the_installed_chain(_QUERY_TAIL_SHAPE)
+    assert "vq1" not in chain and "vq3" not in chain, chain
+
+
+@pytest.mark.parametrize("line", _REFUSED_TAIL_SHAPES)
+def test_a_refused_tail_shape_prints_byte_for_byte_as_before(
+    line: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    new = _tail_outputs([line])
+    assert new == _before_the_tails(monkeypatch, [line])
+
+
+@pytest.mark.parametrize(
+    ("guard", "loosened"),
+    (
+        ("_BYTES_CHARS", "[^'\"{\\r\\n]"),
+        ("_NO_LABEL_BEFORE", ""),
+        ("_TAIL_END", ""),
+    ),
+    ids=("bytes-holds-a-colon", "padding-after-a-label-word", "no-end-rule"),
+)
+def test_the_invariant_sees_each_tail_guard_removed(
+    guard: str, loosened: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE POSITIVE CONTROLS FOR THE GRAMMAR. The comparison would hide a loosened guard, so it is
+    taken out on both sides here: each guard of the tail grammar, loosened in every stopped pattern
+    of both copies and in the query filter, must then make the invariant find more breaches than
+    the grammar alone leaves. The bytes literal that may hold ":" or "=", the padding refused after
+    a label word, and the end rule."""
+    fragment: str = getattr(scrub_mod, guard)
+    assert any(fragment in getattr(scrub_mod, name).pattern for name in _STOPPED_PATTERNS)
+    grammar_alone = len(_mask_only_breaches(monkeypatch, compare=False))
+    loosened_count = len(_mask_only_breaches(monkeypatch, ((fragment, loosened),), compare=False))
+    assert loosened_count > grammar_alone, (
+        f"with {guard} loosened the invariant found {loosened_count} breaches, against "
+        f"{grammar_alone} with it in place, so it cannot see that guard"
+    )
+
+
+def test_the_comparison_is_what_keeps_the_tails_mask_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE POSITIVE CONTROL FOR THE COMPARISON. Over the same corpus, with the comparison taken out,
+    the tail grammar alone breaks the invariant somewhere, so the green invariant above is the
+    comparison's work, and the invariant can see the comparison removed."""
+    assert _mask_only_breaches(monkeypatch, compare=False), "the grammar alone breaks nothing"
+
+
+def test_a_scheme_token_after_an_earlier_plain_value_still_prints() -> None:
+    """A RESIDUAL. The earlier value runs on over ``authorization:"`` and no tail follows it, so the
+    token prints as it did before. Stopping that value before the label, as a quoted scheme-token
+    branch of ``_QUOTED_LABEL`` would, shortens the earlier match and breaks the invariant above."""
+    line = 'MEFOR_X=a;authorization:"Basic vq1vq2=="'
+    for _surface, apply in _TAIL_SURFACES:
+        assert "vq1vq2" in apply(line)

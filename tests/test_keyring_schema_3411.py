@@ -188,7 +188,7 @@ def test_each_server_check_refuses_a_store_without_the_keyring(backend: str) -> 
     """The verifier expects what the batch declares: a store provisioned before the keyring existed
     is refused until it is provisioned again, and one with it passes."""
     declared = pg_declared() if backend == "postgres" else mssql_declared()
-    assert server_schema_differences(declared, declared, {}) == []
+    assert server_schema_differences(declared, declared) == []
     columns = {t: set(c) for t, c in declared.columns.items() if t != "keyring"}
     before = live_shape(columns, dict(declared.named_indexes))
-    assert server_schema_differences(declared, before, {}) == ["table 'keyring' is missing"]
+    assert server_schema_differences(declared, before) == ["table 'keyring' is missing"]

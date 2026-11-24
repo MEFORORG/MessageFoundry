@@ -2302,8 +2302,10 @@ def test_the_seventh_sweep_offers_no_mtls_remedy_and_states_which_locks_double()
     doubling = (
         "The second-step lock doubles per cycle up to `lockout_max_minutes` on every local "
         "account, and the sign-in lock does so on a local account with a TOTP enrolled unless "
-        "the engine KNOWS this release refuses that enrolment: a TOTP whose cell does not open, "
-        "or whose value will not compute, still escalates. It does so too on a local account "
+        "the engine KNOWS this release refuses that enrolment (at least a marker it refuses, "
+        "BACKLOG #3422, a key under 160 bits, BACKLOG #5340, or no secret): a TOTP it cannot "
+        "judge, as [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068) says, still escalates. "
+        "It does so too on a local account "
         "holding a discoverable passkey under the configured relying party (BACKLOG #3937). "
         "Every other lock keeps "
         "`lockout_minutes`. A local account whose enrolment is known to be refused, and that holds "
@@ -2520,7 +2522,9 @@ def test_the_ninth_sweep_probes_the_amendment_a_order_in_the_code() -> None:
             # Item 6: once TOTP is on, a covered account cannot remove it while no DISCOVERABLE
             # passkey remains; this one is not discoverable ...
             # (enable_totp needs a staged secret, BACKLOG #2224.)
-            staged_cell = await store.set_totp_secret(identity.user_id, secret="JBSWY3DPEHPK3PXP")
+            staged_cell = await store.set_totp_secret(
+                identity.user_id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+            )
             assert await store.enable_totp(
                 identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
             )
