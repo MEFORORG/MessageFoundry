@@ -139,6 +139,7 @@ from messagefoundry.store.crypto import (
     AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
+    AuditKeyVersionUnverifiedError,
     AuditMacFn,
     AuditMacMalformedError,
     AuditMacVerifier,
@@ -10264,14 +10265,19 @@ async def settle_transit_bound_attestation(
     Transit MAC) and the constant-time compare. It walks no chain, so it costs one MAC. A MAC
     provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
     that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
-    start: a refused key version, such as one a forged hash names, says the MAC does not verify,
-    and any other failure that the MAC could not be checked (vault BACKLOG #6707 item 24)."""
+    start. A key version refused by Vault's own reply, such as one a forged hash names, says the
+    MAC does not verify; at least a 400 not read as a version refusal and an outage that raises
+    :class:`CipherError` say the MAC could not be checked (vault BACKLOG #6707 item 24). A timeout
+    on both asks is not raised here: :func:`_audit_row_mac` reads it as a MAC that does not
+    verify."""
     attestation = read.attestation
     if attestation is None or read.mac_check is None:
         return attestation
     seq = read.mac_check[0]["seq"]
     try:
         verified = await _audit_row_mac_verifies(*read.mac_check)
+    except AuditKeyVersionUnverifiedError as exc:  # no verdict on the MAC, so not "does not verify"
+        return replace(attestation, audit_gap=f"audit row {seq}'s MAC could not be checked: {exc}")
     except AuditKeyVersionRefusedError as exc:  # evidence about the row, as the walk reads it
         return replace(attestation, audit_gap=f"audit row {seq}'s MAC does not verify: {exc}")
     except CipherError as exc:

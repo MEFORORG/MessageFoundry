@@ -627,6 +627,9 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
 
     transit = _ProxiedRotatingTransit() if proxied else _RotatingTransit()
     error = AuditKeyVersionUnverifiedError if proxied else AuditKeyVersionRefusedError
+    # A refusal in Vault's own words is evidence the MAC does not verify; a proxy's page gives no
+    # verdict, so its gap says the MAC could not be checked (vault BACKLOG #6707 item 24).
+    verdict = "could not be checked" if proxied else "does not verify"
     _use_fake(monkeypatch, transit)
     db = tmp_path / "forged-version.db"
     store = await _transit_store(db)
@@ -639,14 +642,12 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     try:
         got = await again.get_transit_bound_attestation()
         # The whole gap text, so it is the expected outcome and no other: an AssertionError in the
-        # fake, or any other CipherError, also writes a gap starting "audit row", and
-        # must fail here.
+        # fake, or any other CipherError, also writes a gap starting "audit row", and must fail
+        # here.
         assert got is not None
         assert got.audit_gap == (
-            f"audit row {recorded.audit_seq}'s MAC does not verify: {error(_UNHELD_VERSION)}"
+            f"audit row {recorded.audit_seq}'s MAC {verdict}: {error(_UNHELD_VERSION)}"
         ), got.audit_gap
-        if proxied:
-            assert "Transit refused" not in got.audit_gap, got.audit_gap
         # The refusal came from Transit's verify, at the planted version.
         assert transit.verified == [_UNHELD_VERSION], transit.verified
     except BaseException:
@@ -1536,12 +1537,10 @@ def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_no_refused_versi
 ) -> None:
     """Vault BACKLOG #6707 item 73: the probe clears a 400 as a refused version only when it
     answers a well-formed Transit MAC naming another version, the same parse the fixed-input check
-    and the writer apply. An empty or versionless answer is a service that cannot MAC, not evidence about
-    the row, so the check could not run rather than read as a planted version."""
-    from messagefoundry.store.crypto import AuditKeyVersionRefusedError
-
+    and the writer apply. An empty or versionless answer is a service that cannot MAC, not
+    evidence about the row, so the check could not run: the plain error, no subclass."""
     refused = _verify_refusal(answer)
-    assert not isinstance(refused, AuditKeyVersionRefusedError), refused
+    assert type(refused) is CipherError, refused
 
 
 @pytest.mark.parametrize(
@@ -1650,7 +1649,6 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
         "version refusal, so its cause is unknown: the key may not hold that version, its "
         "policy may retire it, or the check was refused for another reason"
     )
-    assert "could not be confirmed" not in str(refused)
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
 
 

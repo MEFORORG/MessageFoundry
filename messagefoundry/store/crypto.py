@@ -891,8 +891,9 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
 
     def __str__(self) -> str:
         # "Not read as" holds also for a body too long to read and a read that faulted. It names
-        # every cause the reply leaves open, a refusal for another reason among them, so the alert
-        # reads as an unknown cause rather than an outage (vault BACKLOG #6707 items 11 and 25).
+        # at least the causes the reply leaves open, a refusal for another reason among them, so
+        # the alert reads as an unknown cause rather than an outage (vault BACKLOG #6707 items 11
+        # and 25).
         return (
             f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
             "read as a version refusal, so its cause is unknown: the key may not hold that "
