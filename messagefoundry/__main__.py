@@ -5890,7 +5890,8 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
-    # Vault BACKLOG #2700: first, for the reason `_serve` gives. The supervisor holds the same
+    # Vault BACKLOG #2700: first, as in `_serve`. `install_remote_debug_guard` says what a call
+    # after the module-level one (vault BACKLOG #2742) does. The supervisor holds the same
     # environment its shards do, secrets included.
     install_remote_debug_guard()
 
