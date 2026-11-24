@@ -1327,7 +1327,12 @@ class _FakeSqlLeaseStore:
         return self._db.claim(owner, float(ttl), float(delay))  # type: ignore[arg-type]
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, object] | None:
         # The claim and the paused owner read (BACKLOG #5064); the clamp is not modelled here.
         return await self._fetchone(sql, params)

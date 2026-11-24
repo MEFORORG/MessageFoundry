@@ -154,8 +154,8 @@ class SqlServerCoordinator:
         # seed, which keeps [store].command_timeout (config_version). Each clamped one is the renew,
         # runs under _leadership_lock, or runs in the loop's side pass, which a statement at
         # [store].command_timeout would hold for that long. SqlServerStore._fetchone_clamped says
-        # how it is applied, what one costs on a clamp under 2 s, where the borrow and statement
-        # cannot share its deadline, what the rollback adds, and why the COMMIT is outside it. Since BACKLOG #5710 the heartbeat and
+        # how it is applied, why one costs up to about twice the clamp, three times when its
+        # rollback runs, and why the COMMIT is outside it. Since BACKLOG #5710 the heartbeat and
         # the refresh no longer delay the renew (run_maintenance_loop), so the gap between two
         # renews is the heartbeat interval or the renew's own cost, whichever is longer; nothing
         # checks that cost against the fence. The paused tick's owner read takes the smaller of
@@ -338,10 +338,10 @@ class SqlServerCoordinator:
 
     async def _refresh_config_version(self) -> int:
         """:meth:`config_version` under the renew clamp, for the maintenance loop's side pass
-        (BACKLOG #6472, #5710). The clamp is the Postgres bound only from 2 s up, where the borrow
-        and statement share its deadline (BACKLOG #5064); under it the call can take the borrow plus
-        a 1 s statement, and on any clamp a rollback adds up to the clamp again, plus a COMMIT
-        nothing is known to bound (SqlServerStore._fetchone_clamped)."""
+        (BACKLOG #6472, #5710). The clamp is not the same bound as on Postgres:
+        there the borrow and statement share one deadline, while here each gets the clamp, so the
+        call can take about twice it, three times when a rollback runs, plus a COMMIT nothing is
+        known to bound (SqlServerStore._fetchone_clamped)."""
         return await self._read_config_version(self._renew_timeout)
 
     async def _read_config_version(self, clamp: float | None) -> int:
@@ -642,7 +642,9 @@ class SqlServerCoordinator:
                 self._no_claim_until = 0.0
                 self._last_renew_ok = None  # BACKLOG #5711; DbCoordinator's lift says why
             return False
-        # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout.
+        # ADR 0157 Inc 0: the statement runs under the renew clamp, not [store].command_timeout,
+        # and its borrow and statement share the clamp's deadline (BACKLOG #5064): only the claim
+        # re-extends the lease, so only it must not land past the clamp.
         row = await self._store._fetchone_clamped(
             "SET NOCOUNT ON;"
             f" DECLARE @now FLOAT = {_DB_NOW};"
@@ -668,6 +670,7 @@ class SqlServerCoordinator:
                 self._lease_ttl,  # INSERT lease_expires_at
             ),
             timeout_clamp=self._renew_timeout,
+            share_deadline=True,
         )
         if row is None or row["owner"] != self.node_id:
             # The DB saw another owner's live lease; see DbCoordinator._claim_or_renew_lease (#1508).
@@ -765,8 +768,7 @@ class SqlServerCoordinator:
             elif arming:
                 # Armed a SECOND time from the instant the write returned, taking the later expiry, so
                 # the write's own duration is not spent out of the pause. Its borrow, statement and
-                # rollback take up to about twice the clamp, three times under a 2 s clamp
-                # (SqlServerStore._fetchone_clamped), but its COMMIT is not known to be
+                # rollback take up to about three times the clamp, but its COMMIT is not known to be
                 # bounded at all (SqlServerStore._fetchone_clamped), so the write as a whole is
                 # still unbounded. DbCoordinator's step_down_leadership carries the full reasoning;
                 # keep the two in lockstep.

@@ -14,12 +14,12 @@
 > (yes, bounded, abandon-don't-await) were decided by the owner. The SQL Server renew clamp (Inc 0,
 > deviation 3) was BUILT on 2026-10-30 (BACKLOG #1497); the as-built note is at deviation 3. At least
 > these residuals stay open: the same-process re-promotion case (Consequence 1c); on SQL Server,
-> under a clamp below 2 s, a renew that can land up to its borrow plus a 1 s statement after it is
-> issued, while the margin check compares the clamp alone; the SQL Server claim's COMMIT, which the
-> clamp does not bound. **CORRECTED 2026-11-23 (BACKLOG #5064):** this residual read "a renew that
-> can land up to about twice the clamp after it is issued, because its borrow and its statement
-> each get the full clamp"; from a 2 s clamp up the two now share one deadline, as deviation 3's
-> last note says. **CORRECTED 2026-11-09 (BACKLOG #5064):** this
+> under a clamp below 2 s, a renew whose whole-second statement can overrun the clamp by up to 1 s;
+> the SQL Server claim's cursor creation and COMMIT, which the clamp does not bound.
+> **CORRECTED 2026-11-24 (BACKLOG #5064):** the SQL Server residual read "a renew that can land up
+> to about twice the clamp after it is issued, because its borrow and its statement each get the
+> full clamp"; the claim's borrow and statement now share one deadline, as deviation 3's last note
+> says. **CORRECTED 2026-11-09 (BACKLOG #5064):** this
 > list also named the SQL Server heartbeat, config-version refresh and stepdown release as running
 > under `[store].command_timeout`; they now run under the clamp, as the claim does.
 >
@@ -425,16 +425,16 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    refusal never draws it. Such a clamp passing with little headroom, or a derived one stepped
 >    down, therefore logs nothing. At least a fractional clamp, such as the stock derived 4.5, or a
 >    clamp above a timeout that caps it, can still draw it.
->    **As built since BACKLOG #5064 (2026-11-23), the borrow and the statement share one deadline
->    from a 2 s clamp up**, so the sentences above that say they never do, and the twice-the-clamp
->    bound, describe the build before it. The borrow waits at most the clamp less 1 s, the
->    statement gets the whole seconds the borrow left, and a borrow that leaves under 1 s issues no
->    statement (`config.settings._sqlserver_clamp_windows`, `SqlServerStore._statement_timeout_left`),
->    so the renew is in flight for at most the clamp, short of its COMMIT, as on Postgres. Under a
->    2 s clamp a whole-second statement cannot share the deadline, and the old shape stays: a borrow
->    of up to the clamp plus a 1 s statement, which `_sqlserver_renew_bounds` checks. The warning's
->    `2 * clamp >= margin` predicate is unchanged, so the stock 10/20/30 still draws it; it now
->    stands for the headroom the unbounded COMMIT needs, not for a second clamp-long window.
+>    **As built since BACKLOG #5064 (2026-11-24), the lease claim's borrow and statement share one
+>    deadline**, so for the claim the sentences above that say they never do, and its
+>    twice-the-clamp bound, describe the build before it. The borrow waits at most the clamp less
+>    1 s, never under 1 s; the statement timeout is cut to the whole seconds the borrow left, and a
+>    borrow that leaves under 1 s issues no statement (`SqlServerStore._fetchone_clamped`,
+>    `share_deadline`). From a 2 s clamp up the statement timeout expires within the clamp; under
+>    2 s it runs at 1 s and can overrun by up to a second. The heartbeat, refresh and release keep
+>    two windows, since none re-extends the lease. The load check and the warning are unchanged:
+>    the check still counts two windows, so no config it refused loads, and the warning now
+>    stands for the headroom the unbounded COMMIT needs.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
 >    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.
