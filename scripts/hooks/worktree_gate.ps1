@@ -1221,15 +1221,16 @@ function Test-TrueSeparatorIn([string]$Text) {
 # COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
 # command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
 # pass re-reads that text and re-asks git about the invocations in it; Invoke-GitRead answers a repeated
-# git question from its cache, so a later pass spawns git only for a question no earlier pass asked,
-# or one whose only answer so far is a failure. A hoist is not cut down to its own segment: the text before it carries the chdir and the assignments
-# the hoist exists to read (`cd <p> && echo $(date); git -C <o> log $(git reset --hard)`). Before the
-# cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of
-# 2026-11-23). With it, on one loaded Windows box the same day, the slowest of the five TIMED shapes in
-# tests/test_worktree_gate_added_command_readings.py took 9.9 s, against 2.2 s at origin/main and
-# 18.5 s before the cache: a hoist that names a repository no earlier pass named still costs its own
-# git calls and a pass of the rules. Under the 60 s timeout a slow run blocks the command rather than letting it through
-# (install-gate.ps1 installs `onFailure = block`).
+# git question from its cache, by the rule its own note states. A hoist is not cut down to its own
+# segment: the text before it carries the chdir and the assignments the hoist exists to read (`cd <p>
+# && echo $(date); git -C <o> log $(git reset --hard)`). Before the cache, the Lander measured 7.8 s,
+# 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of 2026-11-23). With it, on one
+# loaded Windows box the same day, the slowest of the five TIMED shapes in
+# tests/test_worktree_gate_added_command_readings.py, whose `-C` paths name no directory, took 9.9 s in
+# one run and 17.7 s in a later one, against 2.2 s and 3.2 s at its BASELINE commit 1983d8eb79a and
+# 18.5 s and 19.5 s before the cache. The extra passes, not git, are most of what is left: each hoist
+# re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
+# than letting it through (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
@@ -3265,14 +3266,16 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 "@
 }
 
-# EVERY GIT CALL THIS HOOK MAKES IS A READ, AND EACH IS ASKED ONCE PER RUN (BACKLOG #5655 step 3 review).
-# Get-AddedCommandReadings hands rules 3c, 3d, 3 and 3b up to eleven strings, and each pass asked git
-# again what an earlier pass had asked: a hoisted string carries the command's earlier lines, so their
-# invocations were resolved once per hoist. Its COST note has the measured times. Get-RootCommonDirCmp
-# and Get-CommonDirAnswer kept their own caches before this one, and still do; this one covers every
-# call, theirs included. The cache is keyed by the argument list, with the one fold below, and it keeps
-# the output lines and the exit code, which it puts back in $LASTEXITCODE, so a caller reads what the
-# git call would have given it; a failure is asked twice before it is kept. The hook runs
+# EVERY GIT CALL THIS HOOK MAKES IS A READ, AND INVOKE-GITREAD CACHES ITS ANSWER (BACKLOG #5655 step 3
+# review). Get-AddedCommandReadings hands rules 3c, 3d, 3 and 3b up to eleven strings, and each pass
+# asked git again what an earlier pass had asked: a hoisted string carries the command's earlier lines,
+# so their invocations were resolved once per hoist. Its COST note has the measured times. The cache is
+# keyed by the argument list, with the one fold below, and it keeps the output lines and the exit code,
+# which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
+# rule for a failed answer is stated once, in the function. Get-RootCommonDirCmp and
+# Get-CommonDirAnswer kept their own caches before this one, and still do; those two keep their FIRST
+# answer, a failure included, and never ask again, so for rule 3c's and 3d's common-dir questions one
+# failed spawn still decides the run, as it did before this cache. The hook runs
 # before the tool call, so nothing it judges has run yet; another process could still change the
 # repository during the run, as it could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3290,10 +3293,12 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    # A FAILED ANSWER IS ASKED ONCE MORE before it is kept. Uncached, a failed call was asked again by
-    # the next pass, so one spawn that failed under load did not decide the run; a failure is replayed
-    # only once it has failed twice. A question that cannot succeed, such as a `-C` that names no
-    # directory, then costs two spawns rather than one.
+    # A FAILED ANSWER IS ASKED ONCE MORE before it is kept, and replayed once it has failed twice. A
+    # question that cannot succeed, such as a `-C` that names no directory, then costs two spawns rather
+    # than one. This retries less than no cache did: uncached, each ask spawned git, and rule 3b's
+    # `worktree list` for one tree was asked about four times on Windows (two spellings, two path
+    # forms), so a failure that cleared by the third ask could still be read; here it is not. The
+    # common-dir callers' own caches keep their first answer and do not reach this retry at all.
     $hit = $null
     if (-not ($gitReadCache.TryGetValue($key, [ref]$hit) -and ($hit.Code -eq 0 -or $hit.Fails -ge 2))) {
         $fails = $(if ($null -ne $hit) { $hit.Fails } else { 0 })
@@ -3482,8 +3487,8 @@ function Test-GovernedEitherForm([string]$Path, [string]$Base) {
 # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
 # SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
 #
-# Cached because the roots cannot change within one invocation; Invoke-GitRead caches the two git calls
-# under it as well, so this cache now saves only the path folding. Rule
+# Cached because the roots cannot change within one invocation; it keeps its first answer, a failed
+# git call included, whatever Invoke-GitRead would do with a second ask. Rule
 # 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
 $rootCommonCache = @{}
 function Get-RootCommonDirCmp($Root) {
