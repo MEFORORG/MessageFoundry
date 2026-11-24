@@ -821,14 +821,23 @@ def test_list_names_an_unreadable_record_and_still_lists_the_good_one(tmp_path: 
     (reg / "0008.json").write_text("{not json", encoding="utf-8")
     (reg / "0009.json").write_text("", encoding="utf-8")
     (reg / "0010.json").write_text("[1, 2]", encoding="utf-8")
+    # A one-element array holding this tree's record is not a record: it must not be unwrapped.
+    (reg / "0011.json").write_text(
+        '[{"number":"0011","worktree":"' + top + '"}]',
+        encoding="utf-8",
+    )
 
     listed = _run(repo, "-List")
     combined = listed.stdout + listed.stderr
     assert listed.returncode == 0, combined
-    assert re.search(r"^adr allocated to this worktree: 0007$", listed.stdout, re.MULTILINE), (
-        combined
-    )
-    for bad in ("0008.json", "0009.json", "0010.json"):
+    # The summary says it is incomplete, because a skipped record may be this tree's own.
+    assert re.search(
+        r"^adr allocated to this worktree: 0007 -- INCOMPLETE: 4 unreadable",
+        listed.stdout,
+        re.MULTILINE,
+    ), combined
+    assert re.search(r"^backlog allocated to this worktree: \(none\)$", listed.stdout, re.MULTILINE)
+    for bad in ("0008.json", "0009.json", "0010.json", "0011.json"):
         assert bad in listed.stderr, f"-List did not name the unreadable record {bad}:\n{combined}"
     assert "0007.json" not in listed.stderr, combined
 
@@ -858,9 +867,22 @@ def test_an_unreadable_high_water_file_refuses_instead_of_lowering_the_floor(
     assert watermark.read_text(encoding="ascii") == body, "the refusal rewrote the high-water file"
 
 
-def test_the_high_water_file_is_replaced_whole_and_leaves_no_temp(tmp_path: Path) -> None:
-    """The ratchet write goes through a temp file and one rename. The control is the read-back: the
-    value an allocation leaves is the floor it allocated above, and no temp file is left behind."""
+def test_a_high_water_path_that_cannot_be_read_refuses(tmp_path: Path) -> None:
+    """Only a MISSING high-water file reads as absent. A path that exists but cannot be read (here a
+    directory in its place) refuses; a ``Test-Path`` probe would also answer ``$false`` for an
+    unreachable share and read the ratchet as 0."""
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    reg = _registry(repo)
+    (reg / ".floor-highwater").mkdir()
+    shown = _run(repo, "-ShowFloor", "-Kind", "adr")
+    assert shown.returncode != 0, shown.stdout + shown.stderr
+    assert "REFUSING TO REPORT A FLOOR" in shown.stdout + shown.stderr
+
+
+def test_the_high_water_write_leaves_the_floor_and_no_temp(tmp_path: Path) -> None:
+    """The ratchet write goes through a temp file and one rename. NOT A CONTROL FOR ATOMICITY: the old
+    truncate-then-write passes this too. It pins the outcome -- the value an allocation leaves is the
+    floor it allocated above -- and that the temp file is cleaned up."""
     repo = _checkout(tmp_path / "repo", {"0042-first.md": "# First\n"})
     reg = _registry(repo)
     (reg / ".floor-highwater").write_text("40\n", encoding="ascii")
@@ -884,3 +906,17 @@ def test_a_wildcard_character_in_the_registry_path_keeps_the_ratchet(tmp_path: P
     assert _floor(repo) == 60
     (reg / ".floor-highwater").unlink()
     assert _floor(repo) == 50
+
+    # The write and the re-entrancy scan under the same path: an allocation lands above the
+    # registry's number and records the ratchet, and a re-run for the same title finds its record.
+    first = _run(repo, "-Kind", "adr", "-Title", "bracket probe", "-NoFetch")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert "ALLOCATED ADR 0051" in first.stdout, first.stdout
+    assert (reg / ".floor-highwater").read_text(encoding="ascii").strip() == "50"
+    again = _run(repo, "-Kind", "adr", "-Title", "bracket probe", "-NoFetch")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "REUSING ADR 0051" in again.stdout, again.stdout
+    listed = _run(repo, "-List")
+    assert re.search(r"^adr allocated to this worktree: 0051$", listed.stdout, re.MULTILINE), (
+        listed.stdout + listed.stderr
+    )

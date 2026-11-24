@@ -217,20 +217,28 @@ if ($List) {
         # "Stop", ended the whole listing; an empty file (the shape a kill between CreateNew and the
         # write leaves) or a non-object body parsed to something with no fields. -List only reports,
         # so skipping is safe: the floor keys on file NAMES and still counts a number whose body is bad.
-        # -LiteralPath, because a `[` in the registry path is a wildcard to -Path and lists nothing.
+        # The summary line says how many it skipped, because a skipped record may be this tree's own.
+        #
+        # -LiteralPath HERE AND AT EVERY REGISTRY READ BELOW: a `[` in the registry path is a wildcard
+        # to -Path, which then lists nothing. Measured on a fixture under `wild[1]`: the floor fell
+        # from 60 to the refs' 1, so a used number would read free.
+        $skipped = 0
         $mine = @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
                 $c = $null
                 $why = "it is empty or is not a JSON object"
-                try { $c = Read-CoordText $_.FullName | ConvertFrom-Json } catch { $why = ConvertTo-Safe $_.Exception.Message }
+                # -NoEnumerate, so a one-element array is not unwrapped into the object inside it.
+                try { $c = Read-CoordText $_.FullName | ConvertFrom-Json -NoEnumerate } catch { $why = ConvertTo-Safe $_.Exception.Message }
                 # The full type name, not the [pscustomobject] accelerator: that names PSObject, and
                 # MEASURED, an empty file's $null passed `-isnot [pscustomobject]` as an object.
                 if ($null -eq $c -or $c -isnot [System.Management.Automation.PSCustomObject]) {
                     [Console]::Error.WriteLine("alloc.ps1: WARNING -- allocation record $($_.FullName) could not be read ($why), so it is left out of this list.")
+                    $skipped++
                     return
                 }
                 if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-CoordRecordIsHere $c)) { $c }
             })
-        Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
+        $incomplete = if ($skipped) { " -- INCOMPLETE: $skipped unreadable record(s) skipped, named on stderr" } else { "" }
+        Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })$incomplete"
     }
     return
 }
@@ -589,8 +597,7 @@ function Get-Floor {
     }
 
 
-    # -LiteralPath: a `[` in the registry path is a wildcard to -Path, which then lists nothing and
-    # drops every allocated number from the floor (BACKLOG #7560).
+    # -LiteralPath, for the wildcard reason at the -List block (BACKLOG #7560).
     foreach ($f in (Get-ChildItem -LiteralPath $alloc -Filter *.json -EA SilentlyContinue)) {
         $n = 0
         if ([int]::TryParse($f.BaseName, [ref]$n)) { $seen.Add($n) }
@@ -634,11 +641,23 @@ function Get-Floor {
     # A HIGH-WATER FILE THAT IS THERE BUT IS NOT A WHOLE NUMBER REFUSES (BACKLOG #7560). The read used
     # to fall back to 0, so a garbled file let the floor drop to what the refs show and the write below
     # then replaced the ratchet with that lower value. Its true value cannot be known from here, and a
-    # guess is what lets a used number read free. -LiteralPath, for the wildcard reason above.
-    if (Test-Path -LiteralPath $watermark) {
-        $raw = "$(Read-CoordText $watermark)".Trim()
-        if (-not [int]::TryParse($raw, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$previous)) {
-            throw "alloc.ps1: $refusal -- the high-water file $watermark does not hold a whole number, so the floor it protects cannot be known and nothing was read as a floor or allocated. Do not delete it to get past this: that drops the ratchet. Write back the highest $Kind number this registry has issued, then re-run."
+    # guess is what lets a used number read free.
+    #
+    # READ DIRECTLY, NOT PROBED WITH Test-Path: Test-Path answers $false for a path it cannot reach as
+    # well as for an absent one, so an SMB blip read the ratchet as 0. Only a missing file is absent;
+    # any other read failure refuses.
+    #
+    # WHAT THIS DOES NOT CATCH: a torn prefix ("10" left of "1032") is a whole number and reads as one.
+    # The temp-and-rename write below is what keeps this script from leaving one.
+    $ratchetRemedy = "Do not delete it to get past this: that drops the ratchet, and the numbers it holds are ones no ref here still shows. Restore the value it held from a backup or log if one has it; otherwise write a number no lower than the highest $Kind number issued anywhere in the fleet, which is at least the $computed this sweep found. Then re-run."
+    $raw = $null
+    $absent = $false
+    try { $raw = Read-CoordText $watermark }
+    catch [System.IO.FileNotFoundException] { $absent = $true }
+    catch { throw "alloc.ps1: $refusal -- the high-water file $watermark could not be read ($(ConvertTo-Safe $_.Exception.Message)), so the floor it protects cannot be known and nothing was read as a floor or allocated. $ratchetRemedy" }
+    if (-not $absent) {
+        if (-not [int]::TryParse("$raw".Trim(), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$previous)) {
+            throw "alloc.ps1: $refusal -- the high-water file $watermark does not hold a whole number, so the floor it protects cannot be known and nothing was read as a floor or allocated. $ratchetRemedy"
         }
     }
 
@@ -671,9 +690,12 @@ function Get-Floor {
     }
     $floor = [Math]::Max($computed, $previous)
     # WRITTEN THROUGH A TEMP FILE AND ONE RENAME (BACKLOG #7560). Set-Content truncates, then writes, so
-    # a kill or an SMB fault between the two left an empty or partial file, which the read above now
-    # refuses. Move-CoordFileReplace is the overwrite rename claim.ps1 uses, retried on a sharing fault.
-    # A failed write still ends the run, as Set-Content's throw did; the temp file is removed first.
+    # a kill or an SMB fault between the two could leave an empty file, which the read above refuses, or
+    # a torn prefix, which it cannot tell from a real value. Move-CoordFileReplace is the overwrite
+    # rename claim.ps1 uses, retried on a sharing fault. A failed write still ends the run, as
+    # Set-Content's throw did; the temp file is removed first.
+    # NOT CLOSED HERE: two concurrent runs still race last-writer-wins, as Set-Content did, so a run
+    # whose refs show less can rename a lower value over a higher one.
     if ($floor -gt $previous -and -not $Peek) {
         $tmp = "$watermark.$PID.$([guid]::NewGuid().ToString('N')).tmp"
         try {
