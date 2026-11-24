@@ -1121,6 +1121,8 @@ def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
         ("const s = tag`${agent(1)}`\n", [1]),
         ("const f = r => `${agent(r)}`\nawait f(1)\n", [1]),
     ],
+    ids=["plain", "parallel", "promise-all", "hook-as-value", "nested-template"]
+    + ["two-agents", "comment-optional-call", "tagged", "helper-body"],
 )
 def test_an_agent_inside_a_template_interpolation_is_residue_not_zero(
     mod: ModuleType, script: str, agent_lines: list[int]
