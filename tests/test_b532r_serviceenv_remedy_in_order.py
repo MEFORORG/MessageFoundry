@@ -458,6 +458,18 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_A": "SEKRITvalueA", "MEFOR_VALUE_B": "SEKRITvalueB"},
         False,
     ),
+    # Code review round 2 on that repair: a broken name's twin takes an installer string as its
+    # value without being read as running on, so the clause prints wherever the doubt step may
+    # leave such a string as it is.
+    "twin-takes-an-installer-string": (
+        [
+            (_EXTRA, "MEFOR_VALUE_A\nMEFOR_VALUE_A\nMEFOR_VALUE_A"),
+            (_EXTRA, "mefor_secrets_directory=SEKA\nSEKD"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKA\nSEKD"}),
+        {"MEFOR_VALUE_A": "SEKA"},
+        False,
+    ),
 }
 
 
@@ -487,6 +499,7 @@ _READ_OUT = {
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},
     "value-name-alone-below-a-directory-line": {"MEFOR_VALUE_A"},
+    "twin-takes-an-installer-string": {"MEFOR_VALUE_A"},
 }
 
 
@@ -525,7 +538,7 @@ def test_no_step_has_a_refused_value_passed_back_on_a_command_line(case: str) ->
     naming = [s for s in steps if "`nssm set`" in s]
     assert naming or not posture.directory_in_doubt
     for sentence in naming:
-        assert "do not pass these lists back with `nssm set`" in sentence or (
+        assert "while a list holds one, do not pass it back with `nssm set`" in sentence or (
             _PASSES_NO_REFUSED in sentence
         ), sentence
     if posture.directory_in_doubt:

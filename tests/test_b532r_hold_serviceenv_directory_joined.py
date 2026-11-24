@@ -549,6 +549,7 @@ def test_a_directory_entry_in_doubt_outside_the_extra_list_is_taken_out_too(
     assert refusal is not None
     assert SET_NO not in refusal
     assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
+    assert refusal.count(DOUBT_STEP) == 1
     assert "Read AppEnvironment and AppEnvironmentExtra, under Parameters" in DOUBT_STEP
     assert "write each back with `Set-ItemProperty -Type MultiString`" in DOUBT_STEP
     assert "Environment value is no NSSM list, and is read and written the same way" in DOUBT_STEP

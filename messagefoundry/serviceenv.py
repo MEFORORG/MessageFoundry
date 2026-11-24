@@ -201,11 +201,11 @@ class ServiceEnvPosture:
     #: leaves as it is each string that holds a refused variable or that one's value runs on
     #: into, so no value goes before the step that moves it. The remedy alone reads this.
     directory_in_refused: bool = False
-    #: Whether an AppEnvironmentExtra string that install-service.ps1 reads as setting
-    #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`) holds a refused variable's line or
-    #: is part of a refused value that runs on, so the doubt step may leave it as it is. Where it
-    #: does (``directory_in_refused``), the create step then says how to treat such a string
-    #: before the installer runs. The remedy alone reads this.
+    #: Whether any AppEnvironmentExtra string is one install-service.ps1 reads as setting
+    #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`), so the doubt step may leave such a
+    #: string as it is. Where it may (``directory_in_refused``), the create step then says how to
+    #: treat such a string before the installer runs, a clause that states its own condition.
+    #: The remedy alone reads this.
     installer_reads_extra: bool = False
     #: Whether a value that runs on takes, as the first string after its own that is not blank
     #: (:func:`_still_blank`), one whose first non-blank line sets ``MEFOR_SECRETS_DIRECTORY``
@@ -684,9 +684,6 @@ class _Variable:
     #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
     #: on its first line (:func:`_sets_directory`).
     holds_directory: bool = False
-    #: Whether it runs on, and a line of a string after its own in the joined group may name
-    #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_may_name_directory`). Remedy only.
-    takes_directory_line: bool = False
     #: Whether its name is written alone, with no equals sign (:func:`_name_alone`). Such a name
     #: sets nothing on its own, so :func:`_names` keeps it only once a value is read into it.
     alone: bool = False
@@ -944,14 +941,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         only_after = [True] * (len(strings) + 1)
         any_after = [False] * (len(strings) + 1)
         set_after = [False] * (len(strings) + 1)
-        # Whether a line of a string from each index on may name the directory at all.
-        may_after = [False] * (len(strings) + 1)
         for i in range(len(strings) - 1, -1, -1):
             only_after[i], any_after[i] = only_after[i + 1], any_after[i + 1]
             set_after[i] = set_after[i + 1] or _sets_directory(strings[i])
-            may_after[i] = may_after[i + 1] or any(
-                _may_name_directory(line) for line in _LINE_BREAK.split(strings[i])
-            )
             if not _still_blank(strings[i]):
                 only_after[i] = only_after[i] and _directory_entry_value(strings[i]) is not None
                 any_after[i] = True
@@ -984,7 +976,6 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                     directory_only=ran_on and any_after[index + 1] and only_after[index + 1],
                     takes_directory=ran_on and set_after[index + 1],
                     holds_directory=holds,
-                    takes_directory_line=ran_on and may_after[index + 1],
                 )
             )
     return read
@@ -1031,14 +1022,15 @@ def _taken_out(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
     return kept
 
 
-def _refused_readings(variables: Sequence[_Variable]) -> frozenset[tuple[str, str, str]]:
-    """Each variable in ``variables`` whose name the refusal is about (:func:`_refused_name`),
-    as ``(registry value, upper-cased name, value)``, line breaks written as one ``\\n``. Every
-    such variable, counted or not and empty or not, since the engine may load an uncounted
-    twin's value under a name that starts with it, and erring toward a difference only leaves
-    more strings as they are. Remedy only."""
+def _refused_readings(variables: Sequence[_Variable]) -> frozenset[int]:
+    """The ``hash`` of each variable in ``variables`` whose name the refusal is about
+    (:func:`_refused_name`), as ``(registry value, upper-cased name, value)``, line breaks
+    written as one ``\\n``, compared within this one process only. Every such variable, counted
+    or not and empty or not, since the engine may load an uncounted twin's value under a name
+    that starts with it, and erring toward a difference only leaves more strings as they are.
+    Hashes, so no repr of them holds a value, which may be key material. Remedy only."""
     return frozenset(
-        (v.where, v.written.upper(), _LINE_BREAK.sub("\n", v.value))
+        hash((v.where, v.written.upper(), _LINE_BREAK.sub("\n", v.value)))
         for v in variables
         if _refused_name(v.written.upper())
     )
@@ -1061,22 +1053,6 @@ def _refused_line(line: str) -> bool:
     """Whether ``line`` sets a name the refusal is about, or names one alone
     (:func:`_refused_name`)."""
     return _refused_name(line.partition("=")[0].strip().upper())
-
-
-def _holds_refused_line(entry: str) -> bool:
-    """Whether a line of the registry string ``entry`` is a :func:`_refused_line`."""
-    return any(_refused_line(line) for line in _LINE_BREAK.split(entry))
-
-
-def _runs_on_into_directory(variable: _Variable) -> bool:
-    """Whether the refused ``variable``, which runs on, may hold a line that may name
-    ``MEFOR_SECRETS_DIRECTORY`` (:func:`_may_name_directory`): a line past its first, in its value
-    or in a name a line break broke, or any line of a string after its own in its joined group
-    (``takes_directory_line``), since the reader may fold a directory string's name into the
-    value of a name written alone above it (code review round 2 on PR 3142's in-doubt reorder).
-    The remedy alone reads this."""
-    lines = _LINE_BREAK.split(f"{variable.written}={variable.value}")
-    return variable.takes_directory_line or any(_may_name_directory(line) for line in lines[1:])
 
 
 def _installer_reads(entry: str) -> bool:
@@ -1258,8 +1234,6 @@ def read_service_env_posture(
         )
     variables = _variables(entries)
     found = _names(variables)
-    # The refused variables whose value runs on into the strings after their own.
-    running = [variable for variable in variables if variable.runs_on and _names([variable])]
     empty, unplain = _value_entry_shapes(variables)
     # Every registry string as written, never the variables read from them, so a line absorbed
     # into a broken name or an uncounted twin is still judged.
@@ -1278,17 +1252,12 @@ def read_service_env_posture(
         directory_in_doubt=doubt,
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
         directory_in_refused=doubt and _take_out_changes_refused(entries, variables),
+        # Any such string, erring toward printing the clause, which states its own condition:
+        # whether the doubt step leaves one as it is follows from the reader's readings
+        # (``directory_in_refused``), which no narrower rule here could restate (code review
+        # round 2 on the repair of the Lander's hold on PR 3142, comment 7116005396).
         installer_reads_extra=any(
-            where.endswith(NSSM_EXTRA_VALUE)
-            and _installer_reads(entry)
-            # A refused line of its own, or, erring toward printing the clause, which states its
-            # own condition, a refused value in the same list that runs on into a string that
-            # may name the directory.
-            and (
-                _holds_refused_line(entry)
-                or any(v.where == where and _runs_on_into_directory(v) for v in running)
-            )
-            for where, entry in entries
+            where.endswith(NSSM_EXTRA_VALUE) and _installer_reads(entry) for where, entry in entries
         ),
         # Not filtered through ``_names``: the directory string is in the lists whichever
         # variable it was joined to, so one ``_names`` drops counts too.
@@ -1464,8 +1433,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # review round 1 on this repair).
         steps.append(
             f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
-            "plainly to a path under that name, in ASCII with no blank around it, so first note "
-            "the path each such line names where it is plainly a path, then take "
+            "plainly to a path under that name, in ASCII with no blank around it, so first, "
+            "reading the lists as this step says below, note the path each such line names where "
+            "it is plainly a path, then take "
             "each line that may set it out of every list, whatever its letter case, a blank "
             "around its name, or a letter outside ASCII that upper-cases to one of its letters, "
             "with each line below it in its string that the engine reads as part of its value, "
@@ -1488,9 +1458,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 else ""
             )
             + ". No refused value may be typed on a command line, where it reaches at least the "
-            "shell's history, a transcript and process-creation audit events, so do not pass "
-            "these lists back with `nssm set`. Read AppEnvironment and AppEnvironmentExtra, "
-            "under Parameters in the registry key named above, with `Get-ItemProperty` into a "
+            "shell's history, a transcript and process-creation audit events, so while a list "
+            "holds one, do not pass it back with `nssm set`. Read AppEnvironment and "
+            "AppEnvironmentExtra, under Parameters in the registry key named above, which "
+            "PowerShell names under HKLM:, with `Get-ItemProperty` into a "
             "variable, printing nothing, edit those strings in that same session, and write each "
             "back with `Set-ItemProperty -Type MultiString`, every entry kept but those lines. "
             "The service's own Environment value is no NSSM list, and is read and written the "
@@ -1532,7 +1503,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
-            if posture.directory_in_refused and posture.installer_reads_extra:
+            if doubt and posture.directory_in_refused and posture.installer_reads_extra:
                 create += (
                     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra "
                     f"and starts with {_DIRECTORY_VARIABLE}= in any letter case, "
@@ -1541,7 +1512,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     "it whole, so before you run the installer read out of that string, and of "
                     "each string a refused value in it runs on into, every line they hold, remove "
                     "those strings with each refused variable whose value they hold, put each "
-                    "refused value you read where the steps below say, keep a retired key for the "
+                    "refused value you read where the other steps say, keep a retired key for the "
                     "shell that runs `messagefoundry rotate-key`, and add each other line back as "
                     f"an entry of its own, but none that may set {_DIRECTORY_VARIABLE}, writing "
                     "the list back as the first step says"

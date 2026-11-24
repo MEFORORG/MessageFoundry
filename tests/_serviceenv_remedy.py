@@ -89,8 +89,9 @@ WIDER = "and the strings this step and any step above say to remove"
 #: PR 3142's repair handback, comment 7106776128).
 DOUBT_STEP = (
     "At least one entry that may set MEFOR_SECRETS_DIRECTORY is not one line setting it plainly "
-    "to a path under that name, in ASCII with no blank around it, so first note the path each "
-    "such line names where it is plainly a path, then take each line that "
+    "to a path under that name, in ASCII with no blank around it, so first, reading the lists as "
+    "this step says below, note the path each such line names where it is plainly a path, then "
+    "take each line that "
     "may set it out of every list, whatever its letter case, a blank around its name, or a letter "
     "outside ASCII that upper-cases to one of its letters, with each line below it in its string "
     "that the engine reads as part of its value, up to the next that names a refused variable, "
@@ -102,9 +103,9 @@ DOUBT_STEP = (
     "write that string back with its other lines as they were, in their order, and leave out "
     "only a string that holds nothing else. No refused value may be typed on a command line, "
     "where it reaches at least the shell's history, a transcript and process-creation audit "
-    "events, so do not pass these lists back with `nssm set`. Read AppEnvironment and "
-    "AppEnvironmentExtra, under Parameters in the registry key named above, with "
-    "`Get-ItemProperty` into a variable, printing nothing, edit those strings in that same "
+    "events, so while a list holds one, do not pass it back with `nssm set`. Read AppEnvironment "
+    "and AppEnvironmentExtra, under Parameters in the registry key named above, which PowerShell "
+    "names under HKLM:, with `Get-ItemProperty` into a variable, printing nothing, edit those strings in that same "
     "session, and write each back with `Set-ItemProperty -Type MultiString`, every entry kept "
     "but those lines. The service's own Environment value is no NSSM list, and is read and "
     'written the same way on the registry key named above: see docs/SERVICE.md, "Start / stop / '
@@ -207,7 +208,7 @@ CREATE_INSTALLER = (
     "print it, and drops it whole, so before you run the installer read out of that string, and "
     "of each string a refused value in it runs on into, every line they hold, remove those "
     "strings with each refused variable whose value they hold, put each refused value you read "
-    "where the steps below say, keep a retired key for the shell that runs `messagefoundry "
+    "where the other steps say, keep a retired key for the shell that runs `messagefoundry "
     "rotate-key`, and add each other line back as an entry of its own, but none that may set "
     "MEFOR_SECRETS_DIRECTORY, writing the list back as the first step says"
 )
