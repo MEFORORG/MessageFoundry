@@ -211,8 +211,8 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
 #: though since BACKLOG #1174 it too stages beside a SQLite store. That limb has no byte cap of its
 #: own: what it copies is whatever the archive path yields, which a device or a growing file does
-#: not bound. Giving it this bound means adding an escape arm to that function's ordered ``except``
-#: block, which is a wider change than the one this constant documents.
+#: not bound. Nothing here gives it this bound yet; that is a change of its own, not one this
+#: constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -466,10 +466,13 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
     empty read, which is the end of the stream.
 
-    Each read goes through the codec's own ``_read_once``, so a no-key copy refuses what a keyed
-    one refuses, with the same :class:`BackupCodecError`. That includes a ``None`` read, from a
-    non-blocking source with no data ready: a bare ``if not buf: break`` loop reads it as the end of
-    the stream and finishes the copy short (BACKLOG #6687). ``what`` names the copy in the refusal.
+    Each read goes through the codec's own ``_read_once``, so a single read is held to the same
+    checks the keyed copies apply to each read, and refused with the same
+    :class:`BackupCodecError`: a ``None`` read, a read that is not bytes, and a read over the size
+    asked for. Those per-read checks are all this shares with the keyed copies. It authenticates
+    nothing and caps no total. A ``None`` read comes from a non-blocking source with no data ready,
+    and a bare ``if not buf: break`` loop reads it as the end of the stream and finishes the copy
+    short (BACKLOG #6687). ``what`` names the copy in the refusal.
     A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
     one this yields the same reads the old loops wrote."""
     while True:
@@ -6964,8 +6967,8 @@ def _restore_config_members(
     it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
     ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. A
     :class:`BackupCodecError` from :func:`_read_chunks`, such as a ``None`` read, is made one too
-    (BACKLOG #6687). Any other exception type still escapes as it did. Unguarded, each left the restore as a CLI
-    traceback, on the config-only route and the store route alike. The caller's ``finally`` still
+    (BACKLOG #6687). Any other exception type still escapes as it did. Unguarded, each left the
+    restore as a CLI traceback, on the config-only route and the store route alike. The caller's ``finally`` still
     rolls back what ``written`` records."""
     try:
         return _extract_config_members(tar_path, config_dest, written=written)

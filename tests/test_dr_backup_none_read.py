@@ -135,8 +135,9 @@ async def test_a_plaintext_backup_refuses_a_none_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, what: str
 ) -> None:
     """The no-key build copies the staged tar to the archive, and verify copies the archive back to
-    a tar. A ``None`` at either used to end the copy at zero bytes, so the run failed later on an
-    empty tar; it now fails at the read, naming the copy."""
+    a tar. A ``None`` at either used to end the copy short: here, on the first read, it ended it at
+    zero bytes and the run failed later on an empty tar. It now fails at the read, naming the
+    copy."""
     dest = (tmp_path / "backups").resolve()
     wrapped: list[_Stalling] = []
     real_open = builtins.open
