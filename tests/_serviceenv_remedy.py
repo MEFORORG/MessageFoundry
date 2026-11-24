@@ -205,11 +205,16 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: operator read every line out before removing the string, since the registry may hold its
 #: only copy, a retired store key among them, which protect-key never stores (code review round
 #: 1 on the repair of PR 3142's round-3 open findings 1 and 2; the Lander's hold on PR 3142,
-#: comment 7116005396, F1). It adds back no line of a refused value, under a printed rule that
-#: ends one below a refused name written alone or set to nothing only at a refused line, and
-#: reads out, until none is left, each string whose refused variable removing the others would
-#: read differently (the Lander's hold on PR 3142, comment 7119680463, items 1 and 3; code review
-#: round 1 on that repair).
+#: comment 7116005396, F1). It adds back no line its printed rule makes part of a refused value:
+#: the rule ends one below a refused name written alone or set to nothing only at a refused line,
+#: and takes every other line of a string whose first non-blank line names a refused variable
+#: (the Lander's hold on PR 3142, comment 7122889682, item 1). It reads out, until none is left,
+#: each string whose refused variable removing the others would read differently (the Lander's
+#: hold on PR 3142, comment 7119680463, items 1 and 3; code review round 1 on that repair). The
+#: rule is not the reader, so it may still add back a line the reader reads as part of a refused
+#: value, at least for a NAME== line the reader reads as empty and a joined group the reader
+#: reads whole (open findings 1 and 2 of code review round 3 on that repair, the repair handback
+#: on PR 3142, comment 7122130265).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "

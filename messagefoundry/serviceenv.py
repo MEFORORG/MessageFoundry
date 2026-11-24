@@ -1502,16 +1502,21 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # into with it, so no value is left behind unnamed, and it has the list written back as
         # the first step says, since the other refused values are still in it (code review on
         # that repair). A line that may set the directory is not added back, so the installer
-        # still finds none to read, and nor is a line of a refused value: below a refused name
-        # written alone or set to nothing only a refused line ends it, erring past the reader's
-        # fail-closed rule (_ends_blank_class); every line of a string led by a refused name is
-        # part of it, as the whole-string reading holds them; and below any other line of one
+        # still finds none to read. Nor is a line the printed rule makes part of a refused value:
+        # below a refused name written alone or set to nothing only a refused line ends it,
+        # erring past the reader's fail-closed rule (_ends_blank_class); every other line of a
+        # string whose first non-blank line names a refused variable is part of it, as the
+        # whole-string reading holds them, and the reader skips leading blank lines (the
+        # Lander's hold on PR 3142, comment 7122889682, item 1); and below any other line of one
         # the doubt step's rule ends it. It also takes, until none is left, the strings whose
         # refused variables removing the others would read differently (the Lander's hold on PR
         # 3142, comment 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair).
-        # The rule still differs from the reader at least for a mixed-case name that takes a key
-        # or its path below an empty value, which the reader reads as that value: an open
-        # finding of code review round 2 on that repair, not a guarantee this text gives.
+        # The rule is not the reader, so this text does not guarantee that no line of a refused
+        # value is added back. The two still differ at least for a mixed-case name that takes a
+        # key or its path below an empty value, which the reader reads as that value (an open
+        # finding of code review round 2 on that repair), and for a NAME== line the reader reads
+        # as empty and a joined group the reader reads whole (open findings 1 and 2 of code
+        # review round 3 on that repair, the repair handback on PR 3142, comment 7122130265).
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
