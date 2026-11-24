@@ -1511,8 +1511,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair). It removes each
         # of those strings whole and adds no line of them back, so the installer finds no line
         # in them to read as the directory, and no line of a refused value they hold is left as
-        # an entry of its own. The ordinary lines they hold go with them; the operator has read
-        # them out first. The add-back step this clause carried before put back at least a
+        # an entry of its own. The ordinary lines they hold are lost with them: the clause has
+        # the operator read them out but gives them nowhere to go, and says nothing of their
+        # loss. The add-back step this clause carried before put back at least a
         # store key below a directory line and a line of a joined group's value, so it was
         # removed (the Lander's hold on PR 3142, comment 7125522135). Restoring those ordinary
         # lines safely is open work, unfiled.
@@ -1535,7 +1536,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     "the strings this sentence names would change, and of each string a refused "
                     "value in them runs on into, every line they hold, remove those strings with "
                     "each refused variable whose value they hold, put each refused value you read "
-                    "where the other steps say, keep a retired key for the shell that runs "
+                    "where the other steps say, and keep a retired key for the shell that runs "
                     "`messagefoundry rotate-key`, writing the list back as the first step says"
                 )
             steps.append(create)

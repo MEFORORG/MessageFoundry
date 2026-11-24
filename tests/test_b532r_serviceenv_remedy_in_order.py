@@ -268,7 +268,7 @@ def _follow_installer_clause(
     """The create step's clause: read out of each kept AppEnvironmentExtra string the installer
     reads what the clause says to read, then remove that string whole, with each refused
     variable whose value it holds. Since the Lander's hold on PR 3142, comment 7125522135, the
-    clause adds no line back, as the remedy on main does not."""
+    clause adds no line back."""
     # Every line since the Lander's hold on PR 3142, comment 7116005396, F1; before it, each
     # value the next step puts in the secrets directory, which no store key is.
     every_line = "every line it holds" in clause or "every line they hold" in clause
@@ -284,7 +284,10 @@ def _follow_installer_clause(
     # The clause must add no line back: its add-back step put back a store key below a
     # directory line and a line of a joined group's value (the Lander's hold on PR 3142,
     # comment 7125522135).
-    assert "add back" not in clause, clause
+    # Any wording that adds a line back fails here, each phrasing the clause has used among
+    # them (code review round 1 on the repair of that hold).
+    assert "entry of its own" not in clause, clause
+    assert not re.search(r"\badd\b.*\bback\b", clause), clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -340,8 +343,7 @@ def _follow_installer_clause(
         if index and registry.entries[index - 1][1].partition("=")[2] == "":
             before = registry.entries[index - 1]
             if _names_refused(before[1], refused):
-                registry.entries.remove(before)
-                index -= 1
+                del registry.entries[index - 1]
 
 
 #: The create step's clause where a string the doubt step leaves as it is may be read by the
@@ -779,6 +781,13 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     was = _value_lines(entries, wide)
     joined = _value_lines(registry.entries, wide | _refused_names(registry.entries)) - was
     assert joined == set()
+
+
+def test_each_per_case_table_names_only_walk_cases() -> None:
+    """A misspelt key in a per-case table would turn its check off unseen (code review round 1
+    on the repair of the Lander's hold on PR 3142, comment 7125522135)."""
+    assert _SECRET_TEXT.keys() <= _CASES.keys()
+    assert _READ_OUT.keys() <= _CASES.keys()
 
 
 def _refused_text_left(

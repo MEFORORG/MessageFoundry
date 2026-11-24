@@ -208,8 +208,8 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: comment 7116005396, F1). It reads out, until none is left, each string whose refused
 #: variable removing the others would read differently (the Lander's hold on PR 3142, comment
 #: 7119680463, items 1 and 3; code review round 1 on that repair). It removes those strings
-#: whole and adds no line back, as the remedy on main does (the Lander's hold on PR 3142,
-#: comment 7125522135).
+#: whole and adds no line back, so the ordinary lines they hold are lost (the Lander's hold
+#: on PR 3142, comment 7125522135).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
@@ -218,8 +218,9 @@ CREATE_INSTALLER = (
     "each string that holds a refused variable, alone or set, whose reading removing the strings "
     "this sentence names would change, and of each string a refused value in them runs on into, "
     "every line they hold, remove those strings with each refused variable whose value they "
-    "hold, put each refused value you read where the other steps say, keep a retired key for the "
-    "shell that runs `messagefoundry rotate-key`, writing the list back as the first step says"
+    "hold, put each refused value you read where the other steps say, and keep a retired key for "
+    "the shell that runs `messagefoundry rotate-key`, writing the list back as the first step "
+    "says"
 )
 
 #: How the Put step names the directory wherever a directory entry is in doubt, since the doubt
