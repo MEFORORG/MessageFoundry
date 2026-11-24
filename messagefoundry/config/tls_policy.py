@@ -3466,7 +3466,8 @@ OUTBOUND_CRL_SETTING = "[tls].crl_file"
 
 
 #: Why ``[tls].crl_check_chain`` is refused on a hop that trusts the OS roots: the one statement of
-#: it (vault BACKLOG #5511). The refusal carries it, so the docs point here rather than restate it.
+#: it (vault BACKLOG #5511). The refusal carries it. The docs/CONFIGURATION.md row and ADR 0173
+#: section 15 summarise it, so a change here changes them too.
 #: On a hop that trusts operator CAs alone the rule can be met: the operator chose the CAs,
 #: :func:`_require_rooted_cas` refuses a certificate in the CA file that is no CA, and a CA file is
 #: loaded whole, so the CA list holds each CA in it.
@@ -3522,23 +3523,26 @@ def refuse_chain_check_on_os_roots(anchor: TrustAnchor, *, ech_sidecar: bool = F
         else "the system arm (the OS trust store, with no CA file of its own)"
     )
     if ech_sidecar:
-        # The token hop of an ECH connection resolves no trust anchor (smart.py), so the remedy
-        # here names no token server and no other hop's setting.
+        # The token hop of an ECH connection resolves a trust anchor, but its opener does not use
+        # it (smart.py, http_auth.py), so the remedy here names no token server and no other
+        # hop's setting.
         raise ValueError(
             "[tls].crl_check_chain is set, and this REST connection sends through its ECH "
             "sidecar (ech_sidecar), which makes the TLS connection to the partner itself. So no "
             "CRL in [tls].crl_file is checked against the partner on this connection, leaf or "
             "chain, whatever its CA setting. The engine still builds a context for the partner "
-            f"from this connection's trust anchor, which is {arm}, and refuses the whole-chain "
-            f"check there. {OS_ROOTS_CHAIN_CHECK_REASON}. To clear this refusal, "
+            f"from this connection's trust anchor, which is {arm}. "
+            f"{OS_ROOTS_CHAIN_CHECK_REASON}. To clear this refusal, "
             f"{_UNSET_CHAIN_CHECK}, or give the connection operator CAs alone through its own "
-            'tls_ca_file or [tls].internal_ca_file with [tls].trust_anchor_mode = "pinned". '
+            'tls_ca_file or [tls].internal_ca_file with [tls].trust_anchor_mode = "pinned", '
+            "which also takes the OS roots away from the other non-loopback hops that resolve "
+            "their CA from [tls] with no CA file of their own. "
             f"{_OPERATOR_CA_FILE_RULE}. None of these makes the engine check the partner's "
             "revocation"
         )
     raise ValueError(
-        f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}, so the "
-        f"setting is refused here. {OS_ROOTS_CHAIN_CHECK_REASON}. To chain-check this hop, give "
+        f"[tls].crl_check_chain is set, but this hop verifies its server against {arm}. "
+        f"{OS_ROOTS_CHAIN_CHECK_REASON}. To chain-check this hop, give "
         f"it operator CAs alone, through {_OPERATOR_CA_SETTINGS}. {_OPERATOR_CA_FILE_RULE}. Or "
         f"{_UNSET_CHAIN_CHECK}"
     )

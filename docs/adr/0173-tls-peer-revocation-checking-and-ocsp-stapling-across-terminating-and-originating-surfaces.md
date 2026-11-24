@@ -1805,7 +1805,8 @@ rule and one wording for both). A site that supplies only the issuing intermedia
 at start, naming the root.
 
 **Still leaf only.** At least every outbound hop under `[tls].crl_file`. Such a hop may verify
-against the OS trust store, where the start rule cannot be met: section 15 gives the reason.
+against the OS trust store, where the start rule is not practical to meet and reads an incomplete
+CA list: section 15 gives the reason.
 *(CORRECTED 2026-11-23: this said the OS store's roots are ones "no CRL file names, so the start
 rule would refuse it". A CRL file can name them; section 15 gives the reason that holds, and makes
 this paragraph hold only while `[tls].crl_check_chain` is unset.)*
