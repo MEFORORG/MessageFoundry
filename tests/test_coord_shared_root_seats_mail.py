@@ -630,6 +630,7 @@ def test_lane_level_skips_with_a_note_when_the_root_is_down(dispatcher_repo: Pat
         (("-Close",), 1),
         (("-BumpEpoch",), 1),
         (("-Record",), 0),
+        (("-Prompt",), 0),
     ],
 )
 def test_an_unresolved_worktree_fails_a_cli_verb_but_not_the_hook(
@@ -646,6 +647,9 @@ def test_an_unresolved_worktree_fails_a_cli_verb_but_not_the_hook(
         env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-nowt"),
     )
     assert proc.returncode == expected, proc.stderr
+    if expected:
+        # Exit 1 from the rule-1 branch, not from some unrelated failure.
+        assert "could not resolve a rooted existing worktree" in proc.stderr, proc.stderr
     assert not (shared / "seats").exists()
 
 
@@ -676,16 +680,19 @@ def test_bump_epoch_starts_an_absent_epoch_at_two_and_increments_an_existing_one
 
 # BACKLOG #7594, reached through the top-level catch, which must exit non-zero for a CLI verb
 # (BACKLOG #7593).
+@pytest.mark.parametrize("content", ["not-a-number", ""])
 def test_bump_epoch_refuses_an_unreadable_epoch_rather_than_resetting_it(
-    repo: Path, shared: Path
+    repo: Path, shared: Path, content: str
 ) -> None:
     epoch = shared / "seats" / ".pool-epoch"
     epoch.parent.mkdir(parents=True)
-    epoch.write_text("not-a-number", encoding="utf-8")
+    epoch.write_text(content, encoding="utf-8")
     proc = _bump(repo, shared)
     assert proc.returncode == 1, proc.stdout
     assert "could not be read, so it was not bumped" in proc.stderr
-    assert epoch.read_text(encoding="utf-8") == "not-a-number"
+    assert "holds no whole number" in proc.stderr
+    assert epoch.read_text(encoding="utf-8") == content
+    assert not (shared / "seats" / ".pool-epoch.lock").exists()
 
 
 def test_the_record_hook_keeps_the_epoch_fallback_for_an_unreadable_file(
@@ -718,5 +725,6 @@ def test_bump_epoch_waits_on_a_held_mutex_and_never_steals_it(repo: Path, shared
     proc = _bump(repo, shared)
     assert proc.returncode == 1, proc.stdout
     assert "timed out" in proc.stderr and "Not stealing it" in proc.stderr
+    assert "held by: pid=1 host=elsewhere" in proc.stderr
     assert (seats / ".pool-epoch").read_text(encoding="utf-8") == "7"
     assert lock.read_text(encoding="utf-8") == "pid=1 host=elsewhere"

@@ -60,8 +60,10 @@
     2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
        seats/.writer-errors.txt, and the hook paths (-Record, -Prompt) still exit 0. Exiting
        non-zero from a Stop hook is its own hazard; leaving no trace is worse than either. The CLI
-       verbs (-Declare, -Close, -BumpEpoch, -ClearHandoff) exit non-zero on a failure, because a
-       caller waits on each and must not read a failed write as done (BACKLOG #7593). A -Record hook input refused under
+       verbs (-Declare, -Close, -BumpEpoch, -ClearHandoff) exit non-zero when the worktree or the
+       shared root does not resolve and when an error reaches the main catch, because a caller
+       waits on each (BACKLOG #7593). A failure caught and recorded part-way through a write, such
+       as an unresolved handoff pointer, still lets the verb finish and exit 0. A -Record hook input refused under
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
        stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
        in, where that checkout and its registry resolve, at most one line per session key and host
@@ -183,8 +185,8 @@ $script:SharedRoot = $null
 
 function Write-WriterError {
     param([string]$Stage, [string]$Message)
-    # Best-effort by construction: if we cannot even record the failure we must still exit 0, or a
-    # broken writer takes the seat's Stop hook down with it.
+    # Best-effort by construction: if we cannot even record the failure a hook path must still exit
+    # 0, or a broken writer takes the seat's Stop hook down with it.
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
@@ -498,12 +500,18 @@ function Get-PoolEpoch {
     # would read as written before a switch it followed (BACKLOG #7594).
     param([string]$SeatsDir, [switch]$Strict)
     $f = Join-Path $SeatsDir '.pool-epoch'
-    if (-not (Test-Path -LiteralPath $f)) { return 1 }
-    $why = 'it is not a whole number'
+    # Test-Path answers false on an I/O or permission error too, so -Strict decides absence only from
+    # the read's own FileNotFoundException.
+    if (-not $Strict -and -not (Test-Path -LiteralPath $f)) { return 1 }
+    $why = 'it holds no whole number; write the correct epoch into it by hand'
     try {
-        $v = (Read-CoordText $f).Trim()
+        # The expansion, not a [string] cast: an empty file emits nothing, and the cast keeps that null.
+        $v = "$(Read-CoordText $f)".Trim()
         if ($v -match '\A[0-9]+\z') { return [int]$v }
-    } catch { $why = $_.Exception.Message }
+    } catch {
+        if ((Get-CoordInnerException $_.Exception) -is [System.IO.FileNotFoundException]) { return 1 }
+        $why = $_.Exception.Message
+    }
     if ($Strict) { throw "the pool epoch file $f could not be read, so it was not bumped: $why" }
     return 1
 }
@@ -513,7 +521,8 @@ function Invoke-PoolEpochBump {
     # the same N both write N+1 and one switch is lost (BACKLOG #7594). The mutex is a file created
     # exclusively BESIDE .pool-epoch, on the shared root, so it serializes bumps from either PC;
     # lock.ps1's Enter-CoordLock anchors to this checkout's own git dir and would not. Like that one,
-    # it retries and never steals: a lock it cannot prove abandoned is reported with its path.
+    # it retries a taken name and never steals: on timeout it names the lock and its holder line.
+    # Access denied (a name still pending deletion, or a real denial) fails at once, loudly.
     param([string]$SeatsDir, [int]$TimeoutSeconds = 10)
     $f = Join-Path $SeatsDir '.pool-epoch'
     $lock = "$f.lock"
@@ -529,24 +538,29 @@ function Invoke-PoolEpochBump {
             $io = if ($_.Exception.InnerException) { $_.Exception.InnerException } else { $_.Exception }
             if ($env:OS -eq 'Windows_NT' -and ($io.HResult -band 0xFFFF) -notin 0x50, 0x20) { throw }
             if ($clock.Elapsed.TotalSeconds -gt $TimeoutSeconds) {
-                throw "timed out after ${TimeoutSeconds}s waiting for $lock, so the pool epoch was not bumped. Not stealing it; if no bump is running, delete it by hand."
+                $held = '(unreadable)'
+                try { $held = "$(Read-CoordText $lock)".Trim() } catch { }
+                throw "timed out after ${TimeoutSeconds}s waiting for $lock (held by: $held), so the pool epoch was not bumped. Not stealing it; if that bump is not running, delete it by hand."
             }
             Start-Sleep -Milliseconds 200
         }
     }
+    $tmp = $null
     try {
-        $who = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID host=$env:COMPUTERNAME at=$([DateTime]::UtcNow.ToString('o'))")
+        $who = [System.Text.Encoding]::UTF8.GetBytes("pid=$PID host=$([Environment]::MachineName) at=$([DateTime]::UtcNow.ToString('o'))")
         $fs.Write($who, 0, $who.Length)
         $fs.Dispose()
         $next = (Get-PoolEpoch -SeatsDir $SeatsDir -Strict) + 1
         $tmp = Join-Path $SeatsDir ('.pool-epoch.' + [guid]::NewGuid().ToString('n') + '.tmp')
         Set-Content -LiteralPath $tmp -Value ([string]$next) -Encoding utf8 -EA Stop
-        try { Move-CoordFileReplace -Source $tmp -Destination $f -ReplaceReadOnly }
-        catch { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue; throw }
+        Move-CoordFileReplace -Source $tmp -Destination $f -ReplaceReadOnly
+        $tmp = $null
         return $next
     } finally {
         try { $fs.Dispose() } catch { }
-        Remove-Item -LiteralPath $lock -Force -EA SilentlyContinue
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -EA SilentlyContinue }
+        try { Remove-Item -LiteralPath $lock -Force -EA Stop }
+        catch { [System.Console]::Error.WriteLine("seat.ps1 -BumpEpoch: WARNING: could not remove the mutex $lock, so every later bump will wait on it and time out. Delete it by hand: $($_.Exception.Message)") }
     }
 }
 
@@ -1164,7 +1178,7 @@ function Invoke-SeatWorktreeLock {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Main. Everything is wrapped: rule 2 says this exits 0 whatever happens.
+# Main. Everything is wrapped: rule 2 says a hook path exits 0 whatever happens.
 # ---------------------------------------------------------------------------------------------
 
 $exit = 0
