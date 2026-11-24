@@ -19,6 +19,7 @@ from __future__ import annotations
 import bisect
 import codecs
 import errno
+import gc
 import hashlib
 import importlib.util
 import io
@@ -28,9 +29,12 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from tests._growth import _growth_between
 
 #: pytest's param type, read from an instance rather than imported from pytest's private modules.
 ParameterSet = type(pytest.param(None))
@@ -1876,12 +1880,9 @@ def test_the_residue_rules_leave_versions_and_plain_numbers_alone(sf, line: str)
         # non-word character, not at every "messagefoundry" in the run.
         f"| {_REQ} | " + "__messagefoundry" * 5000 + " |",
         f"| {_REQ} | " + ("messagefoundry" + chr(0xE9)) * 5000 + " |",
-        # Identifiers split by a word, so each one takes the column lookup.
-        "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * 16000) + " |",
-        "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass",
-        # Review round-23e833d96f: an invisible character and a line separator, which once added
-        # two whole readings, and a long run of spaces, which the sentence split rescanned per space.
-        "ASVS " + " and ".join([_REQ] * 8000) + " cannot pass" + chr(0x200B) + chr(0x2028),
+        # Review round-23e833d96f: a long run of spaces, which the sentence split rescanned per space.
+        # The identifier lists that sat here are timed by a ratio, in
+        # test_a_long_identifier_list_scans_in_linear_time below.
         _REQ + " " * 60000 + ": the row" + chr(0x200B) + chr(0x2028),
         # A cell that goes on past "never failing", over a markup run.
         f"| {_REQ} | x | is never failing; stays" + "*" * 80000 + " |",
@@ -1916,19 +1917,129 @@ def test_a_long_markup_run_after_a_verdict_clause_scans_in_linear_time(sf, body:
     assert time.perf_counter() - began < 1
 
 
+#: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
+#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. Measured
+#: 2026-11-24 on a 32-core Windows box, five to ten attempts per shape: the shipped scanner read
+#: 6.5x to 10.7x on every shape below. Three per-identifier defects, each put back by hand, read 17x
+#: and over on the shape it slows: :func:`_line_at_by_scan` on the hard-wrapped paragraph, a count
+#: of the pipes before each identifier on the column list, and _PR_MARK_BEFORE searched from the
+#: start of the sentence rather than 20 characters back on the "and" list. The line sits between
+#: them. A step of 4 with a line of 8, the house pair in ``tests/test_ad_group_dn_only.py``, passed
+#: the pipe count at about 7x, as the former 10 second bound did at about 1.2 s: at these sizes its
+#: quadratic term is still smaller than the scan, so the step went up rather than the body, which
+#: keeps the control cheap.
+_GROWTH_STEP, _GROWTH_LINE = 8, 14.0
+
+
+def _scan_growth(sf, make: Callable[[int], str], n: int) -> list[float]:
+    """How much longer ``scan_pr_body`` takes on ``make(_GROWTH_STEP * n)`` than on ``make(n)``, one
+    reading per attempt, each a reading of :func:`_growth_between` with the collector off.
+
+    A RATIO, NOT A NUMBER OF SECONDS. A wall-clock bound fails whenever the runner is slow enough:
+    the hard-wrapped paragraph below took about 1.6 s locally against a 10 s bound, and 10.38 s on a
+    loaded windows-2025 runner, which ejected a pull request from the merge queue. A slow runner
+    slows both sizes alike, so the ratio still tells linear from quadratic.
+
+    A reading at or over :data:`_GROWTH_LINE` is taken again, up to three attempts, and stops at the
+    first under it, so the lowest reading is the verdict: one preemption cannot fake a curve. A scan
+    fails only if every attempt reads at or over the line, so that is what a quadratic control must
+    show, read with ``min`` over every attempt. The rule is ``tests/test_ad_group_dn_only.py``'s
+    ``_scaling_ratios``.
+
+    Two rounds per attempt, not one. With every core of a 32-core box held by a spinner, one round
+    let a single slow short sample pull the control's reading down to 10.2x, under the line, and
+    failed it; the minimum over two rounds cleans that sample."""
+    small, large = make(n), make(_GROWTH_STEP * n)
+    readings: list[float] = []
+    for _ in range(3):
+        was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            readings.append(_growth_between(sf.scan_pr_body, small, large, rounds=2))
+        finally:
+            if was_enabled:
+                gc.enable()
+        if readings[-1] < _GROWTH_LINE:
+            break
+    return readings
+
+
+def _assert_linear(sf, make: Callable[[int], str], n: int) -> None:
+    readings = _scan_growth(sf, make, n)
+    ratio = min(readings)
+    assert ratio < _GROWTH_LINE, (
+        f"{_GROWTH_STEP}x the body took {ratio:.2f}x the time ({_attempts(readings)})"
+    )
+
+
+def _attempts(readings: list[float]) -> str:
+    return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
+
+
+def _hard_wrapped(lines: int) -> str:
+    """A hard-wrapped paragraph: one unit, one line mark per line, one binding identifier per line."""
+    return "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
+
+
 def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(sf) -> None:
     """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
     reported at its own line, so finding that line must not scan every mark once per identifier.
-    24000 lines, one binding identifier each: about 1.4 seconds here, against about 25 seconds when
-    each lookup scanned every mark. The bound is 10 seconds, loose for a slow runner."""
-    lines = 24000
-    body = "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
-    began = time.perf_counter()
-    hits = sf.scan_pr_body(body)
-    elapsed = time.perf_counter() - began
+    1000 lines against 8000: the bisecting lookup read 6.5x to 9.5x, and the lookup this test was
+    written against (:func:`_line_at_by_scan`) 17.3x to 26.7x, so the control below shows the check
+    fails it."""
+    lines = _GROWTH_STEP * 1000
+    hits = sf.scan_pr_body(_hard_wrapped(lines))
     # A positive control: each line's identifier is reported at its own line, so the lookup ran.
-    assert len(hits) == lines
-    assert elapsed < 10
+    assert [hit.split(":")[1] for hit in hits] == [str(n) for n in range(1, lines + 1)]
+    _assert_linear(sf, _hard_wrapped, 1000)
+
+
+def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
+    """The line lookup the test above was written against, from before ``_pr_line_at`` bisected:
+    every mark, once per binding identifier."""
+    return max(lineno for start, lineno in marks if start <= offset)
+
+
+def test_the_hard_wrapped_check_fails_the_lookup_it_was_written_against(
+    sf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the ratio check must fail the scanning lookup, or its pass above proves nothing. It
+    asserts exactly the negation of that test's pass condition: every attempt at or over the line,
+    read with ``min``. The scanning lookup reports the same lines, so only its cost differs."""
+    monkeypatch.setattr(sf, "_pr_line_at", _line_at_by_scan)
+    assert [hit.split(":")[1] for hit in sf.scan_pr_body(_hard_wrapped(3))] == ["1", "2", "3"]
+    readings = _scan_growth(sf, _hard_wrapped, 1000)
+    ratio = min(readings)
+    assert ratio >= _GROWTH_LINE, (
+        f"a quadratic lookup scaled by only {ratio:.2f}x ({_attempts(readings)})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("make", "n"),
+    [
+        # Identifiers split by a word, so each one takes the column lookup.
+        (lambda n: "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * n) + " |", 4000),
+        (lambda n: "ASVS " + " and ".join([_REQ] * n) + " cannot pass", 1000),
+        # Review round-23e833d96f: an invisible character and a line separator.
+        (
+            lambda n: (
+                "ASVS " + " and ".join([_REQ] * n) + " cannot pass" + chr(0x200B) + chr(0x2028)
+            ),
+            1000,
+        ),
+    ],
+    ids=["column-lookup", "and-list", "and-list-invisible"],
+)
+def test_a_long_identifier_list_scans_in_linear_time(
+    sf, make: Callable[[int], str], n: int
+) -> None:
+    """A row or a sentence holding a long list of identifiers must scan in time linear in the list.
+    The two "and" lists keep the 8000 identifiers they had under the former 10 second bound, where
+    they took about 1.4 s and 2.7 s locally, too close to it for a loaded runner; the column list
+    grows from 16000 to 32000. A ratio does not see a constant factor, such as the two whole extra
+    readings the invisible character once added, and that bound did not see it either here."""
+    _assert_linear(sf, make, n)
 
 
 def _pr_kinds(sf, body: str) -> set[str]:
