@@ -20,6 +20,7 @@ import logging
 import struct
 import urllib.error
 import urllib.request
+import warnings
 
 import pytest
 
@@ -723,7 +724,7 @@ _NO_MAGIC = "no Part-10 preamble and DICM magic"
 _NO_0003 = "no (0002,0003) in the File Meta group"
 _WRONG_VR = "a (0002,0003) whose VR is not UI"
 _NOT_A_UID = "a (0002,0003) value that is not a UID"
-_OVERRUN = "a File Meta element that runs past the end of the object or of the File Meta group"
+_OVERRUN = "a File Meta element that runs past the end of the object"
 _TOO_LONG = "a File Meta group longer than the reader reads"
 _FILE_META_CAP = 64 * 1024  # the reader's fixed cap on the File Meta group, in bytes
 
@@ -735,14 +736,14 @@ def _with_group_length(obj: bytes, group_length: int) -> bytes:
 
 def _long_zero_length_run(count: int) -> bytes:
     """OBJECT with ``count`` zero-length (0002,0004) UI elements before (0002,0003), and a group
-    length that covers them all. Past the reader's cap, that group length is refused outright."""
+    length that covers them all. Only the reader's fixed cap stops the walk short of (0002,0003)."""
     at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
     run = (struct.pack("<HH", 0x0002, 0x0004) + b"UI" + struct.pack("<H", 0)) * count
     obj = OBJECT[:at] + run + OBJECT[at:]
     return _with_group_length(obj, obj.index(b"synthetic-dataset-bytes") - 144)
 
 
-# A group length that ends where (0002,0003) starts leaves it outside the File Meta group.
+# A group length that ends where (0002,0003) starts: too short, since (0002,0003) follows it.
 _BEFORE_0003 = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003)) - 144
 _NO_COMPARABLE_UID = [
     pytest.param(*_NO_FILE_META[0].values, _NO_0003, id="no-file-meta"),
@@ -765,12 +766,45 @@ _NO_COMPARABLE_UID = [
     pytest.param(
         OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:10], _OVERRUN, id="cut-header"
     ),
-    # Bounded by the (0002,0000) group length: a (0002,0003) after the group's end is not read.
-    pytest.param(_with_group_length(OBJECT, _BEFORE_0003), _NO_0003, id="past-group-length"),
-    # Bounded by a fixed cap: a group length over it, declaring a long run of zero-length group-2
-    # elements, is refused before the run is walked.
+    # Bounded by a fixed cap: a long run of zero-length group-2 elements is walked only to the cap.
     pytest.param(_long_zero_length_run(_FILE_META_CAP // 8 + 1), _TOO_LONG, id="past-the-cap"),
+    # The same with no (0002,0000) at all.
+    pytest.param(
+        OBJECT[:132] + _long_zero_length_run(_FILE_META_CAP // 8 + 1)[144:],
+        _TOO_LONG,
+        id="past-the-cap-no-group-length",
+    ),
 ]
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        pytest.param(OBJECT[:132] + OBJECT[144:], id="absent"),
+        pytest.param(_with_group_length(OBJECT, 0), id="zero"),
+        pytest.param(_with_group_length(OBJECT, _BEFORE_0003), id="too-short"),
+        pytest.param(_with_group_length(OBJECT, _FILE_META_CAP + 1), id="over-the-cap"),
+        pytest.param(_with_group_length(OBJECT, 0xFFFFFFFF), id="undefined"),
+    ],
+)
+async def test_dicomweb_a_wrong_file_meta_group_length_falls_back_to_the_capped_walk(
+    obj: bytes,
+) -> None:
+    # Manager decision of 2026-11-23: pydicom ignores a wrong (0002,0000), so the reader does too and
+    # walks the group, to the cap, until the first element outside group 0002.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+@pytest.mark.parametrize("pad", [b"\0", b" "], ids=["nul", "space"])
+async def test_dicomweb_an_over_padded_file_meta_uid_is_read(pad: bytes) -> None:
+    # The padding is stripped before the 64-character check, so a valid UID padded past 64 bytes
+    # still confirms a 202 that names it.
+    value = SENT_UID.encode() + pad * (66 - len(SENT_UID))
+    dest = _dest()
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(_part10(SENT_UID, value=value))) is None
 
 
 def _with_meta_element_before_0003(vr: bytes, value: bytes) -> bytes:
@@ -841,7 +875,9 @@ def _pydicom_part10(meta_uid: str, dataset_uid: str) -> bytes:
     ds.file_meta = meta
     ds.preamble = b"\0" * 128
     ds.SOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
-    ds.SOPInstanceUID = UID(dataset_uid)
+    with warnings.catch_warnings():  # a test may write a deliberately invalid UID here
+        warnings.simplefilter("ignore")
+        ds.SOPInstanceUID = UID(dataset_uid)
     buf = io.BytesIO()
     pydicom.dcmwrite(buf, ds, enforce_file_format=False)
     return buf.getvalue()
@@ -883,6 +919,82 @@ async def test_dicomweb_202_naming_the_data_set_uid_confirms_with_no_file_meta_u
     dest = _dest()
     body = _uid_body({"vr": "UI", "Value": [_DATASET_UID]})
     dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+async def test_dicomweb_the_data_set_read_lets_no_value_warning_escape() -> None:
+    # Manager decision of 2026-11-23 (R5): pydicom's "Invalid value for VR UI: '<value>'" warning
+    # names the value, so the data set read puts the SCU's ignores back first. The "always" filter
+    # below stands for anything that reset the filters after import.
+    obj = _pydicom_part10(SENT_UID, "1.2.3.Canary^Value")
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("always")
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"  # control: the data set was read and refused
+    assert not [w for w in seen if "Canary" in str(w.message)]
+
+
+async def test_dicomweb_a_202_naming_no_instance_does_not_read_the_data_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The data set read can change the verdict only when the reply names an instance.
+    from messagefoundry.transports import dicomweb
+
+    calls: list[bytes] = []
+    monkeypatch.setattr(dicomweb, "_data_set_instance_uid", lambda obj: calls.append(obj))
+    dest = _dest()
+    for body in ("", json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}})):
+        dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+        with pytest.raises(NegativeAckError):
+            await dest.send(PAYLOAD)
+    assert calls == []
+    # Control: a reply naming another instance does read it.
+    dest._opener = _FakeOpener(
+        body=_uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode(), status=202
+    )  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError):
+        await dest.send(PAYLOAD)
+    assert len(calls) == 1
+
+
+async def test_dicomweb_a_broken_dicom_extra_surfaces_rather_than_refusing_quietly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Manager decision of 2026-11-23 (R8): as the SCU does, a pydicom missing a reader the deflate
+    # guard replays is a deploy error that raises, not a per-message refusal logged at DEBUG.
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    dest = _dest()
+    dest._opener = _FakeOpener(
+        body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
+    )  # type: ignore[assignment]
+    with pytest.raises(RuntimeError, match="refusing to parse DICOM"):
+        await dest.send(_carried(obj))
+
+
+async def test_dicomweb_an_absent_dicom_extra_compares_the_file_meta_uid_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The extra is optional: without it the data set read is skipped, not an error.
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: False)
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    dest = _dest()
+    dest._opener = _FakeOpener(
+        body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
+    )  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
     assert await dest.send(_carried(obj)) is None
 
 

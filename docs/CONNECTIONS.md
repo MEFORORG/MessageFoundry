@@ -3797,15 +3797,16 @@ ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
 A **DICOM** connector (`ConnectorType.DIMSE`) is both an **inbound C-STORE SCP** listener and an
 **outbound C-STORE SCU** sender over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md));
 `DICOMweb(...)` (`ConnectorType.DICOMWEB`) is the modern HTTP imaging lane — an **outbound STOW-RS** store/send
-destination. All three carry the object **opaquely**, though a DICOMweb 202 reads its File Meta UID (see *DICOMweb*) — pair an inbound `DICOM(...)` with `content_type="dicom"`
+destination. All three carry the object **opaquely**, though a DICOMweb 202 reads the object's SOP Instance UIDs (see *DICOMweb*) — pair an inbound `DICOM(...)` with `content_type="dicom"`
 so each received object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a
 Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing,
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
 or STOW-RS destination. The codec is **headers and Structured Report only — no pixel data**. The DIMSE
 connectors need the **`[dicom]` optional extra** (`pip install 'messagefoundry[dicom]'`:
 `pydicom>=3.0.2,<3.1` + `pynetdicom==3.0.4`, pure-Python, no numpy), lazily imported; **DICOMweb needs no
-extra** (it stores the object as bytes over the shared `rest.py` HTTP plumbing, and reads its
-File Meta SOP Instance UID, by hand, to check a 202). Still out of scope:
+extra** (it stores the object as bytes over the shared `rest.py` HTTP plumbing, and checks a 202
+against its File Meta SOP Instance UID, read by hand, and, with the extra, its data set SOP
+Instance UID). Still out of scope:
 MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 
 | Setting | Default | Meaning |
@@ -4041,11 +4042,14 @@ refuses is also `unconfirmed-202`, whatever its reply names, when the object sen
 to compare, and its reason names why the File Meta has none. At least these leave no File Meta
 UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
 `(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
-the end of the object or of the group its `(0002,0000)` Group Length declares, a value that is not
-ASCII or is not in the UID grammar once its padding is dropped, a `(0002,0000)` Group Length over
-64 KiB, and a `(0002,0003)` that does not lie within the first 64 KiB of the group, the most the
-reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
-read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`. The data set UID is read
+the end of the object, a value that is not ASCII or is not in the UID grammar once its NUL or
+space padding is dropped, and a `(0002,0003)` that does not lie within the first 64 KiB after
+`DICM`, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
+read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to the first element
+outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
+too. The data set read puts back the SCU's ignores for `pydicom` warnings that would name a value,
+and an installed `pydicom` that lacks a reader the deflate guard replays raises as the SCU's does,
+rather than refusing each message. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is

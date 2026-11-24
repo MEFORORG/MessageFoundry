@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import http.client
+import importlib.util
 import logging
 import secrets
 import struct
@@ -52,6 +53,7 @@ from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
+from messagefoundry.parsing.dicom._deps import load_header_readers
 from messagefoundry.parsing.dicom.errors import DicomError
 from messagefoundry.parsing.dicom.peek import DicomPeek
 from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
@@ -69,7 +71,10 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     read_2xx_reply_text,
 )
-from messagefoundry.transports.dicom import recover_dicom_object_bytes
+from messagefoundry.transports.dicom import (
+    _ignore_pydicom_value_warnings,
+    recover_dicom_object_bytes,
+)
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture (NOT a
 # wrapper around RestDestination; ADR 0025 §2, exactly as fhir.py / soap.py do).
@@ -116,7 +121,7 @@ _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
 # ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914);
-# see _names_sent_instance and _sent_instance_uid.
+# see _named_uid and _sent_instance_uid.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
 # PS3.10 section 7.1: a 128-byte preamble, then "DICM", then the File Meta group in Explicit VR
@@ -138,7 +143,7 @@ _META_NO_MAGIC = "no Part-10 preamble and DICM magic"
 _META_NO_0003 = "no (0002,0003) in the File Meta group"
 _META_WRONG_VR = "a (0002,0003) whose VR is not UI"
 _META_NOT_A_UID = "a (0002,0003) value that is not a UID"
-_META_OVERRUN = "a File Meta element that runs past the end of the object or of the File Meta group"
+_META_OVERRUN = "a File Meta element that runs past the end of the object"
 _META_TOO_LONG = "a File Meta group longer than the reader reads"
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
@@ -377,22 +382,19 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
 
     Read by hand, so the destination still needs no ``pydicom``: after the 128-byte preamble and
     ``DICM``, the File Meta elements are always Explicit VR Little Endian (PS3.10 section 7.1). The
-    walk stops at the first element outside group ``0002``, at the end of the group that a leading
-    (0002,0000) Group Length declares, and at :data:`_FILE_META_CAP` bytes, so a hostile object
-    cannot make it walk the whole object. The VR and length of (0002,0003) are checked before its
-    value is sliced. The UID is never logged (PHI-safe)."""
+    walk stops at the first element outside group ``0002`` and at :data:`_FILE_META_CAP` bytes, so
+    a hostile object cannot make it walk the whole object. The (0002,0000) Group Length is not
+    read: pydicom ignores a wrong one too, so one that is absent, zero, too short, over the cap or
+    undefined changes nothing. The VR of (0002,0003) is checked before its value, at most the cap,
+    is sliced; its NUL or space padding is dropped before the 64-character check. The UID is never
+    logged (PHI-safe)."""
     if obj[_PART10_PREAMBLE : _PART10_PREAMBLE + 4] != b"DICM":
         return None, _META_NO_MAGIC
     pos = _PART10_PREAMBLE + 4
     size = len(obj)
     limit = min(size, pos + _FILE_META_CAP)
-    group_end: int | None = None
-
-    def past_limit() -> str:
-        # Past the cap, with no Group Length to end the group, the reader stopped short of the
-        # object and of the group; otherwise the object or the declared group ended.
-        return _META_TOO_LONG if group_end is None and limit < size else _META_OVERRUN
-
+    # Where the walk meets the limit: the cap, when the object goes on past it, or the object's end.
+    past_limit = _META_TOO_LONG if limit < size else _META_OVERRUN
     while pos + 8 <= limit:
         group, element = struct.unpack_from("<HH", obj, pos)
         if group != 0x0002:
@@ -403,47 +405,57 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
             start = pos + 8
         else:
             if pos + 12 > limit:
-                return None, past_limit()
+                return None, past_limit
             (length,) = struct.unpack_from("<I", obj, pos + 8)
             start = pos + 12
         end = start + length  # an undefined length (0xFFFFFFFF) runs past the limit, so is refused
         if end > limit:
-            return None, past_limit()
-        if element == 0x0000 and group_end is None and vr == b"UL" and length == 4:
-            (group_length,) = struct.unpack_from("<I", obj, start)
-            if group_length > _FILE_META_CAP:
-                return None, _META_TOO_LONG
-            group_end = end + group_length
-            limit = min(size, group_end)
-        elif element == 0x0003:
+            return None, past_limit
+        if element == 0x0003:
             if vr != b"UI":
                 return None, _META_WRONG_VR
-            if length > _DICOM_UID_MAX_LEN:
+            raw = obj[start:end].rstrip(b"\0 ")
+            if len(raw) > _DICOM_UID_MAX_LEN or not raw.isascii():
                 return None, _META_NOT_A_UID
-            raw = obj[start:end]
-            if not raw.isascii():
-                return None, _META_NOT_A_UID
-            uid = raw.decode("ascii").rstrip("\0 ")
+            uid = raw.decode("ascii")
             return (uid, "") if _is_uid(uid) else (None, _META_NOT_A_UID)
         pos = end
-    # The walk ran to its limit. A partial element header left before it was cut off by the limit;
-    # with none, the cap stopped the walk, or the group or object ended with no (0002,0003).
-    if pos < limit or (group_end is None and limit < size):
-        return None, past_limit()
+    # The walk met its limit: a partial element header was cut off by it, or the cap stopped the
+    # walk; otherwise the object ended with no (0002,0003).
+    if pos < limit or limit < size:
+        return None, past_limit
     return None, _META_NO_0003
+
+
+def _dicom_extra_installed() -> bool:
+    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host."""
+    return importlib.util.find_spec("pydicom") is not None
 
 
 def _data_set_instance_uid(obj: bytes) -> str | None:
     """The data set's SOP Instance UID (``0008,0018``) of the object sent, read with the engine's
     DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
-    materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`), or ``None`` when none is read: the
-    optional ``[dicom]`` extra is absent, the object does not parse, or it carries no UID in the
-    grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
-    whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914). Logged by
-    exception class only, never the UID or the bytes (PHI-safe)."""
+    materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
+    or ``None`` when none is read: the optional ``[dicom]`` extra is absent, the object does not
+    parse, or it carries no UID in the grammar :func:`_is_uid` checks. A server builds its reply
+    from this UID, so a 202 for an object whose File Meta was not rewritten after a re-UID still
+    names it (BACKLOG #5914).
+
+    As the SCU does, an installed pydicom that lacks a reader the deflate guard replays is a deploy
+    error: :func:`~messagefoundry.parsing.dicom._deps.load_header_readers` raises its
+    :class:`RuntimeError` here, outside the handler, rather than refusing each message. The SCU's
+    ignores for pydicom's value warnings, which name a value, are put back first before the read.
+    A parse failure is logged by exception class only, never the UID or the bytes (PHI-safe)."""
+    if not _dicom_extra_installed():
+        logger.debug(
+            "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
+        )
+        return None
+    _ignore_pydicom_value_warnings()
+    load_header_readers()
     try:
         uid = DicomPeek.parse(obj).sop_instance_uid
-    except (DicomError, RuntimeError) as exc:  # not parseable, or the [dicom] extra is absent
+    except DicomError as exc:
         logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
         return None
     if uid is None:
@@ -452,22 +464,22 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     return uid if _is_uid(uid) else None
 
 
-def _names_sent_instance(item: Any, sent_uid: str) -> bool:
-    """True when a ReferencedSOPSequence item names the instance sent: a dataset whose
+def _named_uid(item: Any) -> str | None:
+    """The UID a ReferencedSOPSequence item names, padding dropped, or ``None``: a dataset whose
     ReferencedSOPInstanceUID element has ``vr`` ``UI``, passes :func:`_element_values`, and holds
-    exactly one value (the attribute's VM is 1), a string equal to ``sent_uid`` once trailing NUL
-    or space padding, which a binary-to-JSON converter can leave, is dropped. ``sent_uid`` has
-    passed :func:`_is_uid`, so equality also holds the reply's UID to that grammar. Anything else
-    confirms nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
+    exactly one value (the attribute's VM is 1) that is a string, with trailing NUL or space
+    padding, which a binary-to-JSON converter can leave, dropped. It is compared only with a sent
+    UID that has passed :func:`_is_uid`, so equality also holds it to that grammar. Anything else
+    names nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
     if not isinstance(item, dict):
-        return False
+        return None
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
     if not isinstance(element, dict) or element.get("vr") != "UI":
-        return False
+        return None
     value = _element_values(element)
     if value is None or len(value) != 1 or not isinstance(value[0], str):
-        return False
-    return value[0].rstrip("\0 ") == sent_uid
+        return None
+    return value[0].rstrip("\0 ")
 
 
 def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | None:
@@ -526,13 +538,15 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
     """The ``unconfirmed-202`` refusal for a 202 whose ReferencedSOPSequence items are
     ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID
     (:func:`_sent_instance_uid`) or, failing that, its data set's SOP Instance UID
-    (:func:`_data_set_instance_uid`, read only then). With neither UID to compare, the reason
-    names why the File Meta has none (BACKLOG #5914)."""
+    (:func:`_data_set_instance_uid`). The data set is read only when an item names some instance,
+    the one case its UID can change the verdict. With neither UID to compare, the reason names why
+    the File Meta has none (BACKLOG #5914)."""
+    named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     meta_uid, cause = _sent_instance_uid(sent)
-    if meta_uid is not None and any(_names_sent_instance(i, meta_uid) for i in referenced):
+    if meta_uid is not None and meta_uid in named:
         return None
-    data_set_uid = _data_set_instance_uid(sent)
-    if data_set_uid is not None and any(_names_sent_instance(i, data_set_uid) for i in referenced):
+    data_set_uid = _data_set_instance_uid(sent) if named else None
+    if data_set_uid is not None and data_set_uid in named:
         return None
     if meta_uid is None and data_set_uid is None:
         return (

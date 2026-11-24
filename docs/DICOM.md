@@ -305,7 +305,8 @@ the retry/dead-letter classification, the `[egress].allowed_http` gate) and adds
 (with a per-request collision-checked random boundary) + `application/dicom+json` response handling (a per-instance
 `FailedSOPSequence` → permanent dead-letter, as are some other 2xx replies that do not confirm the
 store, though not all; which ones is CONNECTIONS.md *DICOMweb*, *Status classification*). **No new dependency** and **no `[dicom]` extra** — the object rides
-as bytes, and a 202 reply is checked against its File Meta SOP Instance UID, read by hand. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
+as bytes, and a 202 reply is checked against the object's File Meta SOP Instance UID, read by hand,
+and, with the `[dicom]` extra, its data set SOP Instance UID (CONNECTIONS.md *DICOMweb*). This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
 
 ---
 
