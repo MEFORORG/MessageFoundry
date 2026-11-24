@@ -359,6 +359,12 @@ def test_idle_sessions_on_moved_resets_do_not_trade_the_window_on_every_fire(
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(80.0)
     assert [r["seven_day"] for r in history(tmp_path)] == [80.0]
 
+    # CONTROL. The window is not frozen: the same lower reading from a session that has just called
+    # the API opens the new window.
+    _session_fire(tmp_path, low, session="J", api_ms=2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+    assert [r["seven_day"] for r in history(tmp_path)] == [80.0, 5.0]
+
 
 def test_a_frozen_lower_number_on_a_moved_reset_cannot_replace_a_spent_pool(
     tmp_path: Path,
@@ -1930,6 +1936,13 @@ def test_a_last_row_in_another_spelling_of_this_root_is_this_roots_row(tmp_path:
     seven = {"used_percentage": 86.0, "resets_at": epoch}
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
     assert len(history(tmp_path)) == 1, history(tmp_path)
+
+    # CONTROL. The collector does append here: a changed percentage adds a row.
+    collect(
+        tmp_path,
+        {"session_id": "A", "rate_limits": {"seven_day": {**seven, "used_percentage": 87.0}}},
+    )
+    assert len(history(tmp_path)) == 2, history(tmp_path)
 
 
 def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) -> None:

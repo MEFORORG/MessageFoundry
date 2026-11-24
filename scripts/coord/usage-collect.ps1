@@ -365,7 +365,9 @@ try {
     # A LOWER OR EQUAL READING ON ANOTHER RESET OPENS A NEW WINDOW ONLY FROM A LIVE SESSION (BACKLOG
     # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
     # frozen number replaced the published one on every fire. So it needs a session that has just
-    # called the API and is stamped with this root, as a confirmation must be. A higher reading with a
+    # called the API and is stamped with this root by Test-OwnStamp, as a confirmation must be. That
+    # test counts an unpinned session as this root's, so an unpinned session of another root that
+    # publishes here through a mis-wired -StateDir passes it too. A higher reading with a
     # readable reset that is not an earlier, passed one (refused above, higher or not) is taken from
     # anyone, before or after the published reset, because refusing it weakens a stop: while
     # that reset is ahead the lower published number could clear the gate, and past it the gone window
@@ -393,13 +395,13 @@ try {
         # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
         $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
+        $live = $calledApi -and $stampOwn
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
-            $live = $calledApi -and $stampOwn
             ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not $live)) -or
             ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
-        $confirmed = $calledApi -and $stampOwn -and
+        $confirmed = $live -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
             $seven.used_percentage -eq $publishedPct
     }

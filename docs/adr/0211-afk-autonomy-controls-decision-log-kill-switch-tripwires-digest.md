@@ -437,8 +437,8 @@ roster alias of the Lander.
 > window of this root's, the collector therefore refuses a reading with the same reset that is not
 > higher, and a reading whose reset is earlier than the published one and has already passed. A refused
 > reading reaches neither `latest.json` nor the history. Any other reset is a new window: a higher
-> reading replaces the value from any session, and a lower or equal one only from a session of this root
-> that has just called the API, whether or not the published reset has passed (BACKLOG #5178). A reading with no readable reset is refused while the published reset
+> reading replaces the value from any session, and a lower or equal one only from a session of this root,
+> or an unpinned one, that has just called the API, whether or not the published reset has passed (BACKLOG #5178). A reading with no readable reset is refused while the published reset
 > is ahead, higher or not, because it cannot prove which window it belongs to.
 >
 > **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
@@ -547,13 +547,15 @@ roster alias of the Lander.
 >   earlier reset. The same-reset case is what this amendment closes.
 >   **Narrowed 2026-11-24 (BACKLOG #5178):** a reading at or below the published one, on another reset,
 >   now counts as a new window only from a session of this root that has just called the API, whether or
->   not the published reset has passed. Two idle sessions' 80, 5, 80, 5 now leaves one history row, and
+>   not the published reset has passed. An unpinned session counts as this root's, so an unpinned session
+>   of another root that publishes here still passes. From a published 80, two idle sessions' 80, 5, 80, 5
+>   now leaves one history row, and
 >   an idle session's frozen 5 no longer replaces a published 100. A higher reading on a later reset, or
 >   on an earlier one that has not passed, is still taken from any session, before or after the
 >   published reset: past it, refusing an idle 99 over a gone 50 would
 >   turn the gate's HALT into a REVIEW. So a live lower session and an idle higher one can still trade
->   the window. Liveness is a rise in the API-duration counter. Whether a
->   failed call or an unpinned session moves it is not measured, so a frozen number from a session
+>   the window. Liveness is a rise in the session's API-duration counter. Whether a
+>   failed call moves it is not measured, so a frozen number from a session
 >   whose calls fail may still pass as live. After a real reset, a session that never reads as live
 >   cannot open the new window at or below the gone window's number, and the gate answers REVIEW on the
 >   gone one until a live session or a higher reading does.

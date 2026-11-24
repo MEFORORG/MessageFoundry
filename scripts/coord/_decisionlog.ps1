@@ -899,7 +899,8 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       carry the owner's ruling of 2026-10-31, which moved the stop to the weekly window when Anthropic
       removed the five-hour limit and replaced the 2026-08-14 ruling that a weekly rung stops nobody.
       The percentage is the weekly HOLD level of the owner's ruling of 2026-09-17. The Steward has
-      later rungs in minutes too; only HOLD is read here.
+      later rungs in minutes too; only HOLD is used here, though all three numbers are read to
+      find it (below).
 
       The Steward's thresholds.json overrides them through the keys its watch.py reads:
       `levels.weekly` and `minutes`, each three numbers, HOLD first in watch.py's order. Any other key under `levels` is an unknown window,
@@ -917,9 +918,10 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes the default instead
       and the strictest number still holds, so a NaN can only pull the rung toward the default, never
       past it. Throwing would answer UNKNOWN, which is a REVIEW where the triple's other numbers can
-      halt. Other out-of-range values pass as written: 0, a negative level or an infinite lead time
-      halts early. Only a triple whose every level is Infinity, or whose every lead time is minus
-      Infinity, never fires.
+      halt. Other out-of-range values pass as written, and a slip in any slot can move the rung: a
+      level of 0 or below, or an infinite lead time, halts early. A triple whose every level is above
+      100, or whose every lead time is 0 or below, turns that clause off, as the same value in the
+      first slot did before this rule.
     #>
     $holdAt = 90.0
     $holdMin = 60.0
@@ -938,8 +940,10 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
         $nanCount = @($t | Where-Object { [double]::IsNaN($_) }).Count
         $t = @($t | ForEach-Object { if ([double]::IsNaN($_)) { $Default } else { $_ } })
         $hold = ($t | Measure-Object -Minimum:($Pick -eq 'Minimum') -Maximum:($Pick -eq 'Maximum')).$Pick
-        $note = if ($nanCount) { "$What holds NaN, read as the default" } elseif ($hold -ne $t[0]) { "$What out of order" } else { $null }
-        return [pscustomobject]@{ Hold = $hold; Note = $note }
+        $notes = @()
+        if ($nanCount) { $notes += "$What holds NaN, read as the default" }
+        if ($hold -ne $t[0]) { $notes += "$What out of order" }
+        return [pscustomobject]@{ Hold = $hold; Notes = $notes }
     }
     $levels = Get-DecisionJsonValue $doc 'levels'
     if ($null -ne $levels) {
@@ -949,7 +953,7 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
             $h = Get-Hold $p.Value 'levels.weekly' $holdAt 'Minimum'
             $holdAt = $h.Hold
             $source = $ThresholdsFile
-            if ($h.Note) { $notes += $h.Note }
+            $notes += $h.Notes
         }
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
@@ -957,7 +961,7 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
         $h = Get-Hold $minutes 'minutes' $holdMin 'Maximum'
         $holdMin = $h.Hold
         $source = $ThresholdsFile
-        if ($h.Note) { $notes += $h.Note }
+        $notes += $h.Notes
     }
     if ($notes) { $source = "$source ($($notes -join ' and '), so the strictest number holds)" }
     return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source }

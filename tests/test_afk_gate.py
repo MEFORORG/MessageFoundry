@@ -514,8 +514,13 @@ def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
 
 @pytest.mark.parametrize(
     "weekly",
-    [[float("nan"), 94, 97], [93, float("nan"), 97], [93, 96, float("nan")]],
-    ids=["nan-first", "nan-middle", "nan-last"],
+    [
+        [float("nan"), 94, 97],
+        [93, float("nan"), 97],
+        [93, 96, float("nan")],
+        [97, float("nan"), 94],
+    ],
+    ids=["nan-first", "nan-middle", "nan-last", "nan-and-out-of-order"],
 )
 def test_a_nan_weekly_level_never_lifts_the_rung(sb: Sandbox, weekly: list[float]) -> None:
     """BACKLOG #5178. ConvertFrom-Json reads a bare NaN as a number, and the lowest-number rule made a
@@ -528,6 +533,8 @@ def test_a_nan_weekly_level_never_lifts_the_rung(sb: Sandbox, weekly: list[float
     assert "NaN" in _thresholds(sb).read_text(encoding="utf-8"), "control: the file holds a NaN"
     code, doc = gate(sb)
     assert code == HALT and "levels.weekly holds NaN" in why(doc), why(doc)
+    if weekly[0] == 97:
+        assert "levels.weekly out of order" in why(doc), "both faults are named: " + why(doc)
 
 
 def test_a_nan_minutes_slot_never_shortens_the_lead_time(sb: Sandbox) -> None:
