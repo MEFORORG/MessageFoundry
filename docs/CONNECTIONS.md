@@ -1876,9 +1876,9 @@ header allowlist that
 [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#no-escape-sends-a-credential-to-an-unverified-peer)
 states. In the connection's headers it refuses the connection when it is built, and stamped per
 message it refuses that send, and the message dead-letters; neither drops the header. With none
-set, a delivery request asks for `identity`. A partner that honours yours may code its reply,
-and the engine decodes no content coding, so leave `Accept-Encoding` unset; the paragraph above
-says what happens to a coded 2xx delivery reply. A forward proxy must not change the header either
+set, a delivery request asks for `identity`. A partner that honours yours may code its reply, so
+leave `Accept-Encoding` unset; *A 2xx reply body in a content coding*, above, says what happens to
+a coded 2xx delivery reply. A forward proxy must not remove or change the header, whoever set it
 ([CONFIGURATION.md](CONFIGURATION.md#a-forward-proxy-must-not-re-frame-what-it-carries), item 4).
 
 **Security.** Redirects are **refused** (a 3xx can't divert PHI to another host — ASVS 15.3.2), the URL
