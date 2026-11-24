@@ -2785,9 +2785,10 @@ colon-written EUI-64 device id such as `00:1A:2B:FF:FE:3C:4D:5E`. At least these
 allowed link-local address.
 
 The IPv6 check reads each value as written and also folded to compatibility form (NFKC), and
-refuses when either reading holds an address it counts as routable. So a routable address
-written with fullwidth digits or colons, or with a circled digit, is refused, such as
-`4000<U+FF1A>a1<U+FF1A><U+FF1A>5`. A folded reading that is an allowed address adds no hit, so
+refuses when either reading holds an address it counts as routable. So at least a routable
+address the check reads, written with fullwidth digits or colons or with a circled digit, is
+refused, such as `4000<U+FF1A>a1<U+FF1A><U+FF1A>5`; a fullwidth form of a miss listed above
+still passes, such as `1.2.4000<U+FF1A><U+FF1A>5`. A folded reading that is an allowed address adds no hit, so
 `fe80<U+FF1A><U+FF1A>1` and `::<U+2460>` pass: they fold to `fe80::1` and `::1`, and neither
 holds a routable address as written. The written reading still counts on its own:
 `<U+FF46>e80::1` folds to the allowed `fe80::1` and is refused, because as written it holds

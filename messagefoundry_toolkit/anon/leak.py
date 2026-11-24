@@ -1163,8 +1163,10 @@ def past_first_component_hits(
 def retarget_residue_hits(
     text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
 ) -> list[str]:
-    """The hits of :func:`past_first_component_hits` in what a retarget of a default field left
-    (BACKLOG #3493)."""
+    """The hits of :func:`past_first_component_hits` in what a retarget of a default field left,
+    for a default whose kind is not ``id``, ``mrn``, ``ssn`` or ``dln``, whatever kind the
+    retarget points it at. A retarget of a default of one of those four kinds reads in
+    :func:`kept_component_hits` instead (BACKLOG #3493)."""
     hits = past_first_component_hits(text, rules, version=version)
     return [hit for hit in hits if mapped_field_label(hit) == RETARGET_RESIDUE]
 
@@ -1173,8 +1175,11 @@ def kept_component_hits(
     text: str, rules: tuple[FieldRule, ...], *, version: str | None = None
 ) -> list[str]:
     """The hits of :func:`past_first_component_hits` in the components an ``id``, ``mrn``,
-    ``ssn`` or ``dln`` rule kept, and in what a retarget of a default of one of those kinds left,
-    which is the same components (BACKLOG #5533, #5534)."""
+    ``ssn`` or ``dln`` rule kept, and in what any retarget of an ``id``, ``mrn``, ``ssn`` or
+    ``dln`` default left past component 1, whatever kind it now points at. A hit is named as a
+    component an identifier rule keeps even when the retarget points the field at another kind,
+    such as ``PID-4`` retargeted from ``id`` to ``name``. A retarget of a default of another kind
+    to one of these four reads in :func:`retarget_residue_hits` instead (BACKLOG #5533, #5534)."""
     hits = past_first_component_hits(text, rules, version=version)
     return [hit for hit in hits if mapped_field_label(hit) == KEPT_COMPONENT]
 
