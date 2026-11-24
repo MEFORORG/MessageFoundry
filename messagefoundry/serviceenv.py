@@ -1506,28 +1506,16 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # comment 7116005396, F1). It takes the strings a refused value in that string runs on
         # into with it, so no value is left behind unnamed, and it has the list written back as
         # the first step says, since the other refused values are still in it (code review on
-        # that repair). A line that may set the directory is not added back, so the installer
-        # still finds none to read. Nor is a line the printed rule makes part of a refused value:
-        # below a refused name written alone or set to nothing only a refused line ends it,
-        # erring past the reader's fail-closed rule (_ends_blank_class); every other line of a
-        # string whose first non-blank line names a refused variable is part of it, as the
-        # whole-string reading holds them where that line sets the name, and the reader skips
-        # leading blank lines (the Lander's hold on PR 3142, comment 7122889682, item 1); where
-        # that line is a name written alone, the rule errs past the reader, which may end the
-        # value at a line below it; and below any other line of one
-        # the doubt step's rule ends it. It also takes, until none is left, the strings whose
-        # refused variables removing the others would read differently (the Lander's hold on PR
-        # 3142, comment 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair).
-        # The rule is not the reader, so this text does not guarantee that no line of a refused
-        # value is added back. The two still differ at least for a mixed-case name that takes a
-        # key or its path below an empty value, which the reader reads as that value (an open
-        # finding of code review round 2 on that repair), and for a NAME== line the reader reads
-        # as empty and a joined group the reader reads whole (open findings 1 and 2 of code
-        # review round 3 on that repair, the repair handback on PR 3142, comment 7122130265).
-        # Nor does it keep back a line below a directory line in a string the clause removes,
-        # which the doubt step's rule reads as part of the directory's value and which may be
-        # key text: the rule adds such a line back (code review round 2 on the repair of the
-        # Lander's hold on PR 3142, comment 7122889682, finding 1, open).
+        # that repair). It also takes, until none is left, the strings whose refused variables
+        # removing the others would read differently (the Lander's hold on PR 3142, comment
+        # 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair). It removes each
+        # of those strings whole and adds no line of them back, so the installer finds no line
+        # in them to read as the directory, and no line of a refused value they hold is left as
+        # an entry of its own. The ordinary lines they hold go with them; the operator has read
+        # them out first. The add-back step this clause carried before put back at least a
+        # store key below a directory line and a line of a joined group's value, so it was
+        # removed (the Lander's hold on PR 3142, comment 7125522135). Restoring those ordinary
+        # lines safely is open work, unfiled.
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
@@ -1548,15 +1536,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     "value in them runs on into, every line they hold, remove those strings with "
                     "each refused variable whose value they hold, put each refused value you read "
                     "where the other steps say, keep a retired key for the shell that runs "
-                    "`messagefoundry rotate-key`, and add back as an entry of its own each other "
-                    f"line, but none that may set {_DIRECTORY_VARIABLE} and none that is part of "
-                    "a refused value: each line below a refused name written alone or set to "
-                    "nothing, up to the next that names a refused variable, alone or set, each "
-                    "other line of a string whose first non-blank line names a refused "
-                    "variable, and each line below another line of a refused value, up to the "
-                    "next that names a refused variable or sets another variable as the first "
-                    f"step says, where a line that may set {_DIRECTORY_VARIABLE} ends neither, "
-                    "writing the list back as the first step says"
+                    "`messagefoundry rotate-key`, writing the list back as the first step says"
                 )
             steps.append(create)
         put = [", ".join(moving_others)] if moving_others else []

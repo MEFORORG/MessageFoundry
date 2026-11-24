@@ -205,14 +205,11 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: operator read every line out before removing the string, since the registry may hold its
 #: only copy, a retired store key among them, which protect-key never stores (code review round
 #: 1 on the repair of PR 3142's round-3 open findings 1 and 2; the Lander's hold on PR 3142,
-#: comment 7116005396, F1). It adds back no line its printed rule makes part of a refused value:
-#: the rule ends one below a refused name written alone or set to nothing only at a refused line,
-#: and takes every other line of a string whose first non-blank line names a refused variable
-#: (the Lander's hold on PR 3142, comment 7122889682, item 1). It reads out, until none is left,
-#: each string whose refused variable removing the others would read differently (the Lander's
-#: hold on PR 3142, comment 7119680463, items 1 and 3; code review round 1 on that repair). The
-#: rule is not the reader, so it may still add back a line the reader reads as part of a refused
-#: value; the clause's comment in messagefoundry/serviceenv.py names the shapes still open.
+#: comment 7116005396, F1). It reads out, until none is left, each string whose refused
+#: variable removing the others would read differently (the Lander's hold on PR 3142, comment
+#: 7119680463, items 1 and 3; code review round 1 on that repair). It removes those strings
+#: whole and adds no line back, as the remedy on main does (the Lander's hold on PR 3142,
+#: comment 7125522135).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
@@ -222,14 +219,7 @@ CREATE_INSTALLER = (
     "this sentence names would change, and of each string a refused value in them runs on into, "
     "every line they hold, remove those strings with each refused variable whose value they "
     "hold, put each refused value you read where the other steps say, keep a retired key for the "
-    "shell that runs `messagefoundry rotate-key`, and add back as an entry of its own each other "
-    "line, but none that may set MEFOR_SECRETS_DIRECTORY and none that is part of a refused "
-    "value: each line below a refused name written alone or set to nothing, up to the next that "
-    "names a refused variable, alone or set, each other line of a string whose first non-blank "
-    "line names a refused variable, and each line below another line of a refused value, up to "
-    "the next that names a refused variable or sets another variable as the first step says, "
-    "where a line that may set MEFOR_SECRETS_DIRECTORY ends neither, writing the list "
-    "back as the first step says"
+    "shell that runs `messagefoundry rotate-key`, writing the list back as the first step says"
 )
 
 #: How the Put step names the directory wherever a directory entry is in doubt, since the doubt

@@ -44,6 +44,7 @@ _RETIRED = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
 assert _RETIRED in KEY_CLASS_NAMES and _KEY != _RETIRED
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-for-tests-01").decode()
 _KEY_B64_2 = base64.b64encode(b"synthetic-store-key-for-tests-02").decode()
+_KEY_B64_3 = base64.b64encode(b"synthetic-store-key-for-tests-03").decode()
 _NEW_DIRECTORY = "C:\\synthetic-secrets"
 
 
@@ -168,43 +169,6 @@ def _refused_names(entries: list[tuple[str, str]]) -> frozenset[str]:
     )
 
 
-def _part_of_refused_value(
-    entries: list[tuple[str, str]], where: str, *, non_blank: bool
-) -> set[tuple[int, int]]:
-    """The ``(string, line)`` positions in the list ``where`` that the installer clause's printed
-    rule makes part of a refused value: each line below a refused name written alone or set to
-    nothing, up to the next that names a refused variable, each other line of a string whose
-    first non-blank line names a refused variable, and each line below another line of a
-    refused value, up to the next that names one or sets another variable as the doubt step
-    says, where a line that may set the directory ends neither. ``non_blank`` is whether the
-    clause says first non-blank line; before the Lander's hold on PR 3142, comment 7122889682,
-    item 1, it said first line, which a blank first line hid the refused name from."""
-    part: set[tuple[int, int]] = set()
-    state: str | None = None
-    for i, (at, string) in enumerate(entries):
-        if at != where:
-            continue
-        lines = _LINE_BREAK.split(string)
-        lead = next((j for j, line in enumerate(lines) if line.strip()), 0) if non_blank else 0
-        if _refused_name(lines[lead].partition("=")[0].strip().upper()):
-            part |= {(i, j) for j in range(len(lines)) if j != lead}
-        for j, line in enumerate(lines):
-            name, equals, value = line.partition("=")
-            if _refused_name(name.strip().upper()):
-                state = "open" if not equals or not value.replace("=", "").strip() else "value"
-                continue
-            if (
-                state == "value"
-                and not _may_name_directory(line)
-                and _ends_the_value(line, frozenset())
-            ):
-                state = None
-                continue
-            if state is not None:
-                part.add((i, j))
-    return part
-
-
 def _value_lines(entries: list[tuple[str, str]], refused: frozenset[str]) -> frozenset[str]:
     """Every non-blank line of each refused variable as the reader reads it, its name and its
     value."""
@@ -302,8 +266,9 @@ def _follow_installer_clause(
     clause: str, registry: _Registry, refused: frozenset[str], moves: dict[str, str]
 ) -> None:
     """The create step's clause: read out of each kept AppEnvironmentExtra string the installer
-    reads what the clause says to read, then remove that string, with each refused variable
-    whose value it holds, and add back what the clause says to add back."""
+    reads what the clause says to read, then remove that string whole, with each refused
+    variable whose value it holds. Since the Lander's hold on PR 3142, comment 7125522135, the
+    clause adds no line back, as the remedy on main does not."""
     # Every line since the Lander's hold on PR 3142, comment 7116005396, F1; before it, each
     # value the next step puts in the secrets directory, which no store key is.
     every_line = "every line it holds" in clause or "every line they hold" in clause
@@ -316,17 +281,10 @@ def _follow_installer_clause(
     # that repair: also, until none is left, each string holding a refused variable, empty or
     # not, that removing the strings the sentence names would read differently.
     with_changed = "whose reading removing the strings this sentence names would change" in clause
-    # Before that hold, item 1, each other line; since, none that is part of a refused value
-    # under the clause's printed rule (_part_of_refused_value), which the walk follows as
-    # printed, so the check after the walk tests that rule against the reader.
-    add_back = (
-        "add each other line back as an entry of its own" in clause
-        or "add back as an entry of its own each other line" in clause
-    )
-    by_rule = "none that is part of a refused value" in clause
-    # Since the Lander's hold on PR 3142, comment 7122889682, item 1: the string's first
-    # non-blank line, as the reader skips leading blank lines.
-    non_blank = "of a string whose first non-blank line names a refused variable" in clause
+    # The clause must add no line back: its add-back step put back a store key below a
+    # directory line and a line of a joined group's value (the Lander's hold on PR 3142,
+    # comment 7125522135).
+    assert "add back" not in clause, clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -339,7 +297,6 @@ def _follow_installer_clause(
         }
         snapshot = list(registry.entries)
         wide = refused | _refused_names(snapshot)
-        part = _part_of_refused_value(snapshot, where, non_blank=non_blank)
         start = snapshot.index((where, string))
         gone = {start}
 
@@ -385,21 +342,6 @@ def _follow_installer_clause(
             if _names_refused(before[1], refused):
                 registry.entries.remove(before)
                 index -= 1
-        if add_back:
-            # Each line that is neither a refused variable nor part of a refused value, and, as
-            # the clause says, none that may set the directory.
-            others = [
-                line
-                for k, (_where, text) in removed
-                for j, line in enumerate(_LINE_BREAK.split(text))
-                if line.strip()
-                and not _names_refused(line, wide if by_rule else refused)
-                and not (
-                    (k, j) in part if by_rule else any(secret in line for secret in moves.values())
-                )
-                and not ("but none that may set" in clause and _may_name_directory(line))
-            ]
-            registry.entries[index:index] = [(where, line) for line in others]
 
 
 #: The create step's clause where a string the doubt step leaves as it is may be read by the
@@ -620,8 +562,9 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         False,
     ),
     # The Lander's hold on PR 3142, comment 7119680463, item 1: an empty retired key runs on into
-    # an installer string whose value is a list of two keys on two lines. The clause bounds a
-    # refused value's lines by the doubt step's rule, so the second key is not added back.
+    # an installer string whose value is a list of two keys on two lines. The clause removes
+    # that string whole, so the second key is not left behind (the Lander's hold on PR 3142,
+    # comment 7125522135).
     "retired-key-list-on-two-lines-in-an-installer-string": (
         [
             (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
@@ -659,8 +602,9 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_B": "SEKRITb"},
         True,
     ),
-    # Code review round 1 on that repair: below an empty refused name only a refused line ends
-    # its value, so a key the reader holds there under a Windows name is not added back.
+    # Code review round 1 on that repair: a key the reader holds below an empty refused name
+    # under a Windows name, which the clause's whole-string removal takes with its string (the
+    # Lander's hold on PR 3142, comment 7125522135).
     "windows-name-key-below-an-empty-retired-key": (
         [
             (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
@@ -699,7 +643,8 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
     # The same review: removing the name's strings would join the empty password to the
     # ordinary line below them, so the clause takes the password's string too.
     # Code review round 2 on that repair: the whole-string reading of a string led by a refused
-    # name holds every line below it, an ordinary one among them, so none is added back.
+    # name holds every line below it, an ordinary one among them, and the clause removes the
+    # string whole (the Lander's hold on PR 3142, comment 7125522135).
     "ordinary-line-in-a-string-led-by-a-refused-name": (
         [
             (
@@ -716,8 +661,9 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
     # The Lander's hold on PR 3142, comment 7122889682, item 1, as the Lander reproduced it: a
     # blank first line, then a name the refusal is about. The reader skips the blank line, so
     # every line below the name is part of its value, SEKz43=Q a line of the private key's
-    # among them, and none is added back. This value reads as a path, so the refusal does not
-    # list the key; the next case's does.
+    # among them, and the clause removes the string whole (the Lander's hold on PR 3142,
+    # comment 7125522135). This value reads as a path, so the refusal does not list the key;
+    # the next case's does.
     "blank-first-line-above-a-refused-name": (
         [
             (
@@ -749,8 +695,8 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         },
         False,
     ),
-    # The same hold, item 2: the same shape adds back no ordinary line the reader held as part
-    # of a refused value.
+    # The same hold, item 2: the same shape leaves no ordinary line the reader held as part of
+    # a refused value, as the clause removes the string whole.
     "blank-first-line-above-a-value-name": (
         [
             (
@@ -762,6 +708,31 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         ],
         frozenset({"mefor_secrets_directory=SEKRITpw"}),
         {"MEFOR_VALUE_A": "SEKRITa", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
+        False,
+    ),
+    # The Lander's hold on PR 3142, comment 7125522135: a store key's text below a directory
+    # line in an installer string the clause removes, which the reader reads as part of the
+    # directory's value. The clause's former add-back step put it back as an entry of its own.
+    "below-dir-line-key": (
+        [
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_VALUE_B"),
+            (_EXTRA, _KEY_B64),
+            (_EXTRA, "HTTP_PROXY=http://proxy.invalid"),
+            (_EXTRA, f"mefor_secrets_directory=y\n{_KEY_B64_3}\nMEFOR_VALUE_A=SEKa"),
+        ],
+        frozenset({_KEY_B64}),
+        {"MEFOR_VALUE_B": _KEY_B64, "MEFOR_VALUE_A": "SEKa"},
+        False,
+    ),
+    # The same hold: a joined group, whose last line SEKz=Q the reader reads as part of the
+    # store password's value. The former add-back step put it back as an entry of its own.
+    "joined-group": (
+        [
+            (_EXTRA, "MEFOR_STORE_PASSWORD=\n="),
+            (_EXTRA, "mefor_secrets_directory=SEKd\nMEFOR_STORE_PASSWORD=SEKpw\nSEKz=Q"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKd\nMEFOR_STORE_PASSWORD=SEKpw\nSEKz=Q"}),
+        {"MEFOR_STORE_PASSWORD": "SEKpw"},
         False,
     ),
     "empty-key-rejoins-an-ordinary-line": (
@@ -800,7 +771,8 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     assert registry.read_out == _READ_OUT.get(case, set())
     # The Lander's hold on PR 3142, comment 7119680463, item 1: no line of a refused value is
     # left in the lists but one a refused variable still holds, for the removal step to take.
-    assert _refused_text_left(entries, registry, moves) == []
+    secrets = frozenset(moves.values()) | _SECRET_TEXT.get(case, frozenset())
+    assert _refused_text_left(entries, registry, moves, secrets) == []
     # Code review round 1 on that repair: and no line the steps leave has joined a refused value
     # it was not part of, which the next start would refuse again.
     wide = frozenset(moves) | _refused_names(entries)
@@ -810,14 +782,16 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
 
 
 def _refused_text_left(
-    entries: list[tuple[str, str]], registry: _Registry, moves: dict[str, str]
+    entries: list[tuple[str, str]],
+    registry: _Registry,
+    moves: dict[str, str],
+    secrets: frozenset[str],
 ) -> list[str]:
     """Each line left in ``registry`` that was a line of a refused value in ``entries``, as the
-    reader read it, any refused name counted, or that holds a secret the case moves, and that a
+    reader read it, any refused name counted, or that holds one of ``secrets``, and that a
     later step does not remove: it is in no string that names a refused variable or that a
-    refused value runs on into, and no refused variable's reading holds it. The walk follows
-    the clause's printed rule for what to add back, so this tests that rule against the reader
-    (code review round 1 on the repair of the Lander's hold on PR 3142, comment 7119680463)."""
+    refused value runs on into, and no refused variable's reading holds it (code review round 1
+    on the repair of the Lander's hold on PR 3142, comment 7119680463)."""
     now = registry.entries
     wide = frozenset(moves) | _refused_names(entries)
     was = _value_lines(entries, wide)
@@ -830,9 +804,19 @@ def _refused_text_left(
         if not _holds_refused(string, wide | _refused_names(now))
         and string not in registry.runs_on_into
         for line in _LINE_BREAK.split(string)
-        if (line.strip() in was or any(secret in line for secret in moves.values()))
+        if (line.strip() in was or any(secret in line for secret in secrets))
         and line.strip() not in held
     ]
+
+
+#: Secret text a case holds beside the values it moves, by case, which no line the steps leave
+#: may hold: key text the reader reads as part of a directory line's value, which no refused
+#: variable holds, and a line the reader reads as part of a refused value (the Lander's hold
+#: on PR 3142, comment 7125522135).
+_SECRET_TEXT: dict[str, frozenset[str]] = {
+    "below-dir-line-key": frozenset({_KEY_B64_3}),
+    "joined-group": frozenset({"SEKz=Q"}),
+}
 
 
 #: The values the create step's installer clause has the operator read out, by case.
@@ -853,6 +837,8 @@ _READ_OUT = {
         "MEFOR_STORE_PASSWORD",
     },
     "blank-first-line-above-a-value-name": {"MEFOR_VALUE_A", "MEFOR_STORE_PASSWORD"},
+    "below-dir-line-key": {"MEFOR_VALUE_A", "MEFOR_VALUE_B"},
+    "joined-group": {"MEFOR_STORE_PASSWORD"},
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},
