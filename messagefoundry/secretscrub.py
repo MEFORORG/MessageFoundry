@@ -727,17 +727,20 @@ _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 #: The same, holding no whitespace at all: the one braced shape the old plain class took whole.
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 
-# A BRACED VALUE HOLDING WHITE SPACE, WITH TEXT GLUED AFTER ITS CLOSER (BACKLOG #2966 steps 1 and 2).
+# A BRACED VALUE HOLDING WHITE SPACE, WITH TEXT GLUED AFTER ITS CLOSER (BACKLOG #2966 step 1).
 # The guard above refuses a closer that does not end the value, and the plain class then stopped at the
-# first white space inside the braces, so ``MEFOR_X={pp ww}x rest`` printed " ww}x rest" and
-# ``private_key={pp ww},rest`` printed " ww},rest". ``_MEFOR_SECRET`` and ``_KEY_MATERIAL`` now take
-# such a value, closer and glued text, in one narrow shape (:data:`_MEFOR_GLUED_BRANCH`,
-# :data:`_KEY_GLUED_BRANCH`). Every other shape falls back to the plain class and prints as before.
+# first white space inside the braces, so ``MEFOR_X={pp ww}x rest`` printed " ww}x rest".
+# ``_MEFOR_SECRET`` now takes such a value, closer and glued text, in one narrow shape
+# (:data:`_MEFOR_GLUED_BRANCH`). Every other shape falls back to the plain class and prints as before.
+# ``_KEY_MATERIAL`` takes no such branch: one ending its glued text at ";" or "&" deleted the space
+# that ended the token before it, so the support bundle's HL7 field-run pass read one longer token
+# and printed a name or a password tail ``origin/main`` hid (``a|b|private_key={pp ww}x;Smith
+# Jones`` printed "Jones"). Found by the third review round; #2966 step 2 stays open.
 #
 # WHAT THE OLD CLASS LEFT, from the space in the braces to the end of the glued text, was still read by
-# every later pass, here and in the support bundle's PHI pass. A pass that starts there and reads on,
-# across the next space or to the end of the line, hid text that this branch would take its anchor
-# away from. So the shape is an ALLOWLIST, as :data:`_SPACED_BRACED_TAIL` is, and each condition is a
+# every later pass, here and in the support bundle's PHI pass. A pass that starts there, or before the
+# label, and reads on, across the next space or to the end of the line, hid text that this branch
+# would take its anchor or its token end away from. So the shape is an ALLOWLIST, as :data:`_SPACED_BRACED_TAIL` is, and each condition is a
 # measured or reviewed reason:
 #
 # * Before the braces' first white space, anything the guarded braced form takes except ";", "&" and
@@ -748,8 +751,8 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # * The first white space is a plain space, U+0020. A line separator such as U+2028 would be deleted,
 #   joining two lines of a multi-line record.
 # * After it, up to the closer, and in the glued text after the closer, only lower case ASCII letters,
-#   with spaces in the braces and the separators that pattern's plain class runs over in the glued
-#   text (";", "," and "&" for ``_MEFOR_SECRET``, "," for ``_KEY_MATERIAL``). That refuses at least a
+#   with spaces in the braces and ";", "," and "&" in the glued text, which the plain class runs over
+#   too. That refuses at least a
 #   capital, a digit, "|", "(", ":", "=", "-", "." and "/": an HL7 segment ID, a DICOM tag, a
 #   ``PatientName=`` label, a name run or a date the PHI pass reads to the end of the line or across
 #   the next space, a ``://`` or a ``-----BEGIN`` marker. Found by code review on this change, with
@@ -758,9 +761,10 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 #   ``mrn``, ``nonnumeric`` and the scheme words are in. ``MEFOR_X={pp ww}mrn 12345`` printed
 #   "12345" in the bundle without it, and ``nonnumeric port: 'pw@host'`` after the glued text printed
 #   the password, found by the first and second review rounds.
-# * The glued text ends where the plain class stops, and is not followed by white space and a ":",
-#   "=" or quote, or by a quote, which is :data:`_NO_QUOTED_LABEL_AFTER`: ``;password = v`` keeps its
-#   label.
+# * The glued text ends where the plain class stops, at white space, a quote or the end, so the token
+#   after it ends where it did. It is not followed by at least white space and a ":", "=" or quote, a
+#   quote, or white space and a scheme word and white space, which is :data:`_NO_QUOTED_LABEL_AFTER`:
+#   ``;password = v`` keeps its label.
 #
 # These are the readings found so far, not a proof that no later pass reads anything else in such
 # text. ``tests/test_secretscrub_braced_glued.py`` compares both surfaces with and without the
@@ -1071,22 +1075,14 @@ _PLAIN_SCHEME_VALUE = (
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
-#: The branches :data:`_SPACED_GUARDED_BRACED` says why: a braced value holding a space, then glued
-#: text up to where the pattern's plain class stops, with no label after it.
+#: The branch :data:`_SPACED_GUARDED_BRACED` says why: a braced value holding a space, then glued
+#: text up to where ``_MEFOR_SECRET``'s plain class stops, with no label after it.
 _MEFOR_GLUED_BRANCH = (
     _SPACED_GUARDED_BRACED
     + r"(?:[;,&]|"
     + _GLUED_LOWER
     + r")++"
     + rf"(?![^{_PLAIN_TERMINATORS}])"
-    + _NO_QUOTED_LABEL_AFTER
-)
-_KEY_GLUED_BRANCH = (
-    _SPACED_GUARDED_BRACED
-    + r"(?:,|"
-    + _GLUED_LOWER
-    + r")++"
-    + rf"(?![^{_KEY_TERMINATORS}])"
     + _NO_QUOTED_LABEL_AFTER
 )
 
@@ -1462,13 +1458,9 @@ _MEFOR_SECRET = re.compile(
 #   Without that guard, ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc", which the plain class
 #   used to hide. Both forms are the GUARDED ones. A value either refuses falls back to the plain
 #   class, which now carries the stop before a quoted label and is otherwise the old class. Since
-#   BACKLOG #2966 steps 1 and 2, a braced value holding a space is also taken with text glued after
-#   its closer in one narrow shape (:data:`_SPACED_GUARDED_BRACED`), so ``MEFOR_X={pp ww}x rest`` and
-#   ``private_key={pp ww},rest`` no longer print the braced tail. Every shape outside it still falls
-#   back to the plain class and prints the tail as before: at least a tail or glued text holding a
-#   capital, a digit, punctuation other than the glued separators, a non-ASCII character or a word a
-#   later pass reads, glued text followed by a quote or by a label, and braces holding ";", "&", "{",
-#   a quote or a line break.
+#   BACKLOG #2966 step 1, ``_MEFOR_SECRET`` also takes a braced value holding a space with text glued
+#   after its closer, in the one shape :data:`_SPACED_GUARDED_BRACED` states; every other shape, and
+#   every such value under ``_KEY_MATERIAL``, still prints the braced tail as before.
 # * ``_BEARER`` takes a quoted value and NOT a braced one. ``session=`` and ``token=`` legitimately
 #   carry a "{"-opening dict or JSON repr in this engine's log text, and taking braces would change
 #   those lines for no credential.
@@ -1556,8 +1548,6 @@ _KEY_MATERIAL = re.compile(
     + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
-    + _KEY_GLUED_BRANCH
-    + r"|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _CAMEL_PLAIN_KEY_VALUE
