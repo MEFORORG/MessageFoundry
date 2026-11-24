@@ -67,8 +67,10 @@ def _looks_like_hl7(raw: bytes) -> bool:
 _LEADING_WS = b" \t\r\n\x0b\x0c"
 
 
-#: The first byte that is not :data:`_LEADING_WS`, found in C without copying the body.
-_PAST_LEADING_WS = re.compile(b"[^" + re.escape(_LEADING_WS) + b"]")
+#: The first byte that is not :data:`_LEADING_WS`, found in C without copying the body. Written out
+#: as a literal so the static regex scan in tests/test_security_static.py can read it; a test in
+#: tests/test_sniff_head_copy.py pins its class to :data:`_LEADING_WS`.
+_PAST_LEADING_WS = re.compile(rb"[^ \t\r\n\x0b\x0c]")
 
 #: How much of the body past the leading noise :func:`_sniff_head` returns: more than the longest
 #: signature any caller compares (the 8-byte PNG magic).
@@ -99,8 +101,9 @@ _TEXT_SNIFF_HEAD_CHARS = 8
 
 #: The first character that is not :data:`_LEADING_WS_STR`, found without copying the text, so a
 #: large decoded body with leading noise is not copied whole (BACKLOG #5520, filing review
-#: finding 3).
-_PAST_LEADING_WS_STR = re.compile("[^" + re.escape(_LEADING_WS_STR) + "]")
+#: finding 3). A literal for the same reason as :data:`_PAST_LEADING_WS`, and pinned to
+#: :data:`_LEADING_WS_STR` by the same test file.
+_PAST_LEADING_WS_STR = re.compile(r"[^ \t\r\n\x0b\x0c﻿]")
 
 
 def text_sniff_head(text: str) -> bytes:
