@@ -639,11 +639,11 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     try:
         got = await again.get_transit_bound_attestation()
         # The whole gap text, so it is the expected outcome and no other: an AssertionError in the
-        # fake, or any other CipherError, also writes a gap starting "the check of audit row", and
+        # fake, or any other CipherError, also writes a gap starting "audit row", and
         # must fail here.
         assert got is not None
         assert got.audit_gap == (
-            f"the check of audit row {recorded.audit_seq}'s MAC failed: {error(_UNHELD_VERSION)}"
+            f"audit row {recorded.audit_seq}'s MAC does not verify: {error(_UNHELD_VERSION)}"
         ), got.audit_gap
         if proxied:
             assert "Transit refused" not in got.audit_gap, got.audit_gap
@@ -1534,9 +1534,9 @@ def test_a_verify_400_with_a_working_probe_is_a_refused_version() -> None:
 def test_a_verify_400_whose_probe_answers_no_well_formed_mac_is_no_refused_version(
     answer: str,
 ) -> None:
-    """BACKLOG #6707 item 73: the probe clears a 400 as a refused version only when it answers a
-    well-formed Transit MAC naming another version, the same parse the fixed-input check and the
-    writer apply. An empty or versionless answer is a service that cannot MAC, not evidence about
+    """Vault BACKLOG #6707 item 73: the probe clears a 400 as a refused version only when it
+    answers a well-formed Transit MAC naming another version, the same parse the fixed-input check
+    and the writer apply. An empty or versionless answer is a service that cannot MAC, not evidence about
     the row, so the check could not run rather than read as a planted version."""
     from messagefoundry.store.crypto import AuditKeyVersionRefusedError
 
@@ -1642,12 +1642,13 @@ def test_a_verify_400_not_read_as_a_version_refusal_is_labelled_unconfirmed(
 
     refused = _verify_refusal(_V2_MAC, errors, text=text)
     assert isinstance(refused, AuditKeyVersionUnverifiedError)
-    # BACKLOG #6707 items 11 and 25: the alert names every cause the reply leaves open, a refusal
-    # for another reason among them, and reads as a statement about the cause, not an outage.
+    # Vault BACKLOG #6707 items 11 and 25: the alert names every cause the reply leaves open, a
+    # refusal for another reason among them, and reads as a statement about the cause, not an
+    # outage.
     assert str(refused) == (
-        "the Transit audit MAC check at key version 3 got HTTP 400 whose reply names no version "
-        "refusal, so its cause is unknown: the key may not hold that version, its policy may "
-        "retire it, or the check was refused for another reason"
+        "the Transit audit MAC check at key version 3 got HTTP 400 that was not read as a "
+        "version refusal, so its cause is unknown: the key may not hold that version, its "
+        "policy may retire it, or the check was refused for another reason"
     )
     assert "could not be confirmed" not in str(refused)
     assert _KEY_NAME not in str(refused)  # the walk puts this text in the tamper alert
@@ -3118,7 +3119,9 @@ async def test_posture_survives_a_transit_failure(
     monkeypatch.setattr(store_module, "_audit_row_mac", boom)
     view = (await _posture(store))["transit_bound_attestation"]
     assert isinstance(view, dict)
-    assert view["attested"] is False and "MAC failed: Transit audit HMAC failed" in str(view["gap"])
+    assert view["attested"] is False and "MAC could not be checked: Transit audit HMAC" in str(
+        view["gap"]
+    )
     # An outage is no refusal, so the gap does not say Transit refused (vault BACKLOG #6707 item 24).
     assert "Transit refused" not in str(view["gap"]), view["gap"]
 

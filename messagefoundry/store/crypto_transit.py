@@ -1275,7 +1275,18 @@ class TransitCipher(_UnmarkedPolicy):
             )
             return False
         named = transit_mac_version(answered) if isinstance(answered, str) else None
-        return named is not None and named != key_version
+        if named is None:
+            _warn_quietly(
+                lambda: (
+                    "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
+                    "latest version answered no well-formed MAC (key=%r); not read as a refused "
+                    "version",
+                    key_version,
+                    self._audit_key,
+                )
+            )
+            return False
+        return named != key_version
 
     def _is_outage(self, exc: Exception) -> bool:
         """:func:`is_vault_unavailable` for an audit-MAC verify failure. Runs inside the caller's

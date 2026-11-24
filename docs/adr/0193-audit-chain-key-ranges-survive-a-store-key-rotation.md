@@ -465,7 +465,7 @@ section 0): this is what the first deployment's first routine rotation would hav
    version answers a well-formed MAC naming a version other than the pinned one, raises it; an
    empty answer or one naming no version passed too until a correction of 2026-11-24 (vault
    BACKLOG #6707 item 73). A proxy, not Transit, can author the 400 (corrected 2026-11-11,
-   BACKLOG #6707). The walk records a break at that row, naming the
+   vault BACKLOG #6707). The walk records a break at that row, naming the
    version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
    raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`
    (BACKLOG #6707). For example, these exact 400 bodies with the Content-Type exactly

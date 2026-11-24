@@ -854,9 +854,10 @@ class AuditMacMalformedError(CipherError):
 
 class AuditKeyVersionRefusedError(CipherError):
     """A Transit check of a stored audit MAC, made at the key version that MAC names, got HTTP 400
-    read as a refusal of that version, while
-    Transit still answers under the latest. Transit's own refusal is one cause; the subclass
-    :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does not read as one.
+    read as a refusal of that version, while a probe under the latest version answers a
+    well-formed MAC naming another version (vault BACKLOG #6707 item 73). Transit's own refusal is
+    one cause; the subclass :class:`AuditKeyVersionUnverifiedError` covers a 400 whose reply does
+    not read as one.
 
     The version comes from a stored audit hash, which a DML writer can plant (BACKLOG #2337).
     So the refusal is evidence about that ROW, and the chain walk reports a break there. It is never
@@ -879,8 +880,8 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     """A Transit check of a stored audit MAC at one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
     refusal, or whose reading raises one of
-    :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while the key still answers under the
-    latest (vault BACKLOG #6707).
+    :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while a probe under the latest
+    version answers a well-formed MAC naming another version (vault BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
@@ -889,12 +890,12 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     never the key or the reply, because the walk puts it in the tamper alert."""
 
     def __str__(self) -> str:
-        # It names every cause the reply leaves open, a refusal for another reason among them,
-        # so the alert reads as an unknown cause rather than an outage (vault BACKLOG #6707 items
-        # 11 and 25).
+        # "Not read as" holds also for a body too long to read and a read that faulted. It names
+        # every cause the reply leaves open, a refusal for another reason among them, so the alert
+        # reads as an unknown cause rather than an outage (vault BACKLOG #6707 items 11 and 25).
         return (
-            f"the Transit audit MAC check at key version {self.version} got HTTP 400 whose reply "
-            "names no version refusal, so its cause is unknown: the key may not hold that "
+            f"the Transit audit MAC check at key version {self.version} got HTTP 400 that was not "
+            "read as a version refusal, so its cause is unknown: the key may not hold that "
             "version, its policy may retire it, or the check was refused for another reason"
         )
 
