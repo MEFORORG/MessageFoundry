@@ -1652,3 +1652,45 @@ def test_a_byte_order_mark_anywhere_is_whitespace(mod: ModuleType) -> None:
     for source in ("\ufeff" + body, "await agent('a')\n\ufeff" + body):
         cost = mod.price_script(source)
         assert cost.exact and cost.agents == 3 + source.count("agent('a')")
+
+
+# BACKLOG #7600, repair round 3. Each shape priced EXACT and wrong at 878a7bda.
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a string subject: the mask blanks it, and blank read as an empty array of width 0
+        "for (const ch of 'abc') await agent('a')\n",
+        "for await (const ch of 'abc') await agent('a')\n",
+        "for (const ch of `abc`) { await agent('a') }\n",
+        # an unclosed bracket in a brace-less body: the rest of the file was a known extent
+        "for (const r of [1, 2]) x = f(\nawait agent('a')\nawait agent('b')\n",
+        "for (const r of [1, 2]) x = [1,\nawait agent('a')\n",
+    ],
+)
+def test_an_unread_loop_shape_is_a_floor_not_a_count(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+
+
+@pytest.mark.parametrize(
+    "then",
+    [
+        # the branch's `;` sits past the line break ASI was offered, then the `else`
+        "a()\n;",
+        # a do-while's `;` past its `)`
+        "do a(); while (c)\n;",
+        "do { a() } while (c) ;",
+    ],
+)
+def test_an_else_after_a_branch_ended_past_its_line_is_in_the_loop(
+    mod: ModuleType, then: str
+) -> None:
+    source = f"for (const r of [1, 2]) if (r) {then}\nelse await agent('a')\nawait agent('b')\n"
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (3, True), cost.unknowns
+
+
+def test_the_module_source_holds_no_invisible_byte_order_mark() -> None:
+    """A literal U+FEFF in the source is invisible in review: it is written as an escape."""
+    assert b"\xef\xbb\xbf" not in _SCRIPT.read_bytes()

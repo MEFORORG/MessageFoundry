@@ -989,6 +989,12 @@ def _expr_end(ctx: _Ctx, i: int, stops: str = ";,") -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues, a line break held in a
     block comment included. A statement passes ``stops=";"``: a top-level ``,`` does not end one."""
+    return _read_expr_end(ctx, i, stops)[0]
+
+
+def _read_expr_end(ctx: _Ctx, i: int, stops: str) -> tuple[int, bool]:
+    """:func:`_expr_end`, and whether that end was read: False where a bracket opened in the
+    expression is never closed, so the end of the file is a guess rather than its end."""
     masked, raw = ctx.masked, ctx.code
     depth = 0
     for j in range(i, len(masked)):
@@ -997,16 +1003,16 @@ def _expr_end(ctx: _Ctx, i: int, stops: str = ";,") -> int:
             depth += 1
         elif c in _CLOSERS:
             if depth == 0:
-                return j
+                return j, True
             depth -= 1
         elif depth == 0 and c in stops:
-            return j
+            return j, True
         elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             last = i + len(raw[i:j].rstrip()) - 1
             if nxt is None or not _continues(ctx.ends.get(last, _VALUE), raw, nxt.start()):
-                return j
-    return len(masked)
+                return j, True
+    return len(masked), depth == 0
 
 
 def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
@@ -1114,6 +1120,9 @@ def _width_of(ctx: _Ctx, start: int, end: int) -> tuple[int | None, str]:
     """
     seg = ctx.masked[start:end]
     if not seg.strip():
+        # The mask blanks a string, template or regex literal: blank there is not empty source.
+        if ctx.code[start:end].strip():
+            return None, "a literal whose length is not read"
         return 0, "empty"
     lead = start + (len(seg) - len(seg.lstrip()))
 
@@ -1288,7 +1297,7 @@ def _statement_end(ctx: _Ctx, i: int) -> tuple[int, bool]:
         return span.resume, span.settled
     head = _COMPOUND_RE.match(masked, i)
     if head is None:
-        return _expr_end(ctx, i, ";"), True
+        return _read_expr_end(ctx, i, ";")
     keyword = head.group(1)
     if keyword is None:  # a label
         return _statement_end(ctx, head.end())
@@ -1313,7 +1322,10 @@ def _statement_end(ctx: _Ctx, i: int) -> tuple[int, bool]:
         return n, False
     end, settled = _statement_end(ctx, close + 1)
     if keyword == "if":
-        found = _ELSE_RE.match(masked, end + 1 if masked[end : end + 1] == ";" else end)
+        # The branch's own `;` may sit past the line break ASI was offered or a do-while's `)`:
+        # `a()\n;` and `do a(); while (c)\n;` each end at that `;`, and the `else` follows it.
+        k = _skip_space(ctx.code, end)
+        found = _ELSE_RE.match(masked, k + 1 if masked[k : k + 1] == ";" else end)
         if found is not None:
             end, ok = _statement_end(ctx, found.end())
             settled = settled and ok
@@ -1691,7 +1703,7 @@ def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
     # U+FEFF is whitespace to JavaScript, anywhere, but a token to the lexer: a BOM'd copy of a
     # file priced differently. Same length, so every offset holds.
-    source = source.replace("﻿", " ")
+    source = source.replace("\ufeff", " ")
     notes = _MaskNotes()
     masked = _mask(source, notes)
     chars = list(source)
@@ -1903,8 +1915,8 @@ def main(argv: list[str] | None = None) -> int:
     # Bytes, decoded as UTF-8 on both routes (BACKLOG #7601): `sys.stdin.read()` decoded in the
     # locale encoding, cp1252 on Windows, so one file priced from two different texts. Undecodable
     # input is a broken instrument, reported, never a traceback or a guess at the text. Line ends
-    # are translated as the text-mode reads both routes made before did, and a BOM is dropped: the
-    # lexer reads U+FEFF as a token, so a BOM'd copy of a file would price differently.
+    # are translated as the text-mode reads both routes made before did. A BOM is kept here:
+    # `price_script` reads every U+FEFF as the space it is to JavaScript.
     try:
         if not args.stdin:
             data = Path(args.script).read_bytes()
