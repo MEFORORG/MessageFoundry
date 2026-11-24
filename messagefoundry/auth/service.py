@@ -4579,7 +4579,8 @@ class AuthService:
         #: `_advance_hold_standing` moves it.
         self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
-        #: #2027), so each is logged and audited once per process rather than once per pass.
+        #: #2027), so a marked row is not reported on every pass. When a mark is set and dropped is
+        #: stated in `_report_unkeyed_bindings`.
         self._reconcile_unkeyed_reported: set[str] = set()
         #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
         #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
@@ -9955,8 +9956,9 @@ class AuthService:
             is_unkeyed = _holds_unkeyed_federated_binding(user)
             if is_unkeyed:
                 # Recorded BEFORE the session filter, so an account whose sessions lapse between
-                # passes keeps its "already reported" mark and is not reported again on its next
-                # sign-in.
+                # passes keeps its "already reported" mark and is not reported again if a session
+                # of its is listed again later. Such a row cannot sign in, but a session can come
+                # back into the listing, for example after a backward clock step (BACKLOG #2283).
                 still_unkeyed.add(user.id)
             # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
             # backward clock step or a raised idle setting makes the validator accept it again. So
@@ -10244,7 +10246,8 @@ class AuthService:
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
         # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
-        # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
+        # BACKLOG #2027. Reported LAST, on every exit that returns after the users are loaded (an
+        # exception raised above skips it for that pass), so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
