@@ -1379,6 +1379,8 @@ async def refuse_expiry_before_graph(
             "makes them, and dates a changed secret from that start.",
             refused_view.withheld,
         )
+    # A refusal's traceback holds this frame, so the credential values must not be in it.
+    extra = {}
     # Outside the handler above, for the reason enforce_store_key_expiry gives.
     await refuse(stamps, alert_sink)
 

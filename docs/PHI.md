@@ -790,7 +790,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    held too (BACKLOG #4942, #4936).** `rotate-key` rolls a keyed audit chain only after both data
    passes, so on a store with a keyed chain a start that finds a changed key and a chain not yet
    rolled to it opens the rotation record for that key itself, writes no stamp, and logs a WARNING.
-   A record already open for another key is kept rather than replaced, and still holds that key
+   The exception is a single-node start refused for expiry before its graph (BACKLOG #5615): it
+   saves that record only where the store has no key stamp, and logs that other writes were not
+   saved. A record already open for another key is kept rather than replaced, and still holds that key
    when it comes back, since a run may have rolled the chain to it with an upload still under the
    prior key. A `rotate-key` run on a third key replaces it, and a start on a keyed chain then still
    holds the rolled key, because it holds a changed key whenever a record stands open for another

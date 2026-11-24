@@ -537,10 +537,17 @@ async def test_no_prediction_on_a_clustered_start(
     monkeypatch.setattr(
         "messagefoundry.pipeline.engine.NullCoordinator.is_clustered", lambda _self: True
     )
-    try:
+
+    class _ReachedClusteredBranch(Exception):
+        pass
+
+    def reached(_self: Engine) -> Any:
+        raise _ReachedClusteredBranch
+
+    # The clustered arm's first act, so the raise proves the start took that arm.
+    monkeypatch.setattr(Engine, "_make_reference_runner", reached)
+    with pytest.raises(_ReachedClusteredBranch):
         await rig.start(key)
-    except Exception:  # a forced-clustered SQLite start may stop later; only the gate is read here
-        logging.getLogger(__name__).debug("forced-clustered start stopped", exc_info=True)
     assert calls == 0
 
 
@@ -589,6 +596,38 @@ async def test_a_seal_failure_on_an_opted_in_class_refuses_after_the_graph(
     opted = SecretRotationSettings(enforce_secret_expiry_classes=[AD])
     assert await rig.start(key, settings=opted) == "SecretRotationOverdueError"
     assert rig.graph_starts == 1
+
+
+async def test_a_refusal_traceback_holds_no_credential_value() -> None:
+    value = "test-only-credential-value"
+
+    class _Meta:
+        def secret_rotation_cipher(self) -> Any:
+            return make_cipher(generate_key())
+
+        async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
+            return {}
+
+        async def upsert_secret_rotation_meta(self, *_a: Any, **_k: Any) -> None:
+            return None
+
+    async def held() -> frozenset[str]:
+        return frozenset()
+
+    with pytest.raises(StoreKeyRotationOverdueError) as caught:
+        await sr.refuse_expiry_before_graph(
+            _Meta(),
+            SecretRotationSettings(store_key_last_rotated=OLD),
+            dek_key_id=lambda: "a" * 16,
+            enforcement=SecurityEnforcement.ENFORCE,
+            alert_sink=None,
+            extra_values=lambda: {"conn_secret": value},
+            audit_rolled=lambda: None,
+            held=held,
+        )
+    for entry in caught.traceback:
+        for local in entry.frame.f_locals.values():
+            assert not (isinstance(local, dict) and value in local.values())
 
 
 def test_a_refused_start_charges_a_real_seal_only_for_a_first_sighting() -> None:
