@@ -51,6 +51,7 @@ def test_a_15_byte_salt_is_refused_without_quoting_it(keying: ModuleType) -> Non
     with pytest.raises(ValueError) as exc:
         keying.Keyer(_SALT_15)
     assert str(keying.MIN_SALT_LEN) in str(exc.value)
+    assert "secrets.token_urlsafe(24)" in str(exc.value)  # the generator, not a longer placeholder
     _no_run_of(_SALT_15, str(exc.value))
 
 
