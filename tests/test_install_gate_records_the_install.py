@@ -47,7 +47,7 @@ _END = 'Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encodi
 
 # The receipt guard that precedes the allowlist write (BACKLOG #1247's last limb): from the check to
 # the comment that opens the allowlist read below it.
-_GUARD_START = "$unexplained = Get-UnexplainedGate $GateDst"
+_GUARD_START = "$guardSha = Get-GateHash $GateDst"
 _GUARD_END = "# READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES"
 
 _INSTALLED_GATE = "# THE GATE THAT WAS ALREADY INSTALLED\n"
@@ -345,3 +345,55 @@ def test_the_receipt_guard_runs_before_anything_on_the_box_changes() -> None:
         "Copy-Item -LiteralPath $GateSrc -Destination $GateDst",
     ):
         assert guard < text.index(write, install), f"the receipt guard runs after {write!r}"
+
+
+def test_the_guard_judges_the_same_read_it_re_checks_before_the_copy(tmp_path: Path) -> None:
+    """The guard reads the installed gate ONCE: the hash it judges is the hash re-checked later.
+
+    A second read for ``$guardSha`` would let a write between the two reads pass as explained, so
+    this counts the guard's reads of the installed gate, and checks the judged hash is the one
+    handed in rather than a fresh read of the file.
+    """
+    if shutil.which("pwsh") is None:
+        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+    dst = tmp_path / "worktree_gate.ps1"
+    dst.write_bytes(_INSTALLED_GATE.encode("utf-8"))
+    Path(f"{dst}.receipt.json").write_text(
+        json.dumps({"gateSha256": _content_sha(_INSTALLED_GATE.encode("utf-8"))}), encoding="utf-8"
+    )
+    other = _content_sha(b"# a write after the read\n")
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            f"$GateDst = '{dst.as_posix()}'",
+            "$OverwriteUnexplained = $false",
+            "$checkedSha = 'X'",
+            _function("Get-GateHash").replace(
+                "function Get-GateHash", "function Get-GateHashReal", 1
+            ),
+            "$script:hashReads = 0",
+            "function Get-GateHash([string]$Path) { $script:hashReads++; Get-GateHashReal $Path }",
+            _function("Get-UnexplainedGate"),
+            _guard(),
+            'Write-Output "reads=$script:hashReads"',
+            # The judged hash is the one given, not a re-read: a file matching its receipt still
+            # reads as unexplained when the hash handed in differs.
+            f"$r = Get-UnexplainedGate $GateDst -InstalledSha '{other}'",
+            'Write-Output "judged=$($r.InstalledSha)"',
+            'Write-Output "none=$($null -eq (Get-UnexplainedGate $GateDst -InstalledSha $null))"',
+        ]
+    )
+    runner = tmp_path / "run.ps1"
+    runner.write_text(script, encoding="utf-8")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0, out
+    assert "reads=1" in out, f"the guard must read the installed gate exactly once:\n{out}"
+    assert f"judged={other}" in out, out
+    assert "none=True" in out, out
