@@ -5,10 +5,11 @@
 Two engine shards of one config, each built from ``filter_registry_for_shard`` as ``serve --shard``
 builds it, share ONE SQLite store. A scoped operator may reach an inbound that engine shard b holds.
 Asked of engine shard a, the per-name connection routes refuse it with the 403 and an
-``auth.channel_denied`` row, as they refuse an out-of-scope inbound. ``/events`` checked the channel
-scope only, so engine shard a answered it from the shared store. These tests pin that ``/events``
-now refuses it the same way, and that its answers on the right engine shard did not change. The
-refusal covers this route only: ``GET /events?connection=`` applies the channel scope alone.
+``auth.channel_denied`` row, as they refuse an out-of-scope inbound. ``GET
+/connections/{name}/events`` checked the channel scope only, so engine shard a answered it from the
+shared store. These tests pin that this route now refuses it the same way, and that its answers on
+the right engine shard did not change. The refusal covers this route only: ``GET
+/events?connection=`` applies the channel scope alone.
 
 What it runs: in-process engines and API apps on SQLite. No ``serve --shard`` subprocess and no
 server-DB store, the only kind ``serve --shard`` accepts with more than one engine shard (ADR 0063).
@@ -160,8 +161,9 @@ async def test_events_on_the_wrong_engine_shard_gets_the_403_and_a_denial_row(
 async def test_an_unscoped_caller_on_the_wrong_engine_shard_is_unchanged(
     shards: tuple[Engine, Engine],
 ) -> None:
-    """An unscoped caller has no channel scope to deny, so ``/events`` still reads the shared store
-    for it on either engine shard and writes no denial row, as before this change."""
+    """An unscoped caller has no channel scope to deny, so this route still reads the shared store
+    for it on engine shard a, which does not hold the inbound, and writes no denial row, as before
+    this change."""
     a, _ = shards
     service = await _service(a, admin_write_rate_limit=False)
     wide = await _add(service, "boss", Role.OPERATOR)

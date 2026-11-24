@@ -5813,10 +5813,12 @@ def create_app(
         that name; it needs ``messages:view_summary``, charges the PHI-read budget, and is audited
         as ``connection_error_reveal``. The ``status`` word and the ``errored`` count stay
         readable, so an operator can still tell that a connection failed."""
-        # Per-channel RBAC, as on GET /connections/{name}/events: a reveal naming a connection
-        # outside the caller's scope is refused and audited as a channel denial. Checked BEFORE the
-        # reveal is admitted, so a refused name spends no PHI-read budget and cannot be hidden
-        # behind a 429. A scoped caller's dashboard carries no outbound rows at all.
+        # Per-channel RBAC: a reveal naming a connection outside the caller's scope is refused and
+        # audited as a channel denial. Only the scope is checked here; GET
+        # /connections/{name}/events also refuses a name this engine does not hold (BACKLOG #3031).
+        # Checked BEFORE the reveal is admitted, so a refused name spends no PHI-read budget and
+        # cannot be hidden behind a 429. A scoped caller's dashboard carries no outbound rows at
+        # all.
         if reveal is not None:
             await _control_guard(engine, identity, reveal, client_ip(request))
         await _admit_reveal(request, identity, reveal)
@@ -6425,12 +6427,13 @@ def create_app(
 
         The test is written here rather than through :func:`_resolve_connection`, which the other
         per-name routes share, because the two ask whether a name exists in different sets
-        (BACKLOG #3378). Those routes act on this process's runner, so they read its own inbounds.
+        (BACKLOG #3378). Those routes read this process's own inbounds, ``GET
+        /connections/{name}/events`` included, although that one reads the shared store.
         The flag lives in the store, so this one reads ``inbound_names()``, every inbound in the
         deployment, and a caller's in-scope inbound on a sibling engine shard is no denial. Both
         give the same refusal for an outbound and for a name outside the scope, and so does the web
         console's flag route for a direction that names neither side. A change to that refusal has
-        to be made in at least those three places."""
+        to be made in at least those places."""
         rr = engine.registry_runner
         wrong_direction = req.direction != "inbound"
         if identity.allowed_channels is not None and (
@@ -7105,13 +7108,17 @@ def create_app(
         """The connection/transport event log scoped to one connection (#46), newest first.
         ``reason`` and ``reveal`` behave as on ``GET /events`` (BACKLOG #2443)."""
         await _admit_reveal(request, identity, reveal)
-        # The name and its scope are resolved as the other per-name connection routes resolve them
-        # (BACKLOG #3031): with the engine started, a channel-scoped caller reaches only an inbound
-        # in its scope that THIS engine holds. An out-of-scope inbound, an outbound, a name that exists nowhere, and an
-        # inbound another engine shard holds all get the one 403 and an auth.channel_denied row, so
-        # no answer here tells a scoped caller which names exist. An unscoped caller is not refused,
-        # and its unknown name still reads the store. This covers this route only: GET /events with
-        # ?connection= applies the channel scope alone. The store scope is defense-in-depth.
+        # The name and its scope are resolved through _resolve_connection, as /metadata, /test,
+        # /start, /stop and /restart resolve them (BACKLOG #3031). With the engine started, a
+        # channel-scoped caller reaches only an inbound in its scope that THIS engine holds: an
+        # out-of-scope inbound, an outbound, a name that exists nowhere, and an inbound another
+        # engine shard holds all get the one 403 and an auth.channel_denied row. That holds although
+        # the rows are read from the shared store, so it differs from the flag route, which reads
+        # inbound_names(). With no runner, only the channel scope is checked. An unscoped caller is
+        # not refused. This covers this route only: at least GET /events?connection= and the
+        # console's event pages, which go through _admit_event_read, apply the channel scope alone.
+        # ``role`` picks no refusal; the side it selects is unused. The store scope is
+        # defense-in-depth.
         await _resolve_connection(engine, identity, name, client_ip(request), role="source")
         rows = await engine.store.list_connection_events(
             connection=name,
