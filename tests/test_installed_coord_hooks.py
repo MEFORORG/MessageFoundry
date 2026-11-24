@@ -321,11 +321,12 @@ def _git_at(root: Path, *args: str) -> str:
 
 
 def hooks_dir_for(root: Path) -> Path | None:
-    """Where git looks for ``root``'s hooks, taken from git as ``install-git-hooks.ps1`` takes it.
+    """Where git looks for ``root``'s hooks, taken from git itself.
 
     ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. When it is set, the answer
     is ``git rev-parse --git-path hooks``, because git expands ``~/`` and resolves a relative value
-    against the worktree root, which a join under ``root`` gets wrong (BACKLOG #6258). Deriving it
+    against the worktree root (BACKLOG #6258). ``install-git-hooks.ps1`` takes the same answer but
+    refuses to install for some values this still resolves (non-local scope, relative). Deriving it
     any other way would compare a directory git never consults and report parity for a copy that is
     not the one running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
     ``root/.git`` is a FILE pointing at the common dir, so ``root/.git/hooks`` never exists and every
@@ -1814,6 +1815,17 @@ def _run_git_hooks_installer(
 _NEEDS_PWSH = pytest.mark.skipif(shutil.which("pwsh") is None, reason="runs the real installer")
 
 
+def _squashed(result: subprocess.CompletedProcess[str]) -> str:
+    """Output with ANSI codes, whitespace and pwsh's ``|`` error-wrap gutters removed, so a phrase
+    the error view wrapped across lines can still be matched (compare against ``_squash(phrase)``)."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout + result.stderr)
+    return re.sub(r"[\s|]", "", text)
+
+
+def _squash(phrase: str) -> str:
+    return re.sub(r"[\s|]", "", phrase)
+
+
 @_NEEDS_PWSH
 def test_a_home_prefixed_hookspath_installs_where_git_runs_hooks(tmp_path: Path) -> None:
     """``~/hk`` is expanded against HOME by git; the installer used to join it under the repo root."""
@@ -1873,9 +1885,32 @@ def test_a_hookspath_outside_this_repos_local_config_is_refused(tmp_path: Path, 
     result = _run_git_hooks_installer(repo, env)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
-    assert "UNRESOLVABLE" in out, out
+    name = scope.removeprefix("--")
+    assert _squash(f"is set in {name} config, not in this repository's local config") in _squashed(
+        result
+    ), out
     assert "governs" not in out, out
     assert not (tmp_path / "scoped-hooks" / "commit-msg").exists()
+
+
+@_NEEDS_PWSH
+def test_uninstall_still_removes_our_hooks_from_a_refused_hookspath(tmp_path: Path) -> None:
+    """-Uninstall removes only marker-bearing files, so a refusal must not strand an older install."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    target = tmp_path / "global-hooks"
+    target.mkdir()
+    (target / "commit-msg").write_text("#!/bin/sh\n# MessageFoundry claim gate\n", encoding="utf-8")
+    (target / "pre-push").write_text("#!/bin/sh\n# someone else's hook\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--global", "core.hooksPath", target.as_posix()],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    result = _run_git_hooks_installer(repo, env, "-Uninstall")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (target / "commit-msg").exists()
+    assert (target / "pre-push").exists(), "a hook without our marker must survive -Uninstall"
 
 
 @_NEEDS_PWSH
@@ -1888,8 +1923,11 @@ def test_a_drive_relative_hookspath_is_refused_on_windows(tmp_path: Path) -> Non
     result = _run_git_hooks_installer(repo, env)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
-    assert "core.hooksPath" in out, out
+    # The fully-qualified check on the configured value is what must fire, not the later check on
+    # rev-parse's answer, whose refusal also names core.hooksPath.
+    assert _squash("which is relative, or on Windows has no drive") in _squashed(result), out
     assert "governs" not in out, out
+    assert not (tmp_path / "dr-hooks" / "commit-msg").exists()
 
 
 @_NEEDS_PWSH
