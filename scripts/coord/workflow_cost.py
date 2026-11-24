@@ -1400,6 +1400,11 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             pos = m.end() if invoked else max(m.end(), _function_value_end(ctx, m))
             continue
 
+        # `{ do: 1 }` or `{ while: x }`: the lexer read the word as a name, not the keyword. Only
+        # a word it read as a name is skipped; one it did not classify is still priced as a loop.
+        if ctx.ends.get(m.end() - 1) == _VALUE:
+            pos = m.end()
+            continue
         total = total + _price_loop(ctx, m)
         pos = _loop_head(ctx, m.end(), m.group("loop")).resume
     return total

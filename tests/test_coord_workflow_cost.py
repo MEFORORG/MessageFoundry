@@ -1725,6 +1725,23 @@ def test_a_guessed_loop_extent_with_no_agent_is_still_a_floor(mod: ModuleType, s
 
 
 @pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # a key named like a loop keyword is a name: an unsettled `do` here cost the exact label
+        ("for (const r of [1, 2]) { const o = { do: 1 }; await agent('a') }\n", 2),
+        ("const opts = { retries: 2, do: 'x' }\nfor (const r of [1, 2]) await agent('a')\n", 2),
+        ("const o = { while: agent('x') }\nawait agent('b')\n", 2),
+        ("x.do(1)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_loop_keyword_used_as_a_name_is_not_a_loop(
+    mod: ModuleType, source: str, agents: int
+) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
+
+
+@pytest.mark.parametrize(
     "receiver",
     ["rows?", "R!", "R !", ""],
 )
