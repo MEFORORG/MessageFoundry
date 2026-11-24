@@ -300,7 +300,12 @@ def _take_with_failing_record_build(repo: Path, key: str) -> subprocess.Complete
     """
     script = str(repo / "scripts" / "coord" / "claim.ps1").replace("'", "''")
     command = (
-        "function global:ConvertTo-Json { throw 'injected record-build failure' }; "
+        # Throws only for this take's own record, so a ConvertTo-Json call added elsewhere on the path
+        # forwards to the cmdlet rather than stopping the run before the record build.
+        "function global:ConvertTo-Json { $o = @($input); "
+        f"if ($o.Count -eq 1 -and $o[0].key -eq '{key}' -and $o[0].claimed) "
+        "{ throw 'injected record-build failure' }; "
+        "$o | Microsoft.PowerShell.Utility\\ConvertTo-Json @args }; "
         f"& '{script}' -Take '{key}' -Note 'n'"
     )
     return subprocess.run(
@@ -338,23 +343,31 @@ def test_concurrent_first_takes_from_different_worktrees_have_exactly_one_winner
 ) -> None:
     """Building the record before ``CreateNew`` must not move the exclusion off it (BACKLOG #7565).
 
-    A smoke check, not a proof: the barrier below lines up the four starts, but nothing can force
-    every run to collide inside the take, so a broken exclusion may still pass a given run.
+    Still a smoke check, not a proof: the barrier lines the four takes up just before CreateNew, but
+    nothing can force every run to collide inside it, so a broken exclusion may pass a given run.
     """
     trees = []
     for i in range(4):
         wt = tmp_path / f"wt{i}"
         git(repo, "worktree", "add", "-q", "-b", f"b{i}", str(wt))
         trees.append(wt)
-    # Every process spins until one shared instant, past pwsh start-up, then runs the take.
-    go = (datetime.now(UTC) + timedelta(seconds=8)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    # THE BARRIER SITS AT THE RECORD BUILD, the last step before CreateNew: ConvertTo-Json is shadowed
+    # by a function that waits for one shared instant and then forwards to the cmdlet. A barrier at
+    # pwsh start-up would leave the script's own start-up, which varies by far more than the take's
+    # span, between the barrier and CreateNew.
+    go = (datetime.now(UTC) + timedelta(seconds=15)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
     procs: list[subprocess.Popen[str]] = []
     try:
         for wt in trees:
             script = str(wt / "scripts" / "coord" / "claim.ps1").replace("'", "''")
             command = (
-                f"$go = [DateTimeOffset]::Parse('{go}'); "
-                "while ([DateTimeOffset]::UtcNow -lt $go) { }; "
+                f"$global:go = [DateTimeOffset]::Parse('{go}'); "
+                "function global:ConvertTo-Json { "
+                "$o = @($input); "
+                "while (($global:go - [DateTimeOffset]::UtcNow).TotalMilliseconds -gt 50) "
+                "{ Start-Sleep -Milliseconds 20 }; "
+                "while ([DateTimeOffset]::UtcNow -lt $global:go) { }; "
+                "$o | Microsoft.PowerShell.Utility\\ConvertTo-Json @args }; "
                 f"& '{script}' -Take 'k' -Note '{wt.name}'; exit $LASTEXITCODE"
             )
             procs.append(
