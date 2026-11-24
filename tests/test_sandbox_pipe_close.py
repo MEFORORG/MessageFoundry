@@ -10,9 +10,11 @@ import io
 import logging
 import queue
 import subprocess
+import threading
+import time
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -103,7 +105,7 @@ def test_a_worker_still_running_after_the_reaps_wait_is_logged(
             session._reap(proc)
     finally:
         session.close()
-    assert calls and calls[0] == 5
+    assert calls and calls[0] == sandbox_mod._REAP_WAIT_SECONDS
     assert session._proc is None
     lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("'IB_T'" in line and str(proc.pid) in line for line in lines), lines
@@ -119,3 +121,46 @@ def test_the_drains_close_their_stream_at_eof(tmp_path: Path) -> None:
     err = io.BytesIO(b"partial line")
     sandbox_mod._StderrRelay("IB_T", 1, 1).run(err)
     assert err.closed
+
+
+class _FakeWorker:
+    """Hashable, with the one attribute the lookup path reads."""
+
+    def __init__(self) -> None:
+        self.stdin = io.BytesIO()
+
+
+@pytest.mark.parametrize("abandoned", [True, False], ids=["given_up_on", "ended_in_time"])
+def test_the_request_pipe_has_exactly_one_closer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, abandoned: bool
+) -> None:
+    """A lookup helper its dispatch gave up on may still be writing the request pipe, so the reap
+    leaves the pipe to that helper, which closes it when it ends; a helper that ended in time
+    leaves it to the reap (BACKLOG #6831)."""
+    session = _session(str(tmp_path))
+    worker: Any = _FakeWorker()  # stands in for the Popen the lookup path reads stdin off
+    release = threading.Event()
+
+    def reply(*_args: Any) -> bytes:
+        if abandoned:
+            assert release.wait(10)
+        return b""
+
+    monkeypatch.setattr(session, "_lookup_reply", reply)
+    monkeypatch.setattr(sandbox_mod, "_write_frame", lambda stream, body: None)
+    deadline = time.monotonic() + (0.2 if abandoned else 10.0)
+    served = session._serve_bounded(worker, "rid", "transform", "h", cast(Any, None), deadline)
+    assert served is not abandoned
+    if abandoned:
+        assert worker in session._stdin_held  # the reap must not close it under the helper
+        assert not worker.stdin.closed
+        release.set()
+        for _ in range(200):
+            if worker not in session._stdin_held:
+                break
+            time.sleep(0.05)
+        assert worker not in session._stdin_held
+        assert worker.stdin.closed  # the helper closed it when it ended
+    else:
+        assert worker not in session._stdin_held  # the reap closes it
+        assert not worker.stdin.closed

@@ -527,12 +527,12 @@ _REAP_WAIT_SECONDS: Final = 5.0
 
 
 def _close_quietly(stream: Any) -> None:
-    """Close a pipe end this side owns. A close can only fail with ``OSError``, which is not worth
-    a line: the pipe is no longer used either way."""
-    try:  # noqa: SIM105
+    """Close a pipe end this side owns and no longer uses. A failed close changes nothing for the
+    worker, so it is logged at DEBUG, by exception type only."""
+    try:
         stream.close()
-    except OSError:
-        pass
+    except OSError as exc:
+        log.debug("could not close a sandbox worker pipe (%s)", type(exc).__name__)
 
 
 class _StderrRelay:
@@ -1314,7 +1314,8 @@ class SandboxSession:
 
     def _reap(self, proc: subprocess.Popen[bytes] | None) -> None:
         """Reap ``proc``'s whole tree, recording no kill and writing no kill line (see
-        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`)."""
+        :class:`KillCause`). The tree reap itself can still log (see :func:`_reap_process_tree`),
+        and so can the wait for the worker to exit that follows it."""
         if proc is None:
             return
         # Reap the WHOLE tree, not just ``proc``: a grandchild the Handler spawned inherited fd 1 (the
@@ -1334,11 +1335,11 @@ class SandboxSession:
         try:
             proc.wait(timeout=_REAP_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
-            # Not swallowed (BACKLOG #6831): this engine stops waiting on a worker the tree kill
+            # Not swallowed (BACKLOG #6831): this engine stops waiting on a worker the tree reap
             # did not end in time. Identity only, no content.
             log.warning(
-                "inbound %r: sandbox worker pid %d had not exited %.0fs after its kill, and is "
-                "not waited on further",
+                "inbound %r: sandbox worker pid %d had not exited %.0fs after its process tree was "
+                "reaped, and is not waited on further",
                 self._inbound,
                 proc.pid,
                 _REAP_WAIT_SECONDS,
@@ -1652,14 +1653,21 @@ class SandboxSession:
             except Exception as exc:  # noqa: BLE001 — logged by type, failed by the dispatch thread
                 report(exc)
 
+        # Who closes the request pipe is decided under this lock (see :meth:`_reap`): the helper
+        # if its dispatch gave up on it before it ended, and the reap otherwise.
+        handoff = threading.Lock()
+        ended = False
+
         def serve_then_release() -> None:
+            nonlocal ended
             try:
                 serve()
             finally:
-                # A helper its dispatch gave up on owns the pipe from then on (see :meth:`_reap`).
-                if abandoned.is_set():
-                    _close_quietly(stdin)
-                    self._stdin_held.discard(proc)
+                with handoff:
+                    ended = True
+                    if abandoned.is_set():
+                        _close_quietly(stdin)
+                        self._stdin_held.discard(proc)
 
         context = contextvars.copy_context()
         helper = threading.Thread(
@@ -1671,10 +1679,10 @@ class SandboxSession:
         helper.start()
         helper.join(max(0.0, deadline - time.monotonic()))
         if helper.is_alive():
-            # Before ``abandoned`` is set, so the reap never closes the pipe under the helper's
-            # write; the helper closes it when it ends (see :meth:`_reap`).
-            self._stdin_held.add(proc)
-            abandoned.set()
+            with handoff:
+                if not ended:
+                    self._stdin_held.add(proc)
+                abandoned.set()
             return False
         if fault:
             self._kill(proc, KillCause.LOOKUP_FAULT, phase)
