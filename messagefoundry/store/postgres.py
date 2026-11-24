@@ -155,6 +155,7 @@ from messagefoundry.store.crypto import (
     cipher_info,
     cipher_meta_key,
     decrypt_json_cell,
+    encrypt_many,
     report_sealed_surface,
     reseal_rotation_fingerprints,
     rotation_fingerprint_cipher,
@@ -3968,19 +3969,25 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                for r in rows:
+                # One batch per page, so a Transit cipher seals it in few requests (BACKLOG #6706).
+                sealed_values = await cipher_call(
+                    self._cipher,
+                    encrypt_many,
+                    self._cipher,
+                    [
+                        (
+                            r["v"],
+                            aad_of(r)
+                            if aad_of is not None
+                            else cell_aad(table, column, *(r[c] for c in aad_cols)),
+                        )
+                        for r in rows
+                    ],
+                )
+                for value, r in zip(sealed_values, rows, strict=True):
                     await conn.execute(
                         f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        (
-                            await self._aencrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            )
-                        ),
+                        value,
                         *(r[c] for c in keys),
                     )
                 sealed += len(rows)
