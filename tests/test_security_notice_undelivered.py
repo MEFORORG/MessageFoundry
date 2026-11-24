@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -601,3 +602,100 @@ async def test_the_reopening_sink_answers_a_failed_write_before_a_slow_close(
         "an undelivered security notice could not be recorded in the audit log (OSError)"
     ]
     assert _STILL_RUNNING not in [r.getMessage() for r in caplog.records]
+
+
+def _blocking_send(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, threading.Event]:
+    """A send that blocks its worker thread until released, as a slow relay would."""
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(**_: Any) -> None:
+        started.set()
+        release.wait(5.0)
+
+    monkeypatch.setattr(_SEND, slow)
+    return started, release
+
+
+async def test_a_cut_close_records_every_notice_it_left_unsent(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832. The shutdown cuts the notifier's close while a send waits on a slow relay. The
+    send under way and each notice still queued gets its own row while the store is open, and the
+    drain does not outlive the close."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = _notifier(store)
+    notifier.start()
+    drain = notifier._task
+    assert drain is not None
+    for name in ("amy", "ben"):
+        await notifier.notify(
+            SecurityEvent(PASSWORD_CHANGED, username=name, email=f"{name}@x.test")
+        )
+    await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-c", email="c@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        closing = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert drain.done()
+        assert sorted(await _undelivered(store)) == [
+            (
+                LOCK_NOTICE_UNDELIVERED_ACTION,
+                "lock-c",
+                {"notice": "account_locked", "reason": "closing"},
+            ),
+            (
+                SECURITY_NOTICE_UNDELIVERED_ACTION,
+                "amy",
+                {"notice": "password_changed", "reason": "interrupted"},
+            ),
+            (
+                SECURITY_NOTICE_UNDELIVERED_ACTION,
+                "ben",
+                {"notice": "password_changed", "reason": "closing"},
+            ),
+        ]
+        assert notifier.undelivered == 3
+    finally:
+        release.set()
+
+
+async def test_a_close_cut_on_a_full_queue_cancels_the_drain(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832. On a full queue the close waits to put its stop sentinel, so a cut there used
+    to leave the drain running past the close, into the closed store."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = _notifier(store)
+    notifier._queue = asyncio.Queue(maxsize=1)
+    notifier.start()
+    drain = notifier._task
+    assert drain is not None
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
+        closing = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
+        assert not closing.done()  # waiting on the full queue
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        assert drain.done()
+        assert sorted(await _undelivered(store)) == [
+            (
+                SECURITY_NOTICE_UNDELIVERED_ACTION,
+                "amy",
+                {"notice": "password_changed", "reason": "interrupted"},
+            ),
+            (
+                SECURITY_NOTICE_UNDELIVERED_ACTION,
+                "ben",
+                {"notice": "password_changed", "reason": "closing"},
+            ),
+        ]
+    finally:
+        release.set()

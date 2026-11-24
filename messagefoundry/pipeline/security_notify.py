@@ -806,17 +806,59 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         super().start()
 
     async def aclose(self) -> None:
+        """Drain the queue and stop. A close cut short, as the shutdown's bounded step cuts it,
+        cancels the drain, and records the notice whose send it cut and every notice still queued
+        before it returns, so each is recorded while the store is open (BACKLOG #6832)."""
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
+        drain = self._task
         try:
             await super().aclose()
         finally:
-            # Each one swallows its own failure, so this only waits.
-            await asyncio.gather(*self._recording, return_exceptions=True)
+            try:
+                if drain is not None:
+                    if not drain.done():
+                        # Cut while the sentinel waited on a full queue: the drain still runs. A
+                        # cut while the close waited on the drain has already cancelled it.
+                        drain.cancel()
+                        self._task = None
+                    await asyncio.gather(drain, return_exceptions=True)
+                await self._record_abandoned()
+            finally:
+                # Each one swallows its own failure, so this only waits.
+                await asyncio.gather(*self._recording, return_exceptions=True)
+
+    async def _record_abandoned(self) -> None:
+        """Record each notice the close left on the queue, never sent (BACKLOG #6832). One at a
+        time, without the queue-full path's cap: the queue's own bound caps the count."""
+        left: list[SecurityEvent] = []
+        while not self._queue.empty():
+            event = self._queue.get_nowait()
+            if event is not None:
+                left.append(event)
+        if not left:
+            return
+        # A count, and never one that includes a lock notice (BACKLOG #1131). Logged before the
+        # writes, so a write the closing store refuses still leaves the loss in the log.
+        shown = sum(event.event_type not in LOG_SILENT_EVENT_TYPES for event in left)
+        if shown:
+            log.warning(
+                "%s closed with %d security notice(s) still queued; recording them as undelivered",
+                type(self).__name__,
+                shown,
+            )
+        for event in left:
+            await self._record_undelivered(event, {"reason": "closing"})
 
     async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
         try:
             if await asyncio.to_thread(self._send, event):
                 delivered()
+        except asyncio.CancelledError:
+            # The close was cut while this send waited on the relay (BACKLOG #6832). The send's
+            # thread runs on to its own timeout, so the notice may still go out: "interrupted"
+            # says its delivery is unknown, apart from a send that raised.
+            await self._record_undelivered(event, {"reason": "interrupted"})
+            raise
         except Exception:
             # Best-effort: a failed send must never propagate. The event is usually also in the audit
             # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
