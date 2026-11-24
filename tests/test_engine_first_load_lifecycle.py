@@ -147,6 +147,50 @@ async def test_a_hung_source_stop_does_not_hold_a_cancelled_start(
     assert "hung" not in runner._sources
 
 
+async def test_a_teardown_that_absorbs_one_cut_does_not_outlive_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The connection-event flush absorbs a cancel. A teardown left running past the lock's
+    release would overlap engine.stop()'s own."""
+    monkeypatch.setattr(wiring_runner, "_CANCELLED_STOP_GRACE_SECONDS", 0.05)
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path)
+    runner = eng.add_registry(load_config(cfg))
+    reached = _hold_start(monkeypatch)
+    real = RegistryRunner._teardown_unsafe
+    ended = asyncio.Event()
+    calls = 0
+
+    async def absorbing(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            await real(self, *args, **kwargs)
+            return
+        try:
+            try:  # noqa: SIM105
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                pass  # as the flush does
+            await asyncio.Event().wait()  # the next phase hangs until it is cut
+        finally:
+            ended.set()
+
+    monkeypatch.setattr(RegistryRunner, "_teardown_unsafe", absorbing)
+    task = asyncio.create_task(runner.start())
+    await asyncio.wait_for(reached.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 5)
+    try:
+        assert ended.is_set(), "the teardown was still running after the start returned"
+        assert not runner._pending_source_stops
+        assert runner.start_cancel_unwound is False
+    finally:
+        await eng.stop()
+
+
 async def test_a_cancelled_first_load_clears_the_runner_it_unwound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

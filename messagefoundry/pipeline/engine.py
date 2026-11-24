@@ -1705,7 +1705,8 @@ class Engine:
             return await self._install_first_load(registry, env_values, refused, start=True)
         # BACKLOG #5743: only the leader runs the graph, with its epoch pushed first. The recovery
         # runs before the runner is installed, so nothing (a DR activation, say) can take an
-        # unstarted runner as live in that window. It only re-pends rows. The dead-letter sweeps and
+        # unstarted runner as live in that window. It dead-letters nothing, but its epoch push and
+        # any re-pended rows or re-read state cache outlive a start that fails. The sweeps and
         # the reference write are not run here, as a first load never ran them: they would commit
         # before a start that can still fail. reload_detail syncs the references after the start,
         # and the sweeps run at the next promotion.

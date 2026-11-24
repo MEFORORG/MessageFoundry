@@ -7045,9 +7045,10 @@ class RegistryRunner:
         This runs holding the reload lock, which ``stop()`` needs, so a hung source stop must not
         hold it for long. The teardown runs in its own task so it can be cut: it gets
         :data:`_CANCELLED_STOP_GRACE_SECONDS`, or less on a further cancel of this start, and is
-        then cancelled twice, which :meth:`_join_cancelled_source_stops` reads as cut at once.
-        What a cut teardown leaves stays registered for a later stop. A task that outlives even
-        that is held in ``_pending_source_stops``, where a SHUTDOWN stop settles it."""
+        then cancelled twice, which :meth:`_join_cancelled_source_stops` reads as cut at once, for
+        up to four rounds. What a cut teardown leaves stays registered for a later stop. A task
+        that ignores all of them is held in ``_pending_source_stops``, and a later stop can then
+        overlap it, because that stop settles the task only after its own teardown."""
         teardown = asyncio.create_task(
             self._teardown_unsafe(TeardownReason.SHUTDOWN), name="cancelled-start-teardown"
         )
@@ -7055,11 +7056,15 @@ class RegistryRunner:
             await asyncio.wait({teardown}, timeout=_CANCELLED_STOP_GRACE_SECONDS)
         except asyncio.CancelledError:
             pass  # the caller re-raises the cancel it is already handling
-        if not teardown.done():
+        # More than one round: the teardown's connection-event flush absorbs a cancel and carries
+        # on, and a teardown still running once the lock is released would overlap a later stop.
+        for _ in range(4):
+            if teardown.done():
+                break
             teardown.cancel()
             teardown.cancel()
             try:  # noqa: SIM105
-                await asyncio.wait({teardown}, timeout=_CANCELLED_STOP_GRACE_SECONDS)
+                await asyncio.wait({teardown}, timeout=_CANCELLED_STOP_GRACE_SECONDS / 4)
             except asyncio.CancelledError:
                 pass
         if not teardown.done():
