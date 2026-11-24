@@ -425,15 +425,16 @@ class RetentionRunner:
     def enabled(self) -> bool:
         """True when any window/threshold/maintenance knob is configured. When False, a pass does
         nothing worth running, so the loop skips it (and :meth:`start` spawns no loop at all when no
-        registry is wired, since nothing can change the answer then). Every purge window is off by default, but the low-disk floor
-        (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL truncate (``wal_checkpoint_seconds``,
-        vault BACKLOG #2619) ship ON, so on a file-backed SQLite store the runner starts on stock
-        settings to run those two. The audit-log growth warning (``audit_log_warn_rows``, BACKLOG
-        #1421) ships ON as well and applies to every backend, so stock settings start the runner on
-        SQL Server and Postgres too. It purges nothing unless a window is set.
+        registry is wired, since nothing can change the answer then). Every purge window is off by
+        default, but the low-disk floor (``min_free_disk_mb``, BACKLOG #290) and the hourly WAL
+        truncate (``wal_checkpoint_seconds``, vault BACKLOG #2619) ship ON, so on a file-backed
+        SQLite store stock settings give the runner passes to run for those two. The audit-log
+        growth warning (``audit_log_warn_rows``, BACKLOG #1421) ships ON as well and applies to every
+        backend, so stock settings give it passes on SQL Server and Postgres too. It purges nothing
+        unless a window is set.
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
-        per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
+        per-connection knob — so this is also True when any inbound sets ``prune_documents_after``
         even if no global window is configured. So must a per-connection ``messages_days`` or
         ``dead_letter_days`` window above 0 (0 keeps forever, which no pass acts on). The registry is
         consulted via ``_registry_source`` (None when no registry is wired) and read live, because a
@@ -485,6 +486,7 @@ class RetentionRunner:
             log.debug("retention disabled (nothing configured); not starting")
             return
         self._stop.clear()
+        self._wake.clear()
         self._active = active
         self._task = asyncio.create_task(self._run())
         if not active:
@@ -514,9 +516,12 @@ class RetentionRunner:
         )
 
     def wake(self) -> None:
-        """End the loop's current sleep, so it re-reads :attr:`enabled` now (BACKLOG #6804). The
-        engine calls this after a config reload; a no-op when no loop is running."""
-        self._wake.set()
+        """End an IDLE loop's sleep, so it re-reads :attr:`enabled` now and runs a pass if a config
+        reload just gave it something to do (BACKLOG #6804). The engine calls this after every
+        reload. An active loop keeps its interval: waking it would add a pass per reload, each with
+        its own alerts and audit row, for a change that it picks up on its next pass anyway."""
+        if not self._active:
+            self._wake.set()
 
     async def stop(self) -> None:
         """Signal the loop and await its exit (idempotent)."""

@@ -2118,6 +2118,50 @@ async def test_a_disabled_runner_with_a_registry_idles(store: MessageStore) -> N
     assert bare._task is None
 
 
+async def test_wake_runs_a_pass_only_when_it_makes_the_loop_active(store: MessageStore) -> None:
+    """A reload's wake() on an active loop adds no pass; one that gives an idle loop a window runs
+    one at once. The 3600 s interval means no pass below can come from the timer."""
+    passes: list[None] = []
+    settings = RetentionSettings.model_validate({**_ALL_OFF, "purge_interval_seconds": 3600})
+    window = Registry()
+    window.add_inbound(build_inbound_connection("IB", MLLP(port=2612), router="r", messages_days=1))
+    holder: dict[str, Registry] = {"reg": window}
+    runner = RetentionRunner(store, settings, registry_source=lambda: holder["reg"])
+
+    async def _counting(now: float | None = None) -> Any:
+        passes.append(None)
+
+    runner.run_once = _counting  # type: ignore[method-assign]
+    runner.start()
+    try:
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1
+        runner.wake()  # a reload while active
+        await asyncio.sleep(0.1)
+        assert len(passes) == 1, "a reload added a pass to an already-active loop"
+    finally:
+        await runner.stop()
+
+    holder["reg"] = Registry()
+    passes.clear()
+    runner.start()
+    try:
+        await asyncio.sleep(0.1)
+        assert passes == [], "a restarted idle loop ran a pass (a stale wake was left set)"
+        holder["reg"] = window
+        runner.wake()  # the reload that makes it active
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert len(passes) == 1, "the reload that gave the idle loop a window ran no pass"
+    finally:
+        await runner.stop()
+
+
 @pytest.mark.parametrize(
     "window",
     ["i:messages_days=1", "i:prune_documents_after=1", "o:dead_letter_days=1"],
