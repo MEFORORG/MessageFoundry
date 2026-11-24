@@ -3192,11 +3192,9 @@ def _audits_anchors_refused_before_the_lifespan(
 @_audits_anchors_refused_before_the_lifespan
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
-    # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
-    # this module's other imports and argument parsing; this one covers a caller that reached
-    # `_serve` some other way, and adds no second copy otherwise (`install_remote_debug_guard` says
-    # why). A no-op where the interpreter was started with remote debugging disabled, which is
-    # every engine shard under `supervise`.
+    # module-level call (vault BACKLOG #2742) has normally put the hook in place already;
+    # `install_remote_debug_guard` says what a later call does, and the module docstring of
+    # `messagefoundry.remotedebug` what start-up still runs before the hook.
     install_remote_debug_guard()
 
     import uvicorn
@@ -5892,7 +5890,8 @@ def _supervise(args: argparse.Namespace) -> int:
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
     API port. Monitors + restarts crashed shards, and stops them all cleanly on SIGINT/SIGTERM. A single
     (default) shard yields a single subprocess — identical to a plain `serve`."""
-    # Vault BACKLOG #2700: first, for the reason `_serve` gives. The supervisor holds the same
+    # Vault BACKLOG #2700: first, as in `_serve`. `install_remote_debug_guard` says what a call
+    # after the module-level one (vault BACKLOG #2742) does. The supervisor holds the same
     # environment its shards do, secrets included.
     install_remote_debug_guard()
 
