@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #6687: a DR copy loop reads a ``None`` read as "no data yet", never as end of stream.
+"""BACKLOG #6687: a DR copy loop reads a ``None`` read as "no data yet", not as end of stream.
 
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
 ``if not buf: break`` ends the copy short there. Three copy loops in ``pipeline/dr_backup.py`` now
 share :func:`dr_backup._read_chunks`, and these tests drive each of the three. Reads in that module
 this branch does not change include at least ``_extract_member``, the plaintext branch of
-``_restore_blocking``, the ``shutil.copyfileobj`` in ``_place_restored_store`` and ``_sha256_file``. The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
+``_restore_blocking``, the ``shutil.copyfileobj`` in ``_place_restored_store`` and ``_sha256_file``.
+The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
 
 from __future__ import annotations
 
