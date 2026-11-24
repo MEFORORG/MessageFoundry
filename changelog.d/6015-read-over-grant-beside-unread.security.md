@@ -17,6 +17,7 @@
   store probe fills the `unread` field too, but the two backends differ: an unread audit-table
   grant beside a read over-grant stays OBSERVED and refuses, while under external a
   `current_schema()` that resolves to NULL still reports unobserved before any over-grant is
-  weighed, so a read `SUPERUSER` there only warns under enforce. Under external,
+  weighed, so with `[store].require_least_privilege` unset a read `SUPERUSER` there only warns
+  under enforce. Under external,
   `db_securityadmin` no longer adds a separate `VIEW DEFINITION` finding, since the role carries
   that right. (`BACKLOG #6015`, `BACKLOG #6714`)

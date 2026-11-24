@@ -2047,7 +2047,9 @@ class _LookupPlan(NamedTuple):
     reason: str | None
     revocation_attested: bool
     revocation_reason: str | None
-    #: The read hop's trust anchor, resolved and chain-checked here; ``None`` with verify_tls off.
+    #: The read hop's trust anchor, resolved here, and chain-checked here for an http url only;
+    #: an https url's chain check runs when the build loop builds its opener. ``None`` with
+    #: verify_tls off.
     anchor: TrustAnchor | None
 
 
@@ -2231,10 +2233,11 @@ class FhirLookupExecutor:
         """What this lookup's checks run before any lookup is built settle, once it passes them
         (BACKLOG #8299 items 2, 3 and 9): its base url, scheme and static headers, screened and
         bounded, its timeout, its hop declarations, the SMART settings refusals of BACKLOG #5800,
-        and its read hop's trust anchor, with the #5511 chain-check refusal of an http url. Each
-        refusal names the lookup, except the SMART ones, which name the setting as the provider
-        does. The build loop runs at least the cleartext-credential check and the rest of the SMART
-        provider's checks later.
+        and its read hop's trust anchor, with the #5511 chain-check refusal of an http url. At
+        least the SMART refusals and a non-bool ``verify_tls`` name the setting and not the lookup.
+        The build loop runs at least the cleartext-credential check, the #5511 refusal of an https
+        url on the OS roots, and the rest of the SMART provider's checks later, so a refusal from
+        one of those can still follow a crossing record.
 
         #1241: the SECOND url construction site in this module. The destination screens its own;
         screening one and not its sibling reproduces the asymmetry the item reports. BACKLOG #5911:

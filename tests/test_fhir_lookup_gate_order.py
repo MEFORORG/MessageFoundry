@@ -359,15 +359,20 @@ def _signed_destination(**over: Any) -> object:
     return _destination(sign_private_key=pem, sign_algorithm="ES256", **over)
 
 
-@pytest.mark.parametrize("header", ["Authorization", "authorization"])
+@pytest.mark.parametrize("header", ["Authorization", "authorization", "Authorization\t"])
 @pytest.mark.parametrize(
     "credential",
     [
         {"bearer_token": "synthetic-token"},
         {"basic_user": "svc", "basic_password": "synthetic-pw"},
         {"headers": {"authorization": "Bearer x"}},
+        {
+            "oauth2_token_url": "https://auth.partner.invalid/token",
+            "oauth2_client_id": "cid",
+            "oauth2_client_secret": "synthetic-pw",
+        },
     ],
-    ids=["bearer", "basic", "static-header"],
+    ids=["bearer", "basic", "static-header", "oauth2"],
 )
 def test_the_fhir_destination_refuses_an_authorization_signer_beside_a_credential(
     credential: dict[str, Any], header: str
@@ -381,5 +386,7 @@ def test_the_fhir_destination_refuses_an_authorization_signer_beside_a_credentia
 
 
 def test_the_control_the_fhir_destination_signs_alone_or_under_another_name() -> None:
-    assert _signed_destination(sign_header="Authorization")
-    assert _signed_destination(sign_header="X-JWS-Signature", bearer_token="synthetic-token")
+    alone = _signed_destination(sign_header="Authorization")
+    assert getattr(alone, "_signer", None) is not None
+    beside = _signed_destination(sign_header="X-JWS-Signature", bearer_token="synthetic-token")
+    assert getattr(beside, "_signer", None) is not None
