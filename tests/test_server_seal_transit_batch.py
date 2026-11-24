@@ -12,7 +12,7 @@ server is needed, and count requests against the batch-answering fake Transit. S
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,8 +21,9 @@ import pytest
 pytest.importorskip("requests", reason="Transit batch tests need the [vault] extra")
 pytest.importorskip("hvac", reason="Transit batch tests need the [vault] extra")
 
-from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.crypto import BATCH_MAX_ITEMS, cell_aad
 from messagefoundry.store.postgres import PostgresStore
+from messagefoundry.store.row_seal import seal_page
 from messagefoundry.store.sqlserver import SqlServerStore
 from tests.test_transit_batch import _BatchTransit, _cipher
 
@@ -51,12 +52,24 @@ def _limit(sql: str, word: str) -> int:
     return int(tail.split(")")[0].split()[0])
 
 
-def _assert_sealed(rows: list[dict[str, Any]], transit: _BatchTransit) -> None:
+def _tag(row: Any) -> bytes:
+    """A row-built AAD, standing in for the queue payload's routing tag."""
+    return f"tag/{row['namespace']}/{row['key']}".encode()
+
+
+def _assert_sealed(
+    rows: list[dict[str, Any]], transit: _BatchTransit, aad_of: Callable[[Any], bytes] | None
+) -> None:
     opener = _cipher(transit)
     for i, r in enumerate(rows):
         assert r["value"].startswith("mfenc:")
-        aad = cell_aad("state", "value", r["namespace"], r["key"])
+        aad = aad_of(r) if aad_of else cell_aad("state", "value", r["namespace"], r["key"])
         assert opener.decrypt(r["value"], aad=aad) == f"synthetic value {i}"
+
+
+#: (page size, row-built AAD, Transit requests). One request per cell before the batch path: 200.
+#: A page of 200 is two batches of 128; four pages of 50 are one batch each.
+_CASES = [(500, None, 2), (50, _tag, 4)]
 
 
 class _PgConn:
@@ -111,15 +124,19 @@ def _pg_store(conn: _PgConn, transit: _BatchTransit) -> PostgresStore:
     return store
 
 
-async def test_the_postgres_seal_seals_many_cells_per_transit_request() -> None:
+@pytest.mark.parametrize(("batch", "aad_of", "requests"), _CASES)
+async def test_the_postgres_seal_seals_many_cells_per_transit_request(
+    batch: int, aad_of: Callable[[Any], bytes] | None, requests: int
+) -> None:
     transit = _BatchTransit()
     conn = _PgConn(_legacy_rows())
     store = _pg_store(conn, transit)
-    sealed = await store._seal_surface("state", "value", _LIKE, aad_cols=("namespace", "key"))
+    sealed = await store._seal_surface(
+        "state", "value", _LIKE, aad_cols=("namespace", "key"), aad_of=aad_of, batch=batch
+    )
     assert sealed == _ROWS
-    # One request per cell before the batch path: 200. One page of 200 is two batches of 128.
-    assert transit.encrypt_requests == 2
-    _assert_sealed(conn.rows, transit)
+    assert transit.encrypt_requests == requests
+    _assert_sealed(conn.rows, transit, aad_of)
 
 
 class _MssqlCursor:
@@ -191,12 +208,52 @@ def _mssql_store(cur: _MssqlCursor, transit: _BatchTransit) -> SqlServerStore:
     return store
 
 
-async def test_the_sqlserver_seal_seals_many_cells_per_transit_request() -> None:
+@pytest.mark.parametrize(("batch", "aad_of", "requests"), _CASES)
+async def test_the_sqlserver_seal_seals_many_cells_per_transit_request(
+    batch: int, aad_of: Callable[[Any], bytes] | None, requests: int
+) -> None:
     transit = _BatchTransit()
     cur = _MssqlCursor(_legacy_rows())
     store = _mssql_store(cur, transit)
-    sealed = await store._seal_surface("state", "value", _LIKE, aad_cols=("namespace", "key"))
+    sealed = await store._seal_surface(
+        "state", "value", _LIKE, aad_cols=("namespace", "key"), aad_of=aad_of, batch=batch
+    )
     assert sealed == _ROWS
-    # One request per cell before the batch path: 200. One page of 200 is two batches of 128.
-    assert transit.encrypt_requests == 2
-    _assert_sealed(cur.rows, transit)
+    assert transit.encrypt_requests == requests
+    _assert_sealed(cur.rows, transit, aad_of)
+
+
+class _CountingBatchCipher:
+    """A batch cipher recording how many values each ``encrypt_many`` call carries."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        raise AssertionError("the page went value by value")
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        raise AssertionError("unused")
+
+    def decrypt_many(self, items: Any) -> list[Any]:
+        raise AssertionError("unused")
+
+    def encrypt_many(self, items: Any) -> list[str]:
+        self.calls.append(len(items))
+        return [f"mfenc:{plaintext}" for plaintext, _aad in items]
+
+
+async def test_a_page_is_one_cipher_call_per_batch_bound() -> None:
+    """One call carries at most ``BATCH_MAX_ITEMS`` values, so a cancelled seal leaves at most that
+    many running on in the Transit pool, and other pool callers wait behind at most that many."""
+    cipher = _CountingBatchCipher()
+    rows = _pending(_legacy_rows(), _ROWS)
+    sealed = await seal_page(
+        cipher,  # type: ignore[arg-type]
+        "state",
+        "value",
+        rows,
+        aad_cols=("namespace", "key"),
+    )
+    assert cipher.calls == [BATCH_MAX_ITEMS, _ROWS - BATCH_MAX_ITEMS]
+    assert sealed == [f"mfenc:{r['v']}" for r in rows]
