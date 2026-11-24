@@ -248,8 +248,11 @@ jobs:
 
       # Guardrail #2 (DEPENDENCY-POSTURE-REVIEW.md): a SECURITY-track PR auto-merges ONLY when a
       # real, published, non-withdrawn advisory covers the dependency's PREVIOUS version. The
-      # security track is detected by Dependabot's `dependency-group` (python-security/ide-security)
-      # — a security-update group — falling back to a present-but-empty group meaning version track.
+      # track is read from Dependabot's `dependency-group`, and only a POSITIVE read is the version
+      # track (BACKLOG #5474): an exact match on one of dependabot.yml's version-update groups.
+      # A *security* group is the security track, and so is every other value, an empty group
+      # included, which is also held outright here: a track this step cannot read must not reach
+      # the merge on the version track's terms, where neither this gate nor #4 applies.
       # The advisory lookup FAILS CLOSED: any error or no-match leaves advisory_ok=false.
       - name: Verify a published advisory backs the security track
         id: ghsa
@@ -259,20 +262,33 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
-          # Is this the security track? Dependabot tags security-update grouped PRs with a
-          # *-security dependency-group. A non-security (version) PR has no security group.
-          is_security=false
+          # Which track? An ALLOW-LIST of the version-update groups, never "anything that is not a
+          # security group" (BACKLOG #5474). That inference read an EMPTY group, which every
+          # ungrouped PR carries, as the version track, so a security update Dependabot filed
+          # ungrouped would have skipped this gate and #4. The arm names exactly the groups in
+          # .github/dependabot.yml that lack `applies-to: security-updates`; a test pins the two
+          # lists equal, and a group added there without being added here holds rather than merges.
           case "$DEP_GROUP" in
-            *security*) is_security=true ;;
+            python-deps|python-deps-major|actions-deps|ide-deps|ci-npm-tools) track=version ;;
+            *security*) track=security ;;
+            *) track=unknown ;;
           esac
 
-          if [ "$is_security" != "true" ]; then
+          if [ "$track" = "version" ]; then
             # Version track: already cooldown-aged by dependabot.yml — the GHSA gate does not apply.
             echo "security_track=false" >> "$GITHUB_OUTPUT"
             echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # From here on the merge `if` requires advisory_ok AND age_ok, so an unknown track is
+          # reported as the security track: `security_track=unknown` would read as "not true" there
+          # and pass the conjunct this step exists to hold.
           echo "security_track=true" >> "$GITHUB_OUTPUT"
+          if [ "$track" != "security" ]; then
+            echo "::warning::dependency-group '${DEP_GROUP:-<none>}' names no known track — failing closed (manual review)."
+            echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Require at least one matching published (non-withdrawn) advisory for EVERY named dep at
           # the previous version. Query the global advisories endpoint (ecosystem pip — Python
@@ -296,8 +312,14 @@ jobs:
           fi
           advisory_ok=true
           while IFS="$(printf '\t')" read -r raw prev; do
-            name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
-            if [ -z "$name" ]; then continue; fi
+            name="${raw,,}"
+            # An EMPTY name DENIES, it is not skipped (BACKLOG #5474): skipping let `[{}]`, one
+            # tab-only line, confirm nothing and still leave advisory_ok=true.
+            if [ -z "$name" ]; then
+              echo "::warning::a dependency with no name — failing closed (manual review)."
+              advisory_ok=false
+              break
+            fi
             # A non-first dependency can carry an EMPTY prevVersion — update_metadata.ts:101 falls back
             # to '' for index > 0 when the PR body yields no "from" version. Unknown previous version
             # means the advisory question cannot be asked, so DENY; skipping it would wave the dep
@@ -307,6 +329,26 @@ jobs:
               advisory_ok=false
               break
             fi
+            # Both values are PR-DERIVED and become one `affects` value, which the advisories API
+            # reads as a COMMA-SEPARATED list of `package` or `package@version` (BACKLOG #5474). A
+            # comma in either would add a package of its own choosing, unversioned, and any advisory
+            # for THAT package would confirm this one. So admit only a PEP 508 name's characters and
+            # the release-age step's version set; anything else, whitespace included, denies.
+            # Names are not PEP 503-normalised here: a spelling the API does not match denies.
+            case "$name" in
+              *[!a-z0-9._-]*)
+                echo "::warning::unexpected package name '$raw' — failing closed (manual review)."
+                advisory_ok=false
+                break
+                ;;
+            esac
+            case "$prev" in
+              *[!A-Za-z0-9._+!-]*)
+                echo "::warning::unexpected previous version '$prev' for '$name' — failing closed (manual review)."
+                advisory_ok=false
+                break
+                ;;
+            esac
             # The `||` binds the ASSIGNMENT, never the substitution. `x=$(cmd || echo ERR)` APPENDS
             # the sentinel to whatever cmd already wrote to stdout, and `gh api` copies the JSON
             # error BODY to stdout on any HTTP error (only the `gh: ... (HTTP nnn)` line goes to
@@ -406,7 +448,13 @@ jobs:
           while IFS="$(printf '\t')" read -r raw ver; do
             name="${raw,,}"
             name="${name//[[:space:]]/}"
-            if [ -z "$name" ]; then continue; fi
+            # An EMPTY name DENIES, it is not skipped, for the reason the advisory loop above gives
+            # (BACKLOG #5474).
+            if [ -z "$name" ]; then
+              echo "::warning::a dependency with no name — failing closed (manual review)."
+              age_ok=false
+              break
+            fi
             # `newVersion` carries the SAME update_metadata.ts `index === 0` fallback the prevVersion
             # guard above cites: a non-first dependency can arrive with an empty string. An unknown
             # candidate version means the age question cannot be asked, so DENY.
