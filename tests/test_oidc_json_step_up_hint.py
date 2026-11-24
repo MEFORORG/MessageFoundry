@@ -253,7 +253,7 @@ async def test_mfa_verify_refuses_a_satisfied_oidc_session_with_the_idp_header(
     the header ``POST /me/reauth`` sends. A password session's wrong code is the control: still the
     ordinary 401, so the refusal keys on the session's mechanism."""
     uid = await _add_admin(service)
-    secret = "JBSWY3DPEHPK3PXP"
+    secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
     staged_cell = await service.store.set_totp_secret(uid, secret=secret)
     wrong = "000000" if totp.totp(secret) != "000000" else "111111"
     assert await service.store.enable_totp(

@@ -376,9 +376,12 @@ def _scrub_field(value: str | None, *, detail: bool = False) -> str | None:
         result = _encode_c0(first) if as_json else first
         if as_json and not _parses(result):
             return whole
-        # This result must hide every word the handler chain alone hides. The plain pass can
-        # redact a span the chain read differently, a name run that takes a ``Bearer`` label with
-        # it, and leave the credential the chain would have caught.
+        # This result must hide every word the field scrub's passes alone hide over the encoded
+        # value. The plain pass can redact a span those passes read differently, a name run that
+        # takes a ``Bearer`` label with it, and leave the credential they would have caught. Those
+        # passes read without the masked tails and the key-block mask (``scrub_log_text`` says
+        # why), so this bar is the chain as it read before them; the chain itself is held on the
+        # whole line, by ``sink_readings`` in :func:`_tee_line`.
         alone = scrub_log_text(json.dumps(written, ensure_ascii=False)[1:-1])
         if not _shows_no_more(json.dumps(result, ensure_ascii=False)[1:-1], _line_words(alone)):
             return whole

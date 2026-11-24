@@ -120,7 +120,7 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
     )
 
     with_totp = await _directory_account(store, "totp")
-    cell = await store.set_totp_secret(with_totp, secret="JBSWY3DPEHPK3PXP")
+    cell = await store.set_totp_secret(with_totp, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     assert await store.enable_totp(with_totp, recovery_code_hashes=[], expected_secret_cell=cell)
     assert (
         await store.issue_enrolment_code(
@@ -216,7 +216,7 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
 
     # --- the TOTP fold: enable and spend in one write, or neither -------------------------------
     fold = await _directory_account(store, "fold")
-    fold_cell = await store.set_totp_secret(fold, secret="JBSWY3DPEHPK3PXP")
+    fold_cell = await store.set_totp_secret(fold, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     assert await store.issue_enrolment_code(
         fold, code_digest=_digest("f"), expires_at=later, issuer_id="admin-3"
     )
@@ -253,7 +253,7 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
 
     # A passkey bound before the fold leaves TOTP off and the code unspent (AC-19).
     fold_pk = await _directory_account(store, "fold-pk")
-    fold_pk_cell = await store.set_totp_secret(fold_pk, secret="JBSWY3DPEHPK3PXP")
+    fold_pk_cell = await store.set_totp_secret(fold_pk, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     assert await store.issue_enrolment_code(
         fold_pk, code_digest=_digest("p"), expires_at=later, issuer_id=None
     )
@@ -273,7 +273,7 @@ async def assert_enrolment_code_store_contract(store: Any) -> None:
 
     # --- AC-10: two spends of one code at once, exactly one wins ------------------------------
     race = await _directory_account(store, "race")
-    race_cell = await store.set_totp_secret(race, secret="JBSWY3DPEHPK3PXP")
+    race_cell = await store.set_totp_secret(race, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     assert await store.issue_enrolment_code(
         race, code_digest=_digest("race"), expires_at=later, issuer_id=None
     )

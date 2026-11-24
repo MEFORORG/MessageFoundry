@@ -27,21 +27,16 @@ per-connection opener (server verification stays on); incompatible with ``verify
 **Fault mapping.** A response is inspected for a SOAP ``Fault`` (faults can arrive as HTTP 500 *or* an
 HTTP 200 body). A WS-Security fault (FailedAuthentication / InvalidSecurityToken / MessageExpired) →
 :class:`NegativeAckError` (``permanent=True``) → dead-letter (a credential/expiry reject won't fix on a
-retry), with the one OAuth2 exception at the end of this paragraph. A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server** fault →
+retry), with the bearer exception at the end of this paragraph. A **Sender/Client** fault → permanent dead-letter; a **Receiver/Server** fault →
 :class:`DeliveryError` (retry). The code is read first from the Fault's first child, its faultcode or
 Code, and where that yields none, from the Fault's first faultcode or a Value ahead of it
 (``_fault_code`` says how). An unrecognized fault is treated as permanent. With no fault, the HTTP
 status decides: 2xx delivered, 5xx retry, other 4xx / refused 3xx dead-letter; a connection/timeout
-error retries. With OAuth2 client credentials configured, an HTTP 401 drops the cached bearer and
-retries, as the REST and FHIR connectors do, unless its body is a WS-Security fault. Such a fault
-stays permanent where a fresh bearer cannot fix it: on a connection whose transport stamps a
-UsernameToken (``ws_security`` with ``ws_username``), and wherever it is MessageExpired. Elsewhere
-the first 401 FailedAuthentication or InvalidSecurityToken retries with a fresh bearer, and the next
-one is a credential fault (ADR 0095), which under the default ``credential_fault_policy`` stops the
-lane and keeps the queue: the credential at fault is one the engine cannot see, at least a
-UsernameToken a Handler writes into its own envelope or a client certificate. Only a 2xx or a 401 that is not a WS-Security fault ends that run; a 5xx,
-a 407, any other status or no answer leaves it open (BACKLOG #5798). Fault bodies are **not**
-echoed into errors/logs (they may carry PHI) — only the SOAP fault role + HTTP status are.
+error retries. With a bearer token provider, an HTTP 401 drops the cached bearer and retries, as
+the REST and FHIR connectors do, except that some WS-Security faults stay permanent or stop the
+lane. docs/CONNECTIONS.md, *WS-\* mode*, states which, and which providers a SOAP connection can
+carry (BACKLOG #5798); ``_post`` is the code of it. Fault bodies are **not** echoed into
+errors/logs (they may carry PHI) — only the SOAP fault role + HTTP status are.
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** (minting a fresh ``<wsa:MessageID>``
 in WS-\* mode — correct WS-\* retry semantics). The service operation **must be idempotent** and its
@@ -86,6 +81,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     hop_name_prefix,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
 )
 from messagefoundry.keywrap import load_checked_cert_chain
@@ -492,11 +488,60 @@ def _searched_code(body: str, start: int, end: int) -> str:
     return ""
 
 
+# BACKLOG #5798 added item 3: the faultcode close tag outside markup, as _CODE_END_OUTSIDE_MARKUP_RE
+# finds the Code's, and a tag up to its first '>', for the code element's text content. Each
+# match attempt stops scanning at the next '<', so the strip stays linear (review round
+# 64cd4c17: r"<[^>]*>" scanned past it and was quadratic in a run of '<' with no '>').
+_TAG_RE = re.compile(r"<[^<>]*>")
+_FAULTCODE_END_OUTSIDE_MARKUP_RE = re.compile(
+    r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?faultcode\s*>)"
+)
+
+
+def _code_element_span(body: str, fault: re.Match[str]) -> tuple[int, int] | None:
+    """Where the Fault's first child starts and where its close tag starts, when that child is a
+    ``faultcode`` or a ``Code`` with a close tag outside markup, else ``None``: the element
+    :func:`_first_child_code` reads. For a SOAP 1.2 ``Code`` the span holds its ``Subcode``, where
+    WS-Security puts its code. A self-closing element has no span."""
+    gt = _start_tag_gt(body, fault.end() - 1, len(body))
+    if gt < 0:
+        return None
+    fault_end = _search_outside_markup(_FAULT_END_OUTSIDE_MARKUP_RE, body, gt + 1, len(body))
+    end = len(body) if fault_end is None else fault_end.start()
+    child = _first_child(body, gt + 1, end)
+    if child < 0:
+        return None
+    if (element := _FAULTCODE_RE.match(body, child, end)) is not None:
+        close_re = _FAULTCODE_END_OUTSIDE_MARKUP_RE
+    elif (element := _CODE_RE.match(body, child, end)) is not None:
+        close_re = _CODE_END_OUTSIDE_MARKUP_RE
+    else:
+        return None
+    element_gt = _start_tag_gt(body, element.end(), end)
+    close = None if element_gt < 0 else _search_outside_markup(close_re, body, element_gt + 1, end)
+    return None if close is None else (child, close.start())
+
+
 def _names_expired_timestamp(body: str) -> bool:
-    """Whether ``body`` holds a Fault whose WS-Security code, searched as :func:`_classify_soap`
-    searches it, includes ``MessageExpired``."""
+    """Whether ``body``'s Fault reads as ``MessageExpired`` for the bearer retry in ``_post``, by
+    the rule docs/CONNECTIONS.md states in its WS-Security mode section (BACKLOG #5798 added
+    item 3): the code element (:func:`_code_element_span`) decides where it names a WS-Security
+    code, and otherwise the search :func:`_classify_soap` runs for one."""
     fault, start = _find_fault(body)
-    return bool(fault) and _WSSE_EXPIRED_RE.search(body, start) is not None
+    if fault is None:
+        return False
+    span = _code_element_span(body, fault)
+    if span is not None:
+        # An approximation of the text content: comments and processing instructions out
+        # (_scan_markup), then each tag up to its first '>'. So a comment, or an attribute holding
+        # no '>', does not decide whether the element names a WS-Security code; a '>' inside an
+        # attribute value can still change the read, and a CDATA section holding no '<' or '>' is
+        # stripped as a tag, so its text does not count. Where the element names no WS-Security
+        # code, the range search below reads all of it.
+        text = _TAG_RE.sub(" ", _scan_markup(body[span[0] : span[1]])[0])
+        if _WSSE_FAULT_RE.search(text) is not None:
+            return _WSSE_EXPIRED_RE.search(text) is not None
+    return _WSSE_EXPIRED_RE.search(body, start) is not None
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:
@@ -505,8 +550,8 @@ def _classify_soap(status: int, body: str) -> DeliveryError | None:
     transient; unrecognized → permanent so a rejected request can't loop the lane); a fault-less
     response falls back to the HTTP status. The Fault and the WS-Security code are searched for from
     where :func:`_find_fault` starts. This is the classification of the reply alone: on an HTTP 401
-    with OAuth2 configured, ``_post`` retries some WS-Security faults instead (BACKLOG #5798, the
-    module docstring's fault mapping says which)."""
+    with a bearer token provider, ``_post`` retries some WS-Security faults instead (BACKLOG #5798;
+    docs/CONNECTIONS.md, its WS-Security mode section, says which)."""
     fault, start = _find_fault(body)
     if fault:
         code = _fault_code(body, fault)
@@ -529,6 +574,11 @@ def _classify_soap(status: int, body: str) -> DeliveryError | None:
     return NegativeAckError(
         f"SOAP endpoint rejected with HTTP {status}", code=str(status), permanent=True
     )
+
+
+def _is_wssecurity_fault(failure: DeliveryError | None) -> bool:
+    """Whether :func:`_classify_soap` read the reply as a WS-Security fault."""
+    return isinstance(failure, NegativeAckError) and failure.code == "wssecurity"
 
 
 def _client_cert_opener(
@@ -742,9 +792,9 @@ class SoapDestination(DestinationConnector):
         )
         self._ws_mode: bool = self.ws_addressing or self.ws_security
         # BACKLOG #5798: set when a 401 WS-Security fault was retried with a fresh bearer, so the
-        # next one stops the lane. Only a 2xx or a 401 that is not a WS-Security fault clears it; a
-        # 5xx, a 407, another status or no answer at all leaves it set. Per connection, not per
-        # message: it is read by the next such answer, whatever message that answer is for.
+        # next one stops the lane. docs/CONNECTIONS.md, *WS-\* mode*, states what clears it. Per
+        # connection, not per message: it is read by the next such answer, whatever message that
+        # answer is for.
         self._wssecurity_401_retried = False
 
         # Non-deterministic generators — instance attributes so tests can inject a fixed clock / UUID /
@@ -856,6 +906,12 @@ class SoapDestination(DestinationConnector):
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
         verify = bool_setting(s, "verify_tls", default=True)
+        if scheme == "http" and (verify or (self.client_cert_file and self.client_key_file)):
+            # The same refusal for an http url, worded so it does not say the hop verifies its
+            # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+            refuse_chain_check_on_os_roots(
+                anchor, cleartext=True, connection_kind="SOAP connection"
+            )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,
@@ -899,9 +955,10 @@ class SoapDestination(DestinationConnector):
                 _redact_url(self.url),
             )
             self._opener = _insecure_opener(*proxy_handlers)
-        # #65: an opt-in bearer provider (OAuth2 client-credentials) for the HTTP *hop*, independent
-        # of WS-Security, which secures the SOAP *message*. Minted in _post and _probe. Built after
-        # the gates above, so a build one of them refuses never builds it.
+        # #65: an opt-in bearer provider (OAuth2 client-credentials, or SMART from hand-written
+        # smart_* settings) for the HTTP *hop*, independent of WS-Security, which secures the SOAP
+        # *message*. Minted in _post and _probe. Built after the gates above, so a build one of
+        # them refuses never builds it.
         from messagefoundry.transports.http_auth import (
             bearer_provider_from_settings,
             oauth2_auth_configured,
@@ -1401,8 +1458,14 @@ class SoapDestination(DestinationConnector):
         # so the wire (and any detached JWS over those bytes) carries the secret while the store still
         # holds only the token. No-op / byte-identical when no body_secrets are configured.
         payload = self._apply_body_secrets(payload)
+        run_open = self._wssecurity_401_retried
         body, status, headers = self._post(payload)
         failure = _classify_soap(status, body)
+        if _is_wssecurity_fault(failure):
+            # BACKLOG #5798 added item 2: _post ended the WS-Security 401 run on this 2xx, but one
+            # carrying a WS-Security fault leaves it as it was (CONNECTIONS.md). This assumes no
+            # other send on this connection ran during the POST.
+            self._wssecurity_401_retried = run_open
         # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
         # echoed secret before send() returns it (a validating registry may echo a bad credential in
         # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
@@ -1420,8 +1483,9 @@ class SoapDestination(DestinationConnector):
         # payload is the FINAL wire body (in WS-* mode _post_and_classify already wrapped + stamped it),
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
-        # #65: a fresh OAuth2-CC bearer per request, acquired off-loop past the queue boundary (a
-        # retry re-mints — re-run purity holds).
+        # #65: the provider's bearer per request, acquired off-loop past the queue boundary. It is
+        # the cached token until it nears expiry or something invalidates it (at least a 401 and
+        # the send-time length gate do), then a fresh mint.
         headers = self._send_headers()
         if self._signer is not None:
             # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue
@@ -1439,8 +1503,9 @@ class SoapDestination(DestinationConnector):
         self._bound_sent_headers(req.full_url, headers, connector=f"SOAP {_redact_url(self.url)}")
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
-                # BACKLOG #5798: a 2xx ends a WS-Security 401 run. First, so a 2xx whose read below
-                # raises still ends it.
+                # BACKLOG #5798: a 2xx ends a WS-Security 401 run. First, so a 2xx whose read or
+                # close below raises still ends it. _post_and_classify restores it on a 2xx
+                # WS-Security fault.
                 self._wssecurity_401_retried = False
                 # ASVS 15.2.2: bounded on the socket read. One SOAP response envelope sits far under
                 # the 16 MiB ceiling, so this refuses only a peer that is broken or hostile.
@@ -1507,14 +1572,14 @@ class SoapDestination(DestinationConnector):
                 # BACKLOG #5798, as in the REST and FHIR twins: the cached bearer may have been
                 # revoked or expired between mint and use. Drop it and retry with a fresh one
                 # (transient); classifying the 401 permanent dead-lettered the message and left the
-                # bad token cached for every later send. A 403 stays permanent below, as there. The
-                # module docstring's fault mapping states the WS-Security limits; this arm is the
+                # bad token cached for every later send. A 403 stays permanent below, as there.
+                # docs/CONNECTIONS.md, *WS-\* mode*, states the WS-Security limits; this arm is the
                 # code of them. Secret-safe: the redacted URL only.
                 self._token_provider.invalidate()
                 refreshing = (
-                    f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing OAuth2 token"
+                    f"SOAP {_redact_url(self.url)} returned HTTP 401; refreshing the bearer token"
                 )
-                if not (isinstance(failure, NegativeAckError) and failure.code == "wssecurity"):
+                if not _is_wssecurity_fault(failure):
                     # An answer that is not a WS-Security fault ends a WS-Security 401 run.
                     self._wssecurity_401_retried = False
                     raise DeliveryError(refreshing) from exc

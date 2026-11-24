@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import io
 import xml.sax
+from typing import Any
 from xml.sax.handler import ContentHandler, feature_external_ges, feature_external_pes
 from xml.sax.xmlreader import InputSource
 
@@ -181,6 +182,19 @@ def _corepoint_parse(document: str) -> object:
     return _hardened_fromstring(document)
 
 
+def _x12_map_parse(document: str) -> Any:
+    """Surface 5 — the X12 map reader (``parsing/x12/_deps.py``): defusedxml, all flags ON.
+
+    Driven at ``_parse_map_xml`` because the reader around it turns a refusal into an empty set, and
+    no document in this corpus holds a segment id, so aiming at the reader could not fail. Its real
+    input is a file's bytes, so a document is encoded the way its own declaration says.
+    """
+    from messagefoundry.parsing.x12._deps import _parse_map_xml
+
+    encoding = "iso-8859-1" if 'encoding="iso-8859-1"' in document else "utf-8"
+    return _parse_map_xml(io.BytesIO(document.encode(encoding))).getroot()
+
+
 def _lxml_parse(document: str | bytes) -> object:
     """Surface 3 — ``parsing/xml/harden.py``: the hardened lxml parser + post-parse DOCTYPE refusal.
 
@@ -274,6 +288,18 @@ def test_corepoint_import_refuses_every_hostile_document(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(HOSTILE))
+def test_x12_map_reader_refuses_every_hostile_document(name: str) -> None:
+    assert not _accepts(_x12_map_parse, HOSTILE[name])
+
+
+@pytest.mark.parametrize("name", sorted(BENIGN))
+def test_x12_map_reader_reads_benign_text_like_its_siblings(name: str) -> None:
+    # Anti-vacuity for the refusals above: a surface that refused everything would pass them.
+    document, expected = BENIGN[name]
+    assert "".join(_x12_map_parse(document).itertext()) == expected
+
+
+@pytest.mark.parametrize("name", sorted(HOSTILE))
 def test_no_parser_accepts_what_a_sibling_refuses(name: str) -> None:
     # THE consistency assertion — the reason the cell exists. Stated as a per-document unanimity check
     # so the failure message names which surface disagreed.
@@ -282,6 +308,7 @@ def test_no_parser_accepts_what_a_sibling_refuses(name: str) -> None:
         "defusedxml": _accepts(_defusedxml_parse, document),
         "xml.sax (soap gate)": _accepts(_soap_gate, document),
         "defusedxml (corepoint import)": _accepts(_corepoint_parse, document),
+        "defusedxml (x12 map reader)": _accepts(_x12_map_parse, document),
     }
     if _lxml_available():
         verdicts["lxml (harden.py)"] = _accepts(_lxml_parse, document)

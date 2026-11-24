@@ -861,6 +861,64 @@ def test_the_shim_class_skips_a_declared_proxys_certificate() -> None:
     assert MF_CLIENT_PEERCERT_STATE_KEY in direct.app_state
 
 
+@pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+def test_serve_never_stashes_a_declared_proxys_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through ``serve``: with mTLS, a cert-identity map and ``[api].trusted_proxies`` declared, the
+    HTTP class uvicorn is handed does not stash the certificate a declared proxy presents, and does
+    stash the same certificate from another peer. It reads only what ``serve`` hands uvicorn and
+    names nothing the fix added, so lifted out of this module (whose imports do name such things),
+    it fails on the code before the fix on the stash itself, not on a missing name."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.store.crypto import generate_key
+    from tests.test_api_tls import SAMPLES_CONFIG, _self_signed
+
+    cert, key = _self_signed(tmp_path)
+    captured: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")  # ADR 0078 opt-out (off-loopback TLS)
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet; the shim is under test.
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.block_unlisted_outbound = true\n"
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "alerts.security_notifications_required = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        # Warn, so the proxy-hop gates (#3538, ASVS 12.1.1's probe of a public origin) let a
+        # declared proxy start without a reachable front door; they are not under test.
+        'security.enforcement = "warn"\n'
+        f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
+        f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
+        'trusted_proxies = ["10.0.0.5"]\nproxy_tls_min_version = "1.2"\n'
+        'tls_client_cert_identities = { "CN=Test CA" = '
+        '{ "CN:svc" = "0123456789abcdef0123456789abcdef" } }\n',
+        encoding="utf-8",
+    )
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
+    http_cls: Any = captured["http"]
+    assert "connection_made" in vars(http_cls), "serve did not hand uvicorn the shim"
+    # uvicorn's own connection_made needs a live loop and config; stand down the first class from
+    # outside this package, so the shim and every layer of ours beneath it still run.
+    server_base = next(c for c in http_cls.__mro__ if not c.__module__.startswith("messagefoundry"))
+    monkeypatch.setattr(server_base, "connection_made", lambda self, transport: None)
+
+    def _connect(peer: tuple[str, int]) -> dict[str, Any]:
+        protocol: Any = object.__new__(http_cls)
+        protocol.app_state = {}
+        protocol.connection_made(_Transport(peer, _CERT))
+        state: dict[str, Any] = protocol.app_state
+        return state
+
+    assert MF_CLIENT_PEERCERT_STATE_KEY not in _connect(("10.0.0.5", 443)), (
+        "a declared proxy's certificate was stashed, so callers behind it would act as its "
+        "mapped principal"
+    )
+    assert MF_CLIENT_PEERCERT_STATE_KEY in _connect(("10.0.0.6", 443))
+
+
 @pytest.mark.parametrize("build", [_client_cert_shim, client_cert_http_protocol_class])
 def test_every_shim_builder_must_be_given_the_proxies(build: Any) -> None:
     """Keyword-only with no default, so a call site that forgot them fails rather than skips."""

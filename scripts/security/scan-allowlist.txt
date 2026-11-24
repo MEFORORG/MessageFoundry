@@ -15,12 +15,12 @@
 ^\s*[A-Z_]+\s+\d+ ms\s+\d+ tasks\s*$
 
 # The OIDC Core spec-section citation in the federated-SSO claim ladder (ADR 0142,
-# messagefoundry/auth/oidc/claims.py) reads as a dotted quad: the azp rule's section number has four
-# parts, then '/2' for rule 2 -- not a host. The citation is worth keeping verbatim in
+# messagefoundry/auth/oidc/claims.py) reads as a dotted quad: the ID Token Validation section number
+# has four parts, then '/4' for its azp item 4 -- not a host. The citation is worth keeping verbatim in
 # security-critical verification code, so the line is allowlisted rather than reworded. The entry is
 # that one comment line, literal, so a routable IP, site code or name added to it, or written on any
 # other line beside the same citation shape, still trips the scan.
-^\s*# With multiple audiences, azp MUST be present and equal to our client_id \(OIDC core 3\.1\.3\.7/2\)\.$
+^\s*# OIDC core 3\.1\.3\.7/4 and /5 \(ID Token Validation\) are the azp items, neither a MUST\.$
 
 # Generated password-wordlist entries in messagefoundry/auth/data/common_passwords.txt that collide
 # with the estate-identifier SHAPE (a six-digit run joined to a letter-bearing segment). Nine lines

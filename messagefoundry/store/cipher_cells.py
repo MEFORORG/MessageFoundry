@@ -109,9 +109,11 @@ class CipherCell:
     has no ``rowid``); the SQLite walk pages by ``rowid`` and does not read it. On a server cell
     the ``"position"`` locator stands where SQLite's ``rowid`` does: the value's 1-based place, in
     ``order``, among the values the walk fetched for the cell. A walk that reads unmarked values
-    fetches every non-NULL value; a ``sealed_only`` walk fetches only the values that start with
-    the marker in any ASCII case, so one row can hold a different position in each. A later write
-    may shift it.
+    fetches every non-NULL value; a ``sealed_only`` walk fetches the values that start with the
+    marker in any ASCII case, so one row can hold a different position in each. A SQL Server
+    column whose collation ignores width or accents can also match a non-ASCII lookalike there;
+    such a value takes a position and the walk then skips it as unsealed. A later write may shift
+    a position.
 
     ``chunk_cap`` bounds a server walk's chunk for a cell whose rows are large, since a server
     driver fetches a whole chunk at once where SQLite reads it one row at a time."""
@@ -135,8 +137,11 @@ class CipherCell:
         """The row's ``locator`` values as ``column=value`` pairs, for a PHI-free failure message.
 
         A value is read from the store, and a planted row is one thing a cipher read hunts for, so
-        each is cut to :data:`_LOCATOR_LIMIT` characters and a control character is escaped: a
-        locator cannot forge a line of the report or carry a long value out whole."""
+        each is shown at most :data:`_LOCATOR_LIMIT` characters and an elision mark. It is escaped,
+        whole escape by whole escape, only when the shown head of that many characters holds a
+        non-printable character (:func:`_shown`), so a locator cannot start a new line of the
+        report or carry a long value out whole. A printable head is shown unquoted, so it can still
+        read as report text within its line."""
         return " ".join(f"{c}={_shown(v)}" for c, v in zip(self.locator, values, strict=True))
 
 
@@ -145,10 +150,26 @@ _LOCATOR_LIMIT = 64
 
 
 def _shown(value: object) -> str:
+    # `str(value)` renders the whole value first; only its head is then shown. An escape makes one
+    # character up to ten (`\U000e0001`), so a head with a non-printable character is escaped
+    # character by character, its backslashes included, and cut at the last whole escape that
+    # fits. A shown value is then at most the limit plus the elision mark, whatever it holds
+    # (BACKLOG #1719). A printable head is shown as it is, so a value that spells an escape reads
+    # the same as one that holds it.
     text = str(value)
-    if len(text) > _LOCATOR_LIMIT:
-        text = text[:_LOCATOR_LIMIT] + "..."
-    return text if text.isprintable() else text.encode("unicode_escape").decode("ascii")
+    head = text[:_LOCATOR_LIMIT]
+    more = "..." if len(text) > _LOCATOR_LIMIT else ""
+    if head.isprintable():
+        return head + more
+    shown: list[str] = []
+    width = 0
+    for ch in head:
+        piece = ch.encode("unicode_escape").decode("ascii")
+        if width + len(piece) > _LOCATOR_LIMIT:
+            return "".join(shown) + "..."
+        shown.append(piece)
+        width += len(piece)
+    return "".join(shown) + more
 
 
 _RESPONSE_KEY = ("message_id", "destination_name", "response_seq")
@@ -223,6 +244,16 @@ POSITION = "position"
 #: usual chunk would hold hundreds of MiB at once. The store's own seal pass batches it the same.
 _ATTACHMENT_CHUNK_ROWS = 16
 
+#: Rows a server walk reads per chunk of a cell that holds a whole message or response body. One
+#: body has no fixed bound here (an inbound's ``max_message_bytes`` is per connection), so the
+#: usual chunk would fetch hundreds of whole ciphertexts in one statement (BACKLOG #1719 item 2).
+_BODY_CHUNK_ROWS = 16
+
+#: The server cells read :data:`_BODY_CHUNK_ROWS` at a time.
+_BODY_CELLS: frozenset[tuple[str, str]] = frozenset(
+    {("messages", "raw"), ("queue", "payload"), ("shared_body", "body"), ("response", "body")}
+)
+
 #: The id-keyed cells both server stores seal, pinned to each module's ``cell_aad`` calls by a test.
 _SERVER_ID_KEYED: tuple[tuple[str, str], ...] = (
     ("messages", "raw"),
@@ -249,7 +280,11 @@ def _server_cell(cell: CipherCell) -> CipherCell:
     """``cell`` as a server walk reads it: paged by its table's primary key, and located by
     ``position`` where SQLite's ``rowid`` stood."""
     locator = (POSITION,) if cell.locator == ("rowid",) else cell.locator
-    cap = _ATTACHMENT_CHUNK_ROWS if cell.table == "attachment_chunk" else None
+    cap: int | None = None
+    if cell.table == "attachment_chunk":
+        cap = _ATTACHMENT_CHUNK_ROWS
+    elif (cell.table, cell.column) in _BODY_CELLS:
+        cap = _BODY_CHUNK_ROWS
     return replace(
         cell, locator=locator, order=_SERVER_ORDER.get(cell.table, ("id",)), chunk_cap=cap
     )
@@ -771,8 +806,10 @@ def audit_cipher_cells(
 
 
 class CipherCellSource(Protocol):
-    """What a server store offers :func:`read_server_cipher_cells`: four reads, each one statement,
-    implemented by ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes."""
+    """What a server store offers :func:`read_server_cipher_cells`: four reads, implemented by
+    ``PostgresStore`` and ``SqlServerStore`` in their own dialects. None writes. A read may take
+    more than one statement: at least SQL Server's column inventory, which asks once per table,
+    and each backend's surface-sealed test."""
 
     async def cipher_walk_columns(self, tables: Sequence[str]) -> dict[str, frozenset[str]]: ...
 

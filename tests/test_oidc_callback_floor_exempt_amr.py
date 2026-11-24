@@ -332,6 +332,13 @@ async def _binding_changed(
     service: AuthService, store: MessageStore, mp: pytest.MonkeyPatch
 ) -> None:
     async def issue(*_a: Any, **_k: Any) -> Any:
+        # The unbind lands for real, so the read after the refusal shows the binding moved
+        # (BACKLOG #5653: a refusal that read cannot explain gets a neutral reason instead).
+        user = await store.get_user_by_username("jdoe")
+        assert user is not None
+        assert await store.clear_user_federated_subject(
+            user.id, expected_issuer=user.oidc_issuer, expected_subject=user.oidc_subject
+        )
         raise service_module._BindingChangedMidLogin()
 
     mp.setattr(service, "_issue_session", issue)

@@ -29,7 +29,7 @@ from messagefoundry_toolkit.anon.keying import Keyer
 from tee.anon import surrogates as tee_surrogates
 from tests.test_anon_core import _NO_SCANNER
 
-_SALT = "b224-5632-salt-0123456789abcdef"
+_SALT = "b224-5632-salt-0123456789abcdef-0123456789"
 _HEAD = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
 _SURROGATES = pytest.mark.parametrize(
     "surrogates", [engine_surrogates, tee_surrogates], ids=["engine", "tee"]

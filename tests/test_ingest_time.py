@@ -19,6 +19,7 @@ from messagefoundry.config.run_context import (
     ROUTER,
     TRANSFORM,
     RunContext,
+    RunPhase,
     registered_providers,
     run_contexts,
 )
@@ -43,7 +44,7 @@ def test_provider_registered() -> None:
 
 
 @pytest.mark.parametrize("phase", [ROUTER, TRANSFORM])
-def test_run_contexts_publishes_ingest_time(phase: str) -> None:
+def test_run_contexts_publishes_ingest_time(phase: RunPhase) -> None:
     # Re-run-stable: it's just the RunContext value the runner passes (the row's created_at), in BOTH
     # the router and transform phases.
     with run_contexts(RunContext(ingest_time=42.0), phase=phase):
