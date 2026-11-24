@@ -361,6 +361,48 @@ def test_each_git_question_is_asked_once_across_the_passes(
     assert not repeated, f"{len(starts)} git calls, repeated: {repeated}"
 
 
+_STUB_GIT = """
+import os, subprocess, sys
+state = os.environ["MEFOR_STUB_STATE"]
+args = sys.argv[1:]
+if "worktree" in args and "list" in args:
+    n = int(open(state).read() or 0) if os.path.exists(state) else 0
+    open(state, "w").write(str(n + 1))
+    if n < int(os.environ["MEFOR_STUB_FAILS"]):
+        sys.exit(128)
+sys.exit(subprocess.run([os.environ["MEFOR_STUB_REAL_GIT"], *args]).returncode)
+"""
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the ask counts were measured on Windows")
+@pytest.mark.parametrize("fails", [2, 3])
+def test_a_failed_git_answer_is_asked_again(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fails: int
+) -> None:
+    """A git that fails its first asks, then answers, is read on the ask origin/main would have made.
+
+    Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
+    spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
+    or three failed asks that head allowed the hijack origin/main refused (Manager decision of
+    2026-11-23: only a success is kept). The stub fails the first ``fails`` `worktree list` asks.
+    """
+    real = shutil.which("git")
+    assert real is not None
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "stub.py").write_text(_STUB_GIT, encoding="utf-8")
+    (stub / "git.cmd").write_text(f'@"{sys.executable}" "%~dp0stub.py" %*\r\n', encoding="utf-8")
+    state = tmp_path / "asks"
+    monkeypatch.setenv("PATH", str(stub) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("MEFOR_STUB_STATE", str(state))
+    monkeypatch.setenv("MEFOR_STUB_FAILS", str(fails))
+    monkeypatch.setenv("MEFOR_STUB_REAL_GIT", real)
+    reason = _verdict(rig, ("git -C {wt} checkout {b}", "outside", "Bash"))
+    asks = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    assert reason is not None and "LINKED WORKTREE" in reason, (asks, reason)
+    assert asks > fails, f"the stub answered no ask ({asks} asks), so this measured nothing"
+
+
 _FILLER = "abcdefghij " * 2700
 _NINE = range(9)
 #: (shape, template, cwd, tool): the shapes of the Lander's timing probes on 2026-11-23, nine judged

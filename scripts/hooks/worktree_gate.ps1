@@ -271,7 +271,7 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     open: under the Bash tool, a DOUBLE-QUOTED device spelling written with escaped backslashes, which the
     gate reads as written while bash unescapes it; and the cost, unbatched: the extra git call per
     candidate in rules 3c and 3d, and rule 3b's git calls, which Invoke-GitRead now asks once per
-    run, or twice where the first answer is a failure.
+    run where git answers, and on every ask where it fails.
     #>
     # Read through Test-Path, as in Get-FullPathRaw: a strict-mode caller of this function alone has no flag.
     if ((Test-Path variable:script:PathFormLexical) -and $script:PathFormLexical) {
@@ -1228,9 +1228,12 @@ function Test-TrueSeparatorIn([string]$Text) {
 # loaded Windows box the same day, the slowest of the five TIMED shapes in
 # tests/test_worktree_gate_added_command_readings.py, whose `-C` paths name no directory, took 9.9 s in
 # one run and 17.7 s in a later one, against 2.2 s and 3.2 s at its BASELINE commit 1983d8eb79a and
-# 18.5 s and 19.5 s before the cache. The extra passes, not git, are most of what is left: each hoist
-# re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
-# than letting it through (install-gate.ps1 installs `onFailure = block`).
+# 18.5 s and 19.5 s before the cache. Since the cache stopped keeping failures (the same day), a run
+# took 16.5 s against 1.8 s and 19.2 s: every git question on those paths fails, so each is asked as
+# often as before the cache. The other three shapes took 2.1 s to 3.1 s, against 32.9 s to 45.6 s
+# before the cache. Each hoist also re-reads the whole text before its cut. Under the 60 s timeout a
+# slow run blocks the command rather than letting it through (install-gate.ps1 installs `onFailure =
+# block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
@@ -3273,9 +3276,8 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # keyed by the argument list, with the one fold below, and it keeps the output lines and the exit code,
 # which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
 # rule for a failed answer is stated once, in the function. Get-RootCommonDirCmp and
-# Get-CommonDirAnswer kept their own caches before this one, and still do; those two keep their FIRST
-# answer, a failure included, and never ask again, so for rule 3c's and 3d's common-dir questions one
-# failed spawn still decides the run, as it did before this cache. The hook runs
+# Get-CommonDirAnswer kept their own caches before this one, and still do; their notes say what each
+# keeps. The hook runs
 # before the tool call, so nothing it judges has run yet; another process could still change the
 # repository during the run, as it could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3293,22 +3295,22 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    # A FAILED ANSWER IS ASKED ONCE MORE before it is kept, and replayed once it has failed twice. A
-    # question that cannot succeed, such as a `-C` that names no directory, then costs two spawns rather
-    # than one. This retries less than no cache did: uncached, each ask spawned git, and rule 3b's
-    # `worktree list` for one tree was asked about four times on Windows (two spellings, two path
-    # forms), so a failure that cleared by the third ask could still be read; here it is not. The
-    # common-dir callers' own caches keep their first answer and do not reach this retry at all.
+    # ONLY A SUCCESS IS KEPT: an exit code of 0 with some output. A failure, or an empty answer, is
+    # never kept, so the next ask spawns git again, and a question that fails is asked on every ask, as
+    # it was with no cache (Manager decision of 2026-11-23 under the owner's instruction to take the
+    # strictly safer option). Keeping a failure let one spawn that failed under load stand for every
+    # later ask of that question, where an uncached ask could have read the answer and denied. A
+    # question that cannot succeed, such as a `-C` that names no directory, costs a spawn per ask.
     $hit = $null
-    if (-not ($gitReadCache.TryGetValue($key, [ref]$hit) -and ($hit.Code -eq 0 -or $hit.Fails -ge 2))) {
-        $fails = $(if ($null -ne $hit) { $hit.Fails } else { 0 })
-        $out = @(& git @GitArgs 2>$null)
-        $code = $LASTEXITCODE
-        $hit = [pscustomobject]@{ Out = $out; Code = $code; Fails = $(if ($code -eq 0) { 0 } else { $fails + 1 }) }
-        $gitReadCache[$key] = $hit
+    if ($gitReadCache.TryGetValue($key, [ref]$hit)) {
+        $global:LASTEXITCODE = $hit.Code
+        return $hit.Out
     }
-    $global:LASTEXITCODE = $hit.Code
-    $hit.Out
+    $out = @(& git @GitArgs 2>$null)
+    $code = $LASTEXITCODE
+    if ($code -eq 0 -and $out.Count -gt 0) { $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
+    $global:LASTEXITCODE = $code
+    $out
 }
 
 # WHICH governed root does the SESSION belong to? Every other rule judges a PATH and takes its root from
@@ -3487,8 +3489,9 @@ function Test-GovernedEitherForm([string]$Path, [string]$Base) {
 # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
 # SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
 #
-# Cached because the roots cannot change within one invocation; it keeps its first answer, a failed
-# git call included, whatever Invoke-GitRead would do with a second ask. Rule
+# Cached because the roots cannot change within one invocation, but only an answer both git calls
+# gave: a failed call leaves nothing cached, so the next ask runs them again (until 2026-11-23 a
+# failure was kept, and one failed spawn decided the run). Rule
 # 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
 $rootCommonCache = @{}
 function Get-RootCommonDirCmp($Root) {
@@ -3497,6 +3500,7 @@ function Get-RootCommonDirCmp($Root) {
     $cacheKey = "$([bool]$script:PathFormLexical)|$key"
     if ($rootCommonCache.ContainsKey($cacheKey)) { return $rootCommonCache[$cacheKey] }
     $value = ""
+    $answered = $false
     # The RAW spelling, never the Compare form: that one is lowercased, and this file warns twice that a
     # lowercased path handed to `git -C` passes on Windows and misses the real directory on a
     # case-sensitive filesystem. Any git failure just means "no answer", which is the empty string.
@@ -3506,11 +3510,15 @@ function Get-RootCommonDirCmp($Root) {
     # more only while the root's git dir sits under it; a separate git dir breaks that, so the change
     # is not shown to deny at least as much. Git reports the toplevel of the directory it was handed,
     # so the two spellings differing by an ignorable character is not a shape this is known to meet.
-    if ($LASTEXITCODE -eq 0 -and $top -and (Get-ComparablePath $top) -eq $key) {
-        $common = "$(Invoke-GitRead @('-C', $where, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
-        if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common }
+    if ($LASTEXITCODE -eq 0 -and $top) {
+        # A toplevel that is not this root is an answer: the root is not a repository's top level.
+        $answered = (Get-ComparablePath $top) -ne $key
+        if (-not $answered) {
+            $common = "$(Invoke-GitRead @('-C', $where, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
+            if ($LASTEXITCODE -eq 0 -and $common) { $value = Get-ComparablePath $common; $answered = $true }
+        }
     }
-    $rootCommonCache[$cacheKey] = $value
+    if ($answered) { $rootCommonCache[$cacheKey] = $value }
     return $value
 }
 
@@ -3571,21 +3579,27 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # (`--path-format=absolute`, which Get-RootCommonDirCmp already asks for). That one is git's own
 # resolution of the value, so it names the real repository through at least some device spellings that
 # neither path form folds onto the drive (review round 1850f169 measured `\\?\X:\..\C:\<governed>` and
-# `\\?\.\C:\<governed>`). The git outputs are cached once; the comparable forms are built in the path
+# `\\?\.\C:\<governed>`). A whole git answer is cached once; the comparable forms are built in the path
 # form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Get-CommonDirAnswer([string]$CandRaw) {
     if (-not $commonDirAnswers.ContainsKey($CandRaw)) {
         $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()
         $git = $null
+        $whole = $false
         if ($LASTEXITCODE -eq 0 -and $common) {
             $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
+            $whole = $LASTEXITCODE -eq 0 -and $absolute
             if ($LASTEXITCODE -ne 0) { $absolute = "" }
             $git = [pscustomobject]@{ Common = $common; Absolute = $absolute }
         }
-        $commonDirAnswers[$CandRaw] = $git
+        # Only a whole answer is kept; a failed call is asked again on the next ask (until 2026-11-23 a
+        # failure was kept, and one failed spawn decided the run).
+        if ($whole) { $commonDirAnswers[$CandRaw] = $git }
+        $answer = $git
+    } else {
+        $answer = $commonDirAnswers[$CandRaw]
     }
-    $answer = $commonDirAnswers[$CandRaw]
     if ($null -eq $answer) { return $null }
     $forms = [System.Collections.Generic.List[string]]::new()
     $forms.Add([string](Get-ComparablePath $answer.Common $CandRaw))
