@@ -637,10 +637,11 @@ def main() -> int:
             resp: bytes | None = _respond(registry, req, boot.code_sets, broker)
         except MemoryError as exc:
             # Caught here rather than around the Handler alone, so a result too big to encode is
-            # answered the same way. Only the text is kept: the reply is built AFTER this block,
-            # because until it ends the traceback keeps the Handler's frames, and the memory their
-            # locals hold, alive.
-            resp, detail = None, _error_text(exc)
+            # answered the same way. The error is kept without its traceback or chain, which hold
+            # the Handler's frames and the memory their locals hold, and is formatted only once
+            # those are gone, below (BACKLOG #6813).
+            resp, oom = None, exc.with_traceback(None)
+            oom.__context__ = oom.__cause__ = None
         if broker is not None:
             broker.end()  # before the answer: no lookup frame may follow it
             if broker.broken:
@@ -651,25 +652,34 @@ def main() -> int:
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
-            # the parent starts a fresh worker (vault BACKLOG #3133 part 2).
+            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). The raw frame and the
+            # decoded request are let go first, so the reply is not built beside them (BACKLOG #6813).
+            request_id, phase, name = req.request_id, req.phase, req.name
+            del frame, req
             with contextlib.suppress(OSError, SandboxError, MemoryError):
                 _write_frame(
                     stdout,
                     codec.encode_fail(
-                        request_id=req.request_id,
-                        phase=req.phase,
-                        name=req.name,
+                        request_id=request_id,
+                        phase=phase,
+                        name=name,
                         kind=codec.FAIL_MEMORY,
-                        error=f"{detail}; {memory_cap}",
+                        error=f"{_error_text(oom)}; {memory_cap}",
                     ),
                 )
             return 1  # with no reply sent, the parent reads EOF and reports a crash instead
         try:
             _write_frame(stdout, resp)
-        except (OSError, SandboxError) as exc:
-            # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time —
-            # report it instead of dying so the child's "survives for the next message" contract holds,
-            # rather than the parent reading EOF and paying a full config-reload respawn.
+        except OSError:
+            # Part of the frame may be on the pipe already, so another frame after it would put the
+            # stream out of step with the parent. Exit: the parent fails this message on EOF or on
+            # the torn frame, and starts a fresh worker (BACKLOG #6813).
+            return 1
+        except SandboxError as exc:
+            # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time,
+            # and before any byte is written. Report it instead of dying so the child's "survives for
+            # the next message" contract holds, rather than the parent reading EOF and paying a full
+            # config-reload respawn.
             try:
                 _write_frame(
                     stdout,
