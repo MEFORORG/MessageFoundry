@@ -7718,11 +7718,12 @@ record what the pre-pacing route recorded: an `auth.channel_denied` or `auth.per
 row, or the new-address refusal's deduped `auth.new_address_reverify_required` row; the serve-hop
 refusal writes none of its own. Unlike
 that route, they then write no `monitoring:read` grant row. A held 429 the route never raises,
-because one of those checks refused first, writes no log line. The scope and permission refusals
-write no throttled row either. The serve-hop and new-address refusals do write the held 429's
-`auth.gate_refused` row (reason `throttled`) before they are answered, so such a request leaves a
-decision row even when the refusal writes none of its own. That row also records what the caller
-was answered, as `answered_status` and `answered_reason`: for those two refusals, 403 with
+at least because one of those checks refused first, writes no log line. The scope and permission
+refusals write no throttled row either. When the serve-hop or new-address refusal answers with an
+HTTP refusal, it writes the held 429's `auth.gate_refused` row (reason `throttled`) before that
+refusal is answered, so such a request leaves a decision row even when the refusal writes none of
+its own. Any other exception those checks raise, such as a store fault, writes no throttled row.
+That row, where written, also records what the caller was answered, as `answered_status` and `answered_reason`: for those two refusals, 403 with
 `serve_hop`, or 403 with `step_up`, which on this route is the new-address refusal and not a stale
 step-up window. `record_deferred_monitoring_refusal` in `messagefoundry/api/security.py` says how
 the fields are filled. Like every gate decision row, it is not

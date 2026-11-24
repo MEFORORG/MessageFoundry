@@ -2022,10 +2022,10 @@ def require_monitoring_read(
     is held on the request, with no decision row yet, until the route body calls
     :func:`raise_deferred_monitoring_refusal` after its own checks. ``defer_value_valid``, when
     given, defers only a value that will pass the route's validation, so an invalid one is charged
-    and refused here as any other read. A held 429 the route never raises, because one of its own
-    checks refused the request first, is answered by that refusal and writes no log line. It writes
-    its throttled row only where the route calls :func:`record_deferred_monitoring_refusal` for
-    that refusal. ``GET /connections`` defers on
+    and refused here as any other read. A held 429 the route never raises, at least because one of
+    its own checks refused the request first, writes no log line. Where a check refused it, that
+    refusal answers the request, and the throttled row is written only where the route calls
+    :func:`record_deferred_monitoring_refusal` for that refusal. ``GET /connections`` defers on
     ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says why."""
 
     async def dependency(request: Request) -> Identity:
