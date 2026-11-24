@@ -72,6 +72,7 @@ tests/test_ci_step_margin.py
 tests/test_ci_tool_and_image_pins.py
 tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
+tests/test_ci_windows_smoke_mllp_read.py
 tests/test_cla_action_advisory_gate.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
