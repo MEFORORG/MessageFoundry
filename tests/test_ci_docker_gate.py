@@ -327,6 +327,7 @@ def test_every_root_file_the_image_copies_trips_the_gate() -> None:
         f"the Dockerfile COPY reader found {sorted(copied)}; it has drifted from the Dockerfile"
     )
     missed = sorted(path for path in copied if not gate([path]))
+    assert len(copied) >= 4, "the COPY reader found too little, so the check below is vacuous"
     assert not missed, (
         f"the image COPYs these root files, yet editing one skips the smoke: {missed}"
     )

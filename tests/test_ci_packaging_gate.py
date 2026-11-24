@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._force_include import hatch_build
 from tests._workflow_contexts import changes_arm_pattern, jobs_of
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -55,9 +56,8 @@ def _root_files_the_engine_build_reads() -> set[str]:
     package) and a nested path are left out: the packaged trees are not this arm's by design, as
     the comment above it in ci.yml says.
     """
-    doc = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
-    project = doc["project"]
-    sdist = doc["tool"]["hatch"]["build"]["targets"]["sdist"]
+    project = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))["project"]
+    sdist = hatch_build(_PYPROJECT)["targets"]["sdist"]
     roots = {*sdist["only-include"], project["readme"]}
     named = {name for name in roots if "/" not in name} | set(project["license-files"])
     return {name for name in named if (_ROOT / name).is_file()}
@@ -69,6 +69,7 @@ def test_every_lock_the_job_installs_trips_the_gate() -> None:
         f"the job's lock reader found {sorted(locks)}; it has drifted from the job"
     )
     missed = sorted(lock for lock in locks if not gate([lock]))
+    assert len(locks) >= 1, "the lock reader found nothing, so the absence check below is vacuous"
     assert not missed, f"packaging-build installs from these, yet a bump to one skips it: {missed}"
 
 
@@ -78,6 +79,7 @@ def test_every_root_file_the_engine_build_reads_trips_the_gate() -> None:
         f"the pyproject reader found {sorted(files)}; it has drifted from pyproject.toml"
     )
     missed = sorted(path for path in files if not gate([path]))
+    assert len(files) >= 4, "the pyproject reader found too little, so the check below is vacuous"
     assert not missed, (
         f"the engine build reads these, yet a PR touching one skips the build: {missed}"
     )

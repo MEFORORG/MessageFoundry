@@ -60,8 +60,9 @@ name: Dependabot auto-merge
 #      shape, or an ecosystem with no publish-date source wired all route to manual review.
 #      READ THIS BEFORE CITING #2 OR #4 AS A CONTROL: BOTH ARE INERT with respect to the merge
 #      decision as shipped, and recording either as operating would be exactly the false premise
-#      docs/Secure_Development_Standards.md §3 forbids. Only #3 (and the sole-author, update-type
-#      and disarm checks) can change a merge decision today; every security-track PR holds.
+#      docs/Secure_Development_Standards.md §3 forbids. Among the checks that can change a merge
+#      decision today are at least #3 and the sole-author, update-type, dependency-type
+#      (`direct:development`) and disarm checks; every security-track PR holds.
 #      `age_ok=true` is reachable only for uv/pip (no publish-date source is wired for any
 #      other ecosystem), while `eligible=true` is reachable only for github-actions (the uv/pip/npm
 #      allow rows ship EMPTY). Those two sets are DISJOINT, so no PR can satisfy both conjuncts the
