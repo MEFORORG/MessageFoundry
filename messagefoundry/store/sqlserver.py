@@ -6090,9 +6090,10 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
-        # A cancel in the settle, a DB write, would otherwise skip every step below: the pool is
-        # then marked closing and its executor shut down without waiting, and the cancel raised
-        # (BACKLOG #5720). Marking it closing does not close its free connections.
+        # A cancel in the settle, a DB write, would otherwise skip every step below: the sync
+        # handoff pools are then closed, the pool marked closing and its executor shut down, without
+        # waiting, and the cancel raised (BACKLOG #5720). That closes at least neither the pool's
+        # free connections nor the dedicated claim holders.
         await close_or_force(
             self._settle_at_close,
             self._force_pool_release,
@@ -6132,9 +6133,13 @@ class SqlServerStore:
             log.debug("the settle's failure at close", exc_info=exc)
 
     def _force_pool_release(self) -> None:
-        """Synchronous: mark the pool closing and shut its executor down, without waiting."""
+        """Synchronous: close the sync handoff pools, mark the pool closing and shut its executor
+        down, without waiting."""
         try:
-            self._pool.close()
+            try:
+                self.close_sync_handoff_pool()
+            finally:
+                self._pool.close()
         finally:
             if self._pool_executor is not None:
                 self._pool_executor.shutdown(wait=False)

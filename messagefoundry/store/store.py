@@ -2212,11 +2212,17 @@ async def close_or_force(
 ) -> None:
     """Await ``close``. When it ends by raising, a cancel included, call ``force_release``, so
     what the close had not reached is dropped without waiting, then re-raise (BACKLOG #5720).
-    ``what`` names the close in the WARNING a failed ``force_release`` writes."""
+    ``what`` names the close in the WARNING written either way, whether the release ran or failed.
+    """
     try:
         await close()
-    except BaseException:
-        _force_failed_open_release(force_release, after=what)
+    except BaseException as exc:
+        if _force_failed_open_release(force_release, after=what):
+            log.warning(
+                "%s (%s); what it held was released without waiting for it",
+                what,
+                type(exc).__name__,
+            )
         raise
 
 
@@ -14080,29 +14086,17 @@ class MessageStore:
             if callable(release):
                 release()
 
-    async def _settle_at_close(self) -> None:
-        """The AES-GCM settle :meth:`_close_handles` runs first; a failure is logged, not raised."""
+    async def _close_handles(self) -> None:
+        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
+        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
+        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
+        # a failing settlement must never turn a clean shutdown into an error.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             _log_close_failure("could not settle the AES-GCM invocation bound at close", exc)
-
-    async def _close_handles(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
-        # A cancel in the settle, a write, would otherwise skip every close below and leave the
-        # connections' non-daemon worker threads running: they are interrupted and stopped without
-        # waiting, and the cancel raised (BACKLOG #5720). A group-commit committer is not stopped.
-        conns = [*self._read_conns, self._db]
-        await close_or_force(
-            self._settle_at_close,
-            functools.partial(_force_stop_connections, conns),
-            what="a store close cut short in its settle",
-        )
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
         # resolves their futures before the write connection is closed — otherwise an in-flight handoff
         # would hang forever on a future no committer will ever complete.

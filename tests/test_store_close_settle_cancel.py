@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5720: a cancel landing in a store close's AES-GCM settle skipped every close step after
-it, on all three backends, so the pool (PostgreSQL), the pool and its executor (SQL Server) or the
-connections' non-daemon worker threads (SQLite) were left open.
+it, so the pool (PostgreSQL) or the pool and its executor (SQL Server) were left open. SQLite is
+not covered: a forced stop there followed by a later close() can hang aiosqlite.
 
 The settle is a database write on a keyed store, so a cancel can land there; each test stands a
 settle that blocks in for it. No real PostgreSQL or SQL Server is involved. Synthetic data only.
@@ -11,8 +11,6 @@ settle that blocks in for it. No real PostgreSQL or SQL Server is involved. Synt
 from __future__ import annotations
 
 import asyncio
-import threading
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,7 +18,6 @@ import pytest
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.sqlserver import SqlServerStore
-from messagefoundry.store.store import MessageStore
 
 
 async def _cancel_close_in_its_settle(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -52,7 +49,7 @@ class _PgPool:
 
 
 async def test_postgres_close_cancelled_in_its_settle_terminates_the_pool(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Red before the fix: the pool is never terminated."""
     pool = _PgPool()
@@ -62,6 +59,26 @@ async def test_postgres_close_cancelled_in_its_settle_terminates_the_pool(
     store = PostgresStore(pool, settings)
     await _cancel_close_in_its_settle(store, monkeypatch)
     assert pool.terminated == 1
+    assert "a store close cut short in its settle (CancelledError)" in caplog.text
+
+
+async def test_a_settle_that_finishes_forces_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Control: a close whose settle finishes closes the pool gracefully and terminates nothing."""
+
+    class _Pool(_PgPool):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = 0
+
+        async def close(self) -> None:
+            self.closed += 1
+
+    pool = _Pool()
+    settings = StoreSettings(
+        backend=StoreBackend.POSTGRES, server="localhost", database="mefor_test", username="mefor"
+    )
+    await PostgresStore(pool, settings).close()
+    assert (pool.closed, pool.terminated) == (1, 0)
 
 
 class _OdbcPool:
@@ -98,22 +115,3 @@ async def test_sqlserver_close_cancelled_in_its_settle_releases_pool_and_executo
     assert pool.closed == 1
     assert executor.shutdown_calls == [False]
     assert store._pool_executor is None
-
-
-async def test_sqlite_close_cancelled_in_its_settle_stops_the_writer_thread(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Red before the fix: the writer's non-daemon worker thread is still running."""
-    store = await MessageStore.open(tmp_path / "store.db")
-    thread = getattr(store._db, "_thread", None)
-    assert isinstance(thread, threading.Thread)
-    try:
-        await _cancel_close_in_its_settle(store, monkeypatch)
-        for _ in range(200):
-            if not thread.is_alive():
-                break
-            await asyncio.sleep(0.01)
-        assert not thread.is_alive()
-    finally:
-        if thread.is_alive():
-            store._db.stop()
