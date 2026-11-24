@@ -8299,6 +8299,14 @@ from a **private / internal CA** not in the box-global store can pin that CA onc
   CA is ignored), `augment` (OS roots **plus** the internal CA — a mixed public + private estate), or
   `pinned` (**only** the internal CA, not the public bundle — a fully-private estate; the same
   single-anchor posture as the off-box syslog `forward_tls_ca_file`).
+- `[tls].crl_check_chain` — opt-in, default off (vault BACKLOG #5511): `[tls].crl_file` is checked against
+  the server's whole chain, so a revoked intermediate CA refuses the servers under it, though not
+  against the partner on a REST connection's ECH sidecar hop, where the sidecar makes the TLS connection to the partner,
+  or on a connection whose url is `http`, which sends to the partner without TLS. A hop that verifies against the OS
+  trust store (under `system` or `augment`, with no CA of its own) refuses at build. So does an `http`
+  connection, or an ECH sidecar hop, whose trust anchor is that store, though it checks no CRL against the partner. So does a CA file holding a CA that does not
+  chain to a self-signed root in that file; [CONFIGURATION.md](CONFIGURATION.md#tls--outbound-client-trust-anchors) says what it
+  takes. Off, each hop keeps the leaf check.
 
 A connection that names its **own** `tls_ca_file` always **wins verbatim**; a loopback (on-box) hop is
 exempt (it needs no org-PKI anchor). The anchor **supplies which roots verify the peer** — it **never
