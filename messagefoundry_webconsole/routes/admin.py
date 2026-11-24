@@ -53,7 +53,6 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
     AuthService,
 )
-from messagefoundry.auth.usernames import username_refusal
 from messagefoundry.controlchars import scrub_log_argument
 
 from .. import pages
@@ -246,6 +245,18 @@ def _refusal_status(exc: Exception) -> int:
     if isinstance(exc, HTTPException) and exc.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
         return exc.status_code
     return status.HTTP_400_BAD_REQUEST
+
+
+def _username_rule_reason(exc: ValidationError) -> str | None:
+    """The new-username rule's reason from a ``UserCreateRequest`` refusal, or ``None`` when the
+    rule did not refuse the name (BACKLOG #5520 items 7 and 16). The rule raises a ``ValueError``
+    whose text is fixed and never echoes the value; any other error on the field, such as the
+    length cap, which refuses before the rule runs, gives ``None``."""
+    for error in exc.errors(include_url=False, include_input=False):
+        cause = error.get("ctx", {}).get("error")
+        if error["loc"] == ("username",) and isinstance(cause, ValueError):
+            return str(cause)
+    return None
 
 
 def _group_keys(pairs: list[tuple[str, str]]) -> list[str]:
@@ -454,7 +465,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if isinstance(exc, ValidationError):
                 # BACKLOG #5520 items 7 and 16: the username rule's reason is fixed text that never
                 # echoes the value, so the form can say why; any other field keeps "invalid input".
-                detail = username_refusal(form.get("username", "").strip()) or detail
+                # Read from the model's own refusal rather than by running the rule again, so a name
+                # the length cap refused is never walked whole on the event loop.
+                detail = _username_rule_reason(exc) or detail
             all_roles = await admin.list_roles(service=service, _=identity)
             return HTMLResponse(
                 pages.user_new_page(

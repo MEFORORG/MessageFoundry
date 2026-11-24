@@ -1732,7 +1732,10 @@ or federated pair cannot make it vanish from these reads. One that keeps changin
 unreported. Honest writes that race all three checks the same way would be a false alarm
 too. **Two honest role writes to the account that commit across both of those reads
 are still answered as a failing record and reported**, a false alarm the reads cannot tell from
-tampering, because the role rows are read apart from the account's row. Where
+tampering, because the role rows are read apart from the account's row. Since
+`PUT /users/{user_id}/roles` reads the account this way before it writes, that false alarm there
+answers 423 and the role write does not happen, where before this read it would have gone ahead:
+an over-refusal, kept by decision d20261123T150929936-d70a0b. Where
 `[auth].require_action_step_up` is on, the default, `PATCH /users/{user_id}` reads the account
 after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
 proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. So does its 422

@@ -309,6 +309,41 @@ async def test_the_console_create_shows_why_the_username_rule_refused(engine: En
     assert other.status_code == 400 and "invalid input" in other.text
 
 
+async def test_the_console_create_does_not_run_the_rule_over_an_over_long_name(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5520, the reason limb's cost: a name over the request model's length cap is refused
+    by the model without its rule running, and the console must not then run the rule over the
+    whole value on the event loop to find a reason. No call of the rule may see more than the cap;
+    the refusal stays "invalid input". The control is a refused name under the cap, whose reason is
+    still shown."""
+    from messagefoundry.api import auth_models
+    from messagefoundry.auth import usernames
+    from messagefoundry_webconsole.routes import admin as console_admin
+
+    seen: list[int] = []
+    real = usernames.username_refusal
+
+    def spy(name: str) -> str | None:
+        seen.append(len(name))
+        return real(name)
+
+    monkeypatch.setattr(auth_models, "username_refusal", spy)
+    monkeypatch.setattr(console_admin, "username_refusal", spy, raising=False)
+    service = await _service(engine)
+    async with _boss_client(engine, service) as c:
+        long = await _post_pairs(
+            c, "/ui/users", [("username", "a" * (1024 * 1024 - 4096)), ("email", "x@example.test")]
+        )
+        control = await _post_pairs(
+            c, "/ui/users", [("username", "system"), ("email", "x@example.test")]
+        )
+    assert long.status_code == 400 and "invalid input" in long.text
+    assert all(n <= 256 for n in seen), max(seen)
+    assert control.status_code == 400
+    assert "reserved for the audit trail" in html.unescape(control.text)
+
+
 async def test_create_user_duplicate_rerenders_without_password(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)

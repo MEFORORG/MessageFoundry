@@ -29,13 +29,17 @@ and in an audit export. The NUL case is pinned by
 ``tests/test_username_rule.py::test_the_rule_refuses``.
 
 The bare word ``directory`` is NOT reserved: nothing at HEAD writes it as an audit actor. The
-directory sign-in's marker ``<directory>`` (``api.security.DIRECTORY_GRANTED_BY``) is, by the
-``<...>`` form.
+``granted_by`` marker ``<directory>`` (``api.security.DIRECTORY_GRANTED_BY``), which a directory
+sign-in and the directory reconciler put on the ``administrator_granted`` alert, is reserved, by
+the ``<...>`` form.
 
 What it admits, at least: a space separator inside the name (U+00A0, U+3000), a blank glyph
 :data:`_BLANK_GLYPHS` does not list, and a lookalike letter from another script, so a Cyrillic
 spelling that reads as ``system`` passes, as does a reserved form spelled with a delimiter
-lookalike :data:`_DELIMITER_LOOKALIKES` does not list. It matches the reserved forms after NFKC,
+lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes from the same
+script pass too: ``cli:root`` spelled with a dotless i (U+0131), ``<oidc>`` spelled with the
+modifier low arrowheads U+02F1 and U+02F2, and ``<oidc>`` followed by a combining low line
+(U+0332). It matches the reserved forms after NFKC,
 with the delimiter lookalikes that table lists taken to ASCII, and case folding; it does not fold
 confusable letters across scripts.
 
@@ -67,8 +71,8 @@ RESERVED_ACTOR_FORMS: Final = re.compile(r"(?s)system(:.*)?|cli:.*|<.*>")
 #: for ``:``, ``<`` and ``>``, and not every lookalike of them. At least these are left out: some
 #: letters it lists (Canadian syllabics PA and PO, a runic letter and a Lisu tone letter), so a
 #: name in those scripts is not refused as a ``<...>`` form, though the modifier letters U+02D0,
-#: U+02F8, U+A789, U+02C2 and U+02C3 are kept; and U+FE30, which NFKC turns into a two-dot leader
-#: rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008 and U+3009.
+#: U+02F8, U+A789, U+02C2 and U+02C3 are kept; and U+FE30, which NFKC turns into two full stops
+#: (``..``) rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008 and U+3009.
 _DELIMITER_LOOKALIKES: Final = str.maketrans(
     dict.fromkeys(
         (0x02D0, 0x02F8, 0x0589, 0x05C3, 0x0703, 0x0704, 0x0903, 0x0A83, 0x16EC, 0x17D6, 0x1803)

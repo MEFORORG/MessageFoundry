@@ -101,7 +101,7 @@ LOOKALIKE_DELIMITERS = [
     "cli" + chr(0x0903) + "root",  # DEVANAGARI SIGN VISARGA
     "cli" + chr(0x0A83) + "root",  # GUJARATI SIGN VISARGA
     "cli" + chr(0x17D6) + "root",  # KHMER SIGN CAMNUC PII KUUH
-    chr(0x1D236) + "oidc" + chr(0x1D237),  # GREEK INSTRUMENTAL NOTATION SYMBOL-38/39
+    chr(0x1D236) + "oidc" + chr(0x1D237),  # GREEK INSTRUMENTAL NOTATION SYMBOL-40 and SYMBOL-42
 ]
 
 #: The controls: names beside each refused form that the rule must leave alone.
