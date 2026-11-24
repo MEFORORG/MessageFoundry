@@ -430,10 +430,10 @@ Since BACKLOG #7613, `install-selfheal.ps1` creates no allowlist. The backstop r
 first and the legacy one only as a fallback, so a repo `install-gate.ps1` adds reaches it. A legacy
 copy an earlier run seeded is still read once the gate's file is gone: `install-gate.ps1 -Uninstall`
 deletes the gate's file, and where that copy remains the backstop stays armed on the roots it lists,
-so the "verified byte-for-byte clean uninstall" claim is still true of the gate and not of the estate.
-Neither installer deletes the legacy file; `install-selfheal.ps1` prints a note naming it when it exists
-and the gate's file is absent. A backstop copy installed before that change reads only the legacy file until
-`install-selfheal.ps1` runs again.
+so the "verified byte-for-byte clean uninstall" claim is not true of the estate. Neither installer
+deletes the legacy file; `install-selfheal.ps1` prints a note naming it when it exists and the gate's
+file is absent. The reverse also holds: once `install-gate.ps1` creates the gate's file, the backstop
+stops reading the legacy one, and a root only the legacy file listed loses the backstop with no message.
 
 Related: `install-selfheal.ps1` now carries the `CLAUDECODE` refusal its sibling has, but its source is
 still `$PSScriptRoot`, the calling session's own worktree copy, which that session may freely edit. The

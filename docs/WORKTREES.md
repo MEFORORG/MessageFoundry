@@ -2017,7 +2017,7 @@ never overwritten; with no stub there, a stale backup does not refuse. If a side
 exists at the destination, the transcript still moves, the source sidecar stays where it is, and a
 warning names it.
 
-**The worktree gate keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
+**The worktree gate's write rule keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
 the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
 path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
 where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.

@@ -33,9 +33,9 @@
     which includes at least `refs/rescue/`, `refs/tags/rescue/`, `refs/remotes/<r>/rescuetags/` and
     `refs/remotes/<r>/rescue/` (`Get-RescueNamespaces` is the list). A `git fetch --prune` deletes a
     remote-tracking one whose server copy is gone, which is when it may be the last copy, and
-    with pruning on (`--prune`, `fetch.prune` or `remote.<r>.prune`), `--prune-tags` or
-    `fetch.pruneTags` deletes a local tag the remote lacks, which includes every `-Anchor` tag
-    never pushed. Measured 2026-09-20: this checkout held 328 refs under
+    with pruning on (`--prune`, `fetch.prune` or `remote.<r>.prune`), at least `--prune-tags`,
+    `fetch.pruneTags`, `remote.<r>.pruneTags` or a fetch refspec that maps tags or refs/rescue
+    locally deletes a local ref the remote lacks, which includes every `-Anchor` tag never pushed. Measured 2026-09-20: this checkout held 328 refs under
     `refs/rescue/` alone, not a total across the namespaces above, at least one being the sole
     remaining copy of files deleted from the working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
