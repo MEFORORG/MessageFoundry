@@ -8431,6 +8431,7 @@ async def settle_audit_ranges(
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
             # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            # No roll closes a Transit range, so that case is a row some other writer put there.
             if out_secret is not None and not await cipher_call(
                 out_secret[1], _audit_tag_ok, parsed, out_secret
             ):
@@ -8601,7 +8602,8 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
-    # The handover tag is a MAC under the outgoing key: off the loop for a blocking provider (#3929).
+    # The handover tag is a MAC under the outgoing key, routed as every audit MAC is (#3929). The
+    # outgoing key here is in-heap today (a held Transit key is the active one), so it runs inline.
     detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:

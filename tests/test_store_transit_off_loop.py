@@ -427,38 +427,3 @@ async def test_the_open_refuses_a_transit_handover_tag_that_does_not_verify() ->
     await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
     assert not host._audit_ranges_trusted
     assert host._audit_range_keys == ["k-unheld", transit_id]
-
-
-async def test_the_roll_makes_its_handover_tag_through_cipher_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``roll_audit_key_range`` makes the outgoing key's handover tag through ``cipher_call``, keyed
-    on the outgoing secret's MAC provider, so a blocking provider would be called off the loop.
-
-    The roll reaches that tag only under an in-heap key today: a store holding the Transit MAC has
-    the Transit key active, and the roll never closes a range under the active key. So this pins
-    the route, not a measured hop; under an in-heap key ``cipher_call`` runs the call inline."""
-    path = tmp_path / "r.db"
-    a, b = generate_key(), generate_key()
-    first = make_cipher(a)
-    store = await MessageStore.open(path, cipher=first, audit_mac_key=first.audit_mac_key())
-    try:
-        await store.record_audit("probe", actor="tester", detail="synthetic")
-    finally:
-        await store.close()
-    rotated = make_cipher(b, (a,))
-    store = await MessageStore.open(path, cipher=rotated, audit_mac_key=rotated.audit_mac_key())
-    try:
-        routed: list[tuple[object, object]] = []
-        real = row_seal.cipher_call  # the object store.py imports under the same name
-
-        async def recording(cipher: object, call: Any, *args: Any, **kwargs: Any) -> Any:
-            routed.append((cipher, call))
-            return await real(cipher, call, *args, **kwargs)
-
-        monkeypatch.setattr(store_module, "cipher_call", recording)
-        ok, msg = await store.roll_audit_key_epoch()
-        assert ok, msg
-        assert (None, store_module.audit_epoch_detail) in routed
-    finally:
-        await store.close()

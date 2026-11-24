@@ -29,6 +29,8 @@ from typing import Any
 import pytest
 
 from messagefoundry.__main__ import main
+from messagefoundry.store import row_seal
+from messagefoundry.store import store as store_module
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.store.store import (
     AUDIT_KEY_EPOCH_ACTION,
@@ -819,5 +821,39 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
         )
         ok, detail = await store.verify_audit_chain()
         assert ok, detail
+    finally:
+        await store.close()
+
+
+async def test_the_roll_makes_its_handover_tag_through_cipher_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #3929: the roll makes the outgoing key's handover tag through ``cipher_call``, the
+    helper every audit MAC goes through, so a provider that blocks on I/O would run off the loop.
+
+    The roll reaches that tag only under an in-heap key today: a store holding the Transit MAC has
+    the Transit key active, and the roll never closes a range under the active key. So this pins
+    the route only. It cannot tell which MAC provider the call is keyed on, since both are ``None``
+    here, and under an in-heap key ``cipher_call`` runs the call inline."""
+    path = tmp_path / "r.db"
+    a, b = generate_key(), generate_key()
+    store = await _open(path, a)
+    try:
+        await _seed(store, "probe", 1)
+    finally:
+        await store.close()
+    store = await _open(path, b, (a,))
+    try:
+        routed: list[tuple[object, object]] = []
+        real = row_seal.cipher_call  # the object store.py imports under the same name
+
+        async def recording(cipher: object, call: Any, *args: Any, **kwargs: Any) -> Any:
+            routed.append((cipher, call))
+            return await real(cipher, call, *args, **kwargs)
+
+        monkeypatch.setattr(store_module, "cipher_call", recording)
+        ok, msg = await store.roll_audit_key_epoch()
+        assert ok, msg
+        assert (None, store_module.audit_epoch_detail) in routed
     finally:
         await store.close()
