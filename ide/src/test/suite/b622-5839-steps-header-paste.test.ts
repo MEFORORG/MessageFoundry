@@ -5,7 +5,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import { buildPasteRequest } from "../../stepsModel";
-import { loadPage, withControls, type Page } from "./b622-g09-steps-page";
+import { loadPage, withControls, withElif, type Fixture, type Page } from "./b622-g09-steps-page";
 
 // BACKLOG #5839, the Paste remainder: a paste on a selected if/elif/else/for header was requested
 // directly after the header line, which the engine's re-parse refuses. The page now resolves the
@@ -22,8 +22,8 @@ function key(page: Page, k: string): void {
   );
 }
 
-function pasteOn(lineStart: number): Record<string, unknown> | undefined {
-  const page = loadPage(withControls());
+function pasteOn(lineStart: number, fixture: Fixture = withControls()): Record<string, unknown> | undefined {
+  const page = loadPage(fixture);
   page.row(3).click();
   key(page, "c");
   page.row(lineStart).click();
@@ -54,6 +54,15 @@ suite("b622 #5839 — Paste on a control header lands as the block's first state
       assert.strictEqual(typeof paste.block, "string");
     });
   }
+
+  // The elif case, which the first red reading did not name.
+  test("webview: Ctrl+V on an elif header posts the elif body's first row, before", () => {
+    const paste = pasteOn(4, withElif());
+    assert.ok(paste, "a paste was posted");
+    assert.strictEqual(paste.lineStart, 5);
+    assert.strictEqual(paste.position, "before");
+    assert.strictEqual(typeof paste.block, "string");
+  });
 
   // stepsView.ts imports vscode, so the provider cannot be loaded node-side; pin its wiring by scan.
   test("provider: the paste handler accepts only 'before' and forwards it to buildPasteRequest", () => {

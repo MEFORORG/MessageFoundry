@@ -72,7 +72,11 @@ from messagefoundry.config.models import (
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
+from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
+    TrustAnchorPolicy,
+    refuse_chain_check_on_os_roots,
+)
 from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
@@ -1317,6 +1321,12 @@ class FhirDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if scheme == "http":
+                # The same refusal for an http url, worded so it does not say the hop verifies its
+                # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                refuse_chain_check_on_os_roots(
+                    anchor, cleartext=True, connection_kind="FHIR connection"
+                )
             if allow_expired:
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.base_url).hostname or "",
@@ -1969,8 +1979,9 @@ def _mint_bearer(token: Any, prefix: str) -> str:
     The mint runs before the GET's own ``try``. The provider raises ``DeliveryError`` for a failed
     mint: a refused or unreachable endpoint, an unparseable reply, or a refused reply body (an
     ``EgressReplyError``, or, for a 2xx reply in a content coding, the ``token-reply-coded``
-    ``NegativeAckError`` of BACKLOG #5910; both are subclasses). It raises ``ValueError`` when a configured value is
-    over the length limit. Neither is a lookup error, so a Handler that caught ``FhirLookupError``
+    ``NegativeAckError`` of BACKLOG #5910; both are subclasses). It can raise ``ValueError`` for a
+    request it cannot build or encode; an over-length configured value is refused when the provider
+    is built instead (BACKLOG #5800). Neither is a lookup error, so a Handler that caught ``FhirLookupError``
     missed it (BACKLOG #1980). The ``DeliveryError`` text names the redacted token URL and a status
     or reason, or, for a refused reply body, only the fixed hop label (BACKLOG #2060). It never
     carries the client assertion or the reply body, so it is echoed like
@@ -2146,6 +2157,12 @@ class FhirLookupExecutor:
                     trust_anchor_policy=trust_anchor_policy,
                     cell=f"FhirLookup {cname!r}",
                 )
+                if scheme == "http":
+                    # The same refusal for an http url, worded so it does not say the hop verifies its
+                    # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                    refuse_chain_check_on_os_roots(
+                        lookup_anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
+                    )
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows

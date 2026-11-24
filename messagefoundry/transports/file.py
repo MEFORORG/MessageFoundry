@@ -172,8 +172,9 @@ _TRANSIENT_ERRNOS = frozenset(
     )
     if hasattr(errno, name)
 )
-# Windows maps several of these errnos to EACCES or EINVAL, which alone would read as lasting, so the Windows
-# code is checked first: ERROR_NOT_READY 21, ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
+# Windows codes, checked before the errno: the errno CPython maps a Windows code to does not say
+# whether the failure clears by itself, so these are judged by the code. ERROR_NOT_READY 21,
+# ERROR_SHARING_VIOLATION 32, ERROR_LOCK_VIOLATION 33,
 # ERROR_BAD_NETPATH 53, ERROR_UNEXP_NET_ERR 59, ERROR_NETNAME_DELETED 64, ERROR_BAD_NET_NAME 67,
 # ERROR_DEV_NOT_EXIST 55, ERROR_SEM_TIMEOUT 121, ERROR_VC_DISCONNECTED 240,
 # ERROR_NO_NET_OR_BAD_PATH 1222, ERROR_NETWORK_UNREACHABLE 1231, ERROR_HOST_UNREACHABLE 1232,
@@ -1023,9 +1024,12 @@ class FileSource(SourceConnector):
         if self.sort not in ("name", "mtime"):
             raise ValueError(f"file source sort must be 'name' or 'mtime', got {self.sort!r}")
         self.recursive: bool = bool(s.get("recursive", False))
-        # Encoding used to re-encode split batch messages back to bytes for the handler. A single
-        # (non-batch) message is handed off verbatim, so its bytes never round-trip through this.
+        # Encoding _emit decodes a file with to split it, and re-encodes each split message with.
+        # A single (non-batch) message is handed off as parsing.split.one_message_bytes says,
+        # which re-encodes it with this where a byte order mark or an FHS/BHS header leads it.
         # The name rule is the one the runner decodes by (BACKLOG #2431).
+        # CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a single message went verbatim;
+        # the _emit docstring holds the retraction.
         self.encoding: str = declared_encoding(s.get("encoding"))
         self.max_file_bytes: int | None = positive_cap(
             s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
@@ -1957,21 +1961,26 @@ class FileSource(SourceConnector):
         below, byte-identical to before this gate existed.
 
         Corepoint-style **batch split** (Tier 2.2-A): a dropped file may hold several MSH-delimited
-        messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off — the same
-        per-message split a dry-run / ``messagefoundry check`` sees, via the shared
-        :func:`~messagefoundry.parsing.split.split_batch`.
+        messages (a batch, or an FHS/BHS envelope). Each becomes one pipeline hand-off, cut by
+        :func:`~messagefoundry.parsing.split.split_batch`. A dry run and ``messagefoundry check``
+        cut with the same function, but on a latin-1 view of the bytes rather than this decode, so
+        their split can differ from this one, for example on a UTF-16 batch, which they read as one
+        message; :func:`~messagefoundry.pipeline.dryrun.split_messages` says where. CORRECTED
+        2026-11-23 (BACKLOG #8357 item 5): this said each hand-off is "the same per-message split a
+        dry-run / ``messagefoundry check`` sees".
 
         Splitting must decode the bytes to find the MSH boundaries, so we decode with the
         connection's **declared encoding** (``errors="strict"``) — never UTF-8 by accident — so a
-        non-UTF-8 batch (e.g. latin-1) splits without mojibake. If the file isn't decodable in that
-        encoding, or it holds a single message, the **original bytes are handed off verbatim** (one
-        hand-off): a single-message file is then byte-for-byte identical to before the split existed,
-        unless a byte order mark or an ``FHS``/``BHS`` header the parser refuses leads it, when the
-        message goes as the split read it (ADR 0206), and an undecodable file flows to the pipeline
-        unchanged so its ``normalize(errors="strict")`` records the proper ``ERROR`` disposition
-        exactly as today (we don't pre-empt that here). A true batch is split and each message
+        non-UTF-8 batch (e.g. latin-1) splits without mojibake. A file that isn't decodable in that
+        encoding is handed off as its **original bytes**, unchanged, so the pipeline's
+        ``normalize(errors="strict")`` records the proper ``ERROR`` disposition (we don't pre-empt
+        that here). A file holding a single message is one hand-off, of the bytes
+        :func:`~messagefoundry.parsing.split.one_message_bytes` gives, which are not always its
+        original bytes. A true batch is split and each message
         **re-encoded with the same declared encoding**, so the handler still receives ``bytes``
-        exactly as in the un-split path.
+        exactly as in the un-split path. CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a
+        single-message file "is then byte-for-byte identical to before the split existed", which
+        the trailer-line cut of BACKLOG #5806 made untrue.
 
         Any exception (a durable-store failure on hand-off K) propagates to the caller, which then
         leaves the whole file in place for the next scan — preserving at-least-once with no partial
@@ -1996,10 +2005,8 @@ class FileSource(SourceConnector):
             text
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
         if len(messages) == 1:
-            # Fast path / strict back-compat: a lone message is handed off as its original bytes, so a
-            # non-batch file behaves as before the split was introduced, unless the parser would
-            # refuse what leads them (a byte order mark, an FHS/BHS header): then it goes as the
-            # split read it, as a batch member does (ADR 0206).
+            # A lone message goes as one_message_bytes says (ADR 0206, BACKLOG #5806). CORRECTED
+            # 2026-11-23 (BACKLOG #8357 item 5): the docstring above holds the retraction.
             await self._handler(one_message_bytes(raw, text, messages[0], self.encoding))
             return True
         for message in messages:

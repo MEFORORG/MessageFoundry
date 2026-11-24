@@ -74,6 +74,7 @@ from messagefoundry.config.tls_policy import (
     insecure_hop_disposition,
     is_loopback_hop_host,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
     resolve_trust_anchor,
     urllib_handler_context,
@@ -443,9 +444,10 @@ def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = Fa
     """Call a bearer provider's ``access_token`` for ``label``'s hop (BACKLOG #5795, #5797).
 
     The provider raises ``DeliveryError`` for a failed mint, but a token request it cannot build or
-    encode raises a plain ``ValueError``: at least an over-length token URL or proxy credential
-    (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That is the
-    connection's fault, the same for every queued row, so for a delivery it becomes a permanent
+    encode raises a plain ``ValueError``: at least a header value ``http.client`` refuses. (The
+    SMART and OAuth2 client-credentials providers refuse an over-length token URL or proxy
+    credential when they are built, BACKLOG #5800, so this arm is not their length control.) That
+    is the connection's fault, the same for every queued row, so for a delivery it becomes a permanent
     configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
     the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead: a
     REST or FHIR test-connection probe raises only that type.
@@ -513,6 +515,7 @@ def http_family_trust_anchor(
 def _no_redirect_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
+    connector: str = _HTTP_FAMILY_CELL,
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
@@ -529,12 +532,31 @@ def _no_redirect_opener(
     narrows nothing — the default — leaves the opener handler-for-handler what it was (apart from the
     strict reply class every opener gets, BACKLOG #2052), which is why a
     connection needs one of these openers only when it carries an extra handler OR an anchor that
-    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`."""
+    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`.
+    :func:`_verifying_opener` makes that choice for the hops that call it.
+
+    ``connector`` is the hop label an opener-build refusal names, such as a cipher-assertion or
+    handler-context refusal. A CA or CRL load refusal names the ``[tls]`` setting instead.
+    The AI broker's anchored opener passes its own (BACKLOG #5527 item 9); the shared opener is
+    built once, with the default."""
     return build_strict_opener(
         _NoRedirectHandler,
-        build_anchored_https_handler(anchor=trust_anchor, connector=_HTTP_FAMILY_CELL),
+        build_anchored_https_handler(anchor=trust_anchor, connector=connector),
         *extra_handlers,
     )
+
+
+def _verifying_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+    trust_anchor: TrustAnchor,
+) -> urllib.request.OpenerDirector:
+    """The verifying, no-redirect opener for a hop with ``extra_handlers`` and ``trust_anchor``:
+    rest.py's shared opener when there is no handler and the anchor narrows nothing, otherwise one
+    of the hop's own from :func:`_no_redirect_opener` (BACKLOG #5527 item 10). At least the
+    DICOMweb destination and the token hops call it."""
+    if extra_handlers or trust_anchor.narrows:
+        return _no_redirect_opener(*extra_handlers, trust_anchor=trust_anchor)
+    return _shared_no_redirect_opener()
 
 
 # Shared opener that verifies TLS and never follows redirects, reused by every connection that needs
@@ -2943,6 +2965,8 @@ class RestDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly and first, on every branch: bool("false") is True (vault BACKLOG #3234).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
@@ -3150,7 +3174,17 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
-            if bool(s.get("tls_allow_expired", False)):
+            if self._ech_sidecar is not None:
+                # Vault BACKLOG #5511: the opener built below is replaced by the sidecar's, so the
+                # whole-chain refusal is worded for an ECH hop before the generic one can fire.
+                refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
+            elif scheme == "http":
+                # The same refusal for an http url (admitted by the cleartext egress gate above),
+                # worded so it does not say the hop verifies its server: the opener makes no TLS
+                # connection to the partner. Its https handler can still serve a TLS leg to an
+                # https forward proxy, where one is set.
+                refuse_chain_check_on_os_roots(anchor, cleartext=True)
+            if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
                     *proxy_handlers,
@@ -3221,7 +3255,6 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            allow_expired = bool(s.get("tls_allow_expired", False))
             no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,

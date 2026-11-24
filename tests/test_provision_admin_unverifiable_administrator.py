@@ -98,7 +98,7 @@ async def _earlier_holder(store: MessageStore, service: AuthService) -> str:
         must_change_password=False,
         password_generated=False,
     )
-    staged_cell = await store.set_totp_secret(_HOLDER, secret="JBSWY3DPEHPK3PXP")
+    staged_cell = await store.set_totp_secret(_HOLDER, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     assert await store.enable_totp(
         _HOLDER, expected_secret_cell=staged_cell, recovery_code_hashes=["h1", "h2"]
     )
