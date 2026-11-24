@@ -32,7 +32,7 @@ from tee.anon import leak as tee_leak
 from tee.anon.surrogates import normalized_message as tee_normalized
 from tests._tee_seed import seed_capture
 
-_SALT = "b193-salt-0123456789abcdef"
+_SALT = "b193-salt-0123456789abcdef-0123456789"
 _HEADER = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
 _PID = "PID|1||1^^^H^MR||X^Y"
 _BASE = f"{_HEADER}\r{_PID}"
