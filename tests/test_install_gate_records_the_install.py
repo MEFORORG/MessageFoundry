@@ -337,8 +337,9 @@ def test_the_receipt_guard_runs_before_anything_on_the_box_changes() -> None:
     """A refusal says nothing was changed, so the guard must precede every install-path write."""
     text = INSTALLER.read_text(encoding="utf-8")
     install = text.index("# " + "-" * 89 + " install\n")
-    guard = text.index(_GUARD_START)
-    assert install < guard, "the receipt guard is not on the install path"
+    assert install < text.index(_GUARD_START), "the receipt guard is not on the install path"
+    # The refusal itself, not just the hash read the guard opens with, must precede every write.
+    guard = text.index('throw "Refusing to overwrite the installed gate at $($unexplained.Path)')
     for write in (
         "$bak = Write-GovernedRoots -Path $ReposFile",
         "Copy-Item -LiteralPath $GateDst -Destination $gateBak",
@@ -347,12 +348,11 @@ def test_the_receipt_guard_runs_before_anything_on_the_box_changes() -> None:
         assert guard < text.index(write, install), f"the receipt guard runs after {write!r}"
 
 
-def test_the_guard_judges_the_same_read_it_re_checks_before_the_copy(tmp_path: Path) -> None:
-    """The guard reads the installed gate ONCE: the hash it judges is the hash re-checked later.
+def test_the_guard_reads_the_installed_gate_once_and_judges_that_read(tmp_path: Path) -> None:
+    """The guard reads the installed gate ONCE, and judges the hash it is handed.
 
-    A second read for ``$guardSha`` would let a write between the two reads pass as explained, so
-    this counts the guard's reads of the installed gate, and checks the judged hash is the one
-    handed in rather than a fresh read of the file.
+    This counts the guard's reads of the installed gate, and checks the judged hash is the one
+    handed in rather than a fresh read of the file. It does not exercise the later re-check.
     """
     if shutil.which("pwsh") is None:
         pytest.skip("SKIP (nothing run): pwsh not on PATH")
@@ -394,6 +394,8 @@ def test_the_guard_judges_the_same_read_it_re_checks_before_the_copy(tmp_path: P
     )
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out
-    assert "reads=1" in out, f"the guard must read the installed gate exactly once:\n{out}"
+    assert "reads=1" in out.splitlines(), (
+        f"the guard must read the installed gate exactly once:\n{out}"
+    )
     assert f"judged={other}" in out, out
     assert "none=True" in out, out
