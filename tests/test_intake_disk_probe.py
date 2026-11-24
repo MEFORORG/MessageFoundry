@@ -357,14 +357,25 @@ async def test_a_finalizer_failure_leaves_no_unowned_thread(
     def refuse(*_: object) -> None:
         raise MemoryError("no finalizer")
 
+    # Control: unpatched, a check does start a live thread under the name the census below filters
+    # on, so a renamed thread cannot turn that census into a pass over nothing.
+    control = _disk_monitor(tmp_path, IntakeGate())
+    await control.check_once()
+    named = [t for t in probe.threads if t.name == "intake-disk-probe"]
+    assert named, "control: the probe ran on a thread named as the census expects"
+    await control.stop()
+    measured = probe.started
+
     before = set(threading.enumerate())
     monitor = _disk_monitor(tmp_path, IntakeGate())
     with monkeypatch.context() as patch:
         patch.setattr(intake_bound, "weakref", SimpleNamespace(finalize=refuse))
         await monitor.check_once()  # must not raise
-    started = [t for t in set(threading.enumerate()) - before if t.name == "intake-disk-probe"]
+    after = set(threading.enumerate())
+    assert after, "control: the thread census sees the running threads"
+    started = [t for t in after - before if t.name == "intake-disk-probe"]
     assert not started, "a probe thread started with nothing owning it"
-    assert probe.started == 0
+    assert probe.started == measured
 
 
 async def test_a_dead_worker_drops_its_finalizer(tmp_path: Path, probe: _Probe) -> None:
