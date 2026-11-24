@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from functools import cache, partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import (
@@ -5562,34 +5562,34 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     it handed over: :func:`acquire_pooled`'s done-callback, or the warm-up cleanup in
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
-    This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
-    loop's task type). On a task without it nothing can be checked, and one WARNING says the check
-    is off. Each caller then keeps what it did before BACKLOG #5686: with ``defer_unknown`` (the
-    warm-up) the cancel is put off one loop turn with ``call_soon(borrow.cancel)``, and without it
-    (:func:`acquire_pooled`) the borrow is cancelled at once. On such a task type each can lose a
-    hand-over, at least: the deferred cancel one resolved after the cancel is scheduled, or one the
-    driver takes more than a step to finish; the immediate cancel one whose borrow wake-up is
-    already scheduled. The WARNING covers the borrow's own task type only: a nested task without
-    ``_fut_waiter`` counts as in flight (:func:`_value_in_flight`) with no log line.
+    This reads ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the loop's
+    task type). Where the borrow, or a task it waits on, has no such attribute, the check reads
+    unknown and one WARNING says the check is off. Each caller then keeps what it did before
+    BACKLOG #5686, on the turn the check first reads unknown: with ``defer_unknown`` (the warm-up)
+    the cancel is put off one loop turn with ``call_soon(borrow.cancel)``, and without it
+    (:func:`acquire_pooled`) the borrow is cancelled at once. Each can then lose a hand-over, at
+    least: the deferred cancel one resolved after the cancel is scheduled, or one the driver takes
+    more than a step to finish; the immediate cancel one whose borrow wake-up is already scheduled.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
     if borrow.done():
         return
-    if not hasattr(borrow, "_fut_waiter"):
+    state = _value_in_flight(borrow)
+    if state == "unknown":
         global _warned_no_waiter
         if not _warned_no_waiter:
             _warned_no_waiter = True
             log.warning(
-                "this event loop's tasks have no _fut_waiter; abandoned pool borrows are cancelled "
-                "without checking for a hand-over in flight"
+                "a pool borrow waits on a task with no _fut_waiter; abandoned pool borrows on such a "
+                "task are cancelled without checking for a hand-over in flight"
             )
         if defer_unknown:
             asyncio.get_running_loop().call_soon(borrow.cancel)
         else:
             borrow.cancel()
         return
-    if deferrals < _BORROW_CANCEL_MAX_DEFERRALS and _value_in_flight(borrow):
+    if state == "in_flight" and deferrals < _BORROW_CANCEL_MAX_DEFERRALS:
         asyncio.get_running_loop().call_soon(
             partial(_cancel_borrow, borrow, deferrals + 1, defer_unknown=defer_unknown)
         )
@@ -5597,28 +5597,39 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     borrow.cancel()
 
 
-def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
-    """Whether cancelling ``fut`` now could throw the cancel in place of a value already on its way.
+_Flight = Literal["in_flight", "parked", "unknown"]
 
-    It checks these: a future already done with a result, a task that yielded with no future or
-    whose awaited future is in flight, and a gather future whose children are all done (it refuses
-    the cancel) or has a pending child in flight. A task whose awaited future failed or was
-    cancelled is not in flight, since no value is on its way. Outside the check, at least: a gather
-    with a child done with a value beside a pending child (its cancel discards that value), a shield
-    or another combinator, and a future that ignores its cancel; each counts as not in flight. The
-    gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour.
-    A nested task without ``_fut_waiter`` counts as runnable, so in flight."""
+
+def _value_in_flight(fut: asyncio.Future[Any]) -> _Flight:
+    """Whether cancelling ``fut`` now could throw the cancel in place of a value already on its way:
+    ``in_flight``, ``parked`` (it could not), or ``unknown`` (a task on the way has no
+    ``_fut_waiter`` to read).
+
+    It reads these as in flight: a future already done with a result, a task that yielded with no
+    future or whose awaited future is in flight, and a gather future whose children are all done
+    (it refuses the cancel) or has a pending child in flight. A task whose awaited future failed or
+    was cancelled is parked, since no value is on its way. A gather with no pending child in flight
+    and a pending child that reads unknown reads unknown. Outside the check, at least: a gather with
+    a child done with a value beside a pending child (its cancel discards that value), a shield or
+    another combinator, and a future that ignores its cancel; each reads parked. The gather check
+    reads ``_children``, a CPython detail the gather tests pin only through behaviour."""
     if fut.done():
-        return not fut.cancelled() and fut.exception() is None
+        return "parked" if fut.cancelled() or fut.exception() is not None else "in_flight"
     if isinstance(fut, asyncio.Task):
-        waiter: asyncio.Future[Any] | None = getattr(fut, "_fut_waiter", None)
-        return waiter is None or _value_in_flight(waiter)
+        waiter: Any = getattr(fut, "_fut_waiter", _NO_WAITER_ATTR)
+        if waiter is _NO_WAITER_ATTR:
+            return "unknown"
+        return "in_flight" if waiter is None else _value_in_flight(waiter)
     children: list[asyncio.Future[Any]] | None = getattr(fut, "_children", None)
-    if children is not None:
-        pending = [child for child in children if not child.done()]
-        return not pending or any(_value_in_flight(child) for child in pending)
-    return False
+    if children is None:
+        return "parked"
+    pending = [_value_in_flight(child) for child in children if not child.done()]
+    if not pending or "in_flight" in pending:
+        return "in_flight"
+    return "unknown" if "unknown" in pending else "parked"
 
+
+_NO_WAITER_ATTR: Final = object()
 
 #: Loop turns :func:`_cancel_borrow` waits for a borrow with a value in flight before it cancels
 #: anyway. A hand-over takes a few turns; the bound is for a borrow that never parks.

@@ -26,7 +26,8 @@ class _HandOffPool:
     """``acquire()`` parks on a hand-off future. ``shape`` picks how the driver's acquire reaches it:
     ``plain`` returns the future itself; ``deaf`` swallows a cancel and keeps waiting, so a borrow
     stays stuck until the test hands a connection over; ``yield`` takes one bare step after the
-    hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a gather."""
+    hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a gather;
+    ``nested`` awaits it through an inner task of a type without ``_fut_waiter``."""
 
     def __init__(self, *, shape: str = "plain") -> None:
         self.shape = shape
@@ -60,7 +61,11 @@ class _HandOffPool:
             (conn,) = await asyncio.gather(asyncio.ensure_future(_inner()))
             return conn
 
-        return {"deaf": _deaf, "yield": _yield, "gather": _gather}[self.shape]()
+        async def _nested() -> str:
+            return await _NoWaiterTask(_inner())
+
+        shapes = {"deaf": _deaf, "yield": _yield, "gather": _gather, "nested": _nested}
+        return shapes[self.shape]()
 
     def hand_over(self, index: int = 0) -> None:
         fut = self.handoffs[index]
@@ -415,10 +420,10 @@ async def test_warm_hands_the_borrow_to_the_cleanup_before_the_cancel_runs(
 
 
 #: Whether a connection is stranded on a task type without _fut_waiter, per path and per order of
-#: the hand-over against the cancel in one turn. It is what each path did before BACKLOG #5686 (the
-#: warm-up put its cancel off one turn; acquire_pooled cancelled at once), measured on that code:
-#: each order loses a connection here only where it lost one there.
-_NO_WAITER_PARITY = {
+#: the hand-over against the cancel in one turn, measured on the code before BACKLOG #5686 (the
+#: warm-up put its cancel off one turn; acquire_pooled cancelled at once). An order may strand a
+#: connection here only where it stranded one there.
+_NO_WAITER_STRANDS_BEFORE_5686 = {
     ("warm-up", "hand-over-first"): False,
     ("warm-up", "hand-over-queued-behind"): True,
     ("acquire_pooled", "hand-over-first"): True,
@@ -426,13 +431,13 @@ _NO_WAITER_PARITY = {
 }
 
 
-@pytest.mark.parametrize(("path", "order"), sorted(_NO_WAITER_PARITY))
-async def test_no_waiter_task_type_matches_the_pre_5686_outcome(
+@pytest.mark.parametrize(("path", "order"), sorted(_NO_WAITER_STRANDS_BEFORE_5686))
+async def test_no_waiter_task_type_strands_no_more_than_before_5686(
     path: str, order: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Nothing can be checked without _fut_waiter, so each path keeps its pre-#5686 cancel and its
-    # outcome: no order strands a connection that the old code returned, and none is newly saved
-    # by a change of rule either.
+    # Nothing can be checked without _fut_waiter, so each path keeps its pre-#5686 cancel: no order
+    # strands a connection that the old code returned. The strand is read before unstick(), which
+    # hands over any hand-off still pending and would otherwise count as one.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
@@ -456,13 +461,57 @@ async def test_no_waiter_task_type_matches_the_pre_5686_outcome(
         with pytest.raises(asyncio.CancelledError):
             await task
         await _turns()
+        stranded = list(pool.checked_out)
+        released = list(pool.released)
+        issued = list(pool.issued)
     finally:
         loop.set_task_factory(previous)
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await pool.unstick()
-    stranded = bool(pool.checked_out)
-    assert stranded == _NO_WAITER_PARITY[(path, order)], (
-        f"{path}, {order}: stranded={pool.checked_out}, released={pool.released}"
-    )
+    if not _NO_WAITER_STRANDS_BEFORE_5686[(path, order)]:
+        assert stranded == [], f"{path}, {order}: stranded={stranded}, released={released}"
+    if not stranded and issued:
+        assert released == ["conn-1"], f"{path}, {order}: released={released}"
+
+
+@pytest.mark.parametrize("late_turn", [13, 14, 15])
+@pytest.mark.parametrize("path", ["warm-up", "acquire_pooled"])
+async def test_borrow_on_a_nested_task_without_the_waiter_is_cancelled_by_the_callers_rule(
+    path: str, late_turn: int, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The borrow is an ordinary task, but it waits on an inner task without _fut_waiter, so the
+    # check reads unknown. The caller's pre-#5686 rule decides at once (the warm-up one turn later,
+    # acquire_pooled at once), as for a borrow without the attribute: the borrow is not held back
+    # for the whole deferral bound, where a cancel at the bound lands on the hand-over's wake-up and
+    # strands the connection. The hand-over comes late in that bound, after the borrow is cancelled,
+    # so the pool hands nothing over, as before BACKLOG #5686.
+    monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
+    pool = _HandOffPool(shape="nested")
+    task: asyncio.Task[object] | None = None
+    try:
+        if path == "warm-up":
+            task = asyncio.create_task(
+                warm_pool_connections(pool, target=1, timeout=30.0, backend="stub")
+            )
+        else:
+            task = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+        await _turns()
+        assert len(pool.handoffs) == 1
+        task.cancel()
+        await _turns(late_turn)
+        pool.hand_over()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _turns()
+        stranded = list(pool.checked_out)
+        issued = list(pool.issued)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await pool.unstick()
+    assert stranded == [], f"turn {late_turn}: the late hand-over was stranded"
+    assert issued == [], f"turn {late_turn}: the borrow was held back past the caller's rule"
+    assert "_fut_waiter" in caplog.text
