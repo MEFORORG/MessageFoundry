@@ -2943,6 +2943,8 @@ class RestDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly and first, on every branch: bool("false") is True (vault BACKLOG #3234).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
@@ -3150,7 +3152,7 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
-            if bool(s.get("tls_allow_expired", False)):
+            if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
                     *proxy_handlers,
@@ -3221,7 +3223,6 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            allow_expired = bool(s.get("tls_allow_expired", False))
             no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,

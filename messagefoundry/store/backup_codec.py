@@ -33,10 +33,23 @@ module imports ``cryptography`` / ``hashlib``, it is registered in
 The per-chunk **AAD binds**: ``header_sha256 ‖ frame_counter(uint64) ‖ final_flag(uint8)``, where
 the header digest is over the canonical header bytes the writer emits. The reader refuses a header
 not in that exact form, so a header changed in any byte is refused or fails closed. A reordered,
-dropped, truncated, or appended chunk changes the AAD and **fails the GCM tag** (fail-closed). ``final_flag = 1`` on the last frame and the
+dropped or truncated chunk changes the AAD and **fails the GCM tag** (fail-closed), and a chunk
+appended after the final frame is refused as trailing bytes. ``final_flag = 1`` on the last frame and the
 decoder requires it, so a truncation that drops the tail frame is detected as a missing terminator, not
 silently accepted. The frame counter is **monotonic from 0**, re-derived on decode, so a frame replayed
 out of order authenticates against the wrong counter and fails the tag.
+
+**The AAD binds a frame to its position and to the header bytes, not to one archive.** The header
+carries no per-archive value, so archives whose headers are byte-identical share every frame's AAD.
+At least these share a header: archives of one format version, DEK, store salt and chunk size. The
+backup runner writes one format version and the default chunk size, so that is every archive this
+build writes for one store under one DEK and store salt. An unsalted header (version 1, or version 2
+with ``salt`` null) names no salt, so unsalted archives of one version, DEK and chunk size share it
+across stores too. A frame from
+one such archive authenticates at its own index in another, a final frame included, which ends the
+stream there. So a splice of two of them can mix their plaintexts, cut one short or extend it, and
+it still decrypts without error: the truncation and append guarantees above hold within one archive
+only. A frame placed at another index still fails its tag.
 
 **Every attacker-declared length is bounded BEFORE the read it drives.** ``hdrlen`` and each frame's
 ``ctlen`` are uint32 fields in a plaintext, as-yet-unauthenticated prefix, so a reader that hands them
@@ -123,7 +136,9 @@ class BackupCodecError(Exception):
     """The ``.mfbak`` archive could not be processed: a bad magic/version/header, a malformed frame, or
     — the security-relevant case — a **failed AEAD tag** (corrupt/tampered/truncated archive, or the
     wrong key). Fail-closed: call sites surface this as a ``FAIL`` restore-verify result + a
-    ``backup_failed`` alert, never a silent pass-through (mirrors ``store/crypto.py``'s ``CipherError``)."""
+    ``backup_failed`` alert, never a silent pass-through (mirrors ``store/crypto.py``'s ``CipherError``).
+    A frame from an archive that shares the header, placed at its own index, raises nothing; see
+    the module docstring."""
 
 
 class BackupKeyMismatch(BackupCodecError):
@@ -191,7 +206,7 @@ def _aad(header_digest: bytes, frame_index: int, *, final: bool) -> bytes:
     """The per-frame AAD: ``header_sha256 ‖ frame_index(uint64) ‖ final_flag(uint8)``. Binds the header
     bytes (a changed header is refused before decrypt or fails the tag; see :func:`decrypt_stream`),
     the frame order (so a reorder/drop fails), and the terminator (so a tail-truncation fails as a
-    missing final frame)."""
+    missing final frame). It holds no per-archive value; see the module docstring."""
     return header_digest + _U64.pack(frame_index) + (b"\x01" if final else b"\x00")
 
 
@@ -518,8 +533,10 @@ def decrypt_stream(
 ) -> ArchiveHeader:
     """Decrypt the ``.mfbak`` stream ``src`` into the plaintext (tar) stream ``dst`` under ``key``,
     returning the parsed header. Re-derives the monotonic frame counter and requires the AAD-bound
-    ``final`` terminator, so a reordered/dropped/truncated/appended chunk **fails the GCM tag**
-    (``BackupCodecError``). A changed header is refused or fails closed, at least: by
+    ``final`` terminator, so a reordered/dropped/truncated chunk **fails the GCM tag**
+    (``BackupCodecError``), and bytes after the final frame are refused. A frame from another
+    archive that shares the header, placed at its own index, is not refused; see the module
+    docstring. A changed header is refused or fails closed, at least: by
     :func:`read_header` before any decrypt when it is re-spelled, its ``alg`` is not AES-256-GCM,
     its ``format_version`` differs from the version byte, or its ``chunk_size`` is out of range;
     as a key mismatch when its ``key_id`` changed; by the frame-length bound when a lowered

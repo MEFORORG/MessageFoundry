@@ -826,15 +826,23 @@ _UNSCANNABLE_RE_PATTERNS = {
     #
     # The text read is the engine's own checked-in DDL: ``declared_schema`` is called from
     # ``postgres.py`` and ``sqlserver.py`` over their ``_SCHEMA`` (and Postgres's migration index
-    # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier and no
-    # quantified group. Each pattern is an alternation of literals, ``@`` and the name, joined by
-    # single ``\s*`` or ``\s+`` runs, plus the optional ``(?:UTE)?`` and an operator class
-    # ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed by
-    # a token that can match whitespace, so there is one way to split any prefix.
+    # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier; the one
+    # quantified group, ``(?:UTE)?``, holds only literals. Each pattern is an alternation of
+    # literals, ``@`` and the name, joined by single ``\s*`` or ``\s+`` runs, plus that optional
+    # ``(?:UTE)?`` and an operator class ``[-+*/|&^%]``, optional in one branch and required in the
+    # other. No ``\s`` run is followed by a token that can match whitespace, so there is one way to
+    # split any prefix.
     "messagefoundry/store/server_schema_verify.py": (
         "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
         "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
     ),
+    # BACKLOG #6637 -- the ignores for pydicom's UserWarning copies of a refused value. ``message``
+    # iterates ``reversed(_PYDICOM_VALUE_WARNINGS)``, which is derived from the ``warning`` field of
+    # each ``_REFUSALS`` shape that sets one, and this scanner reads neither. None has a nested
+    # quantifier. One, ``Value "(?s:.*)" ...``, has the many-starts shape; ``warnings`` applies it
+    # with ``.match``, from the start of the text, so it has one start. That was read in
+    # ``_py_warnings`` and measured through the C ``_warnings.warn`` on CPython 3.14.7.
+    "messagefoundry/transports/dicom.py": ("message",),
     # a wrapper's parameter. NOTE: register_ui_action's own re.compile(pattern) stays here BY
     # CONSTRUCTION — its argument is the function's parameter — but every one of its 25 call sites is
     # now resolved through _PATTERN_WRAPPERS, so no console route pattern is unscanned. consistency.py
@@ -1521,6 +1529,13 @@ _XML_PARSER_ALLOWLIST = {
     "messagefoundry/parsing/xml/_deps.py": (
         "the single lazy loader for the [xml] extra (lxml, xmlschema, signxml) — every consumer in "
         "parsing/xml/ goes through it, and lxml parsing is hardened once in harden.py"
+    ),
+    "messagefoundry/parsing/x12/_deps.py": (
+        "the vendored defusedxml copy's ElementTree.parse with forbid_dtd/forbid_entities/"
+        "forbid_external, isolated in _parse_map_xml() so tests/test_xml_parser_consistency.py "
+        "drives THAT surface directly (the reader around it turns a refusal into an empty set). Its "
+        "input is the map XML inside the installed pyx12 package, never interchange data; the "
+        "ParseError import beside it is the exception type"
     ),
     "messagefoundry/transports/soap.py": (
         "xml.sax well-formedness gate with external general/parameter entities off; it has no "

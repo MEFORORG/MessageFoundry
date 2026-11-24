@@ -4579,7 +4579,8 @@ class AuthService:
         #: `_advance_hold_standing` moves it.
         self._reconcile_hold_standing: _HoldStanding = "fresh"
         #: user_ids of bound id-less rows the reconciler has already reported as skipped (BACKLOG
-        #: #2027), so each is logged and audited once per process rather than once per pass.
+        #: #2027), so a marked row is not reported on every pass. When a mark is set and dropped is
+        #: stated in `_report_unkeyed_bindings`.
         self._reconcile_unkeyed_reported: set[str] = set()
         #: user_ids whose skip report the store refused, in the order of their latest refusal, oldest
         #: first: a dict used as an ordered set (BACKLOG #2137). Refused accounts go last, the
@@ -5161,8 +5162,15 @@ class AuthService:
         totp_secret: str | None = None,
         totp_code: str | None = None,
         totp_code_read_at: float | None = None,
+        on_first_write: Callable[[], None] | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        ``on_first_write`` is called once, at the first account write that may have landed: right
+        after a fresh row's INSERT returns, or on a repair right before the clear of the earlier
+        holder's factors (BACKLOG #5067). A caller uses it to tell a refusal raised before any
+        account write from one that may follow one. A read before it can still write an audit row
+        of its own, such as a seal failure's.
 
         **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
         secret the command generated and showed at the terminal, and ``totp_code`` the code the
@@ -5314,6 +5322,8 @@ class AuthService:
             # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
             # written for the new holder, and before the role that would make a kept session an
             # Administrator session.
+            if on_first_write is not None:
+                on_first_write()
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             # The command's longer budget here too (vault BACKLOG #3023 residual (4)): no request
@@ -5365,6 +5375,10 @@ class AuthService:
                     "provision-admin run is in progress, let it finish. Then run the command again: "
                     "it reads that account and either completes it or says why it cannot"
                 ) from exc
+            # After the INSERT, not before it: a refused INSERT wrote no row, so a refusal from it
+            # is still one raised before any account write (BACKLOG #5067).
+            if on_first_write is not None:
+                on_first_write()
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
         # secret is written, so a code this row already spent (an interrupted earlier run in the
@@ -9942,8 +9956,9 @@ class AuthService:
             is_unkeyed = _holds_unkeyed_federated_binding(user)
             if is_unkeyed:
                 # Recorded BEFORE the session filter, so an account whose sessions lapse between
-                # passes keeps its "already reported" mark and is not reported again on its next
-                # sign-in.
+                # passes keeps its "already reported" mark and is not reported again if a session
+                # of its is listed again later. Such a row cannot sign in, but a session can come
+                # back into the listing, for example after a backward clock step (BACKLOG #2283).
                 still_unkeyed.add(user.id)
             # Deliberately WITHOUT the idle timeout (BACKLOG #2283). An idle row can come back: a
             # backward clock step or a raised idle setting makes the validator accept it again. So
@@ -10231,7 +10246,8 @@ class AuthService:
         # logged rather than raised (BACKLOG #2137), so the pass still returns its plan and the
         # lifespan task still raises an alert for each revocation above and for the hold.
         await self._record_reconcile_hold(plan)
-        # BACKLOG #2027. Reported LAST, on every exit, so an audit write that keeps failing costs
+        # BACKLOG #2027. Reported LAST, on every exit that returns after the users are loaded (an
+        # exception raised above skips it for that pass), so an audit write that keeps failing costs
         # only this report and never stops the probes and revocations above from running. A
         # failed write is logged, not raised (BACKLOG #2137), for the same reason as the hold's.
         await self._report_unkeyed_bindings(unkeyed, still_unkeyed=still_unkeyed)
@@ -11147,9 +11163,15 @@ class AuthService:
     async def _report_unkeyed_bindings(
         self, unkeyed: Sequence[UserRecord], *, still_unkeyed: set[str]
     ) -> None:
-        """Log and audit, once per account per process, each bound id-less row a pass skipped
-        (BACKLOG #2027). ``still_unkeyed`` is every such row, signed in or not; a mark is dropped
-        only when its row stops being one (unbound, disabled or removed).
+        """Log and audit each bound id-less row a pass skipped (BACKLOG #2027).
+
+        A row is marked once its audit row is written, and is not reported again while it stays
+        marked. ``still_unkeyed`` is every enabled bound id-less row the pass loaded, signed in or
+        not. A row missing from it loses its mark, so it can be reported again in this process; at
+        least an unbound, locally disabled or removed row goes missing, and so does one the load
+        leaves out. The loop stops at the first refused write, so the refused row and any behind it
+        stay unmarked. A later pass logs them and tries the audit again only if it finds them
+        signed in and reaches them.
 
         **Its own audit action, ``auth.ad_reconcile_binding_unkeyed``, not the outage row.**
         ``auth.ad_reconcile_skipped`` means the directory was unreachable and the accounts are fine.
@@ -11200,7 +11222,7 @@ class AuthService:
                     }
                 ),
             )
-            # Marked only once the audit row is written, so a failed write is retried next pass.
+            # Marked only once the audit row is written, so a later pass can retry a failed write.
             if not written:
                 # Stop at the first refusal: one ERROR and one WARNING per pass, and no second
                 # acquire timeout behind a store that is refusing every write.

@@ -626,3 +626,96 @@ def test_a_real_start_with_disable_remote_debug_gets_past_this_gate(tmp_path: Pa
     assert _REFUSAL not in proc.stderr
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert "no MEFOR_STORE_ENCRYPTION_KEY" in proc.stderr, proc.stderr[-2000:]
+
+
+def test_serve_lists_a_reading_taken_after_its_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3795 item 15, kept as designed: ``serve`` reads the posture again for its
+    loosening list, because the refused-script count is a snapshot, and a refusal after the gate
+    must still be counted there. The gates in between are stood down and the start is stopped
+    at the list's build.
+
+    Mutation: pass the gate's reading to the list; the list then shows the older count."""
+    readings: list[RemoteDebugPosture] = []
+    listed: list[object] = []
+
+    def reading() -> RemoteDebugPosture:
+        posture = RemoteDebugPosture(
+            interpreter_enabled=False, guard_installed=True, refused_scripts=len(readings)
+        )
+        readings.append(posture)
+        return posture
+
+    def stop_at_the_list(*_args: object, **kwargs: object) -> NoReturn:
+        listed.append(kwargs["remote_debug"])
+        raise _PastTheReLog
+
+    monkeypatch.chdir(tmp_path)
+    _environment(monkeypatch, warn=False, accept=False)
+    _stand_down_the_gates_before_logging(monkeypatch)
+    monkeypatch.setattr(cli, "_store_key_configured", lambda settings: True)
+    monkeypatch.setattr(cli, "_start_logging", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "remote_debug_posture", reading)
+    monkeypatch.setattr("messagefoundry.config.settings.security_loosenings", stop_at_the_list)
+    with caplog.at_level(logging.WARNING, logger=cli.__name__):
+        # main's last-resort handler turns the stop into a non-zero exit.
+        assert cli.main(["serve", "--config", str(_SAMPLES_CONFIG), "--env", "dev"]) != 0
+    assert listed, "the start stopped before the loosening list, so this arm proves nothing"
+    assert len(readings) == 2 and listed == readings[1:], (readings, listed)
+
+
+#: ``supervise`` in a real interpreter, with the start-up code gate pinned clean as
+#: :data:`_PINNED_SERVE` pins it, and the remote-debugging reading pinned on with the hook not
+#: answering, so the remote-debugging gate refuses and logs ``remote_debug_unguarded``.
+_PINNED_UNGUARDED_SUPERVISE = """\
+import sys
+import messagefoundry.startupcode as startupcode
+from messagefoundry.startupcode import InterpreterLaunch, StartupPosture
+hardened = StartupPosture(launch=InterpreterLaunch(
+    isolated=True, safe_path=True, ignore_environment=True, no_user_site=True))
+startupcode.startup_posture = lambda: hardened
+from messagefoundry import __main__ as cli
+from messagefoundry.remotedebug import RemoteDebugPosture
+unguarded = RemoteDebugPosture(interpreter_enabled=True, guard_installed=False)
+cli.remote_debug_posture = lambda: unguarded
+sys.exit(cli.main(sys.argv[1:]))
+"""
+
+_UNGUARDED_LINE = "[security] remote_debug_unguarded: "
+
+
+def _real_unguarded_supervise(tmp_path: Path, *, merged: bool) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", _PINNED_UNGUARDED_SUPERVISE, "supervise"]
+        + ["--config", str(_SAMPLES_CONFIG), "--env", "dev"],
+        cwd=tmp_path,
+        env=_child_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merged else subprocess.PIPE,
+        text=True,
+        timeout=45,
+        check=False,
+    )
+
+
+@_needs_install
+def test_supervise_logs_the_unguarded_line_to_stdout_and_refuses_on_stderr(
+    tmp_path: Path,
+) -> None:
+    """Vault BACKLOG #3795 item 12: the stream each goes to, as SECURITY-LOOSENING.md states it."""
+    _child_interface_on(tmp_path)  # for its skip: the child must import this checkout
+    proc = _real_unguarded_supervise(tmp_path, merged=False)
+    assert proc.returncode == 2, proc.stderr[-2000:]
+    assert _UNGUARDED_LINE in proc.stdout and _UNGUARDED_LINE not in proc.stderr, proc.stdout
+    assert _REFUSAL in proc.stderr and _REFUSAL not in proc.stdout, proc.stderr[-2000:]
+
+
+@_needs_install
+def test_supervise_logs_the_unguarded_line_before_it_refuses(tmp_path: Path) -> None:
+    """Vault BACKLOG #3795 item 12: the order, read with both streams on one pipe."""
+    _child_interface_on(tmp_path)  # for its skip: the child must import this checkout
+    proc = _real_unguarded_supervise(tmp_path, merged=True)
+    assert proc.returncode == 2, proc.stdout[-2000:]
+    assert _UNGUARDED_LINE in proc.stdout and _REFUSAL in proc.stdout, proc.stdout[-2000:]
+    assert proc.stdout.index(_UNGUARDED_LINE) < proc.stdout.index(_REFUSAL), proc.stdout

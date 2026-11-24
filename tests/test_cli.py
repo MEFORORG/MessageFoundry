@@ -3907,7 +3907,8 @@ def test_admin_unlock_exits_2_when_the_open_refuses_for_a_missing_key(
     monkeypatch.setattr(store_base, "open_store", keyless)
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 2
     error = json.loads(capsys.readouterr().out)["error"]
-    assert "holds no key" in error and "Nothing was written" in error
+    # What the open may have changed before it (BACKLOG #5067).
+    assert "holds no key" in error and "this command makes did not land" in error
 
 
 def test_admin_unlock_reports_a_defect_rather_than_a_refusal(
@@ -4920,3 +4921,28 @@ def test_a_host_that_already_configured_logging_is_left_alone(
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+
+
+def test_admin_unlock_account_read_refusal_says_what_the_open_may_have_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5067: the account read follows a full open, which may have written, so a refused
+    read does not say nothing was written.
+
+    Mutation: print "nothing was written" again in admin-unlock's read-refused arm."""
+    from messagefoundry.store.crypto import CipherError
+    from messagefoundry.store.store import MessageStore
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "unlock-read.db"
+    _seed_locked(db, locked_until=None)
+
+    async def refusing(*_a: object, **_k: object) -> object:
+        raise CipherError("synthetic account read refusal")
+
+    monkeypatch.setattr(MessageStore, "get_user_by_username", refusing)
+    assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "the store refused to read the account" in error, error
+    assert "did not land" in error and "nothing was written" not in error.lower(), error
