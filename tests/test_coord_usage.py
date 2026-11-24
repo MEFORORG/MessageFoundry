@@ -510,6 +510,12 @@ def test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule(tmp_path: Path)
     _session_fire(state, {"used_percentage": 97.0, "resets_at": reset}, "hi", 1000)
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(97.0)
 
+    # CONTROL. The number to beat is this root's own last one, not the foreign one: an idle 98 lands
+    # under a foreign 99, as on main, so the gate can still halt on it.
+    _session_fire(state, {**foreign, "used_percentage": 99.0}, "F", 3000, pin=tmp_path / "other")
+    _session_fire(state, {"used_percentage": 98.0, "resets_at": reset}, "hi2", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(98.0)
+
 
 def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
     """BACKLOG #5178: as for a confirmation, the live-session exception needs this root's stamp, or a
@@ -681,21 +687,26 @@ def test_the_status_line_shows_no_number_for_a_gone_window(tmp_path: Path) -> No
 def test_a_window_carried_from_another_root_holds_only_the_live_session_rule(
     tmp_path: Path,
 ) -> None:
-    """A window stamped with another root is no per-reset floor: a live session of this root replaces
-    it on the same reset, lower or not. It does hold the live-session rule (BACKLOG #5178), so an idle
-    session's lower reading cannot replace it; before this fix, as on main, it did."""
+    """A window stamped with another root is no per-reset floor, and its own number is another pool's,
+    so the live-session rule holds a reading of this root's only to this root's own last number, which
+    the window carries (BACKLOG #5178). A window that carries none, as from a hand copy, holds no
+    number, as on main: an idle lower reading replaces it."""
     seven = window(88.0, 280000)
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
     doc = latest(tmp_path)
     doc["seven_day"]["config_root_env"] = str(tmp_path / "another-account")
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
+    doc["seven_day"]["own_used_percentage"] = 40.0
+    carried = json.dumps(doc)
 
-    mine = {**seven, "used_percentage": 12.0}
-    _session_fire(tmp_path, mine, "B", 1000)
+    _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "B", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
+
+    # With this root's own 40 carried, an idle 12 is refused, and a live one replaces.
+    (tmp_path / "latest.json").write_text(carried, encoding="utf-8")
+    _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "C", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(88.0)
-
-    # CONTROL. The same reading from a session that has just called the API replaces it.
-    _session_fire(tmp_path, mine, "B", 2000)
+    _session_fire(tmp_path, {**seven, "used_percentage": 12.0}, "C", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
 

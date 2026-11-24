@@ -336,20 +336,21 @@ try {
     # An idle session keeps reporting its cached number on a timer and every session publishes here, so
     # without the rule a stale 60 replaces a live 99 and reads as freshly observed.
     #
-    # A refused reading leaves the published window whole, its own age included, so the staleness guard
-    # keeps counting from the last real observation. $confirmed is the one exception: a live session's
-    # equal reading for the same running reset refreshes the age and nothing else.
+    # A refused reading leaves the published window whole, so the staleness guard keeps counting from
+    # the last real observation. $confirmed is the one exception: a live session's refused equal reading
+    # for the same running reset refreshes the age and nothing else.
     #
-    # $guard is the live-session rule, checked on every path, a window stamped with another root or
-    # either side with no readable reset included: a reading at or below the published number it read
-    # is taken only from a live session. The per-reset tests below add to it, for this root's own window
-    # only, by the reader's own test. The unlocked write below is the exception it cannot cover.
+    # $guard is the live-session rule. $ownPct is the number it holds a reading to: the published one,
+    # or over a window stamped with another root, this root's own last number, which own_used_percentage
+    # carries across that stamp. With none carried there is no number, so the rule is as on main there.
+    # The per-reset tests ($perReset) hold for this root's own window only, by the reader's own test.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
     $keepPublished = -not $seven
     $calledApi = Test-SessionCalledApi $StateDir $p
     $confirmed = $false
+    $ownPct = $null
     $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
     $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
     $stampOwn = Test-OwnStamp $stampEnv $ownRoot
@@ -360,7 +361,8 @@ try {
         $publishedOwn = Test-OwnStamp $publishedRoot $ownRoot
         # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
         $publishedPct = Get-Percentage $published.used_percentage
-        $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
+        $ownPct = if ($publishedOwn) { $publishedPct } else { Get-Percentage $published.own_used_percentage }
+        $notHigher = $null -ne $ownPct -and $seven.used_percentage -le $ownPct
         $live = $calledApi -and $stampOwn
         $guard = $notHigher -and -not $live
         $perReset = if (-not $publishedOwn) { $false }
@@ -387,6 +389,9 @@ try {
         $freshSeven = $seven.used_percentage
         $seven.captured_at = $now
         $seven.config_root_env = $stampEnv
+        # A reading of another root's carries this root's own last number with it, so the rule above
+        # still has it to hold the next reading of this root's to.
+        if (-not $stampOwn -and $null -ne $ownPct) { $seven.own_used_percentage = $ownPct }
     }
 
     # Nothing observed and nothing remembered: publish NOTHING rather than a document full of nulls.
