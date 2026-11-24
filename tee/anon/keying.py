@@ -49,11 +49,11 @@ MIN_SALT_LEN = 32
 MIN_SALT_ENTROPY_BITS = 32.0
 
 #: Floor on the salt's estimated entropy PER CHARACTER, in bits. The total-bits floor above is
-#: length-scaled, so **length alone would rescue a degenerate pattern**: ``"ab"`` repeated eight
-#: times scores 16.00 bits and is refused, while the SAME two-symbol pattern repeated sixteen times
-#: scores 32.00 and would pass. That is not a blind spot the estimator's docstring can wave at -- it
-#: is the length floor defeating the entropy floor -- so the rate is checked separately from the
-#: total and a string has to clear BOTH.
+#: length-scaled, so **length alone would rescue a degenerate pattern** from it: ``"ab"``
+#: repeated sixteen times is 32 characters, scores 32.00 bits and clears the total, on 1.00 bits per
+#: character. That is not a blind spot the estimator's docstring can wave at -- it is length
+#: defeating the entropy total -- so the rate is checked separately from the total, a string has to
+#: clear BOTH, and this rate floor is the one that refuses that pattern.
 #:
 #: 2.0 bits per character means an effective alphabet of four symbols. Measured against the shapes
 #: that matter: ``"ab"`` repeated scores 1.00 and is refused at any length; ``"abc"`` repeated scores
@@ -115,10 +115,11 @@ def _estimated_entropy_bits(salt: str) -> float:
     generate: count the symbols, take ``-sum(p * log2(p))`` for the per-character entropy, and
     multiply by the length for a total in bits. It needs no dictionary, no alphabet table and no
     network, it grades continuously rather than by category, and -- unlike a bare count of distinct
-    characters -- it sees SKEW. A salt of sixteen "a" characters plus seven distinct others has
-    eight distinct characters and would clear a distinct-character floor of eight, while this
-    estimator scores it at about 40 bits for twenty-three characters and grades it near the floor,
-    which is the honest reading of a string that is five-sixths one symbol.
+    characters -- it sees SKEW. A salt of twenty-four "a" characters plus eight distinct others has
+    nine distinct characters and would clear a distinct-character floor of eight, while this
+    estimator scores it at about 50 bits for thirty-two characters, about 1.56 per character, and
+    the per-character floor refuses it, which is the honest reading of a string that is
+    three-quarters one symbol.
 
     WHAT IT CANNOT SEE, stated plainly because every distribution-based estimator shares the blind
     spot: it is ORDER-BLIND and DICTIONARY-BLIND. It scores every permutation of a string
@@ -126,25 +127,29 @@ def _estimated_entropy_bits(salt: str) -> float:
     length floor -- the arithmetic maximum for 32 characters -- and passes, despite being one of
     the first strings any attacker would try. A repeated cycle such as "abcd" eight times measures
     exactly 64.00 bits and also passes. This check therefore catches a salt that is visibly
-    DEGENERATE; it cannot certify that a salt is unpredictable, and nothing short of generating the salt ourselves could.
+    DEGENERATE; it cannot certify that a salt is unpredictable, and nothing short of generating
+    the salt ourselves could.
     The real defence stays where ADR 0030 section 4 puts it: an env-supplied secret from a random
     generator. This is the floor under that, not a substitute for it.
 
-    Where the floor came from. Measured 2026-08-22 by sampling 200,000 random 16-character salts
-    per alphabet and counting how many this estimator scores below 32 bits: base62 0, lowercase 0,
-    lowercase hex 1, and decimal digits 57 -- the tightest realistic case, and a 16-digit salt
-    carries only about 53 bits of real entropy to begin with. The zeros are trustworthy because the
-    same run returned NON-ZERO at higher floors (at 40 bits the same four alphabets rejected 0, 2,
-    306 and 11,066 of 200,000), so the instrument can fire. A 40-bit floor would refuse better than
-    5 percent of genuinely random 16-digit salts, which is refusing real secrets.
+    Where the 32-bit total came from, under the former 16-character length floor. Measured
+    2026-08-22 by sampling 200,000 random 16-character salts per alphabet and counting how many this
+    estimator scores below 32 bits: base62 0, lowercase 0, lowercase hex 1, and decimal digits 57 --
+    the tightest realistic case, and a 16-digit salt carries only about 53 bits of real entropy to
+    begin with. The zeros are trustworthy because the same run returned NON-ZERO at higher floors
+    (at 40 bits the same four alphabets rejected 0, 2, 306 and 11,066 of 200,000), so the instrument
+    can fire. A 40-bit floor would refuse better than 5 percent of genuinely random 16-digit salts,
+    which is refusing real secrets.
 
-    The two paragraphs above and the next heading describe the screen under the former 16-character
-    length floor. At 32 characters the per-character floor decides every refusal, which there means
-    under 64 bits in total; the 32-bit total only picks the message (see MIN_SALT_ENTROPY_BITS).
+    At the 32-character length floor the per-character floor decides every entropy refusal: it
+    refuses a salt whose estimated total is under 2 bits times its length, which is 64 bits at
+    exactly 32 characters and more for a longer salt. The 32-bit total refuses no salt of 32
+    characters or more on its own and only picks the message (see MIN_SALT_ENTROPY_BITS).
 
-    32 BITS STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
-    source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359
-    took the accepted path rather than lowering the floor, which would weaken the screen. Whether a
+    THE SCREEN STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
+    source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359,
+    under the former 16-character length floor, accepted that rate rather than lower the 32-bit
+    total. At 32 characters the rates below are set by the per-character floor. Whether a
     different estimator could refuse fewer random salts without passing more degenerate ones is a
     separate question nobody has measured. A draw that happens to repeat characters scores low.
     Computed EXACTLY, by enumerating every multiset of character counts against both floors, a
@@ -159,8 +164,9 @@ def _estimated_entropy_bits(salt: str) -> float:
     higher: 2.76e-4 for 16 decimal digits and 2.51e-6 for ``secrets.token_hex(8)``. The length floor
     now refuses those shapes before this screen reads them. The stated bound is UNDER 1 IN 1,000
     for random decimal salts that clear the length floor, since the rate only falls with length.
-    ``tests/test_anon_core.py`` pins the decimal and hex rates above by the same enumeration, run
-    through ``Keyer`` itself, and holds the 32-character URL-safe shape with a seeded sweep; no
+    ``tests/test_anon_core.py`` pins the 32-, 33- and 40-digit decimal rates and the 32-character
+    hex rate above by the same enumeration, run through ``Keyer`` itself; it does not pin the
+    16-character rates. It holds the 32-character URL-safe shape with a seeded sweep; no
     test pins the URL-safe rate itself.
     An operator refused with a real random salt replaces it with one from
     ``secrets.token_urlsafe(24)``.

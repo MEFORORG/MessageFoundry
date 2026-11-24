@@ -830,7 +830,8 @@ def test_real_generated_salts_are_still_accepted() -> None:
 
     Each salt is a FIXED draw from the generator its comment names, not a fresh one. This test drew
     fresh salts until BACKLOG #3359, and failed a required CI leg whenever a 16-digit draw landed in
-    the share the screen refuses. The rates are pinned by the exact enumeration below."""
+    the share the screen refuses. The exact enumeration below pins the refusal rates for 32-, 33-
+    and 40-digit decimal salts and 32-character hex salts."""
     for salt in (
         "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24), the recommended generator
         # secrets.token_hex(8) is refused by the 32-character length floor (BACKLOG #4652).
@@ -840,8 +841,9 @@ def test_real_generated_salts_are_still_accepted() -> None:
         Keyer(salt)  # must not raise
 
 
-#: Draws per alphabet in the seeded sweep. At the 32-character length floor it sees no decimal
-#: refusal; the exact enumeration below pins the rate.
+#: Draws per alphabet in each seeded sweep. At the 32-character length floor the exact decimal
+#: refusal rate is under 1e-9, so a decimal sweep this size is expected to see none; the sweep
+#: test asserts only the bound below, and the exact enumeration below pins the decimal rate.
 _SWEEP_DRAWS = 20_000
 
 #: The stated bound on refusing a genuinely random decimal salt, under 1 in 1,000. The source of

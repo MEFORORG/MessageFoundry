@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The anonymizer salt's 32-character length floor and refusals that withhold it (BACKLOG #4652).
+"""The anonymizer salt's 32-character floor, and refusals that withhold the salt (BACKLOG #4652).
 
 Both copies of the keyer are held: the toolkit's and the one vendored into the tee. The floor is
 32 characters: ``secrets.token_hex(8)`` (16 characters, 64 bits) is refused, and
