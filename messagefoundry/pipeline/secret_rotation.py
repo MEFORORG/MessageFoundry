@@ -364,6 +364,14 @@ _HELD_FOR_ANOTHER_RECORD = (
 )
 
 
+#: The WARNING a deferred save logs when it could not write the record it owed (BACKLOG #5615).
+_RECORD_NOT_WRITTEN = (
+    "secret rotation: the store key in use is not confirmed by its stamp, and the rotation record "
+    "for it could not be written. Its rotation date was not stamped. Stop the engine and run "
+    "`messagefoundry rotate-key`, with the prior key in MEFOR_STORE_ENCRYPTION_KEYS_RETIRED."
+)
+
+
 def _rotation_hold(record: SecretRotationMetaRow | None, fingerprint: str) -> str | None:
     """Why the rotation record says the DEK ``fingerprint`` must not be stamped, as the line to log,
     or ``None`` when it does not.
@@ -571,12 +579,31 @@ async def persist_rotation_meta(
     meta_store: SecretRotationMetaStore, pending: PendingRotationWrites
 ) -> None:
     """Save what a deferred reconcile computed, never re-sealing. The record goes first and through
-    :func:`open_rotation_record`, so it keeps a record another writer opened meanwhile."""
+    :func:`open_rotation_record`, so it keeps a record another writer opened meanwhile. The graph
+    came up since the compute, so the record is read again: a DEK stamp is dropped if a run opened
+    a record for that key in between, as the in-place path's adjacent reads would have seen."""
     if pending.record is not None:
         key_id, day = pending.record
-        if await open_rotation_record(meta_store, key_id, day, keep_another=True):
-            log.warning(_OPENED_AT_START)  # only now is it true that a record was opened
+        try:
+            opened = await open_rotation_record(meta_store, key_id, day, keep_another=True)
+        except Exception:
+            log.warning(_RECORD_NOT_WRITTEN)
+            raise
+        record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
+        hold = _rotation_hold(record, dek_fingerprint(key_id))
+        if hold is None and _record_open(record):
+            hold = _HELD_FOR_ANOTHER_RECORD
+        elif hold is not None and opened:
+            hold = _OPENED_AT_START
+        if hold is not None:
+            log.warning(hold)
     for class_id, fingerprint, tracked_since, last_rotated in pending.stamps:
+        if class_id == _DEK_CLASS_ID:
+            record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
+            hold = _rotation_hold(record, fingerprint)
+            if hold is not None:
+                log.warning(hold)
+                continue
         await meta_store.upsert_secret_rotation_meta(
             class_id,
             fingerprint=fingerprint,
@@ -642,7 +669,8 @@ async def reconcile_rotation_meta(
     **``defer_writes`` holds every write back (BACKLOG #5615).** The stamps and the rotation record
     are collected for :func:`persist_rotation_meta`, and a key the record would hold reads as held
     here, before the record exists. A start that never saves leaves the store as it found it, and
-    the next start detects the same change.
+    the next start computes again. A change is detected again; a class first seen by the unsaved
+    start has no stored date, so its age floor starts at the next start that saves.
 
     PHI/secret-safe: a secret value is read only to compute its keyed MAC; only the sealed MAC + dates
     are ever persisted, and only dates and counts are alerted or logged, never the value."""

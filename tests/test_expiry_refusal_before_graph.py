@@ -287,11 +287,11 @@ async def test_deferred_writes_save_the_value_sealed_in_compute(
         await store.close()
 
 
-async def test_a_crash_before_the_save_is_detected_again_on_the_next_start(
+async def test_a_failed_save_refuses_and_the_next_start_detects_the_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A failed save does not refuse a start that is already up, and loses no rotation: the stored
-    stamp still differs from the value held, so the next start sees the same change."""
+    """As on main, where a failed write left the age undetermined under ENFORCE. Without this a
+    store that cannot keep a date would never age a key."""
     site = _Site(tmp_path)
     await site.seed_old_stamp()
     monkeypatch.setenv(_AD, _CANDIDATE)
@@ -301,12 +301,11 @@ async def test_a_crash_before_the_save_is_detected_again_on_the_next_start(
 
     with monkeypatch.context() as failing:
         failing.setattr("messagefoundry.pipeline.engine.persist_rotation_meta", failed_save)
-        with caplog.at_level("ERROR", logger="messagefoundry.pipeline.engine"):
-            engine = await site.start(SecretRotationSettings())
-        try:
-            assert engine._registry_runner is not None and engine._registry_runner.running
-        finally:
-            await engine.stop()
+        with (
+            caplog.at_level("ERROR", logger="messagefoundry.pipeline.engine"),
+            pytest.raises(StoreKeyRotationOverdueError),
+        ):
+            await site.start(SecretRotationSettings())
     assert "OSError" in caplog.text
     assert _CANDIDATE not in caplog.text
     assert (await site.rows())[_AD].last_rotated == _LONG_AGO
@@ -314,6 +313,31 @@ async def test_a_crash_before_the_save_is_detected_again_on_the_next_start(
     engine = await site.start(SecretRotationSettings())
     await engine.stop()
     assert (await site.rows())[_AD].last_rotated != _LONG_AGO
+
+
+async def test_a_record_opened_during_bring_up_stops_the_deferred_stamp(tmp_path: Path) -> None:
+    """A run that opened a record for this key after the compute must not read as complete."""
+    site = _Site(tmp_path)
+    store = await site.open()
+    try:
+        key_id = store.cipher_info().active_key_id
+        assert key_id is not None
+        pending = sr.PendingRotationWrites()
+        await reconcile_rotation_meta(
+            store,
+            SecretRotationSettings(),
+            dek_key_id=key_id,
+            enforcement=SecurityEnforcement.ENFORCE,
+            defer_writes=pending,
+        )
+        assert [row[0] for row in pending.stamps] == [sr._DEK_CLASS_ID], "premise: a DEK stamp"
+        await sr.open_rotation_record(store, key_id, "2026-01-01")
+        await sr.persist_rotation_meta(store, pending)
+        rows = await store.get_secret_rotation_meta()
+        assert sr._DEK_CLASS_ID not in rows
+        assert rows[sr.ROTATION_RECORD_ID].fingerprint == sr.dek_fingerprint(key_id)
+    finally:
+        await store.close()
 
 
 # --- the store key: a failed or refused start leaves no rotation record ------------------------
@@ -516,6 +540,7 @@ async def test_refusal_against_a_held_key_with_an_open_record(keys: _KeySite) ->
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="BACKLOG #5615 HELD: main stamps the first sighting before it refuses, so the age "
     "survives the refusal. Writing nothing on a refused start loses it and this start passes.",
 )

@@ -2369,8 +2369,8 @@ class Engine:
             # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
             refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
-                # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
-                # before — byte-identical. The config-drift sweeps + reference materialize + listener
+                # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now.
+                # The config-drift sweeps + reference materialize + listener
                 # bring-up live in _start_graph (shared with the clustered leader path).
                 # BACKLOG #5615: refuse an expired key or secret before any listener binds. The
                 # stamps and rotation record are saved at the [secret_rotation] block below, because
@@ -2685,28 +2685,12 @@ class Engine:
             # is re-read rather than hoisted so the reconcile's own guarded call keeps its
             # behaviour; if it were to fail here the engine refuses to start, which is the
             # fail-closed direction.
-            enforce_store_key_expiry(
-                self._secret_rotation_settings,
-                self._secret_rotation_stamps,
-                enforcement=self._security_enforcement,
-                dek_key_id=self.store.cipher_info().active_key_id,
-                alert_sink=self._alert_sink,
-            )
-            # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
-            # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
-            # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
-            # computes nothing in that case, so a default config's start is unchanged.
-            enforce_secret_expiry(
-                self._secret_rotation_settings,
-                self._secret_rotation_stamps,
-                enforcement=self._security_enforcement,
-                held=await self._expiry_enforced_held_ids(),
-                alert_sink=self._alert_sink,
-            )
+            await self._enforce_rotation_expiry()
 
     async def _persist_pending_rotation(self, pending: PendingRotationWrites) -> None:
-        """Save what the start deferred. A failure must not refuse a start that is already up, and
-        loses nothing: the next start detects the same change. Logged by type only, as an error here
+        """Save what the start deferred. A failed save leaves the age undetermined, as a failed
+        in-place reconcile does, so the stamps are dropped and both refusals run again: otherwise a
+        store that cannot keep a date would never age a key. Logged by type only, as an error here
         could quote a stored cell."""
         if not isinstance(self.store, SecretRotationMetaStore):
             return
@@ -2714,9 +2698,36 @@ class Engine:
             await persist_rotation_meta(self.store, pending)
         except Exception as exc:
             log.error(
-                "secret-rotation stamps were not saved (%s); the next start detects them again",
+                "secret-rotation stamps were not saved (%s); their age is undetermined",
                 type(exc).__name__,
             )
+            self._secret_rotation_stamps = {}
+            await self._enforce_rotation_expiry()
+
+    async def _enforce_rotation_expiry(self) -> None:
+        """Run both expiry refusals against the current stamps."""
+        if self._secret_rotation_settings is None or not isinstance(
+            self.store, SecretRotationMetaStore
+        ):
+            return
+        enforce_store_key_expiry(
+            self._secret_rotation_settings,
+            self._secret_rotation_stamps,
+            enforcement=self._security_enforcement,
+            dek_key_id=self.store.cipher_info().active_key_id,
+            alert_sink=self._alert_sink,
+        )
+        # BACKLOG #1932 — the same refusal for the NON-DEK classes the operator opted into
+        # [secret_rotation].enforce_secret_expiry_classes, sited here for the same reason. It is a
+        # no-op on the shipped default (an empty opt-in), and `_expiry_enforced_held_ids`
+        # computes nothing in that case, so a default config's start is unchanged.
+        enforce_secret_expiry(
+            self._secret_rotation_settings,
+            self._secret_rotation_stamps,
+            enforcement=self._security_enforcement,
+            held=await self._expiry_enforced_held_ids(),
+            alert_sink=self._alert_sink,
+        )
 
     # --- active-passive graph gating (Workstream A1/A3/A4) -------------------
 
