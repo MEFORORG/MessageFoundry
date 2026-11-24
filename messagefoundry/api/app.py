@@ -6179,8 +6179,9 @@ def create_app(
     ) -> tuple[RegistryRunner | None, Literal["in", "out"] | None]:
         """The runner, and which side of its registry holds ``name``, decided under the caller's
         channel scope so that no answer tells a scoped caller which names exist (BACKLOG #2551,
-        #2640). The one scope rule behind :func:`_guarded_direction` and
-        :func:`_dual_role_control`, so the two cannot drift apart (BACKLOG #3031).
+        #2640). The one scope rule behind :func:`_guarded_direction`,
+        :func:`_dual_role_control` and ``GET /connections/{name}/events``, so they cannot drift apart
+        (BACKLOG #3031).
 
         A channel-scoped caller reaches only an inbound in its own scope. Every other name gets one
         answer, :func:`_deny_connection`: an inbound outside its scope, any outbound (an outbound
@@ -7104,22 +7105,14 @@ def create_app(
         """The connection/transport event log scoped to one connection (#46), newest first.
         ``reason`` and ``reveal`` behave as on ``GET /events`` (BACKLOG #2443)."""
         await _admit_reveal(request, identity, reveal)
-        # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
-        # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
-        # depth on top of the guard.
-        client = client_ip(request)
-        await _control_guard(engine, identity, name, client)
-        rr = engine.registry_runner
-        if (
-            identity.allowed_channels is not None
-            and rr is not None
-            and name in rr.registry.inbound_names()
-            and name not in rr.registry.inbound
-        ):
-            # An inbound another engine shard holds: the store is shared, so without this the scope
-            # check alone would answer it here. Refused as the per-name routes refuse it, through
-            # _resolve_connection (BACKLOG #3031). The 403 is the one an out-of-scope inbound gets.
-            await _deny_connection(engine, identity, name, client)
+        # The name and its scope are resolved as the other per-name connection routes resolve them
+        # (BACKLOG #3031): with the engine started, a channel-scoped caller reaches only an inbound
+        # in its scope that THIS engine holds. An out-of-scope inbound, an outbound, a name that exists nowhere, and an
+        # inbound another engine shard holds all get the one 403 and an auth.channel_denied row, so
+        # no answer here tells a scoped caller which names exist. An unscoped caller is not refused,
+        # and its unknown name still reads the store. This covers this route only: GET /events with
+        # ?connection= applies the channel scope alone. The store scope is defense-in-depth.
+        await _resolve_connection(engine, identity, name, client_ip(request), role="source")
         rows = await engine.store.list_connection_events(
             connection=name,
             kinds=kind,

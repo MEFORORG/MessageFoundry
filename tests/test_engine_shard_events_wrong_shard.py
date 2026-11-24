@@ -7,7 +7,8 @@ builds it, share ONE SQLite store. A scoped operator may reach an inbound that e
 Asked of engine shard a, the per-name connection routes refuse it with the 403 and an
 ``auth.channel_denied`` row, as they refuse an out-of-scope inbound. ``/events`` checked the channel
 scope only, so engine shard a answered it from the shared store. These tests pin that ``/events``
-now refuses it the same way, and that its answers on the right engine shard did not change.
+now refuses it the same way, and that its answers on the right engine shard did not change. The
+refusal covers this route only: ``GET /events?connection=`` applies the channel scope alone.
 
 What it runs: in-process engines and API apps on SQLite. No ``serve --shard`` subprocess and no
 server-DB store, the only kind ``serve --shard`` accepts with more than one engine shard (ADR 0063).
@@ -35,6 +36,7 @@ from tests.test_channel_rbac import _add, _client, _login, _probe, _service
 _A_OWN = "IB_EVSHARD_A"  # held by engine shard a, in the operator's scope
 _A_OUT = "IB_EVSHARD_A_OUT"  # held by engine shard a, outside the operator's scope
 _B_OWN = "IB_EVSHARD_B"  # held by engine shard b only, in the operator's scope
+_NOWHERE = "IB_EVSHARD_NOWHERE"  # in the operator's scope, an inbound on no engine shard
 
 
 def _whole_config(tmp_path: Path) -> Registry:
@@ -102,7 +104,7 @@ async def test_events_on_the_wrong_engine_shard_gets_the_403_and_a_denial_row(
     service_a = await _service(a, admin_write_rate_limit=False)
     service_b = await _service(b, admin_write_rate_limit=False)
     uid = await _add(service_a, "op", Role.OPERATOR)
-    await service_a.set_channel_scope(uid, [_A_OWN, _B_OWN], actor="admin")
+    await service_a.set_channel_scope(uid, [_A_OWN, _B_OWN, _NOWHERE], actor="admin")
 
     async with (
         contextlib.AsyncExitStack() as stack,
@@ -137,6 +139,17 @@ async def test_events_on_the_wrong_engine_shard_gets_the_403_and_a_denial_row(
         meta = await _probe(ca, a, ha, "GET", f"/connections/{_B_OWN}/metadata")
         assert meta[:2] == wrong[:2]
         assert sorted(act for act, _ in meta[2]) == sorted(act for act, _ in wrong[2])
+
+        # A scope-listed name no engine shard holds gets the same answer, so the 403 for a sibling's
+        # inbound does not tell the caller that the name exists somewhere in the config.
+        nowhere = await _probe(ca, a, ha, "GET", f"/connections/{_NOWHERE}/events")
+        assert nowhere[:2] == wrong[:2], nowhere
+        assert ("auth.channel_denied", _NOWHERE) in nowhere[2], nowhere
+        raw_nowhere = await ca.get(f"/connections/{_NOWHERE}/events", headers=ha)
+        assert (raw_nowhere.status_code, raw_nowhere.content) == (
+            raw_wrong.status_code,
+            raw_wrong.content,
+        )
 
         # The other direction: engine shard b refuses engine shard a's in-scope inbound the same way.
         status, _, audit = await _probe(cb, b, hb, "GET", f"/connections/{_A_OWN}/events")
