@@ -15,10 +15,12 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy, active_hop_posture
 from messagefoundry.transports import build_destination
 from messagefoundry.transports import fhir as fhir_mod
 from messagefoundry.transports import smart as smart_mod
@@ -262,3 +264,122 @@ def test_a_lookup_refusal_survives_the_credential_scrubber(over: dict[str, Any],
     # The control: the scrubber does redact the shape these refusals used before.
     old = f"FhirLookup '{name}': basic_user and basic_password must be set together"
     assert scrub_credentials(old) != old
+
+
+# --- merge review round dc78024a41: main's #5511 and #5800 refusals join the pure phase ---------
+
+
+def _chain_policy() -> TrustAnchorPolicy:
+    """An instance [tls] policy that turns the whole-chain check on over the OS roots, which an
+    http lookup that verifies TLS is refused under (vault BACKLOG #5511)."""
+    return TrustAnchorPolicy(crl_file="synthetic-unread.crl", crl_check_chain=True)
+
+
+def test_a_lookup_refused_by_the_chain_check_leaves_no_crossing_from_an_earlier_lookup(
+    gates: list[tuple[str, str]], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Merge review item 1: the first lookup (verify_tls off, so the chain check does not apply
+    to it) crosses in cleartext; the second, an http lookup on the OS roots, is refused by the
+    #5511 chain check. That refusal reads no wire, so it runs before any lookup reaches a gate."""
+    caplog.set_level(logging.WARNING)
+    first = {**_FIRST, "verify_tls": False}
+    second = {**_FIRST, "url": "http://second.partner.invalid/fhir"}
+    with active_hop_posture(_WARN_DIAL), pytest.raises(ValueError, match="crl_check_chain"):
+        FhirLookupExecutor(
+            {"first": first, "second": second},
+            egress=_OPEN,
+            trust_anchor_policy=_chain_policy(),
+        )
+    assert gates == []
+    assert _crossed(caplog, "first.partner.invalid") == []
+
+
+def test_the_control_the_chain_check_lets_the_first_lookup_build_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    with active_hop_posture(_WARN_DIAL):
+        ex = FhirLookupExecutor(
+            {"first": {**_FIRST, "verify_tls": False}},
+            egress=_OPEN,
+            trust_anchor_policy=_chain_policy(),
+        )
+    assert ex.connections == {"first"}
+    assert _crossed(caplog, "first.partner.invalid")
+
+
+_SMART = {
+    "url": "https://second.partner.invalid/fhir",
+    "smart_token_url": "https://auth.partner.invalid/token",
+    "smart_client_id": "cid",
+    "smart_private_key": "not-a-key-and-never-read",
+}
+
+
+@pytest.mark.parametrize(
+    ("over", "match"),
+    [
+        ({"smart_scope": "system/Patient.r\ud800"}, "smart_scope holds a character"),
+        (
+            {"smart_private_key_password": "pw\udfff"},
+            "smart_private_key_password holds a character",
+        ),
+        (
+            {"smart_token_url": "https://auth.partner.invalid/" + "t" * 9000},
+            "SMART token request",
+        ),
+    ],
+    ids=["scope-surrogate", "password-surrogate", "token-url-length"],
+)
+def test_a_lookup_refused_by_a_smart_settings_check_leaves_no_crossing_from_an_earlier_lookup(
+    gates: list[tuple[str, str]],
+    caplog: pytest.LogCaptureFixture,
+    over: dict[str, Any],
+    match: str,
+) -> None:
+    """Merge review item 1: main's #5800 SMART settings refusals read no wire, so they run before
+    any lookup reaches a hop gate, and the first lookup's cleartext crossing is never recorded."""
+    caplog.set_level(logging.WARNING)
+    with pytest.raises(ValueError, match=match):
+        _build({"first": dict(_FIRST), "second": {**_SMART, **over}})
+    assert gates == []
+    assert _crossed(caplog, "first.partner.invalid") == []
+
+
+def _signed_destination(**over: Any) -> object:
+    pem = (
+        ec.generate_private_key(ec.SECP256R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode("ascii")
+    )
+    return _destination(sign_private_key=pem, sign_algorithm="ES256", **over)
+
+
+@pytest.mark.parametrize("header", ["Authorization", "authorization"])
+@pytest.mark.parametrize(
+    "credential",
+    [
+        {"bearer_token": "synthetic-token"},
+        {"basic_user": "svc", "basic_password": "synthetic-pw"},
+        {"headers": {"authorization": "Bearer x"}},
+    ],
+    ids=["bearer", "basic", "static-header"],
+)
+def test_the_fhir_destination_refuses_an_authorization_signer_beside_a_credential(
+    credential: dict[str, Any], header: str
+) -> None:
+    """Merge review item 4 (BACKLOG #5526 item 6, the FHIR twin): ``_post`` writes the signature
+    after the credential, so under the Authorization name it would replace it on every send."""
+    with pytest.raises(ValueError, match="signing header named Authorization") as ei:
+        _signed_destination(sign_header=header, **credential)
+    assert "synthetic-pw" not in str(ei.value)
+    assert "synthetic-token" not in str(ei.value)
+
+
+def test_the_control_the_fhir_destination_signs_alone_or_under_another_name() -> None:
+    assert _signed_destination(sign_header="Authorization")
+    assert _signed_destination(sign_header="X-JWS-Signature", bearer_token="synthetic-token")

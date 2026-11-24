@@ -83,7 +83,6 @@ __all__ = [
     "http_digest_selected",
     "is_authorization_header_name",
     "refuse_authorization_signer_beside_credential",
-    "refuse_authorization_signer_beside_digest",
     "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
@@ -526,7 +525,6 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
     is refused under the same rule. Also refuses, here rather than late, a SMART or OAuth2 bearer
     provider beside Digest and a missing Digest user or password. Names settings, never a value.
     A signing header named ``Authorization`` is refused later, once the signer is built, by
-    :func:`refuse_authorization_signer_beside_digest` or
     :func:`refuse_authorization_signer_beside_credential`."""
     if not http_digest_selected(s):
         return False
@@ -552,19 +550,6 @@ def refuse_http_digest_conflicts(s: Mapping[str, Any]) -> bool:
             "(password via env())"
         )
     return True
-
-
-def refuse_authorization_signer_beside_digest(
-    sign_header: str | None, *, digest: bool, connection: str | None
-) -> None:
-    """Refuse a detached-JWS signing header named ``Authorization``, however spelled, beside HTTP
-    Digest (BACKLOG #5529). ``_post`` writes the signature per request after the static headers,
-    so under that name it would replace the Digest response on the wire. ``sign_header`` is the
-    built signer's ``header_name``, or ``None`` when signing is off, so the typed
-    ``Destination.sign`` and the flat ``sign_*`` settings are read by the one rule that builds the
-    signer. Called by FHIR; REST and SOAP call
-    :func:`refuse_authorization_signer_beside_credential`, which also reads Digest."""
-    _refuse_authorization_signer(sign_header, "HTTP Digest" if digest else None, connection)
 
 
 def authorization_credential(s: Mapping[str, Any], *, digest: bool) -> str | None:
@@ -597,8 +582,12 @@ def refuse_authorization_signer_beside_credential(
     """Refuse a detached-JWS signing header named ``Authorization``, however spelled, beside any
     credential the connection configures for that header (:func:`authorization_credential`;
     BACKLOG #5526 item 6). ``_post`` writes the signature per request after the configured or
-    minted credential, so under that name it would replace the credential on every send. Called
-    by REST and SOAP; a signature under that name with no credential beside it still builds."""
+    minted credential, so under that name it would replace the credential on every send, or the
+    Digest response on the wire (BACKLOG #5529). ``sign_header`` is the built signer's
+    ``header_name``, or ``None`` when signing is off, so the typed ``Destination.sign`` and the
+    flat ``sign_*`` settings are read by the one rule that builds the signer. Called by REST, SOAP
+    and the FHIR destination; a signature under that name with no credential beside it still
+    builds."""
     if sign_header is None or not is_authorization_header_name(sign_header):
         return
     _refuse_authorization_signer(

@@ -74,6 +74,7 @@ from messagefoundry.config.models import (
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
+    TrustAnchor,
     TrustAnchorPolicy,
     hop_name_prefix,
     refuse_chain_check_on_os_roots,
@@ -1120,7 +1121,7 @@ class FhirDestination(DestinationConnector):
         self._hop = hop_identity("FHIR", config.name)
         # BACKLOG #5529: refused before any hop gate, so a build this refuses logs no crossing.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
@@ -1300,8 +1301,12 @@ class FhirDestination(DestinationConnector):
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        # BACKLOG #5526 item 6, the FHIR twin (merge review of engine PR 3206, item 4): under the
+        # Authorization name the signature would replace the configured or minted credential
+        # _post writes before it.
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )
@@ -2042,6 +2047,8 @@ class _LookupPlan(NamedTuple):
     reason: str | None
     revocation_attested: bool
     revocation_reason: str | None
+    #: The read hop's trust anchor, resolved and chain-checked here; ``None`` with verify_tls off.
+    anchor: TrustAnchor | None
 
 
 class FhirLookupExecutor:
@@ -2096,7 +2103,10 @@ class FhirLookupExecutor:
         # before any lookup is built, so a lookup one of them refuses leaves no hop-gate crossing
         # record (#5529). A refusal later in the loop below, from a check _planned does not run,
         # still can leave one, from the failing lookup itself or from a lookup built before it.
-        planned = {cname: self._planned(cname, raw) for cname, raw in connections.items()}
+        planned = {
+            cname: self._planned(cname, raw, trust_anchor_policy)
+            for cname, raw in connections.items()
+        }
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
         self._timeout: dict[str, float] = {}
@@ -2173,22 +2183,8 @@ class FhirLookupExecutor:
             )
             self._headers[cname] = headers
             self._token[cname] = token
-            if bool_setting(s, "verify_tls", default=True):
-                # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
-                # server is the most on-point instance of 12.3.4's condition in the product, and it
-                # could not name an anchor at all.
-                lookup_anchor = http_family_trust_anchor(
-                    s,
-                    url=url,
-                    trust_anchor_policy=trust_anchor_policy,
-                    cell=f"FhirLookup {cname!r}",
-                )
-                if scheme == "http":
-                    # The same refusal for an http url, worded so it does not say the hop verifies its
-                    # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
-                    refuse_chain_check_on_os_roots(
-                        lookup_anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
-                    )
+            lookup_anchor = plan.anchor
+            if lookup_anchor is not None:
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows
@@ -2229,11 +2225,16 @@ class FhirLookupExecutor:
                 self._opener[cname] = _insecure_opener(*proxy_handlers)
 
     @classmethod
-    def _planned(cls, cname: str, s: Mapping[str, Any]) -> _LookupPlan:
+    def _planned(
+        cls, cname: str, s: Mapping[str, Any], trust_anchor_policy: TrustAnchorPolicy | None
+    ) -> _LookupPlan:
         """What this lookup's checks run before any lookup is built settle, once it passes them
         (BACKLOG #8299 items 2, 3 and 9): its base url, scheme and static headers, screened and
-        bounded, its timeout, and its hop declarations. Each refusal names the lookup. The build
-        loop runs at least the cleartext-credential check and the SMART settings checks later.
+        bounded, its timeout, its hop declarations, the SMART settings refusals of BACKLOG #5800,
+        and its read hop's trust anchor, with the #5511 chain-check refusal of an http url. Each
+        refusal names the lookup, except the SMART ones, which name the setting as the provider
+        does. The build loop runs at least the cleartext-credential check and the rest of the SMART
+        provider's checks later.
 
         #1241: the SECOND url construction site in this module. The destination screens its own;
         screening one and not its sibling reproduces the asymmetry the item reports. BACKLOG #5911:
@@ -2282,8 +2283,40 @@ class FhirLookupExecutor:
             check_attested_and_accepted(attested, accepted)
         except ValueError as exc:
             raise ValueError(f"FhirLookup {cname!r}: {exc}") from exc
+        # Merge review of engine PR 3206, item 1: main's #5800 SMART settings refusals and #5511
+        # http chain-check refusal read no wire, so they run here, before any lookup reaches a hop
+        # gate, rather than in the build loop after the gates of the lookups built before this one.
+        from messagefoundry.transports.smart import refuse_unusable_smart_settings
+
+        refuse_unusable_smart_settings(s)
+        anchor: TrustAnchor | None = None
+        if bool_setting(s, "verify_tls", default=True):
+            # #1180 (ADR 0093): the sanctioned live read-only lookup against an internal FHIR
+            # server is the most on-point instance of 12.3.4's condition in the product, and it
+            # could not name an anchor at all.
+            anchor = http_family_trust_anchor(
+                s,
+                url=url,
+                trust_anchor_policy=trust_anchor_policy,
+                cell=f"FhirLookup {cname!r}",
+            )
+            if scheme == "http":
+                # The same refusal for an http url, worded so it does not say the hop verifies its
+                # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                refuse_chain_check_on_os_roots(
+                    anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
+                )
         return _LookupPlan(
-            url, scheme, headers, timeout, attested, accepted, reason, rev_attested, rev_reason
+            url,
+            scheme,
+            headers,
+            timeout,
+            attested,
+            accepted,
+            reason,
+            rev_attested,
+            rev_reason,
+            anchor,
         )
 
     @staticmethod
