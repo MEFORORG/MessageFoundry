@@ -5545,7 +5545,7 @@ def _discard_late_release(release: asyncio.Future[Any]) -> None:
         log.warning("abandoned pool release ended with %s", type(exc).__name__)
 
 
-def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
+def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unknown: bool) -> None:
     """Cancel a pooled borrow its caller gave up on, but not while a value is on its way into the
     borrow's next step (BACKLOG #5686).
 
@@ -5563,12 +5563,12 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
-    loop's task type). On a task without it nothing can be checked, so the cancel is put off one
-    loop turn with ``call_soon(borrow.cancel)``, as the warm-up did before BACKLOG #5686, and one
-    WARNING says the check is off. A borrow whose wake-up is already scheduled when the cancel is
-    made then finishes first. A hand-over resolved after the cancel is scheduled, even later in the
-    same turn, is lost on such a task type, where an immediate cancel would have stopped it at the
-    pool.
+    loop's task type). On a task without it nothing can be checked, and one WARNING says the check
+    is off. Each caller then keeps what it did before BACKLOG #5686: with ``defer_unknown`` (the
+    warm-up) the cancel is put off one loop turn with ``call_soon(borrow.cancel)``, and without it
+    (:func:`acquire_pooled`) the borrow is cancelled at once. On such a task type the deferred cancel
+    loses a hand-over resolved after the cancel is scheduled, and the immediate one loses a hand-over
+    whose borrow wake-up is already scheduled.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5580,12 +5580,17 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
             _warned_no_waiter = True
             log.warning(
                 "this event loop's tasks have no _fut_waiter; abandoned pool borrows are cancelled "
-                "one turn later without checking for a hand-over in flight"
+                "without checking for a hand-over in flight"
             )
-        asyncio.get_running_loop().call_soon(borrow.cancel)
+        if defer_unknown:
+            asyncio.get_running_loop().call_soon(borrow.cancel)
+        else:
+            borrow.cancel()
         return
     if deferrals < _BORROW_CANCEL_MAX_DEFERRALS and _value_in_flight(borrow):
-        asyncio.get_running_loop().call_soon(_cancel_borrow, borrow, deferrals + 1)
+        asyncio.get_running_loop().call_soon(
+            partial(_cancel_borrow, borrow, deferrals + 1, defer_unknown=defer_unknown)
+        )
         return
     borrow.cancel()
 
@@ -5600,13 +5605,12 @@ def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
     with a child done with a value beside a pending child (its cancel discards that value), a shield
     or another combinator, and a future that ignores its cancel; each counts as not in flight. The
     gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour.
-    A nested task without ``_fut_waiter`` cannot be checked and counts as not in flight, so the
-    cancel goes in with no deferral, unlike the one-turn deferral for a top-level borrow."""
+    A nested task without ``_fut_waiter`` counts as runnable, so in flight."""
     if fut.done():
         return not fut.cancelled() and fut.exception() is None
     if isinstance(fut, asyncio.Task):
         waiter: asyncio.Future[Any] | None = getattr(fut, "_fut_waiter", None)
-        return hasattr(fut, "_fut_waiter") and (waiter is None or _value_in_flight(waiter))
+        return waiter is None or _value_in_flight(waiter)
     children: list[asyncio.Future[Any]] | None = getattr(fut, "_children", None)
     if children is not None:
         pending = [child for child in children if not child.done()]
@@ -5646,7 +5650,7 @@ async def acquire_pooled(
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
     per retry. That cancel goes through :func:`_cancel_borrow`, which on CPython puts it off while a
-    value is on its way into the borrow (on a task type it cannot read, it puts it off one turn).
+    value is on its way into the borrow (on a task type it cannot read, it cancels at once).
     Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
     borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
     not check is lost before the borrow ends. The caller's own cancellation takes the same path — it must, or a
@@ -5656,14 +5660,14 @@ async def acquire_pooled(
         return await asyncio.wait_for(asyncio.shield(borrow), timeout)
     except TimeoutError as exc:
         _park_borrow(pool, backend, borrow)
-        _cancel_borrow(borrow)
+        _cancel_borrow(borrow, defer_unknown=False)
         raise StoreAcquireTimeout(
             f"{backend}: store pool acquire timed out after {timeout:g}s "
             f"(pool exhausted or database unresponsive); retune with {retune}"
         ) from exc
     except asyncio.CancelledError:
         _park_borrow(pool, backend, borrow)
-        _cancel_borrow(borrow)
+        _cancel_borrow(borrow, defer_unknown=False)
         raise
 
 
@@ -5728,7 +5732,7 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
         except asyncio.CancelledError:
             # See "Acquire-side leak-freedom" above: the cleanup returns what this borrow hands over.
             abandoned.append(borrow)
-            _cancel_borrow(borrow)
+            _cancel_borrow(borrow, defer_unknown=True)
             raise
         # No await between the hand-over and the append, so the cleanup below releases it even if the
         # gather is cancelled or times out mid-flight.

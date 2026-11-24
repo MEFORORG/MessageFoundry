@@ -345,8 +345,8 @@ class _NoWaiterTask(asyncio.Task):
 async def test_acquire_pooled_still_cancels_on_a_task_type_without_the_waiter(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Without _fut_waiter nothing can be checked, so the borrow is cancelled one turn later, as the
-    # warm-up did before BACKLOG #5686, rather than left waiting; one WARNING says the check is off.
+    # Without _fut_waiter nothing can be checked, so acquire_pooled cancels the borrow at once, as it
+    # did before BACKLOG #5686, rather than leave it waiting; one WARNING says the check is off.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
@@ -366,7 +366,9 @@ async def test_acquire_pooled_still_cancels_on_a_task_type_without_the_waiter(
     assert "_fut_waiter" in caplog.text
 
 
-def _raising_cancel(borrow: asyncio.Future[object], deferrals: int = 0) -> None:
+def _raising_cancel(
+    borrow: asyncio.Future[object], deferrals: int = 0, *, defer_unknown: bool
+) -> None:
     raise RuntimeError("synthetic failure inside the borrow cancel")
 
 
@@ -411,17 +413,31 @@ async def test_warm_hands_the_borrow_to_the_cleanup_before_the_cancel_runs(
         await pool.unstick()
 
 
-@pytest.mark.parametrize("path", ["warm-up", "acquire_pooled"])
-async def test_no_waiter_task_type_hand_over_before_the_cancel_strands_nothing(path: str) -> None:
-    # On a task type without _fut_waiter nothing can be checked, so the cancel is put off one turn
-    # with call_soon(borrow.cancel), as the warm-up did before BACKLOG #5686: a borrow whose hand-off
-    # resolved in the cancel's turn before the cancel was scheduled takes its queued step first and
-    # ends holding the connection, which is then returned. A hand-over queued behind the cancel in
-    # that turn is not covered, and is lost.
+#: Whether a connection is stranded on a task type without _fut_waiter, per path and per order of
+#: the hand-over against the cancel in one turn. It is what each path did before BACKLOG #5686 (the
+#: warm-up put its cancel off one turn; acquire_pooled cancelled at once), measured on that code:
+#: each order loses a connection here only where it lost one there.
+_NO_WAITER_PARITY = {
+    ("warm-up", "hand-over-first"): False,
+    ("warm-up", "hand-over-queued-behind"): True,
+    ("acquire_pooled", "hand-over-first"): True,
+    ("acquire_pooled", "hand-over-queued-behind"): False,
+}
+
+
+@pytest.mark.parametrize(("path", "order"), sorted(_NO_WAITER_PARITY))
+async def test_no_waiter_task_type_matches_the_pre_5686_outcome(
+    path: str, order: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing can be checked without _fut_waiter, so each path keeps its pre-#5686 cancel and its
+    # outcome: no order strands a connection that the old code returned, and none is newly saved
+    # by a change of rule either.
+    monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
     loop.set_task_factory(lambda lp, coro, **kw: _NoWaiterTask(coro, loop=lp, **kw))
     pool = _HandOffPool()
+    task: asyncio.Task[object] | None = None
     try:
         if path == "warm-up":
             task = asyncio.create_task(
@@ -432,10 +448,20 @@ async def test_no_waiter_task_type_hand_over_before_the_cancel_strands_nothing(p
         await _turns()
         assert len(pool.handoffs) == 1
         task.cancel()
-        pool.hand_over()
+        if order == "hand-over-first":
+            pool.hand_over()
+        else:
+            loop.call_soon(pool.hand_over)
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert await _until(lambda: not pool.checked_out), "the handed-over connection was stranded"
+        await _turns()
     finally:
         loop.set_task_factory(previous)
-    assert pool.released == ["conn-1"]
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await pool.unstick()
+    stranded = bool(pool.checked_out)
+    assert stranded == _NO_WAITER_PARITY[(path, order)], (
+        f"{path}, {order}: stranded={pool.checked_out}, released={pool.released}"
+    )
