@@ -168,7 +168,8 @@ async def test_warm_landed_borrow_is_released_while_a_sibling_borrow_is_stuck(
 ) -> None:
     # Two abandoned borrows: one lands, the other stays stuck on a pool that ignores the cancel.
     # The landed one must be returned at once, not after the stuck sibling or the cleanup bound,
-    # where it would get no release budget left. The bound is lifted so a slow runner cannot lapse it here.
+    # where it would get no release budget left. The bound is lifted so a slow runner cannot lapse
+    # it here.
     monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 3600.0)
     pool = _HandOffPool(shape="deaf")
     try:

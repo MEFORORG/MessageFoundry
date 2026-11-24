@@ -5562,21 +5562,24 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     returns what it handed over: :func:`acquire_pooled`'s done-callback, or the warm-up cleanup in
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
-    This is the one place that says which borrows the check can read. It reads ``_fut_waiter`` on
-    the borrow and on each future the borrow waits on, directly or through a gather, whatever its
-    type; the test suite pins the attribute on the default asyncio task type and on the pure-Python
-    task, which is not an ``asyncio.Task`` subclass. The check reads unknown, and one WARNING per
-    process says the check is off, at least where the borrow has no such attribute, where an
-    ``asyncio.Task`` it waits on has none, or where the attribute holds something that is not a
-    future. It reads parked with no WARNING, so the cancel goes in at once, at least for a future
-    the borrow waits on through another combinator such as a shield, and for a task it waits on
-    that neither subclasses ``asyncio.Task`` nor exposes the attribute. On unknown, each caller
-    keeps what it did before BACKLOG #5686, on the turn the check first reads unknown: with
-    ``defer_unknown`` (the warm-up) the cancel is put off one loop turn with
+    This is the one place that says which borrows the check can read, and what each caller does
+    where it cannot. It reads ``_fut_waiter`` on the borrow and on each future the borrow waits
+    on, directly or through a gather, whatever its type; the test suite pins the attribute on the
+    default asyncio task type and on the pure-Python task where the C task is in use, which is not
+    an ``asyncio.Task`` subclass there. A type that exposes the attribute is trusted to keep it
+    current. The check reads unknown at least where the borrow has no such attribute, or where a
+    pending ``asyncio.Task`` it waits on, directly or through a gather whose other pending children
+    read no value in flight, has none or holds something that is not a future there. It reads
+    parked, so the cancel goes in at once, at least for a future the borrow waits on through
+    another combinator such as a shield, and for a task it waits on that neither subclasses
+    ``asyncio.Task`` nor exposes the attribute, whatever the caller. The first time the check reads
+    unknown in a process, one WARNING says the check is off; no later read logs one. On unknown,
+    each caller keeps what it did before BACKLOG #5686, on the turn the check first reads unknown:
+    with ``defer_unknown`` (the warm-up) the cancel is put off one loop turn with
     ``call_soon(borrow.cancel)``, and without it (:func:`acquire_pooled`) the borrow is cancelled
-    at once. Each can then lose a hand-over, at
-    least: the deferred cancel one resolved after the cancel is scheduled, or one the driver takes
-    more than a step to finish; the immediate cancel one whose borrow wake-up is already scheduled.
+    at once. Each can then lose a hand-over, at least: the deferred cancel one resolved after the
+    cancel is scheduled, or one the driver takes more than a step to finish; the immediate cancel
+    one whose borrow wake-up is already scheduled.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5590,8 +5593,9 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
         if not _warned_no_waiter:
             _warned_no_waiter = True
             log.warning(
-                "a pool borrow waits on a task whose _fut_waiter cannot be read; abandoned pool "
-                "borrows on such a task are cancelled without checking for a hand-over in flight"
+                "a pool borrow, or a task it waits on, has a _fut_waiter the check cannot read; "
+                "abandoned pool borrows like it are cancelled without checking for a hand-over in "
+                "flight"
             )
         if defer_unknown:
             asyncio.get_running_loop().call_soon(borrow.cancel)
@@ -5679,8 +5683,8 @@ async def acquire_pooled(
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
     per retry. That cancel goes through :func:`_cancel_borrow`, which puts it off while a value is
-    on its way into the borrow where it can read that; it says where it cannot, and this caller
-    then cancels at once. Whichever of the two wins, :func:`_salvage_late_borrow` returns the
+    on its way into the borrow where it can read that; it says where it cannot, and what this
+    caller does then. Whichever of the two wins, :func:`_salvage_late_borrow` returns the
     connection if the borrow ends holding one; a connection the cancel replaced in a state
     :func:`_cancel_borrow` does not check is lost before the borrow ends. The caller's own
     cancellation takes the same path — it must, or a shutdown mid-borrow would strand a slot the
@@ -5738,14 +5742,14 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     directly would discard the connection there, because a pending cancel is thrown in instead of
     the resolved value. So the cancel path hands the borrow to the cleanup and cancels it through
     :func:`_cancel_borrow`, which puts the cancel off while a value is on its way into the borrow
-    where it can read that; it says where it cannot, and this caller then puts the cancel off one
-    turn unchecked. The cleanup releases each abandoned borrow's connection as soon as that borrow
-    lands, under the same deadline as the other releases, so a borrow that lands is not kept
-    waiting on a sibling still stuck; it attaches :func:`_salvage_late_borrow` to any borrow still
-    pending at the deadline, and a borrow is returned by one of the two, not both. A borrow parked on the pool takes the cancel at one of the driver's
-    own suspension points, and what that does is the driver's: this rests on ``pool.acquire()``
-    marking the connection in-use atomically with returning it, as ``asyncpg>=0.29`` and
-    ``aioodbc>=0.5`` do.
+    where it can read that; it says where it cannot, and what this caller does then. The cleanup
+    releases each abandoned borrow's connection as soon as that borrow lands, under the same
+    deadline as the other releases, so a borrow that lands is not kept waiting on a sibling still
+    stuck; it attaches :func:`_salvage_late_borrow` to any borrow still pending at the deadline, and
+    a borrow is returned by one of the two, not both. A borrow parked on the pool takes the cancel
+    at one of the driver's own suspension points, and what that does is the driver's: this rests
+    on ``pool.acquire()`` marking the connection in-use atomically with returning it, as
+    ``asyncpg>=0.29`` and ``aioodbc>=0.5`` do.
 
     **Acquire-and-release ONLY** — this deliberately opens NO cursor and runs NO statement, so it neither
     needs nor uses the EF-6 ``_cursor`` close-before-release discipline. If a liveness probe (``SELECT 1``)
