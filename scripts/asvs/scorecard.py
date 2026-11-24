@@ -3250,9 +3250,9 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
         f"aside, where {path} has {live} (as this screen resolves them)"
     )
     clause.tail = (
-        "For this definition the screen compared only those two outermost shape decorators, and "
-        "refused because it reads them as different. It does not read what either definition "
-        "binds the name to when it runs, so the two may bind the same thing. Copy the live decorators; the mutation lives in a different "
+        "The screen refused because it reads those outermost shape decorators as different. It "
+        "does not read what either definition binds the name to when it runs, so the two may bind "
+        "the same thing. Copy the live decorators; the mutation lives in a different "
         "repository from the symbol it shadows, so nothing else keeps the two in step"
     )
     return clause

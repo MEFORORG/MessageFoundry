@@ -3286,7 +3286,7 @@ def test_prove_absences_screen_outer_refusal_names_only_the_decorators_compared(
     assert "where a value was expected" not in problem
     assert "with no shape decorator as its outermost decorator" in problem
     assert "has shape decorator functools.cache" in problem
-    assert "compared only those two outermost shape decorators" in problem
+    assert "reads those outermost shape decorators as different" in problem
     assert "binds the name to a" not in problem
     assert "the function the def itself makes" not in problem
     # A property swapped for a cached_property: each side's decorator is named on its own side.
