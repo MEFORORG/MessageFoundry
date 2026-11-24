@@ -8,8 +8,8 @@ and the ``check`` dry-run leg read the file's ``[pipeline].snapshot_on_send``, a
 its transport and recipient-override checks against the file's ``[alerts]``. Read as an ordinary
 load error, the refusal sent each of them to its fallback. ``alert add`` was still refused later,
 by its post-write settings check, but its transport check first reported the wrong cause. These
-tests pin that the refusal is reported where it is met, and that an unknown-key refusal still falls
-back as before in the two preview helpers.
+tests pin that the refusal is reported where it is met, and that a refusal naming no section's name
+alone still falls back as before in the two preview helpers.
 
 Synthetic values only."""
 
@@ -56,12 +56,15 @@ def _off_toml(tmp_path: Path) -> Path:
 # --- dryrun ----------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("name", ["MEFOR_STORE", "MEFOR_STORE__", "MEFOR_UPDATE_CHECK_"])
 def test_dryrun_snapshot_setting_reports_the_section_name_refusal(
-    tmp_path: Path, clean_env: pytest.MonkeyPatch
+    tmp_path: Path, clean_env: pytest.MonkeyPatch, name: str
 ) -> None:
+    # The trailing-underscore forms were a plain ValueError on main before this change, so the
+    # helper fell back on them; they are reported now too.
     toml = _off_toml(tmp_path)
-    clean_env.setenv("MEFOR_STORE", "x")
-    with pytest.raises(SectionNameEnvError, match="MEFOR_STORE"):
+    clean_env.setenv(name, "x")
+    with pytest.raises(SectionNameEnvError, match=name):
         _snapshot_on_send_setting(str(toml))
 
 

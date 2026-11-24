@@ -423,7 +423,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "settings (--service-config, else ./messagefoundry.toml if present); when no settings load "
         "it falls back to the setting's own default (ON) — matching the default engine, never a "
         "silent OFF (#230). A MEFOR_* variable that is a settings section's name alone is "
-        "refused instead; under --env the refusal does not name the variable.",
+        "refused instead when nothing else refuses the settings first; under --env the refusal "
+        "does not name the variable.",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(
@@ -463,8 +464,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
         "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
         "setting's own default (ON) — matching the default engine, never a silent OFF (#230). When "
-        "the preview runs and a settings source resolves, a MEFOR_* variable that is a settings "
-        "section's name alone fails the dryrun check instead. "
+        "a settings source resolves and nothing else refuses the settings first, a MEFOR_* "
+        "variable that is a settings section's name alone fails the dryrun check instead. "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
         "one in its own working directory; when they differ, each settings check's line names "

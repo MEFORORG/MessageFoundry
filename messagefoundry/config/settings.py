@@ -8973,11 +8973,14 @@ class SectionNameEnvError(ValueError):
     A ``ValueError``, so a caller that reports a load error reports this one too. Its own class so
     a caller that falls back to a default on a load error can tell this refusal apart and report
     it instead. Before this refusal the exact ``MEFOR_<SECTION>`` name did not stop the load, so
-    those callers read the settings; falling back on it would be a new outcome on their path that
-    names nothing. Some trailing-``_`` forms (``MEFOR_UPDATE_CHECK_``, ``MEFOR_STORE__``) were
-    refused before as a plain ``ValueError`` and those callers fell back on them; they are this
-    class now, so those callers report them too. At least these report it: ``dryrun``'s and ``check``'s ``[pipeline].snapshot_on_send``
-    resolution, and ``alert add``'s transport and recipient-override checks.
+    those callers read the settings; falling back on it would drop the file's settings with only
+    the WARNING :func:`load_settings` logs first. Some trailing-``_`` forms
+    (``MEFOR_UPDATE_CHECK_``, ``MEFOR_STORE__``) were refused before as a plain ``ValueError`` and
+    those callers fell back on them; they are this class now, so those callers report them too.
+    At least these report it: ``dryrun``'s and ``check``'s ``[pipeline].snapshot_on_send``
+    resolution, and ``alert add``'s transport and recipient-override checks. A load error raised
+    before this refusal runs (a missing or malformed file, an unknown file key) is not this class,
+    and those callers still fall back on it.
 
     The class is chosen per refusal, not per variable: a refusal that also names an unknown
     ``MEFOR_<SECTION>_<KEY>`` is this class when at least one name is a section's name alone, and
@@ -8986,7 +8989,8 @@ class SectionNameEnvError(ValueError):
 
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
     """Raise ``ValueError`` if the environment sets a ``MEFOR_<SECTION>_<KEY>`` variable that names a
-    modelled section and no setting in it (vault BACKLOG #2600).
+    modelled section and no setting in it, or a variable that is a modelled section's name alone
+    (vault BACKLOG #2600). The second raises :class:`SectionNameEnvError`, a ``ValueError``.
 
     The same failure :func:`_reject_unknown_file_keys` refuses in the file: a mistyped
     ``MEFOR_STORE_REQUIRE_ENCRYPTON`` used to be scraped into ``[store]``, ignored by the model, and
