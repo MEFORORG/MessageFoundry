@@ -825,9 +825,8 @@ class SqlServerCoordinator:
                 # #1986), and never later than the row's own expiry. DbCoordinator._release_leadership
                 # carries the reasoning. MIN over VALUES, because LEAST needs SQL Server 2022, and a
                 # CASE would read the clock twice, so its test and its result could disagree.
-                # The match is counted from OUTPUT, never cursor.rowcount: a session-wide SET
-                # NOCOUNT ON reports -1 for a zero-match UPDATE, which reads as released
-                # (BACKLOG #6795).
+                # The match is counted from OUTPUT, never cursor.rowcount (BACKLOG #6795;
+                # SqlServerStore._exec_terminal says why).
                 rows = await self._store._execute_clamped(
                     "UPDATE leader_lease SET lease_expires_at ="
                     f" (SELECT MIN(v) FROM (VALUES (lease_expires_at), ({_DB_NOW})) AS x(v))"

@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
+from tests.test_adr0157_sqlserver_fence import _force_nocount
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("MEFOR_TEST_SQLSERVER"),
@@ -177,7 +178,9 @@ async def test_concurrent_merges_on_every_cluster_table_do_not_deadlock(store) -
     under update range locks, which conflict with each other, so racers should queue rather than
     convert. This races each table's insert case and its matched case on ONE key, five rounds, and
     any 1205 escapes from gather. It is evidence, not proof: nothing here shows two statements
-    overlapped, and no arm makes a deadlock happen on purpose."""
+    overlapped, and no arm makes a deadlock happen on purpose. The store itself treats a 1205 on a
+    one-key HOLDLOCK burst as possible and retries it (``_retry_idempotent_merge``), so a 1205 here
+    is a measurement for #6793, not a flake to re-run."""
     coords = [_coord(store, f"node{i}:{i}:{i:04x}") for i in range(8)]
     await coords[0]._ensure_tables()
     # cluster_config: the empty-table seed race, then matched bumps of the single row.
@@ -202,9 +205,13 @@ async def test_concurrent_merges_on_every_cluster_table_do_not_deadlock(store) -
         assert sum(1 for h in held if h) == 1
 
 
-async def test_the_release_reports_its_match_on_a_real_driver(store) -> None:
-    """BACKLOG #6795 on the real driver: the release counts its OUTPUT rows, so a release by a node
-    the row does not name reports nothing released, and the owner's reports a release."""
+async def test_the_release_reports_its_match_under_nocount_on(
+    store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6795 on the real driver, under a session-wide SET NOCOUNT ON: the release counts
+    its OUTPUT rows, so a release by a node the row does not name reports nothing released, and
+    the owner's reports a release. Read from ``cursor.rowcount`` the first would read ``-1``."""
+    _force_nocount(store, monkeypatch)
     a = _coord(store, "nodeA:1:aaaa")
     b = _coord(store, "nodeB:2:bbbb")
     await a._ensure_tables()
