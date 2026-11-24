@@ -24,11 +24,11 @@ from messagefoundry.store.base import acquire_pooled, warm_pool_connections
 
 
 class _HandOffPool:
-    """``acquire()`` parks on a hand-off future. ``shape`` picks how the driver's acquire reaches it:
-    ``plain`` returns the future itself; ``deaf`` swallows a cancel and keeps waiting, so a borrow
-    stays stuck until the test hands a connection over; ``yield`` takes one bare step after the
-    hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a gather;
-    ``nested`` awaits it through an inner task of a type without ``_fut_waiter``, and
+    """``acquire()`` parks on a hand-off future. ``shape`` picks how the driver's acquire reaches
+    it: ``plain`` returns the future itself; ``deaf`` swallows a cancel and keeps waiting, so a
+    borrow stays stuck until the test hands a connection over; ``yield`` takes one bare step after
+    the hand-off before it returns; ``gather`` awaits the hand-off through an inner task and a
+    gather; ``nested`` awaits it through an inner task of a type without ``_fut_waiter``, and
     ``gather-nested`` through such a task under a gather."""
 
     def __init__(self, *, shape: str = "plain") -> None:
@@ -166,9 +166,9 @@ async def test_acquire_pooled_cancel_still_stops_a_parked_borrow() -> None:
 async def test_warm_landed_borrow_is_released_while_a_sibling_borrow_is_stuck(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Two abandoned borrows: one lands, the other stays stuck on a pool that ignores the cancel. The
-    # landed one must be returned at once, not after the stuck sibling or the cleanup bound, where it
-    # would get no release budget left. The bound is lifted so a slow runner cannot lapse it here.
+    # Two abandoned borrows: one lands, the other stays stuck on a pool that ignores the cancel.
+    # The landed one must be returned at once, not after the stuck sibling or the cleanup bound,
+    # where it would get no release budget left. The bound is lifted so a slow runner cannot lapse it here.
     monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 3600.0)
     pool = _HandOffPool(shape="deaf")
     try:
@@ -278,8 +278,9 @@ async def test_acquire_pooled_borrow_on_a_gather_strands_nothing(hand_over_first
 
 
 async def test_acquire_pooled_holds_its_abandoned_borrow_until_it_ends() -> None:
-    # The loop holds tasks weakly, so a borrow nobody awaits is kept in _LATE_RELEASES until it ends;
-    # otherwise it and its salvage callback could be collected before the connection comes back.
+    # The loop holds tasks weakly, so a borrow nobody awaits is kept in _LATE_RELEASES until it
+    # ends; otherwise it and its salvage callback could be collected before the connection comes
+    # back.
     pool = _HandOffPool(shape="deaf")
     parked_before = set(base_module._LATE_RELEASES)
     try:
@@ -373,12 +374,19 @@ class _NoWaiterForeignTask(asyncio.tasks._PyTask):  # type: ignore[name-defined,
 
 _NO_WAITER_TASK_TYPES = {"subclass": _NoWaiterTask, "foreign": _NoWaiterForeignTask}
 
+#: The task types the order test drives: the two above, and the pure-Python task as it ships, which
+#: exposes ``_fut_waiter`` without being an ``asyncio.Task`` subclass where the C task is in use.
+_ORDER_TASK_TYPES: dict[str, type] = {
+    **_NO_WAITER_TASK_TYPES,
+    "pure-python": asyncio.tasks._PyTask,  # type: ignore[attr-defined]
+}
+
 
 async def test_acquire_pooled_still_cancels_on_a_task_type_without_the_waiter(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Without _fut_waiter nothing can be checked, so acquire_pooled cancels the borrow at once, as it
-    # did before BACKLOG #5686, rather than leave it waiting; one WARNING says the check is off.
+    # Without _fut_waiter nothing can be checked, so acquire_pooled cancels the borrow at once, as
+    # it did before BACKLOG #5686, rather than leave it waiting; one WARNING says the check is off.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
@@ -445,6 +453,29 @@ async def test_warm_hands_the_borrow_to_the_cleanup_before_the_cancel_runs(
         await pool.unstick()
 
 
+class _WaiterFuture(asyncio.Future[object]):
+    """A future that is not an ``asyncio.Task`` but exposes ``_fut_waiter`` as one does."""
+
+    def __init__(self, waiter: object) -> None:
+        super().__init__()
+        self._fut_waiter = waiter
+
+
+async def test_value_in_flight_reads_any_future_exposing_the_waiter_as_a_task() -> None:
+    # The check is duck-typed: a future that exposes _fut_waiter is read as a task whatever its
+    # type. A waiter that is not a future is not read further, so it reads unknown.
+    loop = asyncio.get_running_loop()
+    pending: asyncio.Future[object] = loop.create_future()
+    resolved: asyncio.Future[object] = loop.create_future()
+    resolved.set_result("conn-1")
+    read = base_module._value_in_flight
+    assert not isinstance(_WaiterFuture(None), asyncio.Task)
+    assert read(_WaiterFuture(None)) == "in_flight"
+    assert read(_WaiterFuture(pending)) == "parked"
+    assert read(_WaiterFuture(resolved)) == "in_flight"
+    assert read(_WaiterFuture(object())) == "unknown"
+
+
 #: Whether a connection is stranded on a task type without _fut_waiter, per path and per order of
 #: the hand-over against the cancel in one turn, measured on the code before BACKLOG #5686 (the
 #: warm-up put its cancel off one turn; acquire_pooled cancelled at once). An order may strand a
@@ -457,7 +488,7 @@ _NO_WAITER_STRANDS_BEFORE_5686 = {
 }
 
 
-@pytest.mark.parametrize("task_type", sorted(_NO_WAITER_TASK_TYPES))
+@pytest.mark.parametrize("task_type", sorted(_ORDER_TASK_TYPES))
 @pytest.mark.parametrize(("path", "order"), sorted(_NO_WAITER_STRANDS_BEFORE_5686))
 async def test_no_waiter_task_type_strands_no_more_than_before_5686(
     path: str,
@@ -468,13 +499,15 @@ async def test_no_waiter_task_type_strands_no_more_than_before_5686(
 ) -> None:
     # Nothing can be checked without _fut_waiter, so each path keeps its pre-#5686 cancel: no order
     # strands a connection that the old code returned, whether or not the task type subclasses
-    # asyncio.Task, and one WARNING says the check is off. The strand is read before unstick(),
-    # which hands over any hand-off still pending and would otherwise count as one.
+    # asyncio.Task, and one WARNING says the check is off. The pure-Python task exposes the
+    # waiter without subclassing asyncio.Task, so the check reads it: no order strands a
+    # connection and no WARNING is logged. The strand is read before unstick(), which hands over
+    # any hand-off still pending and would otherwise count as one.
     monkeypatch.setattr(base_module, "_warned_no_waiter", False, raising=False)
     loop = asyncio.get_running_loop()
     previous = loop.get_task_factory()
-    task_cls = _NO_WAITER_TASK_TYPES[task_type]
-    if task_type == "foreign":
+    task_cls = _ORDER_TASK_TYPES[task_type]
+    if task_type != "subclass":
         # The pure-Python task records itself as current only for the pure-Python current_task;
         # point it at the C bookkeeping so asyncio.timeout() inside it finds its task.
         for which in ("enter", "leave"):
@@ -509,11 +542,12 @@ async def test_no_waiter_task_type_strands_no_more_than_before_5686(
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await pool.unstick()
-    if not _NO_WAITER_STRANDS_BEFORE_5686[(path, order)]:
+    reads_waiter = task_type == "pure-python"
+    if reads_waiter or not _NO_WAITER_STRANDS_BEFORE_5686[(path, order)]:
         assert stranded == [], f"{path}, {order}: stranded={stranded}, released={released}"
     if not stranded and issued:
         assert released == ["conn-1"], f"{path}, {order}: released={released}"
-    assert "_fut_waiter" in caplog.text
+    assert ("_fut_waiter" in caplog.text) is not reads_waiter
 
 
 @pytest.mark.parametrize("late_turn", [13, 14, 15])

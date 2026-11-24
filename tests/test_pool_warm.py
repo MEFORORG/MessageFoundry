@@ -272,8 +272,8 @@ async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing(
     cancel_first: bool,
 ) -> None:
     # Both orders within one turn. Cancel-first is the one that pins the held-back borrow cancel
-    # (_cancel_borrow): an immediate borrow.cancel() there would find the hand-off resolved and throw
-    # the cancel in. tests/test_pool_borrow_cancel_race.py covers the other turn orders.
+    # (_cancel_borrow): an immediate borrow.cancel() there would find the hand-off resolved and
+    # throw the cancel in. tests/test_pool_borrow_cancel_race.py covers the other turn orders.
     pool = _HandOffPool()
     task = asyncio.create_task(warm_pool_connections(pool, target=1, timeout=5.0, backend="stub"))
     await _settle()

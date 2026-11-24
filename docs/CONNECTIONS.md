@@ -4929,8 +4929,13 @@ Facts that are easy to get wrong, stated plainly first:
   so the borrow never ends holding it and nothing releases it. The shapes are named in the
   docstrings of `_cancel_borrow` and `_value_in_flight` in `messagefoundry/store/base.py`; they
   include at least a driver that keeps polling with bare yields past the bounded deferral, a shield
-  or other combinator inside the driver, and a borrow that is, or waits on, a task without
-  CPython's `_fut_waiter`. For a `DatabaseRef` sync the
+  or other combinator inside the driver, and a borrow that is, or waits on, a task whose
+  `_fut_waiter` attribute the check cannot read: the attribute is missing, or holds something that
+  is not a future. The check reads `_fut_waiter` on any task type that exposes it, whether or not
+  the type subclasses `asyncio.Task`. Where it cannot read the borrow or an `asyncio.Task` the
+  borrow waits on, each caller falls back to its cancel from before BACKLOG #5686 and one WARNING
+  is logged; a waited-on task that neither subclasses `asyncio.Task` nor exposes the attribute is
+  cancelled at once with no WARNING. For a `DatabaseRef` sync the
   set fails like any other source failure — the last-good snapshot keeps serving reads and the
   AlertSink fires; because the runner walks the declared sets sequentially, this bound is also what
   stops one unresponsive reference server from stalling every *other* set's refresh.
