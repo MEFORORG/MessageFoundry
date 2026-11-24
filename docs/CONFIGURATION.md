@@ -1444,8 +1444,11 @@ that carries the request's id can instead be taken as the message's result; see 
 paragraph below.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
-on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
-gets neither the alert nor the runner's line. The line says the worker was `killed`, or that it `exited` for a cause recorded
+on a graph refusal from the worker's session still serving, against a graph equal to the one the
+engine serves. A refusal overtaken by a reload or its rollback gets neither the alert nor the
+runner's line, even when the reload re-applies the same registry: the message runs again, and the
+rerun's refusal, if the cause stands, raises the alert (BACKLOG #6830; step 4 under the graph
+refusal below says when the message does not run again). The line says the worker was `killed`, or that it `exited` for a cause recorded
 only once the worker is seen gone (a crash, an exit during boot or right after it), which may still be
 a signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
 POSIX a `WARNING` naming the inbound and the pid says a worker that was already reaped could not have
@@ -1572,9 +1575,11 @@ other module bytes than the engine loaded:
    worker for the next message, which is compared again. A reload refused before it swaps the
    graph keeps the worker's session and its refusal, so later messages are still refused from it,
    with no new comparison and no new alert. A refusal still in progress when a reload or its
-   rollback replaces the worker is neither alerted nor failed: the message runs again on a fresh
-   worker, at once or after it is re-pended, and that worker's refusal, if the cause stands,
-   raises the alert. Each other inbound's worker is compared when it starts,
+   rollback replaces the worker is neither alerted nor failed: the message is retried at once on a
+   fresh worker, or re-pended, and the refusal of the worker it next runs on, if the cause stands,
+   raises the alert. A re-pended message does not always run again: at least a row whose inbound
+   the reload removed never runs, and on a pooled lane repeated re-pends count as infrastructure
+   faults toward `infra_fault_stop_after`, which can stop the lane. Each other inbound's worker is compared when it starts,
    and each one refused raises its own alert. A reload that does not clear the cause raises the
    alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.
