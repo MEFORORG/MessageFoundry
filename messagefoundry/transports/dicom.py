@@ -505,8 +505,14 @@ class _Shape(NamedTuple):
     with the same value in it. ``anchor_required`` is for a head this general: it counts only in a
     line that holds ``anchor``. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
     it, so a long value costs one pass, on whatever thread logged it. A ``warning`` pattern can
-    backtrack over the value: ``.*`` gives text back one character at a time. Each is matched from
-    the start of the warning with at most one such run, so its cost stays linear in the text."""
+    backtrack over the value: ``.*`` gives text back one character at a time. Each holds at most
+    one such run, and ``warnings`` tries each only from the start of the warning (``re.match``),
+    so there its cost stays linear in the text. That rests on ``re.match``: under ``re.search``
+    at least three of them are quadratic. The test that guards these patterns flags only a leading
+    ``.*`` with a second unbounded run after it, so nothing checks the one-run rule as a whole.
+    CORRECTED 2026-11-23 (BACKLOG #8348 item 8): this read "Each is matched from the start of the
+    warning with at most one such run, so its cost stays linear in the text", which named neither
+    the ``re.match`` it rests on nor how little the test checks."""
 
     head: re.Pattern[str]
     anchor: str | None = None

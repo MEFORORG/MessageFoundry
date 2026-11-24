@@ -2873,8 +2873,11 @@ class RemoteFileSource(SourceConnector):
         self._size_held: dict[str, tuple[_HeldRead, int]] = {}
         self._error_dir_asked = False  # this poll already asked for error_subdir (leave mode)
         # Retrieves begun, ever. _retry_stuck lists again only when this count has moved since its
-        # listing, so a listing that aged with elapsed time alone (a slow ledger read, a quarantine
-        # move, a store call) is NOT taken again.
+        # listing. A listing that aged with elapsed time alone (a slow ledger read, a quarantine
+        # move, a store call) is not listed again, and a retry slot is judged on it as it stands.
+        # CORRECTED 2026-11-23 (BACKLOG #8349 item 1): the last sentence read "so a listing that
+        # aged with elapsed time alone (...) is NOT taken again", which can read as that listing
+        # not being used.
         self._retrieves = 0
         # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
         # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
