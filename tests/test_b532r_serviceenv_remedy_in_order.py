@@ -42,6 +42,7 @@ _KEY = KEY_CLASS_NAMES[0]
 _RETIRED = "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"
 assert _RETIRED in KEY_CLASS_NAMES and _KEY != _RETIRED
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-for-tests-01").decode()
+_KEY_B64_2 = base64.b64encode(b"synthetic-store-key-for-tests-02").decode()
 _NEW_DIRECTORY = "C:\\synthetic-secrets"
 
 
@@ -141,6 +142,28 @@ def _take_out(string: str, refused: frozenset[str], *, with_value: bool) -> list
     return kept
 
 
+def _readings(
+    entries: list[tuple[str, str]], refused: frozenset[str]
+) -> frozenset[tuple[str, str, str]]:
+    """How the engine's own reader reads each refused variable in ``entries``: its registry
+    value, its upper-cased name and its value, line breaks written as one ``\\n``."""
+    return frozenset(
+        (v.where, v.written.strip().upper(), _LINE_BREAK.sub("\n", v.value))
+        for v in _variables(entries)
+        if v.written.strip().upper() in refused
+    )
+
+
+def _value_lines(entries: list[tuple[str, str]], refused: frozenset[str]) -> frozenset[str]:
+    """Every non-blank line of each refused variable's value as the reader reads it."""
+    return frozenset(
+        line.strip()
+        for _where, _name, value in _readings(entries, refused)
+        for line in value.split("\n")
+        if line.strip()
+    )
+
+
 def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -> None:
     """Take each line that may set the directory out of every list, as the step says, and pass
     back what its pass-back clause says to pass back."""
@@ -149,6 +172,9 @@ def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -
     leave = (
         "leave as it is each string that holds a refused variable or that a refused" in text.lower()
     )
+    # Since the Lander's hold on PR 3142, comment 7119680463, item 3: also each string whose
+    # take-out would change how the engine reads a refused variable.
+    rejoin = "whose take-out would change how the engine reads a refused variable" in text
     with_value = (
         "each line below it in its string that the engine reads as part of its value" in text
     )
@@ -163,20 +189,26 @@ def _apply_doubt_step(text: str, registry: _Registry, refused: frozenset[str]) -
         also_removed = True
     else:
         raise AssertionError(f"no pass-back clause the walk knows: {text!r}")
+    before = _readings(registry.entries, refused)
     kept: list[tuple[str, str]] = []
-    for where, string in registry.entries:
+    for index, (where, string) in enumerate(registry.entries):
         if also_removed and string in registry.runs_on_into:
-            continue
-        if leave and (string in registry.runs_on_into or _holds_refused(string, refused)):
-            kept.append((where, string))
             continue
         lines = [
             line
             for line in _take_out(string, refused, with_value=with_value)
             if not (also_removed and _names_refused(line, refused))
         ]
-        if any(line.strip() for line in lines):
-            kept.append((where, "\n".join(lines)))
+        taken = [(where, "\n".join(lines))] if any(line.strip() for line in lines) else []
+        if leave and (string in registry.runs_on_into or _holds_refused(string, refused)):
+            kept.append((where, string))
+            continue
+        if rejoin:
+            alone = [*registry.entries[:index], *taken, *registry.entries[index + 1 :]]
+            if _readings(alone, refused) != before:
+                kept.append((where, string))
+                continue
+        kept.extend(taken)
     registry.entries = kept
 
 
@@ -206,8 +238,20 @@ def _follow_installer_clause(
     # value the next step puts in the secrets directory, which no store key is.
     every_line = "every line it holds" in clause or "every line they hold" in clause
     # Since code review on that repair, with each string a refused value in it runs on into.
-    with_run_on = "and of each string a refused value in it runs on into" in clause
-    add_back = "add each other line back as an entry of its own" in clause
+    with_run_on = (
+        "and of each string a refused value in it runs on into" in clause
+        or "and of each string a refused value in these runs on into" in clause
+    )
+    # Since the Lander's hold on PR 3142, comment 7119680463, item 3: also each string holding a
+    # refused variable that removing the installer's string would read differently.
+    with_changed = "whose reading removing that string would change" in clause
+    # Before that hold, item 1, each other line; since, none that is part of a refused value,
+    # which the walk takes as every line of each refused value as the reader reads it.
+    add_back = (
+        "add each other line back as an entry of its own" in clause
+        or "add back as an entry of its own each other line" in clause
+    )
+    by_reading = "none that is part of a refused value" in clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -218,6 +262,8 @@ def _follow_installer_clause(
             for name in refused
             if name not in registry.moved and registry.readable(name, moves[name])
         }
+        value_lines = _value_lines(registry.entries, refused)
+        was_read = _readings(registry.entries, refused)
         index = registry.entries.index((where, string))
         removed = [registry.entries.pop(index)]
         while (
@@ -227,6 +273,24 @@ def _follow_installer_clause(
             and registry.entries[index][1] in registry.runs_on_into
         ):
             removed.append(registry.entries.pop(index))
+        if with_changed:
+            now_read = _readings(registry.entries, refused)
+            changed = frozenset(name for _w, name, _v in was_read ^ now_read)
+            # Each string of this list holding such a variable, and each string its value runs on
+            # into, which the clause has read out with it.
+            at = 0
+            taking = False
+            while at < len(registry.entries):
+                entry_where, entry = registry.entries[at]
+                taking = entry_where == where and (
+                    _holds_refused(entry, changed) or (taking and entry in registry.runs_on_into)
+                )
+                if not taking:
+                    at += 1
+                    continue
+                removed.append(registry.entries.pop(at))
+                if at < index:
+                    index -= 1
         lost = {name for name in holders if not registry.readable(name, moves[name])}
         # Read out only where its value was in a string the operator read, not left behind.
         read = {name for name in lost if any(moves[name] in text for _w, text in removed)}
@@ -247,7 +311,11 @@ def _follow_installer_clause(
                 for line in _LINE_BREAK.split(text)
                 if line.strip()
                 and not _names_refused(line, refused)
-                and not any(secret in line for secret in moves.values())
+                and not (
+                    line.strip() in value_lines
+                    if by_reading
+                    else any(secret in line for secret in moves.values())
+                )
                 and not ("but none that may set" in clause and _may_name_directory(line))
             ]
             registry.entries[index:index] = [(where, line) for line in others]
@@ -470,6 +538,46 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_A": "SEKA"},
         False,
     ),
+    # The Lander's hold on PR 3142, comment 7119680463, item 1: an empty retired key runs on into
+    # an installer string whose value is a list of two keys on two lines. The clause bounds a
+    # refused value's lines by the doubt step's rule, so the second key is not added back.
+    "retired-key-list-on-two-lines-in-an-installer-string": (
+        [
+            (_EXTRA, "MEFOR_VALUE_A=SEKRITvalueA"),
+            (_EXTRA, f"{_RETIRED}="),
+            (_EXTRA, f"mefor_secrets_directory={_KEY_B64},\n{_KEY_B64_2}"),
+        ],
+        frozenset({f"mefor_secrets_directory={_KEY_B64},\n{_KEY_B64_2}"}),
+        {_RETIRED: _KEY_B64, "MEFOR_VALUE_A": "SEKRITvalueA"},
+        False,
+    ),
+    # The same hold, item 3: taking out a string that only sets the directory would join an empty
+    # password above it to a name written alone below it, which then reads as the password's
+    # value, so the doubt step leaves it as it is, and the clause takes that name's strings with it.
+    "directory-string-between-an-empty-key-and-a-name-alone": (
+        [
+            (_EXTRA, "MEFOR_STORE_PASSWORD="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d"),
+            (_EXTRA, "MEFOR_VALUE_B"),
+            (_EXTRA, "SEKRITb"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"SEKRITb"}),
+        {"MEFOR_VALUE_B": "SEKRITb"},
+        False,
+    ),
+    "directory-string-between-an-empty-key-and-a-name-alone-directory-exists": (
+        [
+            (_EXTRA, "MEFOR_STORE_PASSWORD="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\d"),
+            (_EXTRA, "MEFOR_VALUE_B"),
+            (_EXTRA, "SEKRITb"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"SEKRITb"}),
+        {"MEFOR_VALUE_B": "SEKRITb"},
+        True,
+    ),
 }
 
 
@@ -491,10 +599,30 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     assert registry.installer_read == []
     # Only a value the clause had read out before its string went is not read at the Put step.
     assert registry.read_out == _READ_OUT.get(case, set())
+    # The Lander's hold on PR 3142, comment 7119680463, item 1: no line of a refused value is
+    # left in the lists but one a refused variable still holds, for the removal step to take.
+    assert _refused_text_left(entries, registry.entries, frozenset(moves)) == []
+
+
+def _refused_text_left(
+    entries: list[tuple[str, str]], now: list[tuple[str, str]], refused: frozenset[str]
+) -> list[str]:
+    """Each line of ``now`` that was a line of a refused value in ``entries``, as the reader read
+    it, and that neither names a refused variable nor is a line of one's value in ``now``."""
+    was = _value_lines(entries, refused)
+    held = _value_lines(now, refused)
+    return [
+        line
+        for _where, string in now
+        for line in _LINE_BREAK.split(string)
+        if line.strip() in was and line.strip() not in held and not _names_refused(line, refused)
+    ]
 
 
 #: The values the create step's installer clause has the operator read out, by case.
 _READ_OUT = {
+    "retired-key-list-on-two-lines-in-an-installer-string": {_RETIRED},
+    "directory-string-between-an-empty-key-and-a-name-alone": {"MEFOR_VALUE_B"},
     "password-runs-on-into-an-installer-string": {"MEFOR_STORE_PASSWORD"},
     "value-name-alone-above-an-installer-string": {"MEFOR_VALUE_A"},
     "retired-key-runs-on-into-an-installer-string": {_RETIRED},

@@ -1430,7 +1430,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # taking it out may
         # take that value too, a store key among them, so the strings holding a refused variable
         # or its run-on are left as they are until the step that removes that variable (code
-        # review round 1 on this repair).
+        # review round 1 on this repair), and so is a string whose take-out would join its
+        # neighbours into another reading of one (the Lander's hold on PR 3142, comment
+        # 7119680463, item 3).
         steps.append(
             f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
             "plainly to a path under that name, in ASCII with no blank around it, so first, "
@@ -1452,8 +1454,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             + (
                 ". Leave as it is each string that holds a refused variable or that a refused "
                 "variable's value runs on into, since a line there that may set "
-                f"{_DIRECTORY_VARIABLE} may be part of that value, until a step below removes "
-                "that variable, then take such lines out with it"
+                f"{_DIRECTORY_VARIABLE} may be part of that value, and each string whose take-out "
+                "would change how the engine reads a refused variable, such as one between a "
+                "refused name set to nothing and the string below it, which the take-out may "
+                "join, until a step below removes that variable, then take such lines out with it"
                 if posture.directory_in_refused
                 else ""
             )
@@ -1494,7 +1498,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # into with it, so no value is left behind unnamed, and it has the list written back as
         # the first step says, since the other refused values are still in it (code review on
         # that repair). A line that may set the directory is not added back, so the installer
-        # still finds none to read.
+        # still finds none to read, and nor is a line of a refused value, which the clause bounds
+        # by the doubt step's own rule, so no key line split below another is left in the lists
+        # once the refusal stops naming it; it also takes the strings whose refused variables
+        # removing that string would read differently, so none is lost to a rejoin (the Lander's
+        # hold on PR 3142, comment 7119680463, items 1 and 3).
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
@@ -1509,13 +1517,18 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                     f"and starts with {_DIRECTORY_VARIABLE}= in any letter case, "
                     "install-service.ps1, which `messagefoundry service install` also runs, may "
                     "read that string as the directory the service names and print it, and drops "
-                    "it whole, so before you run the installer read out of that string, and of "
-                    "each string a refused value in it runs on into, every line they hold, remove "
-                    "those strings with each refused variable whose value they hold, put each "
-                    "refused value you read where the other steps say, keep a retired key for the "
-                    "shell that runs `messagefoundry rotate-key`, and add each other line back as "
-                    f"an entry of its own, but none that may set {_DIRECTORY_VARIABLE}, writing "
-                    "the list back as the first step says"
+                    "it whole, so before you run the installer read out of that string, of each "
+                    "string that holds a refused variable whose reading removing that string "
+                    "would change, and of each string a refused value in these runs on into, "
+                    "every line they hold, remove those strings with each refused variable whose "
+                    "value they hold, put each refused value you read where the other steps say, "
+                    "keep a retired key for the shell that runs `messagefoundry rotate-key`, and "
+                    "add back as an entry of its own each other line, but none that may set "
+                    f"{_DIRECTORY_VARIABLE} and none that is part of a refused value: a line "
+                    "below a refused name set to nothing, or below a line of a refused value, up "
+                    "to the next that names a refused variable or sets another variable as the "
+                    f"first step says, which a line that may set {_DIRECTORY_VARIABLE} never "
+                    "does, writing the list back as the first step says"
                 )
             steps.append(create)
         put = [", ".join(moving_others)] if moving_others else []

@@ -121,11 +121,16 @@ NO_COMMAND_LINE = "No refused value may be typed on a command line"
 #: holding a refused variable or its run-on stay as they are until the step that removes it,
 #: since such a line may be part of its value, a store key among them (code review round 1 on
 #: the repair of PR 3142's round-3 open findings 1 and 2; its own sentence, after the take-out
-#: it qualifies, under the Lander's hold on PR 3142, comment 7116005396, F5).
+#: it qualifies, under the Lander's hold on PR 3142, comment 7116005396, F5). It also leaves a
+#: string whose take-out would join its neighbours into another reading of a refused variable
+#: (the Lander's hold on PR 3142, comment 7119680463, item 3).
 DOUBT_LEAVE = (
     ". Leave as it is each string that holds a refused variable or that a refused variable's "
     "value runs on into, since a line there that may set MEFOR_SECRETS_DIRECTORY may be part of "
-    "that value, until a step below removes that variable, then take such lines out with it"
+    "that value, and each string whose take-out would change how the engine reads a refused "
+    "variable, such as one between a refused name set to nothing and the string below it, which "
+    "the take-out may join, until a step below removes that variable, then take such lines out "
+    "with it"
 )
 
 #: DOUBT_STEP as printed where DOUBT_LEAVE applies.
@@ -200,17 +205,23 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: operator read every line out before removing the string, since the registry may hold its
 #: only copy, a retired store key among them, which protect-key never stores (code review round
 #: 1 on the repair of PR 3142's round-3 open findings 1 and 2; the Lander's hold on PR 3142,
-#: comment 7116005396, F1).
+#: comment 7116005396, F1). It adds back no line of a refused value, bounded by the doubt step's
+#: rule, and reads out each string whose refused variable removing that string would read
+#: differently (the Lander's hold on PR 3142, comment 7119680463, items 1 and 3).
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "
     "service install` also runs, may read that string as the directory the service names and "
-    "print it, and drops it whole, so before you run the installer read out of that string, and "
-    "of each string a refused value in it runs on into, every line they hold, remove those "
-    "strings with each refused variable whose value they hold, put each refused value you read "
-    "where the other steps say, keep a retired key for the shell that runs `messagefoundry "
-    "rotate-key`, and add each other line back as an entry of its own, but none that may set "
-    "MEFOR_SECRETS_DIRECTORY, writing the list back as the first step says"
+    "print it, and drops it whole, so before you run the installer read out of that string, of "
+    "each string that holds a refused variable whose reading removing that string would change, "
+    "and of each string a refused value in these runs on into, every line they hold, remove "
+    "those strings with each refused variable whose value they hold, put each refused value you "
+    "read where the other steps say, keep a retired key for the shell that runs `messagefoundry "
+    "rotate-key`, and add back as an entry of its own each other line, but none that may set "
+    "MEFOR_SECRETS_DIRECTORY and none that is part of a refused value: a line below a refused "
+    "name set to nothing, or below a line of a refused value, up to the next that names a "
+    "refused variable or sets another variable as the first step says, which a line that may "
+    "set MEFOR_SECRETS_DIRECTORY never does, writing the list back as the first step says"
 )
 
 #: How the Put step names the directory wherever a directory entry is in doubt, since the doubt
