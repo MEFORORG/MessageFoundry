@@ -300,6 +300,28 @@ def test_the_rate_limb_is_inside_sixty_minutes_and_before_the_reset(
         assert f"run out in about {to_empty} min" in why(doc)
 
 
+@pytest.mark.parametrize("kind", ["guarded", "unguarded"])
+def test_a_no_reset_refused_rate_hit_names_the_rate_it_used(sb: Sandbox, kind: str) -> None:
+    """BACKLOG #5494. With no reset, the fallback rate projects a run-out inside the rung and the gate
+    halts on it. Its reason names the rate usage.ps1 fell back on, guarded or unguarded."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(
+            50.0,
+            state="UNKNOWN",
+            rate_refused="synthetic refusal",
+            rate_fallback=kind,
+            rate_pct_per_hr=50.0,
+            minutes_to_empty=30,
+            minutes_to_reset=None,
+        ),
+    )
+    code, doc = gate(sb)
+    assert code == HALT, why(doc)
+    assert f"the history's {kind} rate projects" in why(doc), why(doc)
+
+
 @pytest.mark.parametrize("rate", [0.0, -1.0], ids=["flat", "falling"])
 def test_a_rate_of_zero_or_below_counts_as_no_rate(sb: Sandbox, rate: float) -> None:
     """It must not lift the 90 percent backstop: usage does not fall inside a reset period, so such

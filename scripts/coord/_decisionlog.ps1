@@ -1048,8 +1048,10 @@ function Get-DecisionCostRung {
     if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused')) {
         $uRate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
         $uEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
+        $uKind = [string](Get-DecisionJsonValue $week 'rate_fallback')
+        if ($uKind -notin @('guarded', 'unguarded')) { $uKind = 'unguarded' }
         if ($null -ne $uRate -and [double]$uRate -gt 0 -and $null -ne $uEmpty -and [double]$uEmpty -le $lv.HoldMin -and ($null -eq $toReset -or [double]$uEmpty -lt [double]$toReset)) {
-            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldMin) min to cutoff, from $($lv.Source). usage.ps1 refused the burn rate, but the history's unguarded rate projects a run-out in about $uEmpty min")
+            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldMin) min to cutoff, from $($lv.Source). usage.ps1 refused the burn rate, but the history's $uKind rate projects a run-out in about $uEmpty min")
         }
         if ([double]$pct -ge $lv.HoldAt) {
             return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldAt)% with no rate, from $($lv.Source). usage.ps1 refused the burn rate, so the level is the backstop, and it is reached")

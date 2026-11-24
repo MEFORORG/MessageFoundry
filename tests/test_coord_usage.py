@@ -1562,6 +1562,7 @@ def test_one_tick_under_the_minimum_keeps_mains_run_out(
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, rel=0.2), d
     assert "minimum" in d["seven_day"]["rate_refused"], d
     assert "unguarded rate" in d["seven_day"]["reason"], d
+    assert d["seven_day"]["rate_fallback"] == "unguarded", d
 
 
 def test_two_ticks_under_the_minimum_are_never_calmer_than_main(tmp_path: Path) -> None:
@@ -1785,6 +1786,23 @@ def test_a_guarded_rate_main_never_saw_keeps_the_level_backstop(tmp_path: Path) 
     assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
     assert "unguarded read" in d["seven_day"]["rate_refused"], d
     assert d["seven_day"]["rate_pct_per_hr"] is None, d
+
+
+def test_a_guarded_fallback_is_named_guarded_in_the_reason(tmp_path: Path) -> None:
+    """BACKLOG #5494. Main saw only 450 flat rows of another root's, so the rising rate it falls back on
+    here is this root's own guarded one. The reason must name that rate, not the unguarded one."""
+    root = tmp_path / "root"
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 7200
+    publish(state, seven=84.0, seven_epoch=epoch)
+    _stamp(state, root)
+    write_history(state, [(85.0, 70.0), (2.0, 84.0)], epoch)
+    _foreign_rows(state, root, 450, 10.0, epoch)
+    code, d = read(state)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+    assert d["seven_day"]["rate_fallback"] == "guarded", d
+    assert "guarded rate" in d["seven_day"]["reason"], d
+    assert "unguarded rate" not in d["seven_day"]["reason"], d
 
 
 def test_an_unset_collector_after_a_pinned_one_of_the_same_root_does_not_duplicate(

@@ -339,7 +339,7 @@ $RateMinSpanMinutes = 1.0
 # burn into a clear level. Past the bound, too few of this root's rows is a refusal, never no rate.
 $RateTailLines = 400
 $RateMaxTailLines = 6400
-function New-RateRefusal([string]$Why) { [pscustomobject]@{ PctPerHour = $null; Refused = $Why; Note = $null; Fallback = $null } }
+function New-RateRefusal([string]$Why) { [pscustomobject]@{ PctPerHour = $null; Refused = $Why; Note = $null; Fallback = $null; FallbackKind = $null } }
 
 # MAIN'S RATE, KEPT AS A FLOOR UNDER EVERY GUARD ABOVE (BACKLOG #5494). The guards in Get-GuardedRate
 # refuse or reshape rows that main read as a rate, and a refusal or a calmer number must not turn a stop
@@ -372,7 +372,7 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
     if (-not (Test-Path -LiteralPath $histPath)) { return $null }
     $guarded = Get-GuardedRate -CurrentResetEpoch $CurrentResetEpoch -ReadRoot $ReadRoot
     $main = Get-MainRate -CurrentResetEpoch $CurrentResetEpoch
-    if ($guarded.Refused) { $guarded.Fallback = $main; return $guarded }
+    if ($guarded.Refused) { $guarded.Fallback = $main; $guarded.FallbackKind = 'unguarded'; return $guarded }
     if ($null -eq $main -or $main -le 0) {
         # MAIN HAD NO RISING RATE, SO ITS LEVEL BACKSTOP STOOD, and a small positive guarded rate would lift
         # it, turning main's HIT at the level into OK. So a rising guarded rate main did not see, from rows
@@ -382,6 +382,7 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
             $r = New-RateRefusal "this root's history rows give a rising rate that the unguarded read of the last 400 rows does not, so it is not taken as a measured rate"
             $r.Note = $guarded.Note
             $r.Fallback = $guarded.PctPerHour
+            $r.FallbackKind = 'guarded'
             return $r
         }
         return $guarded
@@ -393,6 +394,7 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
         $r = New-RateRefusal "this root's history rows give no rising rate, but the unguarded read of the history, which counts rows stamped with another root, climbs, so no rate of this root's from them"
         if ($guarded) { $r.Note = $guarded.Note }
         $r.Fallback = $main
+        $r.FallbackKind = 'unguarded'
         return $r
     }
     if ($main -gt $guarded.PctPerHour) { $guarded.PctPerHour = $main }
@@ -849,6 +851,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         # Why the history rows gave no rate on a FRESH reading, or $null. See Get-Rate. A stale reading's
         # refusal goes in its reason only, so Get-DecisionCostRung can read this as "fresh, level only".
         rate_refused     = $null
+        rate_fallback    = $null
         projected_at_reset = $null
         minutes_to_empty = $null
         # Set only on a reading past -MaxAgeMinutes with its reset ahead and inside one 7-day window, and
@@ -930,7 +933,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # CRITICAL and the gate can still halt on it. Short of CRITICAL the refusal below reads UNKNOWN and
     # clears the fallback's numbers, which measure nothing this reader trusts.
     $useRate = $null
-    if ($rate.Refused) { $o.rate_refused = $rate.Refused; $useRate = $rate.Fallback }
+    if ($rate.Refused) { $o.rate_refused = $rate.Refused; $o.rate_fallback = $rate.FallbackKind; $useRate = $rate.Fallback }
     elseif ($rate) { $useRate = $rate.PctPerHour }
     if ($null -ne $useRate) {
         $o.rate_pct_per_hr = $useRate
@@ -977,7 +980,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     }
     # CRITICAL ON MAIN'S RATE, the guarded one refused: rate_refused stays set, so the gate halts where
     # main halted and reviews, rather than clears, where the run-out falls outside its rung.
-    elseif ($o.rate_refused -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason), by the history's unguarded rate; $($o.rate_refused)" }
+    elseif ($o.rate_refused -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason), by the history's $($o.rate_fallback) rate; $($o.rate_refused)" }
     if ($rate.Note) { $o.reason = if ($o.reason) { "$($o.reason); $($rate.Note)" } else { $rate.Note } }
 
     # A READING DATED AFTER NOW CAN STOP WORK AND CANNOT CLEAR IT. Nothing proves when it was taken, so it
