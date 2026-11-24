@@ -1988,7 +1988,7 @@ async def test_a_generator_exit_in_the_cleanup_wait_still_forces_the_release() -
     assert forced == ["forced"]
 
 
-async def test_a_cleanup_that_ends_cancelled_is_logged_as_released(caplog) -> None:
+async def test_a_cleanup_that_ends_cancelled_is_logged_as_a_forced_release(caplog) -> None:
     """BACKLOG #5720, open item 5: a cleanup that ended cancelled was logged at ERROR as one whose
     work "may not have been released", though the forced release then ran. The line now says the
     release ran. Red before the fix: the ERROR line."""

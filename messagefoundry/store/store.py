@@ -2200,8 +2200,9 @@ def _forced_outcome(
 ) -> str:
     """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
     names what was to be released, and ``left`` what follows when nothing released it. A release
-    that ran is not said to have released everything: on SQL Server it only marks the pool
-    closing, and on SQLite a statement that ignores the interrupt keeps its worker running."""
+    that ran is not said to have released everything: on SQL Server it marks the pool closing and
+    shuts its executor down, which leaves the pool's free connections open, and on SQLite a
+    statement that ignores the interrupt keeps its worker running."""
     if released:
         return f"a forced release of {built} ran without waiting for it"
     if force_release is None:
@@ -2308,8 +2309,8 @@ async def cleanup_failed_open(
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
     The bound starts at once when the open's own end was a cancel, or a cancel this open received
     under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
-    the bound, ``force_release`` drops what the open built without waiting, and this stops
-    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    the bound, ``force_release`` runs without waiting, which need not release everything the open
+    built (see :func:`_forced_outcome`), and this stops waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
@@ -2404,7 +2405,7 @@ async def cleanup_failed_open(
                 break
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
-        # the read pool included: drop it without waiting (BACKLOG #5720).
+        # the read pool included: force its release without waiting (BACKLOG #5720).
         released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
         left = _forced_outcome(force_release, released)
@@ -14074,6 +14075,8 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the connections' worker threads stay running; this close is not cancel-safe.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:

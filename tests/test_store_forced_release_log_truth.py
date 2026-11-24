@@ -84,7 +84,7 @@ async def test_a_failed_cleanup_whose_forced_release_failed_does_not_say_it_rele
 async def test_a_cleanup_whose_forced_release_worked_still_says_so(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Control: a forced release that returned is still reported as a release."""
+    """Control: a forced release that returned is reported as having run, not as "released"."""
     released: list[str] = []
 
     async def failing_release() -> None:
@@ -99,7 +99,7 @@ async def test_a_cleanup_whose_forced_release_worked_still_says_so(
         )
     assert released == ["forced"]
     assert "a forced release of what it had not closed ran without waiting for it" in caplog.text
-    assert "was released" not in caplog.text  # finding 5a: a release that ran is not "released"
+    assert "was released" not in caplog.text  # review round-0cfaa45b25, finding 2
 
 
 def _warnings_from_the_bound(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
