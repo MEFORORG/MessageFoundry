@@ -3515,16 +3515,22 @@ _UNSET_CHAIN_CHECK = (
 
 
 def refuse_chain_check_on_os_roots(
-    anchor: TrustAnchor, *, ech_sidecar: bool = False, cleartext: bool = False
+    anchor: TrustAnchor,
+    *,
+    ech_sidecar: bool = False,
+    cleartext: bool = False,
+    connection_kind: str = "REST connection",
 ) -> None:
     """Refuse ``[tls].crl_check_chain`` on a hop that trusts the OS roots (vault BACKLOG #5511).
 
     It refuses at build, with a remedy, rather than leave the gap to a handshake. The reason is
     :data:`OS_ROOTS_CHAIN_CHECK_REASON`, stated there once.
 
-    ``ech_sidecar`` and ``cleartext`` word it for a REST connection that makes no TLS connection
-    to the partner of its own: one with an ``ech_sidecar``, where the sidecar makes it and the
-    engine sends to the sidecar on a plain loopback opener, and one whose url is ``http``. The
+    ``ech_sidecar`` and ``cleartext`` word it for a connection that makes no TLS connection to
+    the partner of its own: a REST connection with an ``ech_sidecar``, where the sidecar makes
+    it and the engine sends to the sidecar on a plain loopback opener, and an HTTP-family
+    connection (REST, SOAP, FHIR, a FhirLookup, DICOMweb) whose url is ``http``, which names
+    itself in ``connection_kind``. The
     engine still resolves a trust anchor for each and builds an https handler on it, so the
     refusal still fires, but no ``[tls]`` CRL is checked against the partner, leaf or chain, and
     pinning the hop would not make one be. Their refusal says so, and names settings that clear
@@ -3548,7 +3554,8 @@ def refuse_chain_check_on_os_roots(
             else "has an http url, so it sends to the partner without TLS"
         )
         raise ValueError(
-            f"[tls].crl_check_chain is set, and this REST connection {no_partner_tls}. So no "
+            f"[tls].crl_check_chain is set, and this "
+            f"{'REST connection' if ech_sidecar else connection_kind} {no_partner_tls}. So no "
             "CRL in [tls].crl_file is checked against the partner on this connection, leaf or "
             "chain, whatever its CA setting. The engine still builds an https handler for this "
             f"connection from its trust anchor, which is {arm}, and refuses the whole-chain "

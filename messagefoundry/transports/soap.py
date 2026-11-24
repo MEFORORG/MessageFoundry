@@ -86,6 +86,7 @@ from messagefoundry.config.tls_policy import (
     harden_cipher_suites,
     hop_name_prefix,
     narrow_to_approved_suites,
+    refuse_chain_check_on_os_roots,
     relax_verify_expiry,
 )
 from messagefoundry.keywrap import load_checked_cert_chain
@@ -856,6 +857,12 @@ class SoapDestination(DestinationConnector):
             s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
         )
         verify = bool_setting(s, "verify_tls", default=True)
+        if scheme == "http" and (verify or (self.client_cert_file and self.client_key_file)):
+            # The same refusal for an http url, worded so it does not say the hop verifies its
+            # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+            refuse_chain_check_on_os_roots(
+                anchor, cleartext=True, connection_kind="SOAP connection"
+            )
         if self.client_cert_file and self.client_key_file:  # NEW — mutual TLS, takes precedence
             self._opener: urllib.request.OpenerDirector = _client_cert_opener(
                 self.client_cert_file,

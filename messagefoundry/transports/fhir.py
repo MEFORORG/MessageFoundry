@@ -72,7 +72,11 @@ from messagefoundry.config.models import (
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
-from messagefoundry.config.tls_policy import InsecureHopRefused, TrustAnchorPolicy
+from messagefoundry.config.tls_policy import (
+    InsecureHopRefused,
+    TrustAnchorPolicy,
+    refuse_chain_check_on_os_roots,
+)
 from messagefoundry.connection_names import fhir_lookup_record_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.fhirsearch import FhirSearchParams, resolve_search_pairs
@@ -1317,6 +1321,12 @@ class FhirDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
             )
+            if scheme == "http":
+                # The same refusal for an http url, worded so it does not say the hop verifies its
+                # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                refuse_chain_check_on_os_roots(
+                    anchor, cleartext=True, connection_kind="FHIR connection"
+                )
             if allow_expired:
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.base_url).hostname or "",
@@ -2146,6 +2156,12 @@ class FhirLookupExecutor:
                     trust_anchor_policy=trust_anchor_policy,
                     cell=f"FhirLookup {cname!r}",
                 )
+                if scheme == "http":
+                    # The same refusal for an http url, worded so it does not say the hop verifies its
+                    # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                    refuse_chain_check_on_os_roots(
+                        lookup_anchor, cleartext=True, connection_kind=f"FhirLookup {cname!r}"
+                    )
                 self._opener[cname] = (
                     _no_redirect_opener(*proxy_handlers, trust_anchor=lookup_anchor)
                     if proxy_handlers or lookup_anchor.narrows

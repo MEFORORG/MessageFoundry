@@ -1840,8 +1840,8 @@ and neither does a REST connection whose url is `http`, which sends to the partn
 With `verify_tls` on, each still builds an https handler from its trust anchor, so on the `system`
 and `augment` arms it is refused too, with wording that says no CRL is checked against the partner
 and offers no way to chain-check the partner. An `http` connection whose forward proxy is `https`
-does make a TLS connection, to the proxy, on that handler. A SOAP, FHIR or DICOMweb connection
-whose url is `http` still gets the generic refusal. LDAPS, OIDC, the log forwarder and the Postgres store, which
+does make a TLS connection, to the proxy, on that handler. A SOAP, FHIR, FhirLookup or DICOMweb
+connection whose url is `http` gets the same refusal wording as an `http` REST connection. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.
 
 Pinned by `tests/test_outbound_crl_chain.py`.

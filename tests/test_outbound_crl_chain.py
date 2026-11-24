@@ -38,10 +38,11 @@ from messagefoundry.config.tls_policy import (
     resolve_trust_anchor,
     urllib_handler_context,
 )
-from messagefoundry.config.wiring import Rest
+from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.pipeline import crl_reload
 from messagefoundry.pki import cas_not_reaching_a_root
 from messagefoundry.transports import build_destination
+from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import opener_tls_context
 from tests import test_api_tls_client_trust as _api_suite
 from tests.test_api_tls_client_trust import _TwoTier
@@ -359,6 +360,96 @@ def test_an_http_rest_hop_builds_on_the_remedies_its_refusal_names(two_tier: _Tw
             crl_file=crl,
             crl_check_chain=True,
         )
+    )
+
+
+def _http_family(kind: str, policy: TrustAnchorPolicy, settings: dict[str, object]) -> object:
+    """A SOAP, FHIR or DICOMweb destination, or a FhirLookup executor, whose url is http and
+    accepted as cleartext."""
+    url = f"http://{_HOST}/x"
+    if kind == "fhir_lookup":
+        return FhirLookupExecutor(
+            {
+                "epic": {
+                    "url": url,
+                    "cleartext_accepted": True,
+                    "cleartext_reason": "synthetic cleartext reason for this test",
+                    **settings,
+                }
+            },
+            egress=EgressSettings(deny_by_default=False),
+            trust_anchor_policy=policy,
+        )
+    built = (
+        Soap(url=url) if kind == "soap" else FHIR(url=url) if kind == "fhir" else DICOMweb(url=url)
+    )
+    ctype = {
+        "soap": ConnectorType.SOAP,
+        "fhir": ConnectorType.FHIR,
+        "dicomweb": ConnectorType.DICOMWEB,
+    }[kind]
+    return build_destination(
+        Destination(
+            name=_CONNECTION,
+            type=ctype,
+            settings={**built.settings, **settings},
+            trust_anchor_policy=policy,
+            cleartext_accepted=True,
+            cleartext_reason="synthetic cleartext reason for this test",
+            tls_revocation_attested=True,
+            tls_revocation_attested_reason="synthetic attestation for this test",
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+
+
+_HTTP_FAMILY = pytest.mark.parametrize("kind", ["soap", "fhir", "fhir_lookup", "dicomweb"])
+
+
+@_HTTP_FAMILY
+def test_an_http_family_hop_on_the_os_roots_refuses_without_claiming_tls(
+    two_tier: _TwoTier, kind: str
+) -> None:
+    """Red before the fix: an http SOAP, FHIR, FhirLookup or DICOMweb hop got the generic
+    refusal, which said it "verifies its server" and promised a chain check."""
+    for mode, internal in (("system", None), ("augment", str(two_tier.root_file))):
+        policy = TrustAnchorPolicy(
+            internal_ca_file=internal,
+            mode=mode,  # type: ignore[arg-type]
+            crl_file=str(two_tier.revokes_nothing),
+            crl_check_chain=True,
+        )
+        with pytest.raises(ValueError, match=r"crl_check_chain is set, and this ") as refused:
+            _http_family(kind, policy, {})
+        text = str(refused.value)
+        assert "has an http url, so it sends to the partner without TLS" in text
+        assert "verifies its server" not in text
+        assert "To chain-check" not in text
+        assert "REST" not in text
+        assert "None of these makes the engine check the partner's revocation" in text
+
+
+@_HTTP_FAMILY
+def test_an_http_family_hop_builds_on_the_remedies_its_refusal_names(
+    two_tier: _TwoTier, kind: str
+) -> None:
+    """Each way out the refusal names builds: the connection's own tls_ca_file, and a pinned
+    internal CA."""
+    crl = str(two_tier.revokes_nothing)
+    _http_family(
+        kind,
+        TrustAnchorPolicy(crl_file=crl, crl_check_chain=True),
+        {"tls_ca_file": str(two_tier.root_file)},
+    )
+    _http_family(
+        kind,
+        TrustAnchorPolicy(
+            internal_ca_file=str(two_tier.root_file),
+            mode="pinned",
+            crl_file=crl,
+            crl_check_chain=True,
+        ),
+        {},
     )
 
 
