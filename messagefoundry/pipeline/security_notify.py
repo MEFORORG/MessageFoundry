@@ -642,6 +642,13 @@ def _build_body(event: SecurityEvent) -> str:
     return "\n".join(lines)
 
 
+def _consume_outcome(send: asyncio.Future[bool]) -> None:
+    """Read a send's outcome, so asyncio never reports it unread: after a cut close nobody else
+    reads it (BACKLOG #6832)."""
+    if not send.cancelled():
+        send.exception()
+
+
 class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
     """Emails the affected user about a security event, on a bounded background queue.
 
@@ -704,7 +711,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._audit = audit
         # The queue-full records still being written, held so the loop keeps them alive and so
         # aclose() can wait for them.
-        self._recording: set[asyncio.Task[None]] = set()
+        self._recording: set[asyncio.Future[bool]] = set()
+        # The send the drain is waiting on, with what it needs to record or count it, so a cut
+        # close can record it (BACKLOG #6832). None between sends.
+        self._sending: tuple[SecurityEvent, asyncio.Future[bool], Callable[[], None]] | None = None
         # Set when aclose() begins, and never cleared: start() refuses (vault BACKLOG #3120). An event
         # queued after that sits behind the stop sentinel, or on a queue nothing reads, and is never
         # sent, so notify() refuses it; the contract on ``SecurityNotifier`` says why.
@@ -797,8 +807,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        # Never again once closed (vault BACKLOG #3120). A close the teardown cut short can leave its
-        # stop sentinel on the queue, so a drain loop started again would read it and stop, and
+        # Never again once closed (vault BACKLOG #3120). A cut close empties the queue (BACKLOG
+        # #6832), but one cancelled a second time can still leave its stop sentinel there, so a drain
+        # loop started again would read it and stop, and
         # notify() would answer True for events nothing sends. The engine builds a new notifier for
         # each lifespan rather than restart one.
         if self._closing:
@@ -807,13 +818,17 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
 
     async def aclose(self) -> None:
         """Drain the queue and stop. A close cut short, as the shutdown's bounded step cuts it,
-        cancels the drain, and records the notice whose send it cut and every notice still queued
-        before it returns, so each is recorded while the store is open (BACKLOG #6832)."""
+        cancels the drain and, before it returns, records the send it cut and each notice still
+        queued (BACKLOG #6832). In the shutdown those writes run in the cut step's grace, so one
+        still running when the teardown stops waiting can meet the closed store and is lost like
+        any failed record write. The count of queued notices is logged before any of them."""
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         drain = self._task
         try:
             await super().aclose()
         finally:
+            # Taken and logged before any await, so a second cancel cannot leave them untold.
+            left = self._take_queued()
             try:
                 if drain is not None:
                     if not drain.done():
@@ -822,61 +837,105 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                         drain.cancel()
                         self._task = None
                     await asyncio.gather(drain, return_exceptions=True)
-                await self._record_abandoned()
             finally:
-                # Each one swallows its own failure, so this only waits.
-                await asyncio.gather(*self._recording, return_exceptions=True)
+                try:
+                    await self._record_cut(left)
+                finally:
+                    # Each one swallows its own failure, so this only waits.
+                    await asyncio.gather(*self._recording, return_exceptions=True)
 
-    async def _record_abandoned(self) -> None:
-        """Record each notice the close left on the queue, never sent (BACKLOG #6832). One at a
-        time, without the queue-full path's cap: the queue's own bound caps the count."""
+    def _take_queued(self) -> list[SecurityEvent]:
+        """Empty the queue, stop sentinel included, and log how many notices it held. Only a cut
+        close leaves any: an uncut one drained them all."""
         left: list[SecurityEvent] = []
         while not self._queue.empty():
-            event = self._queue.get_nowait()
-            if event is not None:
+            if (event := self._queue.get_nowait()) is not None:
                 left.append(event)
-        if not left:
-            return
-        # A count, and never one that includes a lock notice (BACKLOG #1131). Logged before the
-        # writes, so a write the closing store refuses still leaves the loss in the log.
+        # A count, never one that includes a lock notice (BACKLOG #1131).
         shown = sum(event.event_type not in LOG_SILENT_EVENT_TYPES for event in left)
         if shown:
             log.warning(
-                "%s closed with %d security notice(s) still queued; recording them as undelivered",
+                "%s closed with %d security notice(s) still queued, never sent",
                 type(self).__name__,
                 shown,
             )
-        for event in left:
-            await self._record_undelivered(event, {"reason": "closing"})
+        return left
+
+    async def _record_cut(self, left: list[SecurityEvent]) -> None:
+        """Record the send a cut close stopped waiting for, and each notice it left queued."""
+        records: list[tuple[SecurityEvent, str]] = []
+        pending, self._sending = self._sending, None
+        if pending is not None:
+            event, send, delivered = pending
+            if not send.done():
+                # Its thread runs on to its own timeout, so the notice may still go out:
+                # "interrupted" says its delivery is unknown.
+                records.append((event, "interrupted"))
+            elif (exc := send.exception()) is not None:
+                # It ended before the cut reached the drain, so its outcome is known.
+                self._log_send_failed(event, exc)
+                records.append((event, "send_failed"))
+            elif send.result():
+                delivered()
+        # "abandoned", apart from "closing": a lock notice refused at notify() reads mailed: false
+        # on its auth.lock_notice row, while one queued before the close reads mailed: true.
+        records += [(event, "abandoned") for event in left]
+        if self._audit is None:
+            return  # nowhere to record them; the queued count is already in the log
+        failed = 0
+        for event, reason in records:
+            recorded = await self._record_undelivered(event, {"reason": reason}, log_failure=False)
+            failed += not recorded and event.event_type not in LOG_SILENT_EVENT_TYPES
+        if failed:
+            # One line, not one per row: a store closing under a full queue refuses them all.
+            log.warning(
+                "%d undelivered security notice(s) could not be recorded in the audit log at close",
+                failed,
+            )
 
     async def _handle(self, event: SecurityEvent, delivered: Callable[[], None]) -> None:
+        # Shielded, so a cut close can read how the send ended (BACKLOG #6832). Its outcome is
+        # consumed here, since a cut leaves nobody else to read it.
+        send = asyncio.ensure_future(asyncio.to_thread(self._send, event))
+        send.add_done_callback(_consume_outcome)
+        self._sending = (event, send, delivered)
         try:
-            if await asyncio.to_thread(self._send, event):
-                delivered()
-        except asyncio.CancelledError:
-            # The close was cut while this send waited on the relay (BACKLOG #6832). The send's
-            # thread runs on to its own timeout, so the notice may still go out: "interrupted"
-            # says its delivery is unknown, apart from a send that raised.
-            await self._record_undelivered(event, {"reason": "interrupted"})
-            raise
-        except Exception:
-            # Best-effort: a failed send must never propagate. The event is usually also in the audit
-            # log; a refused directory-reconciler audit write leaves no row (BACKLOG #3018).
-            # A lock notice fails silently here (BACKLOG #1131, LOG_SILENT_EVENT_TYPES): a line per
-            # failed lock mail would show a logs:view reader when a lock landed. A relay that is down
-            # still shows, on every other kind of notice.
-            if event.event_type not in LOG_SILENT_EVENT_TYPES:
-                log.warning(
-                    "security-event email failed for %s (%s)",
-                    event.username,
-                    event.event_type,
-                    exc_info=True,
-                )
+            sent = await asyncio.shield(send)
+        except Exception as exc:
+            self._sending = None
+            # Best-effort: a failed send must never propagate.
+            self._log_send_failed(event, exc)
             # The reason only. The exception's text can quote the relay's reply or the address, and
             # even its class would tell the recipient, in their own feed, that the relay is broken.
-            await self._record_undelivered(event, {"reason": "send_failed"})
+            # Shielded and held, so a cut close waits for this write rather than cancelling it.
+            record = asyncio.ensure_future(
+                self._record_undelivered(event, {"reason": "send_failed"})
+            )
+            self._recording.add(record)
+            record.add_done_callback(self._recording.discard)
+            await asyncio.shield(record)
+            return
+        # A cancel leaves self._sending set, for the cut close to record.
+        self._sending = None
+        if sent:
+            delivered()
 
-    async def _record_undelivered(self, event: SecurityEvent, why: dict[str, str]) -> None:
+    def _log_send_failed(self, event: SecurityEvent, exc: BaseException) -> None:
+        # The event is usually also in the audit log; a refused directory-reconciler audit write
+        # leaves no row (BACKLOG #3018). A lock notice fails silently here (BACKLOG #1131,
+        # LOG_SILENT_EVENT_TYPES): a line per failed lock mail would show a logs:view reader when a
+        # lock landed. A relay that is down still shows, on every other kind of notice.
+        if event.event_type not in LOG_SILENT_EVENT_TYPES:
+            log.warning(
+                "security-event email failed for %s (%s)",
+                event.username,
+                event.event_type,
+                exc_info=exc,
+            )
+
+    async def _record_undelivered(
+        self, event: SecurityEvent, why: dict[str, str], *, log_failure: bool = True
+    ) -> bool:
         """Write the audit row that says this notice never left the engine (BACKLOG #2383).
 
         Before this, a full queue or a failed send left only a WARNING line, so the trail could not
@@ -885,11 +944,11 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         ``why``, plus the holder's username on an issuer's reminder, which says whose credential it
         was. Never the rest of ``event.detail`` or the address: an EMAIL_CHANGED carries an address
         in its detail. A lock notice writes the hidden ``auth.lock_notice_undelivered`` action (BACKLOG
-        #1131). A failed write is swallowed, like the send it reports on. It is logged by class, and
-        not at all for a lock notice: that kind writes no other line, so a lone line would say a
-        lock landed."""
+        #1131). A failed write is swallowed, like the send it reports on. It is logged by class,
+        unless ``log_failure`` is False, and never for a lock notice: that kind writes no other
+        line, so a lone line would say a lock landed. Returns whether the row was written."""
         if self._audit is None:
-            return
+            return False
         silent = event.event_type in LOG_SILENT_EVENT_TYPES
         action = LOCK_NOTICE_UNDELIVERED_ACTION if silent else SECURITY_NOTICE_UNDELIVERED_ACTION
         detail = {"notice": notice_kind_log_label(event.event_type), **why}
@@ -901,11 +960,13 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 action, actor=event.username, detail=json.dumps(detail, sort_keys=True)
             )
         except Exception as exc:  # noqa: BLE001 - best-effort, like the notice itself
-            if not silent:
+            if log_failure and not silent:
                 log.warning(
                     "an undelivered security notice could not be recorded in the audit log (%s)",
                     type(exc).__name__,
                 )
+            return False
+        return True
 
     def _send(self, event: SecurityEvent) -> bool:
         """Mail the notice, returning whether it was sent."""

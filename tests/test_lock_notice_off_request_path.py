@@ -856,9 +856,10 @@ async def test_after_a_cut_close_a_notice_reported_queued_is_sent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Vault BACKLOG #3120, review round two. The teardown bounds the notifier's close, and a close
-    cut while a send is under way leaves its stop sentinel on the queue. A drain loop started again
-    then read that sentinel and stopped, and ``notify`` answered ``True`` for an event nothing ever
-    sent. Whatever ``start`` does after a cut close, a notice reported queued must be sent.
+    cut while a send is under way left its stop sentinel on the queue, until BACKLOG #6832 had the
+    cut close empty it. A drain loop started again then read that sentinel and stopped, and
+    ``notify`` answered ``True`` for an event nothing ever sent. Whatever ``start`` does after a cut
+    close, a notice reported queued must be sent.
 
     The control is the event taken before the close: its send was under way when the close was
     cut, and once released it goes out and shows in ``sent``."""

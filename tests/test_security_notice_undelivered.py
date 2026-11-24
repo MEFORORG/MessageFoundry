@@ -645,7 +645,7 @@ async def test_a_cut_close_records_every_notice_it_left_unsent(
             (
                 LOCK_NOTICE_UNDELIVERED_ACTION,
                 "lock-c",
-                {"notice": "account_locked", "reason": "closing"},
+                {"notice": "account_locked", "reason": "abandoned"},
             ),
             (
                 SECURITY_NOTICE_UNDELIVERED_ACTION,
@@ -655,7 +655,7 @@ async def test_a_cut_close_records_every_notice_it_left_unsent(
             (
                 SECURITY_NOTICE_UNDELIVERED_ACTION,
                 "ben",
-                {"notice": "password_changed", "reason": "closing"},
+                {"notice": "password_changed", "reason": "abandoned"},
             ),
         ]
         assert notifier.undelivered == 3
@@ -694,8 +694,91 @@ async def test_a_close_cut_on_a_full_queue_cancels_the_drain(
             (
                 SECURITY_NOTICE_UNDELIVERED_ACTION,
                 "ben",
-                {"notice": "password_changed", "reason": "closing"},
+                {"notice": "password_changed", "reason": "abandoned"},
             ),
         ]
     finally:
         release.set()
+
+
+async def test_a_cut_during_a_failed_send_s_record_keeps_that_record(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, review round one. A cut landing while the drain writes a failed send's row
+    must not cancel that write, or the notice leaves no row at all."""
+
+    def boom(**_: Any) -> None:
+        raise OSError("relay down")
+
+    monkeypatch.setattr(_SEND, boom)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    class _GatedAudit:
+        async def record_view(
+            self, message_id: str, *, actor: str | None = None, now: float | None = None
+        ) -> None:
+            raise AssertionError("the notifier never records a view")
+
+        async def record_audit(
+            self,
+            action: str,
+            *,
+            actor: str | None = None,
+            channel_id: str | None = None,
+            detail: str | None = None,
+            client: str | None = None,
+            now: float | None = None,
+        ) -> None:
+            entered.set()
+            await gate.wait()
+            await store.record_audit(action, actor=actor, detail=detail)
+
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=cast(AuditStore, _GatedAudit()),
+    )
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await asyncio.wait_for(entered.wait(), 5.0)
+    closing = asyncio.create_task(notifier.aclose())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    await asyncio.sleep(0.05)
+    gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert await _undelivered(store) == [
+        (
+            SECURITY_NOTICE_UNDELIVERED_ACTION,
+            "amy",
+            {"notice": "password_changed", "reason": "send_failed"},
+        )
+    ]
+
+
+async def test_a_cut_close_with_no_audit_sink_still_logs_the_queued_count(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #6832, review round one. With no sink the queued notices still show in the log, and
+    the line claims no record."""
+    started, release = _blocking_send(monkeypatch)
+    notifier = SecurityEventNotifier(host="smtp.example.org", port=25, sender="mf@example.org")
+    notifier.start()
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
+    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        closing = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+    finally:
+        release.set()
+    assert [r.getMessage() for r in caplog.records if "still queued" in r.getMessage()] == [
+        "SecurityEventNotifier closed with 1 security notice(s) still queued, never sent"
+    ]
+    assert not [r for r in caplog.records if "could not be recorded" in r.getMessage()]

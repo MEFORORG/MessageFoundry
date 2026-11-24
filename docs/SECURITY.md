@@ -7964,7 +7964,8 @@ begun to close, a cut close leaves the notice queued or cuts its send, or the se
 engine writes one more row, with the notice's recipient as the actor. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
-notice kind and the `reason`, `queue_full`, `closing`, `interrupted` or `send_failed`. An issuer's reminder also names the
+notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
+`send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The
 source of record is `SecurityEventNotifier._record_undelivered` in
 `messagefoundry/pipeline/security_notify.py`. At least the offline commands `provision-admin` and
@@ -7982,11 +7983,12 @@ again for the row, and only when a send failed. **Still open, at least:**
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
   fails in its final drain is recorded. That close is one bounded step of the shutdown. When the
   step is cut, the close cancels its drain and records the send it cut with `reason: interrupted`
-  and each notice still queued with `reason: closing` (BACKLOG #6832). The cut send's thread runs
-  on to its own timeout, so that notice may still go out. Those writes run in the step's cut
-  grace, so one still running when the grace ends can meet the closed store and is lost like any
-  failed record write. A WARNING line counting the queued notices, never a lock notice, comes
-  before their writes. A lock notice among them keeps its `auth.lock_notice` row
+  and each notice still queued with `reason: abandoned` (BACKLOG #6832). The cut send's thread
+  runs on to its own timeout, so that notice may still go out. Those writes run one at a time in
+  the step's cut grace, so the ones still to run when the grace ends meet the closed store and
+  are lost; under a full queue that is most of them. A WARNING line counting the queued notices
+  comes before their writes, and one counting the writes that failed comes after; neither counts
+  a lock notice. A lock notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.
 - A notice that reaches the notifier once it has begun to close is refused and recorded with
