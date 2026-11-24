@@ -1696,3 +1696,44 @@ def test_an_else_after_a_branch_ended_past_its_line_is_in_the_loop(
 def test_the_module_source_holds_no_invisible_byte_order_mark() -> None:
     """A literal U+FEFF in the source is invisible in review: it is written as an escape."""
     assert b"\xef\xbb\xbf" not in _SCRIPT.read_bytes()
+
+
+# BACKLOG #7600, repair round 5. Each shape below was misread at af3c3c51.
+def test_a_mismatched_closer_does_not_swallow_the_rest_of_the_file(mod: ModuleType) -> None:
+    """`read and opened.pop()` skipped the pop once read was False, so the next `(` never closed."""
+    cost = mod.price_script("const g = r => f(r }.y(1)\nawait agent('a')\n")
+    assert cost.agents == 1, "the next line was read into the arrow's body"
+    assert "unattributed" not in [u.kind for u in cost.unknowns]
+    loop = mod.price_script("for (const r of [1, 2]) x = f(r }.y(1)\nawait agent('a')\n")
+    assert not loop.exact
+    assert [(u.kind, u.per_unit) for u in loop.unknowns] == [("loop", 0)]
+    assert loop.agents == 1, "the line after the loop runs once and belongs in the floor"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a `do` with no `while (...)` tail: its extent is a guess, so no agent count is exact
+        "do { i++ }\nawait agent('a')\n",
+        "do i++\n",
+    ],
+)
+def test_a_guessed_loop_extent_with_no_agent_is_still_a_floor(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT for a loop whose extent was a guess"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+
+
+@pytest.mark.parametrize(
+    "receiver",
+    ["rows?", "R!", "R !", ""],
+)
+def test_a_receiver_the_walk_cannot_read_is_not_an_empty_array(
+    mod: ModuleType, receiver: str
+) -> None:
+    source = f"const R = [1, 2]\nawait parallel({receiver}.map(r => () => agent(r)))\n"
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT from an unread receiver"
+    assert [(u.kind, u.form, u.per_unit) for u in cost.unknowns] == [
+        ("dynamic-width", ".map(...): receiver not read", 1)
+    ]

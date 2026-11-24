@@ -1008,7 +1008,10 @@ def _read_expr_end(ctx: _Ctx, i: int, stops: str) -> tuple[int, bool]:
             if not opened:
                 return j, read
             # `f(` closed by an enclosing block's `}`: the same end as before, but not a read one.
-            read = read and opened.pop() == _OPENERS[c]
+            # Pop first: a short-circuited pop left the bracket open, and the scan ran to the end
+            # of the file (BACKLOG #7600).
+            matched = opened.pop() == _OPENERS[c]
+            read = read and matched
         elif not opened and c in stops:
             return j, read
         elif not opened and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
@@ -1497,7 +1500,13 @@ def _price_fan_call(ctx: _Ctx, m: re.Match[str], region_start: int, region_end: 
     if is_map:
         # The `fan` alternative of _TOKEN_PATTERN begins with `\.`, so the match already starts AT the
         # dot -- no search needed.
-        width, why = _width_of(ctx, *_receiver_span(ctx, m.start(), region_start))
+        recv_start, recv_end = _receiver_span(ctx, m.start(), region_start)
+        # A receiver the walk could not read (`rows?.map(`, `R!.map(`, an unmatched bracket) is
+        # an empty span, which _width_of reads as an empty array: width 0, exact.
+        if recv_start >= recv_end:
+            width, why = None, "receiver not read"
+        else:
+            width, why = _width_of(ctx, recv_start, recv_end)
         body = args[0] if args else (open_idx + 1, close)
     else:
         spec = _LENGTH_RE.match(ctx.masked[args[0][0] : args[0][1]]) if args else None
@@ -1519,7 +1528,8 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
     inner = _price(ctx, span.body_start, span.body_end)
     if span.cond is not None:
         inner = inner + _price(ctx, span.cond[0], span.cond[1])
-    if not inner.agents and not inner.unknowns:
+    # Free only where the extent was read: a guessed one may have cut agents out of the body.
+    if not inner.agents and not inner.unknowns and span.settled:
         return Cost()
 
     line = ctx.line_of(m.start())
