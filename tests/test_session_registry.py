@@ -994,7 +994,7 @@ def _rehome(paths: dict[str, Path]) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.mark.parametrize("age_h", [None, 0, 48], ids=["no-unreadable-file", "fresh", "old"])
+@pytest.mark.parametrize("age_h", [None, 0, 48], ids=["directory-only", "fresh", "old"])
 def test_sessions_rehome_refuses_beside_a_fresh_unreadable_registry_file(
     tmp_path: Path, age_h: float | None
 ) -> None:
@@ -1002,7 +1002,10 @@ def test_sessions_rehome_refuses_beside_a_fresh_unreadable_registry_file(
     and Get-SessionLiveness never lists it, so the move went ahead. A fresh one now refuses and moves
     nothing. The twins, no such file or one older than the 24-hour bound, still rehome a dead session."""
     paths = _relocated_session(tmp_path)
-    if age_h is not None:
+    if age_h is None:
+        # A directory named *.json is not a record being written, so it does not veto.
+        (paths["root"] / "sessions" / "3.json").mkdir()
+    else:
         bad = paths["root"] / "sessions" / "2.json"
         bad.write_text('{"pid": 12', encoding="utf-8")
         stamp = time.time() - age_h * 3600
@@ -1018,18 +1021,33 @@ def test_sessions_rehome_refuses_beside_a_fresh_unreadable_registry_file(
 
 
 _STUB = json.dumps({"type": "custom-title", "customTitle": "synthetic", "sessionId": _REHOME_SID})
+_NOT_TITLE = "holds a record that is not a title"
 
 
 @pytest.mark.parametrize(
     ("existing", "backup", "refusal"),
     [
         (_STUB + "\n", None, None),
-        (_STUB + "\n" + json.dumps({"type": "user", "cwd": "x"}) + "\n", None, "not a title"),
-        ("not json\n", None, "not a title"),
+        (json.dumps({"type": "ai-title", "aiTitle": "synthetic"}) + "\n", None, None),
+        (_STUB + "\n" + json.dumps({"type": "user", "cwd": "x"}) + "\n", None, _NOT_TITLE),
+        ("not json\n", None, _NOT_TITLE),
+        ("[" + _STUB + "]\n", None, _NOT_TITLE),
+        (json.dumps({"TYPE": "custom-title"}) + "\n", None, _NOT_TITLE),
+        (json.dumps({"type": "Custom-Title"}) + "\n", None, _NOT_TITLE),
         ("", None, "no title record"),
-        (_STUB + "\n", "earlier stub\n", "already exists"),
+        (_STUB + "\n", "earlier stub\n", ".stub.bak already exists"),
     ],
-    ids=["stub", "real-transcript", "unparsed", "empty", "backup-exists"],
+    ids=[
+        "stub",
+        "ai-title-stub",
+        "real-transcript",
+        "unparsed",
+        "array",
+        "key-case",
+        "value-case",
+        "empty",
+        "backup-exists",
+    ],
 )
 def test_sessions_rehome_merges_only_a_title_stub_at_the_destination(
     tmp_path: Path, existing: str, backup: str | None, refusal: str | None
@@ -1057,7 +1075,7 @@ def test_sessions_rehome_merges_only_a_title_stub_at_the_destination(
         assert proc.returncode == 0 and "Rehomed session" in proc.stdout, proc.stdout + proc.stderr
         assert not paths["source"].exists()
         merged = paths["dest"].read_text(encoding="utf-8-sig")
-        assert merged.startswith(source_text.strip()) and merged.rstrip().endswith(_STUB)
+        assert merged.startswith(source_text.strip()) and merged.rstrip().endswith(existing.strip())
         assert bak.read_text(encoding="utf-8") == existing
 
 

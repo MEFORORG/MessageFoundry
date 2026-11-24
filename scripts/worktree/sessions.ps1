@@ -253,6 +253,9 @@ if ($Rehome) {
     # (no heartbeat, and registry writes are event-driven), so only the positive answer is trustworthy.
     # A negative from one signal must never by itself authorise a destructive move.
     . "$PSScriptRoot\..\coord\session-registry.ps1"
+    # Listed BEFORE the fence reads the registry, as box-activity.ps1 does: a record half-written at
+    # this read and complete by the fence's is then seen by one check or the other (BACKLOG #7622).
+    $unparsed = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable -and -not $_.Directory })
     $reg = Get-SessionLiveness -SessionId $s.Id -Worktree $s.BornCwd
     # UNREADABLE vetoes too: the fence could not be evaluated, or a record naming no session may be
     # this one (session-registry.ps1's header). Such a record used to throw here, which stopped the
@@ -275,11 +278,13 @@ if ($Rehome) {
     }
     # A registry file that does not parse names no session anyone can read, so Get-SessionLiveness never
     # sees it, and it may be this session's own record caught mid-write (BACKLOG #7622). It vetoes while
-    # fresh, on the same 24-hour bound and file-age rules the anonymous records use; it has no cwd anyone
-    # can read, so it cannot be scoped to a tree and vetoes wherever it is. An older one does not veto, or
-    # a file that never becomes readable would block every rehome until someone deleted it.
+    # its file was written in the last 24 hours (the anonymous records' default bound), or when that
+    # file has vanished or carries a future write time; it has no cwd anyone can read, so it cannot be
+    # scoped to a tree and vetoes wherever it is. An older one does not veto, or a file that never
+    # becomes readable would block every rehome until someone deleted it. A directory named *.json is
+    # not a record being written, so it is left out above.
     $wall = [DateTime]::UtcNow
-    $unreadable = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable } | Where-Object {
+    $unreadable = @($unparsed | Where-Object {
         $item = Get-Item -LiteralPath $_.File -Force -EA SilentlyContinue
         -not $item -or ($wall - $item.LastWriteTimeUtc).TotalHours -lt 24
     })
@@ -346,10 +351,12 @@ if ($Rehome) {
                 if ($stubLines.Count -eq 0) { $why = "it holds no title record" }
                 foreach ($line in $stubLines) {
                     $o = $null
-                    try { $o = $line | ConvertFrom-Json -EA Stop } catch { }
-                    $p = if ($o -is [pscustomobject]) { $o.PSObject.Properties['type'] }
+                    # -NoEnumerate keeps a one-element array an array; the name and value compare
+                    # case-sensitively, as the transcript reader does.
+                    try { $o = ConvertFrom-Json -InputObject $line -NoEnumerate -EA Stop } catch { }
+                    $p = if ($o -is [pscustomobject]) { $o.PSObject.Properties | Where-Object { $_.Name -ceq 'type' } | Select-Object -First 1 }
                     $type = if ($p) { [string]$p.Value } else { '' }
-                    if ($type -notin @('custom-title', 'ai-title')) {
+                    if ($type -cnotin @('custom-title', 'ai-title')) {
                         $why = "it holds a record that is not a title (type '$type')"
                         break
                     }
@@ -376,7 +383,10 @@ if ($Rehome) {
     # Keep it: back it up, then re-append its records to the end of the moved transcript (JSONL is a log
     # -- later records win).
     if (Test-Path -LiteralPath $dest) {
-        Copy-Item -LiteralPath $dest -Destination "$dest.stub.bak"
+        # A file that appeared after the check above was never checked: refuse rather than merge it.
+        if ($stubLines.Count -eq 0) { throw "A file appeared at $dest after it was checked, so nothing was moved. Retry." }
+        # $false: never overwrite a backup that appeared since the check.
+        [System.IO.File]::Copy($dest, "$dest.stub.bak", $false)
         Remove-Item -LiteralPath $dest -Force
     }
 
