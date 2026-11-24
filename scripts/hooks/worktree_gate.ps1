@@ -1221,8 +1221,8 @@ function Test-TrueSeparatorIn([string]$Text) {
 # COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
 # command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
 # pass re-reads that text and re-asks git about the invocations in it. Invoke-GitRead answers a
-# repeated question from its cache only where git answered it; a failing question is asked again on
-# every ask, its note says why. A hoist is not cut down to its own
+# repeated question from its cache, except a failed one in the given pass; its note says why. A hoist
+# is not cut down to its own
 # segment: the text before it carries the chdir and the assignments the hoist exists to read (`cd <p>
 # && echo $(date); git -C <o> log $(git reset --hard)`). Before the cache, the Lander measured 7.8 s,
 # 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of 2026-11-23). With it, on one
@@ -1233,12 +1233,13 @@ function Test-TrueSeparatorIn([string]$Text) {
 # a run took 16.5 s and 12.1 s for the two shapes whose `-C` paths name no directory, against 1.8 s
 # and 1.3 s at BASELINE and 19.2 s and 11.4 s before the cache: every git question on those paths
 # fails, and Invoke-GitRead's note says what a failure costs. The other three shapes took 2.1 s to
-# 3.1 s, against 32.9 s to 45.6 s before the cache. No TIMED shape has several lines whose `-C` paths
-# name no directory, and that is the slowest shape measured: review round 2c9e3d7a9b timed nine such
-# lines at 44.1 s, where each hoist re-asks the failing questions of the lines before it, against 9.9 s
-# at BASELINE and 12.0 s when a failure was kept. That is past the 20 s proof wait, where the shell
-# entry starts its own run, so with the wait a run can pass the 60 s timeout below. Each hoist also
-# re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
+# 3.1 s, against 32.9 s to 45.6 s before the cache. Review round 2c9e3d7a9b then timed nine lines whose
+# `-C` paths name no directory at 44.1 s, each hoist re-asking the failing questions of the lines
+# before it, against 9.9 s at BASELINE. Since the rewritten pass replays a failure (later the same
+# day), one run of the TIMED shapes took 5.1 s for that nine-line shape, against 9.0 s at BASELINE
+# and 39.3 s before the cache; 5.1 s and 12.1 s for the two one-line shapes whose paths name no
+# directory, against 2.6 s and 3.7 s; and 2.7 s to 3.5 s for the other three, against 1.6 s to
+# 12.9 s. Each hoist also re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
 # than letting it through (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
@@ -3285,6 +3286,8 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # it judges has run yet; another process could still change the repository during the run, as it
 # could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
+# Which of the shell rules' two passes is running: 'given' or 'rewritten'. Set by the pass loop.
+$script:gitReadPass = 'given'
 function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
     # into an empty argument, which git reads differently.
@@ -3299,22 +3302,25 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    # ONLY A SUCCESS IS KEPT: an exit code of 0 with at least one output line, which may be blank. A
-    # failure, or an answer with no line, is never kept, so the next ask spawns git again, and a
-    # question that fails is asked on every ask that reaches here, as it was with no cache (Manager
-    # decision of 2026-11-23 under the owner's instruction to take the strictly safer option).
-    # A kept success is replayed where an uncached ask could have failed instead. Keeping a failure
-    # let one spawn that failed under load stand for every later ask of that question, where an
-    # uncached ask could have read the answer and denied. A question that cannot succeed, such as a
-    # `-C` that names no directory, costs a spawn per ask.
+    # A SUCCESS IS KEPT FOR THE RUN: an exit code of 0 with at least one output line, which may be
+    # blank. Any other answer is kept too, but replayed only in the rewritten pass. In the given pass,
+    # the only pass origin/main made, it is asked again on every ask that reaches here, as it was with
+    # no cache, so a spawn that failed under load does not stand for a later ask that could read the
+    # answer and deny. The rewritten pass replays the last answer the given pass got, or the first it
+    # got itself: that pass runs only once the command as given is allowed, and can only add a refusal,
+    # so a kept failure there removes no deny origin/main made, and a question that cannot succeed (a
+    # `-C` that names no directory) is not asked once per hoist (Manager decisions of 2026-11-23 under
+    # the owner's instruction to take the strictly safer option). A kept success is replayed where an
+    # uncached ask could have failed instead.
     $hit = $null
-    if ($gitReadCache.TryGetValue($key, [ref]$hit)) {
+    if ($gitReadCache.TryGetValue($key, [ref]$hit) -and
+        (($hit.Code -eq 0 -and $hit.Out.Count -gt 0) -or $script:gitReadPass -eq 'rewritten')) {
         $global:LASTEXITCODE = $hit.Code
         return $hit.Out
     }
     $out = @(& git @GitArgs 2>$null)
     $code = $LASTEXITCODE
-    if ($code -eq 0 -and $out.Count -gt 0) { $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
+    $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code }
     $global:LASTEXITCODE = $code
     $out
 }
@@ -3583,25 +3589,32 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # (`--path-format=absolute`, which Get-RootCommonDirCmp already asks for). That one is git's own
 # resolution of the value, so it names the real repository through at least some device spellings that
 # neither path form folds onto the drive (review round 1850f169 measured `\\?\X:\..\C:\<governed>` and
-# `\\?\.\C:\<governed>`). The git outputs are cached once, a failure included, as on origin/main.
-# For rule 3c, which takes the first candidate that answers, asking again could let a candidate that
-# failed first answer later and change which one answers first (review round 04cd8e041a). For rule 3d,
-# which denies if any base matches, and for a failed absolute form, asking again could only add a
-# deny, so keeping the failure there is a fail-open kept from main and left open (review round
-# 2c9e3d7a9b). The comparable forms are built in the path form current at the call.
+# `\\?\.\C:\<governed>`). The first answer is cached, a failed relative ask included, as on
+# origin/main: rule 3c takes the first candidate that answers, so asking a failed candidate again could
+# change which one answers first (review round 04cd8e041a). Two asks are made again, because each can
+# only add a governed form, and so a deny (review round 2c9e3d7a9b): a failed ABSOLUTE ask, once the
+# candidate has answered, since Get-GovernedRootForCommon takes a root any form names; and, under
+# -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
+# kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
+# Invoke-GitRead's own note says which pass re-spawns git. The comparable forms are built in the path
+# form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
-function Get-CommonDirAnswer([string]$CandRaw) {
-    if (-not $commonDirAnswers.ContainsKey($CandRaw)) {
-        $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()
-        $git = $null
-        if ($LASTEXITCODE -eq 0 -and $common) {
-            $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
-            if ($LASTEXITCODE -ne 0) { $absolute = "" }
-            $git = [pscustomobject]@{ Common = $common; Absolute = $absolute }
-        }
-        $commonDirAnswers[$CandRaw] = $git
-    }
+function Read-CommonDirFromGit([string]$CandRaw) {
+    $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $common) { return $null }
+    $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
+    if ($LASTEXITCODE -ne 0) { $absolute = "" }
+    [pscustomobject]@{ Common = $common; Absolute = $absolute }
+}
+function Get-CommonDirAnswer([string]$CandRaw, [switch]$Reask) {
+    if (-not $commonDirAnswers.ContainsKey($CandRaw)) { $commonDirAnswers[$CandRaw] = Read-CommonDirFromGit $CandRaw }
     $answer = $commonDirAnswers[$CandRaw]
+    if ($null -eq $answer) {
+        if ($Reask) { $answer = Read-CommonDirFromGit $CandRaw }
+    } elseif (-not $answer.Absolute) {
+        $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
+        if ($LASTEXITCODE -eq 0 -and $absolute) { $answer.Absolute = $absolute }
+    }
     if ($null -eq $answer) { return $null }
     $forms = [System.Collections.Generic.List[string]]::new()
     $forms.Add([string](Get-ComparablePath $answer.Common $CandRaw))
@@ -4335,6 +4348,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     # are computed only once the command as given is allowed. The body keeps its pre-#5655 indent so
     # this change does not rewrite every line of it.
     foreach ($pass in @('given', 'rewritten')) {
+    $script:gitReadPass = $pass
     $passCmds = $(if ($pass -eq 'given') { , $givenCmd } else {
             @(Get-AddedCommandReadings $givenCmd (Get-HostConvention $tool) | Select-Object -Skip 1) })
     foreach ($cmd in @($passCmds)) { . {
@@ -5262,7 +5276,7 @@ What to do instead:
                 if ($triedAbs -ccontains $victimAbs) { continue }
                 $triedAbs += $victimAbs
 
-                $victimCommonCmps = Get-CommonDirAnswer $victimAbs
+                $victimCommonCmps = Get-CommonDirAnswer $victimAbs -Reask
                 if ($null -eq $victimCommonCmps) { continue }
                 foreach ($victimCmp in $victimCommonCmps) {
                     # CULTURE OR ORDINAL, as in Test-Governed: a match denies, so each half only adds

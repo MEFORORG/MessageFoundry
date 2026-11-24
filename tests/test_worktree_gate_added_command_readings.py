@@ -437,6 +437,15 @@ TIMED: list[tuple[str, str, str, str]] = [
         "PowerShell",
     ),
     (
+        # Review round 2c9e3d7a9b: each hoist carries the lines before it, so a question that fails
+        # was asked once per hoist (44.1 s, against 9.9 s at BASELINE).
+        "nine lines, a missing -C directory each",
+        "echo start\n"
+        + "\n".join(f"echo line{i} $(git -C {{o}}/m{i} checkout -q y{i})" for i in _NINE),
+        "wt",
+        "Bash",
+    ),
+    (
         "nine lines, a backtick each",
         f"echo {_FILLER}\n"
         + "\n".join(f"echo line{i} {{bt}}git -C {{o}} checkout -q y{i}{{bt}}" for i in _NINE),
