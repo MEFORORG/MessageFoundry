@@ -2305,8 +2305,8 @@ class PostgresStore:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The cleanup settles nothing, as before: a failed open forfeits the
             # AES-GCM invocation block it reserved, and each forfeited block counts toward the
-            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it never replaces the open's own error (vault
-            # BACKLOG #3054).
+            # key's fail-closed invocation ceiling. A cleanup that fails is logged by class, so it
+            # never replaces the open's own error (vault BACKLOG #3054).
             async def _release() -> None:
                 try:
                     await pool.close()
@@ -3031,6 +3031,8 @@ class PostgresStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the pool stays open; this close is not cancel-safe.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)

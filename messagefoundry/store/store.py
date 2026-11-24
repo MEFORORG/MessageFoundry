@@ -2172,19 +2172,42 @@ def cancels_at_entry() -> int:
 
 def _force_failed_open_release(
     force_release: Callable[[], object] | None, *, after: str = "a failed store open"
-) -> None:
+) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
-    None is a caller with nothing it can release without waiting."""
+    None is a caller with nothing it can release without waiting. True only when a release ran
+    and returned something other than ``False``, which a release made of several steps returns
+    when one of them failed, so a caller's log line says the release happened only then (BACKLOG
+    #5720)."""
     if force_release is None:
-        return
+        return False
     try:
-        force_release()
+        return force_release() is not False
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
             "forcing the release after %s also failed (%s)",
             after,
             type(failure).__name__,
         )
+        return False
+
+
+def _forced_outcome(
+    force_release: Callable[[], object] | None,
+    released: bool,
+    *,
+    built: str = "what it had not closed",
+    left: str = "may still be open",
+) -> str:
+    """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
+    names what was to be released, and ``left`` what follows when nothing released it. A release
+    that ran is not said to have released everything: on SQL Server it marks the pool closing and
+    shuts its executor down, which leaves the pool's free connections open, and on SQLite a
+    statement that ignores the interrupt keeps its worker running."""
+    if released:
+        return f"a forced release of {built} ran without waiting for it"
+    if force_release is None:
+        return f"{built} {left}"
+    return f"forcing its release failed, so {built} {left}"
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
@@ -2204,6 +2227,20 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _force_stop_connections(conns: Sequence[aiosqlite.Connection]) -> bool:
+    """Interrupt and stop each of ``conns`` without waiting, each step's failure logged by class.
+    False when any step failed, so the caller does not report them released (BACKLOG #5720).
+    interrupt() aborts a statement the worker is running, so the close stop() queues behind it is
+    reached; stop() does not await it."""
+    released = True
+    for conn in conns:
+        raw = getattr(conn, "_connection", None)
+        if raw is not None:
+            released &= _force_failed_open_release(raw.interrupt)
+        released &= _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+    return released
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -2272,8 +2309,8 @@ async def cleanup_failed_open(
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
     The bound starts at once when the open's own end was a cancel, or a cancel this open received
     under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
-    the bound, ``force_release`` drops what the open built without waiting, and this stops
-    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    the bound, ``force_release`` runs without waiting, which need not release everything the open
+    built (see :func:`_forced_outcome`), and this stops waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
@@ -2322,15 +2359,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release, after=after)
+            released = _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
-                "what the open built was released without waiting for it"
-                if force_release is not None
-                else "it was left to finish on its own",
+                _forced_outcome(
+                    force_release,
+                    released,
+                    built="what the open built",
+                    left="is left to the cleanup, until it finishes, if it does",
+                ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task, what)
@@ -2365,14 +2405,10 @@ async def cleanup_failed_open(
                 break
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
-        # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release, after=after)
+        # the read pool included: force its release without waiting (BACKLOG #5720).
+        released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
-        left = (
-            "what it had not closed was released without waiting for it"
-            if force_release is not None
-            else "what it had not closed may still be open"
-        )
+        left = _forced_outcome(force_release, released)
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:
@@ -12437,14 +12473,8 @@ class MessageStore:
             # Read now: close() empties the list, and a forced release must still reach each one.
             conns = [*(store._read_conns if store is not None else ()), db]
 
-            def _force_release() -> None:
-                # interrupt() aborts a statement the worker is running, so the close stop()
-                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
-                for conn in conns:
-                    raw = getattr(conn, "_connection", None)
-                    if raw is not None:
-                        _force_failed_open_release(raw.interrupt)
-                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+            def _force_release() -> bool:
+                return _force_stop_connections(conns)
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
@@ -14120,6 +14150,8 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the connections' worker threads stay running; this close is not cancel-safe.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:

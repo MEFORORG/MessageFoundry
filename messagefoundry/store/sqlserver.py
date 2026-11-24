@@ -4453,9 +4453,10 @@ class SqlServerStore:
         except BaseException as exc:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
-            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is released in a finally, same as close() above: wait_closed() cannot
-            # complete while the pool is wedged, so releasing the executor only on the success path
-            # would leak its threads in exactly the case this except exists for.
+            # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is
+            # released in a finally, same as close() below: wait_closed() cannot complete while the
+            # pool is wedged, so releasing the executor only on the success path would leak its
+            # threads in exactly the case this except exists for.
             async def _release() -> None:
                 try:
                     try:
@@ -6093,6 +6094,8 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the pool and its executor stay open; this close is not cancel-safe.
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
