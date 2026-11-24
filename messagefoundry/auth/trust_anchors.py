@@ -249,9 +249,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     the check (vault BACKLOG #3714 step 11, :data:`_STORE_PIN_REFUSED`). **This paragraph is
     where the hold is stated; the code and messages that act on it point here.** What sets it: a
     refusal at ``enforce`` that is a verdict on the file's content, its ACL or its path, a pipe or
-    device at the path refused as not a regular file among them (on Windows ``os.stat`` of a pipe
-    or device can fail first, with a fault that sets none; :func:`_transient_read_fault` says
-    which), or an ACL or path that could not be read, since whoever swapped the file can make its
+    device at the path refused as not a regular file among them (:func:`_transient_read_fault`),
+    or an ACL or path that could not be read, since whoever swapped the file can make its
     ACL unreadable. Some file read faults set nothing
     (:func:`_transient_read_fault`, which lists at least which and names the known residuals,
     and says which of them reach a read at ``enforce``). Any other ``OSError`` sets the hold.
@@ -2971,9 +2970,10 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     **A pin whose path verdict at the store open is indeterminate or insecure does not reach this
     read at** ``enforce``. The SQL Server store open refuses both verdicts
     (:func:`~messagefoundry.store.sqlserver.check_pinned_certificate`), so ``serve`` fails at the
-    open whatever the network does. A share can read as either, depending on the owners and mode
-    bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`), and on
-    POSIX so can at least a local disk of a type outside
+    open whatever the network does. On POSIX a share can read as either, depending on the owners
+    and mode bits along its path (:func:`~messagefoundry.auth.anchor_path.anchor_path_verdict`),
+    and on Windows a path on a share or a mapped network drive reads as indeterminate
+    (:data:`~messagefoundry.auth.anchor_path.SHARE_CAUSE`). On POSIX so can at least a local disk of a type outside
     :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`, such as ZFS, vfat or exfat, and any
     host without ``/proc/self/mountinfo``. So at ``enforce`` this exemption
     takes effect only for a pin whose path passed at the store open, such as on a trusted local
@@ -2991,13 +2991,17 @@ def _transient_read_fault(exc: OSError | ValueError) -> bool:
     that becomes networked after the open, and for a read that fails with ``EIO``, as on a
     failing disk or, on POSIX, a device swapped in between the stat and the open. On POSIX a
     device already at the path when the stat runs is refused as not a regular file and sets
-    the hold. On Windows ``os.stat`` of a device or named pipe the account cannot open can raise
-    ``PermissionError``, which sets no hold. Windows also reports at
+    the hold. On Windows, as measured, a busy named pipe fails ``os.stat`` with Windows error 231,
+    which sets the hold, and a named pipe the account cannot open passes the stat and raises
+    ``PermissionError`` at the open, which sets none. Windows also reports at
     least some malformed paths as ``FileNotFoundError``, which then sets no hold either. Each
     such check still refuses the reload. The path verdict does not gate this read at a later
     check: :func:`evaluate_anchor` reads the file before it judges the path, so a pin whose path
-    becomes insecure or indeterminate after the open reaches this read, and a read fault there
-    is judged here first.
+    becomes insecure or indeterminate after the open reaches this read, a read fault there is
+    judged here, and the path is not judged at that check. An overlay mount passes the
+    file-system type check (``overlay`` is in
+    :data:`~messagefoundry.auth.anchor_path.POSIX_TRUSTED_FS`) even where its lower layer is on a
+    network file system, so a network fault reading such a pin sets no hold either.
 
     What still sets the hold: at least a pipe or device refused as not a regular file, a
     ``BrokenPipeError``, which is how a pipe at the path can fail on Windows, a ``ValueError``
