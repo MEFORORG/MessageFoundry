@@ -1050,10 +1050,13 @@ class SandboxSession:
         engine_graph = self._graph() if self._graph is not None else None
         # Compared by value: the cache means "the same graph", and a graph callable need not return
         # one object per graph (BACKLOG #6830). A hit only ever refuses, so it cannot let a
-        # mismatched worker up.
+        # mismatched worker up. ``graph`` stays the object the worker was compared with.
         if self._refused is not None and self._refused[0] == engine_graph:
             raise SandboxWorkerRefused(
-                self._refused[1], first=False, content_only=self._refused[2], graph=engine_graph
+                self._refused[1],
+                first=False,
+                content_only=self._refused[2],
+                graph=self._refused[0],
             )
         # NAMED, not inherited: an allowlist, so the engine's secrets are not in the child's
         # environment (vault BACKLOG #2587). No engine variable crosses. The config-source escape

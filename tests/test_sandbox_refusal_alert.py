@@ -204,7 +204,9 @@ def test_the_refusal_survives_a_copy_and_a_pickle() -> None:
 
 
 def test_only_the_comparing_spawn_is_marked_first(edited_config: Path) -> None:
-    serving = graph_shape(load_config(edited_config))  # one object, as the runner caches it
+    serving = graph_shape(
+        load_config(edited_config)
+    )  # one object per graph, as the runner's alert gate needs
     _edit(edited_config)
     session = SandboxSession(
         SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=30.0),

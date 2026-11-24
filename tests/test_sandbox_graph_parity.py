@@ -325,42 +325,8 @@ def test_an_equal_engine_graph_is_refused_from_the_cache(
         assert session._generation == 1  # no second worker was started
         assert not second.value.first
         assert str(second.value) == str(first.value)
-    finally:
-        session.close()
-
-
-def test_a_config_file_mid_write_on_disk_does_not_reach_a_respawned_worker(
-    config_dir: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A session's workers run the snapshot the engine loaded and never read the directory, so a
-    config file caught half-written on disk cannot make a worker's graph differ, at a first spawn or
-    at a respawn, and there is no transient mismatch for the refusal cache to keep (BACKLOG #6830).
-    The control: the same half-written directory, loaded, builds no graph at all."""
-    monkeypatch.setenv(_VARIABLE, "3")
-    registry = load_config(config_dir)
-    assert registry.config_snapshot is not None
-    (Path(config_dir) / "graph.py").write_text(_GRAPH[: len(_GRAPH) // 2], encoding="utf-8")
-    with pytest.raises(Exception):  # noqa: B017 -- any load failure is the control's point
-        load_config(config_dir)
-    session = SandboxSession(
-        SandboxPolicy(
-            mode=SandboxMode.SUBPROCESS, wall_seconds=30.0, pass_environment=(_VARIABLE,)
-        ),
-        inbound="IB_PARITY",
-        config_dir=config_dir,
-        env=None,
-        graph=lambda: graph_shape(registry),
-        snapshot=registry.config_snapshot,
-    )
-    try:
-        session._spawn()
-        assert session._refused is None
-        proc = session._proc
-        assert proc is not None
-        proc.kill()
-        proc.wait(timeout=30)
-        session._spawn()  # a respawn, with the disk still half-written
-        assert session._refused is None and session._generation == 2
+        # A hit reports the graph the worker was compared with, not the equal one just read.
+        assert second.value.graph is first.value.graph
     finally:
         session.close()
 

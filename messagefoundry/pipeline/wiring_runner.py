@@ -2102,8 +2102,9 @@ class RegistryRunner:
         self._outbound_plan: _OutboundPlan | None = None
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
-        # get their own object, and a session matches its cached refusal by identity, so it would
-        # start a worker and alert again for the same refusal (vault BACKLOG #2724).
+        # get their own object, and the refusal alert's gate in ``_off_loop_sandboxed`` matches a
+        # refusal's graph to the served one by identity, so it would drop the alert for a refusal
+        # against the graph still being served (vault BACKLOG #2724, BACKLOG #6830).
         self._sandbox_graph_shape_lock = threading.Lock()
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
