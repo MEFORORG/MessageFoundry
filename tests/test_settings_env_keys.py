@@ -153,9 +153,11 @@ def test_a_real_field_still_loads_from_the_environment() -> None:
         ("MEFOR_AUTH", "a setting in it is MEFOR_AUTH_<KEY>"),
         ("MEFOR_SECURITY", "a setting in it is MEFOR_SECURITY_<KEY>"),
         ("MEFOR_store", "a setting in it is MEFOR_STORE_<KEY>"),  # matched in lower case
+        ("MEFOR_STORE__", "a setting in it is MEFOR_STORE_<KEY>"),  # any trailing "_"
         # Sections with no env layer, whose names hold an underscore of their own.
         ("MEFOR_UPDATE_CHECK", "that section has no environment layer; set it in the file"),
         ("MEFOR_SECRET_ROTATION", "that section has no environment layer; set it in the file"),
+        ("MEFOR_UPDATE_CHECK_", "that section has no environment layer; set it in the file"),
     ],
 )
 def test_a_name_that_is_a_section_and_no_setting_refuses_the_load(name: str, how: str) -> None:
@@ -163,24 +165,49 @@ def test_a_name_that_is_a_section_and_no_setting_refuses_the_load(name: str, how
     d20261123T172418598-d8ffd6, option (c)): nothing reads it, and nothing else owns the name of
     a config section, so it is refused rather than warned about. Named, never its value."""
     message = _refusal({name: _SENTINEL})
-    assert name in message and how in message
+    section = name[len("MEFOR_") :].lower().rstrip("_")
+    assert f"{name} (names the [{section}] section and no setting; {how})" in message
     assert _SENTINEL not in message
+    # Noted too, since the note is logged before any refusal can hide it.
+    (note,) = _unread_env_notes({name: _SENTINEL}, {})
+    assert name in note and how in note and _SENTINEL not in note
 
 
-def test_a_section_name_refusal_does_not_stop_a_correct_variable_beside_it_from_loading() -> None:
-    """The control: the correct spelling of the first case above loads, and the names outside
-    the shape still load, the near-section typo with a warning and the others silently."""
-    loaded = load_settings(
-        environ={
-            "MEFOR_STORE_PATH": "ok.db",
-            "MEFOR_ALLOW_INSECURE_TLS": "1",  # names no section
-            "MEFOR_TEST_FORCE_AAD_BIND": "1",  # the test suite's own switch
-            "MEFOR_STOER_PATH": "x.db",  # near a section: warned about, not refused
-            "MEFOR_PORT": "tcp://10.0.0.1:8765",  # what a Kubernetes Service named "mefor" injects
-        },
-        default_file=False,
-    )
+def test_names_outside_the_section_name_shape_still_load(caplog: pytest.LogCaptureFixture) -> None:
+    """The controls for the refusal above: the correct spelling of its first case loads, and the
+    names outside the shape still load, the near-section typo with a warning and the others with
+    none."""
+    with caplog.at_level("WARNING", logger="messagefoundry.config.settings"):
+        loaded = load_settings(
+            environ={
+                "MEFOR_STORE_PATH": "ok.db",
+                "MEFOR_ALLOW_INSECURE_TLS": "1",  # names no section
+                "MEFOR_TEST_FORCE_AAD_BIND": "1",  # the test suite's own switch
+                "MEFOR_STOER_PATH": "x.db",  # near a section: warned about, not refused
+                "MEFOR_PORT": "tcp://10.0.0.1:8765",  # what a Service named "mefor" injects
+            },
+            default_file=False,
+        )
     assert str(loaded.store.path) == "ok.db"
+    warned = [r.getMessage() for r in caplog.records if "NOT applied" in r.getMessage()]
+    assert len(warned) == 1 and "MEFOR_STOER_PATH" in warned[0]
+
+
+def test_a_refused_file_key_does_not_hide_a_section_name_variable(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The file-key refusal runs before the env refusal, so the section-name variable is also
+    logged as a WARNING first. The operator sees both on the first start."""
+    config = tmp_path / "messagefoundry.toml"
+    config.write_text("[store]\npathh = 'x.db'\n", encoding="utf-8")
+    with (
+        caplog.at_level("WARNING", logger="messagefoundry.config.settings"),
+        pytest.raises(ValueError, match="pathh"),
+    ):
+        load_settings(config_path=config, environ={"MEFOR_UPDATE_CHECK": _SENTINEL})
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "MEFOR_UPDATE_CHECK" in text and "NOT applied" in text
+    assert _SENTINEL not in text
 
 
 def test_every_spared_name_loads() -> None:
@@ -293,7 +320,9 @@ def test_the_note_is_logged_at_warning_and_the_load_still_succeeds(
             environ={"MEFOR_STOER_PATH": _SENTINEL, "MEFOR_AUHT_LOCKOUT_MINUTES": "7"},
             default_file=False,
         )
-    assert str(loaded.store.path) != _SENTINEL  # the variable changed nothing, as the note says
+    # Neither variable changed anything, as the note says.
+    assert str(loaded.store.path) != _SENTINEL
+    assert loaded.auth.lockout_minutes == 15
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MEFOR_STOER_PATH" in text and "MEFOR_AUHT_LOCKOUT_MINUTES" in text
     assert "NOT applied" in text
@@ -766,7 +795,8 @@ _DEPLOY_GLOBS = (
     "scripts/**/*.sh",
 )
 #: A name followed by ``*`` or ``_*`` is a documented family (``MEFOR_EGRESS_ALLOWED_*``), not a name.
-_FAMILY = re.compile(r"_?\*")
+#: A family written with a wildcard or a placeholder (``MEFOR_STORE_*``, ``MEFOR_STORE_<KEY>``).
+_FAMILY = re.compile(r"_?[*<]")
 
 
 def _deployment_names() -> dict[str, set[str]]:
