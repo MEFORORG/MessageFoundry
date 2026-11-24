@@ -1569,13 +1569,16 @@ other module bytes than the engine loaded:
 4. Every later message on that inbound is refused the same way, without starting another worker,
    until a reload. Those refusals raise no further alert and log no further `WARNING` line of
    their own. Any reload, even one that leaves the graph the same, starts a fresh worker for the
-   next message, which is compared again. A refusal still in flight when the reload began raises
-   no alert. Each other inbound's worker is compared when it
+   next message, which is compared again. A refusal still in progress when a reload or its
+   rollback replaces the worker is neither alerted nor failed: the message runs again on a fresh
+   worker, at once or after it is re-pended, and that worker's refusal, if the cause stands,
+   raises the alert.
+   Each other inbound's worker is compared when it
    starts, and each one refused raises its own alert. A reload that does not clear the cause
    raises the alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.
 
-Reload the config: the engine keeps that refusal until a reload changes the graph it serves. Other files in the config directory, such as
+Reload the config: the engine keeps that refusal until a reload. Other files in the config directory, such as
 `connections.toml` and the code-set tables, are not part of the digest: the worker uses the
 engine's code sets, and `connections.toml` changes the names, which are compared anyway.
 

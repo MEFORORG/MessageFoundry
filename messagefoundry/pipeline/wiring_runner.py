@@ -2102,9 +2102,9 @@ class RegistryRunner:
         self._outbound_plan: _OutboundPlan | None = None
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
-        # get their own object. Both the sessions' refusal cache and the alert gate in
-        # ``_off_loop_sandboxed`` compare by value (BACKLOG #6830), so this is no longer what keeps
-        # an alert; it keeps one shape per registry, not one per session (vault BACKLOG #2724).
+        # get their own object. Both the sessions' refusal cache and ``_sandboxed_dispatch``
+        # compare by value (BACKLOG #6830), so this is no longer what keeps an alert; it keeps one
+        # shape per registry, not one per session (vault BACKLOG #2724).
         self._sandbox_graph_shape_lock = threading.Lock()
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
@@ -7464,13 +7464,17 @@ class RegistryRunner:
         A worker refused for a graph mismatch raises the ``sandbox_worker_refused`` alert here, on
         the loop, before the exception goes on to the internal-error policy unchanged (vault BACKLOG
         #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
-        graphs raises it; the session's cached refusals for later messages do not."""
-        # The session the dispatch ran on, so the alert gate can tell one a reload has discarded.
-        session: SandboxSession | None = None
+        graphs raises it; the session's cached refusals for later messages do not.
+
+        **A refusal that a reload overtook is a close, not a refusal** (BACKLOG #6830): one from a
+        session a reload or a rollback has since discarded, or compared with a graph unequal to the
+        one now served. :meth:`_sandboxed_dispatch` raises it as :class:`SandboxSessionClosed`, so it
+        is retried or re-pended exactly as above, raises no alert and is not dead-lettered. The
+        message's next run compares on a session that is serving, and that refusal, if the cause
+        still stands, is the one that alerts, whether or not any further message arrives."""
         try:
             try:
-                session = self._sandbox_for(name)
-                return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
+                return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
             except SandboxSessionClosed:
                 if self._stop.is_set() or self.registry is not registry:
                     raise
@@ -7478,25 +7482,11 @@ class RegistryRunner:
                     "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
                     name,
                 )
-                session = self._sandbox_for(name)
-                return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
+                return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
         except SandboxWorkerRefused as exc:
-            # Only a refusal from the session still serving this inbound, compared with the graph
-            # still served. A reload or a rollback discards every session, and the next dispatch's
-            # fresh session compares again and raises its own first refusal, so an alert from the
-            # discarded one would be a duplicate or, when the reload cleared the cause, an alert
-            # left open with nothing to fix. The graph is compared by value, as the session's
-            # refusal cache is (BACKLOG #6830): a session kept across a direct swap of
-            # ``self.registry`` to an equal graph refuses its later messages from that cache, never
-            # as ``first``, so this is that refusal's only alert. The graph the worker was
-            # compared with is checked, not ``registry``: a reload that swapped and then rolled
-            # back leaves ``registry`` served though the comparison used the other.
-            if (
-                exc.first
-                and session is not None
-                and self._sandbox_sessions.get(name) is session
-                and (exc.graph is None or exc.graph == self._engine_graph_shape())
-            ):
+            # Only a refusal from a session still serving, against the graph still served, gets
+            # here: :meth:`_sandboxed_dispatch` turns any other into a close.
+            if exc.first:
                 # The whole refusal, once: what differs and both digests. A dead-lettered message
                 # keeps only the first 200 characters of it. Config names and digests, no message.
                 log.warning("inbound %r: %s", name, exc)
@@ -7512,6 +7502,33 @@ class RegistryRunner:
             # SystemExit, whose code may be the author's text, is on neither chain.
             exited = UserCodeCalledSysExit.from_exit(exc)
         raise exited
+
+    async def _sandboxed_dispatch[T](
+        self, name: str, fn: Callable[..., T], registry: Registry, /, *args: Any, **kwargs: Any
+    ) -> T:
+        """One dispatch of :meth:`_off_loop_sandboxed`, on the session resolved for it now.
+
+        A :class:`SandboxWorkerRefused` a reload overtook is raised as :class:`SandboxSessionClosed`
+        (BACKLOG #6830): the session that raised it is no longer the one serving ``name``, because
+        a reload or a rollback discarded it, or the graph its worker was compared with is not equal
+        to the one served now. Neither the alert nor the dead-letter belongs to it: the reload may
+        have cleared the cause, and if not, the message's next run, on a session that is serving,
+        compares again and alerts once. The graph is compared by value, as the session's refusal
+        cache is, so a swap of ``self.registry`` to an equal graph does not overtake a refusal.
+        Checked on the loop with no await before the caller's alert, so a reload cannot discard
+        the session between this check and that alert."""
+        session = self._sandbox_for(name)
+        try:
+            return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
+        except SandboxWorkerRefused as exc:
+            if session is not None and (
+                self._sandbox_sessions.get(name) is not session
+                or (exc.graph is not None and exc.graph != self._engine_graph_shape())
+            ):
+                raise SandboxSessionClosed(
+                    f"inbound {name!r}: a reload overtook its sandbox worker's refusal"
+                ) from exc
+            raise
 
     async def stop(
         self,

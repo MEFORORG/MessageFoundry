@@ -14,6 +14,7 @@ Synthetic HL7 only.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import logging
 import pickle
@@ -204,10 +205,11 @@ async def test_a_refusal_alerts_only_against_a_graph_equal_to_the_served_one(
     tmp_path: Path,
 ) -> None:
     """A refusal from the live session alerts only when the graph it was compared with equals the
-    one served (BACKLOG #6830). Against an unequal graph, as after a reload that changed it or one
-    that swapped and rolled back, it does not: the reload is the remedy. Against an equal object
-    that is not the served one it does, since the session's by-value cache raises no later first
-    refusal for it."""
+    one served (BACKLOG #6830). Against an unequal graph, as after a direct swap of the registry
+    with the session kept, it is overtaken: it is retried once, since the registry is still the
+    one served, and then raised as a close, which the worker re-pends, with no alert and no
+    dead-letter. Against an equal object that is not the served one it alerts, since the
+    session's by-value cache raises no later first refusal for it."""
     registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     compared: list[GraphShape] = []
@@ -220,8 +222,9 @@ async def test_a_refusal_alerts_only_against_a_graph_equal_to_the_served_one(
         runner = _runner(registry, store, tmp_path, cast(Any, sink))
         try:
             compared.append(graph_shape(Registry(code_digest="1" * 64)))  # not the served graph
-            with pytest.raises(SandboxWorkerRefused):
+            with pytest.raises(SandboxSessionClosed) as closed:
                 await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert isinstance(closed.value.__cause__, SandboxWorkerRefused)
             assert sink.refused == []
             # An equal graph is the same graph (BACKLOG #6830): the refusal still stands, so it
             # alerts, as the session's by-value cache will not raise another first refusal.
@@ -242,15 +245,17 @@ async def test_a_refusal_alerts_only_against_a_graph_equal_to_the_served_one(
         await store.close()
 
 
+@pytest.mark.parametrize("cached", [False, True], ids=["first", "cached"])
 @pytest.mark.parametrize("cleared", [False, True], ids=["cause_stands", "reload_cleared_it"])
-async def test_a_refusal_straddling_a_reload_to_an_equal_graph_alerts_once(
-    tmp_path: Path, cleared: bool
+async def test_a_refusal_straddling_a_reload_to_an_equal_graph_re_pends(
+    tmp_path: Path, cleared: bool, cached: bool
 ) -> None:
-    """A first refusal whose session a reload to an equal graph discarded while it ran raises no
-    alert: the reload's own first step, as ``_close_sandbox_sessions`` does it, drops the session
-    before the refusal reaches the gate. The fresh session for the next message compares again.
-    Where the cause stands, its refusal is the one alert; where the reload cleared it (the
-    content-only case: the worker now runs the reloaded bytes), no alert is left open at all."""
+    """A refusal, first or cached, whose session a reload to an equal graph discarded while it ran
+    is a close, not a refusal (BACKLOG #6830): it raises :class:`SandboxSessionClosed`, which the
+    worker re-pends, so it neither alerts nor dead-letters. The message's next run, on a fresh
+    session, compares again. Where the cause stands, its refusal is the one alert; where the reload
+    cleared it (the content-only case: the worker now runs the reloaded bytes), it is delivered
+    and no alert is left open."""
     registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     calls: list[Any] = []
@@ -264,7 +269,9 @@ async def test_a_refusal_straddling_a_reload_to_an_equal_graph_alerts_once(
             runner._sandbox_sessions.clear()  # the reload drops the sessions, then closes them
             runner.registry = copy.copy(registry)  # an equal graph, a new object
             assert runner._engine_graph_shape() == compared
-            raise SandboxWorkerRefused("refused", first=True, content_only=True, graph=compared)
+            raise SandboxWorkerRefused(
+                "refused", first=not cached, content_only=True, graph=compared
+            )
         if not cleared:
             raise SandboxWorkerRefused(
                 "refused", first=True, content_only=True, graph=runner._engine_graph_shape()
@@ -274,9 +281,12 @@ async def test_a_refusal_straddling_a_reload_to_an_equal_graph_alerts_once(
     try:
         runner = _runner(registry, store, tmp_path, cast(Any, sink))
         try:
-            with pytest.raises(SandboxWorkerRefused):
+            with pytest.raises(SandboxSessionClosed) as closed:
                 await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert isinstance(closed.value.__cause__, SandboxWorkerRefused)
             assert sink.refused == []
+            assert len(calls) == 1  # another graph is served, so re-pended rather than retried
+            # The re-pended message's next run reads the registry afresh.
             if cleared:
                 await runner._off_loop_sandboxed("IB_X", dispatch, runner.registry)
                 assert sink.refused == []
@@ -284,7 +294,100 @@ async def test_a_refusal_straddling_a_reload_to_an_equal_graph_alerts_once(
                 with pytest.raises(SandboxWorkerRefused):
                     await runner._off_loop_sandboxed("IB_X", dispatch, runner.registry)
                 assert sink.refused == [("IB_X", True)]
-            assert calls[0] is not calls[1]  # the second message ran on a fresh session
+            assert calls[0] is not calls[1]  # the second run was on a fresh session
+        finally:
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
+def _refused_then_reloaded(
+    runner: RegistryRunner, loop: asyncio.AbstractEventLoop, *, stop: bool
+) -> Any:
+    """``transform_one``, with a reload that re-applies the same registry, as ``reload(None)`` or a
+    rollback does, landing after the first dispatch's real worker refused and before that refusal
+    reaches the loop. ``stop`` sets the runner stopping first, as a shutdown that overlaps it."""
+    runs: list[Any] = []
+
+    def call(*args: Any, sandbox: SandboxSession | None = None, **kwargs: Any) -> Any:
+        runs.append(sandbox)
+        try:
+            return transform_one(*args, sandbox=sandbox, **kwargs)
+        except SandboxWorkerRefused:
+            if len(runs) == 1:
+                if stop:
+                    loop.call_soon_threadsafe(runner._stop.set)
+                asyncio.run_coroutine_threadsafe(runner._close_sandbox_sessions(), loop).result(30)
+            raise
+
+    call.runs = runs  # type: ignore[attr-defined]
+    return call
+
+
+async def test_a_refusal_straddling_a_same_registry_reload_alerts_once(
+    edited_config: Path, tmp_path: Path
+) -> None:
+    """A real refusal whose session a same-registry reload discarded while it ran (BACKLOG #6830).
+    The registry is still served, so the dispatch is retried at once on a fresh session, whose
+    worker compares again and refuses: that refusal is the one alert, and the message fails on it.
+    Before, the first refusal was dropped from the alert as stale and still dead-lettered the
+    message, so no alert was raised until some later message came."""
+    registry = _loaded_then_sent_edited(edited_config)
+    sink = _Recorder()
+    store = await MessageStore.open(tmp_path / "same.db")
+    try:
+        runner = _runner(registry, store, edited_config, cast(Any, sink))
+        try:
+            call = _refused_then_reloaded(runner, asyncio.get_running_loop(), stop=False)
+            with pytest.raises(SandboxWorkerRefused) as refused:
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY", call, registry, "h_0", RAW, run_context=RunContext()
+                )
+            assert refused.value.first
+            assert sink.refused == [("IB_PARITY", True)]
+            first, second = call.runs
+            assert first is not None and second is not None
+            assert first is not second and first._closed and not second._closed
+            assert first._proc is None and second._proc is None  # no worker ever came up
+            assert runner._sandbox_for("IB_PARITY") is second
+            # The next message is refused from the serving session's cache: no second alert.
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY", transform_one, registry, "h_0", RAW, run_context=RunContext()
+                )
+            assert sink.refused == [("IB_PARITY", True)]
+        finally:
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
+async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(
+    edited_config: Path, tmp_path: Path
+) -> None:
+    """As above, with the runner stopping: nothing is retried while it stops, so the refusal is
+    raised as a close and the row is re-pended, with no alert and no dead-letter. The alert is not
+    lost: it comes from the message's own rerun, with no other message needed."""
+    registry = _loaded_then_sent_edited(edited_config)
+    sink = _Recorder()
+    store = await MessageStore.open(tmp_path / "stop.db")
+    try:
+        runner = _runner(registry, store, edited_config, cast(Any, sink))
+        try:
+            call = _refused_then_reloaded(runner, asyncio.get_running_loop(), stop=True)
+            with pytest.raises(SandboxSessionClosed):
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY", call, registry, "h_0", RAW, run_context=RunContext()
+                )
+            assert sink.refused == []
+            assert len(call.runs) == 1
+            # The re-pended row's rerun, once the engine serves again.
+            runner._stop.clear()
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY", transform_one, registry, "h_0", RAW, run_context=RunContext()
+                )
+            assert sink.refused == [("IB_PARITY", True)]
         finally:
             await runner._close_sandbox_sessions()
     finally:
