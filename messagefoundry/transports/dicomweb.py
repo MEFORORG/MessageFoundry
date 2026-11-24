@@ -13,7 +13,8 @@ DICOMWEB into the REST/SOAP/FHIR arm — see transports.egress ``_allowlist_for`
 It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works without the DIMSE stack. A
 202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
 (:func:`_sent_instance_uid`), and, when ``pydicom`` is installed, its data set SOP Instance UID
-(:func:`_data_set_instance_uid`; BACKLOG #5914).
+(:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
+#5914).
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -40,7 +41,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import http.client
 import importlib.util
 import logging
@@ -50,11 +50,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
-from messagefoundry.parsing.dicom._deps import load_header_readers
 from messagefoundry.parsing.dicom.errors import DicomError
 from messagefoundry.parsing.dicom.peek import DicomPeek
 from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
@@ -434,28 +433,21 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
     return None, _META_NO_0003
 
 
-@functools.cache
 def _dicom_extra_installed() -> bool:
-    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host. Cached for
-    the process, so a miss does not scan ``sys.path`` on every call: an extra installed while the
-    engine runs is not seen until it restarts."""
+    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host, asked on
+    each send, so an extra installed or removed while the engine runs is seen at the next one."""
     return importlib.util.find_spec("pydicom") is not None
 
 
-def _refuse_a_broken_dicom_extra(connection: str | None) -> None:
-    """Refuse the build when ``pydicom`` is importable but lacks a reader the deflate guard replays
-    (:func:`~messagefoundry.parsing.dicom._deps.load_header_readers`), so an extra already broken
-    when the connection is built does not first show itself after a partner has answered a 202. A
-    fault that arises after the build still can, and :func:`_data_set_instance_uid` catches its
-    :class:`RuntimeError`. An absent ``pydicom`` is not refused:
-    a 202 is then compared with the File Meta UID alone (BACKLOG #5914). Names the connection and
-    the readers, never a value."""
-    if not _dicom_extra_installed():
-        return
-    try:
-        load_header_readers()
-    except RuntimeError as exc:
-        raise ValueError(f"{hop_name_prefix(connection)}DICOMweb destination: {exc}") from exc
+class _SentUids(NamedTuple):
+    """The SOP Instance UIDs of the object sent that a 202 is compared with, read before the POST
+    (:func:`_read_sent_uids`). ``meta`` is the File Meta (0002,0003) UID or ``None``, with
+    ``cause`` one of the fixed ``_META_*`` strings saying why when it is ``None``; ``data_set`` is
+    the data set (0008,0018) UID or ``None``. Never logged (PHI-safe)."""
+
+    meta: str | None
+    cause: str
+    data_set: str | None
 
 
 def _data_set_instance_uid(obj: bytes) -> str | None:
@@ -463,16 +455,15 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
     materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
     or ``None`` when none is read: the optional ``[dicom]`` extra is absent, the object does not
-    parse, or it carries no UID in the grammar :func:`_is_uid` checks. A server builds its reply
-    from this UID, so a 202 for an object whose File Meta was not rewritten after a re-UID still
-    names it (BACKLOG #5914).
+    parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), or it carries no UID in the
+    grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
+    whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914).
 
-    It runs after the partner has answered. A broken extra is refused when the connection is built
-    (:func:`_refuse_a_broken_dicom_extra`); a :class:`~messagefoundry.parsing.dicom.errors.DicomError`
-    the read meets is read as no UID, and a :class:`RuntimeError` is logged at WARNING and read as
-    no UID. Any other exception is not caught and escapes the send. The SCU's ignores for pydicom's
-    value warnings, which name a value, are put back first before the read. A failure is logged by
-    exception class only, never the UID or the bytes (PHI-safe)."""
+    Any other exception, a :class:`RuntimeError` from an installed ``pydicom`` that lacks a reader
+    the deflate guard replays included, is not caught here: :meth:`DicomWebDestination._post`
+    runs this read before the POST and refuses the message on it. The SCU's ignores for pydicom's
+    value warnings, which name a value, are put back first. A failure is logged by exception class
+    only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
         logger.debug(
             "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
@@ -484,16 +475,19 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     except DicomError as exc:
         logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
         return None
-    except RuntimeError as exc:
-        logger.warning(
-            "DICOMweb: the [dicom] extra failed reading a data set SOP Instance UID (%s)",
-            type(exc).__name__,
-        )
-        return None
     if uid is None:
         return None
     uid = uid.rstrip("\0 ")
     return uid if _is_uid(uid) else None
+
+
+def _read_sent_uids(obj: bytes) -> _SentUids:
+    """Both comparable UIDs of the object sent: the File Meta one by hand
+    (:func:`_sent_instance_uid`) and the data set one with the codec
+    (:func:`_data_set_instance_uid`). Called before the POST, so a fault in either read surfaces
+    before a byte is sent, as the SCU parses before it associates (BACKLOG #5914)."""
+    meta, cause = _sent_instance_uid(obj)
+    return _SentUids(meta, cause, _data_set_instance_uid(obj))
 
 
 def _named_uid(item: Any) -> str | None:
@@ -514,7 +508,7 @@ def _named_uid(item: Any) -> str | None:
     return uid if _is_uid(uid) else None
 
 
-def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | None:
+def _stowrs_refusal(body: str, status: int, sent: _SentUids) -> tuple[str, str] | None:
     """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
     that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
     re-send would get the same reply.
@@ -536,7 +530,7 @@ def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | No
       with a reason naming why (BACKLOG #5914, decisions of 2026-11-23).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule and its ``sent`` is not read (BACKLOG #5914 ruling), so a 200
+    the ReferencedSOPSequence rule and is not compared with ``sent`` (BACKLOG #5914 ruling), so a 200
     dataset that confirms nothing and is not refused above, ``{}`` included, is delivered.
     docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states the rule in full.
 
@@ -566,29 +560,17 @@ def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | No
     return None
 
 
-def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | None:
+def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] | None:
     """The ``unconfirmed-202`` refusal for a 202 whose ReferencedSOPSequence items are
-    ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID
-    (:func:`_sent_instance_uid`) or, failing that, its data set's SOP Instance UID
-    (:func:`_data_set_instance_uid`). The data set is read only when some item names a UID in
-    the grammar :func:`_is_uid` checks, since with none its UID cannot change the verdict. With no
-    UID to compare, the reason names why the File Meta has none, and whether the data set was read
-    (BACKLOG #5914)."""
+    ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID or its
+    data set's SOP Instance UID, both read before the POST (:func:`_read_sent_uids`), so nothing
+    here parses the object. With neither UID to compare, the reason names why the File Meta has
+    none (BACKLOG #5914)."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
-    meta_uid, cause = _sent_instance_uid(sent)
-    if meta_uid is not None and meta_uid in named:
+    if any(uid is not None and uid in named for uid in (sent.meta, sent.data_set)):
         return None
-    data_set_uid = _data_set_instance_uid(sent) if named else None
-    if data_set_uid is not None and data_set_uid in named:
-        return None
-    if meta_uid is None and not named:
-        # The data set was not read, so the reason says nothing of its UID.
-        return (
-            "unconfirmed-202",
-            f"no File Meta SOP Instance UID of the instance sent to compare: {cause}, and the reply "
-            f"names no instance; {_NOT_SENT}",
-        )
-    if meta_uid is None and data_set_uid is None:
+    if sent.meta is None and sent.data_set is None:
+        cause = sent.cause
         return (
             "unconfirmed-202",
             f"no SOP Instance UID of the instance sent to compare: {cause}, and no data set SOP "
@@ -630,8 +612,6 @@ class DicomWebDestination(DestinationConnector):
         refuse_url_credentials(url, "DICOMweb destination 'url'")
         _refuse_base_url_query_or_fragment(url, config.name)
         _refuse_ambiguous_credentials(s, config.name)
-        # BACKLOG #5914: a broken [dicom] extra fails here, never after a partner's 202.
-        _refuse_a_broken_dicom_extra(config.name)
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("DICOMweb", config.name)
@@ -891,6 +871,27 @@ class DicomWebDestination(DestinationConnector):
         if self._hop_guard is not None:
             # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
             self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
+        # BACKLOG #5914: the UIDs a 202 is compared with are read before a byte is sent, as the SCU
+        # parses before it associates, so a fault in the read refuses the message here and never
+        # surfaces after a partner has answered. The refusal is raised outside the handler, so the
+        # fault, whose text can carry a value, rides neither its __cause__ nor its __context__.
+        sent: _SentUids | None = None
+        fault = ""
+        try:
+            sent = _read_sent_uids(dicom_bytes)
+        except Exception as exc:  # noqa: BLE001 - any fault in pydicom's read, a warning-as-error included
+            fault = type(exc).__name__
+        if sent is None:
+            logger.warning(
+                "DICOMweb: reading the SOP Instance UIDs of an object before sending it failed (%s)",
+                fault,
+            )
+            raise NegativeAckError(
+                f"DICOMweb sent-uid-unread: the SOP Instance UIDs of the object could not be read "
+                f"before sending it ({fault}); nothing was sent ({_redact_url(self.base_url)})",
+                code="sent-uid-unread",
+                permanent=True,
+            )
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,
@@ -958,7 +959,7 @@ class DicomWebDestination(DestinationConnector):
         # here, and with no handler active no decode error -- which holds the whole body -- rides
         # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
         # text names no reply content.
-        refused = _stowrs_refusal(body, status, dicom_bytes)
+        refused = _stowrs_refusal(body, status, sent)
         if refused is not None:
             code, reason = refused
             raise NegativeAckError(

@@ -29,6 +29,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
+from messagefoundry.parsing.dicom.peek import DicomPeek
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
@@ -853,10 +854,8 @@ async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
     # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
     text = str(exc.value)
     assert cause in text
-    if body == STORED_OK:  # the data set is read, and has no UID
-        assert "a replay of the same object cannot confirm it on a 202 unless" in text
-    else:  # the reply names no instance, so the data set is not read, and the text says so
-        assert "the reply names no instance" in text and "(0008,0018)" not in text
+    # The data set is read before the POST, whatever the reply names, and has no UID.
+    assert "a replay of the same object cannot confirm it on a 202 unless" in text
     assert "refused again" not in text
     assert "before a replay" in text
     assert SENT_UID not in text
@@ -941,63 +940,114 @@ async def test_dicomweb_the_data_set_read_lets_no_value_warning_escape() -> None
     assert not [w for w in seen if "Canary" in str(w.message)]
 
 
-async def test_dicomweb_a_202_naming_no_instance_does_not_read_the_data_set(
+async def test_dicomweb_the_data_set_is_read_once_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The data set read can change the verdict only when the reply names an instance.
+    # Manager decision of 2026-11-23 (the reviewer's altitude fix): both comparable UIDs are read
+    # before a byte is sent, as the SCU parses before it associates, whatever the reply then says.
+    pytest.importorskip("pydicom")
+    opener = _FakeOpener(body=STORED_OK.encode(), status=202)
+    reads: list[int] = []
+    real = DicomPeek.parse
+
+    def parse(data: bytes) -> object:
+        reads.append(len(opener.requests))  # how many requests had been sent at the read
+        return real(data)
+
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    dest._opener = opener  # type: ignore[assignment]
+    carried = _carried(_pydicom_part10(SENT_UID, _DATASET_UID))
+    opener.body = b""  # a reply naming no instance
+    with pytest.raises(NegativeAckError, match="unconfirmed-202"):
+        await dest.send(carried)
+    opener.body = STORED_OK.encode()  # a reply naming the instance sent
+    assert await dest.send(carried) is None
+    assert reads == [0, 1]  # one read per send, each before that send's POST
+
+
+class _AWarningAsError(UserWarning):
+    """What a pydicom warning becomes when the filters turn warnings into errors."""
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        pytest.param(TypeError("a value: 1.2.3.Canary"), id="TypeError"),
+        pytest.param(_AWarningAsError("Invalid value for VR UI: 1.2.3.Canary"), id="warning"),
+        pytest.param(RuntimeError("a reader is missing"), id="RuntimeError"),
+        pytest.param(AttributeError("no such reader"), id="AttributeError"),
+    ],
+)
+async def test_dicomweb_a_pydicom_fault_of_any_class_refuses_before_the_post(
+    monkeypatch: pytest.MonkeyPatch, fault: Exception, capture: bool
+) -> None:
+    # Manager decision of 2026-11-23: a fault in the data set read becomes a refusal of the
+    # message before anything is sent, never a raise after a partner's 202.
     from messagefoundry.transports import dicomweb
 
-    calls: list[bytes] = []
-    monkeypatch.setattr(dicomweb, "_data_set_instance_uid", lambda obj: calls.append(obj))
-    dest = _dest()
-    for body in (
-        "",
-        json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}),
-        # A name outside the UID grammar can never match, so it does not count either.
-        _uid_body({"vr": "UI", "Value": [""]}),
-        _uid_body({"vr": "UI", "Value": ["N/A"]}),
-    ):
-        dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
-        with pytest.raises(NegativeAckError):
-            await dest.send(PAYLOAD)
-    assert calls == []
-    # Control: a reply naming another instance does read it.
-    dest._opener = _FakeOpener(
-        body=_uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode(), status=202
-    )  # type: ignore[assignment]
-    with pytest.raises(NegativeAckError):
+    def parse(data: bytes) -> object:
+        raise fault
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest(capture_response=capture)
+    # The reply names another instance, so a read made only after the reply still runs.
+    opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]}).encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
-    assert len(calls) == 1
+    assert opener.requests == []  # nothing was sent
+    assert exc.value.code == "sent-uid-unread"
+    assert exc.value.permanent is True
+    text = str(exc.value)
+    assert type(fault).__name__ in text and "nothing was sent" in text
+    assert "Canary" not in text  # the fault's text, which can carry a value, is not named
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
 
 
-def test_dicomweb_a_broken_dicom_extra_fails_the_build(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Manager decision of 2026-11-23 (R8): a pydicom missing a reader the deflate guard replays is
-    # a deploy error, refused when the connection is built, naming the connection.
-    pytest.importorskip("pydicom")
-    from pydicom import filereader
-
-    monkeypatch.delattr(filereader, "_read_file_meta_info")
-    with pytest.raises(ValueError, match="OB_DCMWEB.*refusing to parse DICOM"):
-        _dest()
-
-
-async def test_dicomweb_a_202_never_raises_on_a_broken_dicom_extra(
+async def test_dicomweb_a_broken_dicom_extra_refuses_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The fault arriving after the build (here, a reader removed once built) still never raises
-    # after the partner's 202: the data set read is no UID, and the 202 is a classified refusal.
+    # A pydicom missing a reader the deflate guard replays: the read refuses, before the POST.
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
     obj = _pydicom_part10(SENT_UID, _DATASET_UID)
-    dest = _dest()
     monkeypatch.delattr(filereader, "_read_file_meta_info")
-    dest._opener = _FakeOpener(
-        body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
-    )  # type: ignore[assignment]
+    dest = _dest()
+    opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202)
+    dest._opener = opener  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
-    assert exc.value.code == "unconfirmed-202"
+    assert exc.value.code == "sent-uid-unread"
+    assert opener.requests == []
+
+
+def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The build no longer probes pydicom: a DICOMweb destination that never needs it builds.
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    assert isinstance(_dest(), DicomWebDestination)
+
+
+def test_dicomweb_a_stray_pydicom_does_not_fail_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A pydicom that find_spec finds but that does not import (here, blocked in sys.modules).
+    import sys
+
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setitem(sys.modules, "pydicom", None)
+    monkeypatch.setitem(sys.modules, "pydicom.filereader", None)
+    assert isinstance(_dest(), DicomWebDestination)
 
 
 def test_dicomweb_an_absent_dicom_extra_does_not_fail_the_build(
@@ -1006,9 +1056,6 @@ def test_dicomweb_an_absent_dicom_extra_does_not_fail_the_build(
     from messagefoundry.transports import dicomweb
 
     monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: False)
-    monkeypatch.setattr(
-        dicomweb, "load_header_readers", lambda: pytest.fail("the readers were checked")
-    )
     assert isinstance(_dest(), DicomWebDestination)
 
 

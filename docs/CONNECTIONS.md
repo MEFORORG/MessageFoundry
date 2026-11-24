@@ -4047,13 +4047,14 @@ space padding is dropped, and a `(0002,0003)` that does not lie within the first
 `DICM`, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
 read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to the first element
 outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
-too. The data set read puts back the SCU's ignores for `pydicom` warnings that would name a value,
-and an installed `pydicom` that lacks a reader the deflate guard replays is **refused when the
-connection is built**, naming the connection; an absent `pydicom` is not refused. The data set
-read runs after the partner has answered. A parse failure or a `RuntimeError` it meets, such as
-a reader removed after the build, is logged and read as no data set UID; any other exception is
-not caught and fails the send as an internal error. The data set is read only when the reply names some instance by a UID in the
-grammar above. The data set UID is read
+too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
+associates, so the connection's build does not check `pydicom`. The data set read puts back the
+SCU's ignores for `pydicom` warnings that would name a value. An object the codec cannot parse
+is read as no data set UID. Any other fault in that read that is an `Exception`, such as an
+installed `pydicom` that lacks a reader the deflate guard replays or a warning the filters turn
+into an error, refuses the message before a byte is sent (code `sent-uid-unread`, permanent,
+naming the exception class only), whatever status the partner would have answered. The data set
+UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
