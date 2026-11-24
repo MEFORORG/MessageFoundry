@@ -42,8 +42,8 @@ invariants can't silently regress.
   construction. None of the five is a catastrophic shape by inspection. A constant **imported from
   another module** would land in the same set: the scan is per-file, so it resolves module-,
   function- and class-scope constants and string collections in the file it is reading, and
-  crosses an import only for a module named in :data:`_IMPORTED_CONSTANT_MODULES`, whose string
-  attributes it reads from the imported module itself.
+  crosses an import only through an absolute ``from <module> import NAME`` of a module named in
+  :data:`_IMPORTED_CONSTANT_MODULES`, whose string attributes it reads from the module itself.
 * **Catastrophic shapes the matcher does not model.** It detects an unbounded quantifier (``+``,
   ``*``, ``{n,}``) applied to a group that contains an unbounded quantifier at **any** nesting depth.
   It does **not** detect overlapping alternation (``(a|a)*``), nor a catastrophic interaction spread
@@ -319,31 +319,48 @@ def _assign_targets(node: ast.AST) -> tuple[ast.Name, ast.expr] | None:
 _IMPORTED_CONSTANT_MODULES = frozenset({"messagefoundry.secretscrub"})
 
 
-def _imported_constants(tree: ast.Module) -> dict[str, str]:
-    """``{local name: value}`` for each ``str`` a file imports from :data:`_IMPORTED_CONSTANT_MODULES`.
+def _imported_constants(tree: ast.Module) -> tuple[dict[str, str], set[str]]:
+    """``({local name: value}, shadowed)`` for what a file imports from
+    :data:`_IMPORTED_CONSTANT_MODULES` by an absolute ``from <module> import``.
 
-    A name is left out, so a pattern built on it stays unresolved and pinned, when the file also
-    binds it as a store, augmented-assign or ``del`` target, a parameter, a ``def`` or ``class``
-    name, an ``except ... as`` name or another import, and when any attribute in the file shares its
-    name, since :func:`_static_str` reads ``obj.NAME`` loosely as ``NAME``. Without that, a
-    rebinding the constant pass does not read (``NAME += ...``, a computed local) would be scanned
-    as the imported text and drop out of the pin. Other dynamic bindings, such as ``globals()``
-    writes, are not seen.
+    The first holds each ``str`` imported that way. ``shadowed`` holds each name imported that way
+    that the file also binds some other way, or whose value is not a ``str``; :func:`_string_constants`
+    resolves such a name to nothing, so a pattern built on it stays unresolved and pinned rather
+    than being scanned as the imported text or as the other binding's literal. Other bindings seen
+    are at least: a store, augmented-assign or ``del`` target, a parameter, a ``def`` or ``class``
+    name, a type parameter, an ``except ... as`` name, a ``match`` capture, another import, and any
+    attribute sharing the name, since :func:`_static_str` reads ``obj.NAME`` loosely as ``NAME``.
+    Dynamic bindings, such as ``globals()`` writes, are not seen.
     """
-    names: dict[str, str] = {}
-    dropped: set[str] = set()
-    other_bindings: set[str] = set()
+    values: dict[str, str] = {}
+    listed: set[str] = set()
+    seen: set[str] = set()
+    bound: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
-            other_bindings.add(node.id)
+            bound.add(node.id)
         elif isinstance(node, ast.Attribute):
-            other_bindings.add(node.attr)
+            bound.add(node.attr)
         elif isinstance(node, ast.arg):
-            other_bindings.add(node.arg)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            other_bindings.add(node.name)
-        elif isinstance(node, ast.ExceptHandler):
-            other_bindings.update([node.name] if node.name else [])
+            bound.add(node.arg)
+        elif isinstance(
+            node,
+            (
+                ast.FunctionDef,
+                ast.AsyncFunctionDef,
+                ast.ClassDef,
+                ast.TypeVar,
+                ast.ParamSpec,
+                ast.TypeVarTuple,
+            ),
+        ):
+            bound.add(node.name)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bound.add(node.rest)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             imported = (
                 importlib.import_module(node.module)
@@ -354,14 +371,18 @@ def _imported_constants(tree: ast.Module) -> dict[str, str]:
             )
             for alias in node.names:
                 local = alias.asname or alias.name.split(".")[0]
-                value = None if imported is None else getattr(imported, alias.name, None)
-                if not isinstance(value, str) or names.get(local, value) != value:
-                    dropped.add(local)
-                else:
-                    names[local] = value
-    for name in dropped | other_bindings:
-        names.pop(name, None)
-    return names
+                if imported is None:
+                    bound.add(local)
+                    continue
+                value = getattr(imported, alias.name, None)
+                if local in seen or not isinstance(value, str):
+                    bound.add(local)
+                seen.add(local)
+                listed.add(local)
+                if isinstance(value, str):
+                    values[local] = value
+    shadowed = listed & bound
+    return {k: v for k, v in values.items() if k not in shadowed}, shadowed
 
 
 def _string_constants(tree: ast.Module) -> dict[str, str]:
@@ -371,16 +392,18 @@ def _string_constants(tree: ast.Module) -> dict[str, str]:
     exactly as invisible to an inline-literal scanner as a module-level one, and dropping it silently
     is how a catastrophic pattern would pass. A name bound to two different literals in the same file
     is discarded as ambiguous rather than resolved to whichever won — reporting the wrong literal
-    would be a fabricated finding. The map starts from :func:`_imported_constants`, whose docstring
-    says which imported names it leaves out.
+    would be a fabricated finding. The map starts from :func:`_imported_constants`, and a name it
+    reports shadowed never enters the map.
     """
-    names: dict[str, str] = _imported_constants(tree)
+    names, shadowed = _imported_constants(tree)
     ambiguous: set[str] = set()
     for node in ast.walk(tree):
         assignment = _assign_targets(node)
         if assignment is None:
             continue
         target, value = assignment
+        if target.id in shadowed:
+            continue
         resolved = _static_str(value, names)
         if resolved is None:
             continue
@@ -939,7 +962,7 @@ def test_a_nested_quantifier_in_an_imported_tail_is_caught_in_redact(
     resolved, unresolved = _regex_scan(source)
     tailed = [redact._BEARER, redact._MEFOR_SECRET, redact._CREDENTIAL_KV, redact._KEY_MATERIAL]
     # The scanned text is the text redact.py compiled, tails included.
-    assert [pattern.pattern in resolved for pattern in tailed] == [True] * 4
+    assert all(pattern.pattern in resolved for pattern in tailed)
     assert len(unresolved) == 0
     assert find_nested_quantifiers(source) == []
     monkeypatch.setattr(secretscrub, name, getattr(secretscrub, name) + r"(?:x+)*")
@@ -959,10 +982,17 @@ _TAILS_IMPORT = "import re\nfrom messagefoundry.secretscrub import _KV_TAILS\n"
         "re.compile(obj._KV_TAILS)\n",
         "def f(_KV_TAILS):\n    return re.compile('a' + _KV_TAILS)\n",
         "from messagefoundry.secretscrub import _MEFOR_TAILS as _KV_TAILS\nre.compile('a' + _KV_TAILS)\n",
+        "re.compile('a' + _KV_TAILS)\nclass C:\n    _KV_TAILS = ''\n",
+        "re.compile('a' + _KV_TAILS)\n_KV_TAILS = 'lit'\n",
+        "P = 'a' + _KV_TAILS\nre.compile(P)\ndef f():\n    _KV_TAILS = ''\n",
+        "match s:\n    case _KV_TAILS:\n        re.compile('a' + _KV_TAILS)\n",
+        "match s:\n    case [*_KV_TAILS]:\n        re.compile('a' + _KV_TAILS)\n",
+        "def f[_KV_TAILS]():\n    return re.compile('a' + _KV_TAILS)\n",
     ],
 )
 def test_an_imported_constant_the_file_also_binds_stays_unresolved(body: str) -> None:
-    """A name the file rebinds is not read as the imported text, so the pattern stays pinned."""
+    """A name the file rebinds is read neither as the imported text nor as the other binding's
+    literal, so the pattern stays unresolved and pinned."""
     resolved, unresolved = _regex_scan(_TAILS_IMPORT + body)
     assert len(unresolved) == 1
     assert resolved == []
