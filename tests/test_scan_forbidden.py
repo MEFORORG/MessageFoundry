@@ -1920,52 +1920,49 @@ def test_a_long_markup_run_after_a_verdict_clause_scans_in_linear_time(sf, body:
 #: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
 #: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. Measured
 #: 2026-11-24 on a 32-core Windows box, five to ten attempts per shape: the shipped scanner read
-#: 6.5x to 10.7x on every shape below. Three per-identifier defects, each put back by hand, read 17x
-#: and over on the shape it slows: :func:`_line_at_by_scan` on the hard-wrapped paragraph, a count
-#: of the pipes before each identifier on the column list, and _PR_MARK_BEFORE searched from the
-#: start of the sentence rather than 20 characters back on the "and" list. The line sits between
-#: them. A step of 4 with a line of 8, the house pair in ``tests/test_ad_group_dn_only.py``, passed
-#: the pipe count at about 7x, as the former 10 second bound did at about 1.2 s: at these sizes its
-#: quadratic term is still smaller than the scan, so the step went up rather than the body, which
-#: keeps the control cheap.
+#: 6.5x to 10.7x on every shape below. Three per-identifier defects, each put back by hand in a copy
+#: of the scanner, read 17x and over on the shape it slows: :func:`_line_at_by_scan` on the
+#: hard-wrapped paragraph, a count of the pipes before each identifier on the column list, and
+#: _PR_MARK_BEFORE searched from the start of the sentence rather than 20 characters back on both
+#: "and" lists. The line sits between them. A step of 4 with a line of 8, the house pair in
+#: ``tests/test_ad_group_dn_only.py``, passed the pipe count at about 7x, as the former 10 second
+#: bound did at about 1.2 s: at these sizes its quadratic term is still smaller than the scan.
 _GROWTH_STEP, _GROWTH_LINE = 8, 14.0
 
 
-def _scan_growth(sf, make: Callable[[int], str], n: int) -> list[float]:
-    """How much longer ``scan_pr_body`` takes on ``make(_GROWTH_STEP * n)`` than on ``make(n)``, one
-    reading per attempt, each a reading of :func:`_growth_between` with the collector off.
+def _growth_attempts(
+    call: Callable[[str], object], small: str, large: str, line: float
+) -> list[float]:
+    """How much longer ``call`` takes on ``large`` than on ``small``, one reading per attempt, each a
+    reading of :func:`_growth_between` with the collector off.
 
     A RATIO, NOT A NUMBER OF SECONDS. A wall-clock bound fails whenever the runner is slow enough:
-    the hard-wrapped paragraph below took about 1.6 s locally against a 10 s bound, and 10.38 s on a
-    loaded windows-2025 runner, which ejected a pull request from the merge queue. A slow runner
-    slows both sizes alike, so the ratio still tells linear from quadratic.
+    the hard-wrapped paragraph below took about 1.6 s to 2.8 s locally against a 10 s bound, and
+    10.38 s on a loaded windows-2025 runner, which ejected a pull request from the merge queue. A
+    slow runner slows both sizes alike, so the ratio still tells linear from quadratic.
 
-    A reading at or over :data:`_GROWTH_LINE` is taken again, up to three attempts, and stops at the
-    first under it, so the lowest reading is the verdict: one preemption cannot fake a curve. A scan
-    fails only if every attempt reads at or over the line, so that is what a quadratic control must
-    show, read with ``min`` over every attempt. The rule is ``tests/test_ad_group_dn_only.py``'s
-    ``_scaling_ratios``.
-
-    Two rounds per attempt, not one. With every core of a 32-core box held by a spinner, one round
-    let a single slow short sample pull the control's reading down to 10.2x, under the line, and
-    failed it; the minimum over two rounds cleans that sample."""
-    small, large = make(n), make(_GROWTH_STEP * n)
+    A reading at or over ``line`` is taken again, up to three attempts, and stops at the first under
+    it, so the lowest reading is the verdict: one preemption cannot fake a curve. A subject fails
+    only if every attempt reads at or over the line, so that is what a quadratic control must show,
+    read with ``min`` over every attempt. The rule is ``tests/test_ad_group_dn_only.py``'s
+    ``_scaling_ratios``."""
     readings: list[float] = []
     for _ in range(3):
         was_enabled = gc.isenabled()
         gc.disable()
         try:
-            readings.append(_growth_between(sf.scan_pr_body, small, large, rounds=2))
+            readings.append(_growth_between(call, small, large, rounds=1))
         finally:
             if was_enabled:
                 gc.enable()
-        if readings[-1] < _GROWTH_LINE:
+        if readings[-1] < line:
             break
     return readings
 
 
 def _assert_linear(sf, make: Callable[[int], str], n: int) -> None:
-    readings = _scan_growth(sf, make, n)
+    """``scan_pr_body`` on ``make(_GROWTH_STEP * n)`` against ``make(n)``, under the line."""
+    readings = _growth_attempts(sf.scan_pr_body, make(n), make(_GROWTH_STEP * n), _GROWTH_LINE)
     ratio = min(readings)
     assert ratio < _GROWTH_LINE, (
         f"{_GROWTH_STEP}x the body took {ratio:.2f}x the time ({_attempts(readings)})"
@@ -1985,13 +1982,13 @@ def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(s
     """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
     reported at its own line, so finding that line must not scan every mark once per identifier.
     1000 lines against 8000: the bisecting lookup read 6.5x to 9.5x, and the lookup this test was
-    written against (:func:`_line_at_by_scan`) 17.3x to 26.7x, so the control below shows the check
-    fails it."""
-    lines = _GROWTH_STEP * 1000
+    written against (:func:`_line_at_by_scan`), put back in the scanner, 17.3x to 26.7x. That
+    control is too slow to run here, about 15 s, so the lookup's own control is the next test."""
+    lines = 1000
     hits = sf.scan_pr_body(_hard_wrapped(lines))
     # A positive control: each line's identifier is reported at its own line, so the lookup ran.
     assert [hit.split(":")[1] for hit in hits] == [str(n) for n in range(1, lines + 1)]
-    _assert_linear(sf, _hard_wrapped, 1000)
+    _assert_linear(sf, _hard_wrapped, lines)
 
 
 def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
@@ -2000,19 +1997,88 @@ def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
     return max(lineno for start, lineno in marks if start <= offset)
 
 
-def test_the_hard_wrapped_check_fails_the_lookup_it_was_written_against(
-    sf, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Control: the ratio check must fail the scanning lookup, or its pass above proves nothing. It
-    asserts exactly the negation of that test's pass condition: every attempt at or over the line,
-    read with ``min``. The scanning lookup reports the same lines, so only its cost differs."""
-    monkeypatch.setattr(sf, "_pr_line_at", _line_at_by_scan)
-    assert [hit.split(":")[1] for hit in sf.scan_pr_body(_hard_wrapped(3))] == ["1", "2", "3"]
-    readings = _scan_growth(sf, _hard_wrapped, 1000)
-    ratio = min(readings)
-    assert ratio >= _GROWTH_LINE, (
-        f"a quadratic lookup scaled by only {ratio:.2f}x ({_attempts(readings)})"
+#: The lookup's own timing: 64 lookups over 1000 marks against 64 over 8000, the marks a
+#: hard-wrapped paragraph of that many lines makes. A bisection grows with the log of the marks and
+#: a scan with the marks, so 8 times the marks gives the scan about 8 and the bisection under 2.
+#: Measured 2026-11-24, ten attempts each: ``_pr_line_at`` 1.18x to 1.31x, :func:`_line_at_by_scan`
+#: 6.0x to 9.8x. The line sits near their geometric middle.
+_LOOKUP_LINE = 3.0
+
+
+def _lookups(line_at: Callable[[list[tuple[int, int]], int], int]) -> Callable[[str], object]:
+    """A subject for :func:`_growth_attempts` that runs ``line_at`` over as many marks as its argument
+    has characters, 64 lookups spread over them, so only the mark count differs between sizes."""
+    marks = {n: [(22 * i, i + 1) for i in range(n)] for n in (1000, _GROWTH_STEP * 1000)}
+
+    def look(size: str) -> object:
+        held = marks[len(size)]
+        top = held[-1][0]
+        return [line_at(held, at) for at in range(0, top + 1, top // 63)]
+
+    return look
+
+
+def _lookup_growth(line_at: Callable[[list[tuple[int, int]], int], int]) -> list[float]:
+    return _growth_attempts(
+        _lookups(line_at), "x" * 1000, "x" * (_GROWTH_STEP * 1000), _LOOKUP_LINE
     )
+
+
+def test_the_line_lookup_does_not_grow_with_the_marks(sf) -> None:
+    """The defect site itself, cheap enough to carry its own control: ``_pr_line_at`` over 8 times
+    the marks must take under :data:`_LOOKUP_LINE` times as long. The answers are checked too, so a
+    lookup that skipped the work would not pass."""
+    held = [(22 * i, i + 1) for i in range(1000)]
+    assert [sf._pr_line_at(held, at) for at in (0, 21, 22, 21977, 21978, 99999)] == [
+        1,
+        1,
+        2,
+        999,
+        1000,
+        1000,
+    ]
+    readings = _lookup_growth(sf._pr_line_at)
+    ratio = min(readings)
+    assert ratio < _LOOKUP_LINE, (
+        f"{_GROWTH_STEP}x the marks took {ratio:.2f}x the time ({_attempts(readings)})"
+    )
+
+
+def test_the_line_lookup_check_fails_the_lookup_it_was_written_against() -> None:
+    """Control: the check above must fail the scanning lookup, or its pass proves nothing. It asserts
+    exactly the negation of that test's pass condition: every attempt at or over the line, read with
+    ``min``. The scanning lookup gives the same answers, so only its cost differs."""
+    held = [(22 * i, i + 1) for i in range(1000)]
+    assert [_line_at_by_scan(held, at) for at in (0, 21, 22, 21977, 21978, 99999)] == [
+        1,
+        1,
+        2,
+        999,
+        1000,
+        1000,
+    ]
+    readings = _lookup_growth(_line_at_by_scan)
+    ratio = min(readings)
+    assert ratio >= _LOOKUP_LINE, (
+        f"a scanning lookup scaled by only {ratio:.2f}x ({_attempts(readings)})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("readings", "spent", "verdict"),
+    [((20.0, 3.0, 50.0), 2, 3.0), ((20.0, 15.0, 14.0), 3, 14.0), ((13.9,), 1, 13.9)],
+    ids=["stops-at-the-first-under", "every-attempt-over", "first-under"],
+)
+def test_the_growth_rule_keeps_its_lowest_attempt(
+    monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], spent: int, verdict: float
+) -> None:
+    """The rule both checks and their control share: it stops at the first attempt under the line,
+    takes at most three, and its verdict is the lowest. A reading of exactly the line is over it."""
+    pending = iter(readings)
+    monkeypatch.setitem(globals(), "_growth_between", lambda *_a, **_k: next(pending))
+    taken = _growth_attempts(len, "a", "aa", 14.0)
+    assert len(taken) == spent
+    assert min(taken) == verdict
 
 
 @pytest.mark.parametrize(
@@ -2037,8 +2103,10 @@ def test_a_long_identifier_list_scans_in_linear_time(
     """A row or a sentence holding a long list of identifiers must scan in time linear in the list.
     The two "and" lists keep the 8000 identifiers they had under the former 10 second bound, where
     they took about 1.4 s and 2.7 s locally, too close to it for a loaded runner; the column list
-    grows from 16000 to 32000. A ratio does not see a constant factor, such as the two whole extra
-    readings the invisible character once added, and that bound did not see it either here."""
+    grows from 16000 to 32000. Their controls are the readings :data:`_GROWTH_LINE` records, taken
+    by hand, as a control in the suite would cost tens of seconds. A ratio does not see a constant
+    factor, such as the two whole extra readings the invisible character once added, and the former
+    bound did not see it either at this size."""
     _assert_linear(sf, make, n)
 
 
