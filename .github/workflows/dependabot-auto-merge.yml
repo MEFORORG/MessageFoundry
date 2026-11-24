@@ -9,7 +9,9 @@ name: Dependabot auto-merge
 #
 # IN SCOPE (auto-merged):
 #   - a PATCH update (or a MINOR of a DEV-only dependency) whose EVERY named dependency sits on its
-#     own ecosystem's ALLOW row (guardrail #3 below).
+#     own ecosystem's ALLOW row (guardrail #3 below), and whose Dependabot group is one of
+#     dependabot.yml's VERSION-update groups or passes #2 and #4 (BACKLOG #5474). An UNGROUPED PR,
+#     or one in a group the ghsa step does not name, is read as the security track and holds.
 # OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
 #   - EVERYTHING ELSE, and that is the default by design. An unnamed dependency, an unrecognised
 #     ecosystem, a MINOR/MAJOR update of a runtime dep, any MAJOR update — every one of them HOLDS.
@@ -44,7 +46,9 @@ name: Dependabot auto-merge
 #      confirmed against the dependency's PREVIOUS version (the axios-1.14.1 pattern). The advisory
 #      lookup FAILS CLOSED: a rate-limit/API error or no-matching-advisory routes to manual review,
 #      never auto-merge. The non-security VERSION track keeps its cooldown-aged auto-merge unchanged
-#      (already aged by dependabot.yml, so it does not need the GHSA gate).
+#      (already aged by dependabot.yml, so it does not need the GHSA gate); only a PR in a NAMED
+#      version-update group is on that track. The advisory query is pip-keyed, so a security PR of
+#      any other ecosystem holds here.
 #   #4 RELEASE AGE (security track only) — a SECURITY-track PR additionally requires every candidate
 #      version to have been published at least MIN_RELEASE_AGE_HOURS ago, because that track is the
 #      one the upstream cooldown cannot age. FAILS CLOSED identically to #2: an API error, a missing
@@ -258,6 +262,7 @@ jobs:
         id: ghsa
         env:
           DEP_GROUP: ${{ steps.meta.outputs.dependency-group }}
+          DEP_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
           DEPS_JSON: ${{ steps.meta.outputs.updated-dependencies-json }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -289,6 +294,21 @@ jobs:
             echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The query below is pip-keyed, so a name from any other ecosystem would be asked about a
+          # PyPI package that merely shares it (npm `lodash`, say) and could be confirmed by that
+          # package's advisory (BACKLOG #5474). Such a PR could not reach a merge through this gate
+          # before either, since its own ecosystem's advisories were never asked; now it holds
+          # without asking the wrong one.
+          eco="${DEP_ECOSYSTEM,,}"
+          eco="${eco//[[:space:]]/}"
+          case "$eco" in
+            uv|pip) ;;
+            *)
+              echo "::notice::the advisory gate is pip-keyed; ecosystem '${eco:-<none>}' — routing to manual review."
+              echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
 
           # Require at least one matching published (non-withdrawn) advisory for EVERY named dep at
           # the previous version. Query the global advisories endpoint (ecosystem pip — Python
@@ -314,7 +334,9 @@ jobs:
           while IFS="$(printf '\t')" read -r raw prev; do
             name="${raw,,}"
             # An EMPTY name DENIES, it is not skipped (BACKLOG #5474): skipping let `[{}]`, one
-            # tab-only line, confirm nothing and still leave advisory_ok=true.
+            # tab-only line, confirm nothing and still leave advisory_ok=true. A nameless row WITH a
+            # version arrives shifted (tab is IFS whitespace, so `read` drops the empty first
+            # field): the version lands in `raw`, `prev` is empty, and the guard below denies it.
             if [ -z "$name" ]; then
               echo "::warning::a dependency with no name — failing closed (manual review)."
               advisory_ok=false
@@ -423,8 +445,8 @@ jobs:
           case "$eco" in
             uv|pip) ;;
             *)
-              # NOT a new denial: the ghsa step above queries `ecosystem=pip` only, so every
-              # non-pip SECURITY PR already routes to manual review today. If that gate is ever made
+              # NOT a new denial: the ghsa step above holds every non-pip SECURITY PR (its
+              # advisory query is pip-keyed), so none of them can merge today. If that gate is ever made
               # ecosystem-aware, wire the matching publish-date source in here at the same time —
               # registry.npmjs.org's `.time[version]` for npm, the commit/release date for actions.
               # Until then, writing dated code for ecosystems that cannot reach this step would be
