@@ -365,8 +365,9 @@ try {
     # A LOWER OR EQUAL READING ON ANOTHER RESET OPENS A NEW WINDOW ONLY FROM A LIVE SESSION (BACKLOG
     # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
     # frozen number replaced the published one on every fire. So it needs a session that has just
-    # called the API and is stamped with this root, as a confirmation must be. A higher reading is
-    # taken from anyone, before or after the published reset, because refusing it weakens a stop: while
+    # called the API and is stamped with this root, as a confirmation must be. A higher reading with a
+    # readable reset that is not an earlier, passed one (refused above, higher or not) is taken from
+    # anyone, before or after the published reset, because refusing it weakens a stop: while
     # that reset is ahead the lower published number could clear the gate, and past it the gone window
     # reads UNKNOWN, so the gate would answer REVIEW where the higher number halts it. Past
     # the published reset, a lower or equal idle reading is still refused, because its frozen number

@@ -528,7 +528,8 @@ roster alias of the Lander.
 > - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
 >   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. At the
 >   ceiling only a new reading clears it, and only an interactive terminal session on that root publishes
->   one. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
+>   one. A new reading at or below the stale number clears it only from a session of this root that has
+>   just called the API (BACKLOG #5178). Such a floor needs no verified stamp, so on an unpinned root that number may not be this
 >   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
 >   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
 > - A session pinned to another root that publishes here does the same at any level, the ceiling included
@@ -546,8 +547,9 @@ roster alias of the Lander.
 >   **Narrowed 2026-11-24 (BACKLOG #5178):** a reading at or below the published one, on another reset,
 >   now counts as a new window only from a session of this root that has just called the API, whether or
 >   not the published reset has passed. Two idle sessions' 80, 5, 80, 5 now leaves one history row, and
->   an idle session's frozen 5 no longer replaces a published 100. A higher reading is still taken from
->   any session, before or after the published reset: past it, refusing an idle 99 over a gone 50 would
+>   an idle session's frozen 5 no longer replaces a published 100. A higher reading on a later reset, or
+>   on an earlier one that has not passed, is still taken from any session, before or after the
+>   published reset: past it, refusing an idle 99 over a gone 50 would
 >   turn the gate's HALT into a REVIEW. So a live lower session and an idle higher one can still trade
 >   the window. Liveness is a rise in the API-duration counter. Whether a
 >   failed call or an unpinned session moves it is not measured, so a frozen number from a session
