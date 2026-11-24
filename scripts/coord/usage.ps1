@@ -37,8 +37,13 @@
          at least rows spanning under the minimum that climbed one tick or less, rows across a reset
          the reading cannot name, too few rows once those dated well after now are set aside, and a
          history that could not be read. A fresh reading then reads UNKNOWN below the ceiling, and
-         Get-Rate says why, unless main's unguarded rate over the same rows projects a run-out before
-         the reset, which stays CRITICAL. Get-Rate's comments say how main's rate is kept as a floor.
+         Get-Rate says why, unless the rate it falls back on projects a run-out before the reset, which
+         stays CRITICAL. That fallback is the pre-guard rate (the last 400 history lines, no root
+         filter, raw ages, no minimum span) or, where that rate does not rise and this root's guarded
+         one does, the guarded rate. Get-Rate's comments say how the pre-guard rate is kept as a floor.
+         This is STRICTER than the pre-guard code in at least two places, both failing closed: a
+         guarded fallback can grade CRITICAL, and the gate halt, where that code had no rate; and a
+         refused rate reads UNKNOWN, which the gate answers REVIEW, where that code could grade OK.
       3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
          (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
          Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
@@ -314,7 +319,9 @@ function Test-DatedAfterNow($v) {
 # THREE ANSWERS, NOT TWO (BACKLOG #5494). $null is NO RATE: no history, or fewer than two rows, which
 # is a flat or slow burn, and the owner's rung then falls back to the level. A result with Refused set
 # is a REFUSED RATE: no number from the rows can be trusted, so Get-WindowReport reads a fresh window
-# UNKNOWN below the ceiling, unless its Fallback, main's rate, projects a run-out before the reset.
+# UNKNOWN below the ceiling, unless its Fallback projects a run-out before the reset. The Fallback is the
+# pre-guard rate (FallbackKind 'unguarded'), or the guarded rate itself where the pre-guard rate does not
+# rise (FallbackKind 'guarded'); with neither, both are $null.
 # Folding a refusal into no rate would be a calm answer, because the level reads a pool below the
 # gate's rung as clear; and any small positive rate lifts that backstop, so a
 # diluted number is the fail-open the refusals below exist to prevent. Otherwise, PctPerHour, with a
@@ -341,12 +348,13 @@ $RateTailLines = 400
 $RateMaxTailLines = 6400
 function New-RateRefusal([string]$Why) { [pscustomobject]@{ PctPerHour = $null; Refused = $Why; Note = $null; Fallback = $null; FallbackKind = $null } }
 
-# MAIN'S RATE, KEPT AS A FLOOR UNDER EVERY GUARD ABOVE (BACKLOG #5494). The guards in Get-GuardedRate
-# refuse or reshape rows that main read as a rate, and a refusal or a calmer number must not turn a stop
-# main made into a review or a clear. So this is main's computation, unchanged: the last 400 rows, no
-# root test, raw ages, no minimum span. Get-Rate never returns a rate below it, and a refusal carries it
-# as Fallback, which Get-WindowReport still projects from.
-function Get-MainRate($CurrentResetEpoch) {
+# THE PRE-GUARD RATE, KEPT AS A FLOOR UNDER EVERY GUARD ABOVE (BACKLOG #5494). The guards in
+# Get-GuardedRate refuse or reshape rows the previous code read as a rate, and a refusal or a calmer number
+# must not turn a stop that code made into a review or a clear. So this is the previous computation,
+# unchanged: the last 400 lines, no root test, raw ages, no minimum span. Get-Rate never returns a rate
+# below it, and a refusal carries it as Fallback wherever it rises, which Get-WindowReport still
+# projects from.
+function Get-PreGuardRate($CurrentResetEpoch) {
     $rows = @()
     try {
         foreach ($line in (Get-Content -LiteralPath $histPath -Tail 400 -ErrorAction Stop)) {
@@ -371,13 +379,20 @@ function Get-MainRate($CurrentResetEpoch) {
 function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
     if (-not (Test-Path -LiteralPath $histPath)) { return $null }
     $guarded = Get-GuardedRate -CurrentResetEpoch $CurrentResetEpoch -ReadRoot $ReadRoot
-    $main = Get-MainRate -CurrentResetEpoch $CurrentResetEpoch
-    if ($guarded.Refused) { $guarded.Fallback = $main; $guarded.FallbackKind = 'unguarded'; return $guarded }
-    if ($null -eq $main -or $main -le 0) {
-        # MAIN HAD NO RISING RATE, SO ITS LEVEL BACKSTOP STOOD, and a small positive guarded rate would lift
-        # it, turning main's HIT at the level into OK. So a rising guarded rate main did not see, from rows
-        # the widened read reached or from a span main read as 0, is refused with itself as the Fallback:
-        # it still projects, and short of CRITICAL the level backs it as main's did (BACKLOG #5494).
+    $preGuard = Get-PreGuardRate -CurrentResetEpoch $CurrentResetEpoch
+    if ($guarded.Refused) {
+        # A kind is named only beside a rate, so no caller reads a fallback that does not exist.
+        if ($null -ne $preGuard) { $guarded.Fallback = $preGuard; $guarded.FallbackKind = 'unguarded' }
+        return $guarded
+    }
+    if ($null -eq $preGuard -or $preGuard -le 0) {
+        # THE PRE-GUARD CODE HAD NO RISING RATE, SO ITS LEVEL BACKSTOP STOOD, and a small positive guarded
+        # rate would lift it, turning that code's HIT at the level into OK. So a rising guarded rate it did
+        # not see, from rows the widened read reached or from a span it read as 0, is refused with itself as
+        # the Fallback: it still projects, and short of CRITICAL the level backs it as before (BACKLOG
+        # #5494). STRICTER THAN BEFORE: a run-out it projects inside the gate's rung halts where the
+        # pre-guard code had no rate to halt on, and below the level the gate answers REVIEW where that
+        # code answered OK.
         if ($guarded -and $guarded.PctPerHour -gt 0) {
             $r = New-RateRefusal "this root's history rows give a rising rate that the unguarded read of the last 400 rows does not, so it is not taken as a measured rate"
             $r.Note = $guarded.Note
@@ -387,17 +402,17 @@ function Get-Rate($CurrentResetEpoch, [string]$ReadRoot) {
         }
         return $guarded
     }
-    # Main read a rising rate where the guarded read has none. Main counts rows stamped with another root,
-    # which the guarded read skips, so this is not a measured rate of this root's; and it is not no rate
-    # either, since main would have projected from it.
+    # The pre-guard read has a rising rate where the guarded read has none. It counts rows stamped with
+    # another root, which the guarded read skips, so this is not a measured rate of this root's; and it is
+    # not no rate either, since the pre-guard code would have projected from it.
     if (-not $guarded -or $guarded.PctPerHour -le 0) {
         $r = New-RateRefusal "this root's history rows give no rising rate, but the unguarded read of the history, which counts rows stamped with another root, climbs, so no rate of this root's from them"
         if ($guarded) { $r.Note = $guarded.Note }
-        $r.Fallback = $main
+        $r.Fallback = $preGuard
         $r.FallbackKind = 'unguarded'
         return $r
     }
-    if ($main -gt $guarded.PctPerHour) { $guarded.PctPerHour = $main }
+    if ($preGuard -gt $guarded.PctPerHour) { $guarded.PctPerHour = $preGuard }
     return $guarded
 }
 
@@ -901,8 +916,10 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         if ($age -gt $MaxAgeMinutes) {
             $rate = Get-Rate -CurrentResetEpoch $resetEpoch -ReadRoot $ReadRoot
             if ($rate.Note) { $o.reason = "$($o.reason); $($rate.Note)" }
-            # A REFUSED RATE STILL PROJECTS FROM MAIN'S RATE, its Fallback, so a refusal never drops a
-            # run-out main would have stopped on (BACKLOG #5494).
+            # A REFUSED RATE STILL PROJECTS FROM ITS FALLBACK, the pre-guard rate or, where that does not
+            # rise, the guarded one (BACKLOG #5494). So a refusal never drops a run-out the pre-guard code
+            # would have stopped on; on a guarded fallback it can grade one that code had no rate for,
+            # which is stricter than before.
             $useRate = $null
             if ($rate.Refused) { $o.reason = "$($o.reason); $($rate.Refused)"; $useRate = $rate.Fallback }
             elseif ($rate) { $useRate = $rate.PctPerHour }
@@ -929,11 +946,18 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # burn to the reset. A reading dated ahead takes nothing off.
     $elapsed = [math]::Max(0.0, [double]$age)
     $rate = Get-Rate -CurrentResetEpoch $resetEpoch -ReadRoot $ReadRoot
-    # A REFUSED RATE IS PROJECTED FROM ITS FALLBACK, main's rate, so a run-out main graded CRITICAL stays
-    # CRITICAL and the gate can still halt on it. Short of CRITICAL the refusal below reads UNKNOWN and
-    # clears the fallback's numbers, which measure nothing this reader trusts.
+    # A REFUSED RATE IS PROJECTED FROM ITS FALLBACK, the pre-guard rate or, where that does not rise, the
+    # guarded one. On an unguarded fallback a run-out the pre-guard code graded CRITICAL stays CRITICAL and
+    # the gate can still halt on it; on a guarded fallback that code had no rate, so a CRITICAL here is
+    # stricter than before. Short of CRITICAL the refusal below reads UNKNOWN and, with a reset, clears
+    # the fallback's numbers, which measure nothing this reader trusts.
+    # rate_fallback is published only beside a fallback rate, and cleared with it.
     $useRate = $null
-    if ($rate.Refused) { $o.rate_refused = $rate.Refused; $o.rate_fallback = $rate.FallbackKind; $useRate = $rate.Fallback }
+    if ($rate.Refused) {
+        $o.rate_refused = $rate.Refused
+        if ($null -ne $rate.Fallback) { $o.rate_fallback = $rate.FallbackKind }
+        $useRate = $rate.Fallback
+    }
     elseif ($rate) { $useRate = $rate.PctPerHour }
     if ($null -ne $useRate) {
         $o.rate_pct_per_hr = $useRate
@@ -945,7 +969,7 @@ function Get-WindowReport($w, [string]$ReadRoot) {
         }
     }
     elseif (-not $rate.Refused) {
-        $o.reason = "fewer than two history rows in this window, so no rate"
+        $o.reason = "fewer than two of this root's history rows in this window, so no rate"
     }
 
     # Bands. The question is not "is the number big" but "does it run out before it resets".
@@ -968,18 +992,22 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # Get-DecisionCostRung still holds the level as the backstop at its rung on such a reading.
     # WITH A RESET, the fallback's numbers go: short of CRITICAL its run-out falls after the reset, so
     # they can stop nothing. WITH NO RESET they stay, because there the gate halts on any run-out inside
-    # its rung, as it did on main's rate, and a reset nobody knows must not loosen that.
+    # its rung, and a reset nobody knows must not loosen that. On an unguarded fallback that is where the
+    # pre-guard rate halted; on a guarded one the pre-guard code had no rate, so the halt is stricter.
     if ($o.rate_refused -and $o.state -ne "CRITICAL") {
         $o.state = "UNKNOWN"
         $o.reason = "$pct% used, but no trustworthy burn rate: $($o.rate_refused)"
         if ($null -ne $minsToReset -or $null -eq $o.minutes_to_empty) {
             $o.rate_pct_per_hr = $null
+            $o.rate_fallback = $null
             $o.projected_at_reset = $null
             $o.minutes_to_empty = $null
         }
     }
-    # CRITICAL ON MAIN'S RATE, the guarded one refused: rate_refused stays set, so the gate halts where
-    # main halted and reviews, rather than clears, where the run-out falls outside its rung.
+    # CRITICAL ON THE FALLBACK RATE, the guarded rate refused: rate_refused stays set, and the reason names
+    # the fallback's kind. On an unguarded fallback the gate halts where the pre-guard code halted; on a
+    # guarded fallback that code had no rate, so a halt here is stricter than before. Either way it
+    # reviews, rather than clears, where the run-out falls outside its rung.
     elseif ($o.rate_refused -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason), by the history's $($o.rate_fallback) rate; $($o.rate_refused)" }
     if ($rate.Note) { $o.reason = if ($o.reason) { "$($o.reason); $($rate.Note)" } else { $rate.Note } }
 
@@ -992,22 +1020,23 @@ function Get-WindowReport($w, [string]$ReadRoot) {
     # missing reset must not loosen the rung. At the ceiling the floor sets that verdict.
     if (Test-DatedAfterNow $w.captured_at) {
         $future = "reading is dated $([math]::Abs($age)) min in the FUTURE -- clock skew or a bad timestamp; refusing to trust it"
-        # NOT FRESH, so no rate_refused, which callers read as "a fresh reading with no trustworthy rate".
-        # The refusal stays in the reason.
-        if ($o.rate_refused) {
-            if (-not ([string]$o.reason).Contains($o.rate_refused)) { $future = "$future; $($o.rate_refused)" }
-            $o.rate_refused = $null
-        }
+        # NOT FRESH, so no rate_refused or rate_fallback, which callers read as "a fresh reading with no
+        # trustworthy rate". The refusal and the rows' Note stay in the reason: the arms below that replace
+        # the reason carry them, and the one that appends keeps them where the code above put them.
+        $kept = @(@($o.rate_refused, $rate.Note) | Where-Object { $_ })
+        $futureKept = (@($future) + $kept) -join "; "
+        $o.rate_refused = $null
+        $o.rate_fallback = $null
         $o.dated_ahead = $true
         $o.level_floor = $pct
         if ($null -eq $minsToReset -and $null -ne $o.minutes_to_empty -and $pct -lt $CeilingPct) {
             $o.state = "CRITICAL"
-            $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, with no reset time; $future"
+            $o.reason = "projected to hit 100% in ~$($o.minutes_to_empty) min, with no reset time; $futureKept"
         }
         elseif ($o.state -eq "CRITICAL" -and $pct -lt $CeilingPct) { $o.reason = "$($o.reason); $future" }
         else {
             $o.state = "UNKNOWN"
-            $o.reason = $future
+            $o.reason = $futureKept
             $o.rate_pct_per_hr = $null
             $o.projected_at_reset = $null
             $o.minutes_to_empty = $null

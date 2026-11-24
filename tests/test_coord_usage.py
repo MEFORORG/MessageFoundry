@@ -1635,6 +1635,58 @@ def test_a_row_far_ahead_beside_one_other_refuses_the_rate(tmp_path: Path) -> No
     assert "FUTURE" in d["seven_day"]["rate_refused"].upper(), d
 
 
+def test_a_refusal_with_no_fallback_rate_names_no_fallback_kind(tmp_path: Path) -> None:
+    """BACKLOG #5494. Two rows with no span give the pre-guard read no rate either, so there is no
+    fallback rate, and rate_fallback must not name a kind for one."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(0.1, 85.0), (0.1, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["rate_refused"], d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+    assert d["seven_day"]["rate_fallback"] is None, d
+
+
+def test_a_reading_dated_ahead_clears_the_fallback_kind_with_the_refusal(tmp_path: Path) -> None:
+    """BACKLOG #5494. A reading dated ahead is not fresh, so rate_refused is cleared, and rate_fallback,
+    which describes it, goes with it. The run-out on the pre-guard rate stays CRITICAL and the refusal
+    stays in the reason."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, age_min=-1, seven_epoch=epoch)
+    write_history(tmp_path, [(0.5, 85.0), (0.02, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["dated_ahead"] is True, d
+    assert d["seven_day"]["rate_refused"] is None, d
+    assert d["seven_day"]["rate_fallback"] is None, d
+    assert "minimum" in d["seven_day"]["reason"] and "FUTURE" in d["seven_day"]["reason"], d
+
+
+def test_a_reading_dated_ahead_keeps_the_refusal_in_its_reason(tmp_path: Path) -> None:
+    """BACKLOG #5494. The dated-ahead arm that reads UNKNOWN replaced the reason with its own text, so a
+    refusal already named there was lost. It must stay."""
+    epoch = int(time.time()) + 7200
+    publish(tmp_path, seven=86.0, age_min=-1, seven_epoch=epoch)
+    write_history(tmp_path, [(2.0, 80.0), (-600.0, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["dated_ahead"] is True, d
+    assert d["seven_day"]["rate_refused"] is None, d
+    reason = d["seven_day"]["reason"]
+    assert "reading is dated" in reason and "fewer than two rows are left" in reason, d
+
+
+def test_a_reading_dated_ahead_keeps_the_rows_note_in_its_reason(tmp_path: Path) -> None:
+    """BACKLOG #5494. A slow burn whose third row is dated ten hours ahead: the rate stands, with a Note
+    that the row's date was set aside. A reading dated ahead reads UNKNOWN, and its reason keeps the
+    Note, since fixing the clock does not clear that row."""
+    epoch = int(time.time()) + 7200
+    publish(tmp_path, seven=81.0, age_min=-1, seven_epoch=epoch)
+    write_history(tmp_path, [(85.0, 80.0), (2.0, 81.0), (-600.0, 81.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == UNKNOWN and d["seven_day"]["dated_ahead"] is True, d
+    reason = d["seven_day"]["reason"]
+    assert "reading is dated" in reason and "left out of the span" in reason, d
+
+
 @pytest.mark.parametrize(
     ("points", "stamp_resets"),
     [

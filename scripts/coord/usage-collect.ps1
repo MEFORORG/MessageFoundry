@@ -334,7 +334,7 @@ try {
     # than the published window. Nothing here reads the clock against a lone reading. The reader reports
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
     # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
-    # so it refuses any that show one.
+    # so it refuses the rate only where those rows change reset or fall.
     #
     # AN EQUAL READING IS REFUSED TOO. The payload carries no time of its own, so an idle session's
     # cached number looks like a live flat one. Restamping it let one idle terminal keep a frozen number

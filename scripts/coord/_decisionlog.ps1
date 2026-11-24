@@ -946,7 +946,10 @@ function Get-DecisionCostRung {
       roles/retired/STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung is hit
       when the window is projected to run out within HoldMin minutes and before it resets, whatever
       the level. Only with no rate, or a rate usage.ps1 refused on a fresh reading (rate_refused,
-      BACKLOG #5494), is the level the backstop. A rate of zero or below counts as no
+      BACKLOG #5494), is the level the backstop. A refused rate still HITS when the fallback rate
+      usage.ps1 projects from, unguarded or guarded (rate_fallback), runs out within HoldMin and before
+      the reset, and short of a hit it answers UNKNOWN below the level, never OK. Both are stricter
+      than the pre-guard code where it had no rate or graded OK. A rate of zero or below counts as no
       rate, because usage inside one reset period does not fall, and such a rate must not lift
       the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
       is positive. Its _burn projects again since the owner lifted its suppression on 2026-11-02, from
@@ -1043,8 +1046,10 @@ function Get-DecisionCostRung {
     # (BACKLOG #5494). The refusal means the rows show a move nothing could measure, so it cannot clear;
     # but at the rung it must still hit, as with no rate. usage.ps1 sets rate_refused on a fresh reading
     # only, so this does not grade a stale number.
-    # With no reset, usage.ps1 keeps main's unguarded run-out on such a window, and the rung hits on it
-    # inside HoldMin as main's rate did, since a missing reset must not loosen the rung.
+    # With no reset, usage.ps1 keeps the fallback rate's run-out on such a window, whichever its kind, and
+    # the rung hits on it inside HoldMin, since a missing reset must not loosen the rung. On an unguarded
+    # fallback that is where the pre-guard rate hit; on a guarded one the pre-guard code had no rate, so
+    # the hit is stricter than before.
     if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused')) {
         $uRate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
         $uEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
@@ -1082,8 +1087,10 @@ function Get-DecisionCostRung {
         New-DecisionRung 'OK' "$at. No burn rate; below the level backstop"
     }
     # A RATE usage.ps1 REFUSED CAN HIT AND CANNOT CLEAR (BACKLOG #5494). Its window reads CRITICAL only on
-    # main's unguarded rate, so a run-out inside HoldMin hits as on main; short of that the level backs it
-    # as with no rate, and below the level the answer is REVIEW, never OK.
+    # its fallback rate, unguarded or guarded, so a run-out inside HoldMin hits: where the pre-guard rate
+    # hit, on an unguarded fallback, and where the pre-guard code had no rate, on a guarded one, which is
+    # stricter than before. Short of that the level backs it as with no rate, and below the level the
+    # answer is UNKNOWN (REVIEW), never OK, where the pre-guard code could answer OK.
     $refused = [string](Get-DecisionJsonValue $week 'rate_refused')
     if ($refused -and $rung.State -ne 'HIT') {
         if ($pct -ge $lv.HoldAt) {
