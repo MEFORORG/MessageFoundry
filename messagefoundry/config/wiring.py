@@ -3888,7 +3888,12 @@ def apply_sync_reply_capture_implication(
             continue
         reply_from = _resolved_setting(ic.spec.settings, "reply_from", None, env_values)
         content_type = _resolved_setting(ic.spec.settings, "reply_content_type", None, env_values)
-        if reply_from is not _UNRESOLVED and reply_from and content_type == "passthrough":
+        # A blank resolved type reads as passthrough, as the resolver and the listener read it.
+        if (
+            reply_from is not _UNRESOLVED
+            and reply_from
+            and (content_type or "passthrough") == "passthrough"
+        ):
             targets.add(str(reply_from))
 
     for name in sorted(targets):

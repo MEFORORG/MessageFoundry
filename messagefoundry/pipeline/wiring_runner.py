@@ -2999,6 +2999,7 @@ class RegistryRunner:
                 retry_max_attempts=self._delivery_defaults.max_attempts,
             ),
             env_values=self._env_values,
+            resolved_settings=settings,
         )
         metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
         return SyncReplyResolverImpl(
@@ -8781,15 +8782,15 @@ class RegistryRunner:
         list folders and read files, such as a DATABASE connector's ``sslcapath`` entries (engine PR
         2815, hold F2). What the build reads from this runner is read here, on the loop, first
         (:meth:`_build_check_call`), and the one write the build makes to ``registry``, the
-        idempotent :func:`apply_sync_reply_capture_implication`, is made here too, so the thread
-        repeats it as a no-op. A check the executor never began runs on the loop instead, with a
+        idempotent :func:`apply_sync_reply_capture_implication`, is made here too where both reply
+        settings are literal, so the thread repeats it as a no-op; where either is an ``env()``
+        reference the thread makes it. A check the executor never began runs on the loop instead, with a
         WARNING (:func:`_build_off_loop`); one that began and then failed raises."""
 
         def prepare() -> Callable[[], None]:
-            # The values the build below reads, so its repeat of this write stays a no-op.
-            apply_sync_reply_capture_implication(
-                registry, self._env_values if env_values is None else env_values
-            )
+            # No values here: resolving one runs an operator's cast, which stays off the loop. The
+            # build in the thread makes this write where a reply setting is an env() reference.
+            apply_sync_reply_capture_implication(registry)
             return self._build_check_call(registry, env_values, now)
 
         # Prepared here, on the loop; only the builds run in the thread, through the connector
@@ -15601,7 +15602,13 @@ def _build_check_connectors(
         source_cfg = _source_config(ic, inbound_bind_host, env_values, trust_anchor_policy)
         # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
         # responses, and resolve to a lane that can actually serve concurrent callers.
-        check_http_sync_reply(ic, registry, delivery=delivery, env_values=env_values)
+        check_http_sync_reply(
+            ic,
+            registry,
+            delivery=delivery,
+            env_values=env_values,
+            resolved_settings=source_cfg.settings,
+        )
         # Vault BACKLOG #2622 item 1: the four inbound exposure gates, through the one function
         # _start_inbound_unsafe also calls. Before this they ran only at start, so
         # `messagefoundry check` passed a cleartext off-loopback listener that serve then refused.
@@ -16290,6 +16297,7 @@ def check_http_sync_reply(
     *,
     delivery: DeliverySettings | None = None,
     env_values: Mapping[str, Any] | None = None,
+    resolved_settings: Mapping[str, Any] | None = None,
 ) -> None:
     """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
 
@@ -16324,32 +16332,45 @@ def check_http_sync_reply(
     at all, default included, so it passes as undecided. A mapping resolves it, so an empty one reads
     a ref with no default as missing.
 
-    The inbound's own reply settings follow it (BACKLOG #5745). A mapping resolves them, and a
-    missing key raises as it does for any other setting. Left ``None``, they are read as written,
-    so a ``reply_from`` reference names no outbound and is refused.
+    The inbound's own reply settings follow it (BACKLOG #5745). ``resolved_settings`` is what the
+    source is built from, so the target checked is the one the resolver keys on. Without it a
+    mapping resolves them, and a missing key raises as it does for any other setting. With neither,
+    they are read as written, so a ``reply_from`` reference names no outbound and is refused. A
+    value read through ``env()`` is never echoed unless it names a declared outbound.
     """
     settings: Mapping[str, Any] = ic.spec.settings
     written = settings.get("reply_from")
     if not written:
         return
-    if env_values is not None:
+    if resolved_settings is not None:
+        settings = resolved_settings
+    elif env_values is not None:
         settings = resolve_env_settings(
             {key: settings.get(key) for key in ("reply_from", "reply_content_type")},
             env_values,
             connection=inbound_record_name(ic.name),
         )
-        resolved = settings["reply_from"]
-        if isinstance(written, EnvRef) and (not isinstance(resolved, str) or not resolved.strip()):
-            raise WiringError(
-                f"inbound connection {ic.name!r}: reply_from (env {written.key!r}) resolves to no "
-                "outbound name (value withheld)"
-            )
-    name, target = ic.name, str(settings["reply_from"])
+    resolved = settings["reply_from"]
+    if (
+        isinstance(written, EnvRef)
+        and settings is not ic.spec.settings
+        and (not isinstance(resolved, str) or not resolved.strip())
+    ):
+        raise WiringError(
+            f"inbound connection {ic.name!r}: reply_from (env {written.key!r}) resolves to no "
+            "outbound name (value withheld)"
+        )
+    name, target = ic.name, str(resolved)
 
     oc = registry.outbound.get(target)
     if oc is None:
+        shown = (
+            f"(env {written.key!r}, value withheld)"
+            if isinstance(written, EnvRef)
+            else repr(target)
+        )
         raise WiringError(
-            f"inbound connection {name!r}: reply_from names unknown outbound {target!r} — a "
+            f"inbound connection {name!r}: reply_from names unknown outbound {shown} — a "
             "synchronous reply can only come from an outbound declared in this graph"
         )
     if not oc.deployed:
@@ -16375,7 +16396,8 @@ def check_http_sync_reply(
     # the allow-list. One that does not cannot echo a content type at all, so refuse here rather than
     # let it surface as an AttributeError deep in the capture path.
     if (
-        settings.get("reply_content_type") == "passthrough"
+        # A blank resolved value reads as passthrough, as the resolver and the listener read it.
+        (settings.get("reply_content_type") or "passthrough") == "passthrough"
         and "capture_response_headers" not in oc.spec.settings
     ):
         raise WiringError(

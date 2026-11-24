@@ -7,9 +7,10 @@ check read the written ones. So ``reply_from=env("x")`` was checked as an outbou
 after the reference, and a content type written through ``env()`` would have been answered as the
 reference's own repr.
 
-``Http()`` still refuses ``env()`` on ``reply_timeout`` and ``reply_on_timeout``, so those two are
-carried here on a spec with the setting replaced after the factory, the way
-``test_env_uncast_bool_setting`` carries a capture flag.
+``Http()`` still refuses ``env()`` on ``reply_timeout`` and ``reply_on_timeout``, and on
+``reply_content_type`` unless the reference's repr holds a ``/``. So these are carried here on a
+spec with the setting replaced after the factory, the way ``test_env_uncast_bool_setting`` carries
+a capture flag. They show what the runner reads, not that a config can be written this way.
 """
 
 from __future__ import annotations
@@ -160,8 +161,9 @@ def test_a_reply_from_resolving_to_no_name_is_refused(value: Any) -> None:
 
 def test_the_cross_registry_arms_read_the_resolved_target() -> None:
     reg, ic = _graph(reply_from=env("target"))
-    with pytest.raises(WiringError, match="unknown outbound 'OB_ELSEWHERE'"):
+    with pytest.raises(WiringError, match="unknown outbound") as caught:
         check_http_sync_reply(ic, reg, delivery=SERVICEABLE, env_values={"target": "OB_ELSEWHERE"})
+    assert "OB_ELSEWHERE" not in str(caught.value), "an environment value reached the error"
 
     reg, ic = _graph(reply_from=env("target"), capture_response=False)
     with pytest.raises(WiringError, match="capture_response=True"):
@@ -178,6 +180,38 @@ def test_a_content_type_resolving_to_passthrough_needs_the_allow_list() -> None:
     check_http_sync_reply(ic, reg, delivery=SERVICEABLE, env_values={})
     with pytest.raises(WiringError, match="reply_content_type='passthrough'"):
         check_http_sync_reply(ic, reg, delivery=SERVICEABLE, env_values={"ct": "passthrough"})
+
+
+def test_a_blank_resolved_content_type_reads_as_passthrough_everywhere() -> None:
+    # The resolver reads blank as passthrough, so the implication has to capture the header too.
+    reg, _ = _graph(reply_content_type=env("ct", default="text/plain"))
+    apply_sync_reply_capture_implication(reg, {"ct": ""})
+    assert _captured(reg) == ["content-type"]
+
+    # ... and the check has to hold such a target to the passthrough rule.
+    reg, ic = _graph(reply_content_type=env("ct", default="text/plain"))
+    target = reg.outbound["OB_PARTNER"]
+    settings = {k: v for k, v in target.spec.settings.items() if k != "capture_response_headers"}
+    reg.outbound["OB_PARTNER"] = dataclasses.replace(
+        target, spec=dataclasses.replace(target.spec, settings=settings)
+    )
+    with pytest.raises(WiringError, match="reply_content_type='passthrough'"):
+        check_http_sync_reply(ic, reg, delivery=SERVICEABLE, env_values={"ct": ""})
+
+
+def test_the_check_reads_the_settings_the_source_was_built_from() -> None:
+    # One resolution: a cast that answers differently per call cannot split check from resolver.
+    def cast(value: Any) -> Any:
+        raise AssertionError("the check resolved a value its caller already held")
+
+    reg, ic = _graph(reply_from=env("target", cast=cast))
+    check_http_sync_reply(
+        ic,
+        reg,
+        delivery=SERVICEABLE,
+        env_values={"target": "x"},
+        resolved_settings={"reply_from": "OB_PARTNER", "reply_content_type": "text/plain"},
+    )
 
 
 def test_a_caller_with_no_env_values_still_refuses_an_env_target() -> None:
