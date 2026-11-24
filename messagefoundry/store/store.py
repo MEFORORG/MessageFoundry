@@ -629,23 +629,34 @@ class _GroupCommitter:
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
+        # The task _on_stopped last handled, so it runs once per task whichever of its two callers
+        # (the done-callback, or aclose) reaches it first.
+        self._reaped: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
             self._closed = False
+            self._reaped = None  # the old task is done; a callback still queued for it reads stale
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
             self._task.add_done_callback(self._on_stopped)
 
     def _on_stopped(self, task: asyncio.Task[None]) -> None:
         """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
         first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
-        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
-        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
-        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
-        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
-        if task is not self._task:
-            return  # a stale task; a newer one owns the committer now
+        no :meth:`submit` after this runs may enrol, and every member still pending is rejected, or
+        its caller (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather
+        than a ``finally`` in :meth:`_run`, because a task cancelled before its first step never
+        enters its body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
+
+        :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
+        the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
+        finds the task done and gets past its ``await`` without yielding. Without the direct call
+        this callback would run only after ``aclose`` cleared ``_task``, read the task as stale, and
+        leave that member pending (BACKLOG #5664)."""
+        if task is not self._task or task is self._reaped:
+            return  # a stale task (a newer one owns the committer now), or one already handled
+        self._reaped = task
         self._closed = True
         stranded, self._pending = self._pending, []
         if task.cancelled() or task.exception() is not None:
@@ -658,7 +669,8 @@ class _GroupCommitter:
                 member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
-        """Stop the committer, flushing any enrolled members first so nothing is stranded."""
+        """Stop the committer, flushing the members it can still reach first. A member still pending
+        once the committer task has ended is rejected through :meth:`_on_stopped`, not left to park."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -668,15 +680,23 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier has already rejected its members (_on_stopped); that
-                # stale cancel must not abort the store's close. A cancel of OUR task during the
-                # await still propagates; the baseline keeps a caller that already caught an
+                # A committer cancelled earlier rejects its members in _on_stopped, which its
+                # done-callback or the call below runs once; that stale cancel must not abort the
+                # store's close. A cancel of OUR task during the await still propagates; asyncio
+                # passes it on to the committer, whose done-callback has already run _on_stopped by
+                # the time this re-raises. The baseline keeps a caller that already caught an
                 # earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
                     raise
-            self._task = None
+            # Before clearing _task, so the member a same-turn submit() enrolled is rejected rather
+            # than left to a done-callback that would read the task as stale (see _on_stopped).
+            self._on_stopped(task)
+            # An overlapping close and start() may have installed a newer task; leave that one.
+            if self._task is task:
+                self._task = None
+                self._reaped = None
 
     async def submit(
         self,
