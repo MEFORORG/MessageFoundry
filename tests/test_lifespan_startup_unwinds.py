@@ -342,23 +342,29 @@ class _BlackholedTransport:
         await asyncio.Event().wait()
 
 
-#: The startup unwind's budget, less the engine-stop reserve, in the tests that pin what the
-#: notifier's own drain wait logs when it ends. That wait ends at ``_INNER_SHARE`` of the notifier
-#: step's bound; the teardown cuts the step at the bound, as a backstop. Both are wall-clock
-#: deadlines, so a loop stall longer than the gap between them lets the backstop win: it cancels
-#: the step while it unwinds, and the step's own ERROR, with its count, is never logged. A 0.10 s
-#: gap lost that race on a loaded windows-2022 runner (merge queue run 45460183201). The bound is
-#: therefore kept far above the wait, so every run takes the wait's path.
+#: The startup unwind's budget in the tests that pin what the notifier's own drain wait logs when
+#: it ends. That wait ends at ``_INNER_SHARE`` of the notifier step's bound; the teardown cuts the
+#: step at the bound, as a backstop. Both are wall-clock deadlines, so a loop stall longer than the
+#: gap between them lets the backstop win: it cancels the step while it unwinds, and the step's own
+#: ERROR, with its count, is never logged. A 0.10 s gap lost that race on a loaded windows-2022
+#: runner (merge queue run 45460183201). The bound is therefore kept far above the wait, so a run
+#: takes the wait's path unless the loop stalls for longer than the 6.5 s gap left between them.
 _UNWIND_BUDGET_SECONDS = 8.0
-#: How long the notifier's own drain wait runs before it cuts the drain.
-_DRAIN_WAIT_SECONDS = 0.2
+#: How long the notifier's own drain wait runs before it cuts the drain. A healthy or fast-failing
+#: send must end inside it, so it is not cut finer than a loaded runner can schedule.
+_DRAIN_WAIT_SECONDS = 1.0
 
 
-def _shrink_the_unwind(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Give the unwind :data:`_UNWIND_BUDGET_SECONDS` and the notifier's own drain wait
-    :data:`_DRAIN_WAIT_SECONDS`, so a test is quick and the teardown's cut stays out of reach."""
-    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", _UNWIND_BUDGET_SECONDS + 0.5)
-    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.5)
+def _pin_the_drain_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the unwind :data:`_UNWIND_BUDGET_SECONDS`, which is above the shipped one, and the
+    notifier's own drain wait :data:`_DRAIN_WAIT_SECONDS`, so the teardown's cut stays out of reach.
+
+    The unwind reads only the budget less the reserve, so the reserve is zeroed. ``_INNER_SHARE``
+    is module-wide: the alert-state drain's wait shrinks with it, to about 0.07 s, which these
+    tests' sinks, holding no state writes, never wait on. The hung-notifier test pins the wait this
+    derives from the notifier step's bound, in the ERROR it logs."""
+    monkeypatch.setattr(appmod, "_SHUTDOWN_BUDGET_SECONDS", _UNWIND_BUDGET_SECONDS)
+    monkeypatch.setattr(appmod, "_ENGINE_STOP_RESERVE_SECONDS", 0.0)
     bound = _UNWIND_BUDGET_SECONDS - appmod._UNWIND_STATE_DRAIN_FLOOR_SECONDS
     monkeypatch.setattr(appmod, "_INNER_SHARE", _DRAIN_WAIT_SECONDS / bound)
 
@@ -368,8 +374,8 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
 ) -> None:
     """BACKLOG #5907: the unwind drained the notifier's delivery with no cut before it closed the
     store, so a blackholed alert host held the store open, and with it aiosqlite's non-daemon
-    worker (#1257). The budget is shrunk so the test is quick; the bound is read from it."""
-    _shrink_the_unwind(monkeypatch)
+    worker (#1257). The notifier's own drain wait is pinned short so the test is quick."""
+    _pin_the_drain_wait(monkeypatch)
     transport = _BlackholedTransport()
     sink = NotifierAlertSink([transport])
     # Every level and logger, before the emits, so the content check below covers them all.
@@ -389,11 +395,13 @@ async def test_a_hung_notifier_transport_does_not_keep_the_store_open(
     # The control: the drain did reach the hung send, so the cut is what ended it.
     assert transport.entered.is_set()
     assert closed, "the store was never closed"
-    # Within the unwind's budget, plus one cut grace.
-    assert closed[0] - began <= _UNWIND_BUDGET_SECONDS + appmod._CUT_GRACE_SECONDS + 0.5
+    # Soon after the notifier's own wait ended, and well before the teardown would cut the step.
+    assert closed[0] - began <= _DRAIN_WAIT_SECONDS + 1.5
     errors = [r for r in caplog.records if "did not drain" in r.getMessage()]
     assert len(errors) == 1, caplog.text
     assert "2 alert(s) not confirmed delivered" in errors[0].getMessage()
+    # The control on _pin_the_drain_wait: the wait it derives is the one that ran.
+    assert f"within {_DRAIN_WAIT_SECONDS:.2f}s" in errors[0].getMessage()
     # A count only, never the alert's content.
     assert "PROBE-DETAIL-TEXT" not in caplog.text
     assert "IB_TEST_ADT" not in caplog.text
@@ -421,7 +429,7 @@ async def test_a_blackholed_webhook_does_not_stop_the_email_in_the_unwind(
     blackholed webhook held the email until the unwind cut the drain, and the refusal alert never
     reached a healthy relay. The alert being handled now reaches the email; an alert queued behind
     it still waits on the webhook and is lost to the cut, which the count reports."""
-    _shrink_the_unwind(monkeypatch)
+    _pin_the_drain_wait(monkeypatch)
     webhook, email = _BlackholedTransport(), _HealthyEmail()
     sink = NotifierAlertSink([webhook, email])  # notifier_from_settings's order
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
@@ -452,7 +460,7 @@ async def test_an_alert_the_email_took_counts_as_delivered_whatever_the_webhook_
     read delivered, and the same webhook hanging until the unwind cut the drain read undelivered.
     One rule now holds in both: an alert one selected transport took counts as delivered. The
     webhook's loss is logged either way, by transport name."""
-    _shrink_the_unwind(monkeypatch)
+    _pin_the_drain_wait(monkeypatch)
     webhook: Any = (
         _BlackholedTransport() if webhook_kind == "hangs-until-cut" else _FailingTransport()
     )
@@ -499,7 +507,7 @@ async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
 ) -> None:
     """BACKLOG #5907 step 4: the unwind logged its ERROR on every cut, so a cut that reached no
     running send and left nothing counted read as a loss. It stays silent, as on main."""
-    _shrink_the_unwind(monkeypatch)
+    _pin_the_drain_wait(monkeypatch)
     email = _HealthyEmail()
     sink = _SlowToCloseSink([email])
     sink.connection_stopped("IB_TEST_ADT", detail="probe")
@@ -508,6 +516,7 @@ async def test_a_cut_that_reached_no_running_send_and_lost_nothing_logs_nothing(
     await asyncio.wait_for(appmod._unwind_failed_start(store, sink), 10.0)
     assert [e["connection"] for e in email.events] == ["IB_TEST_ADT"]  # the control: delivered
     assert sink.stall_cut  # the control: the unwind's wait was cut
+    assert "cutting it" not in caplog.text  # the notifier's own wait cut it, not the teardown
     assert sink.undelivered == 0
     assert "did not drain" not in caplog.text
     assert "not confirmed delivered" not in caplog.text
