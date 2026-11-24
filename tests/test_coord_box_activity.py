@@ -444,32 +444,55 @@ class TestTheLibraryHasNoSideEffects:
         assert "lenient" in proc.stdout
 
 
+def _scrubbed_env(home: Path | None, config_dir: Path | str | None) -> dict[str, str]:
+    """The inherited environment with USERPROFILE and CLAUDE_CONFIG_DIR replaced, so no case here
+    reads the real config roots."""
+    env = {
+        k: v for k, v in os.environ.items() if k.upper() not in ("USERPROFILE", "CLAUDE_CONFIG_DIR")
+    }
+    if home is not None:
+        env["USERPROFILE"] = str(home)
+    if config_dir is not None:
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
+def _run_ps(sandbox: Path, env: dict[str, str], body: str) -> str:
+    ps = f". '{sandbox / 'scripts' / 'coord' / 'box-activity.ps1'}'; " + body
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+        env=env,
+        cwd=str(sandbox),
+    )
+    assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+    return proc.stdout.strip()
+
+
+def _transcript_age(
+    sandbox: Path,
+    home: Path | None,
+    config_dir: Path | str | None = None,
+    config_root: Path | None = None,
+) -> str:
+    """Get-TranscriptAgeHours for D:\\proj\\App with no -ConfigRoot unless one is given."""
+    root_arg = f" -ConfigRoot '{config_root}'" if config_root is not None else ""
+    return _run_ps(
+        sandbox,
+        _scrubbed_env(home, config_dir),
+        f"$a = Get-TranscriptAgeHours -WorktreePath 'D:\\proj\\App'{root_arg}; "
+        "if ($null -eq $a) { 'null' } else { [string]$a }",
+    )
+
+
 class TestTheProfileIsReadByItsOwnName:
     """Vault BACKLOG #2985, added item 2. With no -ConfigRoot, Get-TranscriptAgeHours listed
     USERPROFILE with -Path, which reads its argument as a wildcard pattern: a profile named home[1]
     matched only a folder named home1, so the transcript was never found and the signal read as
     UNEVALUABLE. Red before the fix: the bracketed case returned null."""
-
-    def _age(self, sandbox: Path, home: Path | None) -> str:
-        env = {k: v for k, v in os.environ.items() if k.upper() != "USERPROFILE"}
-        if home is not None:
-            env["USERPROFILE"] = str(home)
-        ps = (
-            f". '{sandbox / 'scripts' / 'coord' / 'box-activity.ps1'}'; "
-            "$a = Get-TranscriptAgeHours -WorktreePath 'D:\\proj\\App'; "
-            "if ($null -eq $a) { 'null' } else { [string]$a }"
-        )
-        proc = subprocess.run(
-            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT,
-            check=False,
-            env=env,
-            cwd=str(sandbox),
-        )
-        assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
-        return proc.stdout.strip()
 
     @pytest.mark.parametrize("home_name", ["home", "home[1]"])
     def test_a_transcript_under_the_profile_is_found(self, sandbox: Path, home_name: str) -> None:
@@ -478,7 +501,7 @@ class TestTheProfileIsReadByItsOwnName:
         f = d / "turn.jsonl"
         f.write_text('{"t":1}\n', encoding="utf-8")
         _back_date(f, 5)
-        age = self._age(sandbox, sandbox / home_name)
+        age = _transcript_age(sandbox, sandbox / home_name)
         assert age != "null", f"no transcript found under the profile {home_name}"
         assert float(age) == pytest.approx(5, abs=0.1)
 
@@ -487,4 +510,132 @@ class TestTheProfileIsReadByItsOwnName:
         d = sandbox / ".claude" / "projects" / "D--proj-App"
         d.mkdir(parents=True)
         (d / "turn.jsonl").write_text('{"t":1}\n', encoding="utf-8")
-        assert self._age(sandbox, None) == "null"
+        assert _transcript_age(sandbox, None) == "null"
+
+
+class TestAPinnedConfigDirIsRead:
+    """BACKLOG #7561. With no -ConfigRoot, Get-TranscriptAgeHours listed only the .claude* folders
+    under USERPROFILE, so a caller whose CLAUDE_CONFIG_DIR is pinned elsewhere missed a fresh
+    transcript there, and with it the fresh-transcript veto. Red before the fix: the three finding
+    cases returned null.
+
+    Each finding case is paired with one that must stay null, so a function that always found
+    something would fail."""
+
+    def _pinned_root(self, sandbox: Path, name: str, age_hours: float) -> Path:
+        root = sandbox / name
+        d = root / "projects" / "D--proj-App"
+        d.mkdir(parents=True)
+        f = d / "turn.jsonl"
+        f.write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(f, age_hours)
+        return root
+
+    def test_a_pinned_root_outside_the_profile_is_read(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        root = self._pinned_root(sandbox, "pinned[1]", 2)
+        age = _transcript_age(sandbox, sandbox / "home", config_dir=root)
+        assert age != "null", "the transcript under CLAUDE_CONFIG_DIR was not found"
+        assert float(age) == pytest.approx(2, abs=0.1)
+
+    def test_the_pinned_root_is_read_with_no_profile(self, sandbox: Path) -> None:
+        root = self._pinned_root(sandbox, "pinned", 3)
+        age = _transcript_age(sandbox, None, config_dir=root)
+        assert age != "null"
+        assert float(age) == pytest.approx(3, abs=0.1)
+
+    def test_the_newest_of_profile_and_pinned_root_wins(self, sandbox: Path) -> None:
+        home = sandbox / "home"
+        old = home / ".claude" / "projects" / "D--proj-App"
+        old.mkdir(parents=True)
+        (old / "turn.jsonl").write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(old / "turn.jsonl", 40)
+        root = self._pinned_root(sandbox, "pinned", 1)
+        age = _transcript_age(sandbox, home, config_dir=root)
+        assert float(age) == pytest.approx(1, abs=0.1)
+
+    def test_a_pinned_root_without_the_transcript_stays_unevaluable(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        root = sandbox / "pinned"
+        (root / "projects" / "D--other").mkdir(parents=True)
+        assert _transcript_age(sandbox, sandbox / "home", config_dir=root) == "null"
+
+    def test_a_missing_pinned_root_reads_as_unevaluable_without_error(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        assert _transcript_age(sandbox, sandbox / "home", config_dir=sandbox / "absent") == "null"
+
+    @pytest.mark.parametrize("drive_relative", [False, True])
+    def test_a_relative_pin_is_not_resolved_against_the_current_directory(
+        self, sandbox: Path, drive_relative: bool
+    ) -> None:
+        """The working directory is the sandbox, which holds a matching root at `pinned`; a
+        relative pin, bare or drive-relative, must not be read through it."""
+        (sandbox / "home").mkdir()
+        self._pinned_root(sandbox, "pinned", 1)
+        pin = f"{sandbox.drive}pinned" if drive_relative else "pinned"
+        assert _transcript_age(sandbox, sandbox / "home", config_dir=pin) == "null"
+
+    def test_an_explicit_config_root_still_wins(self, sandbox: Path) -> None:
+        """-ConfigRoot names the roots to read; the pinned root is not added to them."""
+        pinned = self._pinned_root(sandbox, "pinned", 1)
+        explicit = sandbox / "explicit"
+        explicit.mkdir()
+        assert _transcript_age(sandbox, None, config_dir=pinned, config_root=explicit) == "null"
+
+
+class TestAPinnedTranscriptVetoesButIsNotCounted:
+    """BACKLOG #7561, through Get-BoxActivity. The liveness fence does not read the pinned root, so
+    a transcript found only there must veto when fresh and must never be the signal that makes a
+    box evaluable. Otherwise a live session whose registry record sits in the pinned root would
+    move from refused (Evaluable false) to evaluable with no veto."""
+
+    def _activity(self, sandbox: Path, pinned: Path) -> dict:
+        home = sandbox / "home"
+        sessions = home / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "1.json").write_text(
+            json.dumps({"pid": 1, "sessionId": "ffff0000", "startedAt": 0}), encoding="utf-8"
+        )
+        body = (
+            "Get-BoxActivity -BoxKey 'demo-box-0000' "
+            f"-WorktreePath '{sandbox / 'wt'}' -SeatsDir '{sandbox / 'seats'}' "
+            f"-RepoHint '{sandbox / 'nope'}' -SessionId 'abcd1234' | ConvertTo-Json -Depth 5"
+        )
+        return json.loads(_run_ps(sandbox, _scrubbed_env(home, pinned), body))
+
+    def _pin_transcript(self, sandbox: Path, age_hours: float, root: Path | None = None) -> Path:
+        """A transcript under `root` (the pinned root by default); returns the pinned root."""
+        slug = str(sandbox / "wt")
+        for ch in ":\\/.":
+            slug = slug.replace(ch, "-")
+        pinned = sandbox / "pinned"
+        pinned.mkdir(exist_ok=True)
+        d = (root or pinned) / "projects" / slug
+        d.mkdir(parents=True)
+        f = d / "turn.jsonl"
+        f.write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(f, age_hours)
+        return pinned
+
+    def test_a_stale_pinned_transcript_does_not_make_the_box_evaluable(self, sandbox: Path) -> None:
+        a = self._activity(sandbox, self._pin_transcript(sandbox, 30))
+        assert a["FenceState"] == "UNKNOWN", a
+        assert a["Signals"] == 1, a  # the fence alone; the pinned transcript is not counted
+        assert a["Evaluable"] is False, a
+        assert a["Veto"] is False, a
+
+    def test_a_fresh_pinned_transcript_vetoes(self, sandbox: Path) -> None:
+        a = self._activity(sandbox, self._pin_transcript(sandbox, 1))
+        assert a["Veto"] is True, a
+        why = a["Why"] if isinstance(a["Why"], list) else [a["Why"]]
+        assert any("transcript" in str(w) for w in why), a
+
+    def test_a_profile_transcript_is_still_counted_with_a_pin_set(self, sandbox: Path) -> None:
+        """The paired control: the same stale transcript under a profile root IS counted, so the
+        uncounted case above is the pin and not a probe that never counts."""
+        pinned = self._pin_transcript(sandbox, 30, root=sandbox / "home" / ".claude")
+        a = self._activity(sandbox, pinned)
+        assert a["FenceState"] == "UNKNOWN", a
+        assert a["Signals"] == 2, a  # the fence and the profile transcript
+        assert a["Evaluable"] is True, a
+        assert a["Veto"] is False, a
