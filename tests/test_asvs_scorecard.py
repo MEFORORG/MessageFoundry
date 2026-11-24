@@ -3167,8 +3167,8 @@ def test_prove_absences_screen_outer_rule_reads_only_a_shape_that_is_fixed_and_l
     tmp_path: Path,
 ) -> None:
     """The rule tells nothing where the outermost shape decorator may call an implementation
-    registered on it in place of what it wraps (``singledispatch``), where a decorator is called that is not used that way, where
-    ``functools.wraps`` is left uncalled, or where the target's def is not the live binding; each
+    registered on it in place of what it wraps (``singledispatch``), where a decorator is called
+    that is not used that way, where ``functools.wraps`` is left uncalled, or where the target's def is not the live binding; each
     of these is accepted, as without the rule. A ``typing_extensions`` passthrough is passed over
     like the ``typing`` one."""
     head = "import functools\nimport typing_extensions\n\ndef g(): ...\n\nw = WRAP\n\n"
@@ -3282,21 +3282,21 @@ def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path:
     (problem,) = _screen(plain, cached, tmp_path)
     assert "where a value was expected" not in problem
     assert "the function the def itself makes" in problem
-    assert problem.index("bound to the function the def itself makes") < (
+    assert problem.index("binds the name to the function the def itself makes") < (
         problem.index("binds it to a cache wrapper whose call results are cached")
     )
     # A property swapped for a cached_property: the text names what differs.
     prop = _OUTER_HEAD + _decorated(("property", "w"), method=True)
     (swapped,) = _screen(_decorated(("functools.cached_property",), method=True), prop, tmp_path)
     # Each text is attributed to its own side: the mutation's first, then the live one's.
-    assert swapped.index("bound to a cached_property, which is not callable, and which") < (
-        swapped.index("binds it to a property, which is not callable, and which")
-    )
+    assert swapped.index(
+        "binds the name to a cached_property, which is not callable, and which"
+    ) < (swapped.index("binds it to a property, which is not callable, and which"))
     # Control: a signature refusal keeps its own text.
     bare = _OUTER_HEAD + plain
     (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
     assert "where a value was expected" in renamed
-    assert "Code that inspects the name can see that" in renamed
+    assert "code that inspects the name can see it" in renamed
 
 
 def test_signature_fields_name_every_signature_value() -> None:

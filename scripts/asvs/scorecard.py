@@ -3175,7 +3175,8 @@ def _signature(
 
     Parameter NAMES are included, not just counts -- renaming a parameter a call can pass by keyword
     breaks every keyword call that names it, which is the same wrecking-ball failure as a wrong
-    count and is invisible to an arity-only comparison. The other names are compared too. Default
+    count and is invisible to an arity-only comparison. The other names are compared too, except a
+    method's bound first parameter (below). Default
     values are compared by PRESENCE and never by value: a mutation legitimately changes what a default
     IS (that can be the whole reintroduction), while changing which parameters carry one moves the
     arity. Positional defaults always trail, so their count fixes which parameters carry one;
@@ -3229,7 +3230,7 @@ def _signature_clause(
 _OUTER_BINDS: Final = {
     "builtins.property": (
         "a property, which is not callable, and which, read through an instance, runs its getter "
-        "on each read"
+        "on each read, or raises AttributeError where it has none"
     ),
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
     "builtins.classmethod": (
@@ -3282,8 +3283,8 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
         for o in outer
     ]
     clause.tail = (
-        f"Applied, the name is bound to {binds[0]}. The {path} definition it was compared with "
-        f"binds it to {binds[1]}. So the "
+        f"Applied, where no decorator raises, this definition binds the name to {binds[0]}, and "
+        f"the {path} definition it was compared with binds it to {binds[1]}. So the "
         "observable may go red for that change and not for the reintroduction. Copy the live "
         "decorators; the mutation lives in a different repository from the symbol it shadows, so "
         "nothing else keeps the two in step"
@@ -3441,9 +3442,10 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     if mismatch is not None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}. "
-            "Applied, the name is bound to an object whose kind, signature or decorators differ from "
-            "those of the definition it was compared with. Code that inspects the name can see "
-            "that, and for many such differences so can a call -- a TypeError, a coroutine, "
+            "As this screen reads the two sources, the definitions the clause compares differ: one "
+            "is a class and the other a function, or a field the clause lists differs. Where that "
+            "difference survives into what the name is bound to, code that inspects the name can "
+            "see it, and for many such differences so can a call -- a TypeError, a coroutine, "
             "generator or other object where a value was expected, or, where the shape decorators "
             "differ, a different binding, such as results no longer cached -- so the observable "
             "may go red for that change and not for the reintroduction — a wrecking "
