@@ -393,8 +393,12 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
     pos = _PART10_PREAMBLE + 4
     size = len(obj)
     limit = min(size, pos + _FILE_META_CAP)
-    # Where the walk meets the limit: the cap, when the object goes on past it, or the object's end.
-    past_limit = _META_TOO_LONG if limit < size else _META_OVERRUN
+
+    def past(reach: int) -> str:
+        # Bytes needed up to ``reach`` that the object does not hold are an overrun; ones it holds
+        # past the cap are a group longer than the reader reads.
+        return _META_OVERRUN if reach > size else _META_TOO_LONG
+
     while pos + 8 <= limit:
         group, element = struct.unpack_from("<HH", obj, pos)
         if group != 0x0002:
@@ -405,12 +409,12 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
             start = pos + 8
         else:
             if pos + 12 > limit:
-                return None, past_limit
+                return None, past(pos + 12)
             (length,) = struct.unpack_from("<I", obj, pos + 8)
             start = pos + 12
         end = start + length  # an undefined length (0xFFFFFFFF) runs past the limit, so is refused
         if end > limit:
-            return None, past_limit
+            return None, past(end)
         if element == 0x0003:
             if vr != b"UI":
                 return None, _META_WRONG_VR
@@ -422,8 +426,10 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
         pos = end
     # The walk met its limit: a partial element header was cut off by it, or the cap stopped the
     # walk; otherwise the object ended with no (0002,0003).
-    if pos < limit or limit < size:
-        return None, past_limit
+    if pos < limit:
+        return None, past(pos + 8)
+    if limit < size:
+        return None, _META_TOO_LONG
     return None, _META_NO_0003
 
 
@@ -441,9 +447,11 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     from this UID, so a 202 for an object whose File Meta was not rewritten after a re-UID still
     names it (BACKLOG #5914).
 
-    As the SCU does, an installed pydicom that lacks a reader the deflate guard replays is a deploy
-    error: :func:`~messagefoundry.parsing.dicom._deps.load_header_readers` raises its
-    :class:`RuntimeError` here, outside the handler, rather than refusing each message. The SCU's
+    An installed pydicom that lacks a reader the deflate guard replays is treated as a deploy error,
+    as the SCU treats it: :func:`~messagefoundry.parsing.dicom._deps.load_header_readers` raises
+    its :class:`RuntimeError` here, outside the handler, so the send fails with it rather than
+    returning an ``unconfirmed-202`` refusal. Unlike the SCU's, it raises after the partner has
+    answered, and only for a 202 that reaches the data set read. The SCU's
     ignores for pydicom's value warnings, which name a value, are put back first before the read.
     A parse failure is logged by exception class only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
@@ -538,9 +546,10 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
     """The ``unconfirmed-202`` refusal for a 202 whose ReferencedSOPSequence items are
     ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID
     (:func:`_sent_instance_uid`) or, failing that, its data set's SOP Instance UID
-    (:func:`_data_set_instance_uid`). The data set is read only when an item names some instance,
-    the one case its UID can change the verdict. With neither UID to compare, the reason names why
-    the File Meta has none (BACKLOG #5914)."""
+    (:func:`_data_set_instance_uid`). The data set is read only when some item names a string as
+    its instance, since with none its UID cannot change the verdict; a string outside the UID
+    grammar still counts. With no UID to compare, the reason names why the File Meta has none, and
+    whether the data set was read (BACKLOG #5914)."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     meta_uid, cause = _sent_instance_uid(sent)
     if meta_uid is not None and meta_uid in named:
@@ -548,6 +557,13 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
     data_set_uid = _data_set_instance_uid(sent) if named else None
     if data_set_uid is not None and data_set_uid in named:
         return None
+    if meta_uid is None and not named:
+        # The data set was not read, so the reason says nothing of its UID.
+        return (
+            "unconfirmed-202",
+            f"no File Meta SOP Instance UID of the instance sent to compare: {cause}, and the reply "
+            f"names no instance; {_NOT_SENT}",
+        )
     if meta_uid is None and data_set_uid is None:
         return (
             "unconfirmed-202",

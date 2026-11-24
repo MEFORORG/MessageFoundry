@@ -853,7 +853,10 @@ async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
     # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
     text = str(exc.value)
     assert cause in text
-    assert "a replay of the same object cannot confirm it on a 202 unless" in text
+    if body == STORED_OK:  # the data set is read, and has no UID
+        assert "a replay of the same object cannot confirm it on a 202 unless" in text
+    else:  # the reply names no instance, so the data set is not read, and the text says so
+        assert "the reply names no instance" in text and "(0008,0018)" not in text
     assert "refused again" not in text
     assert "before a replay" in text
     assert SENT_UID not in text
@@ -934,7 +937,7 @@ async def test_dicomweb_the_data_set_read_lets_no_value_warning_escape() -> None
         warnings.simplefilter("always")
         with pytest.raises(NegativeAckError) as exc:
             await dest.send(_carried(obj))
-    assert exc.value.code == "unconfirmed-202"  # control: the data set was read and refused
+    assert exc.value.code == "unconfirmed-202"  # the File Meta UID alone already refuses it
     assert not [w for w in seen if "Canary" in str(w.message)]
 
 
