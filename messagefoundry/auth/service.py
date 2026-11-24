@@ -3050,9 +3050,10 @@ class LockableAccountCensus:
     undecryptable_totp: tuple[str, ...] = ()
     #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
     #: or the opened value is not base32), as opposed to a KNOWN refusal: a refused enrolment
-    #: marker (a value holding a colon reads as a refused marker, a known refusal), a key too short to compute with (BACKLOG #5340) or an empty secret is a known refusal
-    #: and is not named here. Every gate counts such a TOTP as the plain enabled-TOTP rule does;
-    #: this names them as unknown (BACKLOG #3422).
+    #: marker (a value holding a colon reads as a refused marker, a known refusal), a key too short
+    #: to compute with (BACKLOG #5340) or an empty secret is a known refusal and is not named here.
+    #: Every gate counts such a TOTP as the plain enabled-TOTP rule does; this names them as
+    #: unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
     #: The covered accounts in ``unknown_totp`` that also hold a discoverable passkey, which a
