@@ -156,17 +156,28 @@ def test_a_day_first_culture_still_reads_a_day_12_or_earlier_stamp_unswapped(rep
     assert f"[held {hours}h;" in out, out
 
 
-def test_a_stamp_left_as_a_string_is_read_invariantly_with_its_offset(repo: Path) -> None:
-    """ConvertFrom-Json does not coerce this shape, so it reaches the helper's string branch."""
+def test_a_stamp_left_as_a_string_is_read_under_the_invariant_culture(repo: Path) -> None:
+    """The month-first short form PowerShell prints a [datetime] as, which ConvertFrom-Json leaves as a
+    string. Under en-GB the old current-culture Parse refused it from the 13th; invariant reads it."""
     hours = 30
     while (datetime.now(UTC) - timedelta(hours=hours)).astimezone().day <= 12:
         hours += 24
-    when = (datetime.now(UTC) - timedelta(hours=hours)).astimezone(_OFFSET)
-    stamp = when.strftime("%Y-%m-%d %H:%M:%S") + " +09:30"
+    local = (datetime.now(UTC) - timedelta(hours=hours)).astimezone()
+    stamp = local.strftime("%m/%d/%Y %H:%M:%S")  # no offset: read as this host's local time
     assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
     _rewrite(_the_record(repo), claimed=stamp)
-    out = _list_under(repo, "de-DE")
+    out = _list_under(repo, "en-GB")
     assert f"[held {hours}h;" in out, out
+
+
+def test_a_printed_stamp_is_round_trip_iso_not_the_culture_ambiguous_short_form(repo: Path) -> None:
+    assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
+    stamp, _ = _stamp_hours_ago(day_past_12=False)
+    _rewrite(_the_record(repo), claimed=stamp)
+    out = _claim(repo, "-Take", "k").stdout  # no -Note, so a re-take, not a refresh
+    line = next((ln for ln in out.splitlines() if "You already hold" in ln), out)
+    assert "/" not in line.split("(claimed ", 1)[1], line
+    assert "T" in line.split("(claimed ", 1)[1], line
 
 
 def test_an_unreadable_stamp_costs_the_age_not_the_liveness_verdict(repo: Path) -> None:

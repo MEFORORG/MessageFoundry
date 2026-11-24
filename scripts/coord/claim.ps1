@@ -937,7 +937,7 @@ if ($Release) {
         Write-Host ""
         Write-Host "REFUSING to release '$Release': it is held by another worktree." -ForegroundColor Yellow
         Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
-        Write-Host "  since  : $($info.Claim.claimed)"
+        Write-Host "  since  : $(ConvertTo-Stamp $info.Claim.claimed)"
         Write-Host "  note   : $($info.Claim.note)"
         # DO NOT recommend -Force without looking. This line used to read "If that session is gone,
         # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
@@ -1190,11 +1190,11 @@ try {
                 exit 1
             }
             Write-Host ""
-            Write-Host "REFRESHED '$Take' (held since $($info.Claim.claimed))." -ForegroundColor Green
+            Write-Host "REFRESHED '$Take' (held since $(ConvertTo-Stamp $info.Claim.claimed))." -ForegroundColor Green
             Write-Host "  note : $Note"
             exit 0
         }
-        Write-Host "You already hold '$Take' (claimed $($info.Claim.claimed))." -ForegroundColor Green
+        Write-Host "You already hold '$Take' (claimed $(ConvertTo-Stamp $info.Claim.claimed))." -ForegroundColor Green
         Write-Host "  note : $($info.Claim.note)"
         Write-Host "  (pass -Note to update it -- it is what other sessions are shown.)"
         exit 0
@@ -1202,7 +1202,7 @@ try {
     Write-Host ""
     Write-Host "BLOCKED: '$Take' is already claimed by another session." -ForegroundColor Red
     Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
-    Write-Host "  since  : $($info.Claim.claimed)"
+    Write-Host "  since  : $(ConvertTo-Stamp $info.Claim.claimed)"
     Write-Host "  note   : $($info.Claim.note)"
     # THE BLOCKING PATH IS WHERE THIS MATTERS MOST. -List is where you browse; this is where a session
     # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
