@@ -1969,7 +1969,7 @@ async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read
 
     monkeypatch.setattr(RetentionRunner, "_has_free_space", rotate_then_allow)
 
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
         result = await RetentionRunner(
             store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
         ).run_once()
@@ -1978,6 +1978,43 @@ async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read
     assert not (logs / "old.log.gz").exists()
     assert not list(logs.glob("*.mftmp"))  # rejected before anything was staged
     assert result.app_logs_compressed == 0
+    assert "not the file the scan aged" in caplog.text
+
+
+async def test_app_log_compression_never_renames_over_an_archive_that_appeared_meanwhile(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A ``<name>.gz`` a peer compressor placed after the scan is never renamed over: it may be the
+    only copy of a longer read whose source the peer is about to remove (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    peer = gzip.compress(body + b"a longer read by a peer\n")
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_peer_places(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            (logs / "old.log.gz").write_bytes(peer)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_peer_places)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (logs / "old.log.gz").read_bytes() == peer
+    assert old_log.read_bytes() == body
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "an archive appeared meanwhile" in caplog.text
 
 
 async def test_app_log_compression_reports_a_source_that_vanished_after_placement(

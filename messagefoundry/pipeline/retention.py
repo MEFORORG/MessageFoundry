@@ -149,8 +149,9 @@ def _verify_archive(path: str, original: bytes, *, name: str) -> bool:
     return True
 
 
-# Opening a log to read or re-check it never follows a symlink and never blocks on a FIFO swapped in
-# at the path; the flags a platform lacks are simply absent there.
+# Opening a log to read or re-check it does not follow a symlink, or block on a FIFO, swapped in at
+# the path, where the platform has O_NOFOLLOW and O_NONBLOCK. Windows has neither, so there the open
+# does follow a symlink; the flags a platform lacks are simply absent.
 _SOURCE_OPEN_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_BINARY", 0)
@@ -178,8 +179,8 @@ def _source_change(source: str, read_st: os.stat_result) -> str | None:
     re-opened and ``fstat``-ed (:data:`_SOURCE_OPEN_FLAGS`) so both sides of the compare are alike.
 
     This does not make the check and the act atomic: at least a change landing between this check and
-    the ``remove`` or rename that follows it, and a same-size rewrite inside one timestamp tick on a
-    file system that reports no file id, still pass it (#6805)."""
+    the ``remove`` or rename that follows it, and an in-place same-size rewrite with the mtime put back
+    inside one ctime tick of the file's last change, still pass it (#6805)."""
     try:
         fd = os.open(source, _SOURCE_OPEN_FLAGS)
     except FileNotFoundError:
@@ -191,7 +192,10 @@ def _source_change(source: str, read_st: os.stat_result) -> str | None:
     except OSError as exc:
         return f"could not be re-read ({type(exc).__name__})"
     finally:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            log.debug("could not close a re-check descriptor", exc_info=True)
     return None if _same_file_state(now_st, read_st) else "changed"
 
 
@@ -1273,8 +1277,10 @@ class RetentionRunner:
            is re-read **before every file**, so the phase releases the pass between files instead of
            running the whole directory in one uninterruptible call. Whatever is left is untouched and is
            simply picked up by the next pass — nothing is dropped, only deferred.
-        1. **Never clobber.** An existing ``<name>.gz`` means the file is already archived (or a crash
-           landed the archive but not the unlink); it is skipped, and the delete window cleans up.
+        1. **Never clobber.** An existing ``<name>.gz`` means the file is already archived, or at least
+           that a crash landed the archive but not the unlink, or that the source changed after its
+           archive was placed (#6805); it is skipped, and only an ``app_log_days`` delete window, where
+           one is set, cleans up.
         2. **Free-space precheck.** ``shutil.disk_usage`` must show room for the source *plus* its
            archive plus a margin, else the file is skipped and logged — a maintenance pass must never be
            what fills the volume. Re-read per file, since each compression changes what is free.
@@ -1382,8 +1388,9 @@ class RetentionRunner:
     def _compress_one(self, source: str, dest: str, *, atime: float, mtime: float) -> int | None:
         """Gzip ``source`` → ``dest``, **validating the bytes at ``dest`` before removing the original**.
 
-        Returns the bytes reclaimed, or ``None`` when the original was left in place (read/codec/write
-        failure, a failed integrity check, or an archive that would not be SMALLER than the source).
+        Returns the bytes reclaimed, or ``None`` when this call did not remove the original (read/codec/
+        write failure, a failed integrity check, an archive that would not be SMALLER than the source, or
+        a source that changed or vanished during compression; in the vanished case it is already gone).
 
         **What authorizes the unlink** is a read-back of ``dest`` *after* the rename — never a check
         against the staging path. Validating the staged file and then renaming "whatever is at that
@@ -1407,16 +1414,27 @@ class RetentionRunner:
             log.warning("app-log compression skipped %r: unreadable", name)
             return None
         try:
+            # The identity of the file these bytes come from, taken on the SAME descriptor before and
+            # after the read, so a change during the read is caught here and the checks below can
+            # refuse a path that no longer holds exactly these bytes (#6805). Checked on the raw
+            # descriptor first: `os.fdopen` raises on a directory without closing the descriptor.
+            try:
+                before_st = os.fstat(fd)
+                aged_file = stat.S_ISREG(before_st.st_mode) and before_st.st_mtime == mtime
+                if aged_file and hasattr(os, "O_NONBLOCK"):
+                    # Opened O_NONBLOCK only so the open cannot hang; a buffered read of a
+                    # non-blocking descriptor may return None, so blocking mode is restored first.
+                    os.set_blocking(fd, True)
+            except OSError:
+                os.close(fd)
+                raise
+            if not aged_file:
+                # Not the regular file the scan aged: rotated in after the scan, or (Windows) the
+                # directory entry's mtime is stale because a writer still has it open. Read nothing.
+                os.close(fd)
+                log.debug("app-log compression skipped %r: not the file the scan aged", name)
+                return None
             with os.fdopen(fd, "rb") as fh:
-                # The identity of the file these bytes come from, taken on the SAME handle before and
-                # after the read, so a change during the read is caught here and the checks below can
-                # refuse a path that no longer holds exactly these bytes (#6805).
-                before_st = os.fstat(fh.fileno())
-                if not stat.S_ISREG(before_st.st_mode) or before_st.st_mtime != mtime:
-                    # Not the regular file the scan aged: rotated in after the scan, or (Windows) the
-                    # directory entry's mtime is stale because a writer still has it open. Read nothing.
-                    log.debug("app-log compression skipped %r: not the file the scan aged", name)
-                    return None
                 # Bounded by the size pinned above: a longer read is a change and is refused below.
                 data = fh.read(before_st.st_size + 1)
                 read_st = os.fstat(fh.fileno())
@@ -1459,7 +1477,7 @@ class RetentionRunner:
             )
             _unlink_quietly(tmp)
             return None
-        if os.path.lexists(dest):
+        if os.path.exists(dest):
             # A peer compressor placed `<name>.gz` since the scan. Never rename over it: it may be the
             # only copy of a longer read whose source the peer is about to remove. This narrows, and
             # does not close, the window before the rename below.
