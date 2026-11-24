@@ -231,3 +231,79 @@ def test_check_collection_exits_by_what_pytest_collected(
         mod.main(["--suite", "engine", "--shard", "1", "--of", "2", "--check-collection"])
     with pytest.raises(SystemExit):
         mod.main(["--shard", "1", "--of", "2", "--", "-m", "x"])
+
+
+# --- the tooling suite (owner ruling 2026-11-24) --------------------------------------------------
+
+
+def _tooling_shards() -> int:
+    """ci.yml's tooling shard count, read from its partition guard, which
+    tests/test_ci_tooling_gate.py holds to the windows-2025 legs' `of`."""
+    text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    counts = set(re.findall(r"shard_tests\.py --suite tooling --of (\d+) --check-collection", text))
+    assert len(counts) == 1, f"ci.yml's tooling guard reads {sorted(counts)}"
+    return int(counts.pop())
+
+
+_TOOLING_SHARDS = _tooling_shards()
+
+
+@pytest.fixture(scope="module")
+def tooling(mod: ModuleType) -> dict[int, list[str]]:
+    return mod.partition(_TOOLING_SHARDS, "tooling")
+
+
+def test_the_tooling_shards_partition_exactly_the_manifest(
+    mod: ModuleType, files: list[str], tooling: dict[int, list[str]], engine: dict[int, list[str]]
+) -> None:
+    """Every manifest file in exactly one tooling shard, no other file in any, and the tooling and
+    engine suites disjoint, so no file runs on both tiers or on neither."""
+    manifest = mod.tooling_files()
+    listed = [f for shard in sorted(tooling) for f in tooling[shard]]
+    sizes = ", ".join(f"shard {n} {len(tooling[n])}" for n in sorted(tooling))
+    print(f"[shards] tooling: {sizes} files")
+    assert sorted(tooling) == list(range(1, _TOOLING_SHARDS + 1))
+    assert len(set(listed)) == len(listed), "a file is in two tooling shards"
+    assert set(listed) == manifest & set(files) == manifest
+    assert all(tooling.values()), "a tooling shard is empty"
+    engine_files = {f for shard in engine.values() for f in shard}
+    assert not engine_files & manifest
+
+
+def test_the_tooling_split_is_salted_and_the_salt_moves_it(mod: ModuleType) -> None:
+    """The salt is what balanced the split on the measured junit; an unsalted hash put one shard 34
+    percent over the mean. Pinned so a dropped salt reds here rather than as a slow shard. Falsified
+    by returning `shard_of(path, shards)` for the tooling suite: RED on the first assertion. Restored."""
+    path = "tests/test_worktree_finished_claude_removal.py"
+    assert mod.assign(path, 3, "tooling") == mod.shard_of(f"{mod.TOOLING_SALT}:{path}", 3)
+    manifest = sorted(mod.tooling_files())
+    moved = [p for p in manifest if mod.assign(p, 3, "tooling") != mod.shard_of(p, 3)]
+    assert moved, "the salted split equals the unsalted one, so the salt does nothing"
+
+
+def test_main_prints_a_tooling_shard(
+    mod: ModuleType, tooling: dict[int, list[str]], capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", str(_TOOLING_SHARDS)]) == 0
+    assert capsys.readouterr().out.splitlines() == tooling[1]
+    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", "1"]) == 0
+    assert sorted(capsys.readouterr().out.splitlines()) == sorted(mod.tooling_files())
+
+
+def test_check_collection_judges_the_tooling_suite(
+    mod: ModuleType, tooling: dict[int, list[str]]
+) -> None:
+    """The guard's verdicts on the tooling split, on a stubbed collection: a collected file outside
+    the manifest is a fault, which is what a basename collision with a non-manifest file would be."""
+
+    def check(files: list[str]) -> int:
+        def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            out = "".join(f"{path}::test_x\n" for path in files)
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
+
+        result: int = mod.check_collection(_TOOLING_SHARDS, "tooling", ["-m", "tooling"], run=run)
+        return result
+
+    every = [f for shard in sorted(tooling) for f in tooling[shard]]
+    assert check(every) == 0
+    assert check([*every, "tests/test_quality_shard_tests_not_in_the_manifest.py"]) == 1

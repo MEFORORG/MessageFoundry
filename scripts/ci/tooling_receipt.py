@@ -52,13 +52,26 @@ def count(report: Path) -> tuple[int, int]:
     return executed, skipped
 
 
-def main() -> int:
+def floor_for(min_executed: int, shards: int) -> int:
+    """The floor one test shard of ``shards`` is held to: the tier's floor over the shard count,
+    rounded up. A dead marker executes nothing in every shard, so a third of the floor still goes
+    red on it, while a whole-tier floor would redden a shard that ran its share."""
+    return -(-min_executed // shards)
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--report", type=Path, required=True, help="junit xml the run produced")
     ap.add_argument(
         "--min-executed", type=int, default=1000, help="dead-marker floor, not a target"
     )
-    args = ap.parse_args()
+    ap.add_argument(
+        "--shards", type=int, default=1, help="test shards the tier runs in on this leg"
+    )
+    args = ap.parse_args(argv)
+    if args.shards < 1:
+        ap.error(f"--shards must be at least 1, got {args.shards}")
+    floor = floor_for(args.min_executed, args.shards)
 
     if not args.report.is_file():
         # Absent report means pytest died before writing one, OR the path is wrong. Either way the
@@ -68,9 +81,9 @@ def main() -> int:
 
     executed, skipped = count(args.report)
     print(f"tooling tests EXECUTED: {executed}   skipped: {skipped}")
-    if executed < args.min_executed:
+    if executed < floor:
         print(
-            f"::error::the tooling marker EXECUTED only {executed} tests (floor {args.min_executed}) "
+            f"::error::the tooling marker EXECUTED only {executed} tests (floor {floor}) "
             f"-- the partition is not being applied; check tests/tooling_manifest.txt, the parser "
             f"that reads it in tests/_tooling_manifest.py, and the pytest_collection_modifyitems "
             f"hook in tests/conftest.py that applies the marker"
