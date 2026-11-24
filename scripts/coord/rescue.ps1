@@ -16,22 +16,23 @@
     `refs/rescue/<x>` to the same name is refused where that hook is installed. It does NOT stop at
     least: a push with `--no-verify`; a push from a clone where `install-git-hooks.ps1` never ran
     (the hook is local); a refspec that maps the ref into an allowed name, such as
-    `refs/rescue/<x>:refs/heads/<x>`, since Guard A reads only the remote name (the guard's other
-    checks still look at what the push carries); and a copy made by anything other than
-    `git push`. So do not assume a remote copy exists. Deleting one and then running `gc` can be
-    unrecoverable loss of the only copy, and nothing reports it.
+    `refs/rescue/<x>:refs/heads/<x>`, since Guard A reads only the remote name; and a copy made by
+    anything other than `git push`. So do not assume a remote copy exists. Deleting one and then
+    running `gc` can be unrecoverable loss of the only copy, and nothing reports it.
 
     AND THE TAGS `-Anchor` WRITES ARE PUSHABLE, WHICH IS A PUBLICATION RISK, NOT A BACKUP. `-Anchor`
     writes the local annotated tag `refs/tags/rescue/<slug>`, which is inside the allowlist. A
     `git push --tags` or `--follow-tags` (or `push.followTags`) can sweep it to whatever remote the
     push names, the public one included, with its message, which carries the local worktree path.
-    `scripts/hooks/durability_push.sh` avoids that for its own captures by pushing tag objects BY ID
-    with no local tag; they come back only through the fetch refspec, under
-    `refs/remotes/<r>/rescuetags/` (its `auto/` and immutable `orphan/` captures). So an `-Anchor`
-    tag is usually local only, and must not be treated as backed up.
+    The same holds for any other rescue tag that lands under local `refs/tags/rescue/`, for example
+    by a fetch's tag auto-follow. `scripts/hooks/durability_push.sh` says how it keeps its own
+    captures off that path. An `-Anchor` tag is usually local only, and must not be treated as
+    backed up.
 
-    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits:
-    `refs/rescue/`, `refs/tags/rescue/` and `refs/remotes/<r>/rescuetags/`. Measured 2026-09-20: this
+    SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits,
+    which includes at least `refs/rescue/`, `refs/tags/rescue/`, `refs/remotes/<r>/rescuetags/` and
+    `refs/remotes/<r>/rescue/` (`Get-RescueNamespaces` is the list). A `git fetch --prune` deletes a
+    remote-tracking one whose server copy is gone, which is when it may be the last copy. Measured 2026-09-20: this
     checkout holds 328 of them, at least one being the sole remaining copy of files deleted from the
     working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
