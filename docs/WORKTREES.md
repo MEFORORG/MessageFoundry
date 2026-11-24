@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Name <dir>` | The `<repo>-<dir>` sibling of the checkout that copy of the script lives in | Without `-Force`: uncommitted tracked changes and untracked files no exclude rule covers (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -350,7 +350,7 @@ proof that a tree is free:
 - The six hours are a judgement. A test run still in progress has not yet written its cache, so it
   can outlast them.
 - A tree that passes all four still goes through the route's own content rules above. On `-Name`,
-  older untracked files and ignored files go with it.
+  ignored files go with it.
 
 **The occupancy check is on `-Path` only.** `-Name` has none. Neither route runs a blanket
 `git worktree prune`: `git worktree remove` already drops the target's own registration, and a
@@ -368,17 +368,17 @@ checkout"; that was false for every worktree created from a linked one, and `new
 exact command with the root already filled in. (BACKLOG #1078.)
 
 ```powershell
-scripts\worktree\remove.ps1 -Name alerts            # refuses if there are uncommitted tracked changes
+scripts\worktree\remove.ps1 -Name alerts            # refuses on uncommitted tracked changes or untracked files
 scripts\worktree\remove.ps1 -Name alerts -DeleteBranch
-scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracked changes older than six hours too
+scripts\worktree\remove.ps1 -Name alerts -Force     # discard those too, once older than six hours
 pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts   # from any cwd
 ```
 
-The untracked `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes, a file flagged skip-worktree or assume-unchanged, and a git
+The gitignored `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
+uncommitted **tracked** changes, untracked files no exclude rule covers (BACKLOG #2554), a file flagged skip-worktree or assume-unchanged, and a git
 repository inside the tree block removal. With `-Force` the run names the flagged files it lets
 go. `-Discard`
-parks the tracked changes instead, as described above. Uncommitted work
+parks the tracked changes and untracked files instead, as described above. Uncommitted work
 written in the last six hours blocks it whatever `-Force` says, as do the other in-use refusals in
 the table above.
 
