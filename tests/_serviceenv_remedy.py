@@ -212,9 +212,7 @@ DOUBT_CREATE_LEAVING = f"{DOUBT_STEP_LEAVING}. {CREATE}"
 #: each string whose refused variable removing the others would read differently (the Lander's
 #: hold on PR 3142, comment 7119680463, items 1 and 3; code review round 1 on that repair). The
 #: rule is not the reader, so it may still add back a line the reader reads as part of a refused
-#: value, at least for a NAME== line the reader reads as empty and a joined group the reader
-#: reads whole (open findings 1 and 2 of code review round 3 on that repair, the repair handback
-#: on PR 3142, comment 7122130265).
+#: value; the clause's comment in messagefoundry/serviceenv.py names the shapes still open.
 CREATE_INSTALLER = (
     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra and starts with "
     "MEFOR_SECRETS_DIRECTORY= in any letter case, install-service.ps1, which `messagefoundry "

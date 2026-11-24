@@ -197,12 +197,9 @@ class ServiceEnvPosture:
     #: Whether a directory entry is in doubt and taking out each line that may name
     #: ``MEFOR_SECRETS_DIRECTORY``, as the doubt step's rule says, changes how the reader reads a
     #: refused variable (:func:`_take_out_changes_refused`), so the reader may hold such a line
-    #: as part of that variable. Where it does, the doubt step then
-    #: leaves as it is each string that holds a refused variable or that one's value runs on
-    #: into, and each string whose take-out, alone or beside the others, would change how the
-    #: reader reads a refused variable, so no value goes before the step that moves it, as far
-    #: as that check sees a change: it misses at least one that only changes how many identical
-    #: readings there are. The remedy alone reads this.
+    #: as part of that variable. Where it does, the doubt step prints its leave sentence; that
+    #: function says what the sentence asks and what the check does not see. The remedy alone
+    #: reads this.
     directory_in_refused: bool = False
     #: Whether any AppEnvironmentExtra string is one install-service.ps1 reads as setting
     #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`), so the doubt step may leave such a
@@ -1046,14 +1043,17 @@ def _take_out_changes_refused(
     ``entries``, which the reader read as ``variables``, changes how the reader reads any
     refused variable (:func:`_refused_readings`): its value, its name, or whether it is read at
     all. Then a line it takes out may be part of a refused value, a store key among them, and
-    the step leaves as it is each string that holds a refused variable or that one's value runs
-    on into (the Lander's hold on PR 3142, comment 7116005396, F3), and each string whose
-    take-out, alone or beside the others, would change such a reading (the Lander's hold on PR
-    3142, comment 7119680463, item 3). It compares the readings as sets, so it does not see a
-    take-out that only changes how many identical readings there are, such as one that stops a
-    reading which a twin with the same registry value, name and value still makes; the step
-    then leaves no string for that (the Lander's hold on PR 3142, comment 7122889682, item 2).
-    The remedy alone reads this."""
+    the step prints a sentence asking the operator to leave as it is each string that holds a
+    refused variable or that one's value runs on into (the Lander's hold on PR 3142, comment
+    7116005396, F3), and each string whose take-out, alone or beside the others, would change
+    such a reading (the Lander's hold on PR 3142, comment 7119680463, item 3). Which strings
+    those are, the operator works out; this check reads only the take-out of every string at
+    once, so it says whether the sentence prints, not which strings it covers. It compares the
+    readings as sets, so it does not see a take-out that only changes how many identical
+    readings there are, such as one that stops a reading which a twin with the same registry
+    value, name and value still makes; the sentence then does not print (the Lander's hold on
+    PR 3142, comment 7122889682, item 2, and its recommended finding on this comparison). The
+    remedy alone reads this."""
     return _refused_readings(variables) != _refused_readings(_variables(_taken_out(entries)))
 
 
@@ -1524,6 +1524,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # finding of code review round 2 on that repair), and for a NAME== line the reader reads
         # as empty and a joined group the reader reads whole (open findings 1 and 2 of code
         # review round 3 on that repair, the repair handback on PR 3142, comment 7122130265).
+        # Nor does it keep back a line below a directory line in a string the clause removes,
+        # which the doubt step's rule reads as part of the directory's value and which may be
+        # key text: the rule adds such a line back (code review round 2 on the repair of the
+        # Lander's hold on PR 3142, comment 7122889682, finding 1, open).
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
