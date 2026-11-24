@@ -257,9 +257,14 @@ async def test_two_sign_ins_that_move_the_roles_keep_each_others_session(
     a = asyncio.create_task(_sign_in(service, _principal(group=VIEW)))
     await asyncio.sleep(0)
     b = asyncio.create_task(_sign_in(service, _principal(group=VIEW)))
-    first = await a
-    a_done.set()
-    second = await b
+    try:
+        first = await a
+        a_done.set()
+        second = await b
+    finally:
+        # A failing ``a`` must not leave ``b`` waiting on ``a_done`` past the test.
+        b.cancel()
+        await asyncio.gather(b, return_exceptions=True)
     assert first.ok and second.ok
     assert await service.identity_for_token(first.token, activity=False) is not None
     assert await service.identity_for_token(second.token, activity=False) is not None

@@ -2726,7 +2726,7 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     return None
 
 
-def _in_principal_credential_queue[**P](
+def _in_directory_sign_in_queue[**P](
     method: Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]],
 ) -> Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]]:
     """Run a directory sign-in's completion inside a per-account queue (BACKLOG #5653).
@@ -2751,7 +2751,7 @@ def _in_principal_credential_queue[**P](
     engine shard take no part in it: it is per API process, keyed by name. A reconciler pass or a
     sign-in on another shard that moves the roles can still end this sign-in's new session.
 
-    The key is the directory's name for the account. A decorator rather than a wrapper method so
+    The key is the account's directory object id. A decorator rather than a wrapper method so
     the completion keeps its one name for every caller; ``__wrapped__`` is the body outside the
     queue, for a test that drives the cross-process race."""
 
@@ -2759,7 +2759,11 @@ def _in_principal_credential_queue[**P](
     async def queued(
         self: AuthService, principal: AdPrincipal, /, *args: P.args, **kwargs: P.kwargs
     ) -> LoginOutcome:
-        key = _credential_lock_key(principal.username)
+        # The directory's immutable id where the principal carries one, so a sign-in under an
+        # old name and one under a renamed one queue together; the name only where it does not,
+        # which the completion refuses anyway (BACKLOG #2027).
+        oid = principal.directory_object_id
+        key = f"id\x00{oid}" if oid else f"name\x00{_credential_lock_key(principal.username)}"
         async with _hold_keyed_lock(self._directory_sign_in_locks, key):
             return await method(self, principal, *args, **kwargs)
 
@@ -4485,7 +4489,7 @@ class AuthService:
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #5653: one directory sign-in per account name at a time
-        # (:func:`_in_principal_credential_queue`). Its own table, not the credential queue above:
+        # (:func:`_in_directory_sign_in_queue`). Its own table, not the credential queue above:
         # a password attempt holds that one across its padded failure window, so sharing it would
         # let anyone who knows a directory name stall that user's Windows SSO and OIDC sign-ins.
         self._directory_sign_in_locks: dict[str, _KeyedLock] = {}
@@ -8434,7 +8438,7 @@ class AuthService:
             return None
         return set(stored.user.role_ids) == set(role_ids)
 
-    @_in_principal_credential_queue
+    @_in_directory_sign_in_queue
     async def _complete_ad_login(
         self,
         principal: AdPrincipal,
@@ -8798,6 +8802,16 @@ class AuthService:
             ineligible: str | None = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
         else:
             ineligible = _directory_login_refusal(decided, time.time(), federated=federated)
+        if federated and ineligible == ACCOUNT_DELETED:
+            await self._directory_reject_audit(
+                principal.username, "oidc", ACCOUNT_DELETED, client=client, extra=outcome_extra
+            )
+            return LoginOutcome(
+                ok=False,
+                error="federated sign-in failed",
+                reason=ACCOUNT_DELETED,
+                roles_gained=roles_gained,
+            )
         if ineligible is not None or decided is None:
             refused = await self._refuse_directory_row(
                 principal.username,
@@ -8871,7 +8885,19 @@ class AuthService:
             # refused for its binding, or its lock lapsed in between, and keeps the binding reason.
             now_ineligible: str | None = None
             if not changed.account_deleted:
-                again = await self._load_user(user.id)
+                try:
+                    again = await self._load_user(user.id)
+                except (*store_call_errors(), *store_connect_errors()) as exc:
+                    if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                        raise
+                    # Only the reason depends on this read; the refusal stands without it.
+                    _log.warning(
+                        "a directory sign-in of account id %r was refused at its session insert, "
+                        "and the account could not be read again to name why (%s)",
+                        user.id,
+                        type(exc).__name__,
+                    )
+                    again = None
                 if again is not None:
                     # ``federated=True`` asks only the disabled and lock states: a binding change
                     # keeps the reason chosen below.

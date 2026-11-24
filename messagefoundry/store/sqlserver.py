@@ -16500,8 +16500,8 @@ class SqlServerStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
