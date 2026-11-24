@@ -304,7 +304,9 @@ def test_a_lower_reading_in_one_reset_period_replaces_nothing(tmp_path: Path) ->
     assert len(history(tmp_path)) == 2
 
 
-def test_a_new_reset_period_replaces_the_old_value_in_either_direction(tmp_path: Path) -> None:
+def test_a_new_reset_period_from_a_live_session_replaces_in_either_direction(
+    tmp_path: Path,
+) -> None:
     """From a session calling the API on every fire: a lower number on a new reset needs one
     (BACKLOG #5178), and an idle one is refused, as the moved-reset tests below pin."""
     epoch = int(time.time()) + 3600
@@ -403,6 +405,11 @@ def test_after_a_real_reset_an_idle_lower_reading_keeps_the_gone_window(tmp_path
     _session_fire(tmp_path, new, "idle", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
     assert read(tmp_path)[0] == UNKNOWN
+
+    # A higher number than the gone window's is no better evidence: an idle session's frozen 95 for
+    # the new window is refused too.
+    _session_fire(tmp_path, {**new, "used_percentage": 95.0}, "other", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
 
     # CONTROL. A live session's reading of the new window replaces the gone one.
     _session_fire(tmp_path, new, "idle", 2000)

@@ -515,7 +515,7 @@ roster alias of the Lander.
 > - It needs a published window to compare with. At least these gone readings are published and reach
 >   the history: one on an empty directory, one over a window stamped with another root or with no reset,
 >   one higher than the published window for the same gone reset, and one with a later reset than the
->   published window. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
+>   published window from a live session of this root. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
 >   level is not graded. With no current reset the rate cannot filter its rows by reset, so rows that
 >   change reset or fall refuse it, under the 2026-11-23 amendment above.
 > - With no published reset ahead, the collector holds no floor: a reading with no reset is taken whatever
@@ -544,11 +544,14 @@ roster alias of the Lander.
 >   widely: measured 2026-11-01, its `five_hour` window read OK at 5 after a spent 100, with the same or an
 >   earlier reset. The same-reset case is what this amendment closes.
 >   **Narrowed 2026-11-24 (BACKLOG #5178):** a reading at or below the published one, on another reset,
->   now counts as a new window only from a session that has just called the API. Two idle sessions'
->   80, 5, 80, 5 now leaves one history row, and a frozen 5 no longer replaces a published 100. A higher
->   reading is still taken from any session, so a live lower session and an idle higher one can still
->   trade the window. The lower number then rests on the API-duration counter, whose behaviour on an
->   unpinned session or a failed call is not measured.
+>   now counts as a new window only from a session of this root that has just called the API. Past the
+>   published reset, any reading on another reset needs one. Two idle sessions' 80, 5, 80, 5 now leaves
+>   one history row, and an idle session's frozen 5 no longer replaces a published 100. A higher reading
+>   is still taken from any session while the published reset is ahead. So a live lower session and an
+>   idle higher one can still trade the window. Liveness is a rise in the API-duration counter. Whether a
+>   failed call or an unpinned session moves it is not measured, so a frozen number from a session
+>   whose calls fail may still pass as live. After a real reset, a session that never reads as live
+>   cannot open the new window, and the gate answers REVIEW on the gone one until a live session does.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number, and
 >   the gate can clear on it. The next live reading corrects it.
