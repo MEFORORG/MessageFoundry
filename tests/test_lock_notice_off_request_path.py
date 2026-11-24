@@ -837,8 +837,9 @@ async def test_the_shipped_notifier_queues_nothing_once_it_has_closed() -> None:
 
 
 async def test_a_closed_notifier_refuses_to_start_again() -> None:
-    """Vault BACKLOG #3120, review round two. A close can leave its stop sentinel on the queue, so a
-    drain loop started again could stop on it at once. ``start`` after ``aclose`` therefore raises,
+    """Vault BACKLOG #3120, review round two. A close could leave its stop sentinel on the queue,
+    until BACKLOG #6832 had a cut close empty it, and a drain loop started again could stop on it at
+    once. ``notify`` refuses every event once the close begins, so ``start`` after ``aclose`` raises,
     and the notifier goes on refusing events. The control is ``start`` on a notifier never closed,
     which raises nothing."""
     relay = _relay()

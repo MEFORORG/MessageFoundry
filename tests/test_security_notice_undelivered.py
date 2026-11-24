@@ -672,10 +672,12 @@ async def test_a_backlog_the_teardown_step_lets_drain_is_all_sent(
     [step] = [s for s in steps if s.label == "the security notifier's close"]
     bound = 1.0
     work = asyncio.ensure_future(step.run(bound))
+    # The step's bound starts here, as the teardown starts it, not after the sleep below.
+    waited = asyncio.ensure_future(app_module._await_step(work, bound, step.label))
     try:
-        await asyncio.sleep(0.4)  # past 0.1 of the bound, well inside the bound itself
+        await asyncio.sleep(0.7)  # well past 0.1 of the bound, still inside the bound itself
         release.set()
-        assert await app_module._await_step(work, bound, step.label)
+        assert await waited
     finally:
         release.set()
     assert sorted(sent) == [["amy@x.test"], ["ben@x.test"], ["cat@x.test"]]
@@ -1010,7 +1012,7 @@ async def test_a_cut_close_logs_a_warning_naming_the_queued_count(
 ) -> None:
     """BACKLOG #6832, Lander hold on PR 3260. A close the teardown cuts logs one WARNING line
     counting the notices it left queued, before their writes, and the count leaves lock notices
-    out (BACKLOG #1131). The teardown's own cut line is the only ERROR the cut adds."""
+    out (BACKLOG #1131)."""
     started, release = _blocking_send(monkeypatch)
     notifier = _notifier(store)
     notifier.start()

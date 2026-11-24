@@ -7993,11 +7993,11 @@ again for the row, and only when a send failed. **Still open, at least:**
   own timeout, so that notice may still go out. Those writes run one at a time and are not
   bounded. The shutdown stops waiting for them at the step's bound plus its cut grace; the rest
   go on beside `engine.stop()`, competing with its writes, until the store closes, and those still
-  to run then fail. Under a full queue that can be most of them. Beside the teardown's ERROR line
-  for the cut, the close logs a WARNING line counting the queued notices before their writes,
-  only when some are queued, and one counting the writes that failed after them; that one does
-  not count the writes a cancel stopped before they ran. Neither line counts a lock notice, and
-  the first does not count the cut send. A lock
+  to run then fail. Under a full queue that can be most of them. A cut logs at least the
+  teardown's ERROR line for the cut and, from the close, a WARNING line counting the queued
+  notices before their writes, only when some are queued, and one counting the writes that
+  failed after them; that one does not count the writes a cancel stopped before they ran.
+  Neither count includes a lock notice, and the first does not count the cut send. A lock
   notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.
@@ -8016,8 +8016,8 @@ again for the row, and only when a send failed. **Still open, at least:**
   on their own loop in a daemon thread, so the limit covers a synchronous key-provider hop inside
   the open too. A record still running at the time limit is not guaranteed either way: the process
   exit may wait for it, or it may be lost with no log line.
-- Under a long overload only 64 queue-full records are written at a time, and drops past that are
-  not recorded.
+- Under a long overload at most 64 records are written at a time, and drops past that are not
+  recorded. A failed send's record and a cut close's records take slots from the same 64.
 - A lock notice whose send fails still leaves its `auth.lock_notice` row reading `mailed: true`,
   because the send fails on the relay's own task after that row is written. So the throttle holds
   back the next lock notice of the kind for the rest of its 24 hours. The failure is on the
