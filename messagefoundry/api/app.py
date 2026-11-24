@@ -4875,8 +4875,8 @@ def create_app(
     if ai_settings is not None:
         app.state.ai = ai_settings
     # #323 layer 3, BACKLOG #5527 item 8: the [tls] policy the AI broker and the alerts test send
-    # read, so a direct create_app reaches the same anchors as the live hops when its embedder
-    # passes it. create_managed_app passes its own.
+    # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
+    # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
     app.state.tls_settings = tls_settings
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
@@ -5478,8 +5478,9 @@ def create_app(
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. create_app stashes its tls_settings
-        # argument and an embedder may set the stash itself; with neither, None goes down.
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
+        # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
@@ -13878,9 +13879,9 @@ def create_managed_app(
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
             app.state.secret_provider = secret_provider
             # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
-            # read, re-stashed at start from the argument the live notifier and the connections
-            # read, so a stash written before start cannot split the two (create_app stashed it
-            # first, BACKLOG #5527 item 8).
+            # read, stashed at start from the argument the live notifier and the connections read,
+            # so a stash written before start cannot split the two. The one writer on this path:
+            # create_app below is not handed it (BACKLOG #5527 item 8).
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail
@@ -14096,7 +14097,6 @@ def create_managed_app(
         # needs a live UploadStore to prune. None uploads_dir → create_app leaves upload_store None.
         store_settings=resolved,
         ai_settings=ai_settings,
-        tls_settings=tls_settings,
         security_settings=security_settings,
         expose_docs=expose_docs,
         allow_no_auth=allow_no_auth,

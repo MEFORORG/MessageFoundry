@@ -885,10 +885,10 @@ async def test_a_direct_create_app_takes_the_tls_section_the_route_hands_the_bro
 def test_the_managed_app_hands_the_broker_the_tls_section_it_was_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pki: _Pki
 ) -> None:
-    """Row #5527 item 8, its first half (and items 18, 28, 36): ``create_managed_app`` puts the
-    ``[tls]`` section it is handed where the route reads it, so on the ``serve`` path an
-    unattested off-box hop crosses enforce on that CRL. Driven through the lifespan, end to end;
-    the route test above is the control that answers 503 with no CRL."""
+    """Row #5527 item 8, its first half (and items 18, 28, 36): the lifespan of
+    ``create_managed_app`` puts the ``[tls]`` section it is handed where the route reads it, so on
+    the ``serve`` path an unattested off-box hop crosses enforce on that CRL. Driven through the
+    lifespan, end to end; the same app with no ``tls_settings`` is the control, and answers 503."""
     from starlette.testclient import TestClient
 
     from messagefoundry.api.app import create_managed_app
@@ -901,17 +901,19 @@ def test_the_managed_app_hands_the_broker_the_tls_section_it_was_given(
 
     monkeypatch.setattr(ai_broker_mod.AiBroker, "chat", fake_chat)
     tls = TlsSettings(crl_file=pki.crl_file)
-    app = create_managed_app(
-        db_path=tmp_path / "managed.db",
-        ai_settings=_managed_ai(),
-        tls_settings=tls,
-        allow_no_auth=True,
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
-    with TestClient(app) as tc:
-        assert tc.app.state.tls_settings is tls  # type: ignore[attr-defined]
-        r = tc.post("/ai/chat", json={"prompt": "synthetic prompt"})
-    assert r.status_code == 200
+    statuses: list[int] = []
+    for name, given in (("with", tls), ("without", None)):
+        app = create_managed_app(
+            db_path=tmp_path / f"managed-{name}.db",
+            ai_settings=_managed_ai(),
+            tls_settings=given,
+            allow_no_auth=True,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        with TestClient(app) as tc:
+            assert tc.app.state.tls_settings is given  # type: ignore[attr-defined]
+            statuses.append(tc.post("/ai/chat", json={"prompt": "synthetic prompt"}).status_code)
+    assert statuses == [200, 503]
     assert len(seen) == 1
     assert seen[0].verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
 
@@ -940,8 +942,8 @@ def test_an_opener_build_refusal_names_the_ai_hop_not_the_http_family(
 def test_the_verifying_opener_is_shared_only_with_no_handler_and_no_narrowing_anchor(
     pki: _Pki,
 ) -> None:
-    """Row #5527 item 10: one helper makes the shared-or-own opener choice the HTTP-family hops
-    open-coded. Nothing to narrow and no handler gives the shared opener, unmutated; a handler or
+    """Row #5527 item 10: one helper makes the shared-or-own opener choice, which DICOMweb and the
+    token hops open-coded. Nothing to narrow and no handler gives the shared opener; a handler or
     a narrowing anchor gives an opener of its own, carrying that anchor's CRL."""
     shared = _shared_no_redirect_opener()
     assert rest._verifying_opener(trust_anchor=tls_policy.SYSTEM_TRUST_ANCHOR) is shared
@@ -968,8 +970,7 @@ def test_the_verifying_opener_is_shared_only_with_no_handler_and_no_narrowing_an
     [
         (
             "direct-create-app",
-            "an embedder's create_app or create_managed_app holds none unless it passes "
-            "tls_settings or sets app.state.tls_settings",
+            "a direct create_app none unless it passes tls_settings or sets app.state.tls_settings",
         ),
         ("loopback", "a loopback endpoint"),
     ],
