@@ -306,14 +306,23 @@ def test_check_collection_judges_the_tooling_suite(
     the manifest is a fault. That is a file carrying the `tooling` mark itself, the shape
     tests/test_scan_forbidden_site_prefix_width.py had until the guard found it."""
 
-    def check(files: list[str]) -> int:
+    def check(*answers: tuple[list[str], int]) -> int:
+        """Each call of the stub answers with the next (files, exit code) pair."""
+        queue = list(answers)
+
         def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            files, code = queue.pop(0)
             out = "".join(f"{path}::test_x\n" for path in files)
-            return subprocess.CompletedProcess(args=[], returncode=0, stdout=out, stderr="")
+            return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr="")
 
         result: int = mod.check_collection(tooling_shards, "tooling", ["-m", "tooling"], run=run)
+        assert not queue, "the stub was asked fewer times than expected"
         return result
 
     every = [f for shard in sorted(tooling) for f in tooling[shard]]
-    assert check(every) == 0
-    assert check([*every, "tests/test_quality_shard_tests_not_in_the_manifest.py"]) == 1
+    quiet, rest = every[0], every[1:]
+    assert check((every, 0)) == 0
+    assert check(([*every, "tests/test_quality_shard_tests_not_in_the_manifest.py"], 0)) == 1
+    # A manifest file the suite ignores but a shard's named path would run is a fault.
+    assert check((rest, 0), ([], 5)) == 0
+    assert check((rest, 0), ([quiet], 0)) == 1

@@ -2501,7 +2501,7 @@ jobs:
     # THE CAP IS STILL NOT THE FIX, and this change names no cause. What is growing the leg is not
     # measured here; the slow-population question and the worker lever above are untouched, and
     # splitting the tier was the option the owner did not take on 2026-11-14. It was taken on
-    # 2026-11-24 (the note above this job): the caps did not move, and each now applies per shard.
+    # 2026-11-24, in the note above this job.
     #
     # NOTHING READS THE TRIGGER BELOW FOR YOU, and pairing this step with scripts/ci/step_margin.py the
     # way the engine and web console steps are paired is not a few lines: it needs a `--mark` step and
@@ -2512,8 +2512,8 @@ jobs:
     # RE-DERIVE IF a GREEN windows-2025 test shard of this tier is observed above 76:55 -- the
     # 100-minute cap divided by the 1.30 floor scripts/ci/step_margin.py applies to the steps it
     # gates -- or if any shard is killed at the 100-minute step cap, or if TOOLING_WORKERS or the
-    # shard count changes. Since the split a shard should run about a third of the 86 minutes above,
-    # so the caps are now far above it; re-sizing them to the shards is a separate change. The
+    # shard count changes. Both caps are unchanged by the split and apply per shard; a shard is
+    # predicted to run about a third of the 86 minutes above, so re-sizing them is its own change. The
     # earlier triggers, at 51:32, 36:55 and 29 minutes, are in this file's git history.
     # `pytest_workers` is NOT this tier's knob and never was -- see the TOOLING_WORKERS note on the
     # step below.
@@ -2541,7 +2541,9 @@ jobs:
       # CI run: 1494 passed, 388 skipped, 4 COLLECTION ERRORS -- deselection does not mean not-imported.
       #
       # That is also why the install line below cannot be trimmed to a harness-only set: collection
-      # imports the whole suite regardless of what this job intends to execute.
+      # imports the whole suite regardless of what this job intends to execute. Since the test
+      # shards, the harness step names only its shard's files; the partition guard, ubuntu only,
+      # is what still collects the whole suite and needs both.
       - name: Install Qt offscreen system libraries
         if: runner.os == 'Linux'
         # BOUNDED AND RETRIED. Unguarded, this step turns an external apt-mirror hiccup into a

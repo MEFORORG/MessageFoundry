@@ -27,6 +27,7 @@ import functools
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -405,11 +406,6 @@ def test_windows_2025_runs_the_tier_in_three_test_shards_and_ubuntu_in_one(
         {"os": "ubuntu-latest", "shard": "1", "of": "1"},
         *({"os": "windows-2025", "of": "3", "shard": str(n)} for n in (1, 2, 3)),
     ], legs
-    for os_name in {leg["os"] for leg in legs}:
-        mine = [leg for leg in legs if leg["os"] == os_name]
-        counts = {leg["of"] for leg in mine}
-        assert len(counts) == 1, f"{os_name} legs disagree on the shard count: {counts}"
-        assert sorted(int(leg["shard"]) for leg in mine) == list(range(1, int(counts.pop()) + 1))
 
 
 def test_every_tooling_leg_has_its_own_check_name_and_junit_artifact(
@@ -479,9 +475,13 @@ def test_the_partition_guard_reads_the_tier_s_selection_on_one_leg(
     assert match, guard["run"]
     shard_counts = {leg["of"] for leg in full_matrix if leg["of"] != "1"}
     assert shard_counts == {match.group(1)}, (shard_counts, match.group(1))
-    for word in match.group(2).split(" -- ")[0].split():
-        assert word in pytest_line, f"the guard selects with {word!r}, the harness step does not"
-    assert "-m tooling" in match.group(2)
+    # The selection is every `-m` and every `--ignore-glob` the harness line carries, and the
+    # guard's tail must be exactly that: a narrower or broader guard compares the wrong collection.
+    argv = shlex.split(pytest_line)
+    selection = [w for i, w in enumerate(argv) if w == "-m" or (i and argv[i - 1] == "-m")]
+    selection += [w for w in argv if w.startswith("--ignore-glob")]
+    assert shlex.split(match.group(2)) == selection, (match.group(2), selection)
+    assert selection[:2] == ["-m", "tooling"], selection
 
 
 def test_the_receipt_holds_each_shard_to_its_share_and_a_dead_marker_still_goes_red(
