@@ -286,6 +286,17 @@ function ConvertTo-Stamp($Value) {
     return [string]$Value
 }
 
+# The INSTANT a `claimed` stamp names, for arithmetic (BACKLOG #5871). Never `[datetime]::Parse` the
+# coerced value: PowerShell turns the [datetime] back into an invariant "MM/dd/yyyy" string and Parse
+# reads it under the CURRENT culture, so a day-first host (en-GB, de-DE) failed every listing line on
+# day 13 onward and swapped day and month before it. A [datetime] from ConvertFrom-Json already holds
+# the instant (Kind Local or Utc); a string is read only as round-trip ISO 8601, keeping its offset.
+function ConvertTo-ClaimedInstant($Value) {
+    if ($Value -is [datetimeoffset]) { return $Value }
+    if ($Value -is [datetime]) { return [datetimeoffset]::new($Value) }
+    return [datetimeoffset]::ParseExact([string]$Value, 'o', [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None)
+}
+
 function Get-Mine([string]$Path) {
     $c = Read-CoordText $Path | ConvertFrom-Json
     $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
@@ -601,7 +612,7 @@ function Format-LandedLine($Ahead, $HeadTime, $Claimed, $Merged, $Base, [string]
     if ($null -eq $Ahead) { return "evidence: UNKNOWN -- git could not count branch head $Short against $at" }
     # Whole seconds on both sides, and a TIE COUNTS AS BEFORE: %ct has no fraction, and for a commit in
     # the claim's own second the safe reading is "nothing built", not "moved on".
-    $claimedAt = [System.DateTimeOffset]::new(([datetime]$Claimed).ToUniversalTime()).ToUnixTimeSeconds()
+    $claimedAt = (ConvertTo-ClaimedInstant $Claimed).ToUnixTimeSeconds()
     $after = ($HeadTime -gt $claimedAt)
     if ($Ahead -eq 0 -or ($Merged -and $Merged -eq $Base.Tree)) {
         if (-not $after -and $Ahead -eq 0) {
@@ -829,7 +840,8 @@ function Show-List {
             continue
         }
         $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-        $mine = if ($held -ieq $me) { "  <-- THIS worktree" } else { "" }
+        # The same rule as Get-Mine: the same path on ANOTHER machine is another tree (BACKLOG #5871).
+        $mine = if (($held -ieq $me) -and (Test-CoordRecordIsHere $c)) { "  <-- THIS worktree" } else { "" }
         # LIVENESS, not age. This used to print "[STALE ~Nh -- release it if that session is gone]" once
         # a claim was 12h old, which measures how long the WORK has run and says nothing about whether
         # anyone is still doing it. Measured 2026-07-31: a claim reported STALE ~21h whose holder had
@@ -839,7 +851,7 @@ function Show-List {
         # shape of long work; report what the HOLDER is doing and let the operator decide.
         $age = ""
         try {
-            $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
+            $hrs = [int]([datetimeoffset]::UtcNow - (ConvertTo-ClaimedInstant $c.claimed)).TotalHours
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
             $live = Get-HolderLiveness $held $c
