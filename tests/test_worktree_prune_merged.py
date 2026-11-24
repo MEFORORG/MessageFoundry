@@ -2959,6 +2959,56 @@ def test_a_gone_entry_stays_in_the_ledger_while_a_claim_may_name_it(
     assert settled["_exit"] == 0
 
 
+@pytest.mark.parametrize("case", ["another-pc", "this-machine-gone", "this-machine-back"])
+def test_the_held_entry_notice_names_the_host_and_forces_only_what_claim_list_would(
+    fx: Fixture, sleeper: int, tmp_path: Path, case: str
+) -> None:
+    """Red on 2d4ef04485: the notice printed one `claim.ps1 -Release '<key>' -Force` recipe for every
+    held entry and no host, so it told the operator to force-release another PC's claim from here.
+    Each claim now shows its host. Another PC's gets no -Force recipe. This machine's keeps it only
+    where `claim.ps1 -List` would read the holder as gone; a holder path that is back gets pointed
+    at -List instead. The path comes back between the ledger read and the notice through the git
+    shim, which is the only way a test can reach that case."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("deleted")
+    _write_orphan_ledger(fx, tree)
+    claim = write_claim(fx, "deleted-work", tree)
+    if case == "another-pc":
+        rec = json.loads(claim.read_bytes())
+        rec["host"] = "OTHER-PC"
+        claim.write_bytes(json.dumps(rec).encode("utf-8"))
+
+    if case == "this-machine-back":
+        shim = _git_shim(
+            tmp_path,
+            f"    New-Item -ItemType Directory -Force -Path '{tree}' | Out-Null",
+        )
+        proc = run_text(fx, "-Apply", "-IdleHours", "0", path_prepend=shim)
+    else:
+        proc = run_text(fx)
+
+    assert claim.exists(), "the notice released a claim"
+    text = proc.stdout
+    start = text.find("ledger entr(ies) kept for a tree read as gone")
+    assert start >= 0, text
+    notice = text[start:]
+    claim_lines = [ln for ln in notice.splitlines() if "claim 'deleted-work'" in ln]
+    assert len(claim_lines) == 1, notice
+    line = claim_lines[0]
+    if case == "another-pc":
+        assert "OTHER-PC" in line, line
+        assert "-Release" not in notice, notice
+        assert "from OTHER-PC" in line, line
+    elif case == "this-machine-gone":
+        assert "this machine" in line, line
+        assert "claim.ps1 -Release 'deleted-work' -Force" in line, line
+    else:
+        assert tree.exists(), "CONTROL: the shim put the holder path back"
+        assert "this machine" in line, line
+        assert "-Release" not in line, line
+        assert "claim.ps1 -List" in line, line
+
+
 def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: int) -> None:
     """The control for the hold above: an entry with nothing to release is not kept."""
     live_record(fx, sleeper, fx.primary)

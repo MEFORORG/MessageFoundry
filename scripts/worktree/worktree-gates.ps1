@@ -557,8 +557,9 @@ function Get-ClaimedWorktreeIndex([string[]]$ClaimsDir, [switch]$RequireParent) 
             $r = Read-CoordRecord $f.FullName
             if ($r.Tombstone) { continue }
             if ($r.Problem) { $unreadable = $true; continue }
-            # Each holder maps to its claims' key and file, so a caller can name what it found.
-            $claimed[$r.Holder] = @($claimed[$r.Holder] | Where-Object { $_ }) + [pscustomobject]@{ Key = [string]$r.Record.key; File = $f.FullName }
+            # Each holder maps to its claims' key, file and record, so a caller can name what it found
+            # and read the claim's host without a second read of the file.
+            $claimed[$r.Holder] = @($claimed[$r.Holder] | Where-Object { $_ }) + [pscustomobject]@{ Key = [string]$r.Record.key; File = $f.FullName; Record = $r.Record }
         }
     }
     return @{ Claimed = $claimed; Unreadable = $unreadable }

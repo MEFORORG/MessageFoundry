@@ -1847,6 +1847,34 @@ if ($claimsUnreadable.Count -gt 0) { Set-Exit $EXIT_FAILED }
 # the claim with nothing reporting it. The claim is named instead, on a dry run and under -Apply, and
 # releasing it stays with claim.ps1. It costs no exit code, so another PC's claim at the same path
 # cannot red every run. An entry no claim names leaves the ledger on -Apply, as it always did.
+#
+# THE NOTICE MAY SUGGEST -Force ONLY WHERE claim.ps1 ITSELF WOULD. It printed one `-Release <key>
+# -Force` recipe for every entry and no host, which told an operator to force-release another PC's
+# claim from here. claim.ps1 -List reads a holder as gone only for a record this machine may judge
+# (Test-CoordRecordIsHere) whose worktree path is not there (Get-HolderLiveness), so that is the one
+# case that keeps the recipe. Another PC's claim names a path on that PC's disk and is released there.
+function Get-HeldClaimNote($Claim) {
+    $named = Get-CoordRecordHost $Claim.Record
+    $thisHost = Get-CoordHost
+    $here = Test-CoordRecordIsHere $Claim.Record
+    $hostText = if (-not $named) { "this machine, $thisHost (the claim names no host)" } elseif ($here) { "this machine, $named" } else { $named }
+    $releasable = $false
+    if ($here) {
+        # claim.ps1's own spelling and test, so the two cannot disagree on what is gone.
+        $held = ([string]$Claim.Record.worktree -replace '\\', '/').TrimEnd('/')
+        try { $releasable = [bool]$held -and -not (Test-Path -LiteralPath $held) } catch { $releasable = $false }
+    }
+    $advice = if (-not $here) {
+        "is held on $named, not on this machine ($thisHost). Do not release it from here: it must be released from $named, where its holder can be checked."
+    }
+    elseif ($releasable) {
+        "is held on $hostText, and claim.ps1 -List reads its holder as gone. Once you have confirmed that, release it with: pwsh -NoProfile -File scripts\coord\claim.ps1 -Release '$($Claim.Key)' -Force"
+    }
+    else {
+        "is held on $hostText, but its worktree path is there now, so claim.ps1 -List would not read it as releasable. Run claim.ps1 -List and follow what it says."
+    }
+    return [pscustomobject]@{ Key = $Claim.Key; File = $Claim.File; Host = $named; HostText = $hostText; Releasable = $releasable; Advice = $advice }
+}
 $heldForClaims = @()
 if ($ledgerConfirmedGone.Count -gt 0) {
     $claimIndex = if ($claimsError) { $null } else { Get-ClaimedWorktreeIndex $claimsDir }
@@ -1859,13 +1887,14 @@ if ($ledgerConfirmedGone.Count -gt 0) {
         $named = @()
         if ($null -eq $claimIndex -or $claimIndex.Unreadable) { $why = 'the claim registry could not be read in full, so a claim on this tree cannot be ruled out' }
         elseif ($claimIndex.Claimed.ContainsKey($n)) {
-            $named = @($claimIndex.Claimed[$n])
-            $why = "the directory is gone, but a claim still names it: $(($named | ForEach-Object { "'$($_.Key)' in $($_.File)" }) -join '; ')"
+            $named = @($claimIndex.Claimed[$n] | ForEach-Object { Get-HeldClaimNote $_ })
+            $why = "the directory is gone, but a claim still names it: $(($named | ForEach-Object { "'$($_.Key)' in $($_.File) on $($_.HostText)" }) -join '; ')"
         }
         else { continue }
         $heldForClaims += [pscustomobject]@{
             path = $p; branch = [string]$e.branch; at = [string]$e.at; why = $why
-            claims = @($named | ForEach-Object { [pscustomobject]@{ key = $_.Key; file = $_.File } })
+            claims = @($named | ForEach-Object { [pscustomobject]@{ key = $_.Key; file = $_.File; host = $_.Host; releasable = $_.Releasable } })
+            advice = @($named | ForEach-Object { "claim '$($_.Key)' $($_.Advice)" })
         }
     }
 }
@@ -2135,9 +2164,11 @@ if ($priorOrphans.Count -gt 0) {
 if ($heldForClaims.Count -gt 0) {
     Write-Host ""
     Write-Host "$($heldForClaims.Count) ledger entr(ies) kept for a tree read as gone, because a claim may still name it:" -ForegroundColor Yellow
-    foreach ($h in $heldForClaims) { Write-Host "  $($h.path)  --  $($h.why)" -ForegroundColor Yellow }
-    Write-Host "  This script releases no claim here. Once a claim's holder is confirmed gone, release it with" -ForegroundColor Yellow
-    Write-Host "  claim.ps1 -Release '<key>' -Force; the entry then leaves the ledger on the next -Apply." -ForegroundColor Yellow
+    foreach ($h in $heldForClaims) {
+        Write-Host "  $($h.path)  --  $($h.why)" -ForegroundColor Yellow
+        foreach ($a in $h.advice) { Write-Host "    $a" -ForegroundColor Yellow }
+    }
+    Write-Host "  This script releases no claim here. An entry leaves the ledger on the next -Apply once no claim names its tree." -ForegroundColor Yellow
 }
 if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
 
