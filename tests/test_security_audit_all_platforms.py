@@ -13,7 +13,6 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 from __future__ import annotations
 
 import codecs
-import contextlib
 import io
 import locale
 import os
@@ -1045,88 +1044,107 @@ def test_a_lock_character_stdout_cannot_encode_does_not_raise(
     assert len(ran) == 2
 
 
-def _stderr_into(monkeypatch: pytest.MonkeyPatch) -> io.BytesIO:
-    raw = io.BytesIO()
-    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(raw, encoding="utf-8", write_through=True))
-    return raw
+def _closed_pipe() -> int:
+    """The write end of a pipe whose reader has already gone."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    return write_end
 
 
 def test_a_closed_stdout_pipe_exits_2_before_the_audit_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """R5: a reader that closed the pipe made the summary raise (OSError errno 22 on Windows,
     BrokenPipeError elsewhere) as a traceback. ``main`` refuses with exit 2 instead, and runs
-    neither pip nor pip-audit, so a run whose output went nowhere is not read as an audit."""
-    read_end, write_end = os.pipe()
-    os.close(read_end)
-    out = io.TextIOWrapper(open(write_end, "wb"), encoding="utf-8")  # noqa: SIM115 -- closed in the finally below
+    neither pip nor pip-audit. The guard covers the summary's write: a reader that leaves after
+    it is not caught here."""
+    out = io.TextIOWrapper(open(_closed_pipe(), "wb"), encoding="utf-8")  # noqa: SIM115 -- closed in the finally below
     monkeypatch.setattr(sys, "stdout", out)
-    err = _stderr_into(monkeypatch)
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     try:
         assert main([str(src)], run=run) == 2
     finally:
-        with contextlib.suppress(OSError):
-            out.close()
+        audit_module._flush_or_discard(out)
+        out.close()
     assert ran == []
-    text = err.getvalue().decode("utf-8")
-    assert f"::error::{src}: " in text
-    assert "Traceback" not in text
+    err = capsys.readouterr().err
+    assert f"::error::{src}: the summary could not be written to stdout (" in err
+    assert "Traceback" not in err
 
 
-def test_a_stdout_that_raises_broken_pipe_and_has_no_fileno_exits_2(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+class _Gone(io.TextIOBase):
+    """A stdout whose reader went away, with no descriptor to point at devnull."""
+
+    def write(self, s: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("fileno")
+
+    def close(self) -> None:
+        """Collected without the flush ``IOBase.close`` would raise from."""
+
+
+@pytest.mark.parametrize("stdout", [_Gone, lambda: None], ids=["broken-pipe-no-fileno", "none"])
+def test_a_stdout_that_cannot_take_the_summary_exits_2(
+    stdout: Callable[[], object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """R5: a stream with no descriptor to point at devnull still ends in the exit 2 refusal."""
-
-    class _Gone(io.TextIOBase):
-        def write(self, s: str) -> int:
-            raise BrokenPipeError(32, "Broken pipe")
-
-        def flush(self) -> None:
-            raise BrokenPipeError(32, "Broken pipe")
-
-        def fileno(self) -> int:
-            raise io.UnsupportedOperation("fileno")
-
-        def close(self) -> None:
-            """Collected without the flush ``IOBase.close`` would raise from."""
-
-    monkeypatch.setattr(sys, "stdout", _Gone())
-    err = _stderr_into(monkeypatch)
+    """R5: a stream with no descriptor, and no stream at all (``None`` under pythonw), end in
+    the same exit 2 refusal, before pip or pip-audit runs."""
+    monkeypatch.setattr(sys, "stdout", stdout())
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     ran, run = _recorder(0)
     assert main([str(src)], run=run) == 2
     assert ran == []
-    assert f"::error::{src}: " in err.getvalue().decode("utf-8")
+    assert (
+        f"::error::{src}: the summary could not be written to stdout (" in capsys.readouterr().err
+    )
 
 
-def test_a_closed_stdout_pipe_leaves_no_error_at_interpreter_exit(tmp_path: Path) -> None:
-    """R5, as a process: what stayed buffered is flushed again at exit, so without stdout pointed
-    at devnull the exit-time flush raised once more, after ``main`` had returned."""
+@pytest.mark.parametrize("shared", [False, True], ids=["stdout", "stdout-and-stderr"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        ["-m", "messagefoundry.security.audit_all_platforms"],
+        ["scripts/security/audit_all_platforms.py"],
+    ],
+    ids=["module", "script"],
+)
+def test_a_closed_stdout_pipe_leaves_exit_2_at_interpreter_exit(
+    tmp_path: Path, entry: list[str], shared: bool
+) -> None:
+    """R5, as a process: what stayed buffered is flushed again at exit, so without the descriptor
+    pointed at devnull that flush raised once more and the exit code was 120. With ``2>&1`` into
+    the same closed pipe, stderr's own unwritten ::error:: line did the same."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
-    read_end, write_end = os.pipe()
-    os.close(read_end)
+    write_end = _closed_pipe()
     try:
         proc = subprocess.run(
-            [sys.executable, "-m", "messagefoundry.security.audit_all_platforms", str(src)],
+            [sys.executable, *entry, str(src)],
             cwd=ROOT,
             stdout=write_end,
-            stderr=subprocess.PIPE,
+            stderr=write_end if shared else subprocess.PIPE,
             timeout=120,
             check=False,
         )
     finally:
         os.close(write_end)
-    err = proc.stderr.decode("utf-8", "replace")
+    err = "" if shared else proc.stderr.decode("utf-8", "replace")
     assert proc.returncode == 2, err
-    assert f"::error::{src}: " in err
-    assert "Traceback" not in err
-    assert "Exception ignored" not in err
+    if not shared:
+        assert f"::error::{src}: the summary could not be written to stdout (" in err
+        assert "Traceback" not in err
+        assert "Exception ignored" not in err
 
 
 def _seen_by(

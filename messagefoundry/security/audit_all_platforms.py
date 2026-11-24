@@ -93,7 +93,9 @@ and any other word after the lock that holds ``=`` and is not ``--option=value``
 option that takes a value, named in full (``_after_lock_refusal``), since pip-audit's usage error
 would print a ``NAME=value`` typed there; and a pip-audit option after the lock that can exit 0
 on pins it did not audit, ``-r`` among them, as ``_FAIL_OPEN_LONG`` says of each, short,
-abbreviated or in the ``=`` form; and a lock path that holds ``=``. No refusal quotes a
+abbreviated or in the ``=`` form; and a lock path that holds ``=``; and a summary that cannot be written to stdout (a
+reader that closed the pipe, say), refused before pip runs, since the guard covers that write
+alone: a reader that leaves after it is not caught here. No refusal quotes a
 word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
 reaches pip-audit, which can print it in its own output. It does not judge
 whether a non-empty lock is complete; released-line-audit carries its own floor for that.
@@ -757,25 +759,34 @@ def _distinct_count(requirements: Sequence[str]) -> int:
     return len(set(requirements))
 
 
-def _refuse_closed_stdout(lock: str) -> int:
-    """Exit 2 for a stdout whose reader went away before the summary was written.
+def _flush_or_discard(stream: object) -> None:
+    """Flush ``stream``; if that fails, point its descriptor at devnull.
 
-    What stayed buffered is flushed again at interpreter exit and would raise there too, after
-    this returned; the Python docs' SIGPIPE note points stdout's descriptor at devnull for that.
-    A stream with no descriptor is left as it is.
+    After a failed write the buffer still holds the text, and the interpreter's own flush at exit
+    would fail again and turn the exit code into 120. Pointing the descriptor at the null device is
+    the recipe in the Python docs' note on SIGPIPE. Only the script entry calls this, never
+    :func:`main`, which would otherwise redirect an in-process caller's stream. Where the redirect
+    itself fails, the exit-time flush still fails and the exit code is 120: nonzero either way.
     """
-    with contextlib.suppress(OSError, ValueError, AttributeError):
-        devnull = os.open(os.devnull, os.O_WRONLY)
+    with contextlib.suppress(AttributeError, OSError, ValueError):
         try:
-            os.dup2(devnull, sys.stdout.fileno())
-        finally:
-            os.close(devnull)
-    with contextlib.suppress(OSError):
-        print(
-            f"::error::{lock}: stdout closed before the summary was written; the audit did not run",
-            file=sys.stderr,
-        )
-    return 2
+            stream.flush()  # type: ignore[attr-defined]
+        except OSError:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            try:
+                os.dup2(devnull, stream.fileno())  # type: ignore[attr-defined]
+            finally:
+                os.close(devnull)
+
+
+def cli() -> int:
+    """The command-line entry: :func:`main`, then each console stream flushed or discarded, so a
+    reader that closed the pipe (stdout alone, or ``2>&1`` with stderr too) leaves ``main``'s exit
+    code in place rather than the interpreter's exit-time 120."""
+    status = main()
+    _flush_or_discard(sys.stdout)
+    _flush_or_discard(sys.stderr)
+    return status
 
 
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
@@ -912,10 +923,18 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         for _, entry in skipped:
             print(f"  not audited, named by --skip-private: {entry}")
         sys.stdout.flush()
-    except OSError:
+    except (OSError, ValueError, AttributeError) as exc:
         # A reader that closed the pipe (BrokenPipeError, or OSError errno 22 on Windows) made this
-        # a traceback (vault BACKLOG #3786 R5). Refused before pip or pip-audit runs.
-        return _refuse_closed_stdout(lock)
+        # a traceback (vault BACKLOG #3786 R5); so did a closed stream (ValueError) and no stream at
+        # all (None under pythonw, so AttributeError on flush). Refused before pip or pip-audit
+        # runs. The line names the error's type alone, which is not always a closed pipe.
+        with contextlib.suppress(OSError, ValueError):
+            print(
+                f"::error::{lock}: the summary could not be written to stdout "
+                f"({type(exc).__name__}); the audit did not run",
+                file=sys.stderr,
+            )
+        return 2
     if run is None:
         run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
@@ -962,4 +981,4 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(cli())
