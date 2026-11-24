@@ -14,10 +14,9 @@ It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works withou
 202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
 (:func:`_sent_instance_uid`), and, when ``pydicom`` is installed, its data set SOP Instance UID
 (:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
-#5914). An installed ``pydicom`` that is broken can be worse than an absent one: at least, one that
-does not load is a configuration fault before the POST, which stops the lane and keeps the queue
-under the default ``credential_fault_policy``, and a parse fault of a class the codec does not wrap
-refuses the message before the POST. :func:`_data_set_instance_uid` says which faults do what.
+#5914). An installed ``pydicom`` that does not load is taken as absent, with one WARNING per
+process; one that loads but raises a parse fault of a class the codec does not wrap refuses the
+message before the POST. :func:`_data_set_instance_uid` says which faults do what.
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -49,6 +48,7 @@ import importlib.util
 import logging
 import secrets
 import struct
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -464,13 +464,10 @@ class _SentUids(NamedTuple):
     data_set: str | None
 
 
-# Where to fix a dicom-extra-unusable stop, read after "fix " in the stop's log line and alert. The
-# extra is installed, so the fix is to repair or remove it, not to install it. A reload keeps the
-# pydicom modules already imported, so a restart is what loads a fixed one.
-_DICOM_EXTRA_REMEDY = (
-    "the [dicom] extra (pydicom) on this host, which is installed but does not load: repair or "
-    "remove it, then restart the engine, since a reload keeps the pydicom already imported"
-)
+# Whether the WARNING for an installed [dicom] extra that does not load has been written in this
+# process (BACKLOG #5914). The extra is checked on every send, so without it each send would warn.
+_extra_unusable_warned = False
+_extra_unusable_lock = threading.Lock()
 
 
 def _dicom_extra_fault() -> str | None:
@@ -490,21 +487,21 @@ def _dicom_extra_fault() -> str | None:
     return None
 
 
-def _dicom_extra_unusable(fault: str, base_url: str) -> NegativeAckError:
-    """The configuration fault, raised before a byte is sent, of an installed ``[dicom]`` extra that
-    does not load (:func:`_dicom_extra_fault`), ``fault`` being the class name of what its load
-    raised (``dicom-extra-unusable``; BACKLOG #5914). Every queued row would meet it, so it is
-    ``permanent`` and a ``config_fault``: under the default ``credential_fault_policy`` the lane
-    stops and keeps its queue (ADR 0095 Amendment B.3), with a remedy naming the extra. The text
-    names the class only (PHI-safe)."""
-    return NegativeAckError(
-        f"DICOMweb dicom-extra-unusable: the installed [dicom] extra did not load ({fault}), so "
-        f"the data set SOP Instance UID of the object could not be read before sending it; "
-        f"nothing was sent ({_redact_url(base_url)})",
-        code="dicom-extra-unusable",
-        permanent=True,
-        config_fault=True,
-        remedy=_DICOM_EXTRA_REMEDY,
+def _warn_extra_unusable(fault: str) -> None:
+    """Write, once per process, the WARNING that the installed ``[dicom]`` extra does not load, so
+    DICOMweb compares a 202 with the File Meta UID alone, as with no extra (BACKLOG #5914).
+    ``fault`` is the class name of what the load raised; the load's own text is not written. A
+    reload keeps the ``pydicom`` modules already imported, so the line says to restart."""
+    global _extra_unusable_warned
+    with _extra_unusable_lock:
+        if _extra_unusable_warned:
+            return
+        _extra_unusable_warned = True
+    logger.warning(
+        "DICOMweb: the [dicom] extra (pydicom) on this host is installed but does not load (%s), "
+        "so a 202 is compared with the File Meta SOP Instance UID alone, as without the extra; "
+        "repair or remove the extra, then restart the engine",
+        fault,
     )
 
 
@@ -526,20 +523,21 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     """The data set's SOP Instance UID (``0008,0018``) of the object sent, read with the engine's
     DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
     materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
-    or ``None`` when none is read: the optional ``[dicom]`` extra is absent, the object does not
+    or ``None`` when none is read: the optional ``[dicom]`` extra is absent or does not load, the
+    object does not
     parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), or it carries no UID in the
     grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
     whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914).
 
     Run before the POST. The extra is loaded first, apart from the object, as the SCU loads it
     before its parse (``DicomScuDestination._store_object``): an extra that is found but does not
-    load raises :func:`_dicom_extra_unusable`'s configuration fault, which every queued row would
-    meet, not a verdict on this object. A
+    load is taken as absent, so the object is sent and a 202 is compared with its File Meta UID
+    alone, and :func:`_warn_extra_unusable` writes one WARNING per process. A
     :class:`~messagefoundry.parsing.dicom.errors.DicomError` from the parse reads as no
     UID, and so does a fault of a class the codec wraps into one, even one a broken extra raised.
     Any other :class:`Exception` but a :class:`MemoryError` from the parse, a warning the filters
-    turn into an error included, raises :func:`_sent_uids_unread`'s refusal. Both are raised outside
-    any handler, so the fault, whose text can carry a value, rides neither its ``__cause__`` nor its
+    turn into an error included, raises :func:`_sent_uids_unread`'s refusal. It is raised outside
+    the handler, so the fault, whose text can carry a value, rides neither its ``__cause__`` nor its
     ``__context__``. The SCU's ignores for pydicom's value warnings, which name a value, are put
     back first. pydicom's log lines from the parse are held, as the SCP holds its reads' lines
     (:func:`~messagefoundry.transports.dicom._logs_held`), and written, through the same redacting
@@ -555,7 +553,8 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     _ignore_pydicom_value_warnings()
     extra_fault = _dicom_extra_fault()
     if extra_fault is not None:
-        raise _dicom_extra_unusable(extra_fault, base_url)
+        _warn_extra_unusable(extra_fault)
+        return None
     parse_fault: str | None = None
     uid: str | None = None
     with _logs_held() as held:
