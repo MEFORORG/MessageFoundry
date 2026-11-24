@@ -72,7 +72,7 @@ class _Gate:
         self.resume.release()
 
 
-def _deliver(msg: Message) -> Send:
+def _deliver(msg: Any) -> Send:
     return Send("file_out", msg)
 
 
@@ -160,9 +160,22 @@ def lookups(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return seen
 
 
+_MODE: dict[str, str] = {}
+
+
+@pytest.fixture(autouse=True, params=["pooled", "per_lane"])
+def _claim_mode(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs under both claim modes: they stop and respawn a lane differently."""
+    monkeypatch.setitem(_MODE, "claim", request.param)
+
+
 async def _start(reg: Registry, store: MessageStore) -> RegistryRunner:
     runner = RegistryRunner(
-        reg, store, poll_interval=0.02, egress=EgressSettings(deny_by_default=False)
+        reg,
+        store,
+        poll_interval=0.02,
+        claim_mode=_MODE["claim"],
+        egress=EgressSettings(deny_by_default=False),
     )
     await runner.start()
     return runner
@@ -270,17 +283,22 @@ async def test_an_inbound_dropped_during_the_router_still_delivers(
         await runner.stop()
 
 
-async def test_a_reload_dropping_the_whole_feed_refuses_the_row(
-    store: MessageStore, tmp_path: Path
+@pytest.mark.parametrize("keep_handler", [False, True], ids=["whole-feed", "outbound-only"])
+async def test_a_reload_dropping_the_feed_refuses_the_row(
+    keep_handler: bool, store: MessageStore, tmp_path: Path
 ) -> None:
     """The dropped-inbound case runs on the SERVED graph. Finishing it on the replaced graph was
-    measured to deliver the row to the outbound the reload removed, where this refuses it."""
+    measured to deliver the row to the outbound the reload removed, where this refuses it.
+    ``outbound-only`` keeps the handler, so it is the outbound check that refuses."""
     gate = _Gate()
     runner = await _start(_graph(tmp_path, _gated(gate)), store)
     try:
         mid = await _enqueue(runner, store, "FEEDGONE")
         await gate.reached()
-        await runner.reload(Registry())
+        after = Registry()
+        if keep_handler:
+            after.add_handler("h", _deliver)
+        await runner.reload(after)
         gate.release()
         assert await _settled(store, mid) == MessageStatus.ERROR.value
         cur = await store._db.execute(
@@ -342,6 +360,24 @@ async def test_repeated_reloads_terminate_and_the_row_completes(
         await runner.stop()
 
 
+@pytest.mark.parametrize("gate_closed", ["none", "stopping", "log_halted"])
+async def test_a_restart_does_not_pass_the_stop_or_log_gate(
+    gate_closed: str, store: MessageStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read = _graph(tmp_path, _plain)
+    runner = RegistryRunner(
+        _graph(tmp_path, _plain), store, egress=EgressSettings(deny_by_default=False)
+    )
+    if gate_closed == "stopping":
+        runner._stop.set()
+    elif gate_closed == "log_halted":
+        monkeypatch.setattr(runner, "_inbound_log_halted", lambda _name: True)
+    await store.enqueue_ingress(channel_id="file_in", raw=_hl7("GATE1"), control_id="GATE1")
+    item = await store.claim_next_fifo("file_in", stage=Stage.INGRESS.value)
+    assert item is not None
+    assert runner._ingress_row_restarts("file_in", item, read, 0) is (gate_closed == "none")
+
+
 class _Kill(BaseException):
     """Escapes every ``except Exception``, as a process-level fault in user code does."""
 
@@ -379,12 +415,18 @@ async def test_a_worker_death_on_the_second_pass_is_counted_once(
         assert killed.is_set()
         await asyncio.sleep(0.1)  # a second count, were there one, would land here
         assert len(deaths) == 1
-        cur = await store._db.execute(
-            "SELECT worker_deaths FROM queue WHERE message_id = ? AND stage = ?",
-            (mid, Stage.INGRESS.value),
-        )
-        row = await cur.fetchone()
-        assert row is not None and row[0] == 1
+        if _MODE["claim"] == "per_lane":
+            # A per-lane worker is respawned, so the row completes and no second death is counted.
+            assert await _settled(store, mid) == MessageStatus.PROCESSED.value
+            assert len(deaths) == 1
+        else:
+            # A pooled serializer is not respawned, so the row is still there to read.
+            cur = await store._db.execute(
+                "SELECT worker_deaths FROM queue WHERE message_id = ? AND stage = ?",
+                (mid, Stage.INGRESS.value),
+            )
+            row = await cur.fetchone()
+            assert row is not None and row[0] == 1
     finally:
         gate.release()
         await runner.stop()

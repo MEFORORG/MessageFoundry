@@ -12658,9 +12658,14 @@ class RegistryRunner:
 
         Not when the reload removed this inbound: a restart would reach the missing-inbound STOP, and
         nothing re-arms a worker that stops while a later reload restores the inbound. That row
-        continues on the served graph, whose ``transform_one`` still refuses a handler or an outbound
-        the reload removed, so the row is not sent to a connection the operator just took away."""
+        continues on the served graph, whose ``transform_one`` refuses a handler or an outbound that
+        graph no longer has. A reload landing during that transform is not covered.
+
+        Nor when the engine is stopping or this inbound's log gate has closed: both are checked before
+        a claim, and a restart would otherwise run the Router again past them."""
         if self.registry is read or name not in self.registry.inbound:
+            return False
+        if self._stop.is_set() or self._inbound_log_halted(name):
             return False
         if repass >= self._INGRESS_RELOAD_REPASSES:
             log.warning(
