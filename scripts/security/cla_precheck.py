@@ -571,7 +571,7 @@ def evaluate(
     # The first page's keys, one per `login || name`, as the action keys its list. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
     first_slots = slots[: read.first_page]
-    seen_by_action = {slot.name for slot in first_slots if slot is not None}
+    first_page_keys = {slot.name for slot in first_slots if slot is not None}
     # A first-page commit this read could not key (an error inside it, a malformed author or
     # committer) has an unknown key, and a null-author one, on which the action throws, has
     # none. A refusal below still holds, since an unsigned author owes a signature wherever the
@@ -592,7 +592,7 @@ def evaluate(
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
             continue  # rule 1 judged it above
-        if who.name in seen_by_action or who.database_id in checked:
+        if who.name in first_page_keys or who.database_id in checked:
             continue
         if who.database_id is None:
             # Linked, but with no integer id: the signature file cannot be checked for it, so

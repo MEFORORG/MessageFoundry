@@ -403,8 +403,8 @@ def test_a_linked_author_with_a_null_or_malformed_committer_passes_past_page_one
 def test_a_null_author_is_refused_and_not_also_a_fault(
     page: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A null author (schema-legal) has no account linked, so rule 1 refuses it, on the action's
-    page or past it, and the refusal is not also reported as a fault about a valid reply."""
+    """A null author (schema-legal) has no account linked, so rule 1 refuses it, on the first page
+    or past it, and the refusal is not also reported as a fault about a valid reply."""
     commit = {"oid": f"{2:040x}", "author": None, "committer": {"name": "C", "user": None}}
     if page == 1:
         pages = [_page([commit, _commit(3, "Octo", "octo-contributor", 90000001)], 2, False)]
