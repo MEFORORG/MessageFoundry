@@ -30,6 +30,7 @@ from fastapi import HTTPException, Request
 
 from messagefoundry.api.security import client_ip
 from messagefoundry.connection_names import is_connection_name
+from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import CipherError, CipherUnavailableError, gave_no_verdict
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
@@ -94,26 +95,26 @@ async def audit_channel_denied(
     ``operation`` names what was refused when the row names no channel (vault BACKLOG #3748 item
     7). The detail then carries ``"operation"`` with one of the :data:`DeniedOperation` values. It
     is written only on a row that names no channel, so a row naming a channel never carries one. A
-    value outside them is left out of the row and logged, rather than refusing the audit: the
-    console hands this helper its keyword through an untyped seam callback. At least these rows
-    name no channel and carry no operation: a refused message read whose integrity tag names no
-    channel, and one whose stored row names none (:func:`read_scoped_message`)."""
+    value outside them is left out of the row and logged, whether or not the row names a channel,
+    rather than refusing the audit: the console hands this helper its keyword through an untyped
+    seam callback. At least one row names no channel and carries no operation: a refused message
+    read whose integrity tag names no channel (:func:`read_scoped_message`)."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
         detail = {"channel": None, "malformed_name": True}
     if flag_direction_not_inbound:
         detail["flag_direction_not_inbound"] = True
-    if operation is not None and channel is None:
+    if operation is not None:
         # isinstance first: the console's value arrives untyped, and an unhashable one would
         # raise in the set test and lose the row.
-        if isinstance(operation, str) and operation in _DENIED_OPERATIONS:
-            detail["operation"] = operation
-        else:
+        if not (isinstance(operation, str) and operation in _DENIED_OPERATIONS):
             _log.warning(
                 "a channel denial for %s named an unknown operation; the row omits it",
-                identity.username,
+                scrub_log_argument(identity.username),
             )
+        elif channel is None:
+            detail["operation"] = operation
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

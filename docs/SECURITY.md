@@ -2351,9 +2351,9 @@ the same permission set on the same method reds CI until it is listed here.
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
 > A name that fails the connection-name rule is never in a scope, and its denial row carries no
 > channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
-> console checks the rule before it calls in, and `audit_channel_denied` in
-> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
+> console checks the rule before it calls in, and then hands on an empty name rather than the
+> caller's text. `audit_channel_denied` in `messagefoundry/api/message_scope.py`, which writes
+> every `auth.channel_denied` row the API and the console seam record, checks the rule again. Its detail then carries `"malformed_name": true`, so
 > such a row is told apart from a refusal that names no channel by design (BACKLOG #3031). At
 > least some rows that name no channel carry `"operation"` in their detail, naming the operation
 > refused: a channel-scoped caller's config reload is one, and a web console bulk selection whose

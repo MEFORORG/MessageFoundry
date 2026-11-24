@@ -807,6 +807,32 @@ async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
     assert all("xxxxx" not in str(dict(row)) for row in rows)
 
 
+async def test_a_malformed_bulk_name_never_reaches_the_engine_helper(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3748 item 7, review: the console hands the engine an empty name, not the
+    caller's text, so the row holds none of it even if the engine helper's own rule check let a
+    name through. The planted weakening makes that check accept everything."""
+    from messagefoundry.api import message_scope
+
+    monkeypatch.setattr(message_scope, "is_connection_name", lambda _value: True)
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    long_bad = "bad name " + "q" * 5000
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", long_bad))],
+        )
+        assert r.status_code == 200, r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert len(rows) == 1
+    assert all("qqqqq" not in str(dict(row)) for row in rows)
+
+
 async def test_console_denials_naming_no_channel_name_their_operation(
     engine: Engine, tmp_path: Path
 ) -> None:

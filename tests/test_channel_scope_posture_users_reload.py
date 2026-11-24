@@ -718,6 +718,11 @@ async def test_an_unknown_denied_operation_is_left_out_and_the_row_is_still_writ
     unknown = [r for r in caplog.records if "unknown operation" in r.getMessage()]
     assert len(unknown) == 2
     await audit_channel_denied(engine, scoped, None, None, operation="connection_purge")
+    # An unknown value passed with a named channel is logged too, not dropped silently.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.message_scope"):
+        await audit_channel_denied(engine, scoped, THEIRS, None, operation=value)
+    assert any("unknown operation" in r.getMessage() for r in caplog.records)
     # A row that names a channel never carries an operation, whatever the caller passed.
     await audit_channel_denied(engine, scoped, THEIRS, None, operation="connection_purge")
     assert sorted(await _denial_details(engine, actor), key=str) == sorted(
@@ -726,6 +731,28 @@ async def test_an_unknown_denied_operation_is_left_out_and_the_row_is_still_writ
             {"channel": None},
             {"channel": None, "operation": "connection_purge"},
             {"channel": THEIRS},
+            {"channel": THEIRS},
         ],
         key=str,
     )
+
+
+async def test_the_unknown_operation_warning_scrubs_the_username(
+    engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The warning carries the actor's name, which a directory can supply; a line break in it
+    must not forge a second log line."""
+    from messagefoundry.api.message_scope import audit_channel_denied
+
+    forged = Identity.build(
+        user_id="forged-id",
+        username="mallory\nFAKE LINE",
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    bogus: Any = "drop_table"
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.message_scope"):
+        await audit_channel_denied(engine, forged, None, None, operation=bogus)
+    [record] = [r for r in caplog.records if "unknown operation" in r.getMessage()]
+    assert "\n" not in record.getMessage()
