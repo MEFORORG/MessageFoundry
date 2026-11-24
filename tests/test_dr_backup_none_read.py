@@ -5,8 +5,9 @@
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
 ``if not buf: break`` ends the copy short there. Three copy loops in ``pipeline/dr_backup.py`` now
 share :func:`dr_backup._read_chunks`, which reads through the codec's ``_read_once`` and so refuses
-a ``None`` read with the codec's ``BackupCodecError``, as the keyed branch does. These tests drive
-each of the three. Reads in that module this branch does not change include at least
+a ``None`` read, as the keyed branch does. It raises the refusal as an ``OSError``, a failed read,
+so each site reports it the way it reports any read failure there; these tests drive each of the
+three and check that report. Reads in that module this branch does not change include at least
 ``_extract_member``, the plaintext branch of ``_restore_blocking``, the ``shutil.copyfileobj`` in
 ``_place_restored_store`` and ``_sha256_file``. The sources are synthetic: a store with one made-up
 row, and a tar of made-up config bytes."""
@@ -14,6 +15,7 @@ row, and a tar of made-up config bytes."""
 from __future__ import annotations
 
 import builtins
+import errno
 import hashlib
 import io
 import tarfile
@@ -81,8 +83,10 @@ def test_a_none_read_is_refused_not_read_as_end_of_stream() -> None:
     src = _Scripted([b"ab", None, b"cd", b""])
     chunks = dr._read_chunks(src, "test copy")
     assert next(chunks) == b"ab"
-    with pytest.raises(BackupCodecError, match="no data ready reading the test copy"):
+    with pytest.raises(OSError, match="no data ready reading the test copy") as caught:
         next(chunks)
+    assert caught.value.errno == errno.EIO
+    assert isinstance(caught.value.__cause__, BackupCodecError)
     assert src.reads == 2
 
 
@@ -129,15 +133,17 @@ async def _store_with_a_row(path: Path) -> MessageStore:
 
 
 @pytest.mark.parametrize(
-    ("site", "what"), [("build", "plaintext tar"), ("verify", "plaintext archive")]
+    ("site", "what", "kind"),
+    [("build", "plaintext tar", "write"), ("verify", "plaintext archive", "verify")],
 )
 async def test_a_plaintext_backup_refuses_a_none_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, what: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, what: str, kind: str
 ) -> None:
     """The no-key build copies the staged tar to the archive, and verify copies the archive back to
     a tar. A ``None`` at either used to end the copy short: here, on the first read, it ended it at
     zero bytes and the run failed later on an empty tar. It now fails at the read, naming the
-    copy."""
+    copy, with the failure kind a read failure gets there: ``write`` at the build, and at verify a
+    ``FAIL`` not worded as a decrypt, since a no-key copy decrypts nothing."""
     dest = (tmp_path / "backups").resolve()
     wrapped: list[_Stalling] = []
     real_open = builtins.open
@@ -166,11 +172,14 @@ async def test_a_plaintext_backup_refuses_a_none_read(
             store_settings=StoreSettings(path=str(db), encryption_key=None),
             config_dir=None,
         )
-        with pytest.raises(BackupError, match=f"no data ready reading the {what}"):
+        with pytest.raises(BackupError, match=f"no data ready reading the {what}") as caught:
             await runner.run_once(now=1.0)
     finally:
         await store.close()
     assert sum(w.stalls for w in wrapped) > 0, "no copy-sized read went through the wrapper"
+    assert caught.value.kind == kind
+    assert "OSError" in str(caught.value)
+    assert "decrypt" not in str(caught.value)
 
 
 def test_a_config_restore_refuses_a_none_read(
@@ -197,10 +206,13 @@ def test_a_config_restore_refuses_a_none_read(
     monkeypatch.setattr(tarfile.TarFile, "extractfile", _extractfile)
     dest = tmp_path / "restored-config"
     written: list[Path] = []
-    # The restore's own wrapper turns the codec's refusal into a named BackupError.
-    with pytest.raises(BackupError, match="no data ready reading the config member"):
+    # The restore's own wrapper names the read failure as a restore refusal.
+    with pytest.raises(BackupError, match="no data ready reading the config member") as caught:
         dr._restore_config_members(tar_path, dest, written=written)
     assert sum(w.stalls for w in wrapped) > 0
+    assert caught.value.kind == "restore"
+    # The file the refused copy opened is on the caller's rollback ledger.
+    assert (dest / "settings.toml").resolve() in [p.resolve() for p in written]
 
 
 def test_a_config_member_still_restores_whole_from_a_blocking_reader(tmp_path: Path) -> None:

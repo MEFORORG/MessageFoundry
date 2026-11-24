@@ -467,16 +467,24 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     empty read, which is the end of the stream.
 
     Each read goes through the codec's own ``_read_once``, so a single read is held to the same
-    checks the keyed copies apply to each read, and refused with the same
-    :class:`BackupCodecError`: a ``None`` read, a read that is not bytes, and a read over the size
-    asked for. Those per-read checks are all this shares with the keyed copies. It authenticates
-    nothing and caps no total. A ``None`` read comes from a non-blocking source with no data ready,
-    and a bare ``if not buf: break`` loop reads it as the end of the stream and finishes the copy
-    short (BACKLOG #6687). ``what`` names the copy in the refusal.
-    A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
-    one this yields the same reads the old loops wrote."""
+    checks the keyed copies apply to each read: a ``None`` read, a read that is not bytes, and a
+    read over the size asked for are refused. Those per-read checks are all this shares with the
+    keyed copies. It authenticates nothing and caps no total. A ``None`` read comes from a
+    non-blocking source with no data ready, and a bare ``if not buf: break`` loop reads it as the
+    end of the stream and finishes the copy short (BACKLOG #6687). ``what`` names the copy in the
+    refusal. A blocking binary file answers each read with at most ``n`` bytes and never ``None``,
+    so for one this yields the same reads the old loops wrote.
+
+    The refusal is raised as an ``OSError`` (``EIO``), with the codec's error chained to it, since
+    it is a failed read of the source. The callers already treat an ``OSError`` from these copies
+    as a read failure: the build reports failure kind ``write``, the verify a ``FAIL`` not worded as
+    a decrypt, and the config restore a named refusal. A ``BackupCodecError`` would be reported as
+    kind ``encrypt`` or as ``decrypt failed``, and a no-key copy does neither."""
     while True:
-        buf = _read_once(cast(BinaryIO, src), _COPY_CHUNK_BYTES, what)
+        try:
+            buf = _read_once(cast(BinaryIO, src), _COPY_CHUNK_BYTES, what)
+        except BackupCodecError as exc:
+            raise OSError(errno.EIO, str(exc)) from exc
         if not buf:
             return
         yield buf
@@ -6965,14 +6973,13 @@ def _restore_config_members(
 ) -> int:
     """:func:`_extract_config_members`, with an ``OSError``, ``ValueError`` or ``tarfile.TarError``
     it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
-    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. A
-    :class:`BackupCodecError` from :func:`_read_chunks`, such as a ``None`` read, is made one too
-    (BACKLOG #6687). Any other exception type still escapes as it did. Unguarded, each left the
-    restore as a CLI traceback, on the config-only route and the store route alike. The caller's ``finally`` still
+    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. Any other
+    exception type still escapes as it did. Unguarded, each left the restore as a CLI
+    traceback, on the config-only route and the store route alike. The caller's ``finally`` still
     rolls back what ``written`` records."""
     try:
         return _extract_config_members(tar_path, config_dest, written=written)
-    except (OSError, ValueError, tarfile.TarError, BackupCodecError) as exc:
+    except (OSError, ValueError, tarfile.TarError) as exc:
         raise BackupError(
             "restore", f"could not restore the config bundle into {config_dest}: {safe_exc(exc)}"
         ) from exc
