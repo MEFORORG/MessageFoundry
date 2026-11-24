@@ -2420,12 +2420,16 @@ Enforced by the engine's async retention task
 ([pipeline/retention.py](../messagefoundry/pipeline/retention.py), `RetentionRunner`). It runs once per
 process, independent of the message graph (so it survives config reloads), and never blocks the event
 loop. **Every purge in the runner is backend-agnostic** — it is constructed with the `Store`
-protocol and started by the Engine when `[retention]` is configured. Its one backend branch purges
+protocol and started by the Engine whenever `[retention]` settings are passed; it runs a pass only
+while `[retention]` or a connection's own window (`messages_days`, `dead_letter_days`,
+`prune_documents_after`) gives it something to do. A config reload that gives an idle runner
+something to do wakes it, so the first pass runs as soon as that reload applies, not after an
+interval or a restart (BACKLOG #6804). Its one backend branch purges
 nothing: the low-disk floor `[retention].min_free_disk_mb` (BACKLOG #290, default-on at 1024 MiB)
 measures free space on a **SQLite** store's volume only, and is skipped on SQL Server and Postgres.
-Because that floor ships on, a SQLite store starts the runner on stock settings. The
+Because that floor ships on, a SQLite store gives the runner a pass to run on stock settings. The
 `[retention].audit_log_warn_rows` growth warning (BACKLOG #1421) also ships on and is
-backend-agnostic, so stock settings start the runner on every backend; it reads the size of
+backend-agnostic, so stock settings give the runner a pass to run on every backend; it reads the size of
 `audit_log` and deletes nothing. Config:
 [CONFIGURATION.md](CONFIGURATION.md#retention).
 
