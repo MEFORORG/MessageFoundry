@@ -1836,12 +1836,13 @@ rule. On the `system` and `augment` arms it refuses the build: the start rule wo
 `OS_ROOTS_CHAIN_CHECK_REASON` in `messagefoundry/config/tls_policy.py` is the refusal's own
 statement of it, and the refusal names the settings that avoid it. A REST connection that sends through an ECH sidecar checks no `[tls]`
 CRL against its partner, leaf or chain, since the sidecar makes the TLS connection to the partner,
-and neither does a REST connection whose url is `http`, which sends to the partner without TLS.
+and neither does a REST, SOAP, FHIR, FhirLookup or DICOMweb connection whose url is `http`, which
+sends to the partner without TLS.
 With `verify_tls` on, each still builds an https handler from its trust anchor, so on the `system`
 and `augment` arms it is refused too, with wording that says no CRL is checked against the partner
 and offers no way to chain-check the partner. An `http` connection whose forward proxy is `https`
-does make a TLS connection, to the proxy, on that handler. A SOAP, FHIR, FhirLookup or DICOMweb
-connection whose url is `http` gets the same refusal wording as an `http` REST connection. LDAPS, OIDC, the log forwarder and the Postgres store, which
+does make a TLS connection, to the proxy, on that handler. Each `http` connection's refusal
+names its own kind of connection. LDAPS, OIDC, the log forwarder and the Postgres store, which
 have CRL settings of their own, keep the leaf check.
 
 Pinned by `tests/test_outbound_crl_chain.py`.
