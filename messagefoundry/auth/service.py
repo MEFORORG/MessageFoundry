@@ -3160,10 +3160,11 @@ def _log_totp_undecryptable(username: str) -> None:
 
 def _log_totp_refused(username: str) -> None:
     """Log an account whose TOTP cell opens but names parameters this release does not compile in
-    (BACKLOG #3422). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    (BACKLOG #3422), or holds a key shorter than it computes with (BACKLOG #5340). No code matches
+    it, so the cure is a fresh enrolment, not the store key."""
     _log.warning(
-        "the TOTP enrolment of account %r names parameters this release does not compute with; no "
-        "code matches it until the account enrols again",
+        "the TOTP enrolment of account %r names parameters this release does not compute with, or "
+        "holds a key shorter than it accepts; no code matches it until the account enrols again",
         username,
     )
 
@@ -3261,7 +3262,7 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
-    refuses, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
+    refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
     open, or the value could not be computed with).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
@@ -3296,7 +3297,8 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
 def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
     """Why an OPENED TOTP secret is no key the engine can compute codes with, or ``None`` when it
     is one. ``"refused"``: its enrolment marker names parameters this release refuses
-    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"malformed"``: not base32, so no key. The one
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422), or its key is too short to compute with
+    (:class:`totp.RefusedTotpSecret`, BACKLOG #5340). ``"malformed"``: not base32, so no key. The one
     statement of the rule: :func:`_totp_secret_state` (the census) and :func:`_opened_totp_state`
     (every way-past gate) both ask it, so they cannot disagree about one account."""
     try:

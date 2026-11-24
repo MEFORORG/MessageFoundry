@@ -14,7 +14,7 @@ Also settles the row's unadjudicated item (S12-39), measured at origin/main da08
 PARTIALLY padded secret decodes (the padding is topped up, not doubled), while an over-padded one
 or one with an inner tab or newline raises ``binascii.Error``. That raise is a refusal, not an
 acceptance, so the decoder is left as tolerant as it was; enrolment now refuses those shapes with
-:class:`totp.RefusedSecret`, so none of them reaches a stored enrolment.
+:class:`totp.RefusedTotpSecret`, so none of them reaches a stored enrolment.
 """
 
 from __future__ import annotations
@@ -38,10 +38,13 @@ _PASSWORD = "a-long-enough-operator-passphrase"
 
 # Every shape a caller-supplied secret was measured to slip through with.
 _REFUSED_SECRETS = [
+    pytest.param("", id="empty"),
     pytest.param("   ", id="whitespace-only"),
     pytest.param("\t\n", id="tab-newline-only"),
     pytest.param("not!base32", id="non-base32"),
-    pytest.param("é" * 32, id="non-ascii"),
+    pytest.param("\u00e9" * 32, id="non-ascii"),
+    # upper() maps U+00DF to "SS", inside the alphabet: refused before it can decode to a key.
+    pytest.param("\u00df" * 16, id="non-ascii-folding-into-base32"),
     pytest.param(_KEY_128, id="128-bit"),
     pytest.param(_KEY_80, id="80-bit"),
     pytest.param(_KEY_160 + "========", id="over-padded"),
@@ -65,29 +68,41 @@ def test_the_floor_is_at_least_rfc_4226s_requirement() -> None:
 
 @pytest.mark.parametrize("secret", _REFUSED_SECRETS)
 def test_enrolment_refuses_a_weak_or_undecodable_secret(secret: str) -> None:
-    with pytest.raises(totp.RefusedSecret):
+    with pytest.raises(totp.RefusedTotpSecret):
         totp.new_enrolment(secret)
 
 
 @pytest.mark.parametrize("secret", _REFUSED_SECRETS)
 def test_enrolment_refuses_it_in_stored_form_too(secret: str) -> None:
-    """A secret handed over already marked is checked the same way, not passed through."""
+    """A secret handed over already marked is checked the same way, not passed through. (A marker
+    with an empty secret is already refused as a malformed marker, the superclass.)"""
     marked = f"totp1:SHA256:6:30:{secret}"
-    with pytest.raises(totp.RefusedSecret):
+    with pytest.raises(totp.RefusedEnrolment):
         totp.new_enrolment(marked)
 
 
 def test_a_refused_secret_is_a_refused_enrolment() -> None:
     """Every caller that already refuses a bad marker refuses a bad secret with no new branch."""
-    assert issubclass(totp.RefusedSecret, totp.RefusedEnrolment)
+    assert issubclass(totp.RefusedTotpSecret, totp.RefusedEnrolment)
 
 
 def test_a_partially_padded_secret_still_enrols() -> None:
     """S12-39's padding half does not hold: a partial pad is topped up, not doubled."""
     padded = base64.b32encode(bytes(range(21))).decode("ascii")
     assert padded.endswith("=")
-    assert totp.new_enrolment(padded[:-1])
-    assert totp.new_enrolment(padded)
+    canonical = padded.rstrip("=")
+    assert totp.new_enrolment(padded[:-1]).endswith(":" + canonical)
+    assert totp.new_enrolment(padded).endswith(":" + canonical)
+
+
+def test_an_enrolment_stores_the_canonical_secret() -> None:
+    """Spaces, case and padding the decoder tolerates are not stored, so the URI the authenticator
+    scans carries exactly the key the engine computes with."""
+    secret = totp.generate_secret()
+    spaced = " " + " ".join(secret[i : i + 4] for i in range(0, len(secret), 4)).lower() + " "
+    assert totp.new_enrolment(spaced) == totp.new_enrolment(secret)
+    assert totp.new_enrolment(f"totp1:SHA256:6:30:{spaced}") == totp.new_enrolment(secret)
+    assert f"secret={secret}&" in totp.otpauth_uri(totp.new_enrolment(spaced), "someone")
 
 
 @pytest.mark.parametrize("secret", ["   ", _KEY_128, _KEY_80])
@@ -95,10 +110,18 @@ def test_no_code_is_computed_from_a_short_stored_key(secret: str) -> None:
     """A short key that reached a cell some other way is refused when a code is computed, and
     matches no code: a zero-length key's codes are computable by anyone."""
     for stored in (secret, f"totp1:SHA256:6:30:{secret}"):
-        with pytest.raises(totp.RefusedSecret):
+        with pytest.raises(totp.RefusedTotpSecret):
             totp.totp(stored, now=0)
-        guessed = totp._hotp(b"", 0, 6, "sha256")
-        assert totp.verify_totp_step(stored, guessed, now=0, window=0) is None
+        # The code the short key itself would give, so the None is the floor and not a wrong key.
+        key = base64.b32decode(secret.strip() + "=" * (-len(secret.strip()) % 8))
+        own_code = totp._hotp(key, 0, 6, "sha256")
+        assert totp.verify_totp_step(stored, own_code, now=0, window=0) is None
+        assert totp.needs_reenrolment(stored) is True
+
+
+def test_a_usable_enrolment_still_needs_no_reenrolment() -> None:
+    """CONTROL for the line above: the floor does not mark a sound enrolment for re-enrolment."""
+    assert totp.needs_reenrolment(totp.new_enrolment(_KEY_160)) is False
 
 
 @pytest.mark.parametrize("secret", _REFUSED_SECRETS)

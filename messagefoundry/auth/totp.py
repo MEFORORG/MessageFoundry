@@ -24,6 +24,7 @@ Security notes:
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import secrets
@@ -39,7 +40,7 @@ __all__ = [
     "DEFAULT_WINDOW",
     "UNMARKED_PARAMETERS",
     "RefusedEnrolment",
-    "RefusedSecret",
+    "RefusedTotpSecret",
     "TotpParameters",
     "generate_secret",
     "needs_reenrolment",
@@ -103,16 +104,20 @@ def generate_secret() -> str:
 def _decode_secret(secret: str) -> bytes:
     """Decode a base32 secret tolerantly: ignore spaces/case and restore any stripped padding.
 
-    Raises :class:`RefusedSecret` for a key shorter than :data:`_MIN_SECRET_BYTES`, a whitespace-only
-    secret's zero-length key included, so no code is ever computed from one (BACKLOG #5340). A value
-    that is not base32 still raises :class:`binascii.Error` (a :class:`ValueError`): ciphertext a
-    keyless store open passes through looks the same, and callers keep that apart from a known
-    refusal."""
-    cleaned = secret.strip().replace(" ", "").upper()
+    Raises :class:`RefusedTotpSecret` for a key shorter than :data:`_MIN_SECRET_BYTES`, a
+    whitespace-only secret's zero-length key included, so no code is ever computed from one
+    (BACKLOG #5340). A value that is not base32, a non-ASCII one included, still raises
+    :class:`binascii.Error` (a :class:`ValueError`): ciphertext a keyless store open passes through
+    looks the same, and callers keep that apart from a known refusal."""
+    cleaned = secret.strip().replace(" ", "")
+    # Before upper(), which maps some non-ASCII letters into the alphabet ("ss" from U+00DF).
+    if not cleaned.isascii():
+        raise binascii.Error("the TOTP secret is not base32")
+    cleaned = cleaned.upper()
     padding = "=" * (-len(cleaned) % 8)
     key = base64.b32decode(cleaned + padding, casefold=True)
     if len(key) < _MIN_SECRET_BYTES:
-        raise RefusedSecret("the TOTP secret is shorter than this release accepts")
+        raise RefusedTotpSecret("the TOTP secret is shorter than this release accepts")
     return key
 
 
@@ -184,7 +189,7 @@ class RefusedEnrolment(ValueError):
     :data:`_COMPILED_PARAMETERS`. Refused, never computed with. The message names no value."""
 
 
-class RefusedSecret(RefusedEnrolment):
+class RefusedTotpSecret(RefusedEnrolment):
     """A TOTP secret that is no key this release enrols or computes with (BACKLOG #5340): not
     base32 (refused at enrolment), or decoding to fewer than :data:`_MIN_SECRET_BYTES` bytes, the
     RFC 4226 section 4 R6 bound (refused at enrolment and whenever a code is computed). A
@@ -201,20 +206,25 @@ def new_enrolment(secret: str) -> str:
     """The stored form of a new enrolment of ``secret``: the bare base32 secret marked with
     :data:`DEFAULT_PARAMETERS`, which :func:`otpauth_uri` then advertises and every code check
     computes with. A ``secret`` already in the stored form is returned unchanged once it parses,
-    whichever compiled-in set it names. An empty ``secret`` raises :class:`ValueError`; a secret
-    that is not base32, or decodes to fewer than :data:`_MIN_SECRET_BYTES` bytes, raises
-    :class:`RefusedSecret` (BACKLOG #5340), so no stored enrolment carries a weak or undecodable
-    key."""
+    whichever compiled-in set it names, with its secret in canonical form. A ``secret`` that is
+    empty, not base32, or decodes to fewer than :data:`_MIN_SECRET_BYTES` bytes raises
+    :class:`RefusedTotpSecret` (BACKLOG #5340), so no stored enrolment carries a weak or
+    undecodable key.
+
+    The secret is stored CANONICAL: upper case, no whitespace, no padding, as
+    :func:`generate_secret` makes it. :func:`otpauth_uri` advertises the stored text, so the
+    authenticator is handed exactly the key the engine computes with."""
     if not secret:
-        raise ValueError("an empty TOTP secret cannot be enrolled")
+        raise RefusedTotpSecret("an empty TOTP secret cannot be enrolled")
     stored = secret if ":" in secret else f"{_marker(DEFAULT_PARAMETERS)}:{secret}"
+    bare, params = parse_enrolment(stored)
     try:
-        _decode_secret(parse_enrolment(stored)[0])
+        key = _decode_secret(bare)
     except RefusedEnrolment:
         raise
-    except ValueError as exc:  # binascii.Error, or a non-ASCII str: not base32, so no key
-        raise RefusedSecret("the TOTP secret is not base32") from exc
-    return stored
+    except ValueError as exc:  # binascii.Error: not base32, so no key
+        raise RefusedTotpSecret("the TOTP secret is not base32") from exc
+    return f"{_marker(params)}:{base64.b32encode(key).decode('ascii').rstrip('=')}"
 
 
 def parse_enrolment(stored: str) -> tuple[str, TotpParameters]:
@@ -243,11 +253,16 @@ def reenrolment_possible() -> bool:
 def needs_reenrolment(stored: str) -> bool:
     """Whether the enrolment ``stored`` was made with parameters other than this release's
     default, so its holder should be offered a fresh enrolment (the ``needs_rehash`` shape, applied
-    to MFA). True for a refused marker too, since a fresh enrolment is the only way past it."""
+    to MFA). True for a refused marker or a key too short to compute with
+    (:class:`RefusedTotpSecret`) too, since a fresh enrolment is the only way past either."""
     try:
-        return parse_enrolment(stored)[1] != DEFAULT_PARAMETERS
+        bare, params = parse_enrolment(stored)
+        _decode_secret(bare)
     except RefusedEnrolment:
         return True
+    except ValueError:  # not base32: judged by its marker alone, as before BACKLOG #5340
+        pass
+    return params != DEFAULT_PARAMETERS
 
 
 def _resolve(secret: str, period: int | None, digits: int | None) -> tuple[str, TotpParameters]:
@@ -289,7 +304,8 @@ def totp(
 
     ``secret`` is a bare base32 secret or a stored enrolment (:func:`new_enrolment`), whose recorded
     parameters it is computed with. Raises :class:`ValueError` for a refused marker
-    (:func:`parse_enrolment`) or a secret that is not base32."""
+    (:func:`parse_enrolment`), a key too short to compute with (:class:`RefusedTotpSecret`), or a
+    secret that is not base32."""
     bare, params = _resolve(secret, period, digits)
     moment = time.time() if now is None else now
     counter = int(moment // params.period)
@@ -314,8 +330,9 @@ def verify_totp_step(
     or wrong-length ``code`` returns ``None``.
 
     ``secret`` is a bare base32 secret or a stored enrolment, checked with the parameters it records
-    (BACKLOG #3422). A refused marker (:class:`RefusedEnrolment`) returns ``None``: no code matches
-    an enrolment this release cannot compute. On the two-step sign-in a recovery code stays the way
+    (BACKLOG #3422). A refused marker (:class:`RefusedEnrolment`), or a key too short to compute
+    with (:class:`RefusedTotpSecret`, BACKLOG #5340), returns ``None``: no code matches an enrolment
+    this release cannot compute. On the two-step sign-in a recovery code stays the way
     past it; the combined sign-in takes a TOTP code only, so there it reads as a wrong code.
 
     The forward half of the skew window is *accepted* (so a near-boundary fast-clock authenticator can
@@ -352,7 +369,7 @@ def verify_totp_step(
     moment = time.time() if now is None else now
     try:
         key = _decode_secret(bare)
-    except RefusedSecret:  # a key too short to compute with matches no code (BACKLOG #5340)
+    except RefusedTotpSecret:  # a key too short to compute with matches no code (BACKLOG #5340)
         return None
     digest = _DIGESTS[params.algorithm]
     counter = int(moment // params.period)

@@ -148,7 +148,7 @@ def test_a_key_that_is_not_base32_or_too_short_is_refused_by_name_and_never_by_v
     key: str,
 ) -> None:
     """A short key would become an enabled Administrator's factor, and the store does not check
-    its length, so the rig refuses one under 128 bits."""
+    its length, so the rig refuses one under 160 bits."""
     with pytest.raises(rigadmin.RigAdminError, match=rigadmin.ADMIN_FACTOR_ENV) as refused:
         rigadmin._totp_code(key, 0.0)
     assert not key or key not in str(refused.value)

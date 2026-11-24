@@ -3952,7 +3952,7 @@ def test_the_last_wrong_code_is_not_told_to_try_again(
 
 #: A second synthetic base32 secret, so the two runs show different entries. Two symbols on
 #: purpose, for the reason ``_PASSWORD`` above is low-entropy: it must not look like a secret.
-_OTHER_TOTP_SECRET = "ABABABABABABABAB"
+_OTHER_TOTP_SECRET = "ABABABABABABABABABABABABABABABAB"
 
 
 async def test_the_run_that_loses_an_enrolment_race_is_told_to_remove_its_dead_entry(
