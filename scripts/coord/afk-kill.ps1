@@ -130,13 +130,15 @@ function Get-SkillInstructionSource {
     if (-not $root) { throw "the hook input's cwd $($p.Cwd) is inside no checkout" }
     # Only a checkout of this repository may name the seat: another repository's marker, or its
     # roster with no Special alias, would hand a Special seat the instruction. A common dir that
-    # cannot be read is not shown to be ours, so it refuses too. Compared as text, as
-    # Resolve-CcxHookSession compares common dirs, so the hooks agree on which repository a cwd is in.
-    # Here this hook gives no instruction where role-card-inject.ps1 still follows the cwd.
+    # cannot be read is not shown to be ours, so it refuses too. Compared through links as well as
+    # by text, because the script's path and a worktree's gitdir line may spell one directory
+    # differently. Here this hook gives no instruction where role-card-inject.ps1 still follows the cwd.
     $own = Get-CcxGitCommonDir (Get-CcxWorktreeRoot $PSScriptRoot)
     if (-not $own) { throw "this script's own checkout above $PSScriptRoot has no readable git common dir" }
     $theirs = Get-CcxGitCommonDir $root
-    if (-not ($theirs -and (Test-CcxSamePath $own $theirs))) {
+    if (-not $theirs) { throw "the hook input's cwd $($p.Cwd) is in $root, whose git common dir cannot be read" }
+    if (-not ((Test-CcxSamePath $own $theirs) -or
+            (Test-CcxSamePath (ConvertTo-CcxRealPath $own) (ConvertTo-CcxRealPath $theirs)))) {
         throw "the hook input's cwd $($p.Cwd) is in $root, which is not a checkout of this repository"
     }
     $source = ''

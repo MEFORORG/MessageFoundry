@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -345,7 +346,50 @@ def test_a_worktree_whose_git_dir_is_gone_gives_no_instruction(sb: Sandbox) -> N
     )
     _mark(wt, "builder")
     proc = _seat_run(sb, "off", "special", cwd=wt)
-    assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
+    assert proc.stdout == "" and "cannot be read" in proc.stderr, proc.stderr
+
+
+def _dir_link(link: Path, target: Path) -> None:
+    if sys.platform == "win32":
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_a_worktree_of_this_repository_spelled_through_a_link_gets_the_instruction(
+    sb: Sandbox,
+) -> None:
+    # The positive control for the repository check: the script runs through a link to the repo,
+    # while the worktree's gitdir line names the real path, as git writes it.
+    wt = _linked_worktree(sb)
+    _mark(wt, "builder")
+    link = sb.repo.parent / "linked-repo"
+    _dir_link(link, sb.repo)
+    sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
+    roles = sb.repo / "docs" / "roles"
+    roles.mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "docs" / "roles" / "seats.json", roles / "seats.json")
+    payload = {"hook_event_name": "SessionStart", "source": "compact", "cwd": str(wt)}
+    argv = sb.argv(KILL, "-Banner")
+    argv[argv.index("-File") + 1] = str(link / KILL.relative_to(ROOT))
+    proc = subprocess.run(
+        argv,
+        cwd=str(link),
+        env=sb.env(KORUS_SEAT="", KORUS_AGENT=""),
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert _instruction(proc.stdout), proc.stderr
 
 
 def test_an_unreadable_own_checkout_gives_no_instruction_and_names_it(sb: Sandbox) -> None:
