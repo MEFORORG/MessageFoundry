@@ -116,7 +116,7 @@ async def test_create_reset_and_factor_reset_write_nothing_when_no_credential_ca
             roles=["viewer"],
             actor="test",
         )
-        staged_cell = await store.set_totp_secret(target, secret="JBSWY3DPEHPK3PXP")
+        staged_cell = await store.set_totp_secret(target, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
         assert await store.enable_totp(
             target, expected_secret_cell=staged_cell, recovery_code_hashes=["h"]
         )

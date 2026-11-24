@@ -310,7 +310,7 @@ def test_a_quoted_name_keeps_its_case_and_an_unquoted_one_folds() -> None:
     assert key_column('"ID"') == "ID"
     live = live_shape({"t": {"ID"}}, {})
     expected = live_shape({"t": {"id"}}, {})
-    assert server_schema_differences(expected, live, {}) == ["table 't' is missing column 'id'"]
+    assert server_schema_differences(expected, live) == ["table 't' is missing column 'id'"]
 
 
 def test_key_columns_normalise_the_same_way_on_both_sides() -> None:
@@ -327,14 +327,14 @@ def test_key_columns_normalise_the_same_way_on_both_sides() -> None:
 
 def test_the_compare_names_each_shortfall_and_tolerates_extras() -> None:
     expected = live_shape({"queue": {"stage", "seq"}, "messages": {"id"}}, {_FIFO: _FIFO_SHAPE})
-    assert server_schema_differences(expected, expected, {}) == []
+    assert server_schema_differences(expected, expected) == []
     extra = live_shape(
         {"queue": {"stage", "seq", "extra"}, "messages": {"id"}, "other": {"x"}},
         {_FIFO: _FIFO_SHAPE, "ix_mine": IndexShape("queue", ("extra",), False, False)},
     )
-    assert server_schema_differences(expected, extra, {}) == []
+    assert server_schema_differences(expected, extra) == []
     short = live_shape({"queue": {"stage"}}, {_FIFO: IndexShape("queue", ("stage",), False, False)})
-    assert server_schema_differences(expected, short, {}) == [
+    assert server_schema_differences(expected, short) == [
         "table 'messages' is missing",
         "table 'queue' is missing column 'seq'",
         f"index {_FIFO!r} is on queue(stage), expected on queue(stage, channel_id, status, seq)",
@@ -344,7 +344,10 @@ def test_the_compare_names_each_shortfall_and_tolerates_extras() -> None:
 def test_a_name_held_by_another_kind_of_object_says_so() -> None:
     expected = live_shape({"queue": {"seq"}, "messages": {"id"}}, {_FIFO: _FIFO_SHAPE})
     live = live_shape({"queue": {"seq"}}, {})
-    assert server_schema_differences(expected, live, {_FIFO: "table", "messages": "index"}) == [
+    taken_tables = {"messages": "index"}
+    assert server_schema_differences(
+        expected, live, taken_indexes={_FIFO: "table"}, taken_tables=taken_tables
+    ) == [
         f"index {_FIFO!r} was never built: the name is taken by a table"
         " (expected on queue(stage, channel_id, status, seq))",
         "table 'messages' was never created: the name is taken by an index",
@@ -354,7 +357,7 @@ def test_a_name_held_by_another_kind_of_object_says_so() -> None:
 def test_an_index_that_exists_but_cannot_serve_says_why() -> None:
     expected = live_shape({"queue": {"seq"}}, {_FIFO: _FIFO_SHAPE})
     live = live_shape({"queue": {"seq"}}, {_FIFO: _FIFO_SHAPE})
-    assert server_schema_differences(expected, live, {}, {_FIFO: "disabled"}) == [
+    assert server_schema_differences(expected, live, unusable={_FIFO: "disabled"}) == [
         f"index {_FIFO!r} exists but is disabled"
         " (expected on queue(stage, channel_id, status, seq))"
     ]
@@ -1291,8 +1294,8 @@ def test_a_column_of_another_type_nullability_or_numbering_refuses(
 ) -> None:
     expected = live_shape({"t": {"a"}}, {}, {"t": {"a": ColumnShape("integer", False)}})
     got = live_shape({"t": {"a"}}, {}, {"t": {"a": live}})
-    assert server_schema_differences(expected, got, {}) == [f"table 't' column 'a' {clause}"]
-    assert server_schema_differences(expected, expected, {}) == []
+    assert server_schema_differences(expected, got) == [f"table 't' column 'a' {clause}"]
+    assert server_schema_differences(expected, expected) == []
 
 
 def test_a_collation_is_compared_only_where_the_batch_declares_one() -> None:
@@ -1302,13 +1305,13 @@ def test_a_collation_is_compared_only_where_the_batch_declares_one() -> None:
     live = live_shape(
         {"t": {"a", "b"}}, {}, {"t": {"a": ci, "b": ColumnShape("int", True, False, "any")}}
     )
-    assert server_schema_differences(expected, live, {}) == [
+    assert server_schema_differences(expected, live) == [
         "table 't' column 'a' has collation 'SQL_Latin1_General_CP1_CI_AS',"
         " expected 'latin1_general_100_bin2'"
     ]
     upper = ColumnShape("nvarchar(64)", False, False, "Latin1_General_100_BIN2")
     same = live_shape({"t": {"a", "b"}}, {}, {"t": {"a": upper}})
-    assert server_schema_differences(expected, same, {}) == []
+    assert server_schema_differences(expected, same) == []
 
 
 def test_refuse_short_schema_reads_each_columns_shape_and_an_empty_table() -> None:
@@ -1493,14 +1496,17 @@ def test_a_guarded_alter_column_that_a_new_store_never_runs_must_match_the_creat
         declared_schema((create, widen), "sqlserver")
     # SQL Server resets an altered column's collation unless the ALTER restates it.
     bin2 = "CREATE TABLE t (a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL)"
-    plain = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
+    plain = "IF 1 = 1 ALTER TABLE t ALTER COLUMN a NVARCHAR(64) NOT NULL"
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema((bin2, plain), "sqlserver")
     restated = "ALTER TABLE t ALTER COLUMN a NVARCHAR(64) COLLATE Latin1_General_100_BIN2 NOT NULL"
     assert declared_schema((bin2, restated), "sqlserver").column_shapes["t"]["a"].collation
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema(
-            ("CREATE TABLE t (a VARCHAR(64))", "ALTER TABLE t ALTER COLUMN a TYPE TEXT"),
+            (
+                "CREATE TABLE t (a VARCHAR(64))",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a TYPE TEXT; END $$",
+            ),
             "postgres",
         )
 
@@ -1559,7 +1565,7 @@ def test_an_index_named_like_a_table_does_not_hide_the_table() -> None:
         {"roles": IndexShape("other", ("x",), False, False)},
         {"roles": {"id": ColumnShape("bigint", False)}},
     )
-    assert server_schema_differences(expected, live, {}, {"roles": "disabled"}) == [
+    assert server_schema_differences(expected, live, unusable={"roles": "disabled"}) == [
         "index 'roles' exists but is disabled (expected on other(x))",
         "table 'roles' is missing column 'name'",
         "table 'roles' column 'id' is bigint not null, expected int not null",
@@ -1589,7 +1595,7 @@ def test_the_refusal_survives_the_log_redaction_and_the_safe_exc_cut() -> None:
     got = live_shape(
         {"connection_state": {"connection"}}, {}, {"connection_state": {"connection": live_col}}
     )
-    exc = ServerSchemaMismatchError("sqlserver", None, server_schema_differences(expected, got, {}))
+    exc = ServerSchemaMismatchError("sqlserver", None, server_schema_differences(expected, got))
     core = (
         "table 'connection_state' column 'connection' is nvarchar(256) null,"
         " expected nvarchar(256) identity not null"
@@ -1651,8 +1657,8 @@ def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
     assert declared_column("postgres", "a BIGINT DEFAULT 0") == ColumnShape("bigint", True)
     created = declared_schema(("CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",), "postgres")
     assert created.column_shapes["t"]["a"] == ColumnShape("bigint", True, True)
-    # An ALTER COLUMN reaches only an older store, so its result must match the CREATE: a nextval()
-    # default it sets or drops changes the numbering, and any other default does not.
+    # A guarded ALTER COLUMN reaches only an older store, so its result must match the CREATE: a
+    # nextval() default it sets or drops changes the numbering, and any other default does not.
     same = declared_schema(
         (
             "CREATE TABLE t (a BIGINT DEFAULT nextval('s'), b INT)",
@@ -1666,13 +1672,16 @@ def test_a_nextval_default_reads_as_numbered_without_not_null() -> None:
         declared_schema(
             (
                 "CREATE TABLE t (a BIGINT DEFAULT nextval('s'))",
-                "ALTER TABLE t ALTER COLUMN a DROP DEFAULT",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a DROP DEFAULT; END $$",
             ),
             "postgres",
         )
     with pytest.raises(ValueError, match="built two ways"):
         declared_schema(
-            ("CREATE TABLE t (a BIGINT)", "ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s')"),
+            (
+                "CREATE TABLE t (a BIGINT)",
+                "DO $$ BEGIN ALTER TABLE t ALTER COLUMN a SET DEFAULT nextval('s'); END $$",
+            ),
             "postgres",
         )
 

@@ -254,7 +254,7 @@ async def test_a_code_at_the_mfa_gate_for_a_satisfied_oidc_session_opens_nothing
         identity = await service.identity_for_token(token, activity=False)
         assert identity is not None and await service.mfa_satisfied(token)
         staged_cell = await service.store.set_totp_secret(
-            identity.user_id, secret="JBSWY3DPEHPK3PXP"
+            identity.user_id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
         )
         assert await service.store.enable_totp(
             identity.user_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]

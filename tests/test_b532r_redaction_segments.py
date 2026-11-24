@@ -7,9 +7,12 @@ so a password-only DSN holding one printed whole. It admits a "%" now, except on
 encoded HL7 separator, which the PHI pass reads a run by, or the encoded form of a character it
 stops at for structure, such as ",". "[" and "]" it refused, so it never crosses a
 placeholder; since wave 3 it takes them where the "[" opens no bracketed word of letters, the
-shape of ``<redacted>``, ``[redacted]`` and ``[REDACTED]``. Item 4, a ";" that opens no member in the run after the first
-segment, was built and declined: the declined form printed a value ``origin/main`` hides,
-pinned below. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says why each was kept or declined.
+shape of ``<redacted>``, ``[redacted]`` and ``[REDACTED]``; other brackets
+``tests/test_b532r_redaction_bracket_tail.py`` covers too. Item 4, a ";" that opens no member in
+the run after the first segment, was built and declined: the declined form printed a value
+``origin/main`` hides, pinned below. A ";"-split tail after a user's placeholder is read now, by its
+own narrower rule, which that file covers. The comment on ``secretscrub._WIDE_DSN_PASSWORD`` says
+why each was kept or declined.
 """
 
 from __future__ import annotations
@@ -64,23 +67,18 @@ _STILL_STOPPED = (
     "connect redis://:p%5EKv9x@db.invalid failed",
     "connect redis://:p%26Kv9x@db.invalid failed",
     "connect redis://:p%7EKv9x@db.invalid failed",
+    "connect redis://:p[KvZx]@db.invalid failed",
     "connect redis://:p[Kvxq]Kv9x@db.invalid failed",
     "connect redis://:p;Kv9x@db.invalid failed",
 )
 
 
 @pytest.mark.parametrize("line", _STILL_STOPPED)
-def test_an_encoded_separator_a_bracket_or_a_semicolon_still_stops_the_reading(line: str) -> None:
+def test_an_encoded_separator_a_placeholder_shape_or_a_semicolon_still_stops_the_reading(
+    line: str,
+) -> None:
     assert scrub_mod._WIDE_DSN_PASSWORD.search(line) is None, line
-    assert "Kv9x" in scrub_credentials(line)
-
-
-def test_a_semicolon_after_a_users_placeholder_still_ends_the_match() -> None:
-    """Item 4's residual: the run after the narrow pass's placeholder stops at a ";", so the
-    password's tail after its own "@" prints, as on ``origin/main``."""
-    match = scrub_mod._WIDE_DSN_PASSWORD.search("postgres://svc:<redacted>@Zq7;w@db")
-    assert match is not None and match.group(0) == "postgres://svc:<redacted>@", match
-    assert "Zq7;w" in scrub_credentials("connect postgres://svc:Kv9x@Zq7;w@db.invalid failed")
+    assert line.split("://:", 1)[1].split("@", 1)[0] in scrub_credentials(line)
 
 
 #: Lines the declined ";" alternative printed a value on, each with that value. In each a DSN is a

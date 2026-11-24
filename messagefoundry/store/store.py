@@ -2172,19 +2172,42 @@ def cancels_at_entry() -> int:
 
 def _force_failed_open_release(
     force_release: Callable[[], object] | None, *, after: str = "a failed store open"
-) -> None:
+) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
-    None is a caller with nothing it can release without waiting."""
+    None is a caller with nothing it can release without waiting. True only when a release ran
+    and returned something other than ``False``, which a release made of several steps returns
+    when one of them failed, so a caller's log line says the release happened only then (BACKLOG
+    #5720)."""
     if force_release is None:
-        return
+        return False
     try:
-        force_release()
+        return force_release() is not False
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
             "forcing the release after %s also failed (%s)",
             after,
             type(failure).__name__,
         )
+        return False
+
+
+def _forced_outcome(
+    force_release: Callable[[], object] | None,
+    released: bool,
+    *,
+    built: str = "what it had not closed",
+    left: str = "may still be open",
+) -> str:
+    """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
+    names what was to be released, and ``left`` what follows when nothing released it. A release
+    that ran is not said to have released everything: on SQL Server it marks the pool closing and
+    shuts its executor down, which leaves the pool's free connections open, and on SQLite a
+    statement that ignores the interrupt keeps its worker running."""
+    if released:
+        return f"a forced release of {built} ran without waiting for it"
+    if force_release is None:
+        return f"{built} {left}"
+    return f"forcing its release failed, so {built} {left}"
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:
@@ -2204,6 +2227,20 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _force_stop_connections(conns: Sequence[aiosqlite.Connection]) -> bool:
+    """Interrupt and stop each of ``conns`` without waiting, each step's failure logged by class.
+    False when any step failed, so the caller does not report them released (BACKLOG #5720).
+    interrupt() aborts a statement the worker is running, so the close stop() queues behind it is
+    reached; stop() does not await it."""
+    released = True
+    for conn in conns:
+        raw = getattr(conn, "_connection", None)
+        if raw is not None:
+            released &= _force_failed_open_release(raw.interrupt)
+        released &= _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+    return released
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -2272,8 +2309,8 @@ async def cleanup_failed_open(
     cleanup until a cancel lands; from then it gets at most :data:`FAILED_OPEN_CANCEL_BOUND_S`.
     The bound starts at once when the open's own end was a cancel, or a cancel this open received
     under another exception, or an exit such as ``SystemExit`` that must not wait unbounded. Past
-    the bound, ``force_release`` drops what the open built without waiting, and this stops
-    waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
+    the bound, ``force_release`` runs without waiting, which need not release everything the open
+    built (see :func:`_forced_outcome`), and this stops waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
@@ -2322,15 +2359,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release, after=after)
+            released = _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
-                "what the open built was released without waiting for it"
-                if force_release is not None
-                else "it was left to finish on its own",
+                _forced_outcome(
+                    force_release,
+                    released,
+                    built="what the open built",
+                    left="is left to the cleanup, until it finishes, if it does",
+                ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task, what)
@@ -2365,14 +2405,10 @@ async def cleanup_failed_open(
                 break
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
-        # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release, after=after)
+        # the read pool included: force its release without waiting (BACKLOG #5720).
+        released = _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
-        left = (
-            "what it had not closed was released without waiting for it"
-            if force_release is not None
-            else "what it had not closed may still be open"
-        )
+        left = _forced_outcome(force_release, released)
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:
@@ -2523,6 +2559,24 @@ async def _held_seal_ok(
         return True
     parts = tuple(fields)
     return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
+
+
+def sign_in_state_refused(
+    disabled: object,
+    locked_until: float | None,
+    second_step_locked_until: float | None,
+    now: float,
+) -> bool:
+    """Whether an account's row, read inside ``create_session``'s transaction, may not take a new
+    session under ``require_sign_in_eligible`` (BACKLOG #5653): disabled, or either lock live at
+    ``now``. The values are the raw columns, so each backend's integer, boolean or bit reads alike.
+    The service's own check before the mint reads the same three states
+    (``_directory_login_refusal``); this repeats it where a concurrent disable or lockout can no
+    longer land between that check and the INSERT. A lock is live on the boundary
+    :meth:`UserRecord.sign_in_locked` and :meth:`UserRecord.second_step_locked` use."""
+    return bool(disabled) or any(
+        until is not None and now < until for until in (locked_until, second_step_locked_until)
+    )
 
 
 def new_session_record(
@@ -2995,6 +3049,56 @@ class AdminGrant(StrEnum):
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
+#: How many times ``create_session`` runs on every backend before it gives up: once per seal over
+#: the session epochs it read, made again when a revoke raised one before the insert's locked read,
+#: and on SQLite also once per busy ``BEGIN IMMEDIATE`` (BACKLOG #5653), which backs off as the
+#: first-administrator grant does. Both are rare, so a bound that is reached raises
+#: :class:`SessionMintContended` rather than spin; it is not a refusal, so it is never ``False``.
+SESSION_MINT_ATTEMPTS: Final = _ADMIN_GRANT_BUSY_ATTEMPTS
+
+#: The ``cause`` of a :class:`SessionMintContended` when SQLite answered busy to every
+#: ``BEGIN IMMEDIATE`` the insert ran (BACKLOG #5653).
+SESSION_MINT_BUSY: Final = "busy"
+#: The ``cause`` of a :class:`SessionMintContended` when a revoke raised a session epoch the seal
+#: covers before every locked read the insert ran (BACKLOG #5653).
+SESSION_MINT_EPOCH_RAISED: Final = "session_epoch_raised"
+#: The ``cause`` of a :class:`SessionMintContended` when the SQLite insert's attempts met both: at
+#: least one answered busy and at least one found the session epochs raised (BACKLOG #5653).
+SESSION_MINT_BUSY_AND_EPOCH_RAISED: Final = "busy_and_session_epoch_raised"
+#: Every ``cause`` a :class:`SessionMintContended` carries.
+SESSION_MINT_CAUSES: Final[frozenset[str]] = frozenset(
+    {SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED, SESSION_MINT_BUSY_AND_EPOCH_RAISED}
+)
+
+
+def session_mint_cause(*, busy: int, epoch_raised: int) -> str:
+    """The ``cause`` a contended insert names from how many of its attempts met each kind of
+    contention, so a run that met both says so rather than naming the last one alone."""
+    if busy and epoch_raised:
+        return SESSION_MINT_BUSY_AND_EPOCH_RAISED
+    return SESSION_MINT_BUSY if busy else SESSION_MINT_EPOCH_RAISED
+
+
+class SessionMintContended(RuntimeError):
+    """:meth:`~messagefoundry.store.base.AuthStore.create_session` ran its bounded attempts and
+    wrote nothing, because each one met contention rather than a refusal (BACKLOG #5653).
+    ``cause`` is one of :data:`SESSION_MINT_CAUSES`, as :func:`session_mint_cause` names it from
+    every attempt; ``attempts`` is how many ran. Exported from :mod:`messagefoundry.store`.
+
+    **Raised, never returned as ``False``.** ``False`` means the account itself refused the
+    session (gone, disabled, locked, or its binding changed), and a caller renders it as that
+    refusal. Contention says nothing about the account, so a sign-in that meets it fails as a
+    temporary server-side failure and is audited under its own reason. The message is numeric and
+    PHI-free."""
+
+    def __init__(self, cause: str, attempts: int) -> None:
+        super().__init__(cause, attempts)
+        self.cause = cause
+        self.attempts = attempts
+
+    def __str__(self) -> str:
+        return f"session insert contended ({self.cause}) after {self.attempts} attempts"
+
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
     """Whether ``exc`` is SQLite's busy family, ``SQLITE_BUSY_SNAPSHOT`` included."""
@@ -3238,7 +3342,7 @@ class UserRecord:
     password_claimed_at: float | None = None
     # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
     # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
-    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on an AD/OIDC login --
     # touches ``display_name`` and ``email`` only.
     #
     # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
@@ -4491,10 +4595,11 @@ def discoverable_way_past(
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
-#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
-#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
-#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
-#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses or whose key is too
+#: short to compute with (BACKLOG #5340), or no secret at all. ``"unknown"``: it could not be judged
+#: (the cell did not open, a cipher service did not answer, or the value is not base32). Only a
+#: KNOWN refusal moves any decision away from the plain ``totp_enabled`` rule; an unknown answer is
+#: treated exactly as that rule treats it.
 TotpState = Literal["usable", "refused", "unknown"]
 
 #: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
@@ -8450,7 +8555,10 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            if out_secret is not None and not await cipher_call(
+                out_secret[1], _audit_tag_ok, parsed, out_secret
+            ):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -8618,12 +8726,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
+    # The handover tag is a MAC under the outgoing key, routed like the open's tag check (#3929).
+    # docs/CONNECTIONS.md, the Vault Transit bulk-cipher row, says where it runs today.
+    detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, out_secret),
+            detail=detail,
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:
@@ -12362,14 +12473,8 @@ class MessageStore:
             # Read now: close() empties the list, and a forced release must still reach each one.
             conns = [*(store._read_conns if store is not None else ()), db]
 
-            def _force_release() -> None:
-                # interrupt() aborts a statement the worker is running, so the close stop()
-                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
-                for conn in conns:
-                    raw = getattr(conn, "_connection", None)
-                    if raw is not None:
-                        _force_failed_open_release(raw.interrupt)
-                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+            def _force_release() -> bool:
+                return _force_stop_connections(conns)
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
@@ -14045,6 +14150,8 @@ class MessageStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # KNOWN GAP (BACKLOG #5720): a cancel in the settle, a write on a keyed store, skips every
+        # close step after it, so the connections' worker threads stay running; this close is not cancel-safe.
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
@@ -20741,8 +20848,8 @@ class MessageStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
-        #1139). Adding that column to this SET list would hand the directory the notification target
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name
+        ``notify_email`` (BACKLOG #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""
         now = time.time() if now is None else now
@@ -22050,42 +22157,156 @@ class MessageStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
-        now = time.time() if now is None else now
+        # BACKLOG #5653: the seal is made BEFORE the writer transaction opens. Under a Vault Transit
+        # sealer it is an HTTP call, and under ``require_sign_in_eligible`` the transaction holds
+        # SQLite's write lock from its BEGIN, so sealing inside it would stall every writer on every
+        # engine shard behind Vault. The seal covers the account's and the store's session epochs,
+        # so they are read first, unlocked, and the transaction reads them again: if a revoke raised
+        # either in between, nothing is written and the record is sealed again over the new values.
+        busy = epoch_raised = 0
+        last_busy: sqlite3.OperationalError | None = None
+        for attempt in range(1, SESSION_MINT_ATTEMPTS + 1):
+            epochs = await self._session_epochs_unlocked(user_id)
+            if epochs is None:
+                # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
+                # INSERT's foreign-key error. The locked read refuses one deleted after this read.
+                return False
+            record = await seal_session_async(
+                self._row_sealer,
+                new_session_record(
+                    token_hash=token_hash,
+                    user_id=user_id,
+                    now=time.time() if now is None else now,
+                    expires_at=expires_at,
+                    client=client,
+                    seed_reauth=seed_reauth,
+                    auth_mechanism=auth_mechanism,
+                    idp_auth_time=idp_auth_time,
+                    mfa_verified=mfa_verified,
+                    user_epoch=epochs[0],
+                    global_epoch=epochs[1],
+                ),
+            )
+            try:
+                inserted = await self._insert_sealed_session(
+                    record,
+                    now=now,
+                    require_federated_subject=require_federated_subject,
+                    require_sign_in_eligible=require_sign_in_eligible,
+                )
+            except sqlite3.OperationalError as exc:
+                # Only the BEGIN IMMEDIATE path is run again: its busy arises at the BEGIN, once
+                # ``busy_timeout`` is outlasted, before anything is read or written.
+                if not require_sign_in_eligible or not _is_sqlite_busy(exc):
+                    raise
+                busy += 1
+                last_busy = exc
+                if attempt < SESSION_MINT_ATTEMPTS:
+                    log.info(
+                        "sqlite: a session insert met a busy database (attempt %d of %d);"
+                        " running it again",
+                        attempt,
+                        SESSION_MINT_ATTEMPTS,
+                    )
+                    await asyncio.sleep(_ADMIN_GRANT_BUSY_BACKOFF_SECONDS * attempt)
+                continue
+            if inserted is not None:
+                return inserted
+            epoch_raised += 1
+        # Contention, not a refusal: ``False`` would tell the caller the account refused the
+        # session. The directory sign-in that asked has already written its roles and profile, so
+        # it fails as a temporary failure rather than see this escape. The cause and the counts
+        # cover every attempt, not only the last one.
+        log.warning(
+            "sqlite: a session insert gave up after %d attempts: %d met a busy database,"
+            " %d found the session epochs raised",
+            SESSION_MINT_ATTEMPTS,
+            busy,
+            epoch_raised,
+        )
+        raise SessionMintContended(
+            session_mint_cause(busy=busy, epoch_raised=epoch_raised), SESSION_MINT_ATTEMPTS
+        ) from last_busy
+
+    async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
+        """The account's session epoch and the store's global one, read on a reader connection
+        with no lock, or ``None`` for no such account. ``create_session`` seals over them and
+        compares them again in its writer transaction (BACKLOG #5653)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                f"SELECT session_epoch, {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch"
+                " FROM users WHERE id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return int(row["session_epoch"]), global_epoch_or_refuse(row["global_epoch"])
+
+    async def _insert_sealed_session(
+        self,
+        record: SessionRecord,
+        *,
+        now: float | None,
+        require_federated_subject: tuple[str | None, str | None] | None,
+        require_sign_in_eligible: bool,
+    ) -> bool | None:
+        """``create_session``'s writer transaction: insert ``record``, already sealed, if the
+        account's row still allows it. ``False`` is a refusal. ``None`` means a revoke raised an
+        epoch the seal covers after the seal was made, so nothing was written and the caller seals
+        again. Nothing here seals (BACKLOG #5653)."""
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
         # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
-        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
-        # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
-        async with _writer_txn(self._db, self._lock):
+        # path's binding check; BACKLOG #5653 for the eligibility check). Within this process the
+        # asyncio lock is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, a disable, a lockout and every whole-account revoke, which
+        # take the same lock. Another engine shard on the same file takes only SQLite's own write
+        # lock. Under ``require_sign_in_eligible`` the transaction is BEGIN IMMEDIATE, so that lock
+        # is held before the read: a disable or lockout another shard commits first is read and
+        # refused. Under the deferred BEGIN the same write fails the INSERT as ``database is
+        # locked`` instead, an error rather than a refusal (BACKLOG #5653; BACKLOG #3078 F5 is the
+        # first-administrator grant's same choice).
+        # Each refusal below rolls back itself, as that helper's contract requires (ADR 0159).
+        async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
+            # Read once the locks are held, so a BEGIN that waited out another writer judges a
+            # lock's expiry at the time of the read, not when this sign-in began to wait.
+            judged_at = time.time() if now is None else now
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                " second_step_locked_until,"
                 f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
-                (user_id,),
+                (record.user_id,),
             )
             row = await cur.fetchone()
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
             # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        judged_at,
+                    )
+                )
             ):
                 await self._db.rollback()
                 return False
-            record = new_session_record(
-                token_hash=token_hash,
-                user_id=user_id,
-                now=now,
-                expires_at=expires_at,
-                client=client,
-                seed_reauth=seed_reauth,
-                auth_mechanism=auth_mechanism,
-                idp_auth_time=idp_auth_time,
-                mfa_verified=mfa_verified,
+            if not session_epochs_current(
+                record,
                 user_epoch=int(row["session_epoch"]),
                 global_epoch=global_epoch_or_refuse(row["global_epoch"]),
-            )
-            record = await seal_session_async(self._row_sealer, record)
+            ):
+                await self._db.rollback()
+                return None
             await self._db.execute(_SESSION_INSERT, session_insert_params(record))
             await self._commit()
         return True

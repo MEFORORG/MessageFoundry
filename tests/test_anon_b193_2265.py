@@ -40,7 +40,7 @@ _NO_SCANNER = pytest.mark.skipif(
     reason="leak-check needs scripts/security/scan_forbidden.py (absent on an installed wheel)",
 )
 
-_SALT = "b193-2265-salt-0123456789abcdef"
+_SALT = "b193-2265-salt-0123456789abcdef-0123456789"
 _SSN = "123-45-6789"
 _HEADER = r"MSH|^~\&|APP|FAC|RCV|RFAC|20260101120000||ADT^A01|M1|P|2.5.1"
 _PID = "PID|1||1^^^H^MR||X^Y"
