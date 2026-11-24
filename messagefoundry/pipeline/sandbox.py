@@ -212,9 +212,10 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
     MEMORY_CAP = "memory_cap"
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
-    #: and raises the ``sandbox_worker_refused`` alert for a refusal against the graph it serves. A
-    #: refusal against a graph a reload has since replaced gets neither, and this record does not
-    #: outlast it: the reload discards this session. That kill then writes no line of its own,
+    #: and raises the ``sandbox_worker_refused`` alert for a refusal from the session still serving
+    #: the inbound, against a graph equal to the one it serves. A refusal from a session a reload
+    #: has discarded, or against an unequal graph, gets neither, and this record does not outlast
+    #: it: the reload discards this session. That kill then writes no line of its own,
     #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
     #: reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"

@@ -200,10 +200,14 @@ async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_pat
     assert sink.refused == [("IB_X", False)]
 
 
-async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path) -> None:
-    """The refused spawn compared with a graph the runner no longer serves, as after a reload,
-    or a reload that swapped and then rolled back. The reload is the remedy, so an alert would
-    stay open with nothing left to fix."""
+async def test_a_refusal_alerts_only_against_a_graph_equal_to_the_served_one(
+    tmp_path: Path,
+) -> None:
+    """A refusal from the live session alerts only when the graph it was compared with equals the
+    one served (BACKLOG #6830). Against an unequal graph, as after a reload that changed it or one
+    that swapped and rolled back, it does not: the reload is the remedy. Against an equal object
+    that is not the served one it does, since the session's by-value cache raises no later first
+    refusal for it."""
     registry = Registry(code_digest=_SOME_DIGEST)
     sink = _Recorder()
     compared: list[GraphShape] = []
@@ -232,6 +236,55 @@ async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path)
             with pytest.raises(SandboxWorkerRefused):
                 await runner._off_loop_sandboxed("IB_X", dispatch, registry)
             assert sink.refused == [("IB_X", True)]
+        finally:
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("cleared", [False, True], ids=["cause_stands", "reload_cleared_it"])
+async def test_a_refusal_straddling_a_reload_to_an_equal_graph_alerts_once(
+    tmp_path: Path, cleared: bool
+) -> None:
+    """A first refusal whose session a reload to an equal graph discarded while it ran raises no
+    alert: the reload's own first step, as ``_close_sandbox_sessions`` does it, drops the session
+    before the refusal reaches the gate. The fresh session for the next message compares again.
+    Where the cause stands, its refusal is the one alert; where the reload cleared it (the
+    content-only case: the worker now runs the reloaded bytes), no alert is left open at all."""
+    registry = Registry(code_digest=_SOME_DIGEST)
+    sink = _Recorder()
+    calls: list[Any] = []
+    runner: RegistryRunner | None = None
+
+    def dispatch(_registry: Registry, *, sandbox: Any) -> None:
+        assert runner is not None
+        calls.append(sandbox)
+        if len(calls) == 1:
+            compared = runner._engine_graph_shape()
+            runner._sandbox_sessions.clear()  # the reload drops the sessions, then closes them
+            runner.registry = copy.copy(registry)  # an equal graph, a new object
+            assert runner._engine_graph_shape() == compared
+            raise SandboxWorkerRefused("refused", first=True, content_only=True, graph=compared)
+        if not cleared:
+            raise SandboxWorkerRefused(
+                "refused", first=True, content_only=True, graph=runner._engine_graph_shape()
+            )
+
+    store = await MessageStore.open(tmp_path / "straddle.db")
+    try:
+        runner = _runner(registry, store, tmp_path, cast(Any, sink))
+        try:
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert sink.refused == []
+            if cleared:
+                await runner._off_loop_sandboxed("IB_X", dispatch, runner.registry)
+                assert sink.refused == []
+            else:
+                with pytest.raises(SandboxWorkerRefused):
+                    await runner._off_loop_sandboxed("IB_X", dispatch, runner.registry)
+                assert sink.refused == [("IB_X", True)]
+            assert calls[0] is not calls[1]  # the second message ran on a fresh session
         finally:
             await runner._close_sandbox_sessions()
     finally:

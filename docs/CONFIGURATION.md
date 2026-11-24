@@ -1567,8 +1567,10 @@ other module bytes than the engine loaded:
    is re-pended, or dead-lettered once its attempts reach the retry cap, and the
    `connection_stopped` alert fires as well.
 4. Every later message on that inbound is refused the same way, without starting another worker,
-   until a reload changes the graph the engine serves. Those refusals raise no further alert and
-   log no further `WARNING` line of their own. Each other inbound's worker is compared when it
+   until a reload. Those refusals raise no further alert and log no further `WARNING` line of
+   their own. Any reload, even one that leaves the graph the same, starts a fresh worker for the
+   next message, which is compared again. A refusal still in flight when the reload began raises
+   no alert. Each other inbound's worker is compared when it
    starts, and each one refused raises its own alert. A reload that does not clear the cause
    raises the alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.

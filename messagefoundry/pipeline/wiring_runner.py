@@ -7465,11 +7465,12 @@ class RegistryRunner:
         the loop, before the exception goes on to the internal-error policy unchanged (vault BACKLOG
         #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
         graphs raises it; the session's cached refusals for later messages do not."""
+        # The session the dispatch ran on, so the alert gate can tell one a reload has discarded.
+        session: SandboxSession | None = None
         try:
             try:
-                return await asyncio.to_thread(
-                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-                )
+                session = self._sandbox_for(name)
+                return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
             except SandboxSessionClosed:
                 if self._stop.is_set() or self.registry is not registry:
                     raise
@@ -7477,18 +7478,25 @@ class RegistryRunner:
                     "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
                     name,
                 )
-                return await asyncio.to_thread(
-                    fn, registry, *args, sandbox=self._sandbox_for(name), **kwargs
-                )
+                session = self._sandbox_for(name)
+                return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
         except SandboxWorkerRefused as exc:
-            # Not for a refusal computed against a graph a reload has since replaced: the reload
-            # is the remedy, so the alert would stay open with nothing left to fix. The graph the
-            # worker was compared with is checked, not ``registry``: a reload that swapped and
-            # then rolled back leaves ``registry`` served though the comparison used the other.
-            # Compared by value, as the session's refusal cache is (BACKLOG #6830): a swap to an
-            # equal graph leaves the refusal standing, and the session's later hits are not
-            # ``first``, so dropping this one would lose the alert for the session's life.
-            if exc.first and (exc.graph is None or exc.graph == self._engine_graph_shape()):
+            # Only a refusal from the session still serving this inbound, compared with the graph
+            # still served. A reload or a rollback discards every session, and the next dispatch's
+            # fresh session compares again and raises its own first refusal, so an alert from the
+            # discarded one would be a duplicate or, when the reload cleared the cause, an alert
+            # left open with nothing to fix. The graph is compared by value, as the session's
+            # refusal cache is (BACKLOG #6830): a session kept across a direct swap of
+            # ``self.registry`` to an equal graph refuses its later messages from that cache, never
+            # as ``first``, so this is that refusal's only alert. The graph the worker was
+            # compared with is checked, not ``registry``: a reload that swapped and then rolled
+            # back leaves ``registry`` served though the comparison used the other.
+            if (
+                exc.first
+                and session is not None
+                and self._sandbox_sessions.get(name) is session
+                and (exc.graph is None or exc.graph == self._engine_graph_shape())
+            ):
                 # The whole refusal, once: what differs and both digests. A dead-lettered message
                 # keeps only the first 200 characters of it. Config names and digests, no message.
                 log.warning("inbound %r: %s", name, exc)
