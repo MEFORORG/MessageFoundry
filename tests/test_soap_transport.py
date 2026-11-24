@@ -12,6 +12,7 @@ import contextlib
 import email.message
 import http.client
 import io
+import time
 import urllib.error
 import urllib.request
 
@@ -25,7 +26,12 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.http_auth import with_oauth2_client_credentials
-from messagefoundry.transports.soap import SoapDestination, _classify_soap, _fault_code
+from messagefoundry.transports.soap import (
+    SoapDestination,
+    _classify_soap,
+    _fault_code,
+    _names_expired_timestamp,
+)
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 URL = "https://api.example.com/svc"
@@ -606,6 +612,10 @@ _FAILED_AUTH_EXPIRED_ELSEWHERE = {
         b'<soap:Fault><faultcode a="MessageExpired">wsse:FailedAuthentication</faultcode>'
         b"</soap:Fault>"
     ),
+    "cdata-code": (
+        b"<soap:Fault><faultcode><![CDATA[wsse:FailedAuthentication]]></faultcode>"
+        b"<faultstring>MessageExpired</faultstring></soap:Fault>"
+    ),
     "after-the-fault": (
         b"<soap:Envelope><soap:Body><soap:Fault><faultcode>wsse:InvalidSecurityToken</faultcode>"
         b"</soap:Fault></soap:Body></soap:Envelope><!-- MessageExpired -->"
@@ -694,3 +704,27 @@ async def test_control_a_401_without_a_token_provider_stays_permanent() -> None:
     with pytest.raises(NegativeAckError) as ei:
         await dest.send("<env/>")
     assert ei.value.permanent is True
+
+
+def _expired_read_seconds(run: int) -> float:
+    body = (
+        "<soap:Fault><faultcode>" + "<" * run + "</faultcode>"
+        "<faultstring>wsse:FailedAuthentication</faultstring></soap:Fault>"
+    )
+    best = float("inf")
+    for _ in range(3):
+        started = time.perf_counter()
+        _names_expired_timestamp(body)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def test_the_401_expired_read_is_linear_in_a_run_of_open_angle_brackets() -> None:
+    """Review round 64cd4c17: the code element's tag strip once took time quadratic in a run of
+    '<' with no '>', holding the GIL, so one 401 near the 16 MiB fault-body cap could stall the
+    event loop for hours. Mutation: _TAG_RE back to r"<[^>]*>". Red: the 4x input takes about 16x
+    as long, and the large read over a second."""
+    small = _expired_read_seconds(50_000)
+    large = _expired_read_seconds(200_000)
+    assert large < 2.0
+    assert large < 8 * max(small, 1e-3)

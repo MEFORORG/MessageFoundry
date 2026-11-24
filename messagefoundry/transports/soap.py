@@ -489,7 +489,9 @@ def _searched_code(body: str, start: int, end: int) -> str:
 
 # BACKLOG #5798 added item 3: the faultcode close tag outside markup, as _CODE_END_OUTSIDE_MARKUP_RE
 # finds the Code's, and any tag, attributes included, for the code element's text content.
-_TAG_RE = re.compile(r"<[^>]*>")
+# No '<' inside, so each '<' starts at most one match attempt and the strip stays linear
+# (review round 64cd4c17: r"<[^>]*>" was quadratic in a run of '<' with no '>').
+_TAG_RE = re.compile(r"<[^<>]*>")
 _FAULTCODE_END_OUTSIDE_MARKUP_RE = re.compile(
     r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?faultcode\s*>)"
 )
@@ -531,8 +533,10 @@ def _names_expired_timestamp(body: str) -> bool:
     if span is not None:
         # Text content only: comments and processing instructions out (_scan_markup), then every
         # tag, its attributes with it, so neither decides whether the element names a WS-Security
-        # code. Where it names none, the range search below still reads them.
-        text = _TAG_RE.sub(" ", _scan_markup(body[span[0] : span[1]])[0])
+        # code. Where it names none, the range search below still reads them. CDATA text counts,
+        # as _child_code_text reads it.
+        kept = _scan_markup(body[span[0] : span[1]])[0]
+        text = _TAG_RE.sub(" ", kept.replace("<![CDATA[", " ").replace("]]>", " "))
         if _WSSE_FAULT_RE.search(text) is not None:
             return _WSSE_EXPIRED_RE.search(text) is not None
     return _WSSE_EXPIRED_RE.search(body, start) is not None
