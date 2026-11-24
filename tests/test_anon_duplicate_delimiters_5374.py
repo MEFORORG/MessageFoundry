@@ -19,7 +19,7 @@ from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 
 _BODY = "|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||SYN1^^^H^MR||ZZTEST^ALPHA"
-_SALT = "b5374-salt-0123456789abcdef"
+_SALT = "b5374-salt-0123456789abcdef-0123456789"
 _BOTH = pytest.mark.parametrize(
     "module", [toolkit_surrogates, tee_surrogates], ids=["toolkit", "tee"]
 )

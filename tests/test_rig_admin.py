@@ -143,18 +143,24 @@ def test_the_rig_computes_the_engines_totp_codes() -> None:
     assert rigadmin._totp_code(spaced, 1e9) == totp.totp(key, now=1e9)
 
 
-@pytest.mark.parametrize("key", ["", "not base32!", "1" * 32, "A" * 25, "AA"])
+@pytest.mark.parametrize("key", ["", "not base32!", "1" * 32, "A" * 25, "A" * 31, "AA"])
 def test_a_key_that_is_not_base32_or_too_short_is_refused_by_name_and_never_by_value(
     key: str,
 ) -> None:
     """A short key would become an enabled Administrator's factor, and the store does not check
-    its length, so the rig refuses one under 128 bits."""
+    its length, so the rig refuses one under 160 bits."""
     with pytest.raises(rigadmin.RigAdminError, match=rigadmin.ADMIN_FACTOR_ENV) as refused:
         rigadmin._totp_code(key, 0.0)
     assert not key or key not in str(refused.value)
     # CONTROL: the shortest key the rig takes, and the engine's own draw, both give a code.
     assert rigadmin._totp_code("A" * rigadmin._MIN_KEY_CHARS, 0.0).isdigit()
     assert rigadmin._totp_code(totp.generate_secret(), 0.0).isdigit()
+
+
+def test_the_rigs_key_floor_is_the_engines() -> None:
+    """The rig writes the engine's floor out as characters (BACKLOG #5340); this ties the two, so
+    a moved engine floor cannot leave the rig's refusal naming the wrong length."""
+    assert rigadmin._MIN_KEY_CHARS * 5 == totp._MIN_SECRET_BYTES * 8
 
 
 def test_sign_in_refuses_an_unusable_key_before_any_wait(

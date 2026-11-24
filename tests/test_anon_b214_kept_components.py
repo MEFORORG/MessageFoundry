@@ -21,7 +21,7 @@ import pytest
 import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
 
-_SALT = "b214-kept-salt-0123456789abcdef"
+_SALT = "b214-kept-salt-0123456789abcdef-0123456789"
 _EACH = pytest.mark.parametrize("anon", (engine_anon, tee_anon), ids=("engine", "tee"))
 _HEADER = "MSH|^~\\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
 _PID3 = "12345^^^HOSP^MR"

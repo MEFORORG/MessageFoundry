@@ -40,7 +40,7 @@ pytestmark = pytest.mark.skipif(
     reason="the engine leak-check needs scripts/security/scan_forbidden.py",
 )
 
-_SALT = "b193-salt-0123456789abcdef"
+_SALT = "b193-salt-0123456789abcdef-0123456789"
 _HEADER = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1"
 _PID = "PID|1||1^^^H^MR||X^Y"
 

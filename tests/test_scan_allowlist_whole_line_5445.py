@@ -49,7 +49,7 @@ def _section() -> str:
 
 def _citation_line() -> str:
     """The tracked comment line the OIDC core entry was written for, read from the tree."""
-    marker = f"OIDC core {_section()}/2"
+    marker = f"OIDC core {_section()}/4"
     lines = [ln for ln in _CLAIMS.read_text(encoding="utf-8").splitlines() if marker in ln]
     assert len(lines) == 1, "claims.py must carry the citation the allowlist entry excuses"
     return lines[0]
@@ -74,9 +74,9 @@ def test_a_leak_beside_the_citation_shape_still_trips(mod, tmp_path: Path) -> No
     must name the PLANTED address, not only the section number that now reads as one."""
     ip = _routable_ip()
     variants = (
-        f"# OIDC core {_section()}/2 host {ip}",
+        f"# OIDC core {_section()}/4 host {ip}",
         f"{_citation_line()} {ip}",
-        f"connect({ip!r})  # OIDC core {_section()}/2",
+        f"connect({ip!r})  # OIDC core {_section()}/4",
     )
     for i, line in enumerate(variants):
         p = tmp_path / f"leak{i}.py"

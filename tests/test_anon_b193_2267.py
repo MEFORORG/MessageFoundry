@@ -29,7 +29,7 @@ import tee.anon.rules
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
 
-_SALT = "b193-salt-0123456789abcdef"
+_SALT = "b193-salt-0123456789abcdef-0123456789"
 _ROWS = 3
 _FAILED = "failed anonymization"
 

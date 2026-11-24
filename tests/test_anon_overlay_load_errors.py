@@ -29,7 +29,7 @@ from tee.__main__ import main as tee_main
 from tee.store import RelayStore
 
 _BOTH = pytest.mark.parametrize("rules_module", (engine_rules, tee_rules), ids=("engine", "tee"))
-_SALT = "b254-3003-salt-0123456789abcdef"
+_SALT = "b254-3003-salt-0123456789abcdef-0123456789"
 _PARSER_REFUSED = "the file holds a value the TOML parser refused"
 _PATH_REFUSED = "the path is not one the system can open"
 

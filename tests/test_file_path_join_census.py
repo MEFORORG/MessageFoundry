@@ -566,7 +566,7 @@ SITES: dict[str, Site] = {
         1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
-        1,
+        3,
         GUARDED,
         _CODESET_NAME,
         "messagefoundry/config/codeset_edit.py::_validate_name",
@@ -723,6 +723,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/log_spool.py::LogSpool.open": Site(
         1, INTERNAL, "A fixed lock name in the spool directory."
+    ),
+    "messagefoundry/parsing/x12/_deps.py::_read_map_segment_ids": Site(
+        2,
+        INTERNAL,
+        "The fixed index name, and map names read from that index inside the installed pyx12 "
+        "package, each refused unless a bare file name; no interchange value reaches either.",
+    ),
+    "messagefoundry/parsing/x12/_deps.py::load_x12_map_segment_ids": Site(
+        1, INTERNAL, "The fixed name map under the installed pyx12 package."
     ),
     "messagefoundry/parsing/xml/schema.py::_bundled_root": Site(
         1, INTERNAL, "A fixed name, schemas, beside the installed xmlschema package's own file."

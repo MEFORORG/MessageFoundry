@@ -3,7 +3,7 @@
 import * as assert from "assert";
 
 import { resolveInsertAnchor } from "../../stepsModel";
-import { dropRows, loadPage, withControls, type DomNode } from "./b622-g09-steps-page";
+import { dropRows, loadPage, withControls, withElif, type DomNode } from "./b622-g09-steps-page";
 
 // BACKLOG #5839: an insert AFTER an if/elif/else/for header was requested directly after the header
 // line, at the header's indent, which the engine's re-parse refuses (an IndentationError). The Steps
@@ -73,6 +73,58 @@ suite("b622 #5839 — insert after a control header lands as the block's first s
     const ins = page.posted.find((m) => m.command === "insertItem");
     assert.ok(ins, "an insertItem was posted");
     assert.strictEqual(ins.lineStart, 7);
+    assert.strictEqual(ins.position, "before");
+  });
+
+  // The elif case, which the first red reading did not name: an elif header is a control header like
+  // the others, so "after" it lands before its own body's first row.
+  test("model: resolveInsertAnchor maps 'after an elif header' to 'before its body's first row'", () => {
+    const got = resolveInsertAnchor(dropRows(withElif()), 4, "after");
+    assert.deepStrictEqual([got?.anchor.lineStart, got?.position], [5, "before"]);
+  });
+
+  test("webview: the resolveInsertAnchor mirror agrees with the model on the if/elif/else chain", () => {
+    const f = withElif();
+    const page = loadPage(f);
+    const web = page.hook.stepsCtxRows();
+    const rows = dropRows(f);
+    for (const r of rows) {
+      for (const pos of ["before", "after"] as const) {
+        const w = page.hook.resolveInsertAnchor(web, r.lineStart, pos);
+        const m = resolveInsertAnchor(rows, r.lineStart, pos);
+        assert.deepStrictEqual(
+          w === null ? null : [w.anchor.lineStart, w.position],
+          m === null ? null : [m.anchor.lineStart, m.position],
+          `line ${r.lineStart}, ${pos}`,
+        );
+      }
+    }
+  });
+
+  test("webview: Insert after on an elif header posts the elif body's first row, before", () => {
+    const page = loadPage(withElif());
+    page.rightClick(page.row(4));
+    const item = page.menuItem('.ctx-submenu[data-for="after"] .ctx-item[data-item-id]:not([data-anchor])');
+    assert.strictEqual(item.disabled, false);
+    item.click();
+    const ins = page.posted.find((m) => m.command === "insertItem");
+    assert.ok(ins, "an insertItem was posted");
+    assert.strictEqual(ins.lineStart, 5);
+    assert.strictEqual(ins.position, "before");
+  });
+
+  test("webview: the toolbar Add on a selected elif header posts the elif body's first row, before", () => {
+    const page = loadPage(withElif());
+    page.row(4).click();
+    const sel = page.doc.getElementById("insertAction");
+    const leaf = Array.from(sel.options as DomNode[]).find((o) => o.value !== "" && !o.dataset.anchor);
+    assert.ok(leaf, "the toolbar offers a plain insert item");
+    sel.value = leaf.value;
+    sel.dispatchEvent(new page.window.Event("change"));
+    page.doc.getElementById("addAction").click();
+    const ins = page.posted.find((m) => m.command === "insertItem");
+    assert.ok(ins, "an insertItem was posted");
+    assert.strictEqual(ins.lineStart, 5);
     assert.strictEqual(ins.position, "before");
   });
 

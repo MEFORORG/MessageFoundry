@@ -272,7 +272,9 @@ def test_the_surrogate_check_fires_on_each_kind_it_judges() -> None:
 
 def test_the_surrogate_check_passes_what_the_anonymizer_writes() -> None:
     """The other control: the same message, anonymized by the same rules, is not named."""
-    scrubbed = anonymize(_UNSCRUBBED, salt="hapi-samples-control-salt", rules=_CONTROL_RULES)
+    scrubbed = anonymize(
+        _UNSCRUBBED, salt="hapi-samples-control-salt-0123456789", rules=_CONTROL_RULES
+    )
     checked, found = _residue(scrubbed, _CONTROL_RULES)
     assert checked == len(_CONTROL_RULES)
     assert found == []
