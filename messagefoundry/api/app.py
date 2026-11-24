@@ -7107,7 +7107,19 @@ def create_app(
         # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
         # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
         # depth on top of the guard.
-        await _control_guard(engine, identity, name, client_ip(request))
+        client = client_ip(request)
+        await _control_guard(engine, identity, name, client)
+        rr = engine.registry_runner
+        if (
+            identity.allowed_channels is not None
+            and rr is not None
+            and name in rr.registry.inbound_names()
+            and name not in rr.registry.inbound
+        ):
+            # An inbound another engine shard holds: the store is shared, so without this the scope
+            # check alone would answer it here. Refused as the per-name routes refuse it, through
+            # _resolve_connection (BACKLOG #3031). The 403 is the one an out-of-scope inbound gets.
+            await _deny_connection(engine, identity, name, client)
         rows = await engine.store.list_connection_events(
             connection=name,
             kinds=kind,
