@@ -485,17 +485,30 @@ def test_the_installed_announce_shim_is_inert_outside_a_git_repo(
 
 
 # --------------------------------------------------------------------------------------------------
-# The NOTICE shim on the Stop rows (seat recorder, wiki write prompt) -- BACKLOG #7575.
-#
-# Plain exit-0 stdout from a Stop hook reaches neither the user nor the model, so a plain-text notice
-# on these rows was as silent as the std shim it was built to replace. The notice is a systemMessage,
-# the field the user is shown on every event.
+# The NOTICE shim on the Stop rows -- BACKLOG #7575. Why it emits a systemMessage is stated once, in
+# the installer's comment above New-NoticeShimCommand.
 # --------------------------------------------------------------------------------------------------
 
-_NOTICE_ROWS = [
-    (_marker("SEAT_MARKER"), "scripts/hooks/seat-record.ps1"),
-    (_marker("WIKI_MARKER"), "scripts/hooks/wiki-write-prompt.ps1"),
-]
+# Every Shim = "notice" row of $WIRING, parsed from the installer so an added or renamed row is
+# exercised rather than silently skipped: (event, script, marker, notice text).
+_NOTICE_ROW_RE = re.compile(
+    r'@\{ Event = "(\w+)";[^\n]*?Script = "([^"]+)";[^\n]*?Marker = \$(\w+); Shim = "notice"'
+    r'\s*\n\s*Notice = "([^"]*)"'
+)
+_NOTICE_ROWS_SRC = _NOTICE_ROW_RE.findall(_SRC)
+_NOTICE_ROWS = [(_marker(var), script) for _event, script, var, _notice in _NOTICE_ROWS_SRC]
+
+
+def test_the_notice_rows_were_parsed_and_are_all_stop_rows_with_ascii_notices() -> None:
+    """The systemMessage form is the right one only on Stop: on SessionStart or UserPromptSubmit
+    plain stdout reaches the model and a systemMessage would not. ASCII, because the shim sets no
+    output encoding, so a non-ASCII notice would reach the harness in the console code page."""
+    assert len(_NOTICE_ROWS_SRC) >= 2, f"notice rows not parsed from {INSTALLER}"
+    rows = len(re.findall(r'Marker = \$\w+; Shim = "notice"', _SRC))
+    assert len(_NOTICE_ROWS_SRC) == rows, "a notice row did not parse"
+    for event, script, _var, notice in _NOTICE_ROWS_SRC:
+        assert event == "Stop", f"{script}: a notice row on {event} needs a different notice form"
+        assert notice.isascii(), f"{script}: non-ASCII notice"
 
 
 def _stop_notice_shim(settings: Path, tmp_path: Path, marker: str) -> Path:
@@ -533,15 +546,20 @@ def test_a_stop_notice_shim_says_so_as_a_system_message(
     assert f"{script} is missing from this checkout" in out["systemMessage"]
 
 
-@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
-def test_a_stop_notice_shim_is_silent_in_a_repo_that_is_not_messagefoundry(
-    settings: Path, tmp_path: Path, marker: str, script: str
+@pytest.mark.parametrize("marker", [m for m, _s in _NOTICE_ROWS])
+@pytest.mark.parametrize("where", ["foreign-repo", "not-a-repo"])
+def test_a_stop_notice_shim_is_silent_outside_a_messagefoundry_checkout(
+    settings: Path, tmp_path: Path, marker: str, where: str
 ) -> None:
-    primary = _fixture_primary(tmp_path, with_announce=False, with_presence=False)
+    if where == "foreign-repo":
+        cwd = _fixture_primary(tmp_path, with_announce=False, with_presence=False)
+    else:
+        cwd = tmp_path / "not-a-repo"
+        cwd.mkdir()
     run_installer(settings)
-    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), primary)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), cwd)
     assert proc.returncode == 0
-    assert proc.stdout.strip() == "", f"notice leaked into a foreign repo: {proc.stdout!r}"
+    assert proc.stdout.strip() == "", f"notice leaked outside MessageFoundry: {proc.stdout!r}"
 
 
 @pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
