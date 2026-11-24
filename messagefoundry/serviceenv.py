@@ -1031,25 +1031,30 @@ def _taken_out(entries: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
     return kept
 
 
-def _refused_readings(entries: Sequence[tuple[str, str]]) -> frozenset[tuple[str, str, str]]:
-    """Each refused variable :func:`_names` keeps from ``entries`` but the directory itself, as
-    ``(registry value, upper-cased name, value)``, line breaks written as one ``\\n``. Remedy
-    only."""
+def _refused_readings(variables: Sequence[_Variable]) -> frozenset[tuple[str, str, str]]:
+    """Each variable in ``variables`` whose name the refusal is about (:func:`_refused_name`),
+    as ``(registry value, upper-cased name, value)``, line breaks written as one ``\\n``. Every
+    such variable, counted or not and empty or not, since the engine may load an uncounted
+    twin's value under a name that starts with it, and erring toward a difference only leaves
+    more strings as they are. Remedy only."""
     return frozenset(
         (v.where, v.written.upper(), _LINE_BREAK.sub("\n", v.value))
-        for v in _variables(entries)
-        if v.written.upper() != _DIRECTORY_VARIABLE and _names([v])
+        for v in variables
+        if _refused_name(v.written.upper())
     )
 
 
-def _take_out_changes_refused(entries: Sequence[tuple[str, str]]) -> bool:
-    """Whether the doubt step's take-out (:func:`_taken_out`), applied to every string, changes
-    how the reader reads any refused variable: its value, its name, or whether it is read at
+def _take_out_changes_refused(
+    entries: Sequence[tuple[str, str]], variables: Sequence[_Variable]
+) -> bool:
+    """Whether the doubt step's take-out (:func:`_taken_out`), applied to every string of
+    ``entries``, which the reader read as ``variables``, changes how the reader reads any
+    refused variable (:func:`_refused_readings`): its value, its name, or whether it is read at
     all. Then a line it takes out may be part of a refused value, a store key among them, and
     the step leaves as it is each string that holds a refused variable or that one's value runs
     on into (the Lander's hold on PR 3142, comment 7116005396, F3). The remedy alone reads
     this."""
-    return _refused_readings(entries) != _refused_readings(_taken_out(entries))
+    return _refused_readings(variables) != _refused_readings(_variables(_taken_out(entries)))
 
 
 def _refused_line(line: str) -> bool:
@@ -1272,7 +1277,7 @@ def read_service_env_posture(
         nothing_to_move_names=_every_kept(variables, found, _nothing_to_move),
         directory_in_doubt=doubt,
         directory_run_on=any(v.takes_directory and _names([v]) for v in variables),
-        directory_in_refused=doubt and _take_out_changes_refused(entries),
+        directory_in_refused=doubt and _take_out_changes_refused(entries, variables),
         installer_reads_extra=any(
             where.endswith(NSSM_EXTRA_VALUE)
             and _installer_reads(entry)
@@ -1441,9 +1446,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # the directory but in a string this step leaves as it is, and the protect-key and Put
         # steps still find every refused value where it was, since this step takes out those
         # lines alone and keeps each refused variable for the steps below. It names
-        # every list it acts in, with how each is edited, since `nssm set` replaces a whole list
-        # and the service's own Environment value is no NSSM list (code review round 2 on the
-        # earlier repair). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
+        # every list it acts in, with how each is edited (code review round 2 on the earlier
+        # repair): since every refused value is still in them, through the registry cmdlets in
+        # one session, never `nssm set`, whose arguments are a command line (the Lander's hold
+        # on PR 3142, comment 7116005396, F2). It replaces the two AppEnvironmentExtra clauses of the Lander's holds
         # on PR 3142, comments 7089064404, 7089400537 and 7090314503: a string that sets the
         # directory and nothing else, or beside other lines, is now either plainly a path, and
         # so kept or listed, or in doubt (the Lander's ruling B on PR 3142's repair handback,
@@ -1459,37 +1465,36 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         steps.append(
             f"At least one entry that may set {_DIRECTORY_VARIABLE} is not one line setting it "
             "plainly to a path under that name, in ASCII with no blank around it, so first note "
-            "the path each such line names, then take "
+            "the path each such line names where it is plainly a path, then take "
             "each line that may set it out of every list, whatever its letter case, a blank "
             "around its name, or a letter outside ASCII that upper-cases to one of its letters, "
             "with each line below it in its string that the engine reads as part of its value, "
             "up to the next that names a refused variable, alone or set, or sets another "
             "variable: a name before its first equals sign with no run of 43 letters, digits, "
             "plus signs, slashes, hyphens or underscores in it, and after that sign something "
-            "besides equals signs and blanks"
+            "besides equals signs and blanks. Take out those lines alone, and keep every refused "
+            "variable and every other line where it is, for the steps below to move each value "
+            "before its entry goes: where such a line shares a registry string with other lines, "
+            "write that string back with its other lines as they were, in their order, and "
+            "leave out only a string that holds nothing else"
+            # Its own sentence, after the take-out it qualifies (the Lander's hold on PR 3142,
+            # comment 7116005396, F5).
             + (
                 ". Leave as it is each string that holds a refused variable or that a refused "
-                "variable's value runs on into, since such a line may be part of that value, "
-                "until a step below removes that variable, then take those lines out with it"
+                "variable's value runs on into, since a line there that may set "
+                f"{_DIRECTORY_VARIABLE} may be part of that value, until a step below removes "
+                "that variable, then take such lines out with it"
                 if posture.directory_in_refused
                 else ""
             )
-            + ". Take out those lines alone, and keep every refused variable and every other "
-            "line where it is, for the steps below to move each value before its entry goes: "
-            "where such a line shares a registry string with other lines, write that string "
-            "back with its other lines as they were, in their order, and leave out only a string "
-            # The lists still hold every refused value here, so they are never passed back on a
-            # command line, which reaches the shell's history, a transcript and process-creation
-            # audit events (the Lander's hold on PR 3142, comment 7116005396, F2).
-            "that holds nothing else. "
-            "No refused value may be typed on a command line, where it reaches the shell's "
-            "history, a transcript and process-creation audit events, so do not pass these lists "
-            "back with `nssm set`. Read "
-            "AppEnvironment and AppEnvironmentExtra, under Parameters in the registry key named "
-            "above, with `Get-ItemProperty`, edit those strings in that same session, and write "
-            "each back with `Set-ItemProperty -Type MultiString`, every entry kept but those "
-            "lines. The service's own Environment value is no NSSM list, and is read and written "
-            'the same way on the registry key named above: see docs/SERVICE.md, "Start / stop / '
+            + ". No refused value may be typed on a command line, where it reaches at least the "
+            "shell's history, a transcript and process-creation audit events, so do not pass "
+            "these lists back with `nssm set`. Read AppEnvironment and AppEnvironmentExtra, "
+            "under Parameters in the registry key named above, with `Get-ItemProperty` into a "
+            "variable, printing nothing, edit those strings in that same session, and write each "
+            "back with `Set-ItemProperty -Type MultiString`, every entry kept but those lines. "
+            "The service's own Environment value is no NSSM list, and is read and written the "
+            'same way on the registry key named above: see docs/SERVICE.md, "Start / stop / '
             'status"'
         )
     if moving_keys:
@@ -1514,8 +1519,11 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # line out before removing the string, since the registry may hold its only copy: a
         # retired store key, which protect-key never stores, an env-provider secret or a
         # MEFOR_VALUE_* value bound for its value file among them (the Lander's hold on PR 3142,
-        # comment 7116005396, F1). A line that may set the directory is not added back, so the
-        # installer still finds none to read.
+        # comment 7116005396, F1). It takes the strings a refused value in that string runs on
+        # into with it, so no value is left behind unnamed, and it has the list written back as
+        # the first step says, since the other refused values are still in it (code review on
+        # that repair). A line that may set the directory is not added back, so the installer
+        # still finds none to read.
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
@@ -1524,18 +1532,19 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
                 'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
                 "says how it is created"
             )
-            if doubt and posture.directory_in_refused and posture.installer_reads_extra:
+            if posture.directory_in_refused and posture.installer_reads_extra:
                 create += (
                     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra "
                     f"and starts with {_DIRECTORY_VARIABLE}= in any letter case, "
                     "install-service.ps1, which `messagefoundry service install` also runs, may "
                     "read that string as the directory the service names and print it, and drops "
-                    "it whole, so before you run the installer read out of that string every line "
-                    "it holds, remove the string with each refused variable whose value it holds, "
-                    "put each refused value you read where the steps below say, keep a retired "
-                    "key for the shell that runs `messagefoundry rotate-key`, and add each other "
-                    "line back as an entry of its own, but none that may set "
-                    f"{_DIRECTORY_VARIABLE}"
+                    "it whole, so before you run the installer read out of that string, and of "
+                    "each string a refused value in it runs on into, every line they hold, remove "
+                    "those strings with each refused variable whose value they hold, put each "
+                    "refused value you read where the steps below say, keep a retired key for the "
+                    "shell that runs `messagefoundry rotate-key`, and add each other line back as "
+                    f"an entry of its own, but none that may set {_DIRECTORY_VARIABLE}, writing "
+                    "the list back as the first step says"
                 )
             steps.append(create)
         put = [", ".join(moving_others)] if moving_others else []

@@ -204,9 +204,13 @@ def _follow_installer_clause(
     whose value it holds, and add back what the clause says to add back."""
     # Every line since the Lander's hold on PR 3142, comment 7116005396, F1; before it, each
     # value the next step puts in the secrets directory, which no store key is.
-    every_line = "read out of that string every line it holds" in clause
+    every_line = "every line it holds" in clause or "every line they hold" in clause
+    # Since code review on that repair, with each string a refused value in it runs on into.
+    with_run_on = "and of each string a refused value in it runs on into" in clause
     add_back = "add each other line back as an entry of its own" in clause
     for where, string in list(registry.entries):
+        if (where, string) not in registry.entries:
+            continue  # removed already, as a string a value ran on into
         if where != _EXTRA or not _installer_reads(string):
             continue
         holders = {
@@ -215,9 +219,18 @@ def _follow_installer_clause(
             if name not in registry.moved and registry.readable(name, moves[name])
         }
         index = registry.entries.index((where, string))
-        registry.entries.remove((where, string))
+        removed = [registry.entries.pop(index)]
+        while (
+            with_run_on
+            and index < len(registry.entries)
+            and registry.entries[index][0] == where
+            and registry.entries[index][1] in registry.runs_on_into
+        ):
+            removed.append(registry.entries.pop(index))
         lost = {name for name in holders if not registry.readable(name, moves[name])}
-        registry.read_out |= lost if every_line else lost - set(KEY_CLASS_NAMES)
+        # Read out only where its value was in a string the operator read, not left behind.
+        read = {name for name in lost if any(moves[name] in text for _w, text in removed)}
+        registry.read_out |= read if every_line else read - set(KEY_CLASS_NAMES)
         # A refused variable whose value it held goes with it: the string before it, when that
         # is the refused name set to nothing that ran on into it.
         if index and registry.entries[index - 1][1].partition("=")[2] == "":
@@ -230,7 +243,8 @@ def _follow_installer_clause(
             # the clause says, none that may set the directory.
             others = [
                 line
-                for line in _LINE_BREAK.split(string)
+                for _where, text in removed
+                for line in _LINE_BREAK.split(text)
                 if line.strip()
                 and not _names_refused(line, refused)
                 and not any(secret in line for secret in moves.values())
@@ -430,6 +444,20 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_A": _KEY_B64},
         False,
     ),
+    # Code review on that repair: the whole-string twin of a name broken by a line break holds
+    # the directory line in its value. It is uncounted, since a later line sets a kept name, but
+    # the engine may still load it, so the take-out changing it leaves the string as it is.
+    "uncounted-twin-holds-a-directory-line": (
+        [
+            (
+                _EXTRA,
+                "MEFOR_VALUE_A\nMEFOR_SECRETS_DIRECTORY=SEKRITvalueA\nMEFOR_VALUE_B=SEKRITvalueB",
+            )
+        ],
+        frozenset(),
+        {"MEFOR_VALUE_A": "SEKRITvalueA", "MEFOR_VALUE_B": "SEKRITvalueB"},
+        False,
+    ),
 }
 
 
@@ -502,6 +530,11 @@ def test_no_step_has_a_refused_value_passed_back_on_a_command_line(case: str) ->
         ), sentence
     if posture.directory_in_doubt:
         assert NO_COMMAND_LINE in _doubt_step(steps)
+    # The installer clause edits a list that still holds the other refused values, so it writes
+    # it back the first step's way (code review on that repair).
+    for sentence in steps:
+        if sentence.startswith(_INSTALLER_CLAUSE):
+            assert sentence.endswith("writing the list back as the first step says"), sentence
 
 
 def test_the_doubt_step_takes_key_text_below_a_directory_line_out_with_it() -> None:
