@@ -994,26 +994,29 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
 
 def _read_expr_end(ctx: _Ctx, i: int, stops: str) -> tuple[int, bool]:
     """:func:`_expr_end` with its stop set, and whether that end was read: False where a bracket
-    opened in the expression is never closed, so the end of the file is a guess rather than its
-    end. A statement passes ``stops=";"``: a top-level ``,`` does not end one."""
+    opened in the expression is never closed, at the end of the file or by a closer of another
+    kind, so the end is a guess. A statement passes ``stops=";"``: a top-level ``,`` does not end
+    one."""
     masked, raw = ctx.masked, ctx.code
-    depth = 0
+    opened: list[str] = []
+    read = True
     for j in range(i, len(masked)):
         c = masked[j]
         if c in _PAIRS:
-            depth += 1
+            opened.append(c)
         elif c in _CLOSERS:
-            if depth == 0:
-                return j, True
-            depth -= 1
-        elif depth == 0 and c in stops:
-            return j, True
-        elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
+            if not opened:
+                return j, read
+            # `f(` closed by an enclosing block's `}`: the same end as before, but not a read one.
+            read = read and opened.pop() == _OPENERS[c]
+        elif not opened and c in stops:
+            return j, read
+        elif not opened and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             last = i + len(raw[i:j].rstrip()) - 1
             if nxt is None or not _continues(ctx.ends.get(last, _VALUE), raw, nxt.start()):
-                return j, True
-    return len(masked), depth == 0
+                return j, read
+    return len(masked), read and not opened
 
 
 def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:

@@ -1665,6 +1665,8 @@ def test_a_byte_order_mark_anywhere_is_whitespace(mod: ModuleType) -> None:
         # an unclosed bracket in a brace-less body: the rest of the file was a known extent
         "for (const r of [1, 2]) x = f(\nawait agent('a')\nawait agent('b')\n",
         "for (const r of [1, 2]) x = [1,\nawait agent('a')\n",
+        # the same unclosed `f(`, closed by an enclosing block's `}`
+        "{ for (const r of [1, 2]) x = f(\nawait agent('a') }\nawait agent('b')\n",
     ],
 )
 def test_an_unread_loop_shape_is_a_floor_not_a_count(mod: ModuleType, source: str) -> None:
