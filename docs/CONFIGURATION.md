@@ -1604,6 +1604,16 @@ by the engine once per worker start, so a sandboxed `code_set(...)` always resol
 engine itself is serving — an unreloaded edit to `codesets/` changes nothing until you reload, exactly
 as with `mode=off`.
 
+**XML signature verification does not run in a sandbox worker.** With `mode` set to `subprocess` or
+`isolated`, a Router, Handler or `accepts=` predicate that calls `verify()` from
+`messagefoundry.parsing.xml` gets a `SandboxError`, because `verify()` imports `cryptography` and the
+worker's forbidden-import guard blocks it. The import fails closed: left uncaught, the error fails
+that message's call as an isolation denial, and nothing about it gets around the guard.
+`mode="off"`, the default, is unaffected. The only workaround today is `mode="off"`, which is
+engine-wide: it takes the process boundary away from every Router and Handler, not only the one
+that verifies, so it is not recommended for a graph that carries PHI. The fix is tracked in vault
+BACKLOG #6812.
+
 **What this boundary does NOT cover.** It confines the *address space*, not the machine: a sandboxed
 Router/Handler can still import `os`/`subprocess`/`ctypes`, open files, and spawn processes as the
 service account — the forbidden-import guard is defence-in-depth (a module imported before it is
