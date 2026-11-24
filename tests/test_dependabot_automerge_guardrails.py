@@ -30,8 +30,8 @@ track -- disjoint sets. #2's step does hold a PR the allow-set would pass (an un
 reported as ``security_track=true`` with ``advisory_ok=false``). The confirming halves are tested as FORWARD
 guards, so that populating a Python allow row later is a one-line change to a control that already works, not
 a control to be written
-under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins only the age step's allow-set
-gate, one conjunct of #4's inertness; it pins nothing about #2.
+under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins only that the age step is
+skipped for a PR the allow-set holds; it pins nothing about #2.
 """
 
 from __future__ import annotations

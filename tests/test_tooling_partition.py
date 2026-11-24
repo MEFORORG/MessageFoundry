@@ -251,7 +251,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # security/risky-component-readings.json, security/bundled-code-survey.json and harness/**.py.
         # And the tooling tier does not run in the merge queue. Listed as tooling this would be dropped by
         # `-m 'not tooling'` on the engine legs and reached only when the path gate happens to match,
-        # so a PR that added an unclassified dependency could face nothing, which is the one thing
+        # so a PR that edited only those paths could face nothing, which is the one thing
         # the designation exists to prevent (BACKLOG #1189).
         "test_risky_component_designation.py",
         "test_sandbox_worker_logging.py",
