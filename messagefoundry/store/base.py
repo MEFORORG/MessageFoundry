@@ -5566,9 +5566,11 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     loop's task type). On a task without it nothing can be checked, and one WARNING says the check
     is off. Each caller then keeps what it did before BACKLOG #5686: with ``defer_unknown`` (the
     warm-up) the cancel is put off one loop turn with ``call_soon(borrow.cancel)``, and without it
-    (:func:`acquire_pooled`) the borrow is cancelled at once. On such a task type the deferred cancel
-    loses a hand-over resolved after the cancel is scheduled, and the immediate one loses a hand-over
-    whose borrow wake-up is already scheduled.
+    (:func:`acquire_pooled`) the borrow is cancelled at once. On such a task type each can lose a
+    hand-over, at least: the deferred cancel one resolved after the cancel is scheduled, or one the
+    driver takes more than a step to finish; the immediate cancel one whose borrow wake-up is
+    already scheduled. The WARNING covers the borrow's own task type only: a nested task without
+    ``_fut_waiter`` counts as in flight (:func:`_value_in_flight`) with no log line.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5707,7 +5709,8 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     loop turn the borrow resolves, and then the append never runs; awaiting the hand-off directly would
     discard the connection there, because a pending cancel is thrown in instead of the resolved value.
     So the cancel path hands the borrow to the cleanup and cancels it through :func:`_cancel_borrow`,
-    which puts the cancel off while a value is on its way into the borrow. The cleanup releases each abandoned
+    which puts the cancel off while a value is on its way into the borrow (on a task type it
+    cannot read, one turn unchecked). The cleanup releases each abandoned
     borrow's connection as soon as that borrow lands, under the same deadline as the other releases,
     so a borrow that lands is not kept waiting on a sibling still stuck; it attaches
     :func:`_salvage_late_borrow` to any borrow still pending at the deadline, and a borrow is returned

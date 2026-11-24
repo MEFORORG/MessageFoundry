@@ -208,8 +208,9 @@ async def test_warm_borrow_landing_after_the_bound_is_released_exactly_once(
 
 async def test_the_task_exposes_the_waiter_the_borrow_cancel_reads() -> None:
     # _cancel_borrow reads Task._fut_waiter to tell a borrow parked on the pool from one whose
-    # hand-over is in flight. Without the attribute it puts every cancel off one turn unchecked, so a
-    # hand-over resolved after the cancel is scheduled can be lost; a Python that drops it fails here.
+    # hand-over is in flight. Without the attribute each caller falls back to its pre-#5686 cancel
+    # (the warm-up one turn later, acquire_pooled at once) unchecked, so a hand-over can be lost; a
+    # Python that drops it fails here.
     fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
 
     async def _parked() -> str:
