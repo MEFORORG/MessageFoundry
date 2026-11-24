@@ -612,13 +612,18 @@ async def seal_chunks(
       cut at :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64, the cost
       ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch
       is one request. A value over the character bound is a chunk of its own. A chunk Transit
-      answers with HTTP 400 is sent value by value, up to one request per value more, while the
-      seal's transaction waits.
+      refuses (at least an HTTP 400, a 413, or a reply without its ``reference`` echo) is sent
+      value by value inside the one call, up to one request per value more, while the seal's
+      transaction waits. A cancelled seal can then leave up to :data:`BATCH_MAX_ITEMS` values
+      running on in the Transit pool.
     - A cipher whose calls wait on I/O and that sends values alone gets one value per chunk, so
-      each request is followed by its write.
-    - Any other cipher, such as in-process AES-GCM, is cut at :data:`BATCH_MAX_ITEMS` values, so a
-      store writes a page of rows per call. Neither of the last two is sized, so no sizing copy of
-      its plaintext is made.
+      each call is followed by the chunk's write, unless the cipher stops batching between the cut
+      and the call.
+    - Any other cipher, such as in-process AES-GCM, is cut at :data:`BATCH_MAX_ITEMS` values, so
+      the SQLite store writes up to that many rows per ``_update_every_row`` call.
+
+    Only the first case is sized here. The cipher itself may still measure a value:
+    ``TransitCipher.encrypt_many`` sizes every value, alone or not.
 
     Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as that
     does."""

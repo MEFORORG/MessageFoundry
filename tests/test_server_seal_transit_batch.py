@@ -323,8 +323,9 @@ class _LoggedMssqlCursor(_MssqlCursor):
 
 @pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
 async def test_a_single_value_cipher_writes_each_value_before_the_next_call(backend: str) -> None:
-    """A cipher with no batch path gets one value per chunk, so on the server stores each encrypt
-    is followed by its write. A Transit cipher sending values alone is not covered by this."""
+    """A cipher with no batch path whose calls wait on I/O gets one value per chunk, so on the
+    server stores each encrypt is followed by its write. An in-process cipher is not covered by
+    this, and the real Transit cipher sending alone is covered only at the chunk level."""
     log: list[str] = []
     store: PostgresStore | SqlServerStore
     if backend == "postgres":
@@ -397,7 +398,7 @@ async def test_a_vault_400_leaves_batching_on_and_chunks_batched() -> None:
     assert transit.encrypt_requests == 2 + _ROWS
 
 
-async def test_the_sqlite_seal_writes_a_page_of_rows_per_update_under_aes_gcm(
+async def test_the_sqlite_seal_writes_many_rows_per_update_under_aes_gcm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An in-process cipher is cut by count, so the SQLite seal writes up to ``BATCH_MAX_ITEMS``
