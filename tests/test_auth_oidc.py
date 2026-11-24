@@ -444,10 +444,8 @@ def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> Non
 
 # --- claims: azp is checked whenever present, and a malformed aud array is refused (BACKLOG #5339) --
 #
-# OpenID Connect Core 1.0, ID Token Validation, item 5 (a SHOULD, and narrowed by errata set 2): a
-# present azp is our client_id. The engine takes the stricter reading and refuses any other azp,
-# whatever the audience count. RFC 7519 section 4.1.3: aud is a string or an array of strings, so a
-# non-string element is malformed; the engine also refuses an empty audience, by choice.
+# What is refused, what is still accepted, and the spec items behind it: the comments above the aud
+# and azp checks in messagefoundry/auth/oidc/claims.py (_check_core_claims).
 
 _ABSENT = object()
 
