@@ -168,8 +168,9 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
     process with ``MALLOC_ARENA_MAX=2``. A live thread's stack counts too, and glibc keeps up to
     about 40 MiB of exited threads' stacks mapped for reuse.
     In at least these cases ``mem_mb`` stays an absolute ``RLIMIT_AS`` cap, and a log line says so:
-    a POSIX kernel other than Linux, Linux before 4.7, a release with no readable ``major.minor``,
-    and no ``VmData``. A ``setrlimit`` that fails is logged and leaves no memory cap."""
+    a ``uname`` that does not name Linux, Linux before 4.7, a release with no readable
+    ``major.minor``, and no ``VmData``. A ``setrlimit`` that fails is logged and sets no cap of this
+    worker's own; a limit it inherited still applies."""
     try:
         import resource
     except ImportError:

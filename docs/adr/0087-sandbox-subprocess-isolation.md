@@ -184,8 +184,8 @@ memory rose about 8 MiB.
    > whose `uname` sysname is not Linux, Linux before 4.7, a kernel release with no readable
    > leading `major.minor`, and no `VmData` in `/proc/self/status`. A suffixed two-component
    > release such as `6.12-rc4` now reads its `major.minor`, where it used to read as
-   > unparseable. Windows gets no memory cap, and a `setrlimit` that fails is logged and leaves
-   > the worker with no memory cap; neither changed.
+   > unparseable. Windows gets no memory cap, and a `setrlimit` that fails is logged and sets no
+   > cap of the worker's own, though a limit it inherited still applies; neither changed.
 4. A `MemoryError` while the worker runs a call or encodes its result is answered with a `fail`
    frame of kind `memory`, which names the cap. The worker then exits, and the parent reaps it, so
    memory the call left held cannot fail a later message. The parent reports that the call ran
