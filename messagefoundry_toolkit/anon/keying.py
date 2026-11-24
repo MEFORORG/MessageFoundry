@@ -125,8 +125,8 @@ def _estimated_entropy_bits(salt: str) -> float:
     identically, so ``string.ascii_letters[:32]`` measures a full 160.00 bits at the 32-character
     length floor -- the arithmetic maximum for 32 characters -- and passes, despite being one of
     the first strings any attacker would try. A repeated cycle such as "abcd" eight times measures
-    exactly 64.00 bits and also passes. This check therefore catches a salt that is visibly DEGENERATE; it cannot
-    certify that a salt is unpredictable, and nothing short of generating the salt ourselves could.
+    exactly 64.00 bits and also passes. This check therefore catches a salt that is visibly
+    DEGENERATE; it cannot certify that a salt is unpredictable, and nothing short of generating the salt ourselves could.
     The real defence stays where ADR 0030 section 4 puts it: an env-supplied secret from a random
     generator. This is the floor under that, not a substitute for it.
 
@@ -137,6 +137,10 @@ def _estimated_entropy_bits(salt: str) -> float:
     same run returned NON-ZERO at higher floors (at 40 bits the same four alphabets rejected 0, 2,
     306 and 11,066 of 200,000), so the instrument can fire. A 40-bit floor would refuse better than
     5 percent of genuinely random 16-digit salts, which is refusing real secrets.
+
+    The two paragraphs above and the next heading describe the screen under the former 16-character
+    length floor. At 32 characters the per-character floor decides every refusal, which there means
+    under 64 bits in total; the 32-bit total only picks the message (see MIN_SALT_ENTROPY_BITS).
 
     32 BITS STILL REFUSES A SMALL SHARE OF REAL RANDOM SALTS, AND THAT IS ACCEPTED. This is the
     source of record for the rate; docs/PHI.md section 9 and the tests point here. BACKLOG #3359
@@ -155,8 +159,9 @@ def _estimated_entropy_bits(salt: str) -> float:
     higher: 2.76e-4 for 16 decimal digits and 2.51e-6 for ``secrets.token_hex(8)``. The length floor
     now refuses those shapes before this screen reads them. The stated bound is UNDER 1 IN 1,000
     for random decimal salts that clear the length floor, since the rate only falls with length.
-    ``tests/test_anon_core.py`` pins the rates above by the same enumeration, run through
-    ``Keyer`` itself, and holds the bound and the 32-character URL-safe shape with seeded sweeps.
+    ``tests/test_anon_core.py`` pins the decimal and hex rates above by the same enumeration, run
+    through ``Keyer`` itself, and holds the 32-character URL-safe shape with a seeded sweep; no
+    test pins the URL-safe rate itself.
     An operator refused with a real random salt replaces it with one from
     ``secrets.token_urlsafe(24)``.
     """
@@ -223,7 +228,8 @@ class Keyer:
             )
         # Checked SEPARATELY from the total, because the total is length-scaled and length would
         # otherwise rescue a degenerate pattern -- "ab" repeated sixteen times reaches the 32-bit
-        # total on 1.00 bits per character. Both floors bind; neither substitutes for the other.
+        # total on 1.00 bits per character. At the 32-character length floor this check refuses
+        # every salt the total refuses too, so the total only decides which message is raised.
         per_char = entropy / len(salt)
         if per_char < MIN_SALT_ENTROPY_BITS_PER_CHAR:
             raise ValueError(

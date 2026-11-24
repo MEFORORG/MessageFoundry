@@ -830,7 +830,7 @@ def test_real_generated_salts_are_still_accepted() -> None:
 
     Each salt is a FIXED draw from the generator its comment names, not a fresh one. This test drew
     fresh salts until BACKLOG #3359, and failed a required CI leg whenever a 16-digit draw landed in
-    the share the screen refuses. The rate itself is pinned by the seeded sweep below."""
+    the share the screen refuses. The rates are pinned by the exact enumeration below."""
     for salt in (
         "oaBlx5VtWT4i_Sl2FfajqZcqhvFiVeGZ",  # secrets.token_urlsafe(24), the recommended generator
         # secrets.token_hex(8) is refused by the 32-character length floor (BACKLOG #4652).
@@ -840,7 +840,8 @@ def test_real_generated_salts_are_still_accepted() -> None:
         Keyer(salt)  # must not raise
 
 
-#: Draws per alphabet in the seeded sweep: enough to see the decimal refusals, under a second to run.
+#: Draws per alphabet in the seeded sweep. At the 32-character length floor it sees no decimal
+#: refusal; the exact enumeration below pins the rate.
 _SWEEP_DRAWS = 20_000
 
 #: The stated bound on refusing a genuinely random decimal salt, under 1 in 1,000. The source of
@@ -949,9 +950,10 @@ def test_seeded_sweep_never_refuses_the_recommended_generator() -> None:
 
 
 def test_the_two_floors_are_independent() -> None:
-    """Neither floor substitutes for the other, so both must be able to fire alone. A single
-    repeated character fails the TOTAL (0 bits); a two-symbol pattern long enough to clear the
-    total fails the RATE. If one message could serve both, one floor would be redundant. Each
+    """Each floor's message must be reachable. A single repeated character fails the TOTAL
+    (0 bits); a two-symbol pattern long enough to clear the total fails the RATE. At the
+    32-character length floor the rate floor refuses everything the total does, so the total
+    decides only which message is raised (BACKLOG #4652), and this pins the two messages. Each
     message must also name the generator the sweep above holds at zero refusals, and send a
     refused random salt to it rather than to another draw from the same alphabet."""
     generator = r"[\s\S]*secrets\.token_urlsafe\(24\)[\s\S]*not another draw from the same alphabet"
