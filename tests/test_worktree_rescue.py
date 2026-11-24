@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from tests._no_prompt import run_holding_stdin_open
+from tests._spawn_lock import single_spawn
 
 _RESCUE = Path(__file__).resolve().parents[1] / "scripts" / "worktree" / "rescue.ps1"
 
@@ -31,9 +32,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+# An inherited GIT_DIR or GIT_WORK_TREE would point every git call here, and the copied script's, at the
+# repository it names instead of the throwaway one; strip them so the real checkout stays out of reach.
+_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=_ENV
     ).stdout
 
 
@@ -54,6 +60,7 @@ def test_a_call_without_name_refuses_instead_of_prompting(tmp_path: Path) -> Non
             "-NoInstall",
         ],
         cwd=repo,
+        env=_ENV,
     )
     assert rc != 0, "a rescue naming no worktree must be refused"
     assert "-Name" in err, err
@@ -118,29 +125,33 @@ def _push_foreign(repo: Path) -> str:
     return _stash_entries(repo)[0][0]
 
 
-def _rescue(repo: Path, name: str, *, concurrent: bool = False) -> subprocess.CompletedProcess[str]:
-    env = dict(os.environ)
+def _rescue(
+    repo: Path, name: str, *, concurrent: bool = False, extra_env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = dict(_ENV)
     env.pop("RESCUE_TEST_CONCURRENT_PUSH", None)
     if concurrent:
         env["RESCUE_TEST_CONCURRENT_PUSH"] = "1"
-    return subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-File",
-            str(repo / "scripts" / "worktree" / "rescue.ps1"),
-            "-Name",
-            name,
-            "-NoInstall",
-        ],
-        cwd=repo,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=50,
-        check=False,
-    )
+    env.update(extra_env or {})
+    with single_spawn():
+        return subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-File",
+                str(repo / "scripts" / "worktree" / "rescue.ps1"),
+                "-Name",
+                name,
+                "-NoInstall",
+            ],
+            cwd=repo,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=50,
+            check=False,
+        )
 
 
 def _make_work(repo: Path) -> None:
@@ -231,3 +242,32 @@ def test_a_linked_worktrees_copy_refuses_and_moves_nothing(tmp_path: Path) -> No
     assert (linked / "work.txt").read_text(encoding="utf-8") == "a linked worktree's own work\n"
     assert _stash_entries(repo) == []
     assert not (tmp_path / "linked-fromlinked").exists()
+
+
+def test_an_existing_branch_of_that_name_is_refused_before_the_stash(tmp_path: Path) -> None:
+    """new.ps1 reuses an existing branch and ignores -Base, so the work would land on another commit."""
+    repo = tmp_path / "repo"
+    _seed(repo)
+    _commit_all(repo)
+    _git(repo, "branch", "taken")
+    _make_work(repo)
+
+    proc = _rescue(repo, "taken")
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "already exists" in proc.stderr + proc.stdout
+    assert _stash_entries(repo) == []
+    assert (repo / "work.txt").is_file()
+
+
+def test_an_inherited_git_redirect_is_refused(tmp_path: Path) -> None:
+    """GIT_DIR naming the primary's .git would also pass a linked copy off as the primary."""
+    repo = tmp_path / "repo"
+    _seed(repo)
+    _commit_all(repo)
+    _make_work(repo)
+
+    proc = _rescue(repo, "redir", extra_env={"GIT_DIR": str(repo / ".git")})
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "GIT_DIR" in proc.stderr + proc.stdout
+    assert _stash_entries(repo) == []
+    assert (repo / "work.txt").is_file()
