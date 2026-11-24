@@ -1,18 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The anonymizer salt's length floor, stated in bytes, and refusals that withhold the salt (BACKLOG #4652).
+"""The anonymizer salt's length floor and refusals that withhold the salt (BACKLOG #4652).
 
-The keyer refuses a salt under 16 bytes, the length of a 128-bit key. Both copies of the keyer are
-held to it: the toolkit's and the one vendored into the tee. Each refusal names the floor, and the
-tee's names the setting the salt came from, without quoting any of the salt. A salt that cannot be
-UTF-8 encoded, as an undecodable byte in an environment variable becomes, is refused without the
-offending character in the message or the traceback.
+Both copies of the keyer are held: the toolkit's and the one vendored into the tee. A salt under
+16 bytes is refused (the 16-character floor implies it). A salt that cannot be UTF-8 encoded, as an
+undecodable byte in an environment variable becomes, is refused with a message that quotes none of
+it and with an empty exception chain: the codec's own error keeps the whole salt on ``.object``.
+The tee's refusal names the variable the salt came from.
+
+What these tests do not cover: the refusing frame's locals still hold the salt, so a traceback
+renderer that captures locals would print it.
 """
 
 from __future__ import annotations
 
 import importlib
-import traceback
+import os
 from types import ModuleType
 
 import pytest
@@ -26,6 +29,9 @@ from tests._tee_seed import seed_capture as _seed_capture
 _SALT_16 = "Q7xZ9vK2mP4wR8tN"
 _SALT_15 = _SALT_16[:15]
 
+#: What os.environ makes of an undecodable 0xFF byte on POSIX (surrogateescape).
+_UNDECODABLE = "\udcff"
+
 
 @pytest.fixture(params=["messagefoundry_toolkit.anon.keying", "tee.anon.keying"])
 def keying(request: pytest.FixtureRequest) -> ModuleType:
@@ -38,18 +44,12 @@ def _no_run_of(secret: str, text: str, width: int = 3) -> None:
         assert secret[i : i + width] not in text, f"refusal quotes part of the salt at {i}"
 
 
-def test_the_byte_floor_is_128_bits(keying: ModuleType) -> None:
-    assert keying.MIN_SALT_BYTES == 16
-
-
-def test_a_15_byte_salt_is_refused_naming_the_floor(keying: ModuleType) -> None:
+def test_a_15_byte_salt_is_refused_without_quoting_it(keying: ModuleType) -> None:
     assert len(_SALT_15.encode("utf-8")) == 15
     with pytest.raises(ValueError) as exc:
         keying.Keyer(_SALT_15)
-    text = str(exc.value)
-    assert "16 bytes" in text
-    assert "128-bit" in text
-    _no_run_of(_SALT_15, text)
+    assert str(keying.MIN_SALT_LEN) in str(exc.value)
+    _no_run_of(_SALT_15, str(exc.value))
 
 
 def test_a_16_byte_salt_is_accepted(keying: ModuleType) -> None:
@@ -57,17 +57,17 @@ def test_a_16_byte_salt_is_accepted(keying: ModuleType) -> None:
     keying.Keyer(_SALT_16)
 
 
-def test_an_unencodable_salt_is_refused_without_its_character(keying: ModuleType) -> None:
-    # "\udcff" is what os.environ makes of an undecodable 0xFF byte on POSIX (surrogateescape).
-    salt = _SALT_16 + "\udcff"
+def test_an_unencodable_salt_is_refused_with_an_empty_chain(keying: ModuleType) -> None:
+    salt = _SALT_16 + _UNDECODABLE
     with pytest.raises(ValueError) as exc:
         keying.Keyer(salt)
+    # A UnicodeEncodeError is a ValueError and keeps the whole salt on .object.
     assert not isinstance(exc.value, UnicodeError)
-    assert exc.value.__context__ is None and exc.value.__cause__ is None
-    rendered = "".join(traceback.format_exception(exc.value))
-    for form in ("\udcff", "\\udcff", "0xff", "dcff"):
-        assert form not in rendered
-    _no_run_of(_SALT_16, rendered)
+    assert exc.value.__context__ is None
+    assert exc.value.__cause__ is None
+    text = str(exc.value)
+    assert _UNDECODABLE not in text and "dcff" not in text
+    _no_run_of(_SALT_16, text)
 
 
 def test_the_tee_refusal_names_the_setting_and_withholds_the_salt(
@@ -80,6 +80,23 @@ def test_the_tee_refusal_names_the_setting_and_withholds_the_salt(
     assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 1
     err = capsys.readouterr().err
     assert "MEFOR_ANON_SALT" in err
-    assert "16 bytes" in err
     _no_run_of(_SALT_15, err)
+    assert not out.exists()
+
+
+def test_the_tee_refuses_an_undecodable_salt_without_quoting_it(
+    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A plain dict stands in for os.environ: Windows cannot hold a lone surrogate in its
+    # environment, and this is the value POSIX would hand the tee for a stray 0xFF byte.
+    db = str(tmp_path / "tee.db")
+    _seed_capture(db, SYNTHETIC_ADT.encode("latin-1"))
+    salt = _SALT_16 + _UNDECODABLE
+    monkeypatch.setattr(os, "environ", {**os.environ, "MEFOR_ANON_SALT": salt})
+    out = tmp_path / "ds.jsonl"
+    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 1
+    err = capsys.readouterr().err
+    assert "MEFOR_ANON_SALT" in err
+    assert _UNDECODABLE not in err and "dcff" not in err
+    _no_run_of(_SALT_16, err)
     assert not out.exists()

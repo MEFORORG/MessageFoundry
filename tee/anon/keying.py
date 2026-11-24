@@ -34,14 +34,12 @@ _DIGEST_SIZE = 16
 #: A salt shorter than this is almost certainly a placeholder/typo, not a real secret. The CLI
 #: boundaries source it from the environment and should pass a high-entropy value; we refuse an
 #: obviously-weak salt rather than emit guessable surrogates (fail closed, ADR 0030 §4).
+#:
+#: UTF-8 spends at least one byte on a character, so this also refuses every salt under 16 bytes.
+#: It is NOT a 128-bit floor, and BACKLOG #4652 names 128 bits as the floor the salt should meet:
+#: ``secrets.token_hex(8)`` is 16 characters carrying 64 bits and passes, and so does
+#: ``"abcdefghijklmnop"``. Nothing here enforces 128 bits; see the note above ``_GENERATE_ADVICE``.
 MIN_SALT_LEN = 16
-
-#: The same floor in BYTES: 16, the length of a 128-bit key (BACKLOG #4652). UTF-8 spends at least
-#: one byte on every character, so the character floor above already holds every salt to it, and
-#: no separate check is made. It is a floor on the key's LENGTH, not on its entropy: sixteen bytes
-#: of text drawn from a narrow alphabet carry far fewer than 128 bits, and the entropy floors below
-#: are a screen, not a measurement of that either (see the note above ``_GENERATE_ADVICE``).
-MIN_SALT_BYTES = MIN_SALT_LEN
 
 #: Floor on the salt's ESTIMATED entropy, in bits. Length alone is not strength: sixteen copies of
 #: the letter "a" clears ``MIN_SALT_LEN`` and is guessable on the first try, so the length floor
@@ -171,14 +169,14 @@ class Keyer:
     def __init__(self, salt: str) -> None:
         if len(salt) < MIN_SALT_LEN:
             raise ValueError(
-                f"anonymizer salt is too short: it must be at least {MIN_SALT_LEN} characters, "
-                f"so at least {MIN_SALT_BYTES} bytes, the length of a 128-bit key. Length is not "
-                f"entropy. {_GENERATE_ADVICE}"
+                f"anonymizer salt must be a secret of at least {MIN_SALT_LEN} characters "
+                "(ADR 0030 §4: pinned-per-dataset secret, env-supplied, never committed)"
             )
-        # The codec's own error quotes the character it could not encode, and on POSIX that
-        # character is a byte of the salt (os.environ maps an undecodable byte to a lone
-        # surrogate). So the refusal is raised OUTSIDE the handler: raised inside it, even
-        # ``from None`` would keep the codec error as ``__context__``, where it can still be read.
+        # The codec's own error keeps the WHOLE salt on its ``.object`` and quotes the character it
+        # could not encode in its message; on POSIX that character is a byte of the salt, since
+        # os.environ maps an undecodable byte to a lone surrogate. So the refusal is raised OUTSIDE
+        # the handler: raised inside it, even ``from None`` would keep the codec error, and the salt
+        # with it, as ``__context__`` (BACKLOG #4652; tests/test_from_none_is_not_redaction.py).
         encoded: bytes | None
         try:
             encoded = salt.encode("utf-8")
@@ -186,8 +184,9 @@ class Keyer:
             encoded = None
         if encoded is None:
             raise ValueError(
-                "anonymizer salt is not valid text: it holds a character UTF-8 cannot encode, "
-                f"such as a byte the environment could not decode. {_GENERATE_ADVICE}"
+                "anonymizer salt holds a character UTF-8 cannot encode, such as a byte the "
+                "environment could not decode. Generate one with secrets.token_urlsafe(24) and "
+                "supply it from the environment. The salt itself is withheld from this message."
             )
         if len(encoded) > MAX_SALT_BYTES:
             raise ValueError(
