@@ -4048,10 +4048,11 @@ space padding is dropped, and a `(0002,0003)` that does not lie within the first
 read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`, up to the first element
 outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` ignores a wrong one
 too. The data set read puts back the SCU's ignores for `pydicom` warnings that would name a value,
-and an installed `pydicom` that lacks a reader the deflate guard replays makes the send raise an
-internal error instead of returning `unconfirmed-202`. Unlike the SCU, where the same fault
-raises before anything is sent, here it raises after the partner has answered, so the partner
-may hold the instance. The data set is read only when the reply names some instance. The data set UID is read
+and an installed `pydicom` that lacks a reader the deflate guard replays is **refused when the
+connection is built**, naming the connection; an absent `pydicom` is not refused. The data set
+read itself does not raise after the partner has answered: a fault it meets is logged and read
+as no data set UID. The data set is read only when the reply names some instance by a UID in the
+grammar above. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is

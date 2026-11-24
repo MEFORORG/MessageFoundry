@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import http.client
 import importlib.util
 import logging
@@ -433,9 +434,25 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
     return None, _META_NO_0003
 
 
+@functools.cache
 def _dicom_extra_installed() -> bool:
-    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host."""
+    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host. Cached: it
+    cannot change within the process, and a miss would scan ``sys.path`` on every call."""
     return importlib.util.find_spec("pydicom") is not None
+
+
+def _refuse_a_broken_dicom_extra(connection: str | None) -> None:
+    """Refuse the build when ``pydicom`` is importable but lacks a reader the deflate guard replays
+    (:func:`~messagefoundry.parsing.dicom._deps.load_header_readers`), so the data set read can
+    never meet that fault after a partner has answered a 202. An absent ``pydicom`` is not refused:
+    a 202 is then compared with the File Meta UID alone (BACKLOG #5914). Names the connection and
+    the readers, never a value."""
+    if not _dicom_extra_installed():
+        return
+    try:
+        load_header_readers()
+    except RuntimeError as exc:
+        raise ValueError(f"{hop_name_prefix(connection)}DICOMweb destination: {exc}") from exc
 
 
 def _data_set_instance_uid(obj: bytes) -> str | None:
@@ -447,24 +464,27 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     from this UID, so a 202 for an object whose File Meta was not rewritten after a re-UID still
     names it (BACKLOG #5914).
 
-    An installed pydicom that lacks a reader the deflate guard replays is treated as a deploy error,
-    as the SCU treats it: :func:`~messagefoundry.parsing.dicom._deps.load_header_readers` raises
-    its :class:`RuntimeError` here, outside the handler, so the send fails with it rather than
-    returning an ``unconfirmed-202`` refusal. Unlike the SCU's, it raises after the partner has
-    answered, and only for a 202 that reaches the data set read. The SCU's
-    ignores for pydicom's value warnings, which name a value, are put back first before the read.
-    A parse failure is logged by exception class only, never the UID or the bytes (PHI-safe)."""
+    It runs after the partner has answered, so it never raises: a broken extra is refused when the
+    connection is built (:func:`_refuse_a_broken_dicom_extra`), and a :class:`RuntimeError` the
+    read meets anyway is logged at WARNING and read as no UID. The SCU's ignores for pydicom's
+    value warnings, which name a value, are put back first before the read. A failure is logged by
+    exception class only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
         logger.debug(
             "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
         )
         return None
     _ignore_pydicom_value_warnings()
-    load_header_readers()
     try:
         uid = DicomPeek.parse(obj).sop_instance_uid
     except DicomError as exc:
         logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
+        return None
+    except RuntimeError as exc:
+        logger.warning(
+            "DICOMweb: the [dicom] extra failed reading a data set SOP Instance UID (%s)",
+            type(exc).__name__,
+        )
         return None
     if uid is None:
         return None
@@ -475,10 +495,9 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
 def _named_uid(item: Any) -> str | None:
     """The UID a ReferencedSOPSequence item names, padding dropped, or ``None``: a dataset whose
     ReferencedSOPInstanceUID element has ``vr`` ``UI``, passes :func:`_element_values`, and holds
-    exactly one value (the attribute's VM is 1) that is a string, with trailing NUL or space
-    padding, which a binary-to-JSON converter can leave, dropped. It is compared only with a sent
-    UID that has passed :func:`_is_uid`, so equality also holds it to that grammar. Anything else
-    names nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
+    exactly one value (the attribute's VM is 1), a string that passes :func:`_is_uid` once
+    trailing NUL or space padding, which a binary-to-JSON converter can leave, is dropped.
+    Anything else names nothing (BACKLOG #5914). The UID is compared, never logged (PHI-safe)."""
     if not isinstance(item, dict):
         return None
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
@@ -487,7 +506,8 @@ def _named_uid(item: Any) -> str | None:
     value = _element_values(element)
     if value is None or len(value) != 1 or not isinstance(value[0], str):
         return None
-    return value[0].rstrip("\0 ")
+    uid = value[0].rstrip("\0 ")
+    return uid if _is_uid(uid) else None
 
 
 def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | None:
@@ -546,9 +566,8 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
     """The ``unconfirmed-202`` refusal for a 202 whose ReferencedSOPSequence items are
     ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID
     (:func:`_sent_instance_uid`) or, failing that, its data set's SOP Instance UID
-    (:func:`_data_set_instance_uid`). The data set is read only when some item names a string as
-    its instance, since with none its UID cannot change the verdict; a string outside the UID
-    grammar still counts. With no UID to compare, the reason names why the File Meta has none, and
+    (:func:`_data_set_instance_uid`). The data set is read only when some item names a UID in
+    the grammar :func:`_is_uid` checks, since with none its UID cannot change the verdict. With no UID to compare, the reason names why the File Meta has none, and
     whether the data set was read (BACKLOG #5914)."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     meta_uid, cause = _sent_instance_uid(sent)
@@ -606,6 +625,8 @@ class DicomWebDestination(DestinationConnector):
         refuse_url_credentials(url, "DICOMweb destination 'url'")
         _refuse_base_url_query_or_fragment(url, config.name)
         _refuse_ambiguous_credentials(s, config.name)
+        # BACKLOG #5914: a broken [dicom] extra fails here, never after a partner's 202.
+        _refuse_a_broken_dicom_extra(config.name)
         self.base_url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("DICOMweb", config.name)

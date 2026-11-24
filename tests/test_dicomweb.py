@@ -950,7 +950,13 @@ async def test_dicomweb_a_202_naming_no_instance_does_not_read_the_data_set(
     calls: list[bytes] = []
     monkeypatch.setattr(dicomweb, "_data_set_instance_uid", lambda obj: calls.append(obj))
     dest = _dest()
-    for body in ("", json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}})):
+    for body in (
+        "",
+        json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}),
+        # A name outside the UID grammar can never match, so it does not count either.
+        _uid_body({"vr": "UI", "Value": [""]}),
+        _uid_body({"vr": "UI", "Value": ["N/A"]}),
+    ):
         dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
         with pytest.raises(NegativeAckError):
             await dest.send(PAYLOAD)
@@ -964,22 +970,46 @@ async def test_dicomweb_a_202_naming_no_instance_does_not_read_the_data_set(
     assert len(calls) == 1
 
 
-async def test_dicomweb_a_broken_dicom_extra_surfaces_rather_than_refusing_quietly(
+def test_dicomweb_a_broken_dicom_extra_fails_the_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Manager decision of 2026-11-23 (R8): a pydicom missing a reader the deflate guard replays is
+    # a deploy error, refused when the connection is built, naming the connection.
+    pytest.importorskip("pydicom")
+    from pydicom import filereader
+
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
+    with pytest.raises(ValueError, match="OB_DCMWEB.*refusing to parse DICOM"):
+        _dest()
+
+
+async def test_dicomweb_a_202_never_raises_on_a_broken_dicom_extra(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Manager decision of 2026-11-23 (R8): as the SCU does, a pydicom missing a reader the deflate
-    # guard replays is a deploy error that raises, not a per-message refusal logged at DEBUG.
+    # The fault arriving after the build (here, a reader removed once built) still never raises
+    # after the partner's 202: the data set read is no UID, and the 202 is a classified refusal.
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
     obj = _pydicom_part10(SENT_UID, _DATASET_UID)
-    monkeypatch.delattr(filereader, "_read_file_meta_info")
     dest = _dest()
+    monkeypatch.delattr(filereader, "_read_file_meta_info")
     dest._opener = _FakeOpener(
         body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202
     )  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="refusing to parse DICOM"):
+    with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+
+
+def test_dicomweb_an_absent_dicom_extra_does_not_fail_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.transports import dicomweb
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: False)
+    monkeypatch.setattr(
+        dicomweb, "load_header_readers", lambda: pytest.fail("the readers were checked")
+    )
+    assert isinstance(_dest(), DicomWebDestination)
 
 
 async def test_dicomweb_an_absent_dicom_extra_compares_the_file_meta_uid_alone(
