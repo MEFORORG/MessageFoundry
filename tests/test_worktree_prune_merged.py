@@ -2972,14 +2972,16 @@ def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: 
     assert res["_exit"] == 0
 
 
-@pytest.mark.parametrize(("git_exit", "surface"), [(1, "json"), (0, "text")])
+@pytest.mark.parametrize(("git_exit", "surface"), [(1, "json"), (0, "text"), (1, "text")])
 def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
     fx: Fixture, sleeper: int, tmp_path: Path, git_exit: int, surface: str
 ) -> None:
     """Red before the fix: it read ORPHANED and printed a recipe for moving a registered checkout
     aside. The run established only git's exit code, that git still lists the tree, and that the
     directory could not be read. A non-zero git exit keeps exit 3, because git may have deleted part
-    of the tree before it failed; exit 0 reports 1."""
+    of the tree before it failed; exit 0 reports 1. The text case with git exit 1 was red a second
+    time on 2d4ef04485: exit 3 reached the closing line that says a directory is broken RIGHT NOW and
+    points at a recipe the run never printed."""
     live_record(fx, sleeper, fx.primary)
     tree = fx.sibling("clean")
     _backdate(fx.primary, tree, hours=100)
@@ -3020,9 +3022,35 @@ def test_an_unknown_end_state_on_a_tree_git_still_lists_is_not_an_orphan(
         assert res["_exit"] == (3 if git_exit else 1)
     else:
         assert "END STATE UNKNOWN" in proc.stdout, proc.stdout
-        for wrong in ("ORPHANED", "Move-Item", "FAILED (exit", "not a git repository"):
+        for wrong in (
+            "ORPHANED",
+            "Move-Item",
+            "FAILED (exit",
+            "not a git repository",
+            "RIGHT NOW",
+            "recipe above",
+        ):
             assert wrong not in proc.stdout, f"{wrong!r} in:\n{proc.stdout}"
+        # The run's own closing line for this exit, saying what it established and to re-check.
+        closing = [ln for ln in proc.stdout.splitlines() if "worktree(s) git still lists" in ln]
+        assert len(closing) == 1, proc.stdout
+        assert "1 worktree(s)" in closing[0], closing[0]
+        assert "Re-check" in closing[0], closing[0]
         assert proc.returncode == (3 if git_exit else 1)
+
+
+def test_the_orphan_closing_line_still_prints_for_a_real_orphan(fx: Fixture, sleeper: int) -> None:
+    """The control for the case above: an orphan the ledger recorded, still on disk, takes the
+    closing line and its recipe, and no unknown-end-state line."""
+    live_record(fx, sleeper, fx.primary)
+    kept = fx.root / "kept" / "repo-kept"
+    kept.mkdir(parents=True)
+    _write_orphan_ledger(fx, kept)
+    proc = run_text(fx)
+    assert "RIGHT NOW" in proc.stdout, proc.stdout
+    assert "Move-Item" in proc.stdout, proc.stdout
+    assert "worktree(s) git still lists" not in proc.stdout, proc.stdout
+    assert proc.returncode == 3
 
 
 def test_a_claim_from_ANOTHER_machine_is_never_reaped_with_the_tree(

@@ -2176,10 +2176,15 @@ if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
 if ($namedMisses.Count -gt 0) {
     Write-Host "  ${refusalWord}: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
 }
-# `if`, not the `elseif` this was: with the branch above gone there is nothing to chain to. Behaviour
-# is unchanged -- the old chain reached here whenever $exit was 3, because 3 is not 2.
-if ($exit -eq $EXIT_ORPHANED) {
+# KEYED ON A RECORDED ORPHAN, NOT ON EXIT 3. A non-zero git exit on a tree git still lists, whose end
+# state could not be read, also reports 3, and it records no orphan and prints no recipe; keyed on the
+# code, this line told that run a directory was broken and pointed at a recipe it never printed.
+if ($newOrphans.Count -gt 0 -or $priorOrphans.Count -gt 0) {
     Write-Host "  ORPHANED: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
+}
+$endUnknownCount = @($decisions | Where-Object { $_.Outcome -eq 'unknown' }).Count
+if ($endUnknownCount -gt 0) {
+    Write-Host "  END STATE UNKNOWN: $endUnknownCount worktree(s) git still lists could not be read after git worktree remove, so this run did not establish whether each is intact or partly deleted. Re-check: restore read access to each and its parent folder, then run this script again." -ForegroundColor Red
 }
 # OUTSIDE the branch above, because the venv refusal no longer decides the code on its own: a run that
 # also removed a worktree reports 1. A line keyed on 2 would go silent on exactly the run where the
