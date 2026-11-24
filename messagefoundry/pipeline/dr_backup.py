@@ -2848,8 +2848,8 @@ def _discard_verify_staging(
 #
 # * A SQLite store stages in its own DATA DIRECTORY, beside the store, and applies the store's
 #   best-effort `_secure_file` to each staged tar and extracted store before its first byte, the way
-#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes. What
-#   `_secure_file` leaves inside a temp directory's own DACL is not always owner-only (ADR 0163).
+#   `mefor-restore-*` does. The snapshot file gets it from `snapshot_to` once its copy completes.
+#   What `_secure_file` leaves on Windows is stated once, in its docstring (ADR 0163).
 # * A server-DB store has no data directory, so it stages in `.mefor-staging` under the backup
 #   destination, secured the same way: an owner-only per-run directory and `_secure_file` on each
 #   staged file. A share that will not keep the directory owner-only refuses the run (see
@@ -5257,7 +5257,7 @@ def _extract_member(
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
     ``secure`` hands the output file to the store's own best-effort ``_secure_file`` the moment it
-    exists, BEFORE the first byte is streamed into it; what that leaves is not always owner-only on
+    exists, BEFORE the first byte is streamed into it; its docstring states what that leaves on
     Windows (ADR 0163). The restore path passes it: its staging directory sits on the destination
     volume, and the file is the whole decrypted store. Securing it after the stream, the way
     :func:`_place_restored_store` secures the file it publishes, would leave a multi-GB write of PHI
@@ -5687,10 +5687,8 @@ def _restore_blocking(
         # moment it exists and before its first byte is written. Best-effort and non-fatal, per that
         # primitive's contract.
         # The file `_place_restored_store` PUBLISHES gets the store-trio rule instead (ADR 0183 Wave 0b).
-        # archive.tar and extracted_store.db keep what `_secure_file` leaves, which is NOT owner-only when
-        # a file carries the temp directory's entries explicitly (it removes inherited entries only;
-        # measured on the hosted runners, CI run 36039014999). A hard-linked placement then shares the
-        # published DACL. A follow-up recorded in ADR 0163.
+        # archive.tar and extracted_store.db keep what `_secure_file` leaves; its docstring states
+        # what that is on Windows (ADR 0163). A hard-linked placement then shares the published DACL. ADR 0163 records it.
         #
         # Staged under the backup's and verify's lock-and-sweep, not in a `TemporaryDirectory`
         # (BACKLOG #5617). That `__exit__` raised when one unlink was refused (on Windows, a scanner

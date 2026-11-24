@@ -9271,14 +9271,51 @@ def write_restore_marker(
     )
 
 
-def _secure_file(path: Path) -> None:
-    """Restrict a store file to its owner — it holds PHI at rest.
+def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
+    """Restrict a file to the account this process runs as — a store file holds PHI at rest.
 
     Best-effort and non-fatal: failing to tighten permissions must never stop the engine from
     starting (``docs/PHI.md``'s ops checklist covers directory-level ACLs as the backstop). On
-    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so we set
-    an owner-only DACL via ``icacls`` (inheritance disabled) instead. A skipped or failed
-    restriction is **logged** (STORE-2) so it isn't silently world-readable.
+    POSIX this is ``chmod 0600``; on Windows ``os.chmod`` only toggles the read-only bit, so it
+    writes one protected DACL whole instead, granting full control to the account read from this
+    process's token. Written whole, the list replaces the entries the file carried: inherited ones,
+    and explicit allows (an explicit grant on a moved-in file, or the entries a temp directory hands
+    a file). The owner is not changed.
+
+    **What the one list carries over** (this is the one statement of the rule; ADR 0163 and the
+    helpers point here). Explicit entries only, never inherited ones, their SDDL text copied as
+    written, and ``icacls /grant:r`` kept each of them:
+
+    - every deny, placed first;
+    - the explicit OWNER RIGHTS entries, decided as a set: they are all dropped only when no deny
+      is carried and each is a plain allow (``A``) with no flags holding both READ_CONTROL and
+      WRITE_DAC; otherwise every one is carried.
+
+    Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
+    owner beyond the list, and those implicit rights are granted before any deny is read, so the
+    entries are decided together and against the carried denies. When they are carried, they stay
+    as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
+    WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
+    An object allow (``OA``) is always carried, as ``icacls /grant:r`` kept it: one carrying an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights
+    (measured). Either way an owner other than this account can end with less than
+    ``icacls /grant:r`` left it, since the one list drops every other principal's allow, one for
+    the owner's own account or groups included: a narrowing, not a loosening. A null DACL carries
+    nothing.
+
+    Where the current list cannot be read or parsed, or the write fails other than by access
+    denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
+    principals' allows included. For an unreadable list that is a deliberate choice: it is what
+    the code before this one-list write did, and the bare list, the other option, would drop a
+    deny or a narrowing OWNER RIGHTS entry it cannot see, so neither is strictly safer. Each of
+    these is **logged** (STORE-2). A restriction that is skipped, or refused with access denied,
+    leaves the file's access list as it was.
+
+    ``keep_explicit_entries`` is the store trio's fallback (:func:`_secure_store_file`), unchanged,
+    and it is NOT owner-only: ``icacls /inheritance:r /grant:r``, which removes only INHERITED
+    entries and replaces only this account's own grant, so every explicit entry the file carries
+    stays. ADR 0163 relies on that: an existing store file keeps the service account's trio entry
+    when an open falls back.
 
     **NOT FOR A FILE THAT HOLDS A KEY** (vault BACKLOG #2601). This tightens a file that already
     exists, and only logs when it cannot, so a key written and then passed here would sit under the
@@ -9297,38 +9334,150 @@ def _secure_file(path: Path) -> None:
                     path,
                 )
                 return
-            # The principal is the token's SID in icacls's ``*S-...`` form, never a name, so no
-            # environment variable or name lookup chooses who is granted (vault BACKLOG #5612).
-            # icacls is pinned to its absolute System32 path and invoked without a shell; the
-            # principal is a single argv token, never a shell word, so it can't inject a flag
-            # (low-27/STORE-5). The pin is what makes "fixed system tool" true:
-            # CreateProcess resolves an unqualified name through a search path that reaches the
-            # caller's working directory, and because this call only logs on a non-zero exit, a
-            # planted icacls.exe that exits 0 would leave this PHI-adjacent file its inherited
-            # (possibly broad) ACL while reporting nothing (BACKLOG #1769).
-            result = subprocess.run(  # nosec B603 B607
-                [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
-                check=False,
-                env=system_tool_environment(),  # the platform's start-up names only (#2716)
-                capture_output=True,
-                text=True,
-                # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
-                # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
-                # failed decode loses the output this warning logs. Only logged, so replace.
-                encoding="oem",
-                errors="replace",
-            )
-            if result.returncode != 0:
+            # The principal is the token's SID, never a name, so no environment variable or name
+            # lookup chooses who is granted (vault BACKLOG #5612).
+            if keep_explicit_entries:
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            current = _read_dacl_sddl(path)
+            kept = None if current is None else _entries_the_one_list_keeps(current)
+            if kept is None:
+                if current is not None:
+                    log.warning(
+                        "could not parse the access list of %s; restricting it with icacls, which "
+                        "keeps its explicit entries",
+                        path,
+                    )
+                _icacls_grant_keeping_explicit_entries(path, sid)
+                return
+            denies, owner_rights = kept
+            # One SetNamedSecurityInfoW call, as _write_trio_dacl makes: icacls cannot drop an
+            # unnamed principal's explicit entry while granting. Denies first, the canonical order.
+            sddl = "D:P" + "".join(denies) + f"(A;;FA;;;{sid})" + "".join(owner_rights)
+            result = _set_security_from_sddl(path, sddl, protected=True)
+            if result.failure is not None or result.dacl_status != 0:
                 log.warning(
-                    "icacls could not restrict %s (exit %s): %s",
+                    "could not restrict %s to this account: %s",
                     path,
-                    result.returncode,
-                    (result.stderr or result.stdout or "").strip(),
+                    result.failure or f"Win32 status {result.dacl_status}",
                 )
+                if result.dacl_status != _ERROR_ACCESS_DENIED:
+                    # The list may be what failed (a carried entry that does not convert, say);
+                    # icacls needs no list text. It needs the same WRITE_DAC, so not after a denial.
+                    log.warning(
+                        "restricting %s with icacls instead, which keeps its explicit entries", path
+                    )
+                    _icacls_grant_keeping_explicit_entries(path, sid)
         else:
             os.chmod(path, _OWNER_ONLY)
     except OSError as exc:
         log.warning("could not restrict permissions on %s: %s", path, exc)
+
+
+#: An SDDL right that includes WRITE_DAC: file all, generic all, key all (the renderer may pick
+#: it for a file's mask), or WRITE_DAC itself.
+_SDDL_RIGHTS_WITH_WRITE_DAC = frozenset({"FA", "GA", "KA", "WD"})
+#: An SDDL right that includes READ_CONTROL: READ_CONTROL itself, and each file or generic right,
+#: since a file's generic mapping and each FILE_GENERIC_* right hold it (and key all).
+_SDDL_RIGHTS_WITH_READ_CONTROL = frozenset(
+    {"RC", "FA", "FR", "FW", "FX", "GA", "GR", "GW", "GX", "KA"}
+)
+_WRITE_DAC = 0x40000
+_READ_CONTROL = 0x20000
+_GENERIC_ALL = 0x10000000
+#: GENERIC_ALL, GENERIC_EXECUTE, GENERIC_WRITE and GENERIC_READ: each maps to READ_CONTROL on a
+#: file.
+_GENERIC_ANY = 0xF0000000
+#: OWNER RIGHTS, as an SDDL alias and as a SID.
+_OWNER_RIGHTS = frozenset({"OW", "S-1-3-4"})
+_ERROR_ACCESS_DENIED = 5
+
+
+def _grants_owner_implicit_rights(rights: str) -> bool:
+    """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
+    access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
+    answers ``False``, so the OWNER RIGHTS entries are carried, as ``icacls /grant:r`` kept them."""
+    if rights.startswith("0X"):
+        try:
+            mask = int(rights, 16)
+        except ValueError:
+            return False
+        return bool(mask & (_WRITE_DAC | _GENERIC_ALL)) and bool(
+            mask & (_READ_CONTROL | _GENERIC_ANY)
+        )
+    tokens = {rights[i : i + 2] for i in range(0, len(rights), 2)}
+    return bool(tokens & _SDDL_RIGHTS_WITH_WRITE_DAC) and bool(
+        tokens & _SDDL_RIGHTS_WITH_READ_CONTROL
+    )
+
+
+def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None:
+    """The explicit entries of ``sddl`` that :func:`_secure_file`'s one list carries over, as SDDL
+    ACE text: ``(denies, owner_rights)``. ``None`` when the list is not plainly parseable.
+
+    The rule, and what the owner ends with, is stated once in :func:`_secure_file`'s docstring,
+    under *What the one list carries over*."""
+    start = sddl.find("D:")
+    body = sddl[start + 2 :] if start >= 0 else ""
+    end = body.find("S:")
+    if end >= 0:
+        body = body[:end]
+    first = body.find("(")
+    if start >= 0 and "NO_ACCESS_CONTROL" in (body if first < 0 else body[:first]):
+        return [], []
+    dacl = _parse_sddl_dacl(sddl)
+    if dacl is None:
+        return None
+    texts = _SDDL_ACE.findall(body)
+    if len(texts) != len(dacl.aces):
+        return None
+    denies: list[str] = []
+    owner_rights: list[str] = []
+    all_full = True
+    for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
+        flag_set = _sddl_flag_set(flags)
+        if "ID" in flag_set:
+            continue
+        if kind in _SDDL_DENY_TYPES:
+            denies.append(f"({text})")
+        elif ace_sid in _OWNER_RIGHTS:
+            owner_rights.append(f"({text})")
+            all_full = all_full and (
+                kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
+            )
+    # A carried deny can withhold the owner's implicit READ_CONTROL and WRITE_DAC only while an
+    # OWNER RIGHTS entry stays: with none left, those two are granted before any deny is read.
+    return denies, ([] if all_full and not denies else owner_rights)
+
+
+def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:
+    """:func:`_secure_file`'s ``keep_explicit_entries`` rewrite. Windows only; logs, never raises
+    except ``OSError``, which the caller logs."""
+    # icacls is pinned to its absolute System32 path and invoked without a shell; the principal is
+    # a single argv token in icacls's ``*S-...`` form, never a shell word, so it can't inject a
+    # flag (low-27/STORE-5). The pin is what makes "fixed system tool" true: CreateProcess resolves
+    # an unqualified name through a search path that reaches the caller's working directory, and
+    # because this call only logs on a non-zero exit, a planted icacls.exe that exits 0 would leave
+    # this PHI-adjacent file its inherited (possibly broad) ACL while reporting nothing (#1769).
+    result = subprocess.run(  # nosec B603 B607
+        [_system_exe("icacls.exe"), str(path), "/inheritance:r", "/grant:r", f"*{sid}:F"],
+        check=False,
+        env=system_tool_environment(),  # the platform's start-up names only (#2716)
+        capture_output=True,
+        text=True,
+        # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+        # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+        # failed decode loses the output this warning logs. Only logged, so replace.
+        encoding="oem",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        log.warning(
+            "icacls could not restrict %s (exit %s): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
 
 
 def _grant_read(path: Path, principal: str) -> None:
@@ -9350,7 +9499,10 @@ def _grant_read(path: Path, principal: str) -> None:
             env=system_tool_environment(),  # the platform's start-up names only (#2716)
             capture_output=True,
             text=True,
-            encoding="oem",  # icacls's piped output; see _secure_file for why "replace"
+            # icacls echoes the path in the OEM code page. Neither the cp1252 locale default nor
+            # UTF-8 decodes every OEM byte (cp437 0x81, u-umlaut, is undefined in both), and a
+            # failed decode loses the output this warning logs. Only logged, so replace.
+            encoding="oem",
             errors="replace",
         )
     except OSError as exc:
@@ -9368,8 +9520,10 @@ def _grant_read(path: Path, principal: str) -> None:
 async def _secure_file_async(path: Path) -> None:
     """:func:`_secure_file` dispatched off the event loop, for a caller that runs ON one.
 
-    On Windows the restriction is an ``icacls`` subprocess, measured at 21 to 28 ms per file. Called
-    straight from a coroutine, that span is dead time for every other task on the loop: a deploying
+    On Windows the restriction was an ``icacls`` subprocess, measured at 21 to 28 ms per file. It is
+    now a blocking security-descriptor read and write, unmeasured, still file I/O, and that
+    subprocess again on the fallbacks :func:`_secure_file` names. Called straight from a
+    coroutine, that span is dead time for every other task on the loop: a deploying
     site would see one such stall per secured file of every in-flight ACK, claim and delivery on each
     DR backup, because ``snapshot_to`` runs on the SERVING loop by design (see
     ``pipeline/dr_backup.py``, which keeps the consistent snapshot there and moves only the tar+AEAD
@@ -9464,8 +9618,11 @@ def _parse_sddl_dacl(sddl: str) -> _SddlDacl | None:
     """The owner and ``D:`` section of an SDDL string, or ``None`` when the DACL is absent or not
     plainly parseable.
 
-    ``None`` is the fail-closed answer: every caller treats it as "not hardened", so a shape this does
-    not understand (a callback ACE, a resource attribute, a null DACL) gets the owner-only rewrite."""
+    For the store-trio callers ``None`` is the fail-closed answer: they treat it as "not hardened",
+    so a shape this does not understand (a callback ACE, a resource attribute, a null DACL) gets the
+    owner-only rewrite. :func:`_secure_file` checks for a null DACL first, and for any other
+    ``None`` it cannot tell what a whole list would drop, so it runs the kept icacls rewrite, which
+    keeps every explicit entry."""
     owner_match = _SDDL_OWNER.search(sddl)
     owner = _resolve_sid(owner_match.group(1)) if owner_match else None
     start = sddl.find("D:")
@@ -9645,7 +9802,8 @@ def _read_dacl_sddl(path: Path, *, owner: bool = False) -> str | None:
 
     GetNamedSecurityInfoW asks for the DACL and owner alone, so it needs only READ_CONTROL, and SDDL
     names principals by SID, so the answer does not depend on the display language. A failure is
-    logged with its Win32 status, because the caller then falls back to the owner-only rewrite."""
+    logged with its Win32 status, because the caller then falls back: a store-trio caller to the
+    owner-only rewrite, :func:`_secure_file` to the kept icacls rewrite."""
     if sys.platform != "win32":
         return None
     import ctypes
@@ -9788,7 +9946,9 @@ def _reaches_through_a_link(path: Path) -> bool:
             return True
         if attributes & reparse:
             log.warning(
-                "%s is reached through a link, so the store there is restricted owner-only", path
+                "%s is reached through a link, so the store there gets this account's grant and "
+                "keeps its explicit entries",
+                path,
             )
             return True
     return False
@@ -9816,7 +9976,8 @@ def _store_dir_grants(directory: Path) -> tuple[str, ...] | None:
         # (a developer checkout) is the expected fallback. Both keep the reason at DEBUG.
         if parsed.protected and not any(sid == "OW" for _t, _f, _r, sid in parsed.aces):
             log.warning(
-                "%s is locked down but %s, so the store there is restricted owner-only; the service "
+                "%s is locked down but %s, so the store there gets the opener's grant and keeps its "
+                "explicit entries; the service "
                 "account and an operator's provision-admin cannot then both open it (ADR 0163 notes "
                 "of 2026-09-24 and 2026-11-05)",
                 directory,
@@ -9970,7 +10131,9 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     """Restrict one file of the SQLite store trio, or a restored store.
 
     ``dir_grants`` is :func:`_store_dir_grants` of the file's directory. ``None`` -- off Windows, or
-    outside a hardened directory -- is :func:`_secure_file`, owner-only, exactly as before. Otherwise
+    outside a hardened directory -- is :func:`_secure_file` with ``keep_explicit_entries``, the
+    icacls rewrite, exactly as before: it grants the opener and keeps every explicit entry.
+    Otherwise
     the file gets an explicit, protected DACL naming exactly those principals, which is the same
     whoever opens, and which drops any entry for anyone else (a moved-in or restored file can carry
     one). An owner outside those principals is moved to Administrators where the opener may do that,
@@ -9979,7 +10142,7 @@ def _secure_store_file(path: Path, *, dir_grants: Sequence[str] | None) -> None:
     fail and warn on every start. A file that is itself a link gets the old owner-only rewrite, as
     before this change. Best-effort, like :func:`_secure_file`: it logs rather than raises."""
     if dir_grants is None or not _is_windows() or _reaches_through_a_link(path):
-        _secure_file(path)
+        _secure_file(path, keep_explicit_entries=True)
         return
     current = _read_dacl_sddl(path, owner=True)
     parsed = _parse_sddl_dacl(current) if current is not None else None
@@ -12518,7 +12681,8 @@ class MessageStore:
             )
             await db.commit()
         # Tighten permissions now that the file (and its WAL siblings) exist — they hold PHI.
-        # Off the loop (BACKLOG #1634): three files, each an icacls subprocess on Windows. Open
+        # Off the loop (BACKLOG #1634): three files, each an ACL write on Windows, and outside a
+        # hardened directory an icacls subprocess (21 to 28 ms each, measured). Open
         # completes before anything is serving, so this one is consistency rather than a fix.
         if str(path) != ":memory:":
             main = Path(path)
@@ -23491,7 +23655,7 @@ class MessageStore:
         # encrypted .mfbak the BackupRunner wraps it in is the at-rest protection, but the transient
         # plaintext snapshot must not be world-readable either.
         # Off the loop (BACKLOG #1634): this is the call that matters. A DR backup runs on the SERVING
-        # loop, so a synchronous icacls here stalls every in-flight ACK, claim and delivery with it.
+        # loop, so a synchronous ACL write here stalls every in-flight ACK, claim and delivery with it.
         await _secure_file_async(dest)
 
     async def _copy_snapshot(self, dest: Path, method: str) -> None:
