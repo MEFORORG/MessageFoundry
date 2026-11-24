@@ -462,12 +462,14 @@ section 0): this is what the first deployment's first routine rotation would hav
    answers with HTTP 400 for that version alone raises `AuditKeyVersionRefusedError`
    (`TransitCipher._refuses_only_version`). The test reads the reply, not who wrote it: a pinned
    call that gets an HTTP 400 that hvac raises as `InvalidRequest`, while a probe under the latest
-   version answers a well-formed MAC naming a version other than the pinned one, raises it. An
-   answer `row_seal.transit_mac_version` refuses, at least an empty one or one naming no version,
-   passed too until a correction of 2026-11-24 (vault BACKLOG #6707 item 73); such a 400 now goes
-   to the 2026-11-11 amendment's item 4 recheck, whose fixed-input check refuses the same answer,
-   so the check could not run. A proxy, not Transit, can author the 400 (corrected 2026-11-11,
-   vault BACKLOG #6707). The walk records a break at that row, naming the
+   version answers with a string that does not start with `vault:v<pinned>:`, raises it. An empty
+   answer or one naming no version passes too, and a proxy, not Transit, can author the 400
+   (corrected 2026-11-11, BACKLOG #6707). **[AMENDED 2026-11-24, vault BACKLOG #6707 item 73: the
+   probe answer must now be a MAC `row_seal.transit_mac_version` accepts, naming a version other
+   than the pinned one. Any other answer, at least an empty one or one naming no version, is read
+   as no refused version, and the failure goes to the 2026-11-11 amendment's item 4 recheck, where
+   a later probe may still answer. The words above are kept as decided.]** The walk records a
+   break at that row, naming the
    version, and goes on. A 400 on which hvac raises an exception other than `InvalidRequest`
    raises neither `AuditKeyVersionRefusedError` nor its subclass `AuditKeyVersionUnverifiedError`
    (BACKLOG #6707). For example, these exact 400 bodies with the Content-Type exactly

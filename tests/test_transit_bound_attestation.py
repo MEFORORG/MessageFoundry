@@ -627,9 +627,6 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
 
     transit = _ProxiedRotatingTransit() if proxied else _RotatingTransit()
     error = AuditKeyVersionUnverifiedError if proxied else AuditKeyVersionRefusedError
-    # A refusal in Vault's own words is evidence the MAC does not verify; a proxy's page gives no
-    # verdict, so its gap says the MAC could not be checked (vault BACKLOG #6707 item 24).
-    verdict = "could not be checked" if proxied else "does not verify"
     _use_fake(monkeypatch, transit)
     db = tmp_path / "forged-version.db"
     store = await _transit_store(db)
@@ -639,15 +636,22 @@ async def test_a_transit_refusal_of_a_forged_key_version_is_a_gap(
     _dml(db, "UPDATE audit_log SET row_hash = ? WHERE seq = ?", (_PLANTED, recorded.audit_seq))
     again = await _transit_store(db)
     transit.verified.clear()
+    # A reply whose wording reads as a version refusal keeps "Transit refused to check"; a proxy's
+    # page gives no verdict, so its gap says the MAC could not be checked (vault BACKLOG #6707
+    # item 24).
+    seq = recorded.audit_seq
+    expected = (
+        f"audit row {seq}'s MAC could not be checked: "
+        if proxied
+        else f"Transit refused to check audit row {seq}'s MAC: "
+    ) + str(error(_UNHELD_VERSION))
     try:
         got = await again.get_transit_bound_attestation()
         # The whole gap text, so it is the expected outcome and no other: an AssertionError in the
         # fake, or any other CipherError, also writes a gap starting "audit row", and must fail
         # here.
         assert got is not None
-        assert got.audit_gap == (
-            f"audit row {recorded.audit_seq}'s MAC {verdict}: {error(_UNHELD_VERSION)}"
-        ), got.audit_gap
+        assert got.audit_gap == expected, got.audit_gap
         # The refusal came from Transit's verify, at the planted version.
         assert transit.verified == [_UNHELD_VERSION], transit.verified
     except BaseException:

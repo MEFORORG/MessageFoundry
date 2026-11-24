@@ -884,9 +884,11 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     version answers a well-formed MAC naming another version (vault BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
-    page, and that cannot be told apart from a tamper behind it. So this is a subclass, and a
-    handler of its parent handles it as it handles a refused version; the chain walk, for one,
-    reports a break at that row and goes on. Only the text differs. It names the version only,
+    page, and that cannot be told apart from a tamper behind it. So this is a subclass: a handler
+    of its parent that does not catch it apart handles it as a refused version, and the chain
+    walk, for one, reports a break at that row and goes on. At least
+    ``store.settle_transit_bound_attestation`` catches it apart and reports the MAC as not checked
+    (vault BACKLOG #6707 item 24). The error's text differs from the parent's. It names the version only,
     never the key or the reply, because the walk puts it in the tamper alert."""
 
     def __str__(self) -> str:
