@@ -2104,6 +2104,11 @@ async def test_a_disabled_runner_with_a_registry_idles(store: MessageStore) -> N
                 break
             await asyncio.sleep(0.01)
         assert passes, "the loop did not pick up a window the live graph set"
+        holder["reg"] = Registry()
+        await asyncio.sleep(0.05)
+        settled = len(passes)
+        await asyncio.sleep(0.1)
+        assert len(passes) == settled, "the loop kept running passes after the window was cleared"
     finally:
         await runner.stop()
     assert runner._task is None
@@ -2139,7 +2144,8 @@ async def test_reload_that_sets_a_window_runs_a_pass(
     engine = await Engine.create(
         tmp_path / "engine.db",
         retention_settings=RetentionSettings.model_validate(
-            {**_ALL_OFF, "purge_interval_seconds": 0.02}
+            # An interval no test waits out: only the reload's wake can run the pass in time.
+            {**_ALL_OFF, "purge_interval_seconds": 3600}
         ),
         egress_settings=EgressSettings(deny_by_default=False),
     )

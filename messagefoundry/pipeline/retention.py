@@ -409,6 +409,9 @@ class RetentionRunner:
         # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
         self._coordinator: ClusterCoordinator = coordinator or NullCoordinator()
         self._stop = asyncio.Event()
+        # Ends the current between-pass sleep early: set by stop(), and by wake() after a config
+        # reload so a window the reload set is enforced now rather than an interval later.
+        self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         # Whether the last check of `enabled` found something to do; the loop logs when it flips.
         self._active = False
@@ -452,15 +455,14 @@ class RetentionRunner:
         ):
             return True
         # Application log-file retention (#120 delete, #119 compress) needs BOTH a window and a log_dir
-        # to do anything, so only start the runner for it when both are present (avoids a no-op task for
-        # a configured window on a stdout-only deployment).
+        # to do anything, so it counts only when both are present (avoids a no-op pass for a configured
+        # window on a stdout-only deployment).
         if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
         if registry is None:
             return False
-        # This engine shard's own graph: a window on another engine shard's connection starts that
-        # shard's runner, whose purge already spans the unified store.
+        # A connection's own window gives a pass something to do even with every global knob off.
         return any(
             ic.prune_documents_after is not None or (ic.messages_days or 0) > 0
             for ic in registry.inbound.values()
@@ -511,9 +513,15 @@ class RetentionRunner:
             self._settings.purge_interval_seconds,
         )
 
+    def wake(self) -> None:
+        """End the loop's current sleep, so it re-reads :attr:`enabled` now (BACKLOG #6804). The
+        engine calls this after a config reload; a no-op when no loop is running."""
+        self._wake.set()
+
     async def stop(self) -> None:
         """Signal the loop and await its exit (idempotent)."""
         self._stop.set()
+        self._wake.set()
         task = self._task
         self._task = None
         if task is not None:
@@ -528,7 +536,14 @@ class RetentionRunner:
         # retention hiccup must never take the engine down). Cooperatively cancellable via _stop.
         while not self._stop.is_set():
             try:
-                if self._refresh_active():
+                active = self._refresh_active()
+            except Exception:
+                log.exception(
+                    "retention could not read its configuration; will retry next interval"
+                )
+                active = False
+            try:
+                if active:
                     await self.run_once()
             except asyncio.CancelledError:
                 raise
@@ -543,17 +558,24 @@ class RetentionRunner:
         if active != self._active:
             self._active = active
             if active:
-                log.info("retention active: the configuration now sets something for it to do")
+                log.info(
+                    "retention active: the configuration now sets something for it to do "
+                    "(a pass every %gs)",
+                    self._settings.purge_interval_seconds,
+                )
             else:
                 log.info("retention idle: the configuration no longer sets anything for it to do")
         return active
 
     async def _sleep(self, delay: float) -> None:
-        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
+        """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)
+        or on :meth:`wake`."""
         try:  # noqa: SIM105
-            await asyncio.wait_for(self._stop.wait(), delay)
+            await asyncio.wait_for(self._wake.wait(), delay)
         except TimeoutError:
             pass
+        if not self._stop.is_set():
+            self._wake.clear()
 
     # --- one pass ------------------------------------------------------------
 

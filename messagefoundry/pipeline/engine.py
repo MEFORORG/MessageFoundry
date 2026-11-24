@@ -3926,6 +3926,10 @@ class Engine:
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
             failures.append(_outbound_close_failure(close_failures))
+        # The retention loop re-reads the live graph each interval; waking it means a window this
+        # reload set is enforced now, not up to an interval later (BACKLOG #6804). Setting an event.
+        if self._retention_runner is not None:
+            self._retention_runner.wake()
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
