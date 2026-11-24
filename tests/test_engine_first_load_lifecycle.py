@@ -353,6 +353,36 @@ async def test_a_kept_runner_gets_no_supervisor_to_start_it(
         await eng.stop()
 
 
+async def test_a_clustered_start_whose_unwind_failed_keeps_the_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The start raises, its own teardown raises too, and a source is still registered."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path, coordinator=_FlipCoordinator(leader=True))
+    await eng.start()
+    real = RegistryRunner._start_outbound
+
+    async def failing_build(self: RegistryRunner, *args: Any, **kwargs: Any) -> None:
+        await real(self, *args, **kwargs)
+        raise RuntimeError("a graph-wide start failure")
+
+    monkeypatch.setattr(RegistryRunner, "_start_outbound", failing_build)
+    _failing_teardown(monkeypatch)
+    with pytest.raises(RuntimeError, match="a source stop failed"):
+        await eng._first_load(load_config(cfg), {"K": "new"})
+    runner = eng._registry_runner
+    try:
+        assert runner is not None, "engine.stop() could no longer reach the live state"
+        assert runner.has_residual_state
+        assert eng._env_values == {"K": "new"}
+        assert eng._graph_supervisor is None
+    finally:
+        monkeypatch.undo()
+        await eng.stop()
+    assert runner is not None and not runner.has_residual_state
+
+
 async def test_no_runner_is_visible_during_a_clustered_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

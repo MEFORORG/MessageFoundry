@@ -7064,7 +7064,7 @@ class RegistryRunner:
                 pass
         if not teardown.done():
             self._pending_source_stops.append(teardown)
-            teardown.add_done_callback(self._reap_pending_stop)
+            teardown.add_done_callback(self._reap_cancelled_start_teardown)
             log.error("a cancelled wiring start's teardown did not end; a later stop settles it")
         elif teardown.cancelled():
             log.error("a cancelled wiring start's teardown was cut; a later stop finishes it")
@@ -7075,6 +7075,16 @@ class RegistryRunner:
             )
         else:
             self._start_cancel_unwound = True
+
+    def _reap_cancelled_start_teardown(self, task: asyncio.Task[None]) -> None:
+        """Drop a late teardown from the pending stops. The class only: a connector's error text
+        can carry a partner host or path."""
+        if task in self._pending_source_stops:
+            self._pending_source_stops.remove(task)
+        if not task.cancelled() and (failure := task.exception()) is not None:
+            log.warning(
+                "a cancelled wiring start's late teardown failed: %s", type(failure).__name__
+            )
 
     async def start(
         self,

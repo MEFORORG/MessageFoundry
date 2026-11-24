@@ -1697,7 +1697,8 @@ class Engine:
             checked = replace(registry, fhir_lookups=kept)
         await checker.build_check_off_loop(checked, env_values)
         # A stop that began during the check found no runner to stop, so none may start now
-        # (engine PR 2815, Lander hold 6698688363 item 4). Nothing yields from here to add_registry.
+        # (engine PR 2815, Lander hold 6698688363 item 4). On a single node nothing yields from here
+        # to add_registry; the clustered path below reads this again after each await.
         if self._stopping:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
         if not self._coordinator.is_clustered():
@@ -1718,6 +1719,10 @@ class Engine:
                         "the engine is stopping, so the first load started no runner"
                     )
                 await self._fire_pool_warm()
+                # The warm can yield, and a stop that passed its warm cancel meanwhile will not
+                # reach the task it created.
+                if self._stopping and self._warm_pool_task is not None:
+                    self._warm_pool_task.cancel()
             if self._stopping:
                 raise RuntimeError("the engine is stopping, so the first load started no runner")
             leading = leading and self._coordinator.is_leader()
