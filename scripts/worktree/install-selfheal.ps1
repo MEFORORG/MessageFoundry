@@ -49,7 +49,9 @@ if (-not $HookPath) { $HookPath = Join-Path $homeDir '.claude-hooks/worktree-sel
 
 # The path goes into a double-quoted shell command below. A `$` or backtick there would be expanded by
 # whichever shell runs the hook, and a double quote would end the argument, so the wired command would
-# name a different file. Refuse rather than escape on a guess about which shell that is.
+# name a different file. Refuse rather than escape on a guess about which shell that is. This refuses
+# those three only: a doubled backslash (bash collapses it) or a %NAME% segment (cmd expands it) is not
+# caught here.
 if ($HookPath -match '[$`"]') {
     throw "Refusing a HookPath containing a dollar sign, backtick or double quote: $HookPath"
 }
@@ -71,7 +73,8 @@ elseif (-not (Test-Path -LiteralPath $HookPath)) { throw "worktree-selfheal.ps1 
 # running `git checkout` on the primary after the gate's allowlist was gone. install-gate.ps1 owns the one
 # allowlist. An existing legacy file is left as it is.
 $gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
-$legacyRepos = Join-Path $sharedDir 'worktree-gate.repos.txt'
+# The backstop's legacy fallback is under the home, whatever -HookPath says (worktree-selfheal.ps1).
+$legacyRepos = Join-Path $homeDir '.claude-hooks/worktree-gate.repos.txt'
 if (-not (Test-Path -LiteralPath $gateRepos)) {
     if (Test-Path -LiteralPath $legacyRepos) {
         Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop reads the legacy $legacyRepos. install-gate.ps1 writes the gate's allowlist; delete the legacy file to stop that fallback."

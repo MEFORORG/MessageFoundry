@@ -442,6 +442,19 @@ def test_an_existing_legacy_allowlist_is_left_alone(home: Path, cfg: Path) -> No
     assert "reads the legacy" in r.stdout, "the operator is told the backstop is off when it is not"
 
 
+def test_the_note_reads_the_home_legacy_file_not_the_hook_dir(
+    home: Path, cfg: Path, tmp_path: Path
+) -> None:
+    """The backstop's fallback is ~/.claude-hooks/worktree-gate.repos.txt whatever -HookPath says, so
+    a file beside a non-default HookPath must not be reported as the one it reads."""
+    hook_dir = tmp_path / "elsewhere"
+    hook_dir.mkdir()
+    (hook_dir / "worktree-gate.repos.txt").write_text("C:/Stray\n", encoding="utf-8")
+    r = run_installer(home, cfg, hook_path=hook_dir / "worktree-selfheal.ps1")
+    assert r.returncode == 0, r.stderr
+    assert "guards nothing" in r.stdout, r.stdout
+
+
 def test_a_tilde_config_dir_still_installs(home: Path, tmp_path: Path) -> None:
     """The temp file is written through .NET, which does not resolve PowerShell's ``~``. The old
     in-place Set-Content did, so a ``~``-relative ConfigDir must keep working."""
