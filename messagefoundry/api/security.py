@@ -588,7 +588,15 @@ def client_ip(conn: HTTPConnection) -> str | None:
     return host if isinstance(host, str) else None
 
 
-def _password_change_required(deadline: float | None, *, suffix: str = "") -> str:
+def _credential_lapsed(deadline: float | None, now: float) -> bool:
+    """Whether a must-change refusal states the temporary credential as lapsed: a readable
+    deadline strictly before ``now``, as the sign-in gate compares."""
+    return deadline is not None and deadline_utc(deadline) is not None and now > deadline
+
+
+def _password_change_required(
+    deadline: float | None, *, suffix: str = "", now: float | None = None
+) -> str:
     """The 403 detail for a must-change session, naming the credential's deadline when it has one.
 
     ``suffix`` names the next step the session can take (the enrol-first step), appended.
@@ -596,11 +604,12 @@ def _password_change_required(deadline: float | None, *, suffix: str = "") -> st
     A deadline already passed is stated in the past tense with the one remedy left, and no
     ``suffix``: no step the session takes can revive the credential (BACKLOG #2298). The session
     check ends such a session before this runs, so it is reached only when the deadline passes
-    between that check and this read. Strictly after, as the sign-in gate compares."""
+    between that check and this read. Strictly after, as the sign-in gate compares. ``now``
+    defaults to the clock; a caller that also judges the lapse passes the instant it used."""
     when = None if deadline is None else deadline_utc(deadline)
     if when is None:
         return "password change required" + suffix
-    if deadline is not None and time.time() > deadline:
+    if _credential_lapsed(deadline, time.time() if now is None else now):
         return (
             f"password change required; the temporary password stopped working at {when};"
             " ask an administrator to reset it"
@@ -1404,13 +1413,20 @@ async def _admit(
             # non-browser caller receives, so it states when the credential dies. The detail
             # stays a string that STARTS with the old text, because clients match on it as a
             # substring (``ide/src/engineStatusModel.ts`` ``classifyForbidden``).
+            deadline = await pending_credential_deadline_for(auth, identity.user_id)
+            # No next-step header once the temporary credential has lapsed: the detail then names
+            # an administrator reset as the one remedy (BACKLOG #2298), and no step the session
+            # could take would revive it.
+            now = time.time()
+            lapsed = _credential_lapsed(deadline, now)
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 _password_change_required(
-                    await pending_credential_deadline_for(auth, identity.user_id),
-                    suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
+                    deadline, suffix=_ENROL_FIRST_SUFFIX if enrol_first else "", now=now
                 ),
-                headers={
+                headers=None
+                if lapsed
+                else {
                     MUST_CHANGE_NEXT_HEADER: await _password_change_next(
                         auth, bearer_token(request), enrol_first=enrol_first
                     )

@@ -11,6 +11,7 @@ accounts only.
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import httpx
 import pytest
 from _totp_clock import pin_totp_clock
 
-from messagefoundry.api import create_app
+from messagefoundry.api import create_app, security
 from messagefoundry.api.auth_models import (
     MUST_CHANGE_NEXT_ENROL_FACTOR,
     MUST_CHANGE_NEXT_HEADER,
@@ -263,6 +264,39 @@ async def test_a_phi_view_check_route_writes_no_grant_row(engine: Engine) -> Non
             assert r.status_code == 200, r.text
     rows = await engine.store.list_audit(limit=200)
     assert not [row for row in rows if "/auth/check/messages:view_" in str(row["detail"])]
+
+
+async def test_an_action_bound_new_address_refusal_names_the_new_address(engine: Engine) -> None:
+    """The require_step_up_action path: DELETE /me/mfa from a host the session has not verified."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service, peer=("10.1.1.1", 4000)) as c:
+        tok = await _login(c, "boss")
+    async with _client(engine, service, peer=("10.2.2.2", 4000)) as c:
+        r = await c.delete("/me/mfa", headers=_auth(tok))
+        assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1", r.text
+        assert r.headers.get("X-Step-Up-Action") == "mfa_disable"
+        assert r.headers.get(STEP_UP_REASON_HEADER) == STEP_UP_REASON_NEW_ADDRESS
+
+
+async def test_a_lapsed_temporary_credential_gets_no_next_step_header(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the deadline passes between the session check and the refusal, the detail names an
+    administrator reset (BACKLOG #2298), so the header names no step the session could take."""
+    service = await _service(engine)
+    admin = await create_admin(service)
+
+    async def _lapsed(_auth: object, _user_id: str) -> float:
+        return time.time() - 60
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, admin.username, admin.password)
+        monkeypatch.setattr(security, "pending_credential_deadline_for", _lapsed)
+        r = await c.get("/users", headers=_auth(tok))
+        assert r.status_code == 403, r.text
+        assert "ask an administrator to reset it" in r.json()["detail"]
+        assert MUST_CHANGE_NEXT_HEADER not in r.headers
 
 
 # --- GET /me/step-up ------------------------------------------------------------------------------
