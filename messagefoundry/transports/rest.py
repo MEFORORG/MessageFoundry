@@ -3158,8 +3158,10 @@ class RestDestination(DestinationConnector):
                 # whole-chain refusal is worded for an ECH hop before the generic one can fire.
                 refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
             elif scheme == "http":
-                # The same refusal for an http url (accepted as cleartext), worded so it does not
-                # say the hop verifies a server: the opener never makes a TLS connection.
+                # The same refusal for an http url (admitted by the cleartext egress gate above),
+                # worded so it does not say the hop verifies its server: the opener makes no TLS
+                # connection to the partner. Its https handler can still serve a TLS leg to an
+                # https forward proxy, where one is set.
                 refuse_chain_check_on_os_roots(anchor, cleartext=True)
             if allow_expired:
                 self._opener = _expiry_relaxed_opener(

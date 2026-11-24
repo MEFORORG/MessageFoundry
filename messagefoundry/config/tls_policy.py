@@ -3473,7 +3473,8 @@ OUTBOUND_CRL_SETTING = "[tls].crl_file"
 
 #: Why ``[tls].crl_check_chain`` is refused on a hop that trusts the OS roots: the one statement of
 #: it (vault BACKLOG #5511). The refusal carries it. The docs/CONFIGURATION.md row and ADR 0173
-#: section 15 summarise it, so a change here changes them too.
+#: section 15 summarise it, with the generic refusal's closing clause, so a change here changes
+#: them too.
 #: On a hop that trusts operator CAs alone the rule can be met: the operator chose the CAs,
 #: :func:`_require_rooted_cas` refuses a certificate in the CA file that is no CA, and a CA file is
 #: loaded whole, so the CA list holds each CA in it.
