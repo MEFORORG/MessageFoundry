@@ -47,15 +47,17 @@ scheme tags (BACKLOG #3421) and to seal and open the fingerprint cells (BACKLOG 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import hashlib
 import hmac
 import logging
 import secrets
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterator, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeGuard
+from typing import TYPE_CHECKING, TypeGuard, cast
 
 from messagefoundry.config.ai_policy import SecurityEnforcement
 from messagefoundry.config.settings import CONNECTOR_SECRET_EXPIRY_CLASS
@@ -73,6 +75,7 @@ from messagefoundry.store.crypto import (
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretRotationSettings
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.store import SecretRotationMetaRow, SecretRotationMetaStore
 
 __all__ = [
@@ -93,6 +96,7 @@ __all__ = [
     "fingerprints_equal",
     "open_rotation_record",
     "reconcile_rotation_meta",
+    "refuse_expiry_before_graph",
     "secrets_from_settings",
     "secrets_from_settings_and_stamps",
 ]
@@ -1163,6 +1167,203 @@ def enforce_secret_expiry(
         except Exception:
             log.warning("secret_rotation expiry-refusal sink failed for %r", r.label, exc_info=True)
     raise SecretRotationOverdueError(refused, grace_days=grace)
+
+
+#: Set only while :func:`refuse_expiry_before_graph` predicts, in that task and the worker threads
+#: it starts. A context variable, so another task's line on this logger is never dropped.
+_predicting: ContextVar[bool] = ContextVar("secret_rotation_predicting", default=False)
+
+
+@contextlib.contextmanager
+def _muted_prediction() -> Iterator[None]:
+    """Drops this task's lines on this logger, so a start never logs one finding twice."""
+
+    def drop(_record: logging.LogRecord) -> bool:
+        return not _predicting.get()
+
+    token = _predicting.set(True)
+    log.addFilter(drop)
+    try:
+        yield
+    finally:
+        log.removeFilter(drop)
+        _predicting.reset(token)
+
+
+class _SilentRotationSink(LoggingAlertSink):
+    """Takes the one alert the reconcile and the two refusals raise, during a prediction."""
+
+    def secret_rotation_due(
+        self,
+        name: str,
+        *,
+        class_id: str,
+        last_rotated: str,
+        days_overdue: int,
+        enforced: bool = False,
+    ) -> None:
+        return None
+
+
+class _UnchargedCipher:
+    """Opens cells with the real cipher and seals none, so a prediction spends no AES-GCM
+    invocation. Its placeholder reaches only the prediction's in-memory rows."""
+
+    def __init__(self, cipher: AesGcmCipher) -> None:
+        self._cipher = cipher
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        return "predicted"
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        return self._cipher.decrypt(stored, aad=aad)
+
+    def is_encrypted(self, stored: str) -> bool:
+        return self._cipher.is_encrypted(stored)
+
+
+class _InMemoryRotationMeta:
+    """The real rows with this run's writes laid over them. With no ``first_sightings_against``
+    nothing reaches the store.
+
+    With it, this is a refused start's view, which persists only a first sighting, so a class's age
+    still runs from the first start that saw it (BACKLOG #5615). A class row goes through only if
+    that class had no row in those rows, and the rotation record only if the DEK had no stamp. A
+    changed value, a re-seal, a re-stamp, or a record opened over a standing stamp stays in memory:
+    this start never brought the graph up, so it must not move a date a later start reads."""
+
+    def __init__(
+        self,
+        store: SecretRotationMetaStore,
+        cipher: AesGcmCipher | None,
+        *,
+        first_sightings_against: Mapping[str, SecretRotationMetaRow] | None = None,
+    ) -> None:
+        self._store = store
+        self._cipher = cipher
+        self._before = first_sightings_against
+        self._written: dict[str, SecretRotationMetaRow] = {}
+        self.withheld = 0
+
+    def secret_rotation_cipher(self) -> AesGcmCipher | None:
+        return self._cipher
+
+    async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
+        return {**await self._store.get_secret_rotation_meta(), **self._written}
+
+    async def upsert_secret_rotation_meta(
+        self, secret_key: str, *, fingerprint: str, tracked_since: str, last_rotated: str
+    ) -> None:
+        from messagefoundry.store.store import SecretRotationMetaRow
+
+        self._written[secret_key] = SecretRotationMetaRow(
+            secret_key=secret_key,
+            fingerprint=fingerprint,
+            tracked_since=tracked_since,
+            last_rotated=last_rotated,
+        )
+        if self._before is None:
+            return
+        first_seen_as = _DEK_CLASS_ID if secret_key == ROTATION_RECORD_ID else secret_key
+        if first_seen_as in self._before:
+            self.withheld += 1
+            return
+        await self._store.upsert_secret_rotation_meta(
+            secret_key,
+            fingerprint=fingerprint,
+            tracked_since=tracked_since,
+            last_rotated=last_rotated,
+        )
+
+
+async def refuse_expiry_before_graph(
+    meta_store: SecretRotationMetaStore,
+    settings: SecretRotationSettings,
+    *,
+    dek_key_id: Callable[[], str | None],
+    enforcement: SecurityEnforcement,
+    alert_sink: AlertSink | None,
+    extra_values: Callable[[], Mapping[str, str]],
+    audit_rolled: Callable[[], bool | None],
+    held: Callable[[], Awaitable[Collection[str]]],
+) -> None:
+    """Refuse an expired store key or opted-in secret BEFORE a single node binds a listener
+    (BACKLOG #5615). :meth:`Engine.start`'s own reconcile and refusals stay where they are, after the
+    graph, and still decide every start this function does not refuse.
+
+    It first runs the real reconcile and refusals against in-memory rows, with no alert, no log line
+    and no AES-GCM charge. With no class opted in, that run skips the non-DEK secrets, which nothing
+    would judge. If they would not refuse, it has changed nothing. If they would, it runs the
+    reconcile again with the real sink, persisting first sightings only
+    (:class:`_InMemoryRotationMeta`), and the refusals raise.
+
+    Runs only under ENFORCE with the DEK refusal on, on a store that holds a local key. A failed
+    prediction is logged by type and the start goes on, so the later block decides, including for a
+    secrets directory it must refuse. ``Exception`` only: a cancellation still propagates."""
+    if enforcement is not SecurityEnforcement.ENFORCE or not settings.enforce_store_key_expiry:
+        return
+    silent = _SilentRotationSink()
+    try:
+        with _muted_prediction():
+            key_id = dek_key_id()
+            if not key_id or (cipher := meta_store.secret_rotation_cipher()) is None:
+                return
+            extra, rolled = extra_values(), audit_rolled()
+
+            async def reconcile(
+                view: _InMemoryRotationMeta, sink: AlertSink | None
+            ) -> dict[str, SecretStamp]:
+                return await reconcile_rotation_meta(
+                    view,
+                    settings,
+                    dek_key_id=key_id,
+                    enforcement=enforcement,
+                    alert_sink=sink,
+                    extra_values=extra,
+                    audit_rolled=rolled,
+                )
+
+            async def refuse(stamps: Mapping[str, SecretStamp], sink: AlertSink | None) -> None:
+                enforce_store_key_expiry(
+                    settings, stamps, enforcement=enforcement, dek_key_id=key_id, alert_sink=sink
+                )
+                enforce_secret_expiry(
+                    settings, stamps, enforcement=enforcement, held=await held(), alert_sink=sink
+                )
+
+            uncharged = (
+                cast("AesGcmCipher", _UnchargedCipher(cipher))
+                if settings.enforce_secret_expiry_classes
+                else None
+            )
+            predicted = await reconcile(_InMemoryRotationMeta(meta_store, uncharged), silent)
+            with contextlib.suppress(StoreKeyRotationOverdueError, SecretRotationOverdueError):
+                await refuse(predicted, silent)
+                return
+        refused_view = _InMemoryRotationMeta(
+            meta_store,
+            cipher,
+            first_sightings_against=await meta_store.get_secret_rotation_meta(),
+        )
+        stamps = await reconcile(refused_view, alert_sink)
+    except Exception as exc:
+        # By type only: a cipher or encode error can carry a fingerprint cell.
+        log.warning(
+            "secret rotation: the check before the graph failed (%s); the check after the graph "
+            "still decides this start",
+            type(exc).__name__,
+        )
+        return
+    if refused_view.withheld:
+        # The reconcile's own lines say "opened", "re-stamped" or "sealed" for these rows.
+        log.warning(
+            "secret rotation: this start is being refused before the graph, so %d rotation "
+            "row write(s) the lines above describe were NOT saved, a rotation record or new "
+            "fingerprint included. A later start that is not refused makes them.",
+            refused_view.withheld,
+        )
+    # Outside the handler above, for the reason enforce_store_key_expiry gives.
+    await refuse(stamps, alert_sink)
 
 
 class SecretRotationRunner:

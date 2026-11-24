@@ -104,6 +104,7 @@ from messagefoundry.pipeline.secret_rotation import (
     enforce_store_key_expiry,
     held_env_secret_values,
     reconcile_rotation_meta,
+    refuse_expiry_before_graph,
     secrets_from_settings_and_stamps,
 )
 from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
@@ -2368,6 +2369,21 @@ class Engine:
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
                 # bring-up live in _start_graph (shared with the clustered leader path).
+                # BACKLOG #5615: an expired key or secret is refused before a listener binds. The
+                # [secret_rotation] block below still decides every start this does not refuse.
+                if self._secret_rotation_settings is not None and isinstance(
+                    self.store, SecretRotationMetaStore
+                ):
+                    await refuse_expiry_before_graph(
+                        self.store,
+                        self._secret_rotation_settings,
+                        dek_key_id=lambda: self.store.cipher_info().active_key_id,
+                        enforcement=self._security_enforcement,
+                        alert_sink=self._alert_sink,
+                        extra_values=self._connector_secret_env_values,
+                        audit_rolled=lambda: audit_chain_rolled(self.store),
+                        held=self._expiry_enforced_held_ids,
+                    )
                 await self._start_graph()
             else:
                 # CLUSTERED (active-passive, Workstream A1): the graph runs ONLY on the leader, so do
