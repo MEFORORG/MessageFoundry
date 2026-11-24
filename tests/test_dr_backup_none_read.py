@@ -5,9 +5,9 @@
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
 ``if not buf: break`` ends the copy short there. Three copy loops in ``pipeline/dr_backup.py`` now
 share :func:`dr_backup._read_chunks`, which reads through the codec's ``_read_once`` and so refuses
-a ``None`` read, as the keyed branch does. It raises the refusal as an ``OSError``, a failed read,
-so each site reports it the way it reports any read failure there; these tests drive each of the
-three and check that report. Reads in that module this branch does not change include at least
+a ``None`` read, as the keyed branch does. It raises the refusal as an ``OSError``, so each site
+reports it the way it reports any ``OSError`` in that copy; these tests drive each of the three and
+check that report. Reads in that module this branch does not change include at least
 ``_extract_member``, the plaintext branch of ``_restore_blocking``, the ``shutil.copyfileobj`` in
 ``_place_restored_store`` and ``_sha256_file``. The sources are synthetic: a store with one made-up
 row, and a tar of made-up config bytes."""
@@ -142,8 +142,8 @@ async def test_a_plaintext_backup_refuses_a_none_read(
     """The no-key build copies the staged tar to the archive, and verify copies the archive back to
     a tar. A ``None`` at either used to end the copy short: here, on the first read, it ended it at
     zero bytes and the run failed later on an empty tar. It now fails at the read, naming the
-    copy, with the failure kind a read failure gets there: ``write`` at the build, and at verify a
-    ``FAIL`` not worded as a decrypt, since a no-key copy decrypts nothing."""
+    copy, with the failure kind any ``OSError`` in that copy gets: ``write`` at the build, and at
+    verify a ``FAIL`` not worded as a decrypt, since a no-key copy decrypts nothing."""
     dest = (tmp_path / "backups").resolve()
     wrapped: list[_Stalling] = []
     real_open = builtins.open
@@ -206,7 +206,7 @@ def test_a_config_restore_refuses_a_none_read(
     monkeypatch.setattr(tarfile.TarFile, "extractfile", _extractfile)
     dest = tmp_path / "restored-config"
     written: list[Path] = []
-    # The restore's own wrapper names the read failure as a restore refusal.
+    # The restore's own wrapper names the OSError as a restore refusal.
     with pytest.raises(BackupError, match="no data ready reading the config member") as caught:
         dr._restore_config_members(tar_path, dest, written=written)
     assert sum(w.stalls for w in wrapped) > 0

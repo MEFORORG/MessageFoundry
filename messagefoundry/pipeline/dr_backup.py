@@ -466,20 +466,18 @@ def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
     empty read, which is the end of the stream.
 
-    Each read goes through the codec's own ``_read_once``, so a single read is held to the same
+    Each read goes through the codec's own ``_read_once``, so a single read is held to at least the
     checks the keyed copies apply to each read: a ``None`` read, a read that is not bytes, and a
-    read over the size asked for are refused. Those per-read checks are all this shares with the
-    keyed copies. It authenticates nothing and caps no total. A ``None`` read comes from a
-    non-blocking source with no data ready, and a bare ``if not buf: break`` loop reads it as the
-    end of the stream and finishes the copy short (BACKLOG #6687). ``what`` names the copy in the
-    refusal. A blocking binary file answers each read with at most ``n`` bytes and never ``None``,
-    so for one this yields the same reads the old loops wrote.
+    read over the size asked for are refused. It authenticates nothing and caps no total. A ``None``
+    read comes from a non-blocking source with no data ready, and a bare ``if not buf: break`` loop
+    reads it as the end of the stream and finishes the copy short (BACKLOG #6687). ``what`` names
+    the copy in the refusal. A blocking binary file answers each read with at most ``n`` bytes and
+    never ``None``, so for one this yields the same reads the old loops wrote.
 
-    The refusal is raised as an ``OSError`` (``EIO``), with the codec's error chained to it, since
-    it is a failed read of the source. The callers already treat an ``OSError`` from these copies
-    as a read failure: the build reports failure kind ``write``, the verify a ``FAIL`` not worded as
-    a decrypt, and the config restore a named refusal. A ``BackupCodecError`` would be reported as
-    kind ``encrypt`` or as ``decrypt failed``, and a no-key copy does neither."""
+    The refusal is raised as an ``OSError`` (``EIO``) with the codec's error chained to it, so each
+    caller handles it as it handles any ``OSError`` from that copy, which the callers' own ``except``
+    arms define. A ``BackupCodecError`` would instead be reported as an encrypt or decrypt failure,
+    and a no-key copy does neither."""
     while True:
         try:
             buf = _read_once(cast(BinaryIO, src), _COPY_CHUNK_BYTES, what)
