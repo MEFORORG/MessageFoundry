@@ -2471,7 +2471,9 @@ class RegistryRunner:
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # Which internal stages recorded each ("inbound", name) hold, None for a hold recorded with
         # no stage. Read only by _log_halt_keeps_stopped, so a log halt keeps STOPPED only the lane
-        # whose own stage holds; the shared record above stays as it is (BACKLOG #5704).
+        # whose own stage holds; the shared record above stays as it is (BACKLOG #5704). Entries
+        # are cleared only with the whole record, so a stage whose STOP was re-armed without a
+        # release stays listed.
         self._stop_held_stages: dict[str, set[Stage | None]] = {}
         # BACKLOG #5708: inbounds whose transform lane's last routed row stopped it because the inbound
         # was missing from the graph, recorded by _apply_routed and read once by whatever ends that
@@ -6091,7 +6093,8 @@ class RegistryRunner:
         still needs), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), the pooled lift of a log halt at an inbound's restart
         (:meth:`_lift_log_halt`, which keeps the inbound record while a lane holds claimed rows
-        in flight), and a full teardown. An operator start that re-arms nothing,
+        in flight, even one it re-arms, which then leaves the record to a teardown), and a full
+        teardown. An operator start that re-arms nothing,
         such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
         leaves the hold in place."""
         key = (kind, name)
@@ -6585,11 +6588,12 @@ class RegistryRunner:
 
         Under pooled each lane the pre-claim gate parked is released
         (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
-        ``resume_lane``, which re-arms a PAUSED or STOPPED one. The inbound's hold is lifted when
-        that re-armed a lane and no lane was STOPPED holding claimed rows in flight
-        (:meth:`StageDispatcher.stopped_holding_rows`), whether or not they are recorded: the
-        release rule this method had when it kept every such lane STOPPED. That covers at least a lane the halt's hand-back STOPPED at T17 or on
-        leadership loss. A lane STOPPED with claimed rows still in flight is re-armed too when
+        ``resume_lane``, which re-arms a PAUSED or STOPPED one. That covers at least a lane the
+        halt's hand-back STOPPED at T17 or on leadership loss. The inbound's hold is lifted when
+        a resume re-armed a lane and no lane was STOPPED holding claimed rows in flight
+        (:meth:`StageDispatcher.stopped_holding_rows`), whether or not they are recorded, so a
+        recorded lane re-armed here leaves the hold with no STOPPED lane to clear it (ADR 0162
+        section 6 note). A lane STOPPED with claimed rows still in flight is re-armed too when
         its next chunk assembly would re-pend them before it claims (BACKLOG #5744), and is not
         re-armed here when it would not
         (:meth:`StageDispatcher.stopped_past_unrecorded_rows` says when), because a re-arm would
@@ -6608,10 +6612,8 @@ class RegistryRunner:
             if (d := self._dispatchers.get(stage)) is not None
         ]
         kept = [stage for stage, d in lanes if d.stopped_past_unrecorded_rows(name)]
-        # The shared ("inbound", name) hold is released in exactly the cases it was before a
-        # recorded lane was re-armed here: only when no lane holds rows in flight at all (recorded
-        # or not) and a resume re-armed a lane. A recorded lane this re-arms therefore keeps the
-        # hold as it did when it was kept STOPPED. Read before the resumes change the phases.
+        # The release rule for the shared hold, read before the resumes change the phases; the
+        # docstring states it.
         hold_kept = any(d.stopped_holding_rows(name) for _stage, d in lanes)
         for stage in kept:
             log.warning(

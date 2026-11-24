@@ -4278,7 +4278,7 @@ def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_fli
     # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
     # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
     # flight that no stranded record covers, which a re-arm would claim past. A lane whose record
-    # would re-pend them first is re-armed: the test after the next one.
+    # would re-pend them first is re-armed but keeps the hold: the test after the next one.
     # MEASURED on main: the lift left every STOPPED lane STOPPED.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
@@ -4336,7 +4336,8 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     # or whose record the re-pend would drop unwritten because the lease moved since, would be
     # claimed past, so that lane stays STOPPED; so does one whose ownership or lease read raises.
     # A node that does not lead now keeps the record, so its lane is re-armed and waits to re-pend
-    # rather than claim. Every case holds rows in flight, so the hold stays, as on main.
+    # rather than claim. Every case holds rows in flight, so the lift keeps the hold, as main's
+    # lift did; where the lane is re-armed, nothing later releases it (an open finding).
     # MEASURED on main: the lift kept the recorded lane STOPPED too, and nothing drained it.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
