@@ -170,23 +170,52 @@ async def test_concurrent_acquire_exactly_one_wins(store) -> None:
     assert sum(1 for r in results if r) == 1
 
 
-async def test_concurrent_merges_on_the_other_cluster_tables_do_not_deadlock(store) -> None:
-    """BACKLOG #6793: the claim of a shared-to-exclusive range-lock conversion deadlock (1205) when
-    two nodes run MERGE ... WITH (HOLDLOCK) at once on ``cluster_config`` or ``nodes``, the two
-    tables the acquire race above does not cover. Each MERGE seeks its primary key and reads the
-    target under update range locks, which conflict with each other, so the racers queue rather
-    than convert. Every statement here starts on an empty table, the insert-range case, then races
-    the matched case on the same key. Any 1205 escapes as an exception from gather."""
+async def test_concurrent_merges_on_every_cluster_table_do_not_deadlock(store) -> None:
+    """BACKLOG #6793 claims a shared-to-exclusive range-lock conversion deadlock (1205) when nodes
+    run MERGE ... WITH (HOLDLOCK) at once on ``cluster_config``, ``nodes`` or ``leader_lease``.
+    Each MERGE seeks its primary key and, by SQL Server's documented locking, reads the target
+    under update range locks, which conflict with each other, so racers should queue rather than
+    convert. This races each table's insert case and its matched case on ONE key, five rounds, and
+    any 1205 escapes from gather. It is evidence, not proof: nothing here shows two statements
+    overlapped, and no arm makes a deadlock happen on purpose."""
     coords = [_coord(store, f"node{i}:{i}:{i:04x}") for i in range(8)]
     await coords[0]._ensure_tables()
-    # The empty-table seed race, then the matched bump race, on the single cluster_config row.
+    # cluster_config: the empty-table seed race, then matched bumps of the single row.
     assert set(await asyncio.gather(*[c.config_version() for c in coords])) == {0}
-    bumped = await asyncio.gather(*[c.bump_config_version(digest=None) for c in coords])
-    assert sorted(bumped) == list(range(1, 9)), "each bump must see the one before it"
-    # Distinct nodes inserting into an empty nodes table, then each re-registering its own row.
+    for round_no in range(5):
+        bumped = await asyncio.gather(*[c.bump_config_version(digest=None) for c in coords])
+        assert sorted(bumped) == list(range(8 * round_no + 1, 8 * round_no + 9))
+    # nodes: distinct inserts into an empty table, then the SAME node_id registered by every racer.
     await asyncio.gather(*[c._register() for c in coords])
-    await asyncio.gather(*[c._register() for c in coords])
-    assert len(await coords[0].cluster_members()) == 8
+    same = [_coord(store, "nodeS:9:ffff") for _ in range(8)]
+    for _ in range(5):
+        await asyncio.gather(*[c._register() for c in same])
+    assert len(await coords[0].cluster_members()) == 9
+    # leader_lease: standbys race the take-over of one EXISTING expired row, the failover case.
+    assert await coords[0]._claim_or_renew_lease() is True  # the row exists from here on
+    for _ in range(5):
+        await store._execute(
+            "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ?",
+            (coords[0]._lease_key,),
+        )
+        held = await asyncio.gather(*[c._claim_or_renew_lease() for c in coords])
+        assert sum(1 for h in held if h) == 1
+
+
+async def test_the_release_reports_its_match_on_a_real_driver(store) -> None:
+    """BACKLOG #6795 on the real driver: the release counts its OUTPUT rows, so a release by a node
+    the row does not name reports nothing released, and the owner's reports a release."""
+    a = _coord(store, "nodeA:1:aaaa")
+    b = _coord(store, "nodeB:2:bbbb")
+    await a._ensure_tables()
+    await a._register()
+    await b._register()
+    assert await a._claim_or_renew_lease() is True
+    _, _, wrote, released = await b._release_leadership(force_write=True)
+    assert (wrote, released) == (True, False), "the row names A, so B's release matched nothing"
+    a._is_leader = True
+    _, _, wrote, released = await a._release_leadership()
+    assert (wrote, released) == (True, True)
 
 
 async def test_config_version_seed_and_bump(store) -> None:

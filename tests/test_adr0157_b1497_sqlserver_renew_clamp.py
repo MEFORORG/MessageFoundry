@@ -1336,7 +1336,14 @@ class _NoCountCursor(_Cursor):
 
     rowcount = -1
 
+    async def execute(self, sql: str, params: Any = None) -> None:
+        self.sql = sql
+        await super().execute(sql, params)
+
     async def fetchall(self) -> list[tuple[object, ...]]:
+        # pyodbc raises here when the statement returned no rowset; so does this fake.
+        if "OUTPUT inserted." not in self.sql:
+            raise RuntimeError("No results.  Previous SQL was not a query.")
         return list(self._conn.output)  # type: ignore[attr-defined]
 
 
@@ -1359,8 +1366,11 @@ async def test_the_release_reads_its_match_from_output_not_the_row_count(
     conn = _NoCountConn(output)
     coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
     coord._is_leader = True
+    store = coord._store
     result = await coord._release_leadership(force_write=True)
     assert (result[0], result[2], result[3]) == (True, True, released)
+    # A release that matched nothing is not counted as a durable write (BACKLOG #5675).
+    assert store.committed_txns == (1 if released else 0)
 
 
 async def test_a_stepdown_whose_row_names_another_node_reports_no_drain() -> None:

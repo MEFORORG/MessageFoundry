@@ -6701,9 +6701,10 @@ class SqlServerStore:
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
         """Run a single write statement (or T-SQL batch) in its own committed transaction, and return
-        the driver's row count (``-1`` when it reports none). Most callers ignore it; the cluster
-        stepdown reads it, through :meth:`_execute_clamped`, to say truthfully whether its
-        owner-scoped release matched a row."""
+        the driver's row count (``-1`` when it reports none). Not a match signal: a session-wide
+        ``SET NOCOUNT ON`` reports ``-1`` for a zero-match UPDATE too, so a caller that must know
+        whether its write matched reads an ``OUTPUT`` rowset instead, as the cluster stepdown's
+        release does through :meth:`_execute_clamped` (BACKLOG #6795)."""
         return await self._write_rows(sql, params)
 
     async def _execute_clamped(
@@ -6726,7 +6727,9 @@ class SqlServerStore:
         ``count_output`` returns the number of rows the statement's ``OUTPUT`` clause returned
         instead of ``cursor.rowcount``, which a session-wide ``SET NOCOUNT ON`` turns into ``-1``
         even for a zero-match UPDATE (BACKLOG #6795, as #2283 does for :meth:`_execute_output`).
-        The lease release passes it, because it reads whether its owner-scoped UPDATE matched."""
+        The SQL must carry an ``OUTPUT`` clause, or the drain raises. A write that output no row
+        commits uncounted, as ``empty_is_read`` does there (BACKLOG #5675). The lease release
+        passes it, because it reads whether its owner-scoped UPDATE matched."""
         return await self._write_rows(sql, params, timeout_clamp, count_output=count_output)
 
     async def _write_rows(
@@ -6762,7 +6765,10 @@ class SqlServerStore:
                             # 'unknown'.
                             count = getattr(cur, "rowcount", -1)
                             rows = count if isinstance(count, int) else -1
-                        await self._commit(conn)
+                        if count_output and rows == 0:
+                            await self._commit_read(conn)  # changed nothing (BACKLOG #5675)
+                        else:
+                            await self._commit(conn)
                 except Exception:
                     # A rollback that fails would otherwise recycle a connection still holding the
                     # write's X locks; _rollback_or_discard discards it instead. After the cursor
