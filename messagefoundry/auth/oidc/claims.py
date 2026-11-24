@@ -277,14 +277,15 @@ def _check_core_claims(
         raise ClaimsError("claim_aud", "aud does not contain the client_id")
     # OIDC core 3.1.3.7/4 and /5 (ID Token Validation) are the azp items, neither a MUST.
     # Under errata set 2, item 4 covers an azp that extensions produce, and item 5 says validation
-    # MAY include checking that a present azp is our client_id. This engine refuses a present azp
-    # that is not exactly our client_id (another client, null, an empty string, a number or any
-    # other non-string), whatever the audience count, and refuses a token with more than one distinct
-    # audience and no azp (BACKLOG #5339). ``in`` rather than ``get``, so an azp present as null is
-    # refused rather than read as absent. Known limit: item 3 of the same section, a MUST, says to
-    # reject a token carrying an extra audience the client does not trust. The engine has no
-    # trusted-audience list, so it still accepts an aud of [client_id, other] when azp is our
-    # client_id. On the azp items this check goes beyond the spec; on aud it falls short of item 3.
+    # MAY include checking that a present azp is our client_id; the azp claim's own definition
+    # encourages a client not using extensions to ignore it. This engine instead refuses a present
+    # azp that is not exactly our client_id (at least another client, null, an empty string or any
+    # non-string), whatever the audience count (BACKLOG #5339). ``in`` rather than ``get``, so an
+    # azp present as null is refused rather than read as absent. A token with more than one
+    # distinct audience and no azp is refused too, as before that row. Known limit: item 3 of the
+    # same section, a MUST, says to reject a token carrying an extra audience the client does not
+    # trust. The engine has no trusted-audience list, so it still accepts an aud of
+    # [client_id, other] when azp is our client_id.
     if "azp" in claims:
         if claims["azp"] != policy.client_id:
             raise ClaimsError("claim_azp", "azp does not match the client_id")
