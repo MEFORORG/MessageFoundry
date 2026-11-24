@@ -1891,9 +1891,40 @@ async def test_a_body_tag_failure_under_a_held_key_is_reported_once(tmp_path: Pa
     assert await store.read_bytes(a.file_id) == b"a\n"
     assert len(reports) == 1
     table, reason = reports[0]
-    assert table == "uploaded_file"
+    assert table == "uploaded_file_body"
     assert "body" in reason
     assert b.file_id[:12] in reason and b.file_id not in reason
+
+
+async def test_a_body_tag_alert_has_its_own_notifier_subject(tmp_path: Path) -> None:
+    """BACKLOG #5552 item 6 (a), review finding: the notifier throttles per subject, so a body
+    alert on the sidecar's subject could be held back by a sidecar page inside the cooldown."""
+    from messagefoundry.pipeline.alerts import alert_cell_tag_failure
+    from messagefoundry.uploads import UploadUnreadableError
+
+    subjects: list[str] = []
+
+    class _Sink:
+        def integrity_drift(self, subject: str, *, reason: str, drift_count: int) -> None:
+            subjects.append(subject)
+
+    sink = _Sink()
+    store = _store(tmp_path, key=True, aad=True)
+    store._cipher.set_tag_failure_hook(  # type: ignore[attr-defined]
+        lambda table, reason: alert_cell_tag_failure(sink, table, reason)  # type: ignore[arg-type]
+    )
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    for suffix in (".meta", ".blob"):
+        (root / f"{b.file_id}{suffix}").write_text(
+            (root / f"{a.file_id}{suffix}").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    await store.list_files()
+    with pytest.raises(UploadUnreadableError):
+        await store.read_bytes(b.file_id)
+    assert len(subjects) == 2 and len(set(subjects)) == 2, subjects
+    assert "uploaded_file-tag" in subjects
 
 
 async def test_a_body_under_a_key_not_held_is_not_reported(tmp_path: Path) -> None:

@@ -2033,8 +2033,10 @@ class UploadStore:
         held = holds(head) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
         if not (held and _tag_reported.first(f"{part} {fid}")):
             return
+        # The body under its own table name, so its alert has its own notifier subject and a
+        # sidecar page inside the cooldown cannot hold it back (BACKLOG #5552 item 6 (a)).
         report(
-            "uploaded_file",
+            "uploaded_file" if part == "sidecar" else "uploaded_file_body",
             f"an uploaded-file {part} failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
         )
 
