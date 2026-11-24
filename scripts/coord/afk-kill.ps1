@@ -29,8 +29,10 @@
     WHEN THE SWITCH READS OFF, -Banner may print the skill instruction ADR 0211 describes. Who gets
     it is stated there. The seat is read the way scripts/hooks/role-card-inject.ps1 reads it: the
     worktree the hook input's `cwd` sits in, its `.claude/seat.local.txt`, then $env:KORUS_SEAT,
-    then the roster's aliases. A fault on this path prints no instruction, so it fails toward no
-    instruction rather than a wrong one. It never runs while the switch reads ON.
+    then the roster's aliases. That worktree must share this script's git common dir; a `cwd` in
+    another repository's checkout prints no instruction. A fault on this path prints no
+    instruction, so it fails toward no instruction rather than a wrong one. It never runs while the
+    switch reads ON.
 
     It writes nothing. Of local state it reads at least the seat marker, the roster and the `.git`
     entries above the hook input's `cwd`, and no coordination state, so it runs in a cloud session
@@ -126,6 +128,14 @@ function Get-SkillInstructionSource {
     if (-not $p.Named) { throw 'the hook input names no cwd' }
     $root = Get-CcxWorktreeRoot $p.Cwd
     if (-not $root) { throw "the hook input's cwd $($p.Cwd) is inside no checkout" }
+    # Only a checkout of this repository may name the seat: another repository's marker, or its
+    # roster with no Special alias, would hand a Special seat the instruction. A common dir that
+    # cannot be read is not shown to be ours, so it refuses too.
+    $own = Get-CcxGitCommonDir (Get-CcxWorktreeRoot $PSScriptRoot)
+    $theirs = Get-CcxGitCommonDir $root
+    $same = $own -and $theirs -and ((Test-CcxSamePath $own $theirs) -or
+        (Test-CcxSamePath (ConvertTo-CcxRealPath $own) (ConvertTo-CcxRealPath $theirs)))
+    if (-not $same) { throw "the hook input's cwd $($p.Cwd) is in $root, which is not a checkout of this repository" }
     $source = ''
     if ($payload.PSObject.Properties['source']) { $source = ([string]$payload.source).Trim().ToLowerInvariant() }
     $raw = $null

@@ -304,6 +304,64 @@ def test_a_cwd_inside_no_checkout_gives_no_instruction_and_says_so(sb: Sandbox) 
     assert proc.stdout == "" and "inside no checkout" in proc.stderr, proc.stderr
 
 
+def _foreign_repo(sb: Sandbox, seat: str) -> Path:
+    """A checkout of another repository, with a roster that maps no alias to Special."""
+    foreign = sb.repo.parent / "foreign"
+    foreign.mkdir()
+    subprocess.run(["git", "init", "-q", str(foreign)], check=True, capture_output=True, timeout=60)
+    roles = foreign / "docs" / "roles"
+    roles.mkdir(parents=True)
+    (roles / "seats.json").write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _mark(foreign, seat)
+    (foreign / "src").mkdir()
+    return foreign
+
+
+@pytest.mark.parametrize("seat", ["builder", "adhoc"])
+def test_a_cwd_in_another_repository_gives_no_instruction_and_says_so(
+    sb: Sandbox, seat: str
+) -> None:
+    # BACKLOG #7559. This worktree's marker says Special. A cwd in another repository's checkout must
+    # not let that checkout's marker, or its roster missing the Special alias, name the seat.
+    foreign = _foreign_repo(sb, seat)
+    proc = _seat_run(sb, "off", "special", cwd=foreign / "src")
+    assert proc.stdout == "", proc.stdout
+    assert "not a checkout of this repository" in proc.stderr, proc.stderr
+
+
+def test_a_linked_worktree_of_another_repository_gives_no_instruction(sb: Sandbox) -> None:
+    foreign = _foreign_repo(sb, "builder")
+    gitdir = foreign / ".git" / "worktrees" / "fwt"
+    gitdir.mkdir(parents=True)
+    (gitdir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (gitdir / "commondir").write_text("../..\n", encoding="utf-8")
+    wt = sb.repo.parent / "fwt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {gitdir}\n", encoding="utf-8")
+    _mark(wt, "builder")
+    proc = _seat_run(sb, "off", "special", cwd=wt)
+    assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
+
+
+def test_a_worktree_whose_git_dir_is_gone_gives_no_instruction(sb: Sandbox) -> None:
+    # Its common dir cannot be read, so it cannot be shown to be this repository's.
+    wt = sb.repo.parent / "orphan"
+    wt.mkdir()
+    (wt / ".git").write_text(
+        f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
+    )
+    _mark(wt, "builder")
+    proc = _seat_run(sb, "off", "special", cwd=wt)
+    assert proc.stdout == "" and "not a checkout of this repository" in proc.stderr, proc.stderr
+
+
+def test_a_cwd_in_another_repository_leaves_the_switch_reading(sb: Sandbox) -> None:
+    # The switch read never depends on the cwd: ON still prints the banner.
+    foreign = _foreign_repo(sb, "builder")
+    hook = json.loads(_seat_banner(sb, "on", "builder", cwd=foreign))
+    assert hook["hookSpecificOutput"]["additionalContext"].startswith("AFK KILL SWITCH IS ON")
+
+
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
 def test_an_unusable_payload_gives_no_skill_instruction(sb: Sandbox, stdin: str) -> None:
     sb.set_state(variables={"MEFOR_AFK_KILL": "off"})
