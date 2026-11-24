@@ -6,7 +6,11 @@
   the [2026-07-12 amendment](#amendment-2026-07-12--connector-secretprovider-5-promoted-to-built));
   Amended 2026-11-05 — the four unbuilt external provider names `aws_kms`, `azure_kv`, `gcp_kms` and
   `pkcs11` removed, so `vault` is the one external provider (see the
-  [2026-11-05 amendment](#amendment-2026-11-05--the-four-unbuilt-external-provider-names-are-removed-vault-backlog-2595-slice-d)).**
+  [2026-11-05 amendment](#amendment-2026-11-05--the-four-unbuilt-external-provider-names-are-removed-vault-backlog-2595-slice-d));
+  further amendments below: 2026-07-17 (two, cell-bound AAD and the invocation ceiling), 2026-07-22
+  (the persisted invocation bound), 2026-07-28 (`aad_bind` on by default), 2026-09-28 and 2026-10-10
+  (the generators under demand, ASVS 11.5.2), and 2026-11-24 (corrections to those two, see the
+  [2026-11-24 amendment](#amendment-2026-11-24--corrections-to-the-2026-09-28-and-2026-10-10-rng-amendments-vault-backlog-1173)).**
   Designs the pluggable
   **KeyProvider** seam (work package **WP-BL3-04**) that lets the store's at-rest data-encryption key be
   sourced from an external HSM / cloud KMS / Vault via **envelope decryption**. **As of the 2026-06-18
@@ -911,3 +915,45 @@ its module and its name in the same change, never the name ahead of the module. 
 that list the four names, at least the *Built* bullet in the header, section 2's value set and
 section 3's provider table, record the design as it was accepted. Read them as the design of
 providers that are not offered, not as accepted values.
+
+## Amendment 2026-11-24 — corrections to the 2026-09-28 and 2026-10-10 RNG amendments (vault BACKLOG #1173)
+
+This amendment corrects and completes the two RNG amendments above. It leaves their text in place
+and says here which reading governs. It claims no verdict on ASVS 11.5.2. Every source below was
+read on 2026-11-24.
+
+1. **The channel token belongs in the 2026-09-28 library table.** Read that table as having one more
+   row:
+
+   | Value | Library | Symbol |
+   |---|---|---|
+   | IDE extension webview channel tokens | Node, `node:crypto` `randomBytes` | `ide/src/webviewMessaging.ts` `openChannel` |
+
+   `openChannel` draws the token through `cspNonce.ts` `nonce`, in a separate call from the CSP
+   nonce it mints beside it. The 2026-10-10 amendment named the token in prose; the table did not.
+
+2. **The Windows `os.urandom` row reads the Python documentation page only.** Its *Can it fail?* cell
+   says the page does not say. The CPython source bullet in the same amendment reads the 3.14 branch
+   of `Python/bootstrap_hash.c`, which raises when `BCryptGenRandom` reports a failed status. So a
+   reported failure raises on Windows too, as point 3 of that amendment says. What the page does not
+   say is still true of the page.
+
+3. **The Node page was checked against the Node that VS Code 1.95 ships.** The extension's
+   `engines.vscode` in `ide/package.json` is `^1.95.0`. The VS Code 1.95 release notes
+   (<https://code.visualstudio.com/updates/v1_95>) say that release ships Electron 32 with
+   Node.js 20.18.0. The `crypto.randomBytes` section of
+   <https://nodejs.org/docs/v20.18.0/api/crypto.html> says what the v26.11.1 page cited above says
+   on the points that amendment's table uses: the call does not complete until there is enough
+   entropy, a longer wait is named only right after boot, and the synchronous form throws "if
+   there is a problem generating the bytes". Two things stay unchecked. A newer VS Code ships a newer
+   Node, and no page for those versions was read. The crypto library under that Node's `randomBytes`
+   inside Electron was not checked either.
+
+4. **The second 2026-10-10 correction note is not a source for the Transit gate.** That note, under
+   the 2026-09-28 amendment's point 4, ends by saying the check counts no invocations and the bound
+   stays weaker than the counted one. Point 4 says the same, and ADR 0138's 2026-10-07 amendment
+   records what the gate checks and what it does not catch. Where they differ, point 4 and that
+   amendment govern; the note's last sentence adds nothing to them.
+
+5. **An enforced bound for DR archives under `vault_transit` is not built.** This ADR does not cover
+   it. Vault BACKLOG #3568 holds that follow-up.
