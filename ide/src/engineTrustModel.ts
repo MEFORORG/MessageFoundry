@@ -28,6 +28,7 @@
 import * as path from "node:path";
 
 import { isLocalEngine } from "./engineTarget";
+import { foldAsciiCase } from "./pathFold";
 
 /** The `api_tls` object of `messagefoundry cert inventory --service-config … --json`. */
 export interface ApiTlsFacts {
@@ -452,6 +453,8 @@ export function isFullyQualifiedPath(file: string, flavour: PathFlavour = path):
  *   * a second, DIFFERENT file for a `host:port` an earlier entry already pinned. Anchors are filed by
  *     `host:port` ({@link engineHostKey}), so two files cannot both apply; the first one stays, and
  *     the same file named twice (an engine shard repeating its environment's URL) is not a conflict.
+ *     On Windows only ASCII case is folded, so one file spelled twice with a non-ASCII case
+ *     difference is refused as another file, the fail-safe reading (BACKLOG #5832).
  */
 export function trustPinsFor(
   targets: readonly PinTarget[],
@@ -493,9 +496,10 @@ export function trustPinsFor(
     const file = flavour.normalize(caFile);
     const earlier = byKey.get(key);
     if (earlier !== undefined) {
-      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file.
+      // Windows paths are case-insensitive, so C:\PKI\ca.pem and c:\pki\ca.pem are one file. ASCII
+      // A-Z only, not toLowerCase() (pathFold.ts).
       const same =
-        flavour.sep === "\\" ? earlier.toLowerCase() === file.toLowerCase() : earlier === file;
+        flavour.sep === "\\" ? foldAsciiCase(earlier) === foldAsciiCase(file) : earlier === file;
       if (!same) {
         out.push({
           kind: "refused",

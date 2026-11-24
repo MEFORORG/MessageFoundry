@@ -27,7 +27,7 @@ from tests._last_admin_store_contract import ADMIN, VIEWER, enabled_admins
 
 __all__ = ["enabled_admins"]
 
-TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 
 
 def hash_of(user_id: str) -> str:

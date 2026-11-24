@@ -10,6 +10,7 @@ hermetic (no live engine / SQL Server)."""
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
@@ -292,6 +293,62 @@ def test_batch_comparison_keys_on_batch_tag_not_fuse() -> None:
     b0_recs = [r for r in recs if not r.batch_handoff_statements]
     assert b1_recs and all(r.batch_handoff_statements for r in b1_recs)
     assert b0_recs and all(not r.batch_handoff_statements for r in b0_recs)
+
+
+_UNRUN_512 = ("pooled", "fixed_aggregate", 512)
+
+
+def _go_at_256() -> list[ConnScaleRecord]:
+    return _trials(False, [100.0, 101.0, 99.0]) + _trials(True, [120.0, 121.0, 119.0])
+
+
+def test_a_count_where_both_arms_failed_to_start_is_a_no_go_bug_5430() -> None:
+    cmp = build_batch_comparison(
+        _go_at_256(), (False, True), missing_detail={_UNRUN_512: "engine error: boom"}
+    )
+    assert cmp is not None
+    assert [(row.count, row.verdict) for row in cmp.rows] == [(256, FUSE_GO)]
+    assert cmp.unrun_cells == [_UNRUN_512]
+    assert cmp.overall_verdict == FUSE_NO_GO
+    assert not cmp.ok
+    assert cmp.to_json_dict()["unrun_cells"] == [list(_UNRUN_512)]
+    assert "[pooled/fixed_aggregate] N=512" in cmp.render_table()
+    assert any("N=512" in note for note in cmp.notes)
+
+
+@pytest.mark.parametrize("build", [build_batch_comparison, build_fuse_comparison])
+def test_every_cell_unrun_is_a_no_go_not_inconclusive_bug_5430(build: Any) -> None:
+    cmp = build([], (False, True), missing_detail={_UNRUN_512: "engine error: boom"})
+    assert cmp is not None
+    assert cmp.rows == []
+    assert cmp.unrun_cells == [_UNRUN_512]
+    assert cmp.overall_verdict == FUSE_NO_GO
+    assert not cmp.ok
+
+
+def test_a_cell_with_one_arm_recorded_is_not_reported_as_unrun_bug_5430() -> None:
+    b1_only = _trials(True, [120.0], count=512)
+    b0_only = _trials(False, [100.0], count=512)
+    detail = {_UNRUN_512: "engine error: boom"}
+
+    orphan = build_batch_comparison(_go_at_256() + b1_only, (False, True), missing_detail=detail)
+    assert orphan is not None
+    assert orphan.baseline_missing == [_UNRUN_512]
+    assert orphan.unrun_cells == []
+
+    missing = build_batch_comparison(_go_at_256() + b0_only, (False, True), missing_detail=detail)
+    assert missing is not None
+    assert missing.missing_arms == 1
+    assert missing.unrun_cells == []
+
+
+def test_a_run_with_no_gap_emits_no_unrun_key_bug_5430() -> None:
+    cmp = build_batch_comparison(_go_at_256(), (False, True))
+    assert cmp is not None
+    assert cmp.overall_verdict == FUSE_GO
+    assert cmp.ok
+    assert "unrun_cells" not in cmp.to_json_dict()
+    assert "UNRUN" not in cmp.render_table()
 
 
 def test_go_when_b1_lift_ge_10pct_and_gt_2sigma() -> None:

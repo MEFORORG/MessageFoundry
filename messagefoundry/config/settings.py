@@ -113,7 +113,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
-from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
+from messagefoundry.hostlist import allow_entry_problem, names_no_host, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -1233,6 +1233,16 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+            # BACKLOG #5512. No hop guard reads a SQL Server store's host, so one that names none
+            # would reach the driver as `SERVER=,1433`. On Postgres only spaces are refused: the
+            # `server` row of docs/CONFIGURATION.md says what an empty value means there.
+            server = self.server or ""  # `missing` above already refused None
+            if self.backend is StoreBackend.SQLSERVER:
+                unnamed = names_no_host(server)
+            else:
+                unnamed = bool(server) and not server.strip()
+            if unnamed:
+                raise ValueError(f"[store].server names no host: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
@@ -2230,7 +2240,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2241,6 +2252,12 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
+    # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
+    # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
+    crl_check_chain: bool = False
 
     @field_validator("crl_file")
     @classmethod
@@ -2265,6 +2282,17 @@ class TlsSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_chain_requires_crl_file(self) -> TlsSettings:
+        # With no CRL file the chain check has nothing to check against, so the flag would read as a
+        # control that is on while every hop keeps no revocation check at all.
+        if self.crl_check_chain and not self.crl_file:
+            raise ValueError(
+                "[tls].crl_check_chain = true requires [tls].crl_file: the whole-chain check reads "
+                "the CRLs in that file, and with none set no hop would check revocation"
+            )
+        return self
+
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
         outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
@@ -2277,6 +2305,7 @@ class TlsSettings(_Section):
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
             crl_file=self.crl_file,
+            crl_check_chain=self.crl_check_chain,
         )
 
 
@@ -3885,7 +3914,9 @@ class AuthSettings(_Section):
     # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
     # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
     oidc_issuer: str | None = None
-    oidc_client_id: str | None = None  # also the required `aud`/`azp`
+    # The id_token aud/azp rule this feeds, and its known limit: docs/CONFIGURATION.md, the
+    # oidc_client_id row, and _check_core_claims in auth/oidc/claims.py.
+    oidc_client_id: str | None = None
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
@@ -5150,11 +5181,12 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host, and so must
+    a value that trims to nothing, which names no other system (BACKLOG #5512). No DNS.
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5431,7 +5463,8 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     the SAME authority the transports consume — so the forwarder decides identically to every other
     egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
     verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
-    MITM-able and go to the gradient:
+    MITM-able and go to the gradient. A forwarder with no host returns ALLOW before any of this:
+    ``serve`` builds none without a host, so there is no hop to judge (BACKLOG #5512).
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
@@ -5451,15 +5484,16 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     instance carrying patient data there is no instance left for it to fire on, so it is gone. A
     ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
     way this cell could express an acceptance."""
+    if not log.forward_host:
+        # An unconfigured forwarder: `serve` builds none without a host, so there is no hop to
+        # refuse. Said here because the shared predicate no longer reads "" as loopback (#5512).
+        return HopDisposition.ALLOW
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
-        # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
-        # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
-        # can never be refused.
-        is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
+        is_loopback_hop=is_loopback_hop_host(log.forward_host),
         hop_attested=log.forward_hop_attested,
         # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
         # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
@@ -5537,7 +5571,7 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     number = int(port)
     # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
     # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
-    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    if "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
         address = ipaddress.ip_address(host)
@@ -11314,10 +11348,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11326,8 +11360,10 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "

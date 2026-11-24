@@ -16,6 +16,7 @@ import {
 } from "./engineClient";
 import { engineLog } from "./engineLog";
 import { isLocalEngine } from "./engineTarget";
+import { foldAsciiCase } from "./pathFold";
 import { droppedSkipped } from "./workspaceContainment";
 import {
   engineHostKey,
@@ -704,9 +705,10 @@ async function readAnchorPem(file: string): Promise<PemRead> {
   return { pem };
 }
 
-/** How a file is identified: Windows paths are case-insensitive, as `trustPinsFor` treats them. */
+/** How a file is identified: Windows paths are case-insensitive, and only ASCII case is folded
+ *  there, as `trustPinsFor` folds it (pathFold.ts, BACKLOG #5832). */
 function fileId(file: string): string {
-  return process.platform === "win32" ? file.toLowerCase() : file;
+  return process.platform === "win32" ? foldAsciiCase(file) : file;
 }
 
 function sameFile(a: string, b: string): boolean {

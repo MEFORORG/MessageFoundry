@@ -87,9 +87,13 @@ class CampaignResult:
     #: Reply frames by MSA-1 code, plus ``closed`` (no reply) and ``bad-reply`` exchanges.
     replies: Counter[str] = field(default_factory=Counter)
     layers: Counter[str] = field(default_factory=Counter)
-    #: Positive acknowledgements whose stored row was found by control id. Zero means the
-    #: per-message store invariant never ran, which proves nothing.
+    #: Positive acknowledgements matched to a new stored row against a pre-send count. Zero means
+    #: the per-message store invariant never proved a new row, which proves nothing.
     stored_checked: int = 0
+    #: Positive acknowledgements echoing an id this case did not re-read just before sending, or
+    #: one another frame of the case carried without a matching ACK. Their check runs, but a row
+    #: that is not theirs can satisfy it, so they do not count toward :attr:`stored_checked`.
+    stored_presence_only: int = 0
     failures: list[Failure] = field(default_factory=list)
     #: What a result must have checked to pass: a stored row for a campaign; for a replay, only a
     #: case judged, since a kept case is often one the engine NAKs or owes no reply at all.
@@ -102,6 +106,12 @@ class CampaignResult:
         if self.cases == 0:
             return "no case was sent, so no invariant was checked"
         if self.require_stored and self.stored_checked == 0:
+            if self.stored_presence_only:
+                return (
+                    f"no positive acknowledgement was matched to a new stored row: "
+                    f"{self.stored_presence_only} echoed a control id with no pre-send count for "
+                    "their case, or one a sibling frame shared, which a row not theirs can satisfy"
+                )
             return (
                 "no positive acknowledgement was matched to a stored row, so the per-message "
                 "store invariant never ran"
@@ -212,15 +222,24 @@ class _Session:
         sent: list[Case] = []
         acknowledgements = 0
         try:
-            # Every frame's id, not only the first's: each positive ACK is checked against the
-            # rows its own id had before the batch.
+            # Every frame's id, not only the first's. This read stays as a floor because an ACK
+            # can echo the id of ANOTHER case of the batch, which that case's re-read won't cover.
             predicted = {cid for c in cases for f in frames(c.data) if (cid := control_id_of(f))}
             before = {cid: rows_for(self.client, cid) for cid in predicted if queryable(cid)}
             for case in cases:
                 if deadline is not None and time.monotonic() >= deadline:
                     break
+                # Read again just before this case goes out: the batch's count would let an
+                # earlier case's row, a NAK's included, satisfy this case's positive ACK (BACKLOG
+                # #5567). Read before the case joins ``sent``, so a fault here does not report an
+                # unsent case as a suspect.
+                own = {c for f in frames(case.data) if (c := control_id_of(f))} & before.keys()
+                before.update({cid: rows_for(self.client, cid) for cid in own})
+                # Again, because that read can wait out a rate limit past the budget.
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 sent.append(case)
-                count, problems = self._one(case, before)
+                count, problems = self._one(case, before, own)
                 acknowledgements += count
                 failures.extend((reason, case) for reason in problems)
             total = store_total(self.client)
@@ -247,7 +266,7 @@ class _Session:
             self._fail(reason, culprit, sent)
         return len(sent), not failures
 
-    def _one(self, case: Case, before: dict[str, int]) -> tuple[int, list[str]]:
+    def _one(self, case: Case, before: dict[str, int], reread: set[str]) -> tuple[int, list[str]]:
         """Send one case; return its acknowledgement count and its broken invariants."""
         self.result.cases += 1
         self.result.layers[case.layer] += 1
@@ -261,6 +280,15 @@ class _Session:
         if not verdict.acks:
             self.result.replies["closed"] += 1
         problems: list[str] = []
+        # A frame whose ACK did not match its id may still have stored a row under that id, and no
+        # read can fall between two frames of one send, so an ACK of that id proves presence only.
+        shared: set[str | None] = set()
+        for ack, payload in zip(verdict.acks, sent_frames, strict=True):
+            carried = control_id_of(payload)
+            if not ack.positive:
+                shared |= {ack.control_id, carried}
+            elif carried is not None and carried.rstrip() != ack.control_id:
+                shared.add(carried)
         # judge held the count to one acknowledgement per frame, answered in the order sent.
         for ack, payload in zip(verdict.acks, sent_frames, strict=True):
             if not ack.positive:
@@ -280,9 +308,12 @@ class _Session:
             if problem:
                 problems.append(problem)
             else:
-                self.result.stored_checked += 1
-                # The next positive ACK for this id, a second frame of the case or a later case
-                # of the batch, owes a row of its own rather than reusing this one.
+                if stored[0] in reread and stored[0] not in shared:
+                    self.result.stored_checked += 1
+                else:
+                    self.result.stored_presence_only += 1
+                # A second frame of this case owes a row of its own rather than reusing this one.
+                # A later case carrying this id re-reads it; one that only echoes it needs this.
                 before[stored[0]] = stored[1] + 1
         return len(verdict.acks), problems
 
@@ -357,13 +388,14 @@ class _Session:
         elapsed = time.monotonic() - self.started
         self.emit(
             f"{verdict} seed={r.seed} cases={r.cases} replies[{replies}] layers[{layers}] "
-            f"stored_checked={r.stored_checked} elapsed={elapsed:.1f}s"
+            f"stored_checked={r.stored_checked} stored_presence_only={r.stored_presence_only} "
+            f"elapsed={elapsed:.1f}s"
         )
         if r.vacuous and not r.failures:
             # Recorded as a failure, with no case and no file, so every reader of the result
             # sees why it did not pass.
             r.failures.append(Failure(r.vacuous, None, ()))
             self.emit(
-                f"FAIL seed={r.seed} reason={r.vacuous}; a run that checked nothing is not a pass"
+                f"FAIL seed={r.seed} reason={r.vacuous}; a run that proved nothing is not a pass"
             )
         return r

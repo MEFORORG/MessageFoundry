@@ -25,6 +25,7 @@ from messagefoundry.config.models import BatchConfig, ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Registry
 from messagefoundry.framing import MLLP_CODEC
+from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.split import split_batch
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
@@ -485,6 +486,33 @@ async def test_head_carried_verbatim(store: Any) -> None:
     env = rec.sent[0]
     # The head member's exact segments (incl its PID) appear verbatim in the envelope body.
     assert "PID|1||100||DOE^P1" in env and "MSG1" in env
+
+
+async def test_the_head_control_id_is_read_without_a_full_parse(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5919 step 1: BHS-11 is the head's MSH-10, read from its first line, so a large
+    # head is not parsed in full to read one field.
+    await _enqueue(store, 2)
+    runner = _runner(store)
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
+    parses: list[object] = []
+    real_parse = Message.parse
+
+    def counting_parse(raw: str | bytes) -> Message:
+        parses.append(raw)
+        return real_parse(raw)
+
+    monkeypatch.setattr(Message, "parse", staticmethod(counting_parse))
+    head = await store.claim_next_fifo(DEST)
+    await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
+    assert parses == []
+    env = rec.sent[0]
+    assert env.split("\r", 1)[0].split("|")[10] == "MSG1"  # BHS-11, as a parse reads it
+    # Negative control: the patch sees a parse when one happens.
+    Message.parse(_msg(1))
+    assert len(parses) == 1
 
 
 # --- count trigger: max_count caps a batch even when more are available --------------------------
@@ -1077,11 +1105,11 @@ async def test_a_halt_mid_window_reschedules_every_member_unsent(
     assert await real_claim(DEST) is None  # rescheduled: the head is not due yet
 
 
-async def test_the_batch_head_is_parsed_off_the_event_loop(
+async def test_the_batch_head_is_read_off_the_event_loop(
     store: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The head member's parse for the BHS control id runs in a worker thread, not on the event
-    loop, so a large member cannot stall every other lane while it parses."""
+    """The head member's read for the BHS control id runs in a worker thread, not on the event
+    loop, so a large member cannot stall every other lane while it is read."""
     import threading
 
     await _enqueue(store, 2)
@@ -1089,18 +1117,18 @@ async def test_the_batch_head_is_parsed_off_the_event_loop(
     rec = _Recorder()
     _wire_batch(runner, rec, BatchConfig(max_count=5, max_wait_ms=1))
     loop_thread = threading.get_ident()
-    parse_threads: list[int] = []
-    real_parse = wiring_runner.Message.parse
+    read_threads: list[int] = []
+    real_read = wiring_runner.head_control_id
 
-    def _recording_parse(raw: str | bytes) -> Any:
-        parse_threads.append(threading.get_ident())
-        return real_parse(raw)
+    def _recording_read(text: str) -> str | None:
+        read_threads.append(threading.get_ident())
+        return real_read(text)
 
-    monkeypatch.setattr(wiring_runner.Message, "parse", _recording_parse)
+    monkeypatch.setattr(wiring_runner, "head_control_id", _recording_read)
     head = await store.claim_next_fifo(DEST)
     await runner._process_delivery_batch(DEST, head, runner._batch[DEST])
-    assert len(rec.sent) == 1  # the control: the batch did go out, so the head was parsed
-    assert parse_threads and loop_thread not in parse_threads
+    assert len(rec.sent) == 1  # the control: the batch did go out, so the head was read
+    assert read_threads and loop_thread not in read_threads
 
 
 async def test_a_pause_that_lands_while_the_envelope_is_framed_sends_nothing(

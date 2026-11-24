@@ -12,6 +12,19 @@ own timeout the only thing that ever gave up — and a client giving up does not
 large log body — is never cut mid-body over a slow link. That is also the limb ASVS words: the cost
 being bounded is the handler's, not the network's.
 
+**One response start does not end the handler.** The body limit answers a counted over-cap body with
+a 413 from inside the route's own read, so the route is still running when that start goes out. The
+limit sets :data:`BODY_REFUSED_KEY` first, and the deadline then stays armed until the route returns.
+While the 413 is written the deadline is held off to at least :data:`_REFUSAL_WRITE_GRACE_SECONDS`
+past its start, so for a write on the route's own task a client that keeps reading gets the whole
+413 within that grace. Once the host has taken the 413, or the write fails, the deadline is back on
+its own time.
+
+A 413 write on the route's own task that stalls past the later of the grace and the deadline's own
+time can be cut with the route, leaving the client a 413 head with no body or the host's own 500. A
+413 write on another task is not necessarily cut by this deadline, but once the route returns the
+host may close the connection, so its client can still get a head with no body.
+
 **Pure ASGI, not** ``BaseHTTPMiddleware``: no task hop, and the response-start signal is visible
 directly. It is registered inside :class:`~messagefoundry.api.client_networks.ClientNetworkMiddleware`
 (a refused address is rejected before it can occupy a deadline) and outside everything that builds a
@@ -22,8 +35,7 @@ release and config reload (inline, from ``/ui``, and released through the approv
 operation through :class:`~messagefoundry.api.outlive.OutlivingOperations`,
 so cancelling the handler here leaves the operation running to its own outcome row rather than half
 done (vault BACKLOG #2751-#2753). At least the approval gate's outcome writes shield themselves the
-same way, and the engine runs a connection flag write as its own task. Anything nobody shields is
-cancelled with the handler.
+same way, and the engine runs a connection flag write as its own task.
 
 Being outside the app's ``_security_headers`` middleware, the refusal sets the baseline response
 headers itself rather than shipping a 503 with none of them — the same reason
@@ -38,9 +50,19 @@ from __future__ import annotations
 import asyncio
 import logging
 
+# By name: tests/_deadline_capture.py replaces this module's ``asyncio`` with ``timeout`` alone.
+from asyncio import get_running_loop
+
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["RequestTimeoutMiddleware", "DEFAULT_REQUEST_TIMEOUT_SECONDS", "TIMEOUT_STATE_ATTR"]
+from messagefoundry.controlchars import scrub_log_argument
+
+__all__ = [
+    "BODY_REFUSED_KEY",
+    "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+    "RequestTimeoutMiddleware",
+    "TIMEOUT_STATE_ATTR",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -56,6 +78,15 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
 #: state, so a bare ASGI scope with no app degrades to the shipped default rather than crashing.
 #: This is the seam a ``[api]`` knob would set; it is not wired to config today.
 TIMEOUT_STATE_ATTR = "request_timeout_seconds"
+
+#: Scope key the body limit sets just before its counted 413: that 413 is this request's response,
+#: and the route it interrupted has not returned. Anything the route sends from here on is dropped.
+BODY_REFUSED_KEY = "messagefoundry.body_refused"
+
+#: How long from its start the body limit's 413 has to be written before the deadline may cut it.
+#: The 413 is a few dozen bytes, so only a client that stops reading uses this. It is also the most
+#: a stalled write can add to the route's deadline.
+_REFUSAL_WRITE_GRACE_SECONDS = 5.0
 
 #: Set directly because this middleware sits OUTSIDE the app's ``_security_headers``, so a refusal
 #: short-circuits it. Mirrors ``client_networks._DENIAL_HEADERS`` minus its denial marker.
@@ -91,25 +122,81 @@ class RequestTimeoutMiddleware:
             return
 
         started = False
+        refusal_due: float | None = None  # the deadline's own time, while the 413 is being written
+        refusal_handed_over = False
+        route_running = True
+        began = get_running_loop().time()
 
         try:
             async with asyncio.timeout(seconds) as deadline:
 
+                def deadline_can_move() -> bool:
+                    # An expired or exited deadline cannot be rescheduled. A concurrent read can
+                    # still be writing the 413 after the route returned and the deadline exited.
+                    return route_running and not deadline.expired()
+
+                def end_refusal_hold() -> None:
+                    nonlocal refusal_due
+                    if refusal_due is not None and deadline_can_move():
+                        deadline.reschedule(refusal_due)
+                    refusal_due = None
+
                 async def send_wrapper(message: Message) -> None:
-                    nonlocal started
+                    nonlocal started, refusal_due, refusal_handed_over
+                    refused = bool(scope.get(BODY_REFUSED_KEY))
                     if message["type"] == "http.response.start":
                         started = True
                         # The handler produced a response; from here the clock belongs to the
                         # network, not to us. Cancelling the deadline is what keeps a slow
-                        # attachment download from being cut mid-body.
-                        deadline.reschedule(None)
-                    await send(message)
+                        # attachment download from being cut mid-body. A body-limit 413 is not
+                        # the handler's response, and the handler is still running, so the
+                        # deadline is only held off while the 413 is written.
+                        if not refused:
+                            deadline.reschedule(None)
+                        elif deadline_can_move() and (due := deadline.when()) is not None:
+                            refusal_due = due
+                            earliest = get_running_loop().time() + _REFUSAL_WRITE_GRACE_SECONDS
+                            deadline.reschedule(max(due, earliest))
+                    try:
+                        await send(message)
+                    except BaseException:
+                        end_refusal_hold()
+                        raise
+                    if (
+                        refused
+                        and message["type"] == "http.response.body"
+                        and not message.get("more_body")
+                    ):
+                        refusal_handed_over = True
+                        end_refusal_hold()
 
-                await self.app(scope, receive, send_wrapper)
+                try:
+                    await self.app(scope, receive, send_wrapper)
+                finally:
+                    route_running = False
         except TimeoutError:
             if started:
-                # Unreachable while the reschedule above stands, and deliberately not swallowed:
-                # the response is already on the wire, so there is nothing to replace it with.
+                if scope.get(BODY_REFUSED_KEY) and deadline.expired():
+                    # The deadline did its work on the route, so there is no error left to raise.
+                    # The 413 was this request's response, whole or not, so no 503 follows it.
+                    # A host's send can return for a client already gone, so this cannot say the
+                    # client received the 413, only that the host took it. The time is measured
+                    # because a write of the 413 can hold the cut up to the grace past the deadline.
+                    _log.warning(
+                        "request ended %.1fs after it began, cut off by its %.1fs deadline while "
+                        "still running %s, on %s %s",
+                        get_running_loop().time() - began,
+                        seconds,
+                        "after the body limit's 413 was handed to the host"
+                        if refusal_handed_over
+                        else "with the body limit's 413 not fully handed to the host",
+                        scrub_log_argument(str(scope.get("method", "?"))),
+                        scrub_log_argument(str(scope.get("path", "?"))),
+                    )
+                    return
+                # Not this deadline: an ordinary response start cancelled it, and past a counted
+                # 413 it has not expired. So at least a route's own TimeoutError lands here, and it
+                # is not swallowed: the response has started, so nothing can replace it.
                 raise
             # Logged, not silent — a control that refuses work must be visible or an operator
             # cannot tell a deadline from an outage. The path is engine-routed, never a body.

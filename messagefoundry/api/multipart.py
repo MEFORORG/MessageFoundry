@@ -11,8 +11,11 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
-``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body in which the
-closing delimiter ``--<boundary>--`` appears nowhere (BACKLOG #5787), and, in
+``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
+closing delimiter ``--<boundary>--`` where a delimiter counts, a body whose first delimiter
+text does not start a line, a delimiter line the walk reaches, up to and including the close,
+with other text after the delimiter than ``_LineStartDelimiters`` admits (all three BACKLOG #5787,
+stated there), and, in
 :func:`parse_single_file_upload`, a body with no file part or with more than one.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
@@ -143,6 +146,122 @@ _FILE_AS_FIELD_HINT = 'Send a file as a file part with a plain filename paramete
 #: it).
 _NOT_CRLF = re.compile(rb"[^\r\n]")
 
+#: Ends the transport padding (spaces and tabs, RFC 2046) after a delimiter. A search for the first
+#: byte that is not padding, rather than a ``[ \t]*`` match, so no quantifier can backtrack.
+_NOT_PADDING = re.compile(rb"[^ \t]")
+
+
+class _LineStartDelimiters:
+    """Finds the delimiters ``--<boundary>`` of a body (BACKLOG #5787). This is the one statement of
+    which offsets count.
+
+    Every delimiter must start a line: it must sit at the start of the body or come right after a
+    CR or an LF. Delimiter text elsewhere after the first delimiter is not a delimiter, so inside a
+    part it is content. A bare CR counts as a line end, so a close marker after one
+    (``MSH|x\r--B--``) is still found. A body whose first ``--<boundary>`` anywhere does not start
+    a line is refused (:attr:`first_starts_line`), so a stray byte (a space, a BOM), a preamble
+    ending mid-line, or close-marker text mid-line in a preamble fails loudly. Before #5787 the first
+    such text was taken as the first delimiter wherever it sat. The refusal is raised after the
+    walk's size and part checks on the parts the walk reached, so a body with such a part gets that
+    refusal, as before. The walk stops at the first close marker, so the parts after it are not
+    checked, and close-marker text that is the first ``--<boundary>`` in the body stops it
+    before any part.
+
+    What may follow a delimiter on its line is read the same way for every delimiter the walk
+    reaches, the first included: optionally ``--`` (which makes it the close), then transport
+    padding (spaces and tabs), then a CR, an LF or the end of the body. RFC 2046 has padding then
+    CRLF, or the end of the body after a close; a bare CR or LF is accepted here too.
+    :func:`_line_end` reads that. A body whose delimiter line carries anything else, such as
+    ``--<boundary>note`` or ``--<boundary>--note``, is refused at the first such line the walk
+    reaches, rather than split, closed or read on as content, again after the checks on the parts
+    before it. A body built with a longer boundary than its Content-Type names (``BX`` where ``B``
+    is declared) can be refused this way. With the cursors below, reading on would cost one Python
+    step per such line, with nothing bounding their number; refusing avoids that.
+
+    When the first ``--<boundary>`` does not start a line, the walk still starts there, so that the
+    size checks on the parts after it rank as before where the walk gets past that text. Where that
+    text is a close marker or has other text after it on its line, the walk stops there, before
+    any part, and the body gets the first-delimiter refusal. The segment from that text to the next
+    delimiter is not counted toward the part cap, and the header-size refusal on it, or the size
+    refusal for a segment with no header block, gives way to the first-delimiter refusal, since
+    that segment is a part only because of the text. The 413 size checks on a file part or text
+    field there still rank first.
+
+    So the boundary is trusted not to start a line inside a part body. That trust goes past RFC
+    2046, which keeps only ``CRLF--<boundary>`` out of content: a content line after a bare CR or a
+    bare LF that starts with ``--<boundary>`` is taken as a delimiter here, though a conforming
+    sender may write one. At least these are still read without a refusal: a content line that is
+    ``--<boundary>--`` with only padding after it up to a CR (bare or not), an LF or the end of the
+    body, taken as the close, whatever follows a bare CR; a content line that is ``--<boundary>``
+    with only padding after it up to such a line end, taken as a delimiter; and a preamble line
+    that starts with the close marker and has only padding after it, taken as the close of a body
+    with no parts.
+
+    After the first, two ``find`` cursors, one for ``\n--B`` and one for ``\r--B``, each only ever
+    moving forward, so a body holding the delimiter text mid-line many times is skipped in C and the
+    walk stays linear. Each later delimiter is found by exactly one cursor, because its previous
+    byte is one of the two. The cursors hold state between calls, so :meth:`find` refuses an ``at``
+    smaller than the previous call's."""
+
+    def __init__(self, body: bytes, delim: bytes) -> None:
+        self._body = body
+        self._delim = delim
+        self._after_lf = b"\n" + delim
+        self._after_cr = b"\r" + delim
+        # Offsets of the line-end byte before a delimiter; -2 until first searched, -1 for none left.
+        self._lf = -2
+        self._cr = -2
+        self._last_at = -1
+        self._first = body.find(delim)
+        #: Whether the first ``--<boundary>`` in the body starts a line (true when there is none).
+        self.first_starts_line = self._first <= 0 or body[self._first - 1] in b"\r\n"
+
+    def _advance(self, cursor: int, needle: bytes, at: int) -> int:
+        if cursor == -1 or cursor + 1 >= at:
+            return cursor
+        return self._body.find(needle, at - 1)
+
+    def first(self) -> int:
+        """The offset of the first ``--<boundary>`` anywhere, or -1; see :attr:`first_starts_line`."""
+        return self._first
+
+    def any_starts_line(self) -> bool:
+        """Whether any ``--<boundary>`` in the body follows a CR or an LF, for the wording of the
+        first-delimiter refusal, whose body has no ``--<boundary>`` at offset 0. At most two
+        ``find`` calls in C over the body."""
+        return self._body.find(self._after_lf) != -1 or self._body.find(self._after_cr) != -1
+
+    def find(self, at: int) -> int:
+        """The offset of the first line-start delimiter at or after ``at`` (at least 1), or -1."""
+        if at < self._last_at or at < 1:
+            raise RuntimeError(f"delimiter search went back to {at} from {self._last_at}")
+        self._last_at = at
+        self._lf = self._advance(self._lf, self._after_lf, at)
+        self._cr = self._advance(self._cr, self._after_cr, at)
+        found = [c for c in (self._lf, self._cr) if c != -1]
+        return min(found) + 1 if found else -1
+
+
+def _line_end(body: bytes, at: int) -> int:
+    """Where the line ends, if the bytes from ``at``, just past a delimiter ``--<boundary>`` or a
+    close ``--<boundary>--``, are transport padding and then a CR, an LF or the end of the body
+    (:class:`_LineStartDelimiters`): the offset of that CR or LF, or ``len(body)``. -1 if not."""
+    first = _NOT_PADDING.search(body, at)
+    if first is None:
+        return len(body)
+    return first.start() if body[first.start()] in b"\r\n" else -1
+
+
+def _first_delimiter_refusal(delims: _LineStartDelimiters) -> MultipartError:
+    """The refusal for a body whose first ``--<boundary>`` does not start a line, worded by
+    whether any of its delimiter text does (:class:`_LineStartDelimiters`)."""
+    if delims.any_starts_line():
+        return MultipartError(
+            "multipart body holds boundary delimiter text that does not start a line, before the "
+            "first line that starts with the delimiter"
+        )
+    return MultipartError("multipart body holds boundary delimiter text, but none starts a line")
+
 
 @dataclass(frozen=True)
 class _Part:
@@ -180,16 +299,33 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     spans: list[tuple[int, int, int, int]] = []
     count = 0
     closed = False
-    # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
-    # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
-    pos = body.find(delim)
+    bad_close = False
+    bad_tail = False
+    # Anything before the first delimiter is the ignorable preamble; the walk stops at the first
+    # delimiter, the first one included, followed by b"--": the close, or, when other text follows
+    # on its line, a close the body is refused for below. It stops too at the first delimiter whose
+    # line carries other text, which the body is refused for below. Anything after the close is the
+    # ignorable epilogue. Which offsets count as a delimiter, and what may follow one on its line,
+    # is stated once, on _LineStartDelimiters.
+    delims = _LineStartDelimiters(body, delim)
+    pos = delims.first()
     seen = pos != -1
+    # True for the one segment after a first delimiter text that does not start a line.
+    mid_line_first = not delims.first_starts_line
     while pos != -1:
         start = pos + len(delim)
         if body.startswith(b"--", start):
-            closed = True
+            closed = _line_end(body, start + 2) != -1
+            bad_close = not closed
             break
-        nxt = body.find(delim, start)
+        if start + 1 == len(body) and body.startswith(b"-", start):
+            # A body cut inside its close marker (``--<boundary>-`` and nothing after it): leave it
+            # unclosed, so it gets the missing-terminator refusal that names the cause.
+            break
+        if _line_end(body, start) == -1:
+            bad_tail = True
+            break
+        nxt = delims.find(start)
         end = len(body) if nxt == -1 else nxt
         # After each delimiter comes CRLF, then the part's header block.
         if body.startswith(b"\r\n", start, end):
@@ -205,7 +341,9 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             break
         # A part with no header separator is skipped below, but it is counted: each one costs a
         # find, so the cap has to bound them too, or a body of empty parts would walk unbounded.
-        count += 1
+        # The one segment after a mid-line first delimiter is not counted (_LineStartDelimiters).
+        if not mid_line_first:
+            count += 1
         if count > _MAX_PARTS:
             # Refuse before any header is parsed: a body of this shape is never a real form.
             raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
@@ -217,6 +355,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # the part's size is not what the client has to change.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
             if size > _MAX_FIELD_BYTES:
+                if mid_line_first:
+                    raise _first_delimiter_refusal(delims)
                 raise MultipartError(
                     f"multipart part of {size} bytes has no header block ended by a blank CRLF "
                     f"line; a part without one is skipped only up to {_MAX_FIELD_BYTES} bytes"
@@ -225,6 +365,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             if sep - start > _MAX_PART_HEADER_BYTES:
                 # Refuse rather than skip: a header this size is never a real client, and skipping
                 # would surface as the confusing "no file part" error instead of the real problem.
+                if mid_line_first:
+                    raise _first_delimiter_refusal(delims)
                 raise MultipartError(
                     f"multipart part header block is {sep - start} bytes; the limit is "
                     f"{_MAX_PART_HEADER_BYTES}"
@@ -234,6 +376,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             if body.endswith(b"\r\n", content_start, end):
                 content_end = end - 2  # the CRLF before the next delimiter
             spans.append((start, sep, content_start, content_end))
+        mid_line_first = False
         pos = nxt
     parts: list[_Part] = []
     for head_start, head_end, content_start, content_end in spans:
@@ -252,26 +395,42 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 f"{_FILE_AS_FIELD_HINT}"
             )
         parts.append(_Part(name=name, filename=filename, start=content_start, end=content_end))
-    # BACKLOG #5787: a body in which the closing delimiter appears nowhere is refused, because a body
-    # that ends before its close marker (for example one built from a file still being written) is
-    # one, and its last part would otherwise run to the end of the body and be taken as complete. Checked last, so a body that fails a check above gets that refusal. A
-    # close marker the walk did not stop on still counts wherever it sits, so this refuses only a
-    # body that carries none. It does not catch a cut-short body whose content holds the close
-    # marker text: the walk takes that text as the close wherever it sits (delimiters are not
-    # anchored to a line start), and the part ends there.
+    # BACKLOG #5787: a body with no closing delimiter is refused, because a body that ends before
+    # its close marker (for example one built from a file still being written) is one, and its last
+    # part would otherwise run to the end of the body and be taken as complete. Checked last, so a
+    # body that fails a check above gets that refusal. A close marker counts only where a delimiter
+    # does (_LineStartDelimiters), so close-marker text in the middle of a content line no longer
+    # makes a cut-short body pass as complete; _LineStartDelimiters names shapes that still do. The
+    # first-delimiter and delimiter-tail refusals it describes are raised here too, after the checks
+    # above on the parts the walk reached.
+    if not delims.first_starts_line:
+        raise _first_delimiter_refusal(delims)
+    if bad_close:
+        raise MultipartError(
+            "multipart line that starts with the close delimiter has text after it other than "
+            "spaces or tabs"
+        )
+    if bad_tail:
+        raise MultipartError(
+            "multipart line that starts with a boundary delimiter has other text on it: only "
+            "spaces or tabs, or two dashes and then spaces or tabs, may follow the delimiter "
+            "before the line end; a body built with a longer boundary than its Content-Type names "
+            "can be refused this way"
+        )
     if not closed:
         if not seen:
-            # No delimiter at all. At least an empty body, one built with another boundary than the
-            # Content-Type names, and one cut inside its first delimiter line land here. A body
-            # built with a boundary the declared one is a prefix of (declared B, body uses BX)
-            # does not: it has delimiters, so it gets the missing-terminator refusal below.
+            # No delimiter text at all. At least an empty body, one built with another boundary than
+            # the Content-Type names, and one cut before its first ``--<boundary>`` is whole land here.
+            # A body built with a boundary the declared one is a prefix of (declared B, body uses
+            # BX) does not: it holds delimiter text, so it can get one of the refusals above,
+            # or, where X is "--" and then at most spaces or tabs, be read as the close of a body
+            # with no parts.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
-        if delim + b"--" not in body:
-            raise MultipartError(
-                "multipart body has no closing boundary delimiter; the upload may be truncated"
-            )
+        raise MultipartError(
+            "multipart body has no closing boundary delimiter; the upload may be truncated"
+        )
     return parts
 
 
@@ -281,11 +440,12 @@ def parse_multipart_form(
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
     Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, its
-    closing delimiter appears nowhere in it, or it holds more than ``_MAX_PARTS`` parts, or a part
+    closing delimiter is missing, or it holds more than ``_MAX_PARTS`` parts, or a part
     with no header block exceeds ``_MAX_FIELD_BYTES`` (all HTTP 400 at the route), and
     :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a non-file part with
-    a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). The boundary is trusted not
-    to appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
+    a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). Which offsets count as a
+    delimiter, and what the parser trusts about the boundary, is stated on
+    :class:`_LineStartDelimiters`.
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`

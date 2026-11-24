@@ -36,6 +36,7 @@ from messagefoundry.store import MessageStatus
 from messagefoundry.transports import database
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.egress import check_lookup_allowed
+from tests._fake_dbapi_driver import DriverError
 
 # --- a faked aioodbc pool/conn/cursor (no driver, no DB) ----------------------
 
@@ -201,7 +202,7 @@ async def test_executor_missing_param(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_executor_db_error_is_phi_free(monkeypatch: pytest.MonkeyPatch) -> None:
     # A driver error carrying a SQLSTATE (args[0]) is wrapped as DbLookupError naming the connection +
     # state only — never the statement, params, or data.
-    pool = _patch_pool(monkeypatch, columns=["npi"], error=Exception("08S01", "connection reset"))
+    pool = _patch_pool(monkeypatch, columns=["npi"], error=DriverError("08S01", "connection reset"))
     ex = DatabaseLookupExecutor(_CONN, egress=EgressSettings(deny_by_default=False))
     secret_sql = "SELECT npi FROM patient WHERE ssn = :ssn"
     with pytest.raises(DbLookupError) as ei:
@@ -1056,7 +1057,7 @@ _SECRET_SQL = "SELECT npi FROM patient WHERE ssn = :ssn"
 _SECRET_VALUE = "000-00-0000"
 
 
-class _FakeDriverError(Exception):
+class _FakeDriverError(DriverError):
     """A pyodbc-shaped error: SQLSTATE in args[0], driver text that echoes DSN attributes."""
 
 

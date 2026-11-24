@@ -27,7 +27,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
 
-_SECRET = "JBSWY3DPEHPK3PXP"
+_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 _T0 = 1_000_000.0
 #: A default a later release might move to. Eight digits keeps the digest compiled in.
 _MOVED = totp.TotpParameters("SHA256", 8, 30)

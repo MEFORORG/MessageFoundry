@@ -36,6 +36,16 @@ This module is the one place that names the hidden rows. Every API read of the t
   ``{"reason": "locked"}``. Only a holder of the account's session can cause one, but it would
   still show another reader that a second-step lock was live. The pre-#3726 directory text is
   named too; :data:`DIRECTORY_LOCKED_REFUSAL_DETAIL` says why.
+* A local password sign-in that failed on ``session_mint_contended`` (BACKLOG #5653):
+  ``auth.login_failed`` with one of the exact details :data:`LOCAL_MINT_CONTENDED_DETAILS` names.
+  Only a right password reaches the session insert on that leg, so the row says the password was
+  right (Manager decision, the safer option). The hidden row is not written as ``bad_credentials``
+  instead: an administrator reads that row as it happened, and it would say the password was
+  wrong. As for a refusal by a lock (BACKLOG #1131), the writer first stores the visible
+  ``auth.login_failed`` row a wrong password for an existing account stores, byte for byte, which
+  is the case a correct-password contention must be indistinguishable from, so the missing row is
+  not itself the oracle; the hidden row beside it names the cause. The directory
+  leg's contended rows are not hidden.
 
 **Considered and left visible:** ``auth.login_after_failures`` (written only on a full sign-in, so
 nobody without both factors can cause it), the per-session re-proof cap rows (``auth.reauth`` with
@@ -86,6 +96,7 @@ from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.permissions import Permission
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.audit_exclusion import AuditExclusion
+from messagefoundry.store.store import SESSION_MINT_CAUSES
 
 __all__ = [
     "ACCOUNT_LOCKED_ACTION",
@@ -99,6 +110,7 @@ __all__ = [
     "DIRECTORY_LOCKED_REFUSAL_DETAIL",
     "DIRECTORY_LOGIN_LOCKED_ACTION",
     "HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE",
+    "LOCAL_MINT_CONTENDED_DETAILS",
     "LOCKED_REFUSAL_DETAIL",
     "LOCK_EVENT_ACTIONS",
     "LOCK_NOTICE_ACTION",
@@ -148,6 +160,26 @@ DIRECTORY_LOCKED_REFUSAL_DETAIL: Final = json.dumps(
     {"provider": "ad", "reason": "locked"}, sort_keys=True
 )
 
+#: The exact details a local password sign-in's ``auth.login_failed`` row stores when its session
+#: insert met contention on every attempt (BACKLOG #5653): one per contention cause, plain or
+#: combined. Built in the writer's form (``_local_refusal_detail`` in
+#: :mod:`messagefoundry.auth.service`, keys sorted); a test pins each one to what that writer
+#: stores. Matched exactly, so a cause the store adds without a match here would be shown;
+#: :data:`~messagefoundry.store.store.SESSION_MINT_CAUSES` is the set this follows.
+LOCAL_MINT_CONTENDED_DETAILS: Final[frozenset[str]] = frozenset(
+    json.dumps(
+        {
+            "contention": cause,
+            "provider": "local",
+            "reason": "session_mint_contended",
+            **({"combined": True} if combined else {}),
+        },
+        sort_keys=True,
+    )
+    for cause in SESSION_MINT_CAUSES
+    for combined in (False, True)
+)
+
 HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
     actions=LOCK_EVENT_ACTIONS,
     rows=frozenset(
@@ -155,6 +187,7 @@ HIDDEN_FROM_READERS_WITHOUT_USERS_MANAGE: Final = AuditExclusion(
             ("auth.mfa_failed", LOCKED_REFUSAL_DETAIL),
             ("auth.webauthn_failed", LOCKED_REFUSAL_DETAIL),
             ("auth.login_failed", DIRECTORY_LOCKED_REFUSAL_DETAIL),
+            *(("auth.login_failed", detail) for detail in LOCAL_MINT_CONTENDED_DETAILS),
         }
     ),
 )

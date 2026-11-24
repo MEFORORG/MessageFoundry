@@ -35,7 +35,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final, Literal, get_args
 
 from messagefoundry.config.active_environment import activated as _environment_activated
 from messagefoundry.config.code_sets import activated as _code_sets_activated
@@ -48,6 +48,7 @@ from messagefoundry.config.state import activated as _state_activated
 __all__ = [
     "RunContext",
     "RunContextProvider",
+    "RunPhase",
     "ROUTER",
     "TRANSFORM",
     "register_run_context",
@@ -57,9 +58,13 @@ __all__ = [
 
 # The two points a router/transform runs. Routers see code sets / references / environment; transforms
 # additionally see committed transform state (state is transform-only — see the built-in phases below).
-ROUTER = "router"
-TRANSFORM = "transform"
-_PHASES = frozenset({ROUTER, TRANSFORM})
+# ``RunPhase`` lets strict mypy refuse a bad phase at a ``run_contexts`` call site (BACKLOG #5780), and
+# it is the one source of ``_PHASES``. run_contexts still checks at run time, for a caller that reaches
+# it with a plain ``str``; register_run_context checks its ``phases`` at import.
+RunPhase = Literal["router", "transform"]
+ROUTER: Final = "router"
+TRANSFORM: Final = "transform"
+_PHASES: frozenset[str] = frozenset(get_args(RunPhase))
 
 
 @dataclass(frozen=True)
@@ -119,13 +124,22 @@ def register_run_context(
 
 
 @contextmanager
-def run_contexts(context: RunContext, *, phase: str) -> Iterator[None]:
+def run_contexts(context: RunContext, *, phase: RunPhase) -> Iterator[None]:
     """Activate every provider registered for ``phase`` (in registration order) for the ``with`` body.
 
     Replaces the hand-written ``with (activated(...), …)`` tuples the router worker, transform worker,
     and dry-run path each used. Enters via one :class:`~contextlib.ExitStack`, so providers nest in
     registration order and unwind cleanly (each accessor's prior view restored) on exit — including on
-    an exception raised inside the body."""
+    an exception raised inside the body.
+
+    An unknown ``phase`` raises :class:`ValueError` (BACKLOG #5780): every provider is tagged with
+    phases from ``_PHASES``, so any other string would silently activate none of them, and a run would
+    read every accessor as unset. A dispatch-level phase such as ``"accepts"`` is not a run phase; the
+    caller maps it first, as the sandbox worker maps it to ``"router"``."""
+    if phase not in _PHASES:
+        raise ValueError(
+            f"run_contexts: unknown phase {phase!r}; expected one of {sorted(_PHASES)}"
+        )
     with ExitStack() as stack:
         for _name, provider, phases in _providers:
             if phase in phases:

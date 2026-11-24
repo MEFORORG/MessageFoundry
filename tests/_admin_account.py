@@ -188,7 +188,7 @@ async def provision_admin(
 
 
 #: A fixed synthetic TOTP secret for provisioning tests (ADR 0197 Amendment A, N-A). Not a secret.
-PROVISION_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+PROVISION_TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 _provision_steps = itertools.count(1)
 
 

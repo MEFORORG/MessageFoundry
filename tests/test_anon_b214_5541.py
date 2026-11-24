@@ -23,7 +23,7 @@ import tee.anon as tee_anon
 from tee.anon import leak as tee_leak
 from tee.anon import surrogates as tee_surrogates
 
-_SALT = "b214-5541-salt-0123456789abcdef"
+_SALT = "b214-5541-salt-0123456789abcdef-0123456789"
 _HEAD = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||1^^^H^MR||X^Y"
 #: A sectioned token source with every floor section filled, so the guard's floor check passes.
 _TOKENS = (

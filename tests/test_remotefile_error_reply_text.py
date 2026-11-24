@@ -569,7 +569,7 @@ _ALLOWED = {
     # A configuration refusal at construction, before any connection.
     "_anon_ftp_guard",
     # Logs a scan hook's or the store hand-off's failure, not a server's, through safe_exc.
-    "RemoteFileSource._poll_once",
+    "RemoteFileSource._examine",
     # Logs a connection-event observer's failure through safe_exc.
     "RemoteFileSource._emit_event",
 }

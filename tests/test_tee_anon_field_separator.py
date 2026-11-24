@@ -26,7 +26,7 @@ from messagefoundry.parsing.message import Message
 from tee.anon import hl7 as tee_hl7
 from tee.anon.keying import Keyer
 
-_SALT = "b214-5540-salt-0123456789abcdef"
+_SALT = "b214-5540-salt-0123456789abcdef-0123456789"
 #: A value in a field no rule rewrites, after the scrubbed one, so a shifted field would show.
 _MARK = "AFTERMARK"
 

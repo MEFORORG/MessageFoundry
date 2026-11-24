@@ -101,6 +101,29 @@ def step_script(workflow: str, job: str, name_starts: str) -> tuple[int, str]:
     return found[0], "\n".join(line for line in lines if not line.lstrip().startswith("#"))
 
 
+@functools.cache
+def changes_arm_pattern(output: str, sanity: str) -> str:
+    """The ``grep -qE`` pattern ``ci.yml``'s ``changes`` job uses to decide ``output`` on a PR.
+
+    Anchored on the LAST ``<output>=true`` emission, because the dispatch and push arms emit one
+    first with no grep in front of them; the last ``grep -qE`` before it is the path arm. ``sanity``
+    is a substring that arm must hold, so a restructure that puts another arm's grep there raises
+    rather than passing against the wrong pattern.
+    """
+    text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+    emit = text.rfind(f'echo "{output}=true" >> "$GITHUB_OUTPUT"')
+    assert emit > 0, (
+        f"the {output} arm's GITHUB_OUTPUT emission is gone; this gate was restructured"
+    )
+    matches = list(re.finditer(r"grep -qE '([^']*)'", text[:emit]))
+    assert matches, f"no `grep -qE` found before the {output} emission"
+    pattern = matches[-1].group(1)
+    assert sanity in pattern, (
+        f"the grep picked up before the {output} emission is not the {output} arm: {pattern}"
+    )
+    return pattern
+
+
 def on_block(parsed: dict[Any, Any]) -> dict[str, Any]:
     """A parsed workflow's ``on:`` triggers, normalised to ``{trigger: config}``.
 

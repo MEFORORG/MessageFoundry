@@ -31,7 +31,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.egress import check_egress_allowed
 from messagefoundry.transports.fhir import FhirDestination
-from messagefoundry.transports.rest import RestDestination
+from messagefoundry.transports.rest import ProxyConfig, RestDestination
 from messagefoundry.transports.signing import (
     CLIENT_ASSERTION_TYPE,
     CompactJwtSigner,
@@ -682,3 +682,70 @@ def test_audit_token_url_must_be_egress_listed(rsa_pem: str) -> None:
     dest = Destination(name="OB", type=ConnectorType.FHIR, settings=spec.settings)
     with pytest.raises(WiringError, match="SMART token endpoint"):
         check_egress_allowed(dest, EgressSettings(allowed_http=["fhir.example"]))
+
+
+# --- BACKLOG #5800 added item 1: the SMART provider's grant checks run at construction ------------
+
+
+@pytest.mark.parametrize(
+    ("setting", "over"),
+    [
+        ("smart_scope", {"scope": "system/Patient.rs\ud800"}),
+        ("smart_private_key", {"private_key": "-----BEGIN PRIVATE KEY-----\udc80"}),
+        ("smart_private_key_password", {"private_key_password": "pw-synthetic-\udc80"}),
+    ],
+    ids=["scope", "private-key", "key-password"],
+)
+def test_smart_refuses_an_unencodable_grant_value_at_construction(
+    rsa_pem: str, setting: str, over: dict[str, str]
+) -> None:
+    """The scope is URL-encoded as strict UTF-8 at each mint, and the key and its password as the
+    signer loads them. Mutation: drop the surrogate check in ``__init__``. Red: "scope" builds,
+    and the first mint raises UnicodeEncodeError out of send or test_connection; the key cases
+    raise one at construction whose ``object`` is the whole key or password (review round
+    2c51ab65)."""
+    with pytest.raises(
+        SmartAuthError, match=f"{setting} holds a character UTF-8 cannot encode"
+    ) as ei:
+        _provider(rsa_pem, **over)
+    (value,) = over.values()
+    assert value not in str(ei.value) and value[:12] not in str(ei.value)
+    # Raised outside any handler, so no exception holding the value rides the chain.
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
+def test_smart_refuses_an_over_length_proxy_credential_at_construction(rsa_pem: str) -> None:
+    """Mutation: drop the second length check, after ``_open_token_hop``. Red: the provider
+    builds, and nothing measures its Proxy-Authorization header at mint either (review round
+    4c3aa241)."""
+    proxy = ProxyConfig(
+        proxies=(("https", "https://proxy.example:3128"),),
+        use_default=False,
+        bypass=(),
+        auth_header=(("Proxy-Authorization", "Basic " + "x" * 20_000),),
+        digest=None,
+    )
+    with pytest.raises(SmartAuthError, match=r"'Proxy-Authorization' is \d+ chars, over the") as ei:
+        _provider(rsa_pem, proxy=proxy)
+    assert "x" * 64 not in str(ei.value)
+
+
+def test_smart_refuses_an_over_length_token_url_at_construction(rsa_pem: str) -> None:
+    """Mutation: move the length check back into ``_fetch_token``. Red: the provider builds, and
+    the first mint raises a bare ValueError out of send or test_connection."""
+    with pytest.raises(
+        SmartAuthError,
+        match=r"SMART token request \(smart_token_url and the proxy headers\): .*over the",
+    ) as ei:
+        _provider(rsa_pem, token_url=TOKEN_URL + "?" + "q" * 20_000, audience=TOKEN_URL)
+    assert "q" * 64 not in str(ei.value)
+
+
+def test_control_a_smart_provider_with_a_plain_scope_still_mints(rsa_pem: str) -> None:
+    """The checks moved, the mint did not: a provider that builds still posts its scope."""
+    p = _provider(rsa_pem)
+    opener = _token_opener("AT")
+    p._opener = opener  # type: ignore[assignment]
+    assert p.access_token() == "AT"
+    sent = urllib.parse.parse_qs((opener.requests[0].data or b"").decode("ascii"))  # type: ignore[union-attr]
+    assert sent["scope"] == ["system/*.rs"]

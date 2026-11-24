@@ -354,12 +354,14 @@ def message_search(
     message_type: str = "",
     control_id: str = "",
     error: str = "",
+    notice: str = "",
     presets: list[Any] | None = None,
 ) -> Markup:
     """The content-search page (a step-up-unlock GET, ADR 0046 #51): search by an HL7 field path
     (``PID-3``) or a raw/summary substring, over the caller's channels. ``results is None`` = the bare
     form (no search yet). Every matched row is a metadata-only summary (server-redacted) linking to the
-    audited detail view — no decrypted body is ever rendered here."""
+    audited detail view — no decrypted body is ever rendered here. ``notice`` says that a refilled
+    leftover was not sent (BACKLOG #6700)."""
     target_options = [
         el("option", label, value=value, selected=value == target or None)
         for value, label in (
@@ -409,6 +411,8 @@ def message_search(
     ]
     if error:
         parts.append(el("p", error, class_="banner"))
+    if notice:
+        parts.append(el("p", notice, class_="muted"))
     if results is not None:
         rows = [
             [

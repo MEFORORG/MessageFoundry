@@ -197,8 +197,11 @@ pwsh -NoProfile -File scripts\worktree\rescue.ps1 -Name <task>
 ```
 
 It stashes the primary's changes (tracked **and** untracked), creates a worktree branched off the primary's
-**current commit** — not `origin/main`, so the stash applies cleanly — and pops it there. If any step
-fails, the work stays in `git stash list` and the script says so. Nothing is ever discarded.
+**current commit** — not `origin/main`, so the stash applies cleanly — and applies it there by its commit id,
+never a bare pop of the shared stack. The stash commit is held under a private `refs/worktree-rescue/<id>`
+ref (`<id>` is a GUID the run generates, not the stash commit's SHA) until the apply succeeds, so if any later step fails the script prints the commands to restore it.
+Changes git stash cannot carry, such as edits inside a nested repository, stay in the primary and the
+script says so.
 
 ## Repairing a primary that is already detached or on the wrong branch
 
@@ -245,6 +248,20 @@ position, so a checkout many commits behind with an unchanged gate still passes.
 | `UNVERIFIED` | The installed gate matches this checkout's gate, but `origin/main` could not be read. |
 
 `-UpstreamRef` names a different yardstick.
+
+Every install leaves `worktree_gate.ps1.receipt.json` beside the installed gate, with the hash it wrote,
+and keeps the replaced gate as `worktree_gate.ps1.bak`. The installer **refuses to overwrite an
+installed gate that does not match its own receipt** (BACKLOG #1247): one whose content hash differs
+from the receipt's, one whose receipt cannot be read or records no hash, and one with no receipt at all.
+Each means something other than the installer may have written it. The refusal names the file and both
+hashes, and runs before any write, so it changes nothing. (The separate refusal for a gate that
+changed between that check and the copy throws later, after the allowlist write: the allowlist and its
+`.bak` are already written, the gate is not.) A missing receipt refuses too, because the receipt is not protected by
+the gate and deleting it must not silence the check; a box with no installed gate installs as before.
+Find out who wrote the gate, then pass `-OverwriteUnexplained`; the new receipt records the
+overwritten hash under `overwroteUnexplained`, and its bytes are kept as
+`worktree_gate.ps1.unexplained-<sha12>`. `-Status` reports the same check. The receipt is a
+convenience record, never attestation, and the gate does not protect it from an edit.
 
 Two structural choices worth understanding:
 
