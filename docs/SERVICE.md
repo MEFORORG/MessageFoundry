@@ -1143,9 +1143,12 @@ alert.
 Recover by fixing the disk or permissions and then **restarting the affected connections** — inbounds
 *and* outbounds — from the web console, or by restarting the service. Restarting an inbound the halt
 stopped also re-arms a router, transform or response lane of it that is STOPPED, for example one the
-infra-fault bound stopped while the log was down, except a pooled lane kept STOPPED because it
-holds claimed rows whose return to the queue never landed. Under the pooled claim mode only, a connection
-restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
+infra-fault bound stopped while the log was down. A pooled lane that holds claimed rows whose
+return to the queue never landed is re-armed too when the engine recorded those rows, as it does at
+least when a pause or the infra-fault bound ended the retry of their return: it returns them to the
+queue before its next claim. Under the pooled claim mode only, a connection restart leaves STOPPED a
+lane that still holds such rows unrecorded, at least when another node took the lead while their
+return was retried;
 under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
 inject or a dead-letter replay, and it can then claim past the unlanded rows; until one arrives it

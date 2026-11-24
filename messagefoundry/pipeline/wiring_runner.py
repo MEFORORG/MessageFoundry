@@ -6578,18 +6578,21 @@ class RegistryRunner:
         """Lift the #122 halt's mark on inbound ``name`` and re-arm its internal lanes, as the
         restart that rebinds its listener did before the halt became a claim gate, when the halt
         paused them and this resumed them (BACKLOG #5704), except a pooled lane kept STOPPED
-        because it holds claimed rows whose return to the queue never landed. Sync and await-free. A restart of an
+        because it holds claimed rows in flight that no stranded record covers. Sync and await-free. A restart of an
         inbound the halt never gated does not come here, and under pooled re-arms no STOP.
 
         Under pooled each lane the pre-claim gate parked is released
         (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
         :meth:`_resume_pooled_lane`, which re-arms a PAUSED or STOPPED one and lifts the inbound's
         hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
-        leadership loss. A lane STOPPED with claimed rows still in flight
-        (:meth:`StageDispatcher.stopped_holding_rows`) is not re-armed here, because a re-arm would
-        claim past them; the WARNING says the pooled lane is kept STOPPED. Any later
-        ``notify_work`` broadcast (:meth:`_broadcast_to`), at least a reload, replay, resend or
-        inject, re-arms it, since the mark is lifted, and it can claim past them. Under per_lane the waiting workers are woken here, and the start that
+        leadership loss. A lane STOPPED with claimed rows still in flight that a stranded record
+        covers (BACKLOG #5744) is re-armed too: its next chunk assembly re-pends those rows before
+        it claims. A lane whose rows in flight no record covers
+        (:meth:`StageDispatcher.stopped_past_unrecorded_rows`), at least after a hold that ended on
+        a moved lease, is not re-armed here, because a re-arm would claim past them; the WARNING
+        says the pooled lane is kept STOPPED. Any later ``notify_work`` broadcast
+        (:meth:`_broadcast_to`), at least a reload, replay, resend or inject, re-arms it, since the
+        mark is lifted, and it can claim past them. Under per_lane the waiting workers are woken here, and the start that
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
         self._log_halted.discard(name)
         if self._claim_mode != "pooled":
@@ -6601,12 +6604,13 @@ class RegistryRunner:
             for stage in _INTERNAL_STAGES
             if (d := self._dispatchers.get(stage)) is not None
         ]
-        kept = [stage for stage, d in lanes if d.stopped_holding_rows(name)]
+        kept = [stage for stage, d in lanes if d.stopped_past_unrecorded_rows(name)]
         for stage in kept:
             log.warning(
                 "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
-                "never landed; any later notify_work broadcast (at least a reload, replay, resend "
-                "or inject) re-arms it, and it can claim past them",
+                "never landed and that it would not re-pend before its next claim; any later "
+                "notify_work broadcast (at least a reload, replay, resend or inject) re-arms it, "
+                "and it can claim past them",
                 stage.value,
                 name,
             )
@@ -11194,7 +11198,7 @@ class RegistryRunner:
         (:meth:`_log_gate_after_claim`). Clearing the latch does not
         itself re-arm such a STOP; the rebind of the inbound's listener that lifts its mark does
         (:meth:`_lift_log_halt`), except a pooled lane kept STOPPED because it holds claimed rows
-        whose return to the queue never landed."""
+        in flight that no stranded record covers."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.

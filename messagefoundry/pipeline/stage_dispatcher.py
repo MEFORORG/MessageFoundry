@@ -2656,10 +2656,25 @@ class StageDispatcher:
 
     def stopped_holding_rows(self, key: str) -> bool:
         """Whether ``key`` is STOPPED by an episode that ended with claimed rows still in flight,
-        whose re-pend did not land (BACKLOG #5704). A re-arm of such a lane would claim past them,
-        so the log halt's recovery restart leaves it STOPPED. False for an unknown lane."""
+        whose re-pend did not land (BACKLOG #5704). Whether a re-arm would claim past them is
+        :meth:`stopped_past_unrecorded_rows`. False for an unknown lane."""
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED and st.unlanded
+
+    def stopped_past_unrecorded_rows(self, key: str) -> bool:
+        """Whether ``key`` is STOPPED holding claimed rows in flight that its next chunk assembly
+        would not re-pend first, because no stranded record covers them (BACKLOG #5704, #5744). At
+        least a hold that ended on a moved lease (``SUPERSEDED``) leaves them so: another node may
+        hold them. A re-arm of such a lane would claim past them, so the log halt's recovery
+        restart leaves it STOPPED. A lane whose rows a record covers re-pends them before it claims,
+        so a re-arm of it is safe. False for an unknown lane."""
+        st = self._states.get(key)
+        return (
+            st is not None
+            and st.phase is _LanePhase.STOPPED
+            and st.unlanded
+            and st.stranded is None
+        )
 
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)

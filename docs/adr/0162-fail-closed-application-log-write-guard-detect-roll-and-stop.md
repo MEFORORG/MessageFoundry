@@ -240,8 +240,10 @@ ingress stage was ACKed on receipt; stopping its inbound unbinds the listener an
 pausing an outbound retains its rows PENDING un-errored. Nothing is un-ACKed, lost, or double-
 delivered — fix the disk, reload, and the backlog drains, with at least these qualifications
 (BACKLOG #5704). Under the pooled claim mode, a router, transform or response lane that STOPPED
-while holding claimed rows whose re-pend never landed is not re-armed by the lift of the halt,
-which logs a WARNING. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
+while holding claimed rows whose re-pend never landed is re-armed by the lift of the halt when a
+stranded record covers those rows (BACKLOG #5744), and re-pends them before its next claim. One
+that no record covers, at least after a hold that ended on a moved lease, is not re-armed by the
+lift, which logs a WARNING. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
 replay, a resend, an inject or a dead-letter replay, and it can then claim past the unlanded rows;
 until one arrives it stays STOPPED. At least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
 is respawned by the reload or restart that lifts its inbound's gate, and it retries that STOP's row.
