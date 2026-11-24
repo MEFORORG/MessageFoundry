@@ -363,7 +363,7 @@ def test_a_failed_own_drop_is_reported_with_a_drop_command_that_works(tmp_path: 
     assert f"Stash commit {own} is still on the shared stash list" in out, out
     assert "stays on the stash list as a spare copy" in out, out
     # The printed command re-finds the position by SHA and drops only that entry.
-    found = re.search(r"\$n = @\(git .*?re-run to re-find it\.' \}", out)
+    found = re.search(r"\$n = @\(git .*?run this command again\.' \}", out)
     assert found, out
     command = found.group(0)
     assert own in command, command
@@ -393,7 +393,7 @@ def test_an_entry_popped_before_the_read_back_is_not_called_untouched(tmp_path: 
     out = _flat(proc.stdout + proc.stderr)
     assert proc.returncode != 0, out
     assert "The stash stack was not touched" not in out, out
-    assert "reported saving the work" in out, out
+    assert "did not report 'No local changes to save'" in out, out
     assert "refs/worktree-rescue/" in out, out
     assert not (tmp_path / "repo-popped").exists()
     # The stand-in peer popped into the primary itself, so the work is back where it started.

@@ -129,18 +129,21 @@ function Get-StashEntries {
 }
 
 # Whether a stash commit is on the clone-wide list right now: $true, $false, or $null when the list cannot
-# be read. Every message below that says where this run's entry is reads it here, at the moment it speaks.
+# be read. The messages that re-read the list at the moment they speak are the end-of-run still-listed
+# check, the failure-path advice in the finally block, and Write-OwnEntryState.
 function Test-StashListed([string]$Id) {
     try { return (@(Get-StashEntries | Where-Object Sha -eq $Id).Count -gt 0) } catch { return $null }
 }
 
 # The command an operator pastes to drop a listed entry. git stash drop takes a POSITION, so the command
-# re-finds it by SHA when it runs and checks that position still holds the SHA just before the drop. Like
-# Remove-OwnStashEntry, it cannot close the gap between that check and the drop itself.
+# re-finds it by SHA when it runs and checks that position still holds the SHA just before the drop. It is a
+# PowerShell command. Unlike Remove-OwnStashEntry it does not read the dropped SHA back from git's output and
+# does not store back another session's entry if a shifted position dropped it; like that function, it
+# cannot close the gap between its position check and the drop itself.
 function Get-DropBySha([string]$Id) {
     ("`$n = @(git -C `"$RepoRoot`" stash list --format=%H).IndexOf('$Id'); " +
         "if (`$n -ge 0 -and (git -C `"$RepoRoot`" rev-parse `"stash@{`$n}`") -eq '$Id') { git -C `"$RepoRoot`" stash drop `"stash@{`$n}`" } " +
-        "else { Write-Host 'Not dropped: that SHA is not listed at the position just found; re-run to re-find it.' }")
+        "else { Write-Host 'Not dropped: that SHA is not at the position just found. If git stash list no longer shows it, the entry is off the stack and nothing needs dropping; if it is listed, run this command again.' }")
 }
 
 # Say where this run's entry is after a drop that did not remove it. A shifted position means some other
@@ -239,9 +242,9 @@ if (-not $stashSha) {
             "was moved. git stash cannot carry these changes (for example, edits inside a nested repository); " +
             "commit or move them by hand. The stash stack was not touched.")
     }
-    # Otherwise the push did record an entry, and the primary is dirty again with no tagged entry listed:
+    # Otherwise the push did not report 'No local changes to save' (all that was measured), so it most likely recorded an entry, and the primary is dirty again with no tagged entry listed:
     # another session popped it before the read-back, which applied it into whatever tree that session runs in.
-    throw ("git stash push reported saving the work, but no stash entry carries this run's tag ($stashMsg) " +
+    throw ("git stash push did not report 'No local changes to save', but no stash entry carries this run's tag ($stashMsg) " +
         "and the primary still shows $($now.Count) change(s). Another session most likely popped this run's " +
         "entry before it could be read, which applied it into that session's tree (the primary itself, if it " +
         "runs there). This run moved nothing further; check the primary, git -C `"$RepoRoot`" stash list, and " +
@@ -253,7 +256,7 @@ if (-not $stashSha) {
 # entry is almost certainly still on top, keeps the position race to milliseconds instead of minutes.
 & git -C $RepoRoot update-ref $anchorRef $stashSha
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not anchor stash commit $stashSha under $anchorRef (exit $LASTEXITCODE). YOUR WORK IS SAFE in the stash, tagged: $stashMsg"
+    throw "Could not anchor stash commit $stashSha under $anchorRef (exit $LASTEXITCODE). The push put the work into a stash entry tagged: $stashMsg (SHA $stashSha). The stash list was not read again after this failure, so check git -C `"$RepoRoot`" stash list before assuming it is still there."
 }
 
 $stashed = $true
