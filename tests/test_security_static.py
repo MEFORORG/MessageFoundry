@@ -935,6 +935,27 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``.*`` with nothing after it. ``is_authorization_header_name`` uses ``fullmatch``, so there is
     # one start position.
     "messagefoundry/transports/http_auth.py": ("f'[^{_TCHARS}]*authorization(?:[^{_TCHARS}].*)?'",),
+    # BACKLOG #5062 -- the server schema check's EXEC-of-a-variable reading, in
+    # ``_assigned_and_run``. Unresolvable because the code splices the variable name that
+    # ``_ASSIGNED_LITERAL`` captured from the DDL text into an f-string. That is a choice, not a
+    # necessity: a static pattern capturing ``@(\w+)`` and comparing the name after the match would
+    # resolve. The name goes in UNESCAPED. It is safe only while the capture admits nothing but
+    # ``\w`` characters, none of which is a regex metacharacter, and this pin does not bind that
+    # capture: a widened capture, or a new caller passing another name, keeps this test green. The
+    # source of record is ``server_schema_verify.py``.
+    #
+    # The text read is the engine's own checked-in DDL: ``declared_schema`` is called from
+    # ``postgres.py`` and ``sqlserver.py`` over their ``_SCHEMA`` (and Postgres's migration index
+    # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier. Each
+    # pattern is an alternation of literals, ``@`` and the name, joined by single ``\s*`` or
+    # ``\s+`` runs. The runs pattern (the first) also holds the optional ``(?:UTE)?``, a group of
+    # literals only. The changes pattern (the second) also holds the operator class
+    # ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed
+    # by a token that can match whitespace, so there is one way to split any prefix.
+    "messagefoundry/store/server_schema_verify.py": (
+        "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
+        "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
+    ),
     # BACKLOG #6637 -- the ignores for pydicom's UserWarning copies of a refused value. ``message``
     # iterates ``reversed(_PYDICOM_VALUE_WARNINGS)``, which is derived from the ``warning`` field of
     # each ``_REFUSALS`` shape that sets one, and this scanner reads neither. None has a nested
