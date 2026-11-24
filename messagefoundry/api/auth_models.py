@@ -633,10 +633,11 @@ class MfaStatusResponse(BaseModel):
     ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) is ALWAYS
     false in this release: the cell is read for it only when this release compiles in a parameter
     set other than its default (``totp.reenrolment_possible()``), and this release compiles in
-    none, so it is false whatever the cell holds. A refused marker or a secret no code is computed
-    from (BACKLOG #5340) does not set it; the startup census and ``messagefoundry verify`` name
-    such an account instead. A release that compiles in a second set would set it for an enrolment
-    made with parameters other than the default."""
+    none, so it is false whatever the cell holds, a refused marker or a secret no code is computed
+    from (BACKLOG #5340) included; the startup census and ``messagefoundry verify`` name such an
+    account instead. A release that compiles in a second set would read the cell and set it
+    wherever ``totp.needs_reenrolment`` is true: an enrolment made with parameters other than the
+    default, a refused marker, or such a secret."""
 
     enabled: bool
     enrolled_at: float | None = None
