@@ -8,6 +8,7 @@ from __future__ import annotations
 import gc
 import io
 import logging
+import os
 import queue
 import subprocess
 import threading
@@ -45,14 +46,28 @@ def test_close_closes_the_workers_pipes(graph: tuple[Registry, str]) -> None:  #
     assert proc.stderr is not None and proc.stderr.closed
 
 
+def _names_in(warning: warnings.WarningMessage, names: set[str]) -> bool:
+    return any(n in str(warning.message) for n in names)
+
+
 def test_a_closed_worker_leaves_no_unclosed_file_for_the_collector(
     graph: tuple[Registry, str],  # noqa: F811
 ) -> None:
     """The observable cost of leaving the pipes open: the collector closes them and raises a
-    ``ResourceWarning`` for each one."""
+    ``ResourceWarning`` for each one.
+
+    POSITIVE CONTROL: a raw pipe end, of the kind the worker is spawned with (``bufsize=0``), is
+    deliberately left open in the same window, so the ``name=<fd>`` filter is shown to match the
+    warning such a pipe raises. Without it an empty result could mean a filter that matches
+    nothing. It stays referenced until the worker is gone, so the worker's pipes cannot reuse its
+    descriptor number."""
     registry, config_dir = graph
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always", ResourceWarning)
+        read_end, write_end = os.pipe()
+        os.close(read_end)
+        leaked = open(write_end, "wb", buffering=0)  # noqa: SIM115 - left open on purpose
+        control = {f"name={leaked.fileno()} "}
         session = _session(config_dir)
         try:
             transform_one(registry, "h_ok", RAW, sandbox=session, run_context=RunContext())
@@ -67,13 +82,18 @@ def test_a_closed_worker_leaves_no_unclosed_file_for_the_collector(
             session.close()
         for thread in threads:
             thread.join(timeout=10)
-        del session, threads
+        del session, threads, leaked
         gc.collect()
     assert len(names) == 3
+    assert not control & names
+    assert caught  # the control's warning at least, so the walk below is over something
+    assert [
+        w for w in caught if issubclass(w.category, ResourceWarning) and _names_in(w, control)
+    ], [str(w.message) for w in caught]
     unclosed = [
         str(w.message)
         for w in caught
-        if issubclass(w.category, ResourceWarning) and any(n in str(w.message) for n in names)
+        if issubclass(w.category, ResourceWarning) and _names_in(w, names)
     ]
     assert unclosed == [], unclosed
 
