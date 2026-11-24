@@ -587,7 +587,9 @@ def _service_raises(monkeypatch: pytest.MonkeyPatch, refusal: Exception, *, wrot
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
 
 
@@ -924,7 +926,9 @@ def test_a_refused_first_insert_says_the_shown_entry_has_no_seed(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
     monkeypatch.setattr("messagefoundry.auth.totp.verify_totp_step", lambda *_a, **_k: 1)
     code = main(_provision_sqlite(shell))
@@ -1091,7 +1095,9 @@ def test_the_create_open_s_own_database_error_names_the_shown_entry(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
     out = _run(_provision_sqlite(shell), capsys)
     assert "cannot open the store at" in out and "unable to open database file" in out, out
@@ -1131,7 +1137,9 @@ def test_a_close_that_fails_after_a_committed_provision_keeps_the_result(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
     monkeypatch.setattr("messagefoundry.auth.totp.verify_totp_step", lambda *_a, **_k: 1)
     code = main(_provision_sqlite(shell))
@@ -1227,7 +1235,9 @@ def test_a_key_refusal_at_the_write_open_over_an_existing_store_names_the_pre_ch
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert "synthetic key service refusal at the write" in out, out

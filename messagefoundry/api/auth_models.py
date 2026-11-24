@@ -630,11 +630,13 @@ class MfaStatusResponse(BaseModel):
     ``enabled`` stays == TOTP-enabled (the desktop console's boolean view is untouched);
     ``webauthn_enrolled`` is the ADR 0068 additive field (defaulted, so an older client's decode
     is unaffected). ``required`` accounts for either factor being enrolled.
-    ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) says the TOTP
-    enrolment was made with parameters other than this release's default, or holds a secret no code
-    is computed from (BACKLOG #5340), so the holder should be offered a fresh one. The cell is read
-    for it only when this release compiles in a set other than its default, so otherwise it is
-    false whatever the cell holds."""
+    ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) is ALWAYS
+    false in this release: the cell is read for it only when this release compiles in a parameter
+    set other than its default (``totp.reenrolment_possible()``), and this release compiles in
+    none, so it is false whatever the cell holds. A refused marker or a secret no code is computed
+    from (BACKLOG #5340) does not set it; the startup census and ``messagefoundry verify`` name
+    such an account instead. A release that compiles in a second set would set it for an enrolment
+    made with parameters other than the default."""
 
     enabled: bool
     enrolled_at: float | None = None

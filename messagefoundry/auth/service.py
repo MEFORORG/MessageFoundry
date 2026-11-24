@@ -3049,8 +3049,10 @@ class LockableAccountCensus:
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
     #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
-    #: or the value would not compute), as opposed to a KNOWN refusal. Every gate counts such a TOTP
-    #: as the plain enabled-TOTP rule does; this names them as unknown (BACKLOG #3422).
+    #: or the opened value is not base32), as opposed to a KNOWN refusal: a refused enrolment
+    #: marker, a key too short to compute with (BACKLOG #5340) or an empty secret is a known refusal
+    #: and is not named here. Every gate counts such a TOTP as the plain enabled-TOTP rule does;
+    #: this names them as unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
     #: The covered accounts in ``unknown_totp`` that also hold a discoverable passkey, which a
@@ -17384,11 +17386,11 @@ class AuthService:
         if census.unknown_totp:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
-                "value would not compute): %s. Until they can be, every gate treats each as an "
-                "enabled TOTP, and its holder cannot remove it while no discoverable passkey "
+                "value it holds is not base32): %s. Until they can be, every gate treats each as "
+                "an enabled TOTP, and its holder cannot remove it while no discoverable passkey "
                 "remains. For a cell that does not open, check the store key and the cipher "
                 "service before resetting anything, since a reset destroys a healthy enrolment; a "
-                "value that opens and will not compute is cleared by an administrator's factor "
+                "value that opens and is not base32 is cleared by an administrator's factor "
                 "reset (POST /users/{id}/reset-mfa).",
                 len(census.unknown_totp),
                 ", ".join(census.unknown_totp),
