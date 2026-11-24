@@ -308,8 +308,8 @@ store, though not all; which ones is CONNECTIONS.md *DICOMweb*, *Status classifi
 as bytes, and a 202 reply is checked against the object's File Meta SOP Instance UID, read by hand,
 and, with the `[dicom]` extra, its data set SOP Instance UID (CONNECTIONS.md *DICOMweb*). The extra
 is optional for DICOMweb, but an installed extra that is broken now matters to it: DICOMweb loads
-and uses it on each send where it is found. One that does not load is taken as absent, with a
-WARNING, and one that loads but is broken can refuse a send, as CONNECTIONS.md *DICOMweb* says. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
+and uses it on each send where it is found. One that does not load, or whose read of an object
+raises, adds no data set UID to the comparison, with a WARNING, as CONNECTIONS.md *DICOMweb* says. This **exceeds** both incumbents (neither Mirth nor Corepoint ships DICOMweb send out of the box).
 
 ---
 

@@ -4006,10 +4006,9 @@ cleartext-credential refusal, the retry/dead-letter classification, the `[egress
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
-adds the data set's UID to that comparison. An installed extra that does not load is taken as
-absent, with a WARNING. **An installed extra that loads but is broken can be worse than none:** a
-message can be refused before it is sent; *Status classification* below says when. So on a host
-running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
+adds the data set's UID to that comparison. An installed extra that does not load, or whose
+read of an object raises, adds nothing, with a WARNING; *Status classification* below says how. So
+on a host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4053,8 +4052,8 @@ outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` i
 too. Both UIDs are read on every send **before the POST**, as the DICOM SCU parses before it
 associates, so the connection's build does not check `pydicom`. The data set read puts back the
 SCU's ignores for `pydicom` warnings that would name a value, and holds the lines `pydicom` logs
-while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only before
-a `sent-uid-unread` refusal (below); otherwise it writes none. `pydicom`'s own copy of such a line
+while it reads. It writes them, redacted as the DICOM connectors' `pydicom` lines are, only with
+the first read-fault WARNING of the process (below); otherwise it writes none. `pydicom`'s own copy of such a line
 as a Python warning is not held, so it can still reach stderr. An object the codec cannot parse is read as no data set
 UID, and the object is still sent. The codec takes at least the exception classes it lists for a
 malformed object as a parse failure, so one of those raised by a broken `pydicom` reads the same
@@ -4066,10 +4065,12 @@ taken as no extra: the object is sent, and a 202 is compared with its File Meta 
 host without the extra. One WARNING per process names the class of what the load raised and says
 to repair or remove the extra. A `pydicom` directory with no `__init__.py`, as an uninstall can
 leave, is taken as no extra too. After fixing or removing `pydicom`, restart the engine: the
-`pydicom` modules an import has already loaded stay loaded until a restart. Any other fault in the read of the object itself, such as a `TypeError` or
-a warning the filters turn into an error, refuses the message before a byte is sent, whatever
-status the partner would have answered, naming the exception class only (code `sent-uid-unread`),
-even when a broken extra caused it. A `MemoryError` is not caught there. The data set UID is read
+`pydicom` modules an import has already loaded stay loaded until a restart. Any other fault in
+the read of the object itself, such as a `TypeError` from a `pydicom` whose private readers changed,
+or a warning the filters turn into an error, also reads as no data set UID: the object is sent, and
+one WARNING per process names the exception class only, never its text. Where the object also has
+no File Meta UID, nothing can be compared, so a 202 is confirmed as before BACKLOG #5914, by a
+ReferencedSOPSequence item that names any UID. A `MemoryError` is not caught there. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is

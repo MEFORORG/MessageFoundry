@@ -14,9 +14,9 @@ It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works withou
 202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
 (:func:`_sent_instance_uid`), and, when ``pydicom`` is installed, its data set SOP Instance UID
 (:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
-#5914). An installed ``pydicom`` that does not load is taken as absent, with one WARNING per
-process; one that loads but raises a parse fault of a class the codec does not wrap refuses the
-message before the POST. :func:`_data_set_instance_uid` says which faults do what.
+#5914). An installed ``pydicom`` that does not load, or whose read of the object raises, is taken
+as reading no data set UID, with one WARNING per process for each of the two, so the object is
+still sent as with no ``pydicom``. :func:`_data_set_instance_uid` says which faults do what.
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -457,17 +457,29 @@ class _SentUids(NamedTuple):
     """The SOP Instance UIDs of the object sent that a 202 is compared with, read before the POST
     (:func:`_read_sent_uids`). ``meta`` is the File Meta (0002,0003) UID or ``None``, with
     ``cause`` one of the fixed ``_META_*`` strings saying why when it is ``None``; ``data_set`` is
-    the data set (0008,0018) UID or ``None``. Never logged (PHI-safe)."""
+    the data set (0008,0018) UID or ``None``; ``read_fault`` is whether the codec's read of the
+    object raised a fault it does not wrap, so the data set UID is unknown rather than absent.
+    Never logged (PHI-safe)."""
 
     meta: str | None
     cause: str
     data_set: str | None
+    read_fault: bool = False
 
 
-# Whether the WARNING for an installed [dicom] extra that does not load has been written in this
-# process (BACKLOG #5914). The extra is checked on every send, so without it each send would warn.
-_extra_unusable_warned = False
-_extra_unusable_lock = threading.Lock()
+# Which of the two pre-read WARNINGs ("load", "read") have been written in this process (BACKLOG
+# #5914). The read runs on every send, so without it each send would warn.
+_pre_read_warned: set[str] = set()
+_pre_read_warned_lock = threading.Lock()
+
+
+def _first_pre_read_warning(kind: str) -> bool:
+    """Whether this is the first pre-read WARNING of ``kind`` in this process, marking it written."""
+    with _pre_read_warned_lock:
+        if kind in _pre_read_warned:
+            return False
+        _pre_read_warned.add(kind)
+        return True
 
 
 def _dicom_extra_fault() -> str | None:
@@ -492,11 +504,8 @@ def _warn_extra_unusable(fault: str) -> None:
     DICOMweb compares a 202 with the File Meta UID alone, as with no extra (BACKLOG #5914).
     ``fault`` is the class name of what the load raised; the load's own text is not written. A
     reload keeps the ``pydicom`` modules already imported, so the line says to restart."""
-    global _extra_unusable_warned
-    with _extra_unusable_lock:
-        if _extra_unusable_warned:
-            return
-        _extra_unusable_warned = True
+    if not _first_pre_read_warning("load"):
+        return
     logger.warning(
         "DICOMweb: the [dicom] extra (pydicom) on this host is installed but does not load (%s), "
         "so a 202 is compared with the File Meta SOP Instance UID alone, as without the extra; "
@@ -505,27 +514,31 @@ def _warn_extra_unusable(fault: str) -> None:
     )
 
 
-def _sent_uids_unread(fault: str, base_url: str) -> NegativeAckError:
-    """The permanent refusal, raised before a byte is sent, of a message whose data set SOP
-    Instance UID could not be read because the parse of this object failed with a class other than
-    :class:`~messagefoundry.parsing.dicom.errors.DicomError` (``sent-uid-unread``; BACKLOG #5914),
-    ``fault`` being that class's name. An extra broken in a way its load does not show can also
-    cause it. The text names the class only: the fault's own text can carry a value (PHI-safe)."""
-    return NegativeAckError(
-        f"DICOMweb sent-uid-unread: the SOP Instance UIDs of the object could not be read before "
-        f"sending it ({fault}); nothing was sent ({_redact_url(base_url)})",
-        code="sent-uid-unread",
-        permanent=True,
+def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
+    """Write, once per process, the WARNING that the codec's read of an object raised ``fault``, the
+    class name of a fault it does not wrap, so that object's data set UID is not compared (BACKLOG
+    #5914). The fault's own text can carry a value, so it is not written (PHI-safe). With the first
+    WARNING go the lines pydicom logged during that read, ``held``, through the redacting filter;
+    later reads' lines are dropped, as on a read that succeeds."""
+    if not _first_pre_read_warning("read"):
+        return
+    _write_held(held)
+    logger.warning(
+        "DICOMweb: the [dicom] extra (pydicom) raised %s reading an object before it was sent, so "
+        "its data set SOP Instance UID is not compared and a 202 is compared with the File Meta "
+        "SOP Instance UID alone; this is written once per process, and the extra may be broken",
+        fault,
     )
 
 
-def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
+def _data_set_instance_uid(obj: bytes) -> tuple[str | None, bool]:
     """The data set's SOP Instance UID (``0008,0018``) of the object sent, read with the engine's
     DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
     materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
     or ``None`` when none is read: the optional ``[dicom]`` extra is absent or does not load, the
-    object does not parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), or it
-    carries no UID in the grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
+    object does not parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), the read
+    raises another fault, or it carries no UID in the grammar :func:`_is_uid` checks. The second
+    item is whether the read raised such another fault. A server builds its reply from this UID, so a 202 for an object
     whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914).
 
     Run before the POST. The extra is loaded first, apart from the object, as the SCU loads it
@@ -535,25 +548,25 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     :class:`~messagefoundry.parsing.dicom.errors.DicomError` from the parse reads as no
     UID, and so does a fault of a class the codec wraps into one, even one a broken extra raised.
     Any other :class:`Exception` but a :class:`MemoryError` from the parse, a warning the filters
-    turn into an error included, raises :func:`_sent_uids_unread`'s refusal. It is raised outside
-    the handler, so the fault, whose text can carry a value, rides neither its ``__cause__`` nor its
-    ``__context__``. The SCU's ignores for pydicom's value warnings, which name a value, are put
-    back first. pydicom's log lines from the parse are held, as the SCP holds its reads' lines
+    turn into an error included, also reads as no UID, and :func:`_warn_read_fault` writes one
+    WARNING per process naming its class, never its text; nothing is refused before the POST. The
+    SCU's ignores for pydicom's value warnings, which name a value, are put back first. pydicom's
+    log lines from the parse are held, as the SCP holds its reads' lines
     (:func:`~messagefoundry.transports.dicom._logs_held`), and written, through the same redacting
-    filter, only before that refusal, where they may say why; otherwise none is written, since the
-    object is sent as bytes and a line on how pydicom read it says nothing about the send.
+    filter, only with that first WARNING; otherwise none is written, since the object is sent as
+    bytes and a line on how pydicom read it says nothing about the send.
     pydicom's own copy of such a line as a Python warning is not held. A parse failure is logged by
     exception class only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
         logger.debug(
             "DICOMweb: the [dicom] extra is absent, so no data set SOP Instance UID is read"
         )
-        return None
+        return None, False
     _ignore_pydicom_value_warnings()
     extra_fault = _dicom_extra_fault()
     if extra_fault is not None:
         _warn_extra_unusable(extra_fault)
-        return None
+        return None, False
     parse_fault: str | None = None
     uid: str | None = None
     with _logs_held() as held:
@@ -561,28 +574,29 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
             uid = DicomPeek.parse(obj).sop_instance_uid
         except DicomError as exc:
             logger.debug("DICOMweb: no data set SOP Instance UID read (%s)", type(exc).__name__)
-            return None
+            return None, False
         except MemoryError:
             raise
         except Exception as exc:  # noqa: BLE001 - pydicom's faults on an object share no base
             parse_fault = type(exc).__name__
     if parse_fault is not None:
-        _write_held(held)
-        raise _sent_uids_unread(parse_fault, base_url)
+        _warn_read_fault(parse_fault, held)
+        return None, True
     if uid is None:
-        return None
+        return None, False
     uid = uid.rstrip("\0 ")
-    return uid if _is_uid(uid) else None
+    return (uid if _is_uid(uid) else None), False
 
 
-def _read_sent_uids(obj: bytes, base_url: str) -> _SentUids:
+def _read_sent_uids(obj: bytes) -> _SentUids:
     """Both comparable UIDs of the object sent: the File Meta one by hand
     (:func:`_sent_instance_uid`) and the data set one with the codec
     (:func:`_data_set_instance_uid`). Called before the POST, as the SCU parses before it
-    associates, so a refusal from that read is raised before a byte is sent (BACKLOG #5914). A
-    fault the codec wraps reads as no UID instead, and the object is still sent."""
+    associates (BACKLOG #5914). Only a :class:`MemoryError` from that read is raised; any other
+    fault reads as no data set UID, and the object is still sent."""
     meta, cause = _sent_instance_uid(obj)
-    return _SentUids(meta, cause, _data_set_instance_uid(obj, base_url))
+    data_set, read_fault = _data_set_instance_uid(obj)
+    return _SentUids(meta, cause, data_set, read_fault)
 
 
 def _named_uid(item: Any) -> str | None:
@@ -660,9 +674,13 @@ def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] 
     ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID or its
     data set's SOP Instance UID, both read before the POST (:func:`_read_sent_uids`), so nothing
     here parses the object. With neither UID to compare, the reason names why the File Meta has
-    none (BACKLOG #5914)."""
+    none (BACKLOG #5914). The exception is an object with no File Meta UID whose data set read
+    raised a fault the codec does not wrap (``read_fault``): nothing can be compared, so a 202 is
+    confirmed as before BACKLOG #5914, by an item that names any UID."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     if any(uid in named for uid in (sent.meta, sent.data_set)):
+        return None
+    if sent.meta is None and sent.read_fault and named:
         return None
     if sent.meta is None and sent.data_set is None:
         return (
@@ -966,9 +984,9 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
             self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
         # BACKLOG #5914: the UIDs a 202 is compared with are read before a byte is sent, as the SCU
-        # parses before it associates, so a refusal from the read is raised before the POST; not
-        # every fault refuses (_data_set_instance_uid says which do).
-        sent = _read_sent_uids(dicom_bytes, self.base_url)
+        # parses before it associates; a fault in the read reads as no data set UID
+        # (_data_set_instance_uid says which).
+        sent = _read_sent_uids(dicom_bytes)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
             **self._headers,
