@@ -21,10 +21,10 @@ the vetted network call.
 * **Trust anchor (BACKLOG #5527).** The endpoint is verified under the instance ``[tls]`` policy the
   caller hands in, resolved by ``tls_policy.resolve_trust_anchor`` as for every other HTTP-family
   hop: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file``, for an
-  endpoint that is not loopback. :func:`_endpoint_opener` says which opener that gives.
+  endpoint that is not loopback. :func:`_ai_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
-  when it builds an anchored opener (:func:`_endpoint_opener`). The API route runs the build
+  when it builds an anchored opener (:func:`_ai_endpoint_opener`). The API route runs the build
   and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
@@ -192,9 +192,9 @@ def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
 class AiOpenerSlot:
     """Where one app holds the AI endpoint's anchored opener, with the anchor it was built for
     (BACKLOG #5527 items 3 to 5). ``create_app`` puts one on ``app.state.ai_opener_slot`` and the
-    ``POST /ai/chat`` route hands it to the broker, so nothing outside the app's state holds the
-    opener, and two apps in one process each hold their own. Only :func:`_endpoint_opener` fills
-    and clears it."""
+    ``POST /ai/chat`` route hands it to the broker, so no process-wide holder keeps the opener:
+    beyond the app's state, only the broker of an assist call in flight holds it. Two apps in one
+    process each hold their own. Only :func:`_ai_endpoint_opener` fills and clears it."""
 
     __slots__ = ("_held", "_lock")
 
@@ -204,7 +204,7 @@ class AiOpenerSlot:
         self._lock = threading.Lock()
 
 
-def _endpoint_opener(
+def _ai_endpoint_opener(
     endpoint: str, policy: TrustAnchorPolicy | None, slot: AiOpenerSlot | None = None
 ) -> urllib.request.OpenerDirector:
     """The opener the broker dials ``endpoint`` through, under the instance ``[tls]`` ``policy``
@@ -221,45 +221,46 @@ def _endpoint_opener(
     by identity to learn that.
 
     **The anchored opener is held in ``slot``**, though the broker is built for each request: the
-    slot holds one, keyed on the resolved anchor, so a narrowing anchor that differs builds a new
-    one in its place, and a call whose anchor narrows nothing empties it. A slot is emptied only by
-    such a call: until the next assist call that reaches the opener, it keeps what it held. Held,
-    its context is a live hop as every connection's is, so ``loaded_crls`` records the CRL it holds,
-    the expiry monitor judges that copy, and ``crl_reload`` brings it current when the file is
-    replaced. An opener that is no longer held keeps its ``loaded_crls`` record until it is
-    garbage-collected, which for an opener's handler cycle is the cyclic collector's next pass.
-    With no slot, as for a broker built directly, each call builds an opener of its own: it reads
-    and judges the CA and CRL files every time, and records a copy in ``loaded_crls`` for each
-    throwaway context until that is collected.
+    slot holds one, keyed on the resolved anchor. A call whose anchor differs from the one held
+    empties the slot first, then builds and holds the new one if its anchor narrows; so a build
+    that raises leaves the slot empty, and a call whose anchor narrows nothing leaves it empty.
+    Only such a call empties it: an assist call refused before it reaches the opener, or no call
+    at all, leaves the slot as it was. Held, its context is a live hop as every connection's is,
+    so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
+    ``crl_reload`` brings it current when the file is replaced. An opener that is no longer held
+    keeps its ``loaded_crls`` record until it is garbage-collected, which for an opener's handler
+    cycle is the cyclic collector's next pass. With no slot, as for a broker built directly, each
+    call builds an opener of its own, held nowhere: it reads and judges the CA and CRL files every
+    time, and records a copy in ``loaded_crls`` for each such context until that is collected.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
-    ``harden_crl_check`` refuses; a build that raises leaves the slot as it was."""
+    ``harden_crl_check`` refuses."""
     anchor = http_family_trust_anchor(
         {}, url=endpoint, trust_anchor_policy=policy, cell="[ai].endpoint"
     )
-    if not anchor.narrows:
-        # BACKLOG #5527 item 3: an opener held for an anchor this app no longer resolves would
-        # keep its context, and its loaded_crls record, live for nothing.
-        # A plain store, not under the lock, so this call never waits on a build: the pair is
-        # replaced whole, and a build racing it for another anchor may fill the slot again.
-        if slot is not None:
-            slot._held = None
-        return _shared_no_redirect_opener()
-    if slot is None:
-        return _no_redirect_opener(trust_anchor=anchor, connector="AI endpoint")
-    # Read without the lock first, as the shared opener's getter does: a hit, every request after
-    # the first, takes no lock.
-    held = slot._held
-    if held is not None and held[0] == anchor:
-        return held[1]
-    with slot._lock:
-        held = slot._held
+    # A slot made for this call alone, held nowhere, so a broker with none takes the one build
+    # path below.
+    held_by = slot if slot is not None else AiOpenerSlot()
+    if anchor.narrows:
+        # Read without the lock first, as the shared opener's getter does: a hit, every request
+        # after the first, takes no lock.
+        held = held_by._held
         if held is not None and held[0] == anchor:
             return held[1]
+    with held_by._lock:
+        held = held_by._held
+        if anchor.narrows and held is not None and held[0] == anchor:
+            return held[1]
+        # BACKLOG #5527 item 3: an opener held for an anchor this call no longer resolves would
+        # keep its context, and its loaded_crls record, live for nothing. Emptied under the lock,
+        # before any build, so neither a racing build nor one that raises leaves it held.
+        held_by._held = None
+        if not anchor.narrows:
+            return _shared_no_redirect_opener()
         # The hop's own label, so a refusal raised while the context is built or asserted does not
         # name the HTTP-family destinations (BACKLOG #5527 item 9).
         opener = _no_redirect_opener(trust_anchor=anchor, connector="AI endpoint")
-        slot._held = (anchor, opener)
+        held_by._held = (anchor, opener)
         return opener
 
 
@@ -301,7 +302,7 @@ def _refuse_an_unrevoked_ai_hop(
       :func:`~messagefoundry.config.tls_policy.crl_no_credit` gives no reason against that
       context (vault BACKLOG #5086, #4912). That function's docstring is the source of record
       for the conditions. It can be ``True`` when
-      ``[tls].crl_file`` reached the hop through :func:`_endpoint_opener` (BACKLOG #5527).
+      ``[tls].crl_file`` reached the hop through :func:`_ai_endpoint_opener` (BACKLOG #5527).
       Otherwise the opener is rest.py's shared one, which loads no CRL, or one carrying only
       ``[tls].internal_ca_file``, so it is ``False``.
     * An attestation with no reason or a blank one, and a reason holding a control character or a
@@ -506,10 +507,10 @@ class AiBroker:
         # BACKLOG #2484: the shared opener is built on first use, so a build refusal, such as an
         # OpenSSL that refuses the engine's list (EngineTlsListRefused, a ValueError), lands here, as
         # does an OSError from the default context's trust-store load (ssl.SSLError is one), and a
-        # [tls] file _endpoint_opener cannot load. Re-raised as AiBrokerError, the API surface's
+        # [tls] file _ai_endpoint_opener cannot load. Re-raised as AiBrokerError, the API surface's
         # one error type.
         try:
-            opener = _endpoint_opener(endpoint, trust_anchor_policy, opener_slot)
+            opener = _ai_endpoint_opener(endpoint, trust_anchor_policy, opener_slot)
         except (ValueError, OSError) as exc:
             raise AiBrokerError(f"[ai] endpoint opener refused: {exc}") from exc
         # Last, so an endpoint refused for any reason above never logs a revocation crossing, and
@@ -658,7 +659,7 @@ def ai_broker_from_settings(
 
     ``trust_anchor_policy`` is the instance ``[tls]`` policy (BACKLOG #5527), or ``None`` where
     none reached the caller, and ``opener_slot`` the calling app's :class:`AiOpenerSlot`, or
-    ``None``. :func:`_endpoint_opener` says what each reaches."""
+    ``None``. :func:`_ai_endpoint_opener` says what each reaches."""
     return AiBroker(
         endpoint=ai.endpoint or "",
         api_key=ai.api_key or "",

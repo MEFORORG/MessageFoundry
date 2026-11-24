@@ -96,7 +96,8 @@ _BUILDERS = frozenset(
         # transports/ai_broker.py: the AI endpoint's shared-or-anchored choice (BACKLOG #5527 item
         # 22), so each caller of it is a site, and a new caller fails the census until it is listed
         # with its guard. Listed as the site itself, it was tied to one named caller's guard only.
-        "_endpoint_opener",
+        # Named for its hop, since a builder name matches a def of that name in any module.
+        "_ai_endpoint_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
         "_client_ssl_context",
@@ -245,7 +246,7 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
     "messagefoundry/transports/soap.py::SoapDestination.__init__": Guarded(),
     "messagefoundry/transports/ai_broker.py::AiBroker.__init__": Guarded(
-        note="the AI endpoint's opener, which _endpoint_opener chooses under the [tls] policy since "
+        note="the AI endpoint's opener, which _ai_endpoint_opener chooses under the [tls] policy since "
         "BACKLOG #5527, handed to _refuse_an_unrevoked_ai_hop (BACKLOG #2193 slice (e)). Off "
         "the box it crosses an enforcing posture only on a [tls].crl_file that reaches its opener "
         "(BACKLOG #5527) or on its [ai].endpoint_revocation_attested pair; an unknown posture "

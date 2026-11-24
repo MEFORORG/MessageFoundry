@@ -21,7 +21,6 @@ import inspect
 import ssl
 import urllib.request
 import weakref
-from pathlib import Path
 
 import pytest
 
@@ -139,8 +138,8 @@ async def test_nothing_outside_the_app_holds_its_anchored_opener(
     monkeypatch: pytest.MonkeyPatch,
     pki: _Pki,  # noqa: F811 - the imported fixture
 ) -> None:
-    """Items 5 and 31: the app's own state is the only holder of the opener its route built, so
-    the opener lives no longer than that state. Dropping what the app holds there, as dropping the
+    """Items 5 and 31: no process-wide holder keeps the opener the route built; once its request
+    is done, the app's own state holds it alone. Dropping what the app holds there, as dropping the
     app does, lets the context and its CRL record go. (The app itself is not dropped here: its
     routes' closures keep it in cycles this test does not control.) Red before the fix: a
     module-global slot kept the opener for the rest of the process, whatever the app held."""
@@ -170,6 +169,7 @@ def test_a_broker_built_with_no_app_slot_holds_no_opener(
     assert _context(second).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
     # Held nowhere: once both brokers are dropped, neither context is alive or recorded.
     refs = [weakref.ref(_context(first)), weakref.ref(_context(second))]
+    assert all(_still_held(ref) for ref in refs)  # the control: recorded while the brokers live
     del first, second
     assert not any(_still_held(ref) for ref in refs)
 
@@ -178,9 +178,11 @@ def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
     """Item 13 (and 26, 43): each remedy is written out in the source, so a grep for the logged
     opening words of either finds it, and no text is made by upper-casing another. Red before the
     fix: the text began "set [ai]..." and the code upper-cased it."""
-    source = Path(inspect.getfile(ai_broker_mod)).read_text(encoding="utf-8")
-    assert '"Set [ai].endpoint_revocation_attested = true with an "' in source
-    assert 'or set [ai].endpoint_revocation_attested = true with an "' in source
+    opening = "Set [ai].endpoint_revocation_attested = true with an "
+    assert ai_broker_mod._AI_ATTESTATION_LEVER.startswith(opening)
+    # The CRL remedy ends with the same attestation remedy, so the two cannot drift apart.
+    tail = ai_broker_mod._AI_ATTESTATION_LEVER[1:]
+    assert ai_broker_mod._AI_CRL_LEVER.endswith(", or s" + tail)
     assert ".upper()" not in inspect.getsource(ai_broker_mod._revocation_lever)
     with pytest.raises(ai_broker_mod.AiBrokerError) as info:
         _broker(posture=_ENFORCING)
@@ -188,24 +190,31 @@ def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
 
 
 def test_each_caller_of_the_ai_opener_chooser_is_a_census_site() -> None:
-    """Items 22 and 32: the revocation census treats ``_endpoint_opener`` as a builder, so the
+    """Items 22 and 32: the revocation census treats ``_ai_endpoint_opener`` as a builder, so the
     function that calls it is the site, tied to its own guard call, and a new caller fails the
     census until it is listed. Red before the fix: ``_endpoint_opener`` was the site, guarded by
     one named caller, so a second caller dialled with no guard and the census stayed green."""
     sites = _scan().sites
     assert "messagefoundry/transports/ai_broker.py::AiBroker.__init__" in sites
-    assert "messagefoundry/transports/ai_broker.py::_endpoint_opener" not in sites
+    assert "messagefoundry/transports/ai_broker.py::_ai_endpoint_opener" not in sites
 
 
 async def test_an_opener_slot_of_another_type_answers_503(
     engine: Engine,  # noqa: F811 - the imported fixture
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An embedder that overwrites ``app.state.ai_opener_slot`` with something else is refused as
-    a misconfiguration, as a ``tls_settings`` stash of another type is, rather than built around
-    with a fresh opener on every request. Nothing is sent."""
+    """An embedder that overwrites ``app.state.ai_opener_slot`` with something else, ``None``
+    included, is refused as a misconfiguration, as a ``tls_settings`` stash of another type is,
+    rather than built around with a fresh opener on every request. Nothing is sent. The endpoint
+    is attested, so the slot is the only reason for the 503: the same app answers 200 first."""
     dialled = _record_openers(monkeypatch)
-    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
-    app.state.ai_opener_slot = object()
-    assert await _chat(app) == 503
-    assert dialled == []
+    ai = _managed_ai(
+        endpoint_revocation_attested=True,
+        endpoint_revocation_attested_reason="synthetic: covered elsewhere",
+    )
+    app = create_app(engine, ai_settings=ai, allow_no_auth=True)
+    assert await _chat(app) == 200  # the control: the slot create_app set
+    for other in (object(), None):
+        app.state.ai_opener_slot = other
+        assert await _chat(app) == 503
+    assert len(dialled) == 1

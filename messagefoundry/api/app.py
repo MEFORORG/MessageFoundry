@@ -5488,16 +5488,17 @@ def create_app(
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
         tls_settings = getattr(request.app.state, "tls_settings", None)
-        # The app's own slot for the held anchored opener (BACKLOG #5527 items 3 to 5). An app
-        # that holds none gets an opener built for this request alone.
+        # The app's own slot for the held anchored opener (BACKLOG #5527 items 3 to 5), which
+        # create_app always sets.
         opener_slot = getattr(request.app.state, "ai_opener_slot", None)
         try:
             # BACKLOG #5527: an embedder's stash of another type is a misconfiguration, mapped to
             # the 503 below, rather than an AttributeError the route would answer 500 for.
             if tls_settings is not None and not isinstance(tls_settings, TlsSettings):
                 raise AiBrokerError("app.state.tls_settings is not a TlsSettings")
-            # Refused as the stash above is, rather than built around on every request.
-            if opener_slot is not None and not isinstance(opener_slot, AiOpenerSlot):
+            # Refused as the stash above is, None or absent included, rather than built around
+            # with an opener for each request that re-reads the [tls] files.
+            if not isinstance(opener_slot, AiOpenerSlot):
                 raise AiBrokerError("app.state.ai_opener_slot is not an AiOpenerSlot")
             broker = await asyncio.to_thread(
                 ai_broker_from_settings,
