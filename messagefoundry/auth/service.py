@@ -42,9 +42,9 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import cache, partial
+from functools import cache, partial, wraps
 from types import MappingProxyType
-from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeVar
+from typing import Any, Concatenate, Final, Literal, NamedTuple, NoReturn, TypeVar
 from uuid import uuid4
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -2724,6 +2724,45 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     if not federated and _holds_federated_binding(user):
         return FEDERATED_SIGN_IN_REQUIRED
     return None
+
+
+def _in_principal_credential_queue[**P](
+    method: Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]],
+) -> Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]]:
+    """Run a directory sign-in's completion inside the account's credential queue, the one
+    :meth:`AuthService.login` and :meth:`AuthService.verify_mfa` hold (BACKLOG #5653).
+
+    **ONE DIRECTORY SIGN-IN PER ACCOUNT AT A TIME, AS ON THE PASSWORD LEG.** The completion reads
+    the row, writes its roles, scope and profile, revokes the other sessions on a role change,
+    mints, and clears the failure counters. Without the queue two sign-ins of one account could
+    each read the roles before either wrote them; the second then found its target already
+    written, counted the change as its own, and revoked every session of the account, the first
+    sign-in's new one included. In the queue the second reads the roles the first wrote and revokes
+    nothing. A second-step check waits behind it too, so a lock that check sets cannot land between
+    this sign-in's checks and its clear.
+
+    **WHAT THE QUEUE DOES NOT COVER, AND WHAT DOES.** An administrator's disable, a lock a re-proof
+    sets, and a sign-in on another engine shard take no queue of this process: the queue is per API
+    process, as the password leg's is. For those the store refuses the mint of an account disabled
+    or locked when it inserts (``require_sign_in_eligible``), and the counter clear is a
+    compare-and-set on the row read before the mint, so it never clears a lock that landed after
+    that read. Two sign-ins on different engine shards can still end each other's new session on
+    a role change.
+
+    The key is the directory's name for the account, which is what ``verify_mfa`` keys a directory
+    account by once its row is current. A directory-side rename lands on the row under the new
+    name, so the two can name different queues for that one sign-in. A decorator rather than a
+    wrapper method so the completion keeps its one name for every caller; ``__wrapped__`` is the
+    body outside the queue, for a test that drives the cross-process race."""
+
+    @wraps(method)
+    async def queued(
+        self: AuthService, principal: AdPrincipal, /, *args: P.args, **kwargs: P.kwargs
+    ) -> LoginOutcome:
+        async with self._account_credential_lock(principal.username):
+            return await method(self, principal, *args, **kwargs)
+
+    return queued
 
 
 @dataclass(frozen=True)
@@ -8389,6 +8428,7 @@ class AuthService:
             return None
         return set(stored.user.role_ids) == set(role_ids)
 
+    @_in_principal_credential_queue
     async def _complete_ad_login(
         self,
         principal: AdPrincipal,
@@ -8740,6 +8780,24 @@ class AuthService:
         # already mints with seed_reauth=False below, so a NEW verdict is challenged by construction
         # and this leg adds the audit row and the notice.
         address = await self._classify_login_address(user, client)
+        # BACKLOG #5653. THE ROW IS READ AGAIN, AND JUDGED, RIGHT BEFORE THE MINT. The checks above
+        # ran on reads taken before the role, scope and profile writes, and a disable or a lock can
+        # commit during them. ``decided`` is also what the counter clear below compares against,
+        # so a lock that lands after this read is never cleared by it.
+        decided = (await self._lookup_user_settled(user.id)).user
+        ineligible = (
+            ACCOUNT_REFUSED
+            if decided is None
+            else _directory_login_refusal(decided, time.time(), federated=federated)
+        )
+        if ineligible is not None or decided is None:
+            refused = await self._refuse_directory_row(
+                principal.username,
+                ineligible or ACCOUNT_REFUSED,
+                client=client,
+                extra=outcome_extra,
+            )
+            return replace(refused, roles_gained=roles_gained)
         # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
         # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
         # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
@@ -8781,6 +8839,11 @@ class AuthService:
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
+                # BACKLOG #5653: the insert also requires the row enabled and unlocked, read under
+                # the lock a disable or a lockout takes, so neither can land between the re-read
+                # above and the insert. A disable's session sweep cannot see a session that does
+                # not exist yet.
+                require_sign_in_eligible=True,
                 idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
@@ -8795,13 +8858,25 @@ class AuthService:
             # set, and the set this sign-in first read was a different one, those sessions were
             # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
             # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
+            # BACKLOG #5653: the store also refuses a row disabled or locked at the insert. The
+            # account is read once more to name that cause; a row that reads eligible again was
+            # refused for its binding, or its lock lapsed in between, and keeps the binding reason.
+            now_ineligible: str | None = None
+            if not changed.account_deleted:
+                again = await self._load_user(user.id)
+                if again is not None:
+                    # ``federated=True`` asks only the disabled and lock states: a binding change
+                    # keeps the reason chosen below.
+                    now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
+            elif now_ineligible is not None:
+                reason = now_ineligible
             elif federated:
                 reason = "federated_subject_unbound"
             else:
                 reason = FEDERATED_SIGN_IN_REQUIRED
-            if not federated:
+            if not federated or now_ineligible is not None:
                 refused = await self._refuse_directory_row(
                     principal.username, reason, client=client, extra=outcome_extra
                 )
@@ -8848,14 +8923,28 @@ class AuthService:
             #
             # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
             # and both clear the counter themselves.
-            await self._store.record_login_success(user.id, audits=())
+            #
+            # BACKLOG #5653: a compare-and-set on ``decided``, the row judged eligible before the
+            # mint, as the re-auth leg's clear is (BACKLOG #5900). A lock, a failure or a disable
+            # that commits after that read leaves the counters as that writer left them.
+            cleared = await self._store.record_login_success(
+                user.id, expected=full_authentication_snapshot(decided), audits=()
+            )
+            if cleared != "written":
+                _log.info(
+                    "a directory sign-in of account id %r found the account %s since its check "
+                    "before the mint, so it cleared no lockout state",
+                    user.id,
+                    "missing" if cleared == "gone" else "changed",
+                )
             # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
             # nothing more marks its address known. The audit baseline this replaced counted a
             # directory row that still owed a factor, because that row carries no marker of it.
             # NEW is written too: no directory session is ever seeded, so withholding the write
             # would challenge nothing and would only repeat the notice at every sign-in from an
             # address its owner keeps using. A failed read is no evidence, so it writes nothing.
-            if address is not _LoginAddress.UNEVALUATED_READ_FAILED:
+            # A clear refused above (BACKLOG #5653) is no full authentication either.
+            if cleared == "written" and address is not _LoginAddress.UNEVALUATED_READ_FAILED:
                 await self._mark_login_address_known(user.id, client)
         return LoginOutcome(
             ok=True,
@@ -9129,9 +9218,14 @@ class AuthService:
                         client=client,
                     )
                 )
-            await self._store.update_user_profile(
-                user_id, display_name=display_name, email=email, audits=repoint
-            )
+            # BACKLOG #5653 item 1 (S11-33): a returning sign-in whose directory profile matches the
+            # row writes nothing, rather than re-seal the row with the same two values on every
+            # sign-in. ``existing`` is the row this sign-in read, so a value another writer moved
+            # since is written back on the next sign-in, as the unconditional write would have.
+            if email_changed or display_name != existing.display_name:
+                await self._store.update_user_profile(
+                    user_id, display_name=display_name, email=email, audits=repoint
+                )
             if email_changed:
                 # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
                 # This read used to start at ``existing.email``, the profile mirror, which is the one
@@ -12333,6 +12427,7 @@ class AuthService:
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
+        require_sign_in_eligible: bool = False,
     ) -> str:
         """Mint a session token and persist the row. Every caller must handle
         :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
@@ -12394,6 +12489,8 @@ class AuthService:
             # seal ended the row, yet this method went on to supersede the caller's prior session
             # and hand back a dead token as a success.
             mfa_verified=mfa_verified,
+            # BACKLOG #5653: the directory leg also requires the row enabled and unlocked.
+            require_sign_in_eligible=require_sign_in_eligible,
         )
         if not issued:
             # An unbind or a bind revoked this account's sessions while this login was in flight,
@@ -12401,7 +12498,9 @@ class AuthService:
             # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
             # nothing to undo. One more read tells the two apart (BACKLOG #5624).
             # An unguarded insert is refused only for a missing row, so it needs no read.
-            deleted = require_federated_subject is None or not await self._user_id_held(user_id)
+            deleted = (
+                require_federated_subject is None and not require_sign_in_eligible
+            ) or not await self._user_id_held(user_id)
             raise _BindingChangedMidLogin(account_deleted=deleted)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)

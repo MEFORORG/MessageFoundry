@@ -441,6 +441,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    sign_in_state_refused,
     stamped_connection_event,
     tee_audits,
     totp_enable,
@@ -17470,6 +17471,7 @@ class SqlServerStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. UPDLOCK/ROWLOCK, not a plain read: the lock is the guard. Either a
@@ -17484,16 +17486,19 @@ class SqlServerStore:
                 # An unguarded sign-in takes a shared lock held to the commit (HOLDLOCK): it still
                 # waits behind a revoke's users UPDATE, and parallel sign-ins of one account do not
                 # wait on each other.
+                # BACKLOG #5653: the eligibility columns are read under the same lock. A disable or
+                # a lockout is an UPDATE, which the shared HOLDLOCK lock blocks too, so either
+                # committed first and refuses this insert, or waits behind it.
                 if require_federated_subject is None:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (HOLDLOCK, ROWLOCK) WHERE id=?",
                         (user_id,),
                     )
                 else:
                     await cur.execute(
-                        "SELECT oidc_issuer, oidc_subject, session_epoch FROM users"
-                        " WITH (UPDLOCK, ROWLOCK) WHERE id=?",
+                        "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                        " second_step_locked_until FROM users WITH (UPDLOCK, ROWLOCK) WHERE id=?",
                         (user_id,),
                     )
                 # fetchall drains the SELECT so the same-cursor INSERT below is clean; `_cursor`
@@ -17502,9 +17507,16 @@ class SqlServerStore:
                 # An account deleted under this sign-in is refused, guarded or not (BACKLOG #2733):
                 # the INSERT would otherwise fail fk_sessions_user with a raw 547. A row this read
                 # found stays locked to the commit, so a delete cannot land before the INSERT.
-                if not rows or (
-                    require_federated_subject is not None
-                    and (rows[0][0], rows[0][1]) != require_federated_subject
+                if (
+                    not rows
+                    or (
+                        require_federated_subject is not None
+                        and (rows[0][0], rows[0][1]) != require_federated_subject
+                    )
+                    or (
+                        require_sign_in_eligible
+                        and sign_in_state_refused(rows[0][3], rows[0][4], rows[0][5], now)
+                    )
                 ):
                     await conn.rollback()
                     return False

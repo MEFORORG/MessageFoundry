@@ -430,6 +430,7 @@ from messagefoundry.store.store import (
     settle_newest_keyed_audit_row,
     settle_transit_bound_attestation,
     should_record_event,
+    sign_in_state_refused,
     stamped_connection_event,
     tee_audits,
     totp_enable,
@@ -12009,6 +12010,7 @@ class PostgresStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # BACKLOG #1474 and #2592. FOR UPDATE, not a plain read: the row lock is the guard. Either a
@@ -12024,23 +12026,38 @@ class PostgresStore:
         # An unguarded sign-in takes FOR SHARE: it still waits behind a revoke's users UPDATE, and
         # parallel sign-ins of one account do not wait on each other.
         async with self._timed_acquire(record=False) as conn, conn.transaction():
+            # BACKLOG #5653: the eligibility columns are read under the same row lock. A disable or
+            # a lockout is an UPDATE, which conflicts with FOR SHARE too, so either committed first
+            # and refuses this insert, or waits behind it.
             if require_federated_subject is None:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR SHARE",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                    " second_step_locked_until FROM users WHERE id=$1 FOR SHARE",
                     user_id,
                 )
             else:
                 row = await conn.fetchrow(
-                    "SELECT oidc_issuer, oidc_subject, session_epoch FROM users WHERE id=$1"
-                    " FOR UPDATE",
+                    "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                    " second_step_locked_until FROM users WHERE id=$1 FOR UPDATE",
                     user_id,
                 )
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
             # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        now,
+                    )
+                )
             ):
                 return False
             record = new_session_record(

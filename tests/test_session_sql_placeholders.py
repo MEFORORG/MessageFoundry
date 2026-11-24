@@ -128,10 +128,18 @@ _LIVE_SESSION = (
 _GLOBAL_EPOCH_READ = f"SELECT {GLOBAL_SESSION_EPOCH_SQL}"
 #: ``create_session``'s account read, which the fakes answer with an unbound account at epoch 0: a
 #: missing account is refused before the INSERT (BACKLOG #2733), which would leave it unchecked.
-_ACCOUNT_COLUMNS = ("oidc_issuer", "oidc_subject", "session_epoch")
+#: The last three are the eligibility columns ``require_sign_in_eligible`` reads (BACKLOG #5653).
+_ACCOUNT_COLUMNS = (
+    "oidc_issuer",
+    "oidc_subject",
+    "session_epoch",
+    "disabled",
+    "locked_until",
+    "second_step_locked_until",
+)
 _ACCOUNT_READ = f"SELECT {', '.join(_ACCOUNT_COLUMNS)} FROM users"
 #: The account row the fakes answer that read with; ``None`` answers it with no row.
-_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0)
+_ACCOUNT_ROW: tuple[Any, ...] | None = (None, None, 0, 0, None, None)
 
 
 def _reads_session_row(sql: str) -> bool:

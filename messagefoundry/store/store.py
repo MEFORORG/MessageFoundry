@@ -2505,6 +2505,24 @@ async def _held_seal_ok(
     return _encodes(kind, parts) and await sealer.verify_held_async(kind, parts, stored)
 
 
+def sign_in_state_refused(
+    disabled: object,
+    locked_until: float | None,
+    second_step_locked_until: float | None,
+    now: float,
+) -> bool:
+    """Whether an account's row, read inside ``create_session``'s transaction, may not take a new
+    session under ``require_sign_in_eligible`` (BACKLOG #5653): disabled, or either lock live at
+    ``now``. The values are the raw columns, so each backend's integer, boolean or bit reads alike.
+    The service's own check before the mint reads the same three states
+    (``_directory_login_refusal``); this repeats it where a concurrent disable or lockout can no
+    longer land between that check and the INSERT. A lock is live on the boundary
+    :meth:`UserRecord.sign_in_locked` and :meth:`UserRecord.second_step_locked` use."""
+    return bool(disabled) or any(
+        until is not None and now < until for until in (locked_until, second_step_locked_until)
+    )
+
+
 def new_session_record(
     *,
     token_hash: str,
@@ -22030,25 +22048,40 @@ class MessageStore:
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
         now = time.time() if now is None else now
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
         # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
-        # path's binding check). The lock alone is what makes the read and the INSERT atomic against
-        # clear_user_federated_subject and every whole-account revoke, which take the same lock.
+        # path's binding check; BACKLOG #5653 for the eligibility check). The lock alone is what
+        # makes the read and the INSERT atomic against clear_user_federated_subject, a disable, a
+        # lockout and every whole-account revoke, which take the same lock.
         # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(
-                "SELECT oidc_issuer, oidc_subject, session_epoch,"
+                "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
+                " second_step_locked_until,"
                 f" {GLOBAL_SESSION_EPOCH_SQL} AS global_epoch FROM users WHERE id=?",
                 (user_id,),
             )
             row = await cur.fetchone()
             # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
             # INSERT's foreign-key error.
-            if row is None or (
-                require_federated_subject is not None
-                and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+            if (
+                row is None
+                or (
+                    require_federated_subject is not None
+                    and (row["oidc_issuer"], row["oidc_subject"]) != require_federated_subject
+                )
+                or (
+                    require_sign_in_eligible
+                    and sign_in_state_refused(
+                        row["disabled"],
+                        row["locked_until"],
+                        row["second_step_locked_until"],
+                        now,
+                    )
+                )
             ):
                 await self._db.rollback()
                 return False
