@@ -5563,9 +5563,11 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
-    loop's task type). On a task without it the borrow is not cancelled, and one WARNING says so: it
-    runs to its end and its done-callback returns the connection, at the cost of a borrow left
-    waiting on a wedged pool."""
+    loop's task type). On a task without it nothing can be checked, so the borrow is cancelled at
+    once, as before this check existed, and one WARNING says the check is off.
+
+    Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
+    ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
     if borrow.done():
         return
     if not hasattr(borrow, "_fut_waiter"):
@@ -5573,9 +5575,10 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
         if not _warned_no_waiter:
             _warned_no_waiter = True
             log.warning(
-                "this event loop's tasks have no _fut_waiter; abandoned pool borrows are left to "
-                "finish instead of being cancelled"
+                "this event loop's tasks have no _fut_waiter; abandoned pool borrows are cancelled "
+                "without checking for a hand-over in flight"
             )
+        borrow.cancel()
         return
     if deferrals < _BORROW_CANCEL_MAX_DEFERRALS and _value_in_flight(borrow):
         asyncio.get_running_loop().call_soon(_cancel_borrow, borrow, deferrals + 1)
@@ -5636,7 +5639,7 @@ async def acquire_pooled(
     A bare ``asyncio.wait_for(pool.acquire(), timeout)`` cancels the borrow at the instant the timer
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
-    per retry (on CPython; see :func:`_cancel_borrow` for a task type it cannot read). That cancel
+    per retry. That cancel
     goes through :func:`_cancel_borrow`, which puts it off while a value is on its way into the
     borrow. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
     borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
@@ -5646,15 +5649,15 @@ async def acquire_pooled(
     try:
         return await asyncio.wait_for(asyncio.shield(borrow), timeout)
     except TimeoutError as exc:
-        _cancel_borrow(borrow)
         _park_borrow(pool, backend, borrow)
+        _cancel_borrow(borrow)
         raise StoreAcquireTimeout(
             f"{backend}: store pool acquire timed out after {timeout:g}s "
             f"(pool exhausted or database unresponsive); retune with {retune}"
         ) from exc
     except asyncio.CancelledError:
-        _cancel_borrow(borrow)
         _park_borrow(pool, backend, borrow)
+        _cancel_borrow(borrow)
         raise
 
 
@@ -5718,8 +5721,8 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
             conn = await asyncio.shield(borrow)
         except asyncio.CancelledError:
             # See "Acquire-side leak-freedom" above: the cleanup returns what this borrow hands over.
-            _cancel_borrow(borrow)
             abandoned.append(borrow)
+            _cancel_borrow(borrow)
             raise
         # No await between the hand-over and the append, so the cleanup below releases it even if the
         # gather is cancelled or times out mid-flight.

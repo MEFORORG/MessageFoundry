@@ -316,14 +316,96 @@ async def test_acquire_pooled_failed_hand_off_in_the_cancel_turn_logs_no_loop_er
     # the loop would report at ERROR as an exception in a shielded future.
     loop = asyncio.get_running_loop()
     errors: list[dict[str, object]] = []
+    previous = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    try:
+        pool = _HandOffPool()
+        caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+        await _turns()
+        caller.cancel()
+        pool.handoffs[0].set_exception(ConnectionResetError("synthetic"))
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await _turns()
+    finally:
+        loop.set_exception_handler(previous)  # the test loop is session-scoped
+    assert errors == [], f"unexpected loop-level error(s): {errors}"
+    assert pool.checked_out == []
+
+
+class _NoWaiterTask(asyncio.Task):
+    """A task type that does not expose ``_fut_waiter``, as a non-CPython task might not."""
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "_fut_waiter":
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+async def test_acquire_pooled_cancels_at_once_on_a_task_type_without_the_waiter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Without _fut_waiter nothing can be checked, so the borrow is cancelled at once, as on main,
+    # rather than left waiting on the pool; one WARNING says the check is off.
+    monkeypatch.setattr(base_module, "_warned_no_waiter", False)
+    loop = asyncio.get_running_loop()
+    previous = loop.get_task_factory()
+    loop.set_task_factory(lambda lp, coro, **kw: _NoWaiterTask(coro, loop=lp, **kw))
+    pool = _HandOffPool()
+    try:
+        caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+        await _turns()
+        assert len(pool.handoffs) == 1
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        await _turns()
+    finally:
+        loop.set_task_factory(previous)
+    assert pool.handoffs[0].cancelled(), "the borrow was left waiting on the pool"
+    assert "_fut_waiter" in caplog.text
+
+
+def _raising_cancel(borrow: asyncio.Future[object], deferrals: int = 0) -> None:
+    raise RuntimeError("synthetic failure inside the borrow cancel")
+
+
+async def test_acquire_pooled_registers_the_salvage_before_the_cancel_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An exception inside _cancel_borrow must not skip the salvage: the borrow is already parked,
+    # so the connection it lands later is returned.
+    monkeypatch.setattr(base_module, "_cancel_borrow", _raising_cancel)
     pool = _HandOffPool()
     caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
     await _turns()
     caller.cancel()
-    pool.handoffs[0].set_exception(ConnectionResetError("synthetic"))
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises((RuntimeError, asyncio.CancelledError)):
         await caller
-    await _turns()
-    assert errors == [], f"unexpected loop-level error(s): {errors}"
+    pool.hand_over()
+    assert await _until(lambda: pool.released == ["conn-1"]), "the borrow was never parked"
     assert pool.checked_out == []
+
+
+async def test_warm_hands_the_borrow_to_the_cleanup_before_the_cancel_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The same in the warm-up: the abandoned borrow reaches the cleanup even if _cancel_borrow
+    # raises, and the cleanup returns what it lands. The bound is lifted for a slow runner.
+    monkeypatch.setattr(base_module, "_cancel_borrow", _raising_cancel)
+    monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 3600.0)
+    pool = _HandOffPool()
+    try:
+        task = asyncio.create_task(
+            warm_pool_connections(pool, target=1, timeout=30.0, backend="stub")
+        )
+        await _turns()
+        task.cancel()
+        await _turns()
+        pool.hand_over()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert pool.released == ["conn-1"], "the abandoned borrow never reached the cleanup"
+        assert pool.checked_out == []
+    finally:
+        await pool.unstick()
