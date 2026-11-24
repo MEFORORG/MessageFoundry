@@ -124,3 +124,21 @@ proves nothing and measures it from the call, so a retired token gains a SECOND 
 one under Consequences: for 5 seconds after an elevation, presented to `/ui/logout` with no
 credential, it ends the session it became. It still cannot open or extend one. `docs/SECURITY.md`
 states both powers. `revoke_own_session` still follows no link.
+
+## Amendment B (2026-11-24): the store's own clock stamps and measures the window
+
+Vault BACKLOG #4276, ASVS 7.2.4 arm (ii). Under Decision 3 and the stated limits above, the link was
+stamped with the elevating process's `time.time()` and the window measured from the signing-in
+process's, so a forward step of the signing-in process's clock, or a sign-in host whose clock ran
+ahead of the elevating one, dropped a link inside the real window. Now every backend stamps
+`retired_at` from the database's own clock in the link's INSERT, and the walk's lineage read and
+the reaper's purge measure the window back from that same clock: SQLite's `julianday('now')`,
+Postgres `statement_timestamp()`, SQL Server `SYSUTCDATETIME()`. Decision 3's bound is now a
+length, `lineage_seconds`, not an instant, `lineage_since`, and `rotate_session` takes no `now`.
+The sign-out asks for its 5 seconds plus the time since its proof on the engine's clock: two
+readings of one process's clock, never compared with a stamp.
+
+What this closes: a step of an engine process's clock, and skew between engine hosts sharing one
+store, no longer move the window. What stays: a step of the store's own clock between the elevation
+and the sign-in still moves it by the step. On SQLite that is the clock of the host that holds the
+database file. `docs/SECURITY.md` states both.

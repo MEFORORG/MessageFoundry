@@ -7,6 +7,15 @@ backend's ``rotate_session`` now writes one ``session_lineage`` row in the same 
 retired hash, the hash that replaced it, and when. This module holds the one walk over those rows
 that every backend shares, so the three cannot disagree on how far it goes.
 
+**"When" is the store's own clock, never an engine process's (vault BACKLOG #4276).** A link's
+``retired_at`` is stamped from the database's clock inside the rotation's own statement, and the
+window a walk follows links for is measured back from the database's clock inside the walk's own
+statements. So the stamp and the test read ONE clock, whichever engine process elevated and
+whichever signs in. A forward step of an engine process's clock, or skew between engine hosts that
+share the store, no longer drops a link inside the window. A step of the store's own clock between
+the rotation and the walk still moves the window by the size of the step. On SQLite that clock is
+the clock of the host that holds the database file, which every engine shard opens.
+
 **A retired hash authenticates nothing.** No session read consults this table: ``get_session``,
 ``list_sessions`` and the service's session loader read ``sessions`` only. The one reader is the
 revoke below, so the only thing a retired hash can lead to is the END of the session it became.
@@ -33,14 +42,15 @@ LINEAGE_MAX_HOPS: Final = 32
 
 #: Revoke the unrevoked row that hash names and return it as revoked, or ``None`` when none did.
 type Revoke = Callable[[str], Awaitable[SessionRecord | None]]
-#: The hash that replaced this one, by a link retired at or after ``since``, or ``None``.
+#: The hash that replaced this one, by a link retired no more than ``seconds`` before the store's
+#: own clock at the lookup, or ``None``.
 type Successor = Callable[[str, float], Awaitable[str | None]]
 
 
 async def revoke_through_lineage(
     token_hash: str,
     *,
-    lineage_since: float | None,
+    lineage_seconds: float | None,
     revoke: Revoke,
     successor: Successor,
 ) -> SessionRecord | None:
@@ -55,17 +65,18 @@ async def revoke_through_lineage(
     COMMITTED a rotation can commit between two steps. Reading the whole chain first and revoking
     its end afterwards would aim the revoke at a hash such a rotation had already retired.
 
-    ``lineage_since`` is the oldest ``retired_at`` a followed link may carry. ``None`` follows no
-    link at all, which is the plain revoke of the hash given (BACKLOG #2146's behaviour).
+    ``lineage_seconds`` is how long before the store's own clock, read at each lookup, a followed
+    link may have been retired. ``None`` follows no link at all, which is the plain revoke of the
+    hash given (BACKLOG #2146's behaviour).
 
     Returns the row it revoked, whose ``token_hash`` is the hash it ended under, or ``None`` when
     the walk reached a hash with no unrevoked row and no live link, or ran out of hops."""
     current = token_hash
     for hop in range(LINEAGE_MAX_HOPS + 1):
         ended = await revoke(current)
-        if ended is not None or lineage_since is None or hop == LINEAGE_MAX_HOPS:
+        if ended is not None or lineage_seconds is None or hop == LINEAGE_MAX_HOPS:
             return ended
-        following = await successor(current, lineage_since)
+        following = await successor(current, lineage_seconds)
         if following is None:
             return None
         current = following

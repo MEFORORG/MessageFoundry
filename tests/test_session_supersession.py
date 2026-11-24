@@ -41,6 +41,7 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 from tests._logout_rows import (
+    age_session_links,
     logout_details,
     logout_entries,
     logout_rows,
@@ -263,13 +264,13 @@ async def test_a_touch_just_before_the_revoke_still_audits_a_live_session(
         return base + reads[0] * 0.001
 
     async def _touched_first(
-        token_hash: str, *, now: float, lineage_since: float | None = None
+        token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> object:
         touched = time.time()
         assert touched > now, "the stepping clock did not separate the touch from the revoke stamp"
         await store.touch_session(token_hash, now=touched)
         touches.append(token_hash)
-        return await real_supersede(token_hash, now=now, lineage_since=lineage_since)
+        return await real_supersede(token_hash, now=now, lineage_seconds=lineage_seconds)
 
     monkeypatch.setattr(store, "supersede_session", _touched_first)
     monkeypatch.setattr(time, "time", _stepping)
@@ -301,10 +302,10 @@ async def test_a_session_live_when_the_revoke_began_is_audited_though_it_lapsed_
     # password hash cannot eat the margin on a slow runner.
     clock = {"now": record.last_used_at + 30 * 60 - 2.0}  # 2 seconds of idle time left
 
-    async def _slow(token_hash: str, *, now: float, lineage_since: float | None = None) -> object:
+    async def _slow(token_hash: str, *, now: float, lineage_seconds: float | None = None) -> object:
         if token_hash == prior_hash:
             clock["now"] += 4.0  # the call returns 2 seconds past the idle limit
-        return await real_supersede(token_hash, now=now, lineage_since=lineage_since)
+        return await real_supersede(token_hash, now=now, lineage_seconds=lineage_seconds)
 
     monkeypatch.setattr(time, "time", lambda: clock["now"])
     monkeypatch.setattr(store, "supersede_session", _slow)
@@ -581,19 +582,50 @@ async def test_a_lapsed_session_is_recorded_as_lapsed_and_names_its_owner(
 
 
 async def test_a_logout_follows_no_rotation_older_than_its_bound_before_proven_at(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+    store: MessageStore,
 ) -> None:
     # BACKLOG #3715. POST /auth/logout passes the moment its request arrived as proven_at, and a
-    # link retired more than _LOGOUT_LINEAGE_SECONDS before that is not followed. The clock steps
-    # past the bound, so the rotation lands strictly before it.
+    # link retired more than _LOGOUT_LINEAGE_SECONDS before that is not followed. The link is aged
+    # past the bound on the store's clock, which is the one the window is measured on (vault
+    # BACKLOG #4276), so the rotation lands strictly before it.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    successor = await _rotated(service, token)
+    await age_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
+    assert outcome == "nothing_to_revoke"
+    assert await _live(service, successor), "a link older than the bound was followed"
+
+
+async def test_a_logout_follows_a_link_retired_after_an_earlier_proof(
+    store: MessageStore,
+) -> None:
+    # Vault BACKLOG #4276. The window is a length back from the store's clock: the bound plus the
+    # time since proven_at. A link 6 seconds old is past the bound alone, and inside it once the
+    # proof is 10 seconds old, as a link written after that proof would be.
+    service = await _service(store, session_idle_timeout_minutes=30)
+    token = await _token(service)
+    successor = await _rotated(service, token)
+    await age_session_links(store, _LOGOUT_LINEAGE_SECONDS + 1.0)
+    proven = time.time() - (_LOGOUT_LINEAGE_SECONDS + 5.0)
+    outcome = await service.logout(token, client=None, actor="op", proven_at=proven)
+    assert outcome == "revoked"
+    assert not await _live(service, successor)
+
+
+async def test_a_logout_after_a_forward_step_of_this_process_clock_still_follows_the_link(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #4276. The process clock jumps past the bound after the rotation. The link's
+    # stamp and the window are both the store's clock, so the step drops nothing.
     service = await _service(store, session_idle_timeout_minutes=30)
     token = await _token(service)
     successor = await _rotated(service, token)
     real = time.time
-    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    monkeypatch.setattr(time, "time", lambda: real() + _LOGOUT_LINEAGE_SECONDS + 60.0)
     outcome = await service.logout(token, client=None, actor="op", proven_at=time.time())
-    assert outcome == "nothing_to_revoke"
-    assert await _live(service, successor), "a link older than the bound was followed"
+    assert outcome == "revoked"
+    assert not await _live(service, successor), "a forward step of the process clock dropped a link"
 
 
 async def test_a_logout_ends_the_session_a_rotation_in_flight_re_keyed(

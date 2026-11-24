@@ -34,6 +34,7 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.store.session_lineage import LINEAGE_MAX_HOPS, revoke_through_lineage
 from messagefoundry.store.store import MessageStore, SessionRecord
 from tests._ast_sites import code_names, code_strings, parse_source
+from tests._logout_rows import age_session_links
 from tests.test_session_supersession import (
     PW,
     _live,
@@ -149,20 +150,71 @@ async def test_the_link_is_followed_over_several_elevations(store: MessageStore)
     assert not await _live(service, end), "the chain was not followed to its live end"
 
 
-async def test_a_link_older_than_the_window_is_not_followed(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_a_link_older_than_the_window_is_not_followed(store: MessageStore) -> None:
+    # The link is aged on the store's clock, the one the window is measured on (vault BACKLOG
+    # #4276); patching `time` would no longer age it, as the next test shows.
     service = await _service(store, session_idle_timeout_minutes=240)
     window = service.supersession_lineage_seconds
     assert window >= service.oidc_flow_ttl_seconds, "the window must outlast the longest sign-in"
+    prior = await _token(service)
+    rotated = await _elevate(service, prior)
+    await age_session_links(store, window + 5)
+    assert await _live(service, rotated)
+    await _token(service, supersedes=prior)
+    assert await _live(service, rotated), "a link past its window ended a session"
+    assert await _superseded(store) == []
+
+
+async def test_a_forward_step_of_the_signing_in_process_clock_does_not_drop_a_link(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Vault BACKLOG #4276, ASVS 7.2.4 arm (ii). The 2026-10-26 pass moved `time.time` forward 425
+    # seconds after one elevation, and a sign-in presenting the older token then left the rotated
+    # session live: the link was stamped and judged on this process's clock. Both now read the
+    # store's clock, so the same step, past the whole window, drops nothing.
+    service = await _service(store, session_idle_timeout_minutes=240)
+    window = service.supersession_lineage_seconds
     prior = await _token(service)
     rotated = await _elevate(service, prior)
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + window + 5)
     assert await _live(service, rotated)
     await _token(service, supersedes=prior)
-    assert await _live(service, rotated), "a link past its window ended a session"
-    assert await _superseded(store) == []
+    assert not await _live(service, rotated), (
+        "a forward step of the signing-in process's clock dropped a link inside the window"
+    )
+    assert await _superseded(store) == [
+        {
+            "scope": "superseded",
+            "session": hash_token(rotated)[:12],
+            "presented": hash_token(prior)[:12],
+            "actor": "op",
+        }
+    ]
+
+
+async def test_the_link_is_stamped_on_the_store_clock_and_the_purge_measures_on_it(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # Vault BACKLOG #4276. An elevating process whose clock runs an hour ahead stamps nothing
+    # ahead: the stamp is the database's. And the purge measures a link's age on that clock too, so
+    # a reaper whose `now` runs ahead keeps a link the supersession would still follow.
+    service = await _service(store, session_idle_timeout_minutes=240)
+    prior = await _token(service)
+    real = time.time
+    skew = 3600.0
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(time, "time", lambda: real() + skew)
+        rotated = await _elevate(service, prior)
+    with closing(sqlite3.connect(tmp_path / "lineage.db")) as db:
+        (stamp,) = db.execute("SELECT retired_at FROM session_lineage").fetchone()
+    assert abs(float(stamp) - real()) < 60, f"the link was stamped {stamp - real():.0f}s off"
+    await store.purge_expired_sessions(
+        now=real() + skew, lineage_seconds=service.supersession_lineage_seconds
+    )
+    assert _links(tmp_path / "lineage.db") == [(hash_token(prior), hash_token(rotated))]
+    await store.purge_expired_sessions(now=real(), lineage_seconds=-60.0)
+    assert _links(tmp_path / "lineage.db") == [], "a window that ends after now kept a link"
 
 
 def _links(path: Path) -> list[tuple[str, str]]:
@@ -258,7 +310,7 @@ def test_the_service_follows_the_lineage_from_the_supersession_and_sign_out_alon
         if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef):
             for call in ast.walk(node):
                 if isinstance(call, ast.Call) and any(
-                    k.arg == "lineage_since" for k in call.keywords
+                    k.arg == "lineage_seconds" for k in call.keywords
                 ):
                     passing.add(node.name)
     assert passing == {"_supersede_session_hash", "logout", "_supersede_session"}
@@ -383,7 +435,7 @@ async def test_a_rotation_landing_mid_walk_costs_a_step_not_the_revoke() -> None
         return found
 
     ended = await revoke_through_lineage(
-        "a", lineage_since=0.0, revoke=_revoke, successor=_successor
+        "a", lineage_seconds=0.0, revoke=_revoke, successor=_successor
     )
     assert ended is not None and ended.token_hash == "c"
     assert calls == ["revoke a", "follow a", "revoke b", "follow b", "revoke c"]
@@ -400,10 +452,10 @@ async def test_the_walk_stops_at_its_hop_bound() -> None:
         return _revoke
 
     reach = await revoke_through_lineage(
-        "0", lineage_since=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS), successor=_successor
+        "0", lineage_seconds=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS), successor=_successor
     )
     assert reach is not None and reach.token_hash == str(LINEAGE_MAX_HOPS)
     past = await revoke_through_lineage(
-        "0", lineage_since=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS + 1), successor=_successor
+        "0", lineage_seconds=0.0, revoke=_revoke_only(LINEAGE_MAX_HOPS + 1), successor=_successor
     )
     assert past is None, "the walk followed more links than its bound"

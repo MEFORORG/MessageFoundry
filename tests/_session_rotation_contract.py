@@ -245,6 +245,11 @@ async def assert_session_lineage_contract(store: Any, *, user_id: str = "lin-u1"
     ``rotate_session`` links the hash it retired to its successor in its own transaction, and
     ``supersede_session`` follows those links, inside a window its caller names, to the live end.
     A retired hash still resolves to nothing, and the reaper's purge drops links past the window.
+
+    The window is a LENGTH, measured back from the database's own clock, which also stamps every
+    link (vault BACKLOG #4276). So a test cannot age a link by passing an old ``now``; a window
+    below zero, which ends after the database's present, stands in for a link past it, and a
+    ``now`` far from the present shows the window does not read it.
     """
     now = time.time()
     await store.create_user(
@@ -263,52 +268,57 @@ async def assert_session_lineage_contract(store: Any, *, user_id: str = "lin-u1"
     # --- two rotations: a -> b -> c, and neither retired hash resolves -------------------------
     a, b, c = _h(), _h(), _h()
     await store.create_session(token_hash=a, user_id=user_id, expires_at=expires, now=now)
-    assert await store.rotate_session(a, new_token_hash=b, now=now) is True
-    assert await store.rotate_session(b, new_token_hash=c, now=now + 1) is True
+    assert await store.rotate_session(a, new_token_hash=b) is True
+    assert await store.rotate_session(b, new_token_hash=c) is True
     assert await store.get_session(a) is None, "a retired hash must resolve to nothing"
     assert await store.get_session(b) is None, "a retired hash must resolve to nothing"
 
     # --- no window: the plain revoke of the hash given, as before ------------------------------
     assert await store.supersede_session(a, now=now + 2) is None
 
-    # --- a window that starts after the first link: that link is not followed -------------------
-    assert await store.supersede_session(a, now=now + 2, lineage_since=now + 0.5) is None
+    # --- a window that ends after both links: neither is followed -------------------------------
+    assert await store.supersede_session(a, now=now + 2, lineage_seconds=-60) is None
     live = await store.get_session(c)
     assert live is not None and live.revoked_at is None, "a link past the window was followed"
 
-    # --- inside the window: followed over both hops, and the live end is what ends --------------
-    ended = await store.supersede_session(a, now=now + 3, lineage_since=now - 10)
+    # --- inside the window: followed over both hops, and the live end is what ends. The revoke's
+    # `now` is far ahead of the database's clock, as a signing-in process whose clock stepped
+    # forward would pass, and the window does not read it (vault BACKLOG #4276) -----------------
+    ahead = now + 5000
+    ended = await store.supersede_session(a, now=ahead, lineage_seconds=60)
     assert ended is not None, "the supersession did not follow the lineage to the live end"
-    assert ended.token_hash == c and ended.user_id == user_id and ended.revoked_at == now + 3
+    assert ended.token_hash == c and ended.user_id == user_id and ended.revoked_at == ahead
     stored = await store.get_session(c)
-    assert stored is not None and stored.revoked_at == now + 3, "the revoke was not persisted"
+    assert stored is not None and stored.revoked_at == ahead, "the revoke was not persisted"
     # The chain now ends at a revoked row, so a second supersession ends nothing.
-    assert await store.supersede_session(a, now=now + 4, lineage_since=now - 10) is None
+    assert await store.supersede_session(a, now=now + 4, lineage_seconds=60) is None
     # From the middle of the chain, too.
-    assert await store.supersede_session(b, now=now + 4, lineage_since=now - 10) is None
+    assert await store.supersede_session(b, now=now + 4, lineage_seconds=60) is None
 
     # --- a rotation that did not land writes no link -------------------------------------------
     d = _h()
-    assert await store.rotate_session(c, new_token_hash=d, now=now + 5) is False
+    assert await store.rotate_session(c, new_token_hash=d) is False
     await store.create_session(token_hash=d, user_id=user_id, expires_at=expires, now=now)
-    assert await store.supersede_session(c, now=now + 6, lineage_since=now - 10) is None, (
+    assert await store.supersede_session(c, now=now + 6, lineage_seconds=60) is None, (
         "a refused rotation linked its hash to a session it never became"
     )
     kept = await store.get_session(d)
     assert kept is not None and kept.revoked_at is None
 
-    # --- the purge drops links past the window and keeps the rest ------------------------------
+    # --- the purge measures on the database's clock: a `now` ahead of it drops no live link, and a
+    # window that ends after the database's present drops every link ---------------------------
     old, old_next, fresh, fresh_next = _h(), _h(), _h(), _h()
     await store.create_session(token_hash=old, user_id=user_id, expires_at=expires, now=now)
     await store.create_session(token_hash=fresh, user_id=user_id, expires_at=expires, now=now)
-    assert await store.rotate_session(old, new_token_hash=old_next, now=now - 1000) is True
-    assert await store.rotate_session(fresh, new_token_hash=fresh_next, now=now) is True
+    assert await store.rotate_session(old, new_token_hash=old_next) is True
+    assert await store.rotate_session(fresh, new_token_hash=fresh_next) is True
     await store.purge_expired_sessions(now=now)  # no window: every link stays
-    await store.purge_expired_sessions(now=now, lineage_seconds=100)
-    assert await store.supersede_session(old, now=now, lineage_since=now - 10_000) is None, (
+    await store.purge_expired_sessions(now=ahead, lineage_seconds=600)
+    swept = await store.supersede_session(fresh, now=now + 7, lineage_seconds=60)
+    assert swept is not None and swept.token_hash == fresh_next, "the purge dropped a live link"
+    await store.purge_expired_sessions(now=now, lineage_seconds=-60)
+    assert await store.supersede_session(old, now=now, lineage_seconds=10_000) is None, (
         "a link past the purge window survived the purge"
     )
     survivor = await store.get_session(old_next)
     assert survivor is not None and survivor.revoked_at is None
-    swept = await store.supersede_session(fresh, now=now + 7, lineage_since=now - 10)
-    assert swept is not None and swept.token_hash == fresh_next, "the purge dropped a live link"

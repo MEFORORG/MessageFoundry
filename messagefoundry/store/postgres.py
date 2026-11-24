@@ -1630,15 +1630,20 @@ _PG_SESSION_RESEAL: Final = (
     " client=$6, reauth_at=$7, mfa_verified_at=$8, auth_mechanism=$9, idp_auth_time=$10,"
     " user_epoch=$11, global_epoch=$12, seal=$13 WHERE token_hash=$14 AND seal=$15"
 )
-# Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`. store.py says
+# Vault BACKLOG #3028: store.py's three session lineage statements respelled for `$n`, stamping and
+# measuring `retired_at` on this server's clock, `_PG_EPOCH_NOW` (vault BACKLOG #4276). store.py says
 # which method runs each, and that no other statement names the table.
 _PG_SESSION_LINEAGE_INSERT: Final = (
-    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at) VALUES ($1,$2,$3)"
+    "INSERT INTO session_lineage (retired_hash, successor_hash, retired_at)"
+    f" VALUES ($1,$2,{_PG_EPOCH_NOW})"
 )
 _PG_SESSION_LINEAGE_SUCCESSOR: Final = (
-    "SELECT successor_hash FROM session_lineage WHERE retired_hash=$1 AND retired_at >= $2"
+    "SELECT successor_hash FROM session_lineage WHERE retired_hash=$1"
+    f" AND retired_at >= {_PG_EPOCH_NOW} - $2::double precision"
 )
-_PG_SESSION_LINEAGE_PURGE: Final = "DELETE FROM session_lineage WHERE retired_at < $1"
+_PG_SESSION_LINEAGE_PURGE: Final = (
+    f"DELETE FROM session_lineage WHERE retired_at < {_PG_EPOCH_NOW} - $1::double precision"
+)
 #: The whole-account session sweep: revoke and blank the seal (BACKLOG #2592). Each caller raises
 #: the account's session epoch in the same transaction.
 _PG_REVOKE_USER_SESSIONS_SQL: Final = (
@@ -12259,25 +12264,21 @@ class PostgresStore:
             written = await self._write_session(conn, token_hash, stamp)
         return written is not None and stamp.anchored
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
 
         The token hash is sealed, so the re-key goes through :meth:`_write_session` (BACKLOG
         #2592). The lineage link goes in the same transaction, only when the re-key landed (vault
-        BACKLOG #3028), its time read once the re-key has landed, after any wait for the borrow
-        or the row lock. The answer is read after the transaction has committed. The borrow is
-        :meth:`_after_commit_txn`'s, for the reason it gives."""
+        BACKLOG #3028), its time this server's clock when the link's own statement runs (vault
+        BACKLOG #4276), after any wait for the borrow or the row lock. The answer is read after
+        the transaction has committed. The borrow is :meth:`_after_commit_txn`'s, for the reason
+        it gives."""
         async with self._after_commit_txn() as conn:
             rotated = await self._write_session(
                 conn, token_hash, lambda s: replace(s, token_hash=new_token_hash)
             )
             if rotated is not None:
-                retired_at = time.time() if now is None else now
-                await conn.execute(
-                    _PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash, retired_at
-                )
+                await conn.execute(_PG_SESSION_LINEAGE_INSERT, token_hash, new_token_hash)
         return rotated is not None
 
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
@@ -12289,7 +12290,7 @@ class PostgresStore:
         )
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke and return, one statement per step, in one transaction (BACKLOG #2146, vault
         BACKLOG #3028). See :meth:`AuthStore.supersede_session`.
@@ -12308,13 +12309,16 @@ class PostgresStore:
                 )
                 return SessionRecord.from_mapping(dict(d)) if d else None
 
-            async def _successor(h: str, since: float) -> str | None:
-                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, since)
+            async def _successor(h: str, seconds: float) -> str | None:
+                found = await conn.fetchval(_PG_SESSION_LINEAGE_SUCCESSOR, h, float(seconds))
                 return None if found is None else str(found)
 
             try:
                 return await revoke_through_lineage(
-                    token_hash, lineage_since=lineage_since, revoke=_revoke, successor=_successor
+                    token_hash,
+                    lineage_seconds=lineage_seconds,
+                    revoke=_revoke,
+                    successor=_successor,
                 )
             except RowSealError as exc:
                 # BACKLOG #5505: only the read-back refused the row, so the block exits cleanly
@@ -12530,7 +12534,9 @@ class PostgresStore:
                 float(idle_seconds),
             )
         if lineage_seconds is not None:
-            await self._execute(_PG_SESSION_LINEAGE_PURGE, now - float(lineage_seconds))
+            # Measured back from this server's clock, as the supersession measures its window,
+            # never from ``now`` (vault BACKLOG #4276).
+            await self._execute(_PG_SESSION_LINEAGE_PURGE, float(lineage_seconds))
         return purged
 
     # --- retention / purge + maintenance (PHI.md §8) -------------------------

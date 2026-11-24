@@ -6580,8 +6580,11 @@ as before this change:
 - a sign-in that runs past the bound, which a slow identity provider or directory can cause, since
   their timeouts bound each call and not the whole sign-in;
 - more than 32 elevations on one session inside the bound;
-- a wall clock that stepped between the elevation and the sign-in, which moves the bound by the
-  size of the step, in either direction.
+- a step of the store's own clock between the elevation and the sign-in, which moves the bound by
+  the size of the step, in either direction. The store stamps each link and measures the bound on
+  that one clock (vault BACKLOG #4276): the database server's on PostgreSQL and SQL Server, and
+  on SQLite the clock of the host that holds the database file. So a step of an engine process's
+  clock, or skew between engine hosts that share the store, does not move the bound.
 
 **A retired token authenticates nothing.** No session read, the validator included, consults the
 links; only a revoke follows them, at a sign-in's supersession or at a sign-out (below). For the
@@ -6591,23 +6594,26 @@ it can only end a session, never open or extend one. Whoever held that token bef
 could already end the session with `POST /auth/logout`; the link lets them do it for the length of
 the bound after the elevation too, through a sign-in whose first credential passes; with MFA
 required, the supersession runs when the password-only session is minted, before the second factor,
-so a password alone is enough. A wall
-clock that stepped forward at the elevation, or back before the sign-in, lengthens that time by the
-step; the reaper's clock-step guard covers its own purge, not this. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
+so a password alone is enough. A store
+clock that stepped back between the elevation and the sign-in lengthens that time by the step; the
+reaper's clock-step guard reads the engine's clock, and covers neither this nor the purge of links,
+which the store measures on its own clock. The links are not under the session integrity seal (BACKLOG #2592): a forged link can only direct a
 revoke, and a revoke needs no key on any backend.
 
 **A sign-out follows the links too, for far less time (BACKLOG #3715).** An elevation in another
 tab can re-key the session while a sign-out is in flight, and the sign-out then ends the session
 under its new token, in the same transaction as the revoke. `POST /auth/logout` follows links
 written up to 5 seconds before its request arrived; the slack covers a link stamped before its
-rotation commits, and clocks that differ between engine processes. Its sign-in check proved the
+rotation commits. The store measures that window back from its own clock, which stamps the link
+too, as the bound plus the time since the request arrived on the engine's clock, so clocks that
+differ between engine processes do not move it. Its sign-in check proved the
 token live after the request arrived, so any link from it was written after that proof, and the
 route gains no reach. `/ui/logout` carries no credential, so it follows links written up to 5
 seconds before the call. **That is a separate power, credential-free and end-only:** for 5 seconds
 after an elevation, anyone who presents the RETIRED token to `/ui/logout` ends the session it
 became, with no sign-in. It cannot open or extend a session. At least these cases stay open, and
 the session lives on under its new token: an elevation older than the bound, more than 32
-elevations in a row inside it, and a wall clock that stepped between the elevation and the
+elevations in a row inside it, and a step of the store's own clock between the elevation and the
 sign-out, which moves the bound by the step. The `auth.logout` row names the
 session's owner as actor, its `outcome` is `revoked`, and a `presented` field holds the hash that
 was presented. The `outcome` is `lapsed` instead when the session's own clock checks fail at the

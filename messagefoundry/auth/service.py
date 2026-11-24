@@ -13540,7 +13540,7 @@ class AuthService:
         )
 
     async def _supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | _EndedUnread | None:
         """The store's ``supersede_session``. A row it ended that then did not parse (BACKLOG
         #5505) is reported, as :meth:`_session_seal_failed` reports one, and answered as
@@ -13549,7 +13549,7 @@ class AuthService:
         fault in that report is logged, not raised, for the same reason."""
         try:
             return await self._store.supersede_session(
-                token_hash, now=now, lineage_since=lineage_since
+                token_hash, now=now, lineage_seconds=lineage_seconds
             )
         except RevokedRowSealError as exc:
             try:
@@ -14672,8 +14672,10 @@ class AuthService:
         transaction as the revoke. There is no read before the revoke: a read through
         :meth:`_load_session` ends and reports a row whose seal fails, so the revoke would then
         record ``nothing_to_revoke`` for a session this call ended. Links retired up to
-        :data:`_LOGOUT_LINEAGE_SECONDS` before ``proven_at`` are followed. The slack covers a link
-        stamped before its rotation commits, and clocks that differ between engine processes.
+        :data:`_LOGOUT_LINEAGE_SECONDS` before ``proven_at`` are followed. The store measures that
+        window back from its own clock, which also stamps every link (vault BACKLOG #4276), so it
+        asks for the bound plus the time since ``proven_at`` on this process's clock. The slack
+        covers a link stamped before its rotation commits.
 
         ``proven_at`` has no default, so every caller states what it proved. ``POST /auth/logout``
         passes the moment its request arrived. Its gate proved the token live after that, so any
@@ -14725,8 +14727,13 @@ class AuthService:
             return "nothing_to_revoke"
         presented = hash_token(token)
         before = time.time()
-        since = (before if proven_at is None else proven_at) - _LOGOUT_LINEAGE_SECONDS
-        ended = await self._supersede_session(presented, now=before, lineage_since=since)
+        # A length back from the store's own clock (vault BACKLOG #4276): the bound, plus the time
+        # since the proof. That time is two readings of this process's clock, never compared with a
+        # link's stamp; a step backward between them is read as no time at all.
+        elapsed = 0.0 if proven_at is None else max(0.0, before - proven_at)
+        ended = await self._supersede_session(
+            presented, now=before, lineage_seconds=_LOGOUT_LINEAGE_SECONDS + elapsed
+        )
         if isinstance(ended, SessionRecord):
             self._forget_reproof_counts((ended.token_hash,))
         if ended is None:
@@ -15012,7 +15019,10 @@ class AuthService:
         federated leg the presented hash was read at the start leg, before the identity provider's
         round trip. The presented hash then names no session. The store follows the lineage links
         each rotation wrote to the session's live end and revokes that, in the same transaction.
-        Only links retired within :attr:`supersession_lineage_seconds` of now are followed. This and
+        Only links retired within :attr:`supersession_lineage_seconds` of now, on the store's own
+        clock, are followed: the store stamps each link and measures the window on that one clock
+        (vault BACKLOG #4276), so this process's clock, and skew between engine hosts, do not move
+        the bound. A step of the store's own clock still does. This and
         :meth:`logout` are the only places a retired hash leads anywhere, and it leads only to an
         end. An elevation
         that finished longer ago than that, such as one a second holder of the token completed
@@ -15021,8 +15031,10 @@ class AuthService:
         followed, the hash that was presented.
         """
         before = time.time()
+        # The window is a length, measured back from the store's own clock (vault BACKLOG #4276),
+        # so a step of this process's clock cannot drop a link inside it.
         prior = await self._supersede_session(
-            prior_hash, now=before, lineage_since=before - self.supersession_lineage_seconds
+            prior_hash, now=before, lineage_seconds=self.supersession_lineage_seconds
         )
         if isinstance(prior, SessionRecord):
             self._forget_reproof_counts((prior.token_hash,))

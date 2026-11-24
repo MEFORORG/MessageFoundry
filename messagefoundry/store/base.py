@@ -3516,9 +3516,7 @@ class AuthStore(Protocol):
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
-    async def rotate_session(
-        self, token_hash: str, *, new_token_hash: str, now: float | None = None
-    ) -> bool:
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
         """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
 
         A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
@@ -3542,8 +3540,9 @@ class AuthStore(Protocol):
         so it must be able to fail closed if the session died underneath it.
 
         **A re-key that lands also records a lineage link, in the SAME transaction** (vault BACKLOG
-        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with
-        ``now`` or, when that is ``None``, the time the re-key landed, after any wait. The
+        #3028, ADR 0210): ``token_hash`` retired, replaced by ``new_token_hash``, stamped with the
+        DATABASE's own clock when the link's statement runs, after any wait, and never with an
+        engine process's clock (vault BACKLOG #4276; ``store/session_lineage.py`` says why). The
         session row itself carries nothing of its old hash, so the old hash still resolves to
         nothing. The link's one reader is :meth:`supersede_session`; ``store/session_lineage.py``
         says why it is unsealed. A re-key that did not land writes no link.
@@ -3600,7 +3599,7 @@ class AuthStore(Protocol):
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None: ...
 
     async def supersede_session(
-        self, token_hash: str, *, now: float, lineage_since: float | None = None
+        self, token_hash: str, *, now: float, lineage_seconds: float | None = None
     ) -> SessionRecord | None:
         """Revoke the unrevoked session ``token_hash`` names, or the one it became, and return its
         row as revoked.
@@ -3617,16 +3616,19 @@ class AuthStore(Protocol):
         first, the row is revoked and the rotation's ``revoked_at IS NULL`` guard refuses it, so
         the rotation fails closed.
 
-        **A rotation that committed FIRST is followed, when ``lineage_since`` is given (vault
+        **A rotation that committed FIRST is followed, when ``lineage_seconds`` is given (vault
         BACKLOG #3028, ADR 0210).** The presented hash then names no row, so the revoke steps along
         the links :meth:`rotate_session` wrote, up to ``LINEAGE_MAX_HOPS`` of them, and ends the
-        live end, inside one transaction. A link retired before ``lineage_since`` is not followed,
-        so a retired hash leads anywhere only for a bounded time; the caller chooses the bound,
-        because the store reads no settings. On Postgres and SQL Server a rotation can still commit
+        live end, inside one transaction. A link retired more than ``lineage_seconds`` before the
+        database's own clock, read in the walk's own statement, is not followed, so a retired hash
+        leads anywhere only for a bounded time; the caller chooses the bound, because the store
+        reads no settings. The stamp and the test read one clock, the database's, so neither an
+        engine process's clock step nor skew between engine hosts moves the bound (vault BACKLOG
+        #4276). ``now`` stamps only the revoke. On Postgres and SQL Server a rotation can still commit
         between two steps; it costs the walk one more step, never the revoke, because each step
         revokes before it reads a link. ``store/session_lineage.py`` says why that order is the
         control. With
-        ``lineage_since`` left ``None`` no link is followed, and a rotation that committed first
+        ``lineage_seconds`` left ``None`` no link is followed, and a rotation that committed first
         leaves this returning ``None``, as before. The lineage lookup lives here and nowhere else:
         no session READ follows a link, so a retired hash authenticates nothing.
 
@@ -3781,7 +3783,9 @@ class AuthStore(Protocol):
         validator refuses them on presentation, so keeping them only grows the table.
 
         With ``lineage_seconds`` given, session lineage links retired more than that long before
-        ``now`` are deleted too (vault BACKLOG #3028). The supersession no longer follows them, so
+        the database's own clock are deleted too (vault BACKLOG #3028), never measured from
+        ``now``: the supersession measures its window on that clock (vault BACKLOG #4276), so the
+        two agree whichever engine process runs the purge. The supersession no longer follows them, so
         keeping them only grows the table. They are not counted in the return.
 
         The idle variant scans the table, because its ``OR`` reaches past the expiry index, and that

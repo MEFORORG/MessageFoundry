@@ -40,7 +40,12 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.store.store import MessageStore
 from messagefoundry_webconsole import pages
 from messagefoundry_webconsole._html import minimal_nav
-from tests._logout_rows import logout_details, logout_rows, temp_password_expired_rows
+from tests._logout_rows import (
+    age_session_links,
+    logout_details,
+    logout_rows,
+    temp_password_expired_rows,
+)
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
 
@@ -347,16 +352,16 @@ async def test_ui_logout_with_a_cookie_an_elevation_just_retired_ends_its_succes
 
 
 async def test_ui_logout_with_a_cookie_retired_past_the_window_ends_nothing(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine,
 ) -> None:
     """The control for the test above, one second past the 5-second window. This route carries no
     credential, so a retired cookie leads nowhere after that: nothing is revoked, the row says
-    ``nothing_to_revoke`` and has no owner to name."""
+    ``nothing_to_revoke`` and has no owner to name. The link is aged on the store's clock, the one
+    the window is measured on (vault BACKLOG #4276); patching ``time`` would not age it."""
     service, old = await _signed_in_operator(engine)
     successor = await service._rotate_session_token(old)
     assert successor is not None
-    rotated_at = time.time()
-    monkeypatch.setattr(time, "time", lambda: rotated_at + _LOGOUT_LINEAGE_SECONDS + 1.0)
+    await age_session_links(engine.store, _LOGOUT_LINEAGE_SECONDS + 1.0)
     out = await _sign_out_with(engine, service, old)
     assert out.status_code == 303
     assert await service.identity_for_token(successor, activity=False) is not None

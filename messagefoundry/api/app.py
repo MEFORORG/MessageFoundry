@@ -12236,8 +12236,10 @@ async def _session_reaper(
     ``_SESSION_REAP_INTERVAL``, until the task is cancelled. With ``idle_seconds`` given,
     idle-expired rows go too (BACKLOG #2096); the lifespan passes the idle timeout the validator
     uses. With ``lineage_seconds`` given, session lineage links older than that go too (vault
-    BACKLOG #3028); the lifespan passes the window the supersession follows them for. Purging as of
-    the earlier instant below only keeps a link longer, never shortens that window.
+    BACKLOG #3028); the lifespan passes the window the supersession follows them for. The store
+    measures that age on its own clock, the one the supersession measures its window on (vault
+    BACKLOG #4276), never from the ``now`` passed below, so the guard below does not cover the
+    links and need not: the purge drops only a link the supersession would no longer follow.
 
     **The reaper skips a pass when the wall clock has jumped forward (BACKLOG #2283).** The purge
     judges expiry and idleness by the wall clock, and its deletes cannot be undone. Run just after
