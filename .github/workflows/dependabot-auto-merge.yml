@@ -50,19 +50,25 @@ name: Dependabot auto-merge
 #      (already aged by dependabot.yml, so it does not need the GHSA gate); only a PR in a NAMED
 #      version-update group is on that track. The advisory query is pip-keyed, so a security PR of
 #      any other ecosystem holds here.
+#      #2 IS INERT TOO, for the reason given under #4: `advisory_ok=true` is reachable only for a
+#      SECURITY-track uv/pip PR, `eligible=true` only for github-actions, so no PR can satisfy both
+#      the allow-set and this gate.
 #   #4 RELEASE AGE (security track only) — a SECURITY-track PR additionally requires every candidate
 #      version to have been published at least MIN_RELEASE_AGE_HOURS ago, because that track is the
 #      one the upstream cooldown cannot age. FAILS CLOSED identically to #2: an API error, a missing
 #      or unparseable upload timestamp, a package name/version that does not match its expected
 #      shape, or an ecosystem with no publish-date source wired all route to manual review.
-#      READ THIS BEFORE CITING #4 AS A CONTROL: it IS INERT with respect to the merge decision as
-#      shipped, and recording it as operating would be exactly the false premise
-#      docs/Secure_Development_Standards.md §3 forbids.
+#      READ THIS BEFORE CITING #2 OR #4 AS A CONTROL: BOTH ARE INERT with respect to the merge
+#      decision as shipped, and recording either as operating would be exactly the false premise
+#      docs/Secure_Development_Standards.md §3 forbids. Only #3 (and the sole-author, update-type
+#      and disarm checks) can change a merge decision today; every security-track PR holds.
 #      `age_ok=true` is reachable only for uv/pip (no publish-date source is wired for any
 #      other ecosystem), while `eligible=true` is reachable only for github-actions (the uv/pip/npm
 #      allow rows ship EMPTY). Those two sets are DISJOINT, so no PR can satisfy both conjuncts the
-#      merge `if` requires. #4 is a FORWARD guard — built, tested and gated now, load-bearing the day
-#      a Python allow row is populated or the advisory gate is made ecosystem-aware. Populating an
+#      merge `if` requires. The same holds for #2, whose `advisory_ok=true` is reachable only for
+#      uv/pip (its query is pip-keyed). #2 and #4 are FORWARD guards — built, tested and gated
+#      now, load-bearing the day a Python allow row is populated or the advisory gate is made
+#      ecosystem-aware. Populating an
 #      allow row is the owner's call, not this workflow's.
 #
 # RESIDUAL ACCEPTED RISK, stated at the ONE path that can actually auto-merge: a VERSION-track patch

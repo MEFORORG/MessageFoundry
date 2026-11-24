@@ -23,9 +23,9 @@ document does not yet make — do not read them as claims about its text:
 All three must be wired into the ``Enable auto-merge`` step's ``if`` so a held/un-advisoried/fresh PR
 does NOT auto-merge, while an eligible patch still does (``gh pr merge --auto`` preserved).
 
-WARNING: #4 cannot change a merge decision as the workflow ships, and these tests do not pretend otherwise:
-``age_ok=true`` is reachable only for uv/pip, ``eligible=true`` only for github-actions, and the merge
-``if`` requires both — disjoint sets. It is tested as a FORWARD guard, so that populating a Python
+WARNING: #2 and #4 cannot change a merge decision as the workflow ships, and these tests do not pretend
+otherwise: ``age_ok=true`` and ``advisory_ok=true`` are reachable only for uv/pip, ``eligible=true`` only for
+github-actions, and the merge ``if`` requires all of them on the security track — disjoint sets. It is tested as a FORWARD guard, so that populating a Python
 allow row later is a one-line change to a control that already works, not a control to be written
 under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins the conjunction that makes this
 true, so the day someone widens it, a test has to be edited deliberately.
