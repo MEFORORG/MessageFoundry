@@ -3175,8 +3175,8 @@ def _signature(
 
     Parameter NAMES are included, not just counts -- renaming a parameter a call can pass by keyword
     breaks every keyword call that names it, which is the same wrecking-ball failure as a wrong
-    count and is invisible to an arity-only comparison. The other names are compared too, except a
-    method's bound first parameter (below). Default
+    count and is invisible to an arity-only comparison. The other names are compared too, except
+    the first parameter of a method this screen does not read as static (below). Default
     values are compared by PRESENCE and never by value: a mutation legitimately changes what a default
     IS (that can be the whole reintroduction), while changing which parameters carry one moves the
     arity. Positional defaults always trail, so their count fixes which parameters carry one;
@@ -3190,10 +3190,14 @@ def _signature(
     So are `decorators`, the shape decorators :func:`_run_block` resolved for `fn`
     (:data:`_SHAPE_DECORATORS`), which change what the name is bound to.
 
-    For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by a
-    caller, so neither its name nor whether it is positional-only is part of the shape (``self``,
-    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. `static`
-    says whether `fn` is a ``staticmethod``; when it is ``None``, `decorators` says.
+    For a ``method`` this screen does not read as a ``staticmethod``, the first parameter is left
+    uncompared: neither its name nor whether it is positional-only is part of the shape (``self``,
+    ``this`` and ``self, /`` are one shape); it is recorded as a leading ``<bound>``. That includes
+    ``__new__``, which has no ``staticmethod`` decorator to read. A caller can pass that parameter,
+    as ``C.m(obj)`` or ``C.__new__(C)`` do, and by keyword, so renaming it, ``cls`` to ``klass``
+    for example, can break such a call and still pass this screen. `static` says whether to read
+    `fn` as a ``staticmethod``; when it is ``None``, whether `decorators` holds
+    ``builtins.staticmethod`` says.
     """
     args = fn.args
     posonly = [p.arg for p in args.posonlyargs]
@@ -3275,16 +3279,17 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
     mine, live = (f"shape decorator {o}" if o else "no shape decorator" for o in outer)
     clause = _OuterClause(
         f"redefines {qual}() with {mine} as its outermost decorator, passthrough decorators "
-        f"aside, where {path} has {live} (as this screen resolves them), so the name is bound "
-        "to a different shape"
+        f"aside, where {path} has {live} (as this screen resolves them), so, as this screen reads "
+        "them, the two bind the name to different shapes"
     )
     binds = [
         _OUTER_BINDS.get(o, f"what {o} returns") if o else "the function the def itself makes"
         for o in outer
     ]
     clause.tail = (
-        f"Applied, this definition binds the name to {binds[0]}. The {path} definition it was "
-        f"compared with binds it to {binds[1]}. Each holds where no decorator raises. So the "
+        f"With the decorators as this screen resolves them, and where each definition runs and no "
+        f"decorator raises, this definition, applied, binds the name to {binds[0]}, and the "
+        f"{path} definition it was compared with binds it to {binds[1]}. So the "
         "observable may go red for that change and not for the reintroduction. Copy the live "
         "decorators; the mutation lives in a different repository from the symbol it shadows, so "
         "nothing else keeps the two in step"
