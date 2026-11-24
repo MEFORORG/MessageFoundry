@@ -322,24 +322,22 @@ NOT_OURS = "not shown to be a checkout of this repository"
 
 
 def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
-    """The run read the seat as undeclared: the instruction, its Special-skips sentence, the note."""
+    """The instruction, its Special-skips sentence and the not-ours note were printed.
+
+    Every instruction carries that sentence, so this alone does not prove the seat was undeclared;
+    the callers set every marker in reach to Special for that.
+    """
     text = _instruction(proc.stdout)
     assert "A Special seat skips this" in text, (proc.stdout, proc.stderr)
     assert NOT_OURS in proc.stderr, proc.stderr
 
 
-@pytest.mark.parametrize("seat", ["special", "adhoc"])
+# Each undeclared case below sets this repository's own marker to Special too, so reading either
+# marker instead of resolving as undeclared would print nothing and fail the test.
+@pytest.mark.parametrize("seat", ["special", "adhoc", "builder"])
 def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox, seat: str) -> None:
     # BACKLOG #7559. A cwd in another repository's checkout must not let that checkout's marker, or
     # its roster missing the Special alias, name the seat: either way it reads as undeclared.
-    foreign = _foreign_repo(sb, seat)
-    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
-
-
-@pytest.mark.parametrize("seat", ["builder", "adhoc"])
-def test_a_foreign_cwd_beside_our_special_marker_reads_as_undeclared(
-    sb: Sandbox, seat: str
-) -> None:
     foreign = _foreign_repo(sb, seat)
     _undeclared(_seat_run(sb, "off", "special", cwd=foreign / "src"))
 
@@ -350,12 +348,19 @@ def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: st
     foreign = _foreign_repo(sb, "builder")
     proc = _seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT=seat)
     assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
+
+
+def test_a_foreign_cwd_with_a_non_special_korus_seat_gets_the_instruction(sb: Sandbox) -> None:
+    # The negative control for the test above.
+    foreign = _foreign_repo(sb, "special")
+    _undeclared(_seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT="builder"))
 
 
 def test_a_linked_worktree_of_another_repository_reads_as_undeclared(sb: Sandbox) -> None:
     wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "special"))
     _mark(wt, "special")
-    _undeclared(_seat_run(sb, "off", "builder", cwd=wt))
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
 
 
 def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> None:
@@ -366,7 +371,7 @@ def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> No
         f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
     )
     _mark(wt, "special")
-    _undeclared(_seat_run(sb, "off", "builder", cwd=wt))
+    _undeclared(_seat_run(sb, "off", "special", cwd=wt))
 
 
 def _dir_link(link: Path, target: Path) -> None:
