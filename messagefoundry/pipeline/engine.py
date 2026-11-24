@@ -1676,9 +1676,52 @@ class Engine:
                 "start), not a per-shard reload"
             )
 
+    # BACKLOG #5705: a cancelled single-node first load cleared a runner whose unwind stopped its
+    # dispatchers, so the next attempt re-pends what they held, within these lanes (None: all).
+    _first_load_recovery_due: bool = False
+    _first_load_recovery_owned: OwnedLanes | None = None
+    # BACKLOG #5743: a clustered runner kept after a failed or cut unwind. The supervisor may stop
+    # it and never starts it. The flag says a stop is still owed, which has_residual_state cannot
+    # say: it omits at least the router, transform and response workers.
+    _stop_only_runner: RegistryRunner | None = None
+    _stop_only_unstopped: bool = False
+
+    def _note_cancelled_first_load(self) -> None:
+        """Record the recovery the next single-node first load owes. Read while the runner is
+        still installed: once it is cleared, a shard's identity and its lanes cannot be read."""
+        if self._coordinator.is_clustered():
+            return  # a leader's first load recovers anyway, and a standby's rows are not its own
+        owned = self._owned_lanes()
+        if owned is None and (self._shares_transform_state() or self.filters_its_graph):
+            # A blanket reset could take a live sibling's in-flight rows, so none runs.
+            log.warning(
+                "a cancelled first load may have left rows in flight; this process shares its "
+                "store and has no lane scope, so they wait for the next process start"
+            )
+            return
+        self._first_load_recovery_due = True
+        self._first_load_recovery_owned = owned
+
+    async def _recover_cancelled_first_load(self) -> None:
+        """Re-pend what a cancelled first load's stopped dispatchers held, as a process start
+        does. A failure propagates with the recovery still due, before anything is installed."""
+        if not self._first_load_recovery_due:
+            return
+        await self.store.reset_stale_inflight(owned=self._first_load_recovery_owned)
+        self._first_load_recovery_due = False
+        self._first_load_recovery_owned = None
+
+    def _keep_runner_stop_only(self, runner: RegistryRunner) -> None:
+        """Supervise a clustered runner kept after a failed or cut unwind, so a demotion still
+        takes it down, while :meth:`_reconcile_graph` refuses to start its graph (BACKLOG #5743)."""
+        self._stop_only_runner = runner
+        self._stop_only_unstopped = True
+        self._ensure_graph_supervisor()
+
     async def _first_load(self, registry: Registry, env_values: dict[str, Any]) -> RegistryRunner:
-        """Install and start the runner for ``registry`` on an engine with none, for
-        :meth:`reload_detail`, which holds ``_first_load_lock`` across this call."""
+        """Install ``registry``'s runner on an engine with none, for :meth:`reload_detail`, which
+        holds ``_first_load_lock`` across this call. A single node and a cluster leader start it.
+        A cluster standby leaves it unstarted, for the supervisor to start on a promotion."""
         if self._stopping:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
         # Bad connector -> WiringError (422), before any start. The check awaits a worker thread,
@@ -1702,6 +1745,12 @@ class Engine:
         if self._stopping:
             raise RuntimeError("the engine is stopping, so the first load started no runner")
         if not self._coordinator.is_clustered():
+            if self._first_load_recovery_due:
+                await self._recover_cancelled_first_load()
+                if self._stopping:
+                    raise RuntimeError(
+                        "the engine is stopping, so the first load started no runner"
+                    )
             return await self._install_first_load(registry, env_values, refused, start=True)
         # BACKLOG #5743: only the leader runs the graph, with its epoch pushed first. The recovery
         # runs before the runner is installed, so nothing (a DR activation, say) can take an
@@ -1763,8 +1812,12 @@ class Engine:
             if installed is not None and (
                 installed.start_cancel_unwound or not installed.start_entered
             ):
+                if installed.start_cancel_unwound:
+                    self._note_cancelled_first_load()
                 self._registry_runner = None
                 self._env_values = previous_env_values
+            elif installed is not None and self._coordinator.is_clustered():
+                self._keep_runner_stop_only(installed)
             raise
         except Exception:
             installed = self._registry_runner
@@ -1774,7 +1827,8 @@ class Engine:
                 and (installed.running or installed.has_residual_state)
             ):
                 # The failed start's own teardown failed: cleared, its live listeners would be
-                # orphaned. Kept for engine.stop(), with no supervisor (BACKLOG #5743).
+                # orphaned. Kept for engine.stop(), and for a demotion to stop (BACKLOG #5743).
+                self._keep_runner_stop_only(installed)
                 raise
             # Don't leave a half-started runner: a later reload would take the "runner exists"
             # path and no-op the start, wedging intake. Clear it so a retry re-enters cleanly.
@@ -2977,7 +3031,10 @@ class Engine:
             return
         async with self._graph_lock:
             running = self._registry_runner.running
+            stop_only = self._stop_only_runner is self._registry_runner
             if self._coordinator.is_leader() and not running:
+                if stop_only:
+                    return  # BACKLOG #5743: the graph of a first load that failed never starts
                 await self._start_graph()
                 # Leadership can be lost DURING the (potentially slow) bring-up — a fence mid-start. If
                 # so, tear straight back down within the same lock so a demoted node never keeps the
@@ -2985,7 +3042,8 @@ class Engine:
                 if not self._coordinator.is_leader():
                     await self._stop_graph()
             elif self._coordinator.is_leader() and running:
-                # ADR 0157 D2 — RE-STAMP the held epoch. _start_graph is the ONLY other push site, so a
+                # ADR 0157 D2 — RE-STAMP the held epoch. The only other push sites are the bring-up's
+                # (_recover_for_bring_up) and a clustered _first_load's, just before its start, so a
                 # slow bring-up that spans demote -> foreign takeover -> re-acquire lands here with the
                 # store holding a STALE epoch and NEITHER of the other branches ever matching again.
                 # Before C5 that half-worked (claim_ready was unfenced); with C5 it is a live leader that
@@ -2997,12 +3055,16 @@ class Engine:
                     self._coordinator.current_epoch(), lease_key=self._coordinator.lease_key()
                 )
             elif not self._coordinator.is_leader() and (
-                running or self._registry_runner.has_residual_state
+                running
+                or self._registry_runner.has_residual_state
+                or (stop_only and self._stop_only_unstopped)
             ):
                 # ADR 0157 D7: `running` alone is not enough once _teardown_unsafe clears _running in a
                 # finally — a raised or cancelled teardown leaves live listeners bound on a standby with
                 # no branch that would ever converge them.
                 await self._stop_graph()
+                if stop_only:
+                    self._stop_only_unstopped = False
 
     async def _graph_supervisor_loop(self) -> None:
         """Active-passive graph supervisor (Workstream A1): poll leadership and start/stop the graph so

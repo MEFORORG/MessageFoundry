@@ -15,6 +15,8 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, TeardownReason
+from messagefoundry.store import Stage
+from messagefoundry.store.store import OwnedLanes
 from tests.test_cluster_graph_gating import _FlipCoordinator
 from tests.test_cluster_graph_gating import _minimal_graph as _graph
 
@@ -239,6 +241,111 @@ async def test_a_cancelled_first_load_keeps_a_runner_it_could_not_unwind(
     assert runner is not None and not runner._destinations
 
 
+_RAW = (
+    "MSH|^~\\&|SEND|FAC|RECV|FAC|20260101000000||ADT^A01|MSG1|P|2.5.1\r"
+    "PID|1||12345^^^FAC^MR||DOE^JANE\r"
+)
+
+
+async def _cancel_with_a_row_claimed(
+    eng: Engine, cfg: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancel a first load while a real pooled dispatcher holds the seeded ingress row."""
+    claimed = asyncio.Event()
+    real_start = RegistryRunner._start_pooled_dispatchers
+
+    async def held_body(self: RegistryRunner, *args: Any, **kwargs: Any) -> Any:
+        claimed.set()
+        await asyncio.Event().wait()
+
+    async def held_start(self: RegistryRunner) -> None:
+        await real_start(self)
+        await asyncio.Event().wait()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(RegistryRunner, "_process_ingress_item", held_body)
+        patch.setattr(RegistryRunner, "_start_pooled_dispatchers", held_start)
+        task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
+        await asyncio.wait_for(claimed.wait(), 20)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert eng._registry_runner is None
+    assert set(await eng.store.inflight_by_lane(stage=Stage.INGRESS.value)) == {"in"}
+
+
+async def test_a_retried_first_load_delivers_the_row_a_cancelled_one_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path)
+    await eng.start()
+    await eng.store.enqueue_ingress(channel_id="in", raw=_RAW)
+    await _cancel_with_a_row_claimed(eng, cfg, monkeypatch)
+    delivered = tmp_path / "out-cfg" / "x.hl7"
+    try:
+        await eng._first_load(load_config(cfg), {"K": "new"})
+        for _ in range(300):
+            if delivered.exists():
+                break
+            await asyncio.sleep(0.05)
+        assert delivered.exists(), "the row a cancelled first load held was never delivered"
+        assert await eng.store.inflight_by_lane(stage=Stage.INGRESS.value) == {}
+    finally:
+        await eng.stop()
+
+
+async def test_a_first_load_with_nothing_cancelled_runs_no_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path)
+    await eng.start()
+    resets: list[Any] = []
+
+    async def reset(**kwargs: Any) -> int:
+        resets.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(eng.store, "reset_stale_inflight", reset)
+    try:
+        await eng._first_load(load_config(cfg), {"K": "new"})
+        assert resets == []
+    finally:
+        await eng.stop()
+
+
+@pytest.mark.parametrize("scoped", [True, False])
+async def test_a_process_sharing_its_store_never_resets_blindly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scoped: bool
+) -> None:
+    """With its lanes known the retry is scoped to them; with none it resets nothing."""
+    cfg = tmp_path / "cfg"
+    _graph(cfg, tmp_path)
+    eng = await _engine(tmp_path)
+    await eng.start()
+    await eng.store.enqueue_ingress(channel_id="in", raw=_RAW)
+    lanes = OwnedLanes(channels=frozenset({"in"}), destinations=frozenset({"out"}))
+    monkeypatch.setattr(eng, "_owned_lanes", lambda: lanes if scoped else None)
+    monkeypatch.setattr(eng, "_shares_transform_state", lambda: True)
+    await _cancel_with_a_row_claimed(eng, cfg, monkeypatch)
+    resets: list[Any] = []
+    real_reset = eng.store.reset_stale_inflight
+
+    async def reset(**kwargs: Any) -> int:
+        resets.append(kwargs)
+        return await real_reset(**kwargs)
+
+    monkeypatch.setattr(eng.store, "reset_stale_inflight", reset)
+    try:
+        await eng._first_load(load_config(cfg), {"K": "new"})
+        assert resets == ([{"owned": lanes}] if scoped else [])
+    finally:
+        await eng.stop()
+
+
 async def test_a_single_node_first_load_failure_still_raises_and_clears(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -371,11 +478,22 @@ async def test_a_failed_leader_first_load_commits_no_sweep_and_leaves_no_supervi
         await eng.stop()
 
 
+class _StoppableSource:
+    """A registered listener that records its stop."""
+
+    def __init__(self) -> None:
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
 @pytest.mark.parametrize("still_leader", [True, False])
-async def test_a_kept_runner_gets_no_supervisor_to_start_it(
+async def test_a_kept_runner_is_stopped_on_demotion_and_never_started(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, still_leader: bool
 ) -> None:
-    """Regression 3: a supervisor would start the failed reload's graph on a promotion."""
+    """Regression 3 and its stop-only path: a demotion takes the kept state down, and no
+    promotion, before or after it, starts the failed reload's graph."""
     cfg = tmp_path / "cfg"
     _graph(cfg, tmp_path)
     coord = _FlipCoordinator(leader=True)
@@ -385,13 +503,33 @@ async def test_a_kept_runner_gets_no_supervisor_to_start_it(
     _failing_teardown(monkeypatch)
     task = asyncio.create_task(eng._first_load(load_config(cfg), {"K": "new"}))
     await asyncio.wait_for(reached.wait(), 15)
+    runner = eng._registry_runner
+    assert runner is not None
+    source = _StoppableSource()
+    runner._sources["kept"] = source  # type: ignore[assignment]
     coord.leader = still_leader
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+    starts = _record_starts(monkeypatch)
     try:
-        assert eng._registry_runner is not None
-        assert eng._graph_supervisor is None
+        assert eng._registry_runner is runner
+        assert eng._graph_supervisor is not None
+        if still_leader:
+            await eng._reconcile_graph()
+            assert starts == [] and runner.running is False
+            assert not source.stopped, "a leader's pass must not act on the kept state"
+        coord.leader = False
+        eng._graph_wake.set()
+        for _ in range(200):
+            if source.stopped and "kept" not in runner._sources:
+                break
+            await asyncio.sleep(0.02)
+        assert source.stopped and "kept" not in runner._sources
+        assert not runner.has_residual_state
+        coord.leader = True
+        await eng._reconcile_graph()
+        assert starts == [] and runner.running is False
     finally:
         monkeypatch.undo()
         await eng.stop()
@@ -420,7 +558,7 @@ async def test_a_clustered_start_whose_unwind_failed_keeps_the_runner(
         assert runner is not None, "engine.stop() could no longer reach the live state"
         assert runner.has_residual_state
         assert eng._env_values == {"K": "new"}
-        assert eng._graph_supervisor is None
+        assert eng._stop_only_runner is runner
     finally:
         monkeypatch.undo()
         await eng.stop()
