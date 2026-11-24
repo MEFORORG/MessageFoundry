@@ -564,14 +564,16 @@ class TestAPinnedConfigDirIsRead:
         (sandbox / "home").mkdir()
         assert _transcript_age(sandbox, sandbox / "home", config_dir=sandbox / "absent") == "null"
 
+    @pytest.mark.parametrize("drive_relative", [False, True])
     def test_a_relative_pin_is_not_resolved_against_the_current_directory(
-        self, sandbox: Path
+        self, sandbox: Path, drive_relative: bool
     ) -> None:
         """The working directory is the sandbox, which holds a matching root at `pinned`; a
-        relative pin must not be read through it."""
+        relative pin, bare or drive-relative, must not be read through it."""
         (sandbox / "home").mkdir()
         self._pinned_root(sandbox, "pinned", 1)
-        assert _transcript_age(sandbox, sandbox / "home", config_dir="pinned") == "null"
+        pin = f"{sandbox.drive}pinned" if drive_relative else "pinned"
+        assert _transcript_age(sandbox, sandbox / "home", config_dir=pin) == "null"
 
     def test_an_explicit_config_root_still_wins(self, sandbox: Path) -> None:
         """-ConfigRoot names the roots to read; the pinned root is not added to them."""
@@ -601,12 +603,14 @@ class TestAPinnedTranscriptVetoesButIsNotCounted:
         )
         return json.loads(_run_ps(sandbox, _scrubbed_env(home, pinned), body))
 
-    def _pin_transcript(self, sandbox: Path, age_hours: float) -> Path:
+    def _pin_transcript(self, sandbox: Path, age_hours: float, root: Path | None = None) -> Path:
+        """A transcript under `root` (the pinned root by default); returns the pinned root."""
         slug = str(sandbox / "wt")
         for ch in ":\\/.":
             slug = slug.replace(ch, "-")
         pinned = sandbox / "pinned"
-        d = pinned / "projects" / slug
+        pinned.mkdir(exist_ok=True)
+        d = (root or pinned) / "projects" / slug
         d.mkdir(parents=True)
         f = d / "turn.jsonl"
         f.write_text('{"t":1}\n', encoding="utf-8")
@@ -625,3 +629,13 @@ class TestAPinnedTranscriptVetoesButIsNotCounted:
         assert a["Veto"] is True, a
         why = a["Why"] if isinstance(a["Why"], list) else [a["Why"]]
         assert any("transcript" in str(w) for w in why), a
+
+    def test_a_profile_transcript_is_still_counted_with_a_pin_set(self, sandbox: Path) -> None:
+        """The paired control: the same stale transcript under a profile root IS counted, so the
+        uncounted case above is the pin and not a probe that never counts."""
+        pinned = self._pin_transcript(sandbox, 30, root=sandbox / "home" / ".claude")
+        a = self._activity(sandbox, pinned)
+        assert a["FenceState"] == "UNKNOWN", a
+        assert a["Signals"] == 2, a  # the fence and the profile transcript
+        assert a["Evaluable"] is True, a
+        assert a["Veto"] is False, a

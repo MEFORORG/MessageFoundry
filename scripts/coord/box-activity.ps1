@@ -44,6 +44,13 @@
     6. AN ABSENT OR UNPARSED REGISTRY IS NOT AN EVALUATED FENCE (BACKLOG #5596). A non-veto answer
        counts only when a registry exists and every record in it parsed. A record that does not parse
        may be this session's, half-written at launch; one written inside the fresh window vetoes.
+    7. THE CALLER'S PINNED ROOT VETOES AND IS NEVER COUNTED (BACKLOG #7561). With no -ConfigRoot, the
+       transcript probe also reads the CALLER's own CLAUDE_CONFIG_DIR when it is a fully qualified
+       directory outside the profile roots, so a fresh transcript there vetoes. It is the caller's
+       pin, not the observed seat's. The liveness fence does not read that root, so a transcript
+       found only there never adds to `Signals`: it must not make a box evaluable. TranscriptAgeH
+       may therefore report a transcript that was not counted. A relative pin is skipped, because
+       it would resolve against whatever the current directory is now.
 
     WHAT THIS FILE DOES NOT OWN. The box key is mail-key.ps1's. The liveness fence is
     session-registry.ps1's. The veto state list is occupancy.ps1's. The host rule is coord-root.ps1's.
@@ -147,16 +154,14 @@ function Get-TranscriptAgeHours {
                  @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
                        ForEach-Object { $_.FullName })
              }
-    # BACKLOG #7561: the CALLER's CLAUDE_CONFIG_DIR, read too when it is pinned outside the profile, so
-    # a fresh transcript there still vetoes. It is the caller's pin only, not the observed seat's. A
-    # relative pin is skipped: it would resolve against whatever the current directory is now.
-    # Get-BoxActivity reads with -ExcludePinnedRoot to count signals, because the liveness fence does
-    # not read this root, and a transcript found only here must veto without making a box evaluable.
+    # RULE 7: the caller's pinned root is read too, for a veto only.
     # @(): an if-statement's output is unrolled, so a single root arrives as a bare string and += on
     # it would concatenate rather than append.
     $roots = @($roots)
-    $pin = Get-PinnedTranscriptRoot -Roots $roots
-    if (-not $ConfigRoot -and -not $ExcludePinnedRoot -and $pin) { $roots += $pin }
+    if (-not $ConfigRoot -and -not $ExcludePinnedRoot) {
+        $pin = Get-PinnedTranscriptRoot -Roots $roots
+        if ($pin) { $roots += $pin }
+    }
     foreach ($r in $roots) {
         $dir = Join-Path (Join-Path $r 'projects') $slug
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
@@ -295,8 +300,8 @@ function Get-BoxActivity {
     }
 
     $transcriptH = Get-TranscriptAgeHours -WorktreePath $WorktreePath -ConfigRoot $ConfigRoot -Now $Now
-    # Counted only when found where the fence also looks (BACKLOG #7561); the pinned root vetoes only.
-    $countedH = if ($ConfigRoot -or $null -eq $transcriptH) { $transcriptH }
+    # RULE 7. The second read runs only when a pin could have been added.
+    $countedH = if ($ConfigRoot -or $null -eq $transcriptH -or -not $env:CLAUDE_CONFIG_DIR) { $transcriptH }
                 else { Get-TranscriptAgeHours -WorktreePath $WorktreePath -Now $Now -ExcludePinnedRoot }
     if ($null -ne $transcriptH) {
         if ($here -and $null -ne $countedH) { $signals++ }
