@@ -2470,8 +2470,10 @@ class RegistryRunner:
         self._stop_held: set[tuple[Direction, str]] = set()
         self._stop_hold_logged: set[tuple[Direction, str]] = set()
         # Which internal stages recorded each ("inbound", name) hold, None for a hold recorded with
-        # no stage. Read only by _log_halt_keeps_stopped, so a log halt keeps STOPPED only the lane
-        # whose own stage holds; the shared record above stays as it is (BACKLOG #5704).
+        # no stage. Read by _log_halt_keeps_stopped, so a log halt keeps STOPPED only the lane
+        # whose own stage holds, and by _lift_log_halt, which keeps the shared record while a stage
+        # listed here is mid-episode (BACKLOG #5704). Entries are cleared only with the whole
+        # record, so a stage whose STOP was re-armed without a release stays listed.
         self._stop_held_stages: dict[str, set[Stage | None]] = {}
         # BACKLOG #5708: inbounds whose transform lane's last routed row stopped it because the inbound
         # was missing from the graph, recorded by _apply_routed and read once by whatever ends that
@@ -6089,7 +6091,9 @@ class RegistryRunner:
         lane it found STOPPED (:meth:`_broadcast_to`, sent by more than an operator: see
         :meth:`outbound_stop_held`; during a log halt it keeps an inbound record a sibling stage
         still needs), a pooled resume of a PAUSED or STOPPED lane
-        (:meth:`_resume_pooled_lane`), and a full teardown. An operator start that re-arms nothing,
+        (:meth:`_resume_pooled_lane`), the pooled lift of a log halt at an inbound's restart
+        (:meth:`_lift_log_halt`, which keeps the inbound record while a lane is kept or a stage
+        that recorded it is mid-episode), and a full teardown. An operator start that re-arms nothing,
         such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
         leaves the hold in place."""
         key = (kind, name)
@@ -6877,8 +6881,9 @@ class RegistryRunner:
         marked, so it stays halted after another inbound's restart clears the latch.
 
         Lifting the gate re-arms the inbound's internal lanes (:meth:`_lift_log_halt`): under pooled
-        a STOPPED or PAUSED one is resumed and its hold lifted here, except a pooled lane kept
-        STOPPED because a re-arm could claim past claimed rows it holds in flight, and under
+        a STOPPED or PAUSED one is resumed here, except a pooled lane kept STOPPED because a
+        re-arm could claim past claimed rows it holds in flight; :meth:`_lift_log_halt` says when
+        the hold is lifted. Under
         per_lane the start that
         called this then respawns the finished workers (:meth:`_ensure_inbound_workers`), which
         re-arms such a STOP."""
