@@ -7,6 +7,8 @@
   left open. In the same sitting the owner answered two more, on grant rows for timer-driven reads
   and on the grant row's form; *To resolve on acceptance* records each question and its answer. The
   last, on extra session reads, was not put to the owner and stays open to slice 5. No code yet.
+  Amended 2026-11-24 by the dated section at the end of this ADR (check routes and the audited
+  grant row, slice 2a).
   > **Superseded status text, kept as a record.** Until 2026-10-30 this line read: *"Proposed"*.
 - **Date:** 2026-10-29
 - **Related:** vault BACKLOG #2603 (this ADR is its research step); #1197 (console grant rows),
@@ -138,12 +140,7 @@ confirmation page, sub-requests a new gate-only route. Slice 2 registers one per
 policy table read, not a permission taken from the request. Each runs what `require` runs, in its
 order: the session resolution and idle-clock touch, must-change confinement, the MFA access gate
 with its `auth.mfa_denied` row, the notification-address gate, the permission loop with its denial
-row, and, on a route that names a permission, the grant row. *Amended 2026-11-24 (BACKLOG #2603,
-Manager decision on the owner's instruction of 2026-11-23):* a check route also writes the grant
-row where its own gate would not, for any permission whose grant is audited on its own routes. That
-covers the PHI views and, with `audit_all_authz` off, the sensitive set and `files:browse` on a GET.
-Section 3's rules about which grants get a row govern every other route; docs/SECURITY.md (Gate-only
-check routes) states the check-route rule. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
+row, and, on a route that names a permission, the grant row. `GET /auth/me` cannot serve here: it is exempt from the MFA access gate and
 from must-change confinement, and it names no permission, so it writes no grant row. A check route
 tells a caller nothing it cannot already read from its own `GET /auth/me`, which lists its
 permissions, and a pending session is answered before the permission loop, as `require` does. A form
@@ -525,3 +522,22 @@ AskUserQuestion. The fourth stays open after acceptance, as open items did on AD
       measurement points to memoising, the choice changes when a console sub-request re-resolves
       the session, which a bearer request would not share, so it goes to the owner as a gate
       question rather than being taken inside the slice.
+
+## Amendment 2026-11-24: check routes write the grant row of an audited permission (BACKLOG #2603, slice 2a)
+
+Section 2 says a gate-only check route runs what `require` runs, in its order, ending with the
+grant row on a route that names a permission. Slice 2a adds one rule to that sentence and changes
+nothing else in section 2: a check route also writes the grant row where its own gate would not,
+for any permission whose grant is audited on its own routes. That covers the PHI views and, with
+`audit_all_authz` off, the sensitive set and `files:browse` on a GET. Section 3's rules about which
+grants get a row govern every other route. docs/SECURITY.md (Gate-only check routes) states the
+check-route rule.
+
+Provenance. This amendment rests on a class B decision logged by the #2603 Manager on 2026-11-24
+with `scripts/coord/decision.ps1`, id `d20261124T092116115-d8b2a5`, gate `REVIEW`, predicate
+`review`: *"round-5d8e21a7 findings 1-4 weaken or mislabel a control on new routes"*. The record
+holds no separate question field. Its recommendation reads: *"Before the slice 2a PR: audited-permission
+check routes write the grant's decision row; must-change header and detail share one target;
+factor-binding refusal gets its own step-up reason; /me/step-up is audited, paced and new-address
+checked. Each is the strictly safer option. Decided under the owner's instruction of 2026-11-23."*
+The owner's instruction of 2026-11-23 is cited by that record and is not quoted in it.
