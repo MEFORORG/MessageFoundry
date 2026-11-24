@@ -1316,13 +1316,15 @@ class NegativeAckError(DeliveryError):
     partner's auth (which could trip an account lockout). Only meaningful when ``permanent`` is True.
 
     ``config_fault`` (BACKLOG #2083) marks a permanent failure every queued row would meet because
-    of the **connection** rather than the message or the credential: its own settings, or the
-    endpoint they name (ADR 0095 Amendment B.2). At least: an FTP server refusing ``AUTH TLS`` or
+    of the **connection** rather than the message or the credential: its own settings, the
+    endpoint they name (ADR 0095 Amendment B.2), or an optional package the connection needs on
+    the host, installed but broken (Amendment B.3). At least: an FTP server refusing ``AUTH TLS`` or
     ``PROT P``, demanding TLS of a plain session, or refusing the greeting; an HTTP endpoint or web
-    proxy sending a Digest challenge the engine refuses (BACKLOG #2323); or an OAuth2 or SMART
+    proxy sending a Digest challenge the engine refuses (BACKLOG #2323); an OAuth2 or SMART
     token endpoint answering a coded 2xx reply, as
     :func:`~messagefoundry.transports.smart.request_token` scopes it (``token-reply-coded``,
-    BACKLOG #5910). Every queued row would fail the same way, so the delivery worker stops the lane and keeps the queue, under the
+    BACKLOG #5910); or a DICOMweb outbound whose installed ``[dicom]`` extra does not load
+    (``dicom-extra-unusable``, BACKLOG #5914). Every queued row would fail the same way, so the delivery worker stops the lane and keeps the queue, under the
     same ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
     is weaker for HTTP than for FTP. Only meaningful when ``permanent`` is True.
 

@@ -1053,12 +1053,25 @@ async def test_dicomweb_a_parse_failure_in_the_read_still_sends() -> None:
     assert len(opener.requests) == 1
 
 
-async def test_dicomweb_a_broken_dicom_extra_raises_before_the_post(
+def _assert_extra_unusable(exc: NegativeAckError, fault: str) -> None:
+    """The dicom-extra-unusable configuration fault (BACKLOG #5914, ADR 0095 Amendment B.3)."""
+    assert exc.code == "dicom-extra-unusable"
+    assert exc.permanent is True and exc.config_fault is True
+    assert exc.credential_fault is False
+    assert exc.remedy is not None
+    assert "installed but does not load" in exc.remedy and "restart" in exc.remedy
+    assert "pip install" not in exc.remedy
+    assert fault in str(exc) and "nothing was sent" in str(exc)
+    assert "Canary" not in str(exc)  # the load's text is not named
+    assert exc.__cause__ is None and exc.__context__ is None
+
+
+async def test_dicomweb_a_broken_dicom_extra_stops_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A pydicom missing a reader the deflate guard replays: the load raises its RuntimeError before
-    # the POST, an internal error as the SCU's own load raises (BACKLOG #5914, Manager decision of
-    # 2026-11-24: follow the SCU), never a verdict on the object.
+    # A pydicom missing a reader the deflate guard replays: the load fails before the POST, a
+    # configuration fault every queued row would meet (BACKLOG #5914, Manager decision of
+    # 2026-11-24: stop the lane, keep the queue), never a verdict on the object.
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
@@ -1067,8 +1080,9 @@ async def test_dicomweb_a_broken_dicom_extra_raises_before_the_post(
     dest = _dest()
     opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [_DATASET_UID]}).encode(), status=202)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="_read_file_meta_info"):
+    with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
+    _assert_extra_unusable(exc.value, "RuntimeError")
     assert opener.requests == []
 
 
@@ -1085,35 +1099,33 @@ def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
 
 
 @pytest.mark.parametrize("fault", [RuntimeError, SyntaxError, AttributeError, TypeError])
-async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_the_post(
+async def test_dicomweb_an_extra_that_does_not_load_builds_and_stops_each_send_before_the_post(
     monkeypatch: pytest.MonkeyPatch, fault: type[Exception]
 ) -> None:
     # A pydicom found on disk whose load raises (an import can raise any class; load_dcmread
-    # turns an ImportError into a RuntimeError): the build succeeds, and a send raises what the
-    # load raised, before the POST, whatever the status. It is the SCU's class for the same
-    # fault (_store_object loads outside its handler): an internal error, which the runner's
-    # internal_error policy handles, not a permanent refusal. The patches stand for that host.
+    # turns an ImportError into a RuntimeError): the build succeeds, and a send is a
+    # configuration fault before the POST, whatever the status. The patches stand for that host.
     from messagefoundry.transports import dicomweb
 
     def load() -> object:
-        raise fault("a broken pydicom")
+        raise fault("1.2.3.Canary")
 
     monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
     monkeypatch.setattr(dicomweb, "load_dcmread", load)
     dest = _dest()
     opener = _FakeOpener(body=STORED_OK.encode(), status=200)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(fault):
+    with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
+    _assert_extra_unusable(exc.value, fault.__name__)
     assert opener.requests == []
 
 
-async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_the_post(
+async def test_dicomweb_a_pydicom_blocked_in_sys_modules_stops_each_send_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A pydicom in sys.modules with no usable module: find_spec answers None for a None entry, so
-    # the extra is forced found here; load_dcmread's import then fails for real, as its
-    # missing-extra RuntimeError.
+    # the extra is forced found here; load_dcmread's import then fails for real.
     import sys
 
     from messagefoundry.transports import dicomweb
@@ -1123,8 +1135,9 @@ async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_the_post(
     dest = _dest()
     opener = _FakeOpener(body=STORED_OK.encode(), status=200)
     dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="optional 'dicom' extra"):
+    with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
+    _assert_extra_unusable(exc.value, "RuntimeError")
     assert opener.requests == []
 
 

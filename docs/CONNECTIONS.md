@@ -4007,10 +4007,10 @@ adds only the `multipart/related; type="application/dicom"` framing + `applicati
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
 adds the data set's UID to that comparison. **An installed extra that is broken can be worse than
-none.** At least these can happen, depending on how it is broken: a message is not sent and is
-handled as an internal error, or is refused before it is sent; *Status classification* below says
-when. So on a host running DICOMweb, fix or remove a broken
-`pydicom`, then restart the engine.
+none.** At least these can happen, depending on how it is broken: under the default
+`credential_fault_policy` the lane stops and keeps its queue, or a message is refused before it is
+sent; *Status classification* below says when. So on a host running DICOMweb, fix or remove a
+broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4062,13 +4062,13 @@ malformed object as a parse failure, so one of those raised by a broken `pydicom
 way: the object is sent, and a 202 that names only its data set UID is then refused after the
 partner has answered. Before the object is read, the extra is loaded apart from it, as the SCU
 loads it: the `dcmread` reader and the readers the deflate guard replays. A load that raises, for
-example from a `pydicom` that is found but will not import, or that lacks such a reader, raises
-that error unchanged before a byte is sent, as the SCU's load does. It is an internal error, so the
-connection's `internal_error` policy decides: the default, `continue`, dead-letters the row, and
-`stop` stops the lane. A `pydicom` directory with no `__init__.py`, as an uninstall can leave, is
-taken as no extra. After fixing `pydicom`, restart the engine. A send may load the fixed one by
-itself where the earlier import failed, but the `pydicom` modules an import has already loaded stay
-loaded until a restart. Any other fault in the read of the object itself, such as a `TypeError` or
+example from a `pydicom` that is found but will not import, or that lacks such a reader, is a
+configuration fault before a byte is sent (code `dicom-extra-unusable`, ADR 0095 Amendment B.3):
+every queued row would meet it, so under the default `credential_fault_policy` the lane stops and
+keeps its queue, and the alert says the extra is installed but does not load. Under `dead_letter`
+the row is dead-lettered instead. A `pydicom` directory with no `__init__.py`, as an uninstall can
+leave, is taken as no extra. After fixing or removing `pydicom`, restart the engine: the `pydicom`
+modules an import has already loaded stay loaded until a restart. Any other fault in the read of the object itself, such as a `TypeError` or
 a warning the filters turn into an error, refuses the message before a byte is sent, whatever
 status the partner would have answered, naming the exception class only (code `sent-uid-unread`),
 even when a broken extra caused it. A `MemoryError` is not caught there. The data set UID is read
