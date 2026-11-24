@@ -1375,11 +1375,12 @@ def test_provision_admin_keyless_refusal_at_the_write_keys_the_pre_check_from_th
     pre-check's open as the earlier one. Each open resolves the key itself, so a keyless write
     open does not show the pre-check's open was keyless: under keyed settings it may have bound
     the salt and written the genesis record, and the text names both, once. Under keyless
-    settings it names neither (Manager decision on the w10-provision-twin review, finding 3), nor
-    for a keyless-chain refusal, which shows the audit log is empty.
+    settings it names neither (Manager decision on the w10-provision-twin review, finding 3).
+    A keyless-chain refusal is no exception: at the write's open it can follow only a log that
+    lost rows after the pre-check's open, and that open may have been keyed (PR 3221 hold).
 
-    Mutation: take the pre-check open's keyedness from the refused class alone, or override it
-    for a keyless-chain refusal too."""
+    Mutation: take the pre-check open's keyedness from the refused class alone, or exempt a
+    keyless-chain refusal from the settings."""
     from messagefoundry.__main__ import _KeylessProvisionRefused
     from messagefoundry.store.base import KeylessAuditChainRefused
     from messagefoundry.store.crypto import StoreKeylessError
@@ -1392,10 +1393,7 @@ def test_provision_admin_keyless_refusal_at_the_write_keys_the_pre_check_from_th
     _refused_at_the_write_after_the_pre_check(monkeypatch, exc, keyed=keyed)
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert _PRE_CHECK_OPEN in out, out
-    # A keyless-chain refusal fires only on an empty audit log, which a keyed open that returned
-    # would have left with its genesis record, so the pre-check's open was keyless.
-    named = keyed and refusal != "keyless-chain"
-    assert out.count(_SALT) == int(named) and out.count(_GENESIS) == int(named), out
+    assert out.count(_SALT) == int(keyed) and out.count(_GENESIS) == int(keyed), out
     assert _UNUSED_ENTRY in out, out
 
 
