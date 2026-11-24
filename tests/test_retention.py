@@ -8,12 +8,14 @@ for determinism."""
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
 import os
 import sqlite3
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -24,6 +26,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StoreSettings,
 )
+from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline import retention as retention_mod
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cluster import NullCoordinator
@@ -2013,3 +2016,116 @@ async def test_engine_without_retention_settings_has_no_runner(tmp_path) -> None
         assert engine._retention_runner is None
     finally:
         await engine.stop()
+
+
+# --- a reload that first sets a per-connection window starts the runner (BACKLOG #6804) ---------
+
+# Every default-ON knob off, so only the graph can enable the runner.
+_ALL_OFF = {"min_free_disk_mb": 0, "wal_checkpoint_seconds": 0, "audit_log_warn_rows": 0}
+
+
+def _write_retention_graph(cfg: Path, inbox: Path, outdir: Path, *, inbound_kw: str = "") -> None:
+    """One file inbound -> router -> handler -> file outbound; ``inbound_kw`` adds keyword arguments
+    to the inbound, such as a per-connection retention window."""
+    cfg.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File\n"
+        f"inbound('IB_RET', File(directory={str(inbox)!r}, pattern='*.hl7', poll_seconds=0.05), "
+        f"router='r'{inbound_kw})\n"
+        f"outbound('OB_RET', File(directory={str(outdir)!r}, filename='{{MSH-10}}.hl7'))\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_RET', msg)\n",
+        encoding="utf-8",
+    )
+
+
+def test_enabled_by_a_per_connection_override(store: MessageStore) -> None:
+    """A per-connection messages_days or dead_letter_days override purges with the global window
+    off (run_once runs the purge whenever one exists), so it must enable the runner on its own."""
+
+    class _In:
+        def __init__(self, messages_days: int | None) -> None:
+            self.name = "IB"
+            self.messages_days = messages_days
+            self.prune_documents_after = None
+
+    class _Out:
+        def __init__(self, dead_letter_days: int | None) -> None:
+            self.name = "OB"
+            self.dead_letter_days = dead_letter_days
+
+    class _Reg:
+        def __init__(self, inbound: _In, outbound: _Out) -> None:
+            self.inbound = {"IB": inbound}
+            self.outbound = {"OB": outbound}
+
+        def inbound_messages_days(self) -> dict[str, int]:
+            ib = self.inbound["IB"]
+            return {} if ib.messages_days is None else {ib.name: ib.messages_days}
+
+    off = RetentionSettings.model_validate(_ALL_OFF)
+
+    def enabled(reg: _Reg) -> bool:
+        return RetentionRunner(store, off, registry_source=lambda: reg).enabled  # type: ignore[arg-type,return-value]
+
+    assert enabled(_Reg(_In(None), _Out(None))) is False
+    assert enabled(_Reg(_In(3), _Out(None))) is True
+    assert enabled(_Reg(_In(None), _Out(3))) is True
+
+
+@pytest.mark.parametrize(
+    "inbound_kw", [", messages_days=1", ", prune_documents_after=1"], ids=["messages_days", "prune"]
+)
+async def test_reload_that_enables_retention_starts_the_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inbound_kw: str
+) -> None:
+    """BACKLOG #6804: the runner was built and found nothing to do at startup, then a reload set a
+    per-connection window. A pass must run without a restart, and a second reload must not start a
+    second loop."""
+    passes: list[None] = []
+    real_run_once = RetentionRunner.run_once
+
+    async def _counting_run_once(self: RetentionRunner, now: float | None = None) -> Any:
+        passes.append(None)
+        return await real_run_once(self, now)
+
+    monkeypatch.setattr(RetentionRunner, "run_once", _counting_run_once)
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    idle_cfg, window_cfg = tmp_path / "idle", tmp_path / "window"
+    _write_retention_graph(idle_cfg, inbox, outdir)
+    _write_retention_graph(window_cfg, inbox, outdir, inbound_kw=inbound_kw)
+
+    engine = await Engine.create(
+        tmp_path / "engine.db",
+        retention_settings=RetentionSettings.model_validate(_ALL_OFF),
+        egress_settings=EgressSettings(deny_by_default=False),
+    )
+    engine.add_registry(load_config(idle_cfg))
+    await engine.start()
+    try:
+        runner = engine._retention_runner
+        assert runner is not None
+        assert runner.enabled is False and runner._task is None and passes == []
+
+        outcome = await engine.reload_detail(window_cfg)
+        assert outcome.applied is True
+        assert runner.enabled is True
+        task = runner._task
+        assert task is not None, "a reload that set a per-connection window left retention off"
+        for _ in range(200):
+            if passes:
+                break
+            await asyncio.sleep(0.01)
+        assert passes, "no retention pass ran after the reload"
+
+        await engine.reload_detail(window_cfg)
+        assert runner._task is task, "a second reload started a second retention loop"
+    finally:
+        await engine.stop()
+    assert runner._task is None and task.done()

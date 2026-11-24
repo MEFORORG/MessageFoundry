@@ -428,8 +428,10 @@ class RetentionRunner:
 
         Embedded-document pruning (#47, ADR 0042) has no ``[retention]`` setting — it is a purely
         per-connection knob — so the runner must also start when any inbound sets ``prune_documents_after``
-        even if no global window is configured. The registry is consulted via ``_registry_source`` (None
-        when no registry is wired)."""
+        even if no global window is configured. So must a per-connection ``messages_days`` or
+        ``dead_letter_days`` override. The registry is consulted via ``_registry_source`` (None when no
+        registry is wired); a reload that first sets one starts the runner through the engine's reload
+        path (BACKLOG #6804)."""
         s = self._settings
         if (
             s.messages_days
@@ -452,11 +454,15 @@ class RetentionRunner:
         if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
-        if registry is not None and any(  # noqa: SIM103
+        if registry is not None and any(
             ic.prune_documents_after is not None for ic in registry.inbound.values()
         ):
             return True
-        return False
+        # A per-connection messages_days/dead_letter_days override purges even with the global
+        # window off (run_once runs the purge whenever an override exists), so it must start the
+        # runner too (BACKLOG #6804).
+        messages_overrides, dead_overrides = self._resolve_overrides()
+        return bool(messages_overrides or dead_overrides)
 
     # --- lifecycle -----------------------------------------------------------
 

@@ -3925,6 +3925,12 @@ class Engine:
         # an operator may still have to finish, not a failed reload (engine PR 2815).
         if close_failures:
             failures.append(_outbound_close_failure(close_failures))
+        # Retention (BACKLOG #6804): the runner spawns its loop only when something is configured,
+        # and per-connection windows (messages_days, dead_letter_days, prune_documents_after) come
+        # from the graph. A graph that first sets one would otherwise wait for a restart. start() is
+        # idempotent: a running loop is left alone, and a graph that still sets nothing starts none.
+        if self._retention_runner is not None and not self._stopping:
+            self._retention_runner.start()
         # Reference sets (ADR 0006): re-arm + materialize after the swap, so a reference set added by
         # this reload syncs immediately (resolves on the next message, not only after the refresh
         # interval) and a 0->N change actually starts the loop. Idempotent when nothing changed.
