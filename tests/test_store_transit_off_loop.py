@@ -351,3 +351,114 @@ async def test_converge_keeps_a_newer_own_sync_made_during_the_read(backend: str
     assert await store.converge_reference_cache() == []
     assert store._reference_versions == {"codes": "v2"}
     assert store._reference_cache["codes"] is own
+
+
+class _RangeHost:
+    """The parts of an :class:`~messagefoundry.store.store.AuditRangeHost` that
+    :func:`~messagefoundry.store.store.settle_audit_ranges` reads, over fixed range rows."""
+
+    def __init__(self, mac_fn: Any, rows: list[dict[str, Any]]) -> None:
+        self._audit_mac_keys: dict[str, bytes] = {}
+        self._audit_mac_key = None
+        self._audit_mac_fn = mac_fn
+        self._audit_range_key_id: str | None = None
+        self._audit_range_from: int | None = None
+        self._audit_range_keys: list[str] = []
+        self._audit_ranges_trusted = True
+        self._rows = rows
+
+    async def _audit_range_rows(self) -> list[dict[str, Any]]:
+        return self._rows
+
+
+def _closes(key_id: str, from_seq: int, to_seq: int) -> dict[str, Any]:
+    return {
+        "key_id": key_id,
+        "from_seq": from_seq,
+        "to_seq": to_seq,
+        "rows": to_seq - from_seq + 1,
+        "digest": "0" * 64,
+        "prev_hash": "",
+    }
+
+
+def _range_rows(transit_tag: tuple[bytes | None, Any]) -> list[dict[str, Any]]:
+    """Two range rows after a genesis under a key the host does not hold: the first opens the
+    Transit range (its outgoing key is not held, so its tag is not checked), the second closes the
+    Transit range, so its tag, made with ``transit_tag``, is checked under the Transit MAC."""
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    return [
+        {
+            "seq": 3,
+            "detail": store_module.audit_epoch_detail(
+                transit_id, _closes("k-unheld", 1, 2), (b"\x01" * 32, None)
+            ),
+        },
+        {
+            "seq": 6,
+            "detail": store_module.audit_epoch_detail(
+                "k-local", _closes(transit_id, 3, 5), transit_tag
+            ),
+        },
+    ]
+
+
+async def test_the_open_checks_a_transit_handover_tag_off_the_loop() -> None:
+    """``settle_audit_ranges`` checks a range row's handover tag under the outgoing key. When that
+    key is the Transit one the check is a Transit MAC call, which ran on the loop at the open."""
+    transit = _RecordingTransit()
+    mac_fn = TransitCipher(_FakeClient(transit), _KEY).audit_mac_fn()
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    host = _RangeHost(mac_fn, _range_rows((None, mac_fn)))
+    transit.threads.clear()
+    await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
+    # The tag verified, so the range it opens was accepted: the check ran, and it passed.
+    assert host._audit_range_keys == ["k-unheld", transit_id, "k-local"]
+    assert host._audit_ranges_trusted
+    assert transit.threads, "the open made no Transit call, so this test measured nothing"
+    assert threading.get_ident() not in transit.threads
+
+
+async def test_the_open_refuses_a_transit_handover_tag_that_does_not_verify() -> None:
+    """The control: the check still refuses a tag the outgoing key did not make."""
+    mac_fn = TransitCipher(_FakeClient(_RecordingTransit()), _KEY).audit_mac_fn()
+    transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+    host = _RangeHost(mac_fn, _range_rows((b"\x02" * 32, None)))
+    await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
+    assert not host._audit_ranges_trusted
+    assert host._audit_range_keys == ["k-unheld", transit_id]
+
+
+async def test_the_roll_makes_its_handover_tag_through_cipher_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``roll_audit_key_range`` makes the outgoing key's handover tag through ``cipher_call``, keyed
+    on the outgoing secret's MAC provider, so a blocking provider would be called off the loop.
+
+    The roll reaches that tag only under an in-heap key today: a store holding the Transit MAC has
+    the Transit key active, and the roll never closes a range under the active key. So this pins
+    the route, not a measured hop; under an in-heap key ``cipher_call`` runs the call inline."""
+    path = tmp_path / "r.db"
+    a, b = generate_key(), generate_key()
+    first = make_cipher(a)
+    store = await MessageStore.open(path, cipher=first, audit_mac_key=first.audit_mac_key())
+    try:
+        await store.record_audit("probe", actor="tester", detail="synthetic")
+    finally:
+        await store.close()
+    rotated = make_cipher(b, (a,))
+    store = await MessageStore.open(path, cipher=rotated, audit_mac_key=rotated.audit_mac_key())
+    try:
+        routed: list[tuple[object, object]] = []
+        real = row_seal.cipher_call  # the object store.py imports under the same name
+
+        async def recording(cipher: object, call: Any, *args: Any, **kwargs: Any) -> Any:
+            routed.append((cipher, call))
+            return await real(cipher, call, *args, **kwargs)
+
+        monkeypatch.setattr(store_module, "cipher_call", recording)
+        ok, msg = await store.roll_audit_key_epoch()
+        assert ok, msg
+        assert (None, store_module.audit_epoch_detail) in routed
+    finally:
+        await store.close()
