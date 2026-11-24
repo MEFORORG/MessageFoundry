@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A braced credential value with text glued after its closer (BACKLOG #2966 steps 1 and 2), and a
-keyword spelled with a fold character after a plain value (BACKLOG #3114 step 4).
+"""A braced credential value with text glued after its closer (BACKLOG #2966 steps 1 and 2).
 
 Synthetic values only. Each shape is read through both surfaces: the write-time
 ``scrub_credentials`` and the support bundle's ``redact_log_line``, whose first layer is the
@@ -15,15 +14,11 @@ from collections.abc import Callable
 
 import pytest
 
+from messagefoundry import redaction
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
-
-_LONG_S = "ſ"  # folds to "s"
-_DOTTED_I = "İ"  # folds to "i"
-_DOTLESS_I = "ı"  # folds to "i"
-_TO_ASCII = str.maketrans({_LONG_S: "s", _DOTTED_I: "i", _DOTLESS_I: "i"})
 
 _Surface = tuple[str, Callable[[str], str], str]
 _SURFACES: tuple[_Surface, ...] = (
@@ -85,10 +80,12 @@ _REFUSED_GLUED_SHAPES = (
     "MEFOR_X={pp PID|x}x rest vq9",
     "MEFOR_X={pp ww}mrn 12345",
     "MEFOR_X={pp ww};mrn 12345",
-    "MEFOR_X={pp ww}x rest",
+    "MEFOR_X={pp\u2028ww}x rest",
     "MEFOR_X={pp name}x rest",
     "private_key={pp ww}Xx rest",
     "private_key={pp ww}mrn 12345",
+    "MEFOR_X={pp ww}nonnumeric port: 'vq7@db.example'",
+    "private_key={pp ww}xnonnumeric port: 'vq7@db.example'",
 )
 
 
@@ -118,10 +115,13 @@ _BRACED_TAILS = (
     *("zz", "zz zz", "PID|vq1", "mrn vq1", "(0010,0010) vq1", "PatientName=vq1"),
     *("Smith Jones", "name", "zz;pwd=vq1 zz"),
 )
-_GLUED_TEXTS = ("zz", ";zz", ",zz", "&zz", "mrn", ";mrn", "zzbearer", "Zz", "zz;pwd=vq2", "")
+_GLUED_TEXTS = (
+    *("zz", ";zz", ",zz", "&zz", "mrn", ";mrn", "zzbearer", "Zz", "zz;pwd=vq2", ""),
+    *("nonnumeric", "xnonnumeric"),
+)
 _AFTER = (
     *("", " vq3", " 91234", " = vq3", " Bearer vq3abcd", " Smith Jones", ";PWD=vq3 zz"),
-    '"vq3"',
+    *('"vq3"', " port: 'vq3@db.example'"),
 )
 
 
@@ -177,122 +177,37 @@ def test_the_glued_differential_sees_a_widened_branch(monkeypatch: pytest.Monkey
     assert _newly_printed(widened, before, corpus), "the corpus cannot see a widened branch"
 
 
-# --- BACKLOG #3114 step 4: a keyword spelled with a fold character ---------------------------------
-
-#: (line, what each surface writes). A keyword spelled with a fold character for its first letter,
-#: after a plain value, before a braced or quoted value. On ``origin/main`` each printed a value:
-#: " ww}" or "vqa vqb", on both surfaces or on the bundle's alone.
-_FOLD_SHAPES = (
-    (f"MEFOR_X=a;{_LONG_S}ecret={{pp ww}}", "MEFOR_X=P xx}"),
-    (f"token=a;{_LONG_S}ecret={{pp ww}}", "token=P xx}"),
-    (f"MEFOR_X=a;{_LONG_S}ecret={{pp ww ww}}", "MEFOR_X=P xx xx}"),
-    (f'MEFOR_X=a;{_LONG_S}ecret="vqa vqb"', f"MEFOR_X=P{_LONG_S}ecret=P"),
-    (
-        f'MEFOR_X=a;{_DOTLESS_I}ntake_api_key_next="vqa vqb"',
-        f'MEFOR_X=P{_DOTLESS_I}ntake_api_key_next=P"',
-    ),
-    (
-        f'MEFOR_X=a;{_DOTTED_I}ntake_api_key_next="vqa vqb"',
-        f'MEFOR_X=P{_DOTTED_I}ntake_api_key_next=P"',
-    ),
-    (
-        f'token=a;{_DOTLESS_I}ntake_api_key_next="vqa vqb"',
-        f'token=P{_DOTLESS_I}ntake_api_key_next=P"',
-    ),
-)
+def _words_later_passes_read() -> set[str]:
+    """The lower case letter words the sources ``_GLUED_REFUSED_WORDS`` names hold."""
+    words = {word.lower() for word in scrub_mod._MEMBER_KEEP_WORDS}
+    for source in (
+        redaction._DICOM_PHI_LABEL.pattern,
+        redaction._CREDENTIAL_AHEAD.pattern,
+        redaction._MSH_DELIMITERS.pattern,
+        redaction._USERINFO_OPENER,
+        redaction._MRN_LABELLED.pattern,
+        " ".join(redaction._JSON_LITERALS),
+        " ".join(redaction._UNBOUNDED_WORDS),
+    ):
+        words.update(re.findall(r"[a-z]{2,}", source.lower()))
+    return {word for word in words if re.fullmatch("[a-z]+", word)}
 
 
-@pytest.mark.parametrize(
-    ("line", "expected"),
-    _FOLD_SHAPES,
-    ids=(
-        "mefor-braced",
-        "token-braced",
-        "two-words",
-        "mefor-quoted",
-        "dotless-i",
-        "dotted-i",
-        "token-i",
-    ),
-)
-@pytest.mark.parametrize("surface", _SURFACES, ids=_SURFACE_IDS)
-def test_a_fold_character_keyword_reads_as_its_ascii_spelling(
-    line: str, expected: str, surface: _Surface
-) -> None:
-    _name, apply, placeholder = surface
-    out = apply(line)
-    assert out == expected.replace("P", placeholder), out
-    assert apply(line.translate(_TO_ASCII)) == out.translate(_TO_ASCII), (
-        "the ASCII spelling differs"
-    )
-
-
-def test_a_fold_character_inside_a_word_is_not_a_label_start() -> None:
-    """Glued onto a letter, the fold spelling reads as the ASCII spelling does: no stop there."""
-    for name, apply, _placeholder in _SURFACES:
-        fold = apply(f'MEFOR_X=a{_LONG_S}ecret="vqa vqb"')
-        plain = apply('MEFOR_X=asecret="vqa vqb"')
-        assert fold.translate(_TO_ASCII) == plain, f"{name}: {fold!r} against {plain!r}"
-
-
-def test_the_fold_gate_is_the_gate_folds_table() -> None:
-    """The gate's class holds exactly the :data:`secretscrub._GATE_FOLDS` characters, read over
-    every code point outside ASCII in the Basic Multilingual Plane."""
-    gate = re.compile(r"(?=" + scrub_mod._FOLD_GATE.removeprefix(r"(?<![A-Za-z0-9])") + r")")
-    assert gate.pattern != r"(?=" + scrub_mod._FOLD_GATE + r")", "the gate lost its lookbehind"
-    found = {chr(c) for c in range(0x80, 0x10000) if gate.match(chr(c))}
-    assert found == {char for char, _letter in scrub_mod._GATE_FOLDS}
-
-
-def test_the_glued_refused_words_cover_the_member_keep_words() -> None:
-    """Every member-keep word lower case ASCII letters can spell is refused, and every refused word
-    is one of them."""
+def test_the_glued_refused_words_cover_the_words_later_passes_read() -> None:
+    """Every such word is refused, and every refused word is one of them."""
     refused = re.compile(scrub_mod._GLUED_REFUSED_WORDS)
-    keep = {word.lower() for word in scrub_mod._MEMBER_KEEP_WORDS}
-    spellable = [word for word in keep if re.fullmatch("[a-z]+", word)]
-    assert spellable, "no member-keep word is spellable, so nothing is checked"
-    assert all(refused.search(word) for word in spellable), [
-        word for word in spellable if not refused.search(word)
-    ]
-    words = scrub_mod._GLUED_REFUSED_WORDS.removeprefix("(?:").removesuffix(")").split("|")
-    assert set(words) <= keep, set(words) - keep
-
-
-def _without_fold_check(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every stopped pattern in both copies with the fold check taken out of its value walk."""
-    for module in (scrub_mod, redact_mod):
-        for name in ("_MEFOR_SECRET", "_BEARER", "_CREDENTIAL_KV", "_KEY_MATERIAL", "_AUTH_SCHEME"):
-            pattern: re.Pattern[str] = getattr(module, name)
-            source = pattern.pattern.replace(module._FOLD_BEFORE, "").replace(module._FOLD_AT, "")
-            monkeypatch.setattr(module, name, re.compile(source, pattern.flags))
-
-
-def _fold_corpus() -> list[str]:
-    firsts = ("MEFOR_A=vq0", "token=vq0", "password=vq0", "private_key=vq0", "session: vq0")
-    seps = (";", ",", " ", "&", "|", "a", "_")
-    seconds = (
-        *(f"{_LONG_S}ecret", f"{_LONG_S}ession", "secret", "session"),
-        *(f"{_DOTLESS_I}ntake_api_key_next", f"{_DOTTED_I}ntake_api_key_next"),
+    words = _words_later_passes_read()
+    assert "nonnumeric" in words and "mrn" in words, "the sources lost a word this test relies on"
+    assert all(refused.search(word) for word in words), sorted(
+        word for word in words if not refused.search(word)
     )
-    values = ("vq1", '"vq1 vq2"', "'vq1 vq2'", "{vq1 zz}", "{vq1 vq2}", "{zz zz}")
-    return [
-        f"{first}{sep}{second}{assign}{value}{tail}"
-        for first, sep, second, assign, value, tail in itertools.product(
-            firsts, seps, seconds, ("=", ": "), values, ("", " vq3")
-        )
-    ]
+    listed = scrub_mod._GLUED_REFUSED_WORDS.removeprefix("(?:").removesuffix(")").split("|")
+    assert set(listed) <= words, set(listed) - words
 
 
-def test_the_fold_check_prints_nothing_the_reading_without_it_hid(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The same differential for the fold check, with a reverse difference as its control."""
-    corpus = _fold_corpus()
-    shipped = _readings(corpus)
-    _without_fold_check(monkeypatch)
-    before = _readings(corpus)
-    newly = _newly_printed(shipped, before, corpus)
-    assert not newly, f"{len(newly)} atoms newly printed, first: {newly[:3]}"
-    assert _newly_printed(before, shipped, corpus), (
-        "the fold check hid nothing, so nothing compared"
-    )
+def test_the_glued_initials_gate_holds_every_refused_word() -> None:
+    """The one-character gate in front of the alternation names each refused word's first letter."""
+    gate = re.search(r"\(\?!\[([a-z]+)\]\)", scrub_mod._GLUED_LOWER)
+    assert gate is not None, scrub_mod._GLUED_LOWER
+    listed = scrub_mod._GLUED_REFUSED_WORDS.removeprefix("(?:").removesuffix(")").split("|")
+    assert {word[0] for word in listed} == set(gate.group(1))

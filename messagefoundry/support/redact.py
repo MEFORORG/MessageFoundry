@@ -57,7 +57,6 @@ from messagefoundry.secretscrub import (
     _BEARER_TAILS,
     _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
-    _FOLD_GATE,
     _KEY_GLUED_BRANCH,
     _KV_TAILS,
     _MEFOR_GLUED_BRANCH,
@@ -207,12 +206,6 @@ _NOT_BEFORE_QUOTED_LABEL = (
     + _MEFOR_QUOTED_LABEL
     + r")"
 )
-# The same checks in front of a separator outside ASCII, so a keyword spelled with a fold character
-# for its first letter stops a plain value here as it does in ``messagefoundry/secretscrub.py``
-# (BACKLOG #3114 step 4); why is stated once, on the same fragments there.
-# The gate is secretscrub's object, imported; the label checks behind it are this copy's own.
-_FOLD_AT = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_AT_QUOTED_LABEL + r")"
-_FOLD_BEFORE = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_BEFORE_QUOTED_LABEL + r")"
 
 
 # ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
@@ -268,26 +261,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_AT}[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_BEFORE}[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_AT}[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_BEFORE}[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_AT}[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_BEFORE}[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_AT}[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|{_FOLD_BEFORE}[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}[A-Za-z0-9]++|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 

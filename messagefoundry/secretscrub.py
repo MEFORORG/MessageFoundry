@@ -583,10 +583,7 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # and for the same reason no lookbehind is needed in front of the keyword. Per unit is cheaper than
 # per character, but not by much on a hyphen-and-dot run, where every run is one character long. What
 # keeps ordinary lines level is the fast path at ``_NO_QUOTED_LABEL_AFTER``, which skips the walk
-# entirely. Since BACKLOG #3114 step 4 a walk also checks in front of a fold letter it reads as a
-# separator, after a character that is not an ASCII letter or digit (:data:`_FOLD_BEFORE`): that is
-# where a unit of the ASCII spelling would start, so the two still agree, and it adds at most one
-# check per such letter.
+# entirely.
 #
 # THE MEFOR_ BRANCH KEEPS THE ``\b`` ITS OWN PATTERN HAS, and so does the prefix branch. That is a cost
 # decision. ``\b`` cannot fire inside a word, so a long MEFOR_MEFOR_... or a_a_a_... run offers one
@@ -613,12 +610,13 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # run or at the very start of the value, still prints the quoted value: ``pwd=a_password="v w"``,
 # ``password=x.client_secret="v w"`` and ``token=bearer_token="v w"``. The stop lands on the keyword
 # and the pass cannot resume there. A label of a later family is caught, because it sees the keyword
-# right after the placeholder. A keyword spelled with a fold character such as U+017F as its FIRST
-# letter was not checked where the run class does not fold, because the walk read that character as
-# a separator and checked only from the next letter. That was ``_MEFOR_SECRET`` here, the one pattern
-# in this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern but
-# ``_AUTH_SCHEME``. Since BACKLOG #3114 step 4 the walk checks in front of every separator outside
-# ASCII too (:data:`_FOLD_BEFORE`), so the check runs there.
+# right after the placeholder. And a keyword spelled with a fold character such as U+017F as its FIRST
+# letter is not checked where the run class does not fold, because the walk reads that character as a
+# separator and checks only from the next letter. That is ``_MEFOR_SECRET`` here, the one pattern in
+# this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern but
+# ``_AUTH_SCHEME``: there ``_MEFOR_SECRET`` has no fold, and ``_BEARER``, ``_CREDENTIAL_KV`` and
+# ``_KEY_MATERIAL`` fold their keywords alone. Both copies of ``_AUTH_SCHEME`` fold globally, so their
+# run class folds and the check runs.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -757,25 +755,33 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 #   the next space, a ``://`` or a ``-----BEGIN`` marker. Found by code review on this change, with
 #   ``MEFOR_X={pp PID|x}x rest vq9`` printing "rest vq9" in the bundle.
 # * No word a later pass reads, anywhere in those letters: :data:`_GLUED_REFUSED_WORDS`, which
-#   ``mrn`` and the scheme words are in. ``MEFOR_X={pp ww}mrn 12345`` printed "12345" in the bundle
-#   without it, found by the same review.
+#   ``mrn``, ``nonnumeric`` and the scheme words are in. ``MEFOR_X={pp ww}mrn 12345`` printed
+#   "12345" in the bundle without it, and ``nonnumeric port: 'pw@host'`` after the glued text printed
+#   the password, found by the first and second review rounds.
 # * The glued text ends where the plain class stops, and is not followed by white space and a ":",
 #   "=" or quote, or by a quote, which is :data:`_NO_QUOTED_LABEL_AFTER`: ``;password = v`` keeps its
 #   label.
 #
 # These are the readings found so far, not a proof that no later pass reads anything else in such
-# text. ``tests/test_secretscrub_braced_glued_fold.py`` compares both surfaces with and without the
+# text. ``tests/test_secretscrub_braced_glued.py`` compares both surfaces with and without the
 # branch over a seeded corpus that holds the anchors above, with a widened branch as its positive
 # control.
-#: Every word a later pass reads that lower case ASCII letters can spell: :data:`_MEMBER_KEEP_WORDS`
-#: reduced by subsumption, and with its entries holding "_", "-" or a digit left out, since no such
-#: text holds one. ``tests/test_secretscrub_braced_glued_fold.py`` holds it to that tuple.
+#: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
+#: and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
+#: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
+#: holding "_", "-" or a digit left out, since no such text holds one. Refusing a short word such as
+#: ``id`` refuses every glued word holding it; that costs coverage only.
+#: ``tests/test_secretscrub_braced_glued.py`` holds it to those sources, which can grow, so a
+#: word a later pass reads and no source lists is not refused.
 _GLUED_REFUSED_WORDS = (
     r"(?:pass|pwd|secret|credential|auth|bearer|token|session|key|sig|jwt|code|state|basic|digest"
     r"|mrn|name|address|family|given|birthdate|identifier|telecom|patient|medicalrecordlocator"
-    r"|responsibleperson)"
+    r"|responsibleperson|access|api|bhs|enc|false|fhs|fs|id|intake|mefor|mfb|msh|next|none"
+    r"|nonnumeric|null|port|private|redacted|retired|true|za)"
 )
-_GLUED_LOWER = r"(?!" + _GLUED_REFUSED_WORDS + r")(?-i:[a-z])"
+#: One lower case letter that does not start a refused word. The one-character gate in front skips
+#: the alternation for a letter no refused word starts with.
+_GLUED_LOWER = r"(?-i:(?![abcdefgijkmnprstz])[a-z]|(?!" + _GLUED_REFUSED_WORDS + r")[a-z])"
 _SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+ (?: |" + _GLUED_LOWER + r")*+\}(?!\})"
 
 #: One unit of a value walk: a run of letters and digits, SPLIT AT EVERY CAMELCASE BOUNDARY, a capital
@@ -943,23 +949,6 @@ _NOT_BEFORE_QUOTED_LABEL = (
     + _MEFOR_QUOTED_LABEL
     + r")"
 )
-#: The same checks, made in front of a character the walk reads as a SEPARATOR when that character is
-#: outside ASCII (BACKLOG #3114 step 4). A keyword spelled with a fold character for its first letter,
-#: such as U+017F for the "s" of ``secret``, is a label to :data:`_LABEL_HEAD` and
-#: :data:`_BRACED_HEAD`, which fold their keywords, but a walk whose run class does not fold read that
-#: letter as a separator and checked only from the next one. So ``MEFOR_X=a;`` and the keyword
-#: spelled that way, then ``={pp ww}``, printed " ww}" where the ASCII spelling prints " xx}". Under a
-#: global ``(?i)`` the run class already takes those letters and the separator class never sees them,
-#: so this changes only ``_MEFOR_SECRET`` here and the patterns without a global fold in
-#: ``support/redact.py``. The check runs only in front of one of the four :data:`_GATE_FOLDS`
-#: letters, the characters ``(?i)`` reads as an ASCII letter, and only where no ASCII letter or digit
-#: is right before it, which is where a unit of the ASCII spelling starts after a separator. So the
-#: stop lands there as it does for the ASCII spelling, and every other separator is read as before,
-#: unchecked.
-#: ``tests/test_secretscrub_braced_glued_fold.py`` holds the class to :data:`_GATE_FOLDS`.
-_FOLD_GATE = r"(?<![A-Za-z0-9])(?=[İıſK])"
-_FOLD_AT = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_AT_QUOTED_LABEL + r")"
-_FOLD_BEFORE = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_BEFORE_QUOTED_LABEL + r")"
 
 
 #: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
@@ -1059,26 +1048,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
