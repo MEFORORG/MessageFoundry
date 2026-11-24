@@ -2395,8 +2395,7 @@ class PostgresStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before, once the
-        forced release has dropped what that close did not reach, a cancel included. Under an
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
         ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
         async generator may await there; only if it fails or a cancel interrupts it does the
         forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
@@ -2459,10 +2458,7 @@ class PostgresStore:
                 what="a one-connection store's cleanup",
             )
             raise
-        # A close cut short, a cancel in its settle included, would leave the pool open.
-        await close_or_force(
-            store.close, lambda: pool.terminate(), what="a one-connection store's close"
-        )
+        await store.close()
 
     @classmethod
     async def schema_meta_anywhere(
@@ -3031,6 +3027,17 @@ class PostgresStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
+        # A cancel in the settle, a DB write, would otherwise skip the pool's close: the pool is
+        # then terminated without waiting, and the cancel raised (BACKLOG #5720).
+        await close_or_force(
+            self._settle_at_close,
+            lambda: self._pool.terminate(),
+            what="a store close cut short in its settle",
+        )
+        await self._pool.close()
+
+    async def _settle_at_close(self) -> None:
+        """The AES-GCM settle :meth:`_close_handles` runs first; a failure is logged, not raised."""
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
@@ -3042,7 +3049,6 @@ class PostgresStore:
                 "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
             )
             log.debug("the settle's failure at close", exc_info=exc)
-        await self._pool.close()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

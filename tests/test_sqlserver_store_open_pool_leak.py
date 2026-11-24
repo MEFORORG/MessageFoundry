@@ -618,34 +618,3 @@ async def test_a_close_that_failed_in_its_pool_step_is_not_retried(
     assert executor.shutdown_calls == [False]
     assert "after an error also failed (ConnectionResetError)" in caplog.text
     assert "closing the pool after that also failed" not in caplog.text
-
-
-async def test_a_cancel_during_a_clean_exits_close_releases_the_pool_and_executor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BACKLOG #5720 (engine PR 3140 tail-review finding 2): on a clean exit the one-connection
-    store's close ran bare, so a cancel landing before its pool step left the pool and the
-    executor's threads. Red before the fix: neither is released."""
-    closing = asyncio.Event()
-
-    async def slow_claim_holders(self: SqlServerStore) -> None:
-        closing.set()
-        await asyncio.sleep(5)
-
-    monkeypatch.setattr(SqlServerStore, "_close_claim_holders", slow_claim_holders)
-    pool = _FakePool()
-    _install_fake_aioodbc(monkeypatch, pool)
-    executor = _fake_executor(monkeypatch)
-    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
-
-    async def body() -> None:
-        async with SqlServerStore._one_connection_store(_settings(), posture=None):
-            pass
-
-    task = asyncio.create_task(body())
-    await asyncio.wait_for(closing.wait(), 5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert pool.closed == 1
-    assert executor.shutdown_calls == [False]

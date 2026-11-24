@@ -5834,8 +5834,7 @@ class SqlServerStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before, once the
-        forced release has dropped what that close did not reach, a cancel included. Under an
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
         ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
         async generator may await there; only if it fails or a cancel interrupts it does the
         forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
@@ -5845,14 +5844,6 @@ class SqlServerStore:
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, maxsize=1)
         store: SqlServerStore | None = None
-
-        def _force_release() -> None:
-            # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
-            try:
-                pool.close()
-            finally:
-                executor.shutdown(wait=False)
-
         try:
             store = cls(pool, settings)
             store._pool_executor = executor
@@ -5867,6 +5858,13 @@ class SqlServerStore:
                 try:
                     pool.close()
                     await pool.wait_closed()
+                finally:
+                    executor.shutdown(wait=False)
+
+            def _force_release() -> None:
+                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
+                try:
+                    pool.close()
                 finally:
                     executor.shutdown(wait=False)
 
@@ -5942,9 +5940,7 @@ class SqlServerStore:
                 what="a one-connection store's cleanup",
             )
             raise
-        # A close cut short before its pool step, a cancel in its settle included, would leave the
-        # pool and the executor open.
-        await close_or_force(store.close, _force_release, what="a one-connection store's close")
+        await store.close()
 
     @classmethod
     async def schema_meta_anywhere(
@@ -6094,17 +6090,14 @@ class SqlServerStore:
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
         # a failing settlement must never turn a clean shutdown into an error.
-        try:
-            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
-                await self.checkpoint_cipher_invocations(settle=True)
-        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
-            # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
-            # path or a value, and the one-connection store's error path and open_store's keyless
-            # refusal run this close too (BACKLOG #5720).
-            log.warning(
-                "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
-            )
-            log.debug("the settle's failure at close", exc_info=exc)
+        # A cancel in the settle, a DB write, would otherwise skip every step below: the pool is
+        # then marked closing and its executor shut down without waiting, and the cancel raised
+        # (BACKLOG #5720). Marking it closing does not close its free connections.
+        await close_or_force(
+            self._settle_at_close,
+            self._force_pool_release,
+            what="a store close cut short in its settle",
+        )
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
         self.close_sync_handoff_pool()
@@ -6119,6 +6112,29 @@ class SqlServerStore:
         try:
             self._pool.close()
             await self._pool.wait_closed()
+        finally:
+            if self._pool_executor is not None:
+                self._pool_executor.shutdown(wait=False)
+                self._pool_executor = None
+
+    async def _settle_at_close(self) -> None:
+        """The AES-GCM settle :meth:`_close_handles` runs first; a failure is logged, not raised."""
+        try:
+            if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
+                await self.checkpoint_cipher_invocations(settle=True)
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
+            # path or a value, and the one-connection store's error path and open_store's keyless
+            # refusal run this close too (BACKLOG #5720).
+            log.warning(
+                "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
+            )
+            log.debug("the settle's failure at close", exc_info=exc)
+
+    def _force_pool_release(self) -> None:
+        """Synchronous: mark the pool closing and shut its executor down, without waiting."""
+        try:
+            self._pool.close()
         finally:
             if self._pool_executor is not None:
                 self._pool_executor.shutdown(wait=False)

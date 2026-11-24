@@ -21,7 +21,7 @@ import pytest
 from messagefoundry.store import store as store_module
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.store.gcm_bound import checkpoint_invocations
-from messagefoundry.store.store import cleanup_failed_open
+from messagefoundry.store.store import _force_failed_open_release, cleanup_failed_open
 
 _SECRET = "synthetic-row-value-5720"
 
@@ -53,7 +53,8 @@ async def test_a_bound_cleanup_whose_forced_release_failed_does_not_say_it_relea
             )
         finally:
             unwedge.set()
-            await asyncio.sleep(0)
+            for _ in range(10):  # let the abandoned cleanup finish before the test ends
+                await asyncio.sleep(0)
     assert "did not finish within 0.05 s of a cancel" in caplog.text
     assert "forcing the release after a failed store open also failed (OSError)" in caplog.text
     assert "released without waiting" not in caplog.text
@@ -158,3 +159,13 @@ async def test_an_add_that_fails_after_its_pass_was_cancelled_is_logged_by_class
     assert records[0].exc_info is None
     assert "(RuntimeError)" in records[0].getMessage()
     assert _SECRET not in caplog.text
+
+
+def test_a_release_that_reports_a_failed_step_is_not_counted_as_released() -> None:
+    """A release made of several steps, such as SQLite's, returns False when a step failed; before
+    the fix that was counted as released, so the cleanup's log said what the open built was
+    released (engine PR 3140 review round-32b0c94714 finding 3)."""
+    assert _force_failed_open_release(lambda: False) is False
+    assert _force_failed_open_release(lambda: None) is True
+    assert _force_failed_open_release(lambda: True) is True
+    assert _force_failed_open_release(None) is False

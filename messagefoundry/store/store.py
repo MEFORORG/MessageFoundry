@@ -2175,11 +2175,13 @@ def _force_failed_open_release(
 ) -> bool:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
     None is a caller with nothing it can release without waiting. True only when a release ran
-    and returned, so a caller's log line says the release happened only then (BACKLOG #5720)."""
+    and returned something other than ``False``, which a release made of several steps returns
+    when one of them failed, so a caller's log line says the release happened only then (BACKLOG
+    #5720)."""
     if force_release is None:
         return False
     try:
-        force_release()
+        return force_release() is not False
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
             "forcing the release after %s also failed (%s)",
@@ -2187,7 +2189,6 @@ def _force_failed_open_release(
             type(failure).__name__,
         )
         return False
-    return True
 
 
 def _forced_outcome(
@@ -2236,6 +2237,20 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _force_stop_connections(conns: Sequence[aiosqlite.Connection]) -> bool:
+    """Interrupt and stop each of ``conns`` without waiting, each step's failure logged by class.
+    False when any step failed, so the caller does not report them released (BACKLOG #5720).
+    interrupt() aborts a statement the worker is running, so the close stop() queues behind it is
+    reached; stop() does not await it."""
+    released = True
+    for conn in conns:
+        raw = getattr(conn, "_connection", None)
+        if raw is not None:
+            released &= _force_failed_open_release(raw.interrupt)
+        released &= _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+    return released
 
 
 def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
@@ -2364,7 +2379,7 @@ async def cleanup_failed_open(
                     force_release,
                     released,
                     built="what the open built",
-                    left="is left to the cleanup, which finishes on its own",
+                    left="is left to the cleanup, until it finishes, if it does",
                 ),
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
@@ -12393,14 +12408,8 @@ class MessageStore:
             # Read now: close() empties the list, and a forced release must still reach each one.
             conns = [*(store._read_conns if store is not None else ()), db]
 
-            def _force_release() -> None:
-                # interrupt() aborts a statement the worker is running, so the close stop()
-                # queues behind it is reached; stop() does not await it (BACKLOG #5720).
-                for conn in conns:
-                    raw = getattr(conn, "_connection", None)
-                    if raw is not None:
-                        _force_failed_open_release(raw.interrupt)
-                    _force_failed_open_release(functools.partial(_stop_unawaited, conn))
+            def _force_release() -> bool:
+                return _force_stop_connections(conns)
 
             await cleanup_failed_open(exc, _release, _force_release, cancels_before=cancels_before)
             raise
@@ -14071,17 +14080,29 @@ class MessageStore:
             if callable(release):
                 release()
 
-    async def _close_handles(self) -> None:
-        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
-        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
-        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
-        # a failing settlement must never turn a clean shutdown into an error.
+    async def _settle_at_close(self) -> None:
+        """The AES-GCM settle :meth:`_close_handles` runs first; a failure is logged, not raised."""
         try:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             _log_close_failure("could not settle the AES-GCM invocation bound at close", exc)
+
+    async def _close_handles(self) -> None:
+        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
+        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
+        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
+        # a failing settlement must never turn a clean shutdown into an error.
+        # A cancel in the settle, a write, would otherwise skip every close below and leave the
+        # connections' non-daemon worker threads running: they are interrupted and stopped without
+        # waiting, and the cancel raised (BACKLOG #5720). A group-commit committer is not stopped.
+        conns = [*self._read_conns, self._db]
+        await close_or_force(
+            self._settle_at_close,
+            functools.partial(_force_stop_connections, conns),
+            what="a store close cut short in its settle",
+        )
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
         # resolves their futures before the write connection is closed — otherwise an in-flight handoff
         # would hang forever on a future no committer will ever complete.
