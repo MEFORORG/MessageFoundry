@@ -334,7 +334,7 @@ try {
     # of this root's, a reading is refused when it has the same reset and is not higher, or when its
     # reset is earlier than the published one and has already passed: that is the number an idle
     # session still holds after a reset. Any other reset is a new window, under the live-session rule
-    # below, which applies only where both windows carry a readable reset. A
+    # (below, and ADR 0211), which applies only where both windows carry a readable reset. A
     # refused reading leaves the published window whole, its own age included, so the
     # staleness guard keeps counting from the last real observation.
     #
@@ -362,21 +362,9 @@ try {
     # live reading could lower until that reset. With no published reset ahead there is nothing to hold
     # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
     #
-    # THE LIVE-SESSION RULE (BACKLOG #5178), stated once in ADR 0211, "The live-session rule", with its
-    # two open gaps. ONLY WHERE THE READING AND THE PUBLISHED WINDOW BOTH CARRY A READABLE RESET, a
-    # lower or equal reading on another reset opens a new window only from a live session: one that
-    # has just called the API and is stamped with this root by Test-OwnStamp, as a confirmation must
-    # be, so an unpinned session of another root that publishes here passes too. Otherwise, after a
-    # moved reset, an idle session's frozen number replaced the published one on every fire. A higher
-    # reading there is taken from anyone, before or after the published reset, because refusing it
-    # weakens a stop: while that reset is ahead the lower published number could clear the gate, and
-    # past it the gone window reads UNKNOWN, so the gate would answer REVIEW where the higher number
-    # halts it. A first fire is never live, so a lower or equal reading waits for a live session.
-    # Where either side has no readable reset, the else branch below decides and liveness plays no
-    # part: past the published reset an idle no-reset reading is taken and drops the reset, and the
-    # next idle reading of any value is then taken (the no-reset gap). A higher reading from a session
-    # pinned to another root is taken too, stamped with that root, and a window stamped with another
-    # root is no floor (the foreign-root gap, which predates BACKLOG #5178).
+    # THE LIVE-SESSION RULE (BACKLOG #5178): $live below, used only in the both-resets branch. ADR 0211,
+    # "The live-session rule", states what it does, its scope and at least its known gaps; read it there
+    # rather than here. The else branch, where either side has no readable reset, ignores liveness.
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset

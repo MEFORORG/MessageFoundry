@@ -448,7 +448,12 @@ roster alias of the Lander.
 > publishes here counts as live. Where either side has no readable reset, the rule does not apply: a
 > reading with no readable reset is refused while the published reset is ahead, higher or not, because
 > it cannot prove which window it belongs to, and is otherwise taken whatever its value; and any reading
-> over a published window with no readable reset is taken, from any session. **Known gaps, both open:**
+> over a published window with no readable reset is taken, from any session. A higher reading is taken
+> from any session because refusing it weakens a stop: while the published reset is ahead, the lower
+> published number could clear the gate, and past it the gone window reads UNKNOWN, so the gate would
+> answer REVIEW where the higher number halts it. A first fire is never live. **Known gaps, at least
+> these two, both open; the limits below name more, among them the trade between a live lower session
+> and an idle higher one, and a failed call that may still read as live:**
 >
 > - The no-reset path. Once the published reset has passed, one idle reading with no reset is taken
 >   and drops the reset, and the next idle reading, a frozen low number on a new reset, is then taken
