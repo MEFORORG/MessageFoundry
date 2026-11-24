@@ -644,10 +644,10 @@ class _GroupCommitter:
     def _on_stopped(self, task: asyncio.Task[None]) -> None:
         """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
         first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
-        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
-        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
-        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
-        body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
+        no :meth:`submit` after this runs may enrol, and every member still pending is rejected, or
+        its caller (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather
+        than a ``finally`` in :meth:`_run`, because a task cancelled before its first step never
+        enters its body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
 
         :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
         the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
@@ -682,9 +682,10 @@ class _GroupCommitter:
             except asyncio.CancelledError:
                 # A committer cancelled earlier rejects its members in _on_stopped, which its
                 # done-callback or the call below runs once; that stale cancel must not abort the
-                # store's close. A cancel of OUR task during the await still propagates, leaving
-                # _task set so the done-callback still rejects; the baseline keeps a caller that
-                # already caught an earlier cancel of its own from reading as cancelled now.
+                # store's close. A cancel of OUR task during the await still propagates; asyncio
+                # passes it on to the committer, whose done-callback has already run _on_stopped by
+                # the time this re-raises. The baseline keeps a caller that already caught an
+                # earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
