@@ -1714,16 +1714,30 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
     )
 
 
+def _keyless_seal(fields: tuple[tuple[str, object], ...]) -> str:
+    """The seal a store with no sealer writes over ``fields``: empty. A float in ``fields`` that is
+    a NaN or an infinity raises ``ValueError``, as :meth:`RowSealer.seal` refuses one (BACKLOG
+    #6717): SQLite stores a NaN as ``NULL``, so a keyless write would otherwise change the value
+    without a word."""
+    if any(isinstance(v, float) and not math.isfinite(v) for _, v in fields):
+        raise ValueError("a row write refuses a float that is not finite")
+    return ""
+
+
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
     """``record`` with its seal set: the sealer's seal over its sealed fields, or empty on a store
     with no sealer (BACKLOG #2592)."""
-    seal = "" if sealer is None else sealer.seal(SESSION_KIND, record.seal_fields())
+    fields = record.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else sealer.seal(SESSION_KIND, fields)
     return replace(record, seal=seal)
 
 
 async def seal_session_async(sealer: AnyRowSealer | None, record: SessionRecord) -> SessionRecord:
     """:func:`seal_session`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    seal = "" if sealer is None else await sealer.seal_async(SESSION_KIND, record.seal_fields())
+    fields = record.seal_fields()
+    seal = (
+        _keyless_seal(fields) if sealer is None else await sealer.seal_async(SESSION_KIND, fields)
+    )
     return replace(record, seal=seal)
 
 
@@ -4149,13 +4163,15 @@ def _factor_unproven(
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
     store with no sealer (BACKLOG #2592)."""
-    seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
+    fields = record.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else sealer.seal(USER_KIND, fields)
     return record.changed(authz_seal=seal)
 
 
 async def seal_user_async(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """:func:`seal_user`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    seal = "" if sealer is None else await sealer.seal_async(USER_KIND, record.seal_fields())
+    fields = record.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else await sealer.seal_async(USER_KIND, fields)
     return record.changed(authz_seal=seal)
 
 
@@ -5807,12 +5823,16 @@ class RoleRow:
 
 def seal_role(sealer: RowSealer | None, row: RoleRow) -> RoleRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
-    return replace(row, seal="" if sealer is None else sealer.seal(ROLE_KIND, row.seal_fields()))
+    fields = row.seal_fields()
+    return replace(
+        row, seal=_keyless_seal(fields) if sealer is None else sealer.seal(ROLE_KIND, fields)
+    )
 
 
 async def seal_role_async(sealer: AnyRowSealer | None, row: RoleRow) -> RoleRow:
     """:func:`seal_role`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    seal = "" if sealer is None else await sealer.seal_async(ROLE_KIND, row.seal_fields())
+    fields = row.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else await sealer.seal_async(ROLE_KIND, fields)
     return replace(row, seal=seal)
 
 
@@ -5949,7 +5969,8 @@ def ad_map_write(sealer: RowSealer | None, current: AdMap, change: AdMapChange) 
         raise RowSealError(ADSET_KIND)
     else:
         changed = change(current)
-    seal = "" if sealer is None else sealer.seal(ADSET_KIND, changed.seal_fields())
+    fields = changed.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else sealer.seal(ADSET_KIND, fields)
     return _ad_map_if_changed(current, replace(changed, seal=seal))
 
 
@@ -5967,7 +5988,8 @@ async def ad_map_write_async(
                 sealer, ADSET_KIND, current.seal_fields(), current.seal, subject=""
             )
         changed = change(current)
-    seal = "" if sealer is None else await sealer.seal_async(ADSET_KIND, changed.seal_fields())
+    fields = changed.seal_fields()
+    seal = _keyless_seal(fields) if sealer is None else await sealer.seal_async(ADSET_KIND, fields)
     return _ad_map_if_changed(current, replace(changed, seal=seal))
 
 
@@ -6265,8 +6287,9 @@ def new_approval_row(
 
 def seal_approval(sealer: RowSealer | None, row: ApprovalRow) -> ApprovalRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
+    fields = row.seal_fields()
     return replace(
-        row, seal="" if sealer is None else sealer.seal(APPROVAL_KIND, row.seal_fields())
+        row, seal=_keyless_seal(fields) if sealer is None else sealer.seal(APPROVAL_KIND, fields)
     )
 
 
@@ -6283,7 +6306,10 @@ def approval_seal_ok(sealer: RowSealer | None, row: ApprovalRow) -> bool:
 
 async def seal_approval_async(sealer: AnyRowSealer | None, row: ApprovalRow) -> ApprovalRow:
     """:func:`seal_approval`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    seal = "" if sealer is None else await sealer.seal_async(APPROVAL_KIND, row.seal_fields())
+    fields = row.seal_fields()
+    seal = (
+        _keyless_seal(fields) if sealer is None else await sealer.seal_async(APPROVAL_KIND, fields)
+    )
     return replace(row, seal=seal)
 
 
@@ -6402,12 +6428,10 @@ def approval_tombstone(
     Sealed under :data:`~messagefoundry.store.row_seal.APPROVAL_TOMBSTONE_KIND` over
     :func:`approval_tombstone_fields`, so it never verifies as the row's approval seal: the row
     keeps failing :func:`approval_seal_ok`, and nothing can turn it back into a request that holds."""
+    fields = approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at)
     if sealer is None:
-        return ""
-    return sealer.seal(
-        APPROVAL_TOMBSTONE_KIND,
-        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
-    )
+        return _keyless_seal(fields)
+    return sealer.seal(APPROVAL_TOMBSTONE_KIND, fields)
 
 
 def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[str, float] | None:
@@ -6460,12 +6484,10 @@ async def approval_tombstone_async(
     sealer: AnyRowSealer | None, approval_id: str, *, approver: str, decided_at: float
 ) -> str:
     """:func:`approval_tombstone`, awaitable, for either sealer (ADR 0217 slice 1b)."""
+    fields = approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at)
     if sealer is None:
-        return ""
-    return await sealer.seal_async(
-        APPROVAL_TOMBSTONE_KIND,
-        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
-    )
+        return _keyless_seal(fields)
+    return await sealer.seal_async(APPROVAL_TOMBSTONE_KIND, fields)
 
 
 async def held_approval_tombstone_async(
