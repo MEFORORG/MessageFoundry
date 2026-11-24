@@ -389,7 +389,7 @@ async def test_an_oauth2_401_invalidates_the_token_and_retries(body: bytes) -> N
         await dest.send("<env/>")
     assert not isinstance(ei.value, NegativeAckError)  # transient: it retries with a fresh bearer
     assert provider.invalidations == 1
-    assert str(ei.value) == f"SOAP {URL} returned HTTP 401; refreshing OAuth2 token"
+    assert str(ei.value) == f"SOAP {URL} returned HTTP 401; refreshing the bearer token"
 
 
 _WSSE_401 = b"<soap:Fault><faultcode>wsse:FailedAuthentication</faultcode></soap:Fault>"
@@ -460,11 +460,22 @@ class _ResetDuringRead(_Resp):
         raise ConnectionResetError("reset mid-body")
 
 
+class _CloseFails(_Resp):
+    """A 2xx read whole whose close then fails (code-review round 3a1460c8)."""
+
+    def __exit__(self, *a: object) -> None:
+        raise ConnectionResetError("reset on close")
+
+
 def _between(kind: str) -> _Opener:
     if kind == "2xx":
         return _Opener(resp=_Resp(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>"))
     if kind == "2xx-read-fails":
         return _Opener(resp=_ResetDuringRead(200))
+    if kind == "2xx-close-fails":
+        return _Opener(
+            resp=_CloseFails(200, b"<soap:Envelope><soap:Body>ok</soap:Body></soap:Envelope>")
+        )
     if kind == "2xx-sender-fault":
         return _Opener(resp=_Resp(200, _SENDER_11.encode()))
     if kind == "2xx-ws-security-fault":
@@ -492,7 +503,9 @@ async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
     dest._opener = _Opener(exc=_http_error(401, _WSSE_401))  # type: ignore[assignment]
 
 
-@pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "2xx-sender-fault", "plain-401"])
+@pytest.mark.parametrize(
+    "kind", ["2xx", "2xx-read-fails", "2xx-close-fails", "2xx-sender-fault", "plain-401"]
+)
 async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run(kind: str) -> None:
     """A 2xx that is not a WS-Security fault, a 2xx whose read fails, or a 401 that is not a
     WS-Security fault ends the run, so the next WS-Security 401 gets its retry again. Mutations:
@@ -589,6 +602,10 @@ _FAILED_AUTH_EXPIRED_ELSEWHERE = {
         b"<soap:Value>wsse:FailedAuthentication</soap:Value></soap:Subcode></soap:Code>"
         b"<soap:Detail><note>MessageExpired</note></soap:Detail></soap:Fault>"
     ),
+    "attribute-names-expired": (
+        b'<soap:Fault><faultcode a="MessageExpired">wsse:FailedAuthentication</faultcode>'
+        b"</soap:Fault>"
+    ),
     "after-the-fault": (
         b"<soap:Envelope><soap:Body><soap:Fault><faultcode>wsse:InvalidSecurityToken</faultcode>"
         b"</soap:Fault></soap:Body></soap:Envelope><!-- MessageExpired -->"
@@ -629,6 +646,10 @@ _EXPIRED_IN_THE_CODE = {
         b"<soap:Fault><faultcode>soap:Client</faultcode>"
         b"<faultstring>wsse:MessageExpired</faultstring>"
         b"<detail>InvalidSecurityToken</detail></soap:Fault>"
+    ),
+    "credential-code-in-a-comment": (
+        b"<soap:Fault><faultcode><!-- FailedAuthentication -->soap:Client</faultcode>"
+        b"<faultstring>wsse:MessageExpired</faultstring></soap:Fault>"
     ),
     "comment-in-the-faultcode": (
         b"<soap:Fault><faultcode><!-- </faultcode> -->wsse:MessageExpired</faultcode>"
