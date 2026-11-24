@@ -152,10 +152,7 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -List
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
 ```
 
-- `-To <path>` -- the recipient **worktree** root. A path inside a worktree but not its root is
-  refused, naming the root: a session's drain keys its box on the cwd it runs in, normally the root,
-  so a box keyed on a subdirectory would go unread (BACKLOG #7581). A path in no worktree is still
-  accepted, for an `-AnchorRepo` session. Matched case-insensitively and exactly. `all`
+- `-To <path>` -- the recipient **worktree** path. Matched case-insensitively and exactly. `all`
   broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
 - `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
   registry holds a readable record for it that names a worktree. **Use this for a seat on another PC**: its worktree path

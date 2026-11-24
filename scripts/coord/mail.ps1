@@ -57,12 +57,6 @@
     seat's worktree and host key to now, never to the old box, which every PC at that path reads. A
     record under it that names no host is refused, and so is any seat record that names no worktree:
     neither can be keyed to one PC's box.
-    A -To PATH INSIDE A WORKTREE BUT NOT ITS ROOT IS REFUSED, naming the root (BACKLOG #7581). It is
-    hashed as given, and a session's drain keys its box on the cwd it runs in, which is its worktree
-    root unless it was launched below it; seat.ps1 publishes the root's key. So a box keyed on a
-    subdirectory is one no drain is likely to read, and a leftover directory of a removed worktree
-    nested under the primary is not quietly re-addressed to the primary's session either. A path in no
-    worktree is still accepted: that is the box an -AnchorRepo drain reads (docs/SESSION-MAIL.md).
     A cwd is matched case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
     an extension of the primary checkout's path, so a prefix match resolves any peer to some arbitrary
     worktree. VS Code also records a lowercase drive letter where the Desktop app records an uppercase
@@ -124,7 +118,7 @@ param(
     # a caller whose stdin stays open and silent (the Bash tool) waits forever. Measured 2026-10-13/14:
     # four sends hung. The one box checked got nothing. The refusal is right after this param block.
     [Parameter(ParameterSetName = 'Send')][switch]$Send,
-    # Recipient worktree. A worktree ROOT path (matched case-insensitively and exactly), a seat id from the shared
+    # Recipient worktree. A path (matched case-insensitively and exactly), a seat id from the shared
     # seat registry (e.g. autonomy-plan-62022e2c, for a seat on another PC), or "all" to broadcast to
     # every live peer in this repo. Defaults to nothing: refusing to guess is the point.
     [Parameter(ParameterSetName = 'Send')][string]$To,
@@ -261,10 +255,6 @@ function Resolve-SeatRecipient {
 # computed different keys, mail would be written to a box nobody reads and BOTH sides would look
 # healthy. See mail-key.ps1 for why the normalisation is load-bearing.
 . "$PSScriptRoot\mail-key.ps1"
-
-# Get-CcxWorktreeRoot, the drain's own test of which worktree a path sits in (the first directory at
-# or above it holding `.git`). Reused rather than copied; functions only, so dot-sourcing runs nothing.
-. (Join-Path (Split-Path -Parent $PSScriptRoot) 'hooks/_hookinput.ps1')
 
 # The claim primitive is shared with the drain for exactly the reason the box key is: three call sites
 # hand-rolling "did my move win" is three chances for one of them to drift back to a check that was
@@ -533,15 +523,7 @@ if ($Send) {
         }
     }
     elseif (Test-Path -LiteralPath $To -PathType Container) {
-        $full = (Resolve-Path -LiteralPath $To).Path
-        # A path below a worktree root; see ADDRESSING. Refused, never raised: raising it would send a
-        # removed worktree's leftover directory to the primary checkout's session.
-        $top = Get-CcxWorktreeRoot $full
-        if ($top -and -not (Test-CcxSamePath $top $full)) {
-            throw ("Refusing to send: '$To' is inside the worktree $top but is not its root, and a box " +
-                "keyed on it is one no drain is likely to read. Send to the worktree root, or to its seat id.")
-        }
-        $targets = @($full)
+        $targets = @((Resolve-Path -LiteralPath $To).Path)
     }
     else {
         # Not a directory here. It may be a seat id for a seat on another PC; see ADDRESSING.
