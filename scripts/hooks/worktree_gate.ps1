@@ -968,10 +968,11 @@ function Get-ScanRawIndexMap($Seg) {
 # between, and the walk reads it as code; its note says what that excludes. So `GIT reset --hard`
 # and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the PowerShell tool on
 # Windows on 2026-11-18, are refused, and `if true; then GIT reset --hard; fi` is not rewritten,
-# nor is a `GIT` after `do`, `!`, `time`, `env` or `exec`. Under the PowerShell tool a backtick is
-# the escape character, so a `GIT` after one is not rewritten, and neither is one after the dot-source
-# `.`: `` `GIT reset --hard `` and `. GIT reset --hard` are ALLOWED from the primary, as on origin/main
-# (Lander hold of 2026-11-23). On Linux it is not rewritten (a macOS volume formatted case-sensitive
+# nor is a `GIT` after `do`, `!`, `time`, `env` or `exec`. Under the PowerShell tool, at least
+# these are not rewritten and are ALLOWED from the primary, as on origin/main: a `GIT` after a
+# backtick, which is the escape character there, or after the dot-source `.` (Lander hold of
+# 2026-11-23), and after an assignment or `return` (`$x = GIT reset --hard`, `return GIT reset
+# --hard`, review round a9c38332ff). On Linux it is not rewritten (a macOS volume formatted case-sensitive
 # gets the rewrite all the same, which costs only a false deny). Also, at least: any line after an
 # earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
@@ -1235,8 +1236,10 @@ function Test-TrueSeparatorIn([string]$Text) {
 # directory; 1.7 s (3.2 s, 31.6 s) for nine lines whose `-C` paths name no directory, which review
 # round 2c9e3d7a9b had timed at 44.1 s when no failure was kept; and 2.5 s to 2.9 s (2.9 s to
 # 12.4 s, 31.4 s to 50.4 s) for the other three. The one-line shapes stay slower than BASELINE: each
-# hoist names a repository no earlier pass named, so it costs its own git calls and a pass of the rules
-# over the text before its cut. These are single runs on one box, not bounds.
+# hoist asks git about a `-C` no earlier pass named, and every hoist costs a pass of the rules over the
+# text before its cut. A failing question that is not kept is asked once per hoist: review round
+# a9c38332ff measured nine lines whose `-C` names an existing directory that is not a repository at
+# 108 git calls and 12.1 s. These are single runs on one box, not bounds.
 # A run past the shell entry's 20 s proof wait makes the entry start its own gate run, so the wait
 # and that run share the 60 s timeout, and past it a slow run blocks the command rather than letting
 # it through (install-gate.ps1 installs `onFailure = block`).
@@ -3300,10 +3303,14 @@ function Invoke-GitRead([object[]]$GitArgs) {
     }
     $key = $keyArgs -join [char]0
     # WHAT IS KEPT. A success, an exit code of 0 with at least one output line (which may be blank),
-    # is kept for the run. A failure is kept only where the first `-C` is a rooted path that names no
-    # directory: git cannot answer there, and the command that might create it has not run. Any other
-    # failure, or an answer with no line, is asked again on every ask, as with no cache, so one spawn
-    # that failed under load does not stand for a later ask that could read the answer and deny
+    # is kept for the run. A failure is kept only where the first `-C` is a PLAIN absolute path -- a
+    # drive letter and a separator on Windows, a `/` elsewhere, with no `.` or `..` segment -- and .NET
+    # finds no directory there: for that shape .NET and git read the path alike, git cannot answer, and
+    # the command that might create it has not run. A device spelling (`\\?\X:\..\C:\<dir>`,
+    # `\\?\C:/<dir>`) is excluded because .NET reports it missing while git enters it, so keeping its
+    # failure allowed a hijack origin/main refused (review round a9c38332ff). Any other failure, or an
+    # answer with no line, is asked again on every ask, as with no cache, so one spawn that failed under
+    # load does not stand for a later ask that could read the answer and deny
     # (Manager decisions of 2026-11-23 under the owner's instruction to take the strictly safer option,
     # and the Lander's hold of the same day). A kept success is replayed where an uncached ask could
     # have failed instead.
@@ -3319,7 +3326,9 @@ function Invoke-GitRead([object[]]$GitArgs) {
         $c = [Array]::IndexOf($GitArgs, '-C')
         if ($c -ge 0 -and $c + 1 -lt $GitArgs.Count) {
             $dir = $GitArgs[$c + 1]
-            $keep = [System.IO.Path]::IsPathRooted($dir) -and -not [System.IO.Directory]::Exists($dir)
+            $plainAbs = $(if ($IsWindows) { '\A[A-Za-z]:[\\/](?![\\/])' } else { '\A/(?!/)' })
+            $keep = $dir -match $plainAbs -and $dir -notmatch '(?:^|[\\/])\.{1,2}(?:[\\/]|\z)' -and
+                -not [System.IO.Directory]::Exists($dir)
         }
     }
     if ($keep) { $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
@@ -3598,8 +3607,8 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # candidate has answered, since Get-GovernedRootForCommon takes a root any form names; and, under
 # -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
 # kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
-# Neither re-ask runs in the call that made the first ask. Invoke-GitRead's own note says when git is
-# spawned again. The comparable forms are built in the path form current at the call.
+# Neither re-ask runs in the call that made the first ask, and each goes through Invoke-GitRead, so
+# it reaches git only where that function did not keep the failure, which its note says. The comparable forms are built in the path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Read-CommonDirFromGit([string]$CandRaw) {
     $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()

@@ -406,6 +406,37 @@ def test_a_failed_git_answer_is_asked_again(
     assert asks > fails, f"the stub answered no ask ({asks} asks), so this measured nothing"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="device spellings are Windows paths")
+@pytest.mark.parametrize("prefix", ["\\\\?\\X:\\..\\", "\\\\?\\"])
+def test_a_failed_answer_on_a_device_spelling_is_asked_again(
+    rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
+) -> None:
+    """.NET reports these spellings of the worktree missing while git enters them (review round a9c38332ff).
+
+    A failure was kept wherever .NET found no directory, so one failed `worktree list` ask let the
+    hijack through that origin/main refused on its second ask. Only a plain absolute path is kept now.
+    """
+    real = shutil.which("git")
+    assert real is not None
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "stub.py").write_text(_STUB_GIT, encoding="utf-8")
+    (stub / "git.cmd").write_text(f'@"{sys.executable}" "%~dp0stub.py" %*\r\n', encoding="utf-8")
+    state = tmp_path / "asks"
+    monkeypatch.setenv("PATH", str(stub) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("MEFOR_STUB_STATE", str(state))
+    monkeypatch.setenv("MEFOR_STUB_FAILS", "1")
+    monkeypatch.setenv("MEFOR_STUB_REAL_GIT", real)
+    win = str(rig.wt).replace("/", "\\")
+    # `\\?\X:\..\C:\<wt>`, or `\\?\C:/<wt>` when the prefix is the bare device one.
+    device = prefix + (win if prefix.endswith("..\\") else win.replace("\\", "/"))
+    command = f"git -C {device} checkout {rig.other}"
+    result = run_gate(shell(command, rig.outside, "PowerShell"), rig.repos)
+    asks = int(state.read_text(encoding="utf-8")) if state.exists() else 0
+    assert result is not None, f"ALLOW after {asks} asks: {command}"
+    assert "LINKED WORKTREE" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
 _FILLER = "abcdefghij " * 2700
 _NINE = range(9)
 #: (shape, template, cwd, tool): the shapes of the Lander's timing probes on 2026-11-23, nine judged
