@@ -124,11 +124,18 @@ function Get-TranscriptAgeHours {
     # right question for the liveness fence and the wrong one here. A root can hold transcripts and no
     # session registry, and dropping it would turn an evaluable signal into a missing one.
     # Read the profile as Get-ClaudeConfigRoots does; its comment in session-registry.ps1 says why.
+    # CLAUDE_CONFIG_DIR is added too (BACKLOG #7561): a root pinned outside the profile holds this
+    # session's transcripts, and missing one would miss a fresh-transcript veto. Adding a root can
+    # only find a newer transcript, never hide one.
     $roots = if ($ConfigRoot) { @($ConfigRoot | Where-Object { Test-Path -LiteralPath $_ }) }
-             elseif (-not $env:USERPROFILE) { @() }
              else {
-                 @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
-                       ForEach-Object { $_.FullName })
+                 @(if ($env:USERPROFILE) {
+                       Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
+                           ForEach-Object { $_.FullName }
+                   }
+                   if ($env:CLAUDE_CONFIG_DIR -and (Test-Path -LiteralPath $env:CLAUDE_CONFIG_DIR -PathType Container)) {
+                       $env:CLAUDE_CONFIG_DIR
+                   })
              }
     foreach ($r in $roots) {
         $dir = Join-Path (Join-Path $r 'projects') $slug

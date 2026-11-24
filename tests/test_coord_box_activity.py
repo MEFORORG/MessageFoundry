@@ -450,10 +450,17 @@ class TestTheProfileIsReadByItsOwnName:
     matched only a folder named home1, so the transcript was never found and the signal read as
     UNEVALUABLE. Red before the fix: the bracketed case returned null."""
 
-    def _age(self, sandbox: Path, home: Path | None) -> str:
-        env = {k: v for k, v in os.environ.items() if k.upper() != "USERPROFILE"}
+    def _age(self, sandbox: Path, home: Path | None, config_dir: Path | None = None) -> str:
+        # CLAUDE_CONFIG_DIR is stripped too, so no case here reads the real config root.
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() not in ("USERPROFILE", "CLAUDE_CONFIG_DIR")
+        }
         if home is not None:
             env["USERPROFILE"] = str(home)
+        if config_dir is not None:
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
         ps = (
             f". '{sandbox / 'scripts' / 'coord' / 'box-activity.ps1'}'; "
             "$a = Get-TranscriptAgeHours -WorktreePath 'D:\\proj\\App'; "
@@ -488,3 +495,84 @@ class TestTheProfileIsReadByItsOwnName:
         d.mkdir(parents=True)
         (d / "turn.jsonl").write_text('{"t":1}\n', encoding="utf-8")
         assert self._age(sandbox, None) == "null"
+
+
+class TestAPinnedConfigDirIsRead:
+    """BACKLOG #7561. With no -ConfigRoot, Get-TranscriptAgeHours listed only the .claude* folders
+    under USERPROFILE, so a session whose CLAUDE_CONFIG_DIR is pinned elsewhere had its fresh
+    transcript missed. A missed fresh transcript is a missed veto: the seat could read as
+    disturbable while it is working. Red before the fix: the pinned cases returned null.
+
+    Each finding case is paired with one that must stay null, so a function that always found
+    something would fail."""
+
+    _age = TestTheProfileIsReadByItsOwnName._age
+
+    def _pinned_root(self, sandbox: Path, name: str, age_hours: float) -> Path:
+        root = sandbox / name
+        d = root / "projects" / "D--proj-App"
+        d.mkdir(parents=True)
+        f = d / "turn.jsonl"
+        f.write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(f, age_hours)
+        return root
+
+    def test_a_pinned_root_outside_the_profile_is_read(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        root = self._pinned_root(sandbox, "pinned[1]", 2)
+        age = self._age(sandbox, sandbox / "home", config_dir=root)
+        assert age != "null", "the transcript under CLAUDE_CONFIG_DIR was not found"
+        assert float(age) == pytest.approx(2, abs=0.1)
+
+    def test_the_pinned_root_is_read_with_no_profile(self, sandbox: Path) -> None:
+        root = self._pinned_root(sandbox, "pinned", 3)
+        age = self._age(sandbox, None, config_dir=root)
+        assert age != "null"
+        assert float(age) == pytest.approx(3, abs=0.1)
+
+    def test_the_newest_of_profile_and_pinned_root_wins(self, sandbox: Path) -> None:
+        home = sandbox / "home"
+        old = home / ".claude" / "projects" / "D--proj-App"
+        old.mkdir(parents=True)
+        (old / "turn.jsonl").write_text('{"t":1}\n', encoding="utf-8")
+        _back_date(old / "turn.jsonl", 40)
+        root = self._pinned_root(sandbox, "pinned", 1)
+        assert float(self._age(sandbox, home, config_dir=root)) == pytest.approx(1, abs=0.1)
+
+    def test_a_pinned_root_without_the_transcript_stays_unevaluable(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        root = sandbox / "pinned"
+        (root / "projects" / "D--other").mkdir(parents=True)
+        assert self._age(sandbox, sandbox / "home", config_dir=root) == "null"
+
+    def test_a_missing_pinned_root_stays_unevaluable(self, sandbox: Path) -> None:
+        (sandbox / "home").mkdir()
+        assert self._age(sandbox, sandbox / "home", config_dir=sandbox / "absent") == "null"
+
+    def test_an_explicit_config_root_still_wins(self, sandbox: Path) -> None:
+        """-ConfigRoot names the roots to read; the pinned root is not added to them."""
+        pinned = self._pinned_root(sandbox, "pinned", 1)
+        explicit = sandbox / "explicit"
+        explicit.mkdir()
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper() not in ("USERPROFILE", "CLAUDE_CONFIG_DIR")
+        }
+        env["CLAUDE_CONFIG_DIR"] = str(pinned)
+        ps = (
+            f". '{sandbox / 'scripts' / 'coord' / 'box-activity.ps1'}'; "
+            f"$a = Get-TranscriptAgeHours -WorktreePath 'D:\\proj\\App' -ConfigRoot '{explicit}'; "
+            "if ($null -eq $a) { 'null' } else { [string]$a }"
+        )
+        proc = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=env,
+            cwd=str(sandbox),
+        )
+        assert proc.returncode == 0 and not proc.stderr.strip(), proc.stderr
+        assert proc.stdout.strip() == "null"
