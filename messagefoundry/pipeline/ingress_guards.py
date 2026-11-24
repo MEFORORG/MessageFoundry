@@ -24,8 +24,9 @@ body. The dry-run runs the decode, NUL, frame-byte and size guards through :func
 ``tests/test_ingress_guard_parity.py`` fails if it grows one back.
 
 **The two callers still differ in at least these places.** The HL7 parse step, which each caller
-runs itself: the stored ``parse error`` text differs, and the dry-run catches only ``HL7PeekError``
-where the listener catches every peek-read fault. The detach's refusals of an escaped ``OBX-5.5``
+runs itself: the stored ``parse error`` text for an ``HL7PeekError`` differs, since the listener
+renders it through ``safe_exc`` and the dry-run does not. Both catch every peek-read fault
+(``PEEK_READ_FAULTS``) and store the same ``peek read failed`` text for one (BACKLOG #6821). The detach's refusals of an escaped ``OBX-5.5``
 document (:class:`~messagefoundry.parsing.binary.EscapedDocumentError`), of a received document
 handle or marker (:class:`~messagefoundry.parsing.binary.InboundDocRefError`), of a document
 under a base64 delimiter (:class:`~messagefoundry.parsing.binary.Base64DelimiterError`) and of a
