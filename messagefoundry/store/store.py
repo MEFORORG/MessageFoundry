@@ -8450,7 +8450,10 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            if out_secret is not None and not await cipher_call(
+                out_secret[1], _audit_tag_ok, parsed, out_secret
+            ):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -8618,12 +8621,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
+    # The handover tag is a MAC under the outgoing key, routed like the open's tag check (#3929).
+    # docs/CONNECTIONS.md, the Vault Transit bulk-cipher row, says where it runs today.
+    detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, out_secret),
+            detail=detail,
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:
