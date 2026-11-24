@@ -2351,7 +2351,12 @@ the same permission set on the same method reds CI until it is listed here.
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
 > A name that fails the connection-name rule is never in a scope. The per-name JSON routes above
 > declare the rule on the path, so they answer such a name with 422 before any scope check and
-> write no audit row for it. The console checks the rule before it calls in. `audit_channel_denied`
+> write no `auth.channel_denied` row for it. Their gate runs before the path is validated, so an
+> `auth.permission_granted` row the gate writes still records the attempt, with the caller's path
+> in its detail. The gate writes one on these routes under the shipped default of
+> `[diagnostics].audit_all_authz`; with that switch off it writes one on the POST routes, whose
+> permissions are in the sensitive set, and none on the GET route. The console checks the rule
+> before it calls in. `audit_channel_denied`
 > in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
 > the console seam record, checks the name it is given against the rule too, and records a name
 > that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
