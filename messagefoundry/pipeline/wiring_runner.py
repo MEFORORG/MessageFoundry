@@ -2880,6 +2880,111 @@ class RegistryRunner:
         """Wake every stage worker now (e.g. after a replay re-queues rows at an unknown stage)."""
         self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
 
+    #: The longest injected summary stored, in characters (BACKLOG #5707). ``\.inN\`` escapes can
+    #: expand a summary far past its body, and a longer one is stored as ``None``, never cut. Also
+    #: the most escape growth an inject will unescape while building a summary.
+    _INJECT_SUMMARY_MAX_CHARS = 4096
+
+    #: The most raw characters, across the fields a summary is built from, that an inject will
+    #: unescape (BACKLOG #5707). Unescaping costs many times a leaf's length in memory before any
+    #: cap can see the result, so a message over this is stored with no summary.
+    _INJECT_SUMMARY_MAX_SOURCE_CHARS = 16 * 1024
+
+    async def ingress_fields_for(
+        self, channel_id: str, raw: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """``(control_id, message_type, summary)`` for an operator-injected ``raw`` on ``channel_id``
+        (BACKLOG #5707): an HL7 inbound through its own :func:`peek_max_bytes` ceiling, reading the
+        three values :func:`_read_ingress_fields` reads but each behind its own bound, which that
+        helper's eager read could not honour; any other inbound as its content type with no control
+        id or summary.
+
+        This only labels a row and never refuses one, because the API's resubmission guard has
+        already admitted the body. An unknown channel or an ``Exception`` raised here is three
+        ``None`` values. Only the exception's type is logged: its text can carry the body. The peek
+        runs off the event loop, as that guard's does, because the body can be upload-sized.
+
+        What this bounds is the label values, and nothing about the store write that follows, which
+        can still fail for its own reasons. A value is dropped to ``None`` when it is wider than
+        SQL Server's ``NVARCHAR(256)`` control id or ``NVARCHAR(64)`` type, counted in UTF-16 units
+        as it counts them; when it holds a NUL, which a hex escape can decode into a summary after
+        the guard's NUL check and Postgres refuses; or when a summary is over
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The widths apply on every backend, so an inject can store
+        ``None`` where a listener on SQLite or Postgres would keep a longer value.
+
+        Those checks see a summary only after it is built, so its memory bound is taken first, from
+        the raw text of the fields it can be built from for any message type. It is not built when
+        a PID, ORC or OBR line is over :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, when
+        those fields total more, or when their counted escapes could add more than
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields and counts the order
+        fields on every type, so a value the summary would not read can still cost a row its
+        summary."""
+        from messagefoundry.parsing._builtin_hl7 import escape_expansion_estimate
+
+        cap = self._INJECT_SUMMARY_MAX_CHARS
+
+        def storable(value: str | None, limit: int, *, utf16: bool = False) -> str | None:
+            # The plain length first: an oversized value is dropped with no scan or encode.
+            if value is None or len(value) > limit or "\x00" in value:
+                return None
+            # Strict on purpose: a lone surrogate raises here and stores no labels.
+            if utf16 and len(value.encode("utf-16-le")) // 2 > limit:
+                return None
+            return value
+
+        try:
+            ic = self.registry.inbound.get(channel_id)
+            if ic is None:
+                return None, None, None
+            if ic.content_type is not ContentType.HL7V2:
+                return None, ic.content_type.value, None
+            ceiling = peek_max_bytes(ic)
+
+            def read() -> tuple[str | None, str | None, str | None]:
+                peek = Peek.parse(raw, max_bytes=ceiling)
+                # A whole-field read returns the raw text and unescapes nothing, so measuring the
+                # fields summarize() reads costs no expansion. The control id and type are such
+                # reads too, which is why only the summary needs this bound.
+                # Any field read splits its whole segment, at a cost set by the segment's field
+                # count, so a long segment is refused from its unsplit line before that read.
+                limit = self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                unsplit = peek.message["_lazy"]
+                read_summary = all(
+                    len(unsplit.get(index, "")) <= limit
+                    for index, segment in enumerate(peek.message["segments"])
+                    if segment["id"] in ("PID", "ORC", "OBR")
+                )
+                sources = (
+                    [
+                        value
+                        for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
+                        if (value := peek.field(path))
+                    ]
+                    if read_summary
+                    else []
+                )
+                read_summary = read_summary and sum(map(len, sources)) <= limit
+                if read_summary:
+                    # The estimate takes the escape character from its text's first line, so the
+                    # probe opens with the message's own MSH encoding characters.
+                    start = peek.raw.find("MSH")
+                    probe = "\r".join([peek.raw[start : start + 8], *sources])
+                    read_summary = escape_expansion_estimate(probe, limit=cap) <= cap
+                return (
+                    storable(peek.control_id, 256, utf16=True),
+                    storable(peek.message_type, 64, utf16=True),
+                    storable(summarize(peek) or None, cap) if read_summary else None,
+                )
+
+            return await asyncio.to_thread(read)
+        except Exception as exc:  # CancelledError is a BaseException, so a cancel still propagates
+            log.warning(
+                "inject on %r: reading the stored fields raised %s; storing none",
+                channel_id,
+                type(exc).__name__,
+            )
+            return None, None, None
+
     @property
     def env_values(self) -> dict[str, Any]:
         """The values ``env()`` refs resolve against when connectors are (re)built. The engine
