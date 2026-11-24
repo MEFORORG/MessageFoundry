@@ -1643,7 +1643,9 @@ def test_serve_warns_not_refuses_posture_b_on_loopback_behind_declared_proxy(
     # The gate used to require `not is_loopback`, so the RECOMMENDED topology (engine on 127.0.0.1,
     # proxy on the same host facing the network) never consulted it at all — the discouraged direct
     # NIC bind got the check and the recommended one did not. Now the DECLARATION triggers it, but the
-    # loopback arm WARNS and still starts: refusing would hard-stop working deployments on upgrade.
+    # loopback arm WARNS and still starts: the engine cannot tell a loopback bind behind a declared
+    # proxy from an unexposed one beyond the declaration, so a refusal would also stop the
+    # recommended topology (BACKLOG #5391, S19-74).
     _posture_b_toml(tmp_path, intra="none", floor=None, loopback=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
     err = capsys.readouterr().err
