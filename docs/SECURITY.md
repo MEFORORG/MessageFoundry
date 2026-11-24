@@ -2371,11 +2371,15 @@ the same permission set on the same method reds CI until it is listed here.
 > both engine shards, and the flag route writing the flag for a sibling engine shard's inbound, as
 > the flag paragraph below says. It runs no `serve --shard` subprocess and no server-DB store,
 > which `serve --shard` requires with more than one engine shard (ADR 0063). Of the routes this
-> paragraph lists it runs metadata only. That `/test`, `/test-credential`, `/start`, `/stop`,
+> paragraph lists it runs metadata and flag only. That `/test`, `/test-credential`, `/start`, `/stop`,
 > `/restart` and the web console's bulk control answer the same on engine shards is read from the
-> code, since they share `_resolve_connection`. `GET /connections/{name}/events` does not use that
-> resolver: it checks the scope only, so on the wrong engine shard it answers an in-scope inbound
-> from the shared store, with no 403 and no denial row.
+> code, since they share `_resolve_connection`. Also read from the code, and run by no test on
+> engine shards: `GET /connections/{name}/events` does not use that resolver. It checks the scope
+> only, through `_control_guard`, on any deployment, so it answers an in-scope name the graph does
+> not hold, and on the wrong engine shard an in-scope inbound, from the shared store, with no 403
+> and no denial row. `GET /events?connection=<name>` and the web console's event reads check the
+> scope only too, through `_admit_event_read`, and refuse a name outside it with their own 403
+> body, `connection is outside your channel scope`.
 > A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its

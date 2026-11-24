@@ -935,7 +935,8 @@ read on 2026-11-24.
 2. **The Windows `os.urandom` row reads the Python documentation page only.** Its *Can it fail?* cell
    says the page does not say. The CPython source bullet in the same amendment reads the 3.14 branch
    of `Python/bootstrap_hash.c`, which raises when `BCryptGenRandom` reports a failed status. So a
-   reported failure raises on Windows too, as point 3 of that amendment says.
+   reported failure raises on Windows too, as point 3 of that amendment says. The cell stays true of
+   its source, the page, and is not replaced; this point adds what the source code shows.
 
 3. **The Node page was checked against the Node that VS Code 1.95 ships.** The extension's
    `engines.vscode` in `ide/package.json` is `^1.95.0`. The VS Code 1.95 release notes
@@ -957,8 +958,12 @@ read on 2026-11-24.
    wording differs.
 
 5. **The 2026-09-28 amendment's point 4 does not cover DR archives under `vault_transit`.** Their
-   nonces are the *Backup frame nonces* row of that amendment's first table. How those archives are
-   sealed under `vault_transit` is recorded in
-   [ADR 0196's 2026-10-10 amendment](0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md#amendment-2026-10-10-dr-archives-under-vault_transit-still-draw-local-nonces-under-the-local-dek-backlog-2187).
-   This is a known gap in this design statement, not a scope boundary. Vault BACKLOG #3568 holds
-   the follow-up for an enforced bound.
+   nonces are the *Backup frame nonces* row of that amendment's first table. Its sentence "The
+   `vault_transit` path counts nothing" is wrong for those archives: read from the code, they are
+   sealed in the process under the local DEK, with random nonces, and their frames are added to
+   that DEK's `cipher_meta` row. Nothing enforces that row's ceiling on this path, so no bound
+   warns or refuses for them, and each backup pass puts the local DEK in engine heap. The record of
+   this is
+   [ADR 0196's 2026-10-10 amendment](0196-a-fresh-or-rewound-store-must-not-restart-a-store-key-s-aes-gcm-invocation-count.md#amendment-2026-10-10-dr-archives-under-vault_transit-still-draw-local-nonces-under-the-local-dek-backlog-2187),
+   and it governs where this point's summary differs. This is a known gap in this design
+   statement, not a scope boundary. Vault BACKLOG #3568 holds the follow-up for an enforced bound.
