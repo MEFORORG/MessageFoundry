@@ -246,10 +246,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # spelled out for review, as test_conftest_name_collision_guard.py above does. Its subject is
         # the DEPENDENCY CLOSURE: it holds docs/RISKY-COMPONENTS.md closed over
         # security/runtime-closure-core.txt and holds that to two exported locks. The
-        # gating argument is the one that keeps the repo-wide scanners here. A dependency bump edits
-        # pyproject.toml / uv.lock / requirements.lock. pyproject.toml and requirements.lock now set
-        # `tooling=true` too, but uv.lock alone sets `code=true` and NOT `tooling=true`, and the
-        # tooling tier does not run in the merge queue. Listed as tooling this would be dropped by
+        # gating argument is the one that keeps the repo-wide scanners here. Several paths it reads
+        # match neither arm of ci.yml's tooling path gate: security/runtime-closure-*.txt,
+        # security/risky-component-readings.json, security/bundled-code-survey.json and harness/**.py.
+        # And the tooling tier does not run in the merge queue. Listed as tooling this would be dropped by
         # `-m 'not tooling'` on the engine legs and reached only when the path gate happens to match,
         # so a PR that added an unclassified dependency could face nothing, which is the one thing
         # the designation exists to prevent (BACKLOG #1189).

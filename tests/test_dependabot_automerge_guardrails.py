@@ -30,8 +30,8 @@ track -- disjoint sets. #2's step does hold a PR the allow-set would pass (an un
 reported as ``security_track=true`` with ``advisory_ok=false``). The confirming halves are tested as FORWARD
 guards, so that populating a Python allow row later is a one-line change to a control that already works, not
 a control to be written
-under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins the conjunction that makes this
-true, so the day someone widens it, a test has to be edited deliberately.
+under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins only the age step's allow-set
+gate, one conjunct of #4's inertness; it pins nothing about #2.
 """
 
 from __future__ import annotations
@@ -350,8 +350,9 @@ def test_release_age_is_gated_on_the_allow_set() -> None:
     this step makes an UNAUTHENTICATED outbound GET from a job holding ``contents: write``, so making
     it for a PR that was going to be held anyway is gratuitous. The honesty reason, which is why the
     assertion lives here rather than in a comment: this ``if`` is half of the conjunction that makes
-    guardrail #4 INERT (and #2 unable to confirm) today (``age_ok=true`` needs uv/pip, ``eligible=true`` needs github-actions).
+    guardrail #4 INERT today (``age_ok=true`` needs uv/pip, ``eligible=true`` needs github-actions).
     Pinning it means widening #4 into a live control has to edit a test, not slip through as prose.
+    It pins nothing about #2.
     """
     age = _step("age")
     cond = str(age.get("if", ""))
