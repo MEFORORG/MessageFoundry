@@ -436,15 +436,18 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
 
 @functools.cache
 def _dicom_extra_installed() -> bool:
-    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host. Cached: it
-    cannot change within the process, and a miss would scan ``sys.path`` on every call."""
+    """Whether ``pydicom``, the optional ``[dicom]`` extra, is importable on this host. Cached for
+    the process, so a miss does not scan ``sys.path`` on every call: an extra installed while the
+    engine runs is not seen until it restarts."""
     return importlib.util.find_spec("pydicom") is not None
 
 
 def _refuse_a_broken_dicom_extra(connection: str | None) -> None:
     """Refuse the build when ``pydicom`` is importable but lacks a reader the deflate guard replays
-    (:func:`~messagefoundry.parsing.dicom._deps.load_header_readers`), so the data set read can
-    never meet that fault after a partner has answered a 202. An absent ``pydicom`` is not refused:
+    (:func:`~messagefoundry.parsing.dicom._deps.load_header_readers`), so an extra already broken
+    when the connection is built does not first show itself after a partner has answered a 202. A
+    fault that arises after the build still can, and :func:`_data_set_instance_uid` catches its
+    :class:`RuntimeError`. An absent ``pydicom`` is not refused:
     a 202 is then compared with the File Meta UID alone (BACKLOG #5914). Names the connection and
     the readers, never a value."""
     if not _dicom_extra_installed():
@@ -464,9 +467,10 @@ def _data_set_instance_uid(obj: bytes) -> str | None:
     from this UID, so a 202 for an object whose File Meta was not rewritten after a re-UID still
     names it (BACKLOG #5914).
 
-    It runs after the partner has answered, so it never raises: a broken extra is refused when the
-    connection is built (:func:`_refuse_a_broken_dicom_extra`), and a :class:`RuntimeError` the
-    read meets anyway is logged at WARNING and read as no UID. The SCU's ignores for pydicom's
+    It runs after the partner has answered. A broken extra is refused when the connection is built
+    (:func:`_refuse_a_broken_dicom_extra`); a :class:`~messagefoundry.parsing.dicom.errors.DicomError`
+    the read meets is read as no UID, and a :class:`RuntimeError` is logged at WARNING and read as
+    no UID. Any other exception is not caught and escapes the send. The SCU's ignores for pydicom's
     value warnings, which name a value, are put back first before the read. A failure is logged by
     exception class only, never the UID or the bytes (PHI-safe)."""
     if not _dicom_extra_installed():
@@ -567,8 +571,9 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
     ``referenced``, or ``None`` when an item names the instance sent: by its File Meta UID
     (:func:`_sent_instance_uid`) or, failing that, its data set's SOP Instance UID
     (:func:`_data_set_instance_uid`). The data set is read only when some item names a UID in
-    the grammar :func:`_is_uid` checks, since with none its UID cannot change the verdict. With no UID to compare, the reason names why the File Meta has none, and
-    whether the data set was read (BACKLOG #5914)."""
+    the grammar :func:`_is_uid` checks, since with none its UID cannot change the verdict. With no
+    UID to compare, the reason names why the File Meta has none, and whether the data set was read
+    (BACKLOG #5914)."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     meta_uid, cause = _sent_instance_uid(sent)
     if meta_uid is not None and meta_uid in named:

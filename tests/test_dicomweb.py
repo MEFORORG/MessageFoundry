@@ -535,7 +535,7 @@ def _uid_body(uid: object) -> str:
 # ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
 # first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element. The
 # element-shape cases from two-values on carry SENT_UID, so the comparison alone cannot refuse them;
-# the blank and grammar cases are refused by the comparison, since SENT_UID passes the grammar.
+# the blank and grammar cases name no instance, since a value outside the UID grammar names none.
 _UNCONFIRMING_BODIES = [
     pytest.param(_uid_body(uid), id=f"uid-{name}")
     for name, uid in [

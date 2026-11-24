@@ -4050,8 +4050,9 @@ outside group `0002`. The `(0002,0000)` Group Length is not read, as `pydicom` i
 too. The data set read puts back the SCU's ignores for `pydicom` warnings that would name a value,
 and an installed `pydicom` that lacks a reader the deflate guard replays is **refused when the
 connection is built**, naming the connection; an absent `pydicom` is not refused. The data set
-read itself does not raise after the partner has answered: a fault it meets is logged and read
-as no data set UID. The data set is read only when the reply names some instance by a UID in the
+read runs after the partner has answered. A parse failure or a `RuntimeError` it meets, such as
+a reader removed after the build, is logged and read as no data set UID; any other exception is
+not caught and fails the send as an internal error. The data set is read only when the reply names some instance by a UID in the
 grammar above. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
