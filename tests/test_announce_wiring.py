@@ -482,3 +482,78 @@ def test_the_installed_announce_shim_is_inert_outside_a_git_repo(
     proc = _run_shim(_extract_shim(settings, tmp_path), outside)
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# --------------------------------------------------------------------------------------------------
+# The NOTICE shim on the Stop rows (seat recorder, wiki write prompt) -- BACKLOG #7575.
+#
+# Plain exit-0 stdout from a Stop hook reaches neither the user nor the model, so a plain-text notice
+# on these rows was as silent as the std shim it was built to replace. The notice is a systemMessage,
+# the field the user is shown on every event.
+# --------------------------------------------------------------------------------------------------
+
+_NOTICE_ROWS = [
+    (_marker("SEAT_MARKER"), "scripts/hooks/seat-record.ps1"),
+    (_marker("WIKI_MARKER"), "scripts/hooks/wiki-write-prompt.ps1"),
+]
+
+
+def _stop_notice_shim(settings: Path, tmp_path: Path, marker: str) -> Path:
+    hits = [c for c in _cmds(load(settings), "Stop") if c.startswith(f"# {marker}\n")]
+    assert len(hits) == 1, f"expected exactly one Stop entry for {marker}, got {len(hits)}"
+    p = tmp_path / f"{marker}-shim.ps1"
+    p.write_text(hits[0], encoding="utf-8")
+    return p
+
+
+def _run_stop_shim(shim: Path, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(shim)],
+        cwd=str(cwd),
+        input=json.dumps({"session_id": "x", "hook_event_name": "Stop"}),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
+def test_a_stop_notice_shim_says_so_as_a_system_message(
+    settings: Path, tmp_path: Path, marker: str, script: str
+) -> None:
+    """Red before #7575: stdout was the bare notice text, which a Stop hook shows nobody."""
+    primary = _fixture_primary(tmp_path, with_announce=False)
+    wt = _linked_worktree(primary, tmp_path)
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), wt)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert set(out) == {"systemMessage"}, out
+    assert f"{script} is missing from this checkout" in out["systemMessage"]
+
+
+@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
+def test_a_stop_notice_shim_is_silent_in_a_repo_that_is_not_messagefoundry(
+    settings: Path, tmp_path: Path, marker: str, script: str
+) -> None:
+    primary = _fixture_primary(tmp_path, with_announce=False, with_presence=False)
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), primary)
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "", f"notice leaked into a foreign repo: {proc.stdout!r}"
+
+
+@pytest.mark.parametrize(("marker", "script"), _NOTICE_ROWS)
+def test_a_stop_notice_shim_runs_the_resolved_script_and_prints_no_notice(
+    settings: Path, tmp_path: Path, marker: str, script: str
+) -> None:
+    primary = _fixture_primary(tmp_path, with_announce=False)
+    target = primary / script
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("Write-Output 'PRIMARY-STOP-HOOK-RAN'\n", encoding="utf-8")
+    wt = _linked_worktree(primary, tmp_path)
+    run_installer(settings)
+    proc = _run_stop_shim(_stop_notice_shim(settings, tmp_path, marker), wt)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "PRIMARY-STOP-HOOK-RAN", proc.stdout
