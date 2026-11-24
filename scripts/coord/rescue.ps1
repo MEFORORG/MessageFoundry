@@ -25,16 +25,18 @@
     `git push --tags` or `--follow-tags` (or `push.followTags`) can sweep it to whatever remote the
     push names, the public one included, with its message, which carries the local worktree path.
     The same holds for any other rescue tag that lands under local `refs/tags/rescue/`, for example
-    by a fetch's tag auto-follow. `scripts/hooks/durability_push.sh` says how it keeps its own
-    captures off that path. An `-Anchor` tag is usually local only, and must not be treated as
-    backed up.
+    by a fetch's tag auto-follow. Local rescue tags under `refs/tags/rescue/` include the durability
+    hook's captures, brought back by tag auto-follow, so `git push --tags` would sweep them too. An
+    `-Anchor` tag is usually local only, and must not be treated as backed up.
 
     SO NO CLEANUP, PRUNE OR REAPER MAY DELETE A RESCUE REF in any namespace this script audits,
     which includes at least `refs/rescue/`, `refs/tags/rescue/`, `refs/remotes/<r>/rescuetags/` and
     `refs/remotes/<r>/rescue/` (`Get-RescueNamespaces` is the list). A `git fetch --prune` deletes a
-    remote-tracking one whose server copy is gone, which is when it may be the last copy. Measured 2026-09-20: this
-    checkout holds 328 of them, at least one being the sole remaining copy of files deleted from the
-    working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
+    remote-tracking one whose server copy is gone, which is when it may be the last copy, and
+    `--prune-tags` or `fetch.pruneTags` deletes a local tag the remote lacks, which includes every
+    `-Anchor` tag never pushed. Measured 2026-09-20: this checkout held 328 refs under
+    `refs/rescue/` alone, not a total across the namespaces above, at least one being the sole
+    remaining copy of files deleted from the working tree. Some are named `POISONED-DO-NOT-RESTORE-*` and are deliberate records of what must
     not be brought back, not junk to sweep up.
 
     AN AGE HEURISTIC IS NOT A SAFE FILTER, AND IT IS THE FIRST THING SUCH A TOOL REACHES FOR. Most of
