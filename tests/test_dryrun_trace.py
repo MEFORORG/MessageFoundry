@@ -16,6 +16,7 @@ Gates asserted here (ADR 0072):
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 from collections.abc import Iterator
@@ -884,7 +885,9 @@ def test_writes_after_the_event_cap_are_not_retained(monkeypatch: pytest.MonkeyP
 
 def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     # A helper the Handler calls is not line-traced, so all its writes land on one Handler line.
-    # The per-invocation cap must bound those too, and say the record is truncated (BACKLOG #6824).
+    # The per-invocation write cap must bound those too, and say so as `writes_truncated`: every
+    # line is still present, so `truncated` (which a consumer reads as short line coverage) stays
+    # off (BACKLOG #6824).
     from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
 
     def fill(msg: Message) -> None:
@@ -899,10 +902,33 @@ def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) 
     traced = trace_dry_run(_registry(route_to_h, {"h": handle_calls_fill}), ADT_A01)
     assert traced["sends"] == [{"outbound": "out"}]
     inv = _handler_invocation(traced)
-    assert inv.get("truncated") is True
+    assert inv.get("writes_truncated") is True
+    assert "truncated" not in inv
     rec = next(r for r in made[0].invocations if r.kind == "handler")
     assert _retained_writes(rec) <= _MAX_WRITES
     assert len(_all_writes(inv)) == _MAX_WRITES
+
+
+def test_a_refused_write_is_not_recorded_and_spends_no_write_budget() -> None:
+    # Only a write that took is recorded, so refused writes cannot push a real one past the cap.
+    from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
+
+    def try_absent(msg: Message) -> None:
+        for _ in range(_MAX_WRITES):
+            with contextlib.suppress(KeyError, ValueError):
+                msg["ZZZ-1"] = "X"
+
+    def handle_refused_then_real(msg: Message) -> Send:
+        try_absent(msg)
+        msg["MSH-3"] = "REAL"
+        return Send("out", msg)
+
+    traced = trace_dry_run(
+        _registry(route_to_h, {"h": handle_refused_then_real}), ADT_A01, show_phi=True
+    )
+    inv = _handler_invocation(traced)
+    assert [w["path"] for w in _all_writes(inv)] == ["MSH-3"]
+    assert "writes_truncated" not in inv
 
 
 def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
@@ -913,7 +939,7 @@ def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
 
     from messagefoundry.pipeline import dryrun_trace as dt
 
-    original = Message._write
+    assert dt._patch_holders == 0
     a_entered = threading.Event()
     b_exited = threading.Event()
     seen: dict[str, object] = {}
@@ -938,4 +964,44 @@ def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
     tb.join(20)
     assert b_exited.is_set()
     assert seen["a_during"] is dt._recording_write
-    assert Message._write is original
+    assert Message._write is dt._ORIG_MESSAGE_WRITE
+    assert dt._patch_holders == 0
+
+
+def test_concurrent_traced_dry_runs_each_record_their_writes() -> None:
+    # End to end: a trace that finishes while another is mid-Handler must not cost the other its
+    # later writes (BACKLOG #6825).
+    import threading
+
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    a_paused = threading.Event()
+    b_done = threading.Event()
+    results: dict[str, dict] = {}
+
+    def handle_pauses(msg: Message) -> Send:
+        a_paused.set()
+        b_done.wait(10)
+        msg["MSH-3"] = "AFTER"
+        return Send("out", msg)
+
+    def run_a() -> None:
+        reg = _registry(route_to_h, {"h": handle_pauses})
+        results["a"] = trace_dry_run(reg, ADT_A01, show_phi=True)
+
+    def run_b() -> None:
+        a_paused.wait(10)
+        results["b"] = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
+        b_done.set()
+
+    ta = threading.Thread(target=run_a)
+    tb = threading.Thread(target=run_b)
+    ta.start()
+    tb.start()
+    ta.join(20)
+    tb.join(20)
+    assert b_done.is_set()
+    assert any(w["path"] == "MSH-3" for w in _all_writes(_handler_invocation(results["b"])))
+    a_writes = _all_writes(_handler_invocation(results["a"]))
+    assert any(w["path"] == "MSH-3" and w["value"] == "AFTER" for w in a_writes)
+    assert Message._write is dt._ORIG_MESSAGE_WRITE

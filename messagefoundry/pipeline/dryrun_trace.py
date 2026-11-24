@@ -97,7 +97,9 @@ __all__ = ["trace_dry_run"]
 _MAX_EVENTS = 5000
 # Message writes are capped per invocation on their own, because a helper the Handler calls is not
 # line-traced: all its writes land on one Handler line, so the event cap alone never bounds them.
-# Past either cap a write is dropped and the record marked ``truncated`` (BACKLOG #6824).
+# A write past the event cap is dropped under ``truncated``, since its line is never emitted; one past
+# this cap is dropped and the record marked ``writes_truncated`` instead, because its lines may all be
+# present and ``truncated`` tells a consumer line coverage is short (BACKLOG #6824).
 _MAX_WRITES = 5000
 _MAX_VALUE_LEN = 120
 
@@ -294,6 +296,7 @@ class _Recorder:
         self.sends: list[str] = []
         self.routed_to: list[str] = []
         self.truncated = False
+        self.writes_truncated = False
         # The return was not walked, so this record's sends/routed_to are not measurable here. For a
         # generator the body has not run yet either, so there are no line events; a Handler's other
         # unwalked iterables (BACKLOG #6823) may still have them. See `record_return`.
@@ -341,8 +344,6 @@ class _Recorder:
     def _finalize(self, frame: FrameType, line: int, elapsed: float) -> None:
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
-            # No later line is emitted, so writes still pending here never will be either.
-            self._writes_by_line.clear()
             return
         now = _safe_snapshot(frame)
         assigned = _diff(now, self._snap_before, self.show_phi)
@@ -357,13 +358,19 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
-        # Past the event cap no line is finalized, so a write kept now would never be emitted, only
-        # held: a long mutating loop would grow this recorder without bound (BACKLOG #6824).
-        if len(self.events) >= _MAX_EVENTS or self._write_count >= _MAX_WRITES:
+        # A write is kept only where a later `_finalize` will emit it. Past the event cap no line is
+        # finalized, and with no latched frame none ever is, so a write kept then would only be held:
+        # a long mutating loop would grow this recorder without bound (BACKLOG #6824).
+        if self.frame is None:
+            return
+        if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
             return
+        if self._write_count >= _MAX_WRITES:
+            self.writes_truncated = True
+            return
         self._write_count += 1
-        line = self.frame.f_lineno if self.frame is not None else (self.def_line or 0)
+        line = self.frame.f_lineno
         self._writes_by_line.setdefault(line, []).append(
             {"path": path, "value": _safe_value(value, self.show_phi)}
         )
@@ -432,6 +439,8 @@ class _Recorder:
         }
         if self.truncated:
             out["truncated"] = True
+        if self.writes_truncated:
+            out["writes_truncated"] = True
         if self.lazy_result:
             out["lazy_result"] = True
         return out
@@ -539,10 +548,12 @@ def _recording_write(
     *,
     as_data: bool,
 ) -> None:
+    _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
+    # Recorded only once the write took, so a refused write neither shows in the trace nor spends
+    # the per-invocation write budget (BACKLOG #6824).
     rec = _active_recorder.get()
     if rec is not None:
         rec.record_write(path, value)
-    _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
 # ``Message._write`` is class-global, so concurrent traces (one per thread) share one patch. A
@@ -559,17 +570,22 @@ def _patched_message_writes() -> Iterator[None]:
     recorder, then restore the original method once no trace still needs it. A no-op passthrough
     whenever no recorder is active, so it never perturbs the mutation itself."""
     global _patch_holders
-    with _patch_lock:
-        if _patch_holders == 0:
-            Message._write = _recording_write  # type: ignore[method-assign]
-        _patch_holders += 1
+    held = False
     try:
+        # Inside the try, so an interrupt after the count rose still releases it; a leaked count
+        # would leave the patch installed for the life of the process.
+        with _patch_lock:
+            if _patch_holders == 0:
+                Message._write = _recording_write  # type: ignore[method-assign]
+            _patch_holders += 1
+            held = True
         yield
     finally:
-        with _patch_lock:
-            _patch_holders -= 1
-            if _patch_holders == 0:
-                Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
+        if held:
+            with _patch_lock:
+                _patch_holders -= 1
+                if _patch_holders == 0:
+                    Message._write = _ORIG_MESSAGE_WRITE  # type: ignore[method-assign]
 
 
 def trace_dry_run(
