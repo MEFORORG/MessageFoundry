@@ -327,16 +327,17 @@ def test_secure_file_carries_explicit_denies_first_and_every_owner_rights_entry_
 @pytest.mark.parametrize(
     ("current", "carried"),
     [
-        # A full entry beside a narrowing one: the owner kept FA under `icacls /grant:r`. RED before
-        # the set rule: FA was dropped and WD carried, so the owner was left WD alone.
+        # A full entry beside a narrowing one: `icacls /grant:r` kept both. RED before the set rule:
+        # FA was dropped and WD carried, so an owner other than this account was left WD alone.
         pytest.param("(A;;FA;;;OW)(A;;WD;;;OW)", "", id="full-and-wd"),
         # An OWNER RIGHTS deny is an OWNER RIGHTS entry too, so the full allow beside it stays.
-        # RED before: the deny was carried and the allow dropped, leaving the owner nothing.
+        # RED before: the deny was carried and the allow dropped, so an owner other than this
+        # account lost the FA allow.
         pytest.param("(D;;FW;;;OW)(A;;FA;;;OW)", "(D;;FW;;;OW)", id="ow-deny-and-full"),
         # Any carried deny keeps the set: with no OWNER RIGHTS entry left, the owner's implicit
         # READ_CONTROL and WRITE_DAC are granted before the deny is read, so it would bind no more.
         pytest.param("(D;;WD;;;WD)(A;;FA;;;OW)", "(D;;WD;;;WD)", id="other-deny-and-full"),
-        # A flagged entry (inherit-only here grants nothing on the file) is not a full one.
+        # A flagged entry is not counted as full (the rule does not rely on Windows removing it).
         pytest.param("(A;OICIIO;FA;;;OW)", "", id="inherit-only-full"),
         # An object allow is always carried, with or without an ObjectType GUID.
         pytest.param("(A;;FA;;;OW)(OA;;FA;;;OW)", "", id="guidless-object-allow"),
@@ -362,10 +363,35 @@ def test_secure_file_decides_the_owner_rights_entries_as_a_set(
     assert captured == [("store.db", expected, True)]
 
 
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        # An inherited deny is not carried, so it does not keep an all-full set.
+        pytest.param("(D;ID;FW;;;BG)(A;;FA;;;OW)", ([], []), id="inherited-deny-drops"),
+        # An object deny is a carried deny, so it keeps the set.
+        pytest.param(
+            "(OD;;FW;;;BG)(A;;FA;;;OW)",
+            (["(OD;;FW;;;BG)"], ["(A;;FA;;;OW)"]),
+            id="object-deny-keeps",
+        ),
+        pytest.param(
+            "(A;;FA;;;OW)(A;;FR;;;OW)", ([], ["(A;;FA;;;OW)", "(A;;FR;;;OW)"]), id="mixed"
+        ),
+    ],
+)
+def test_the_owner_rights_set_rule_on_every_platform(
+    current: str, expected: tuple[list[str], list[str]]
+) -> None:
+    # The rule is pure SDDL text, so it is pinned here on every leg, not only on Windows.
+    import messagefoundry.store.store as store_mod
+
+    assert store_mod._entries_the_one_list_keeps(f"O:BAD:PAI{current}") == expected
+
+
 @_windows_only
 def test_secure_file_keeps_a_full_owner_rights_entry_beside_a_narrowing_one(tmp_path) -> None:
-    # The real write. `icacls /grant:r` kept both OWNER RIGHTS entries, so the owner had FA. RED
-    # before the set rule: FA was dropped and WD carried, narrowing the owner to WD.
+    # The real write. `icacls /grant:r` kept both OWNER RIGHTS entries. RED before the set rule:
+    # FA was dropped and WD carried, narrowing an owner other than this account to WD.
     import messagefoundry.store.store as store_mod
     from tests._win_acl import folder_granting, protected_entries
 

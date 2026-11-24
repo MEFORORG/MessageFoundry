@@ -9296,11 +9296,12 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     entries are decided together and against the carried denies. When they are carried, they stay
     as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
     WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
-    An object allow (``OA``) is always carried: one carrying an ObjectType GUID grants the owner
-    nothing on a file yet still turns off the implicit rights (measured), and one without a GUID
-    applies like a plain allow. Either way the owner can end with less than ``icacls /grant:r``
-    left it, since the one list drops every other principal's allow, an allow for the owner's own
-    account or groups included: a narrowing, not a loosening. A null DACL carries nothing.
+    An object allow (``OA``) is always carried, as ``icacls /grant:r`` kept it: one carrying an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights
+    (measured). Either way an owner other than this account can end with less than
+    ``icacls /grant:r`` left it, since the one list drops every other principal's allow, one for
+    the owner's own account or groups included: a narrowing, not a loosening. A null DACL carries
+    nothing.
 
     Where the current list cannot be read or parsed, or the write fails other than by access
     denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
@@ -9444,8 +9445,8 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
             all_full = all_full and (
                 kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
             )
-    # A carried deny can bind the owner only while an OWNER RIGHTS entry stays: the implicit
-    # rights an owner regains with none left are granted before any deny is read.
+    # A carried deny can withhold the owner's implicit READ_CONTROL and WRITE_DAC only while an
+    # OWNER RIGHTS entry stays: with none left, those two are granted before any deny is read.
     return denies, ([] if all_full and not denies else owner_rights)
 
 
