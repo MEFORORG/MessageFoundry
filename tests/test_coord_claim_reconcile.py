@@ -221,7 +221,7 @@ def test_a_gone_holder_from_another_repository_is_never_judged_here(
     assert proc.returncode == 0, proc.stderr
     rows = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
     assert rows["k-foreign"]["verdict"] == "UNKNOWN", rows
-    assert "belongs to the repository at" in rows["k-foreign"]["why"], rows
+    assert "not this repository's" in rows["k-foreign"]["why"], rows
     assert (claims_dir(repo) / "k-foreign.json").exists()
     assert rows["k-ours"]["verdict"] == "RELEASABLE", rows
     assert not (claims_dir(repo) / "k-ours.json").exists()
@@ -237,7 +237,27 @@ def test_a_gone_holder_outside_any_repository_is_never_judged_here(
     assert proc.returncode == 0, proc.stderr
     row = json.loads(proc.stdout)["claims"][0]
     assert row["verdict"] == "UNKNOWN", row
-    assert "nothing ties it to this repository" in row["why"], row
+    assert "is in no git repository" in row["why"], row
+
+
+def test_git_dir_in_the_environment_cannot_tie_a_foreign_holder_here(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #7564: with GIT_DIR set, git answers for that repository whatever -C names.
+
+    Every directory would then resolve to this repository's common dir, so the check refuses to
+    tie any gone holder rather than pass the foreign one.
+    """
+    other = tmp_path / "other"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True, capture_output=True)
+    landed_branch(repo, "shared-name")
+    write_claim(repo, "k-foreign", other / ".claude" / "worktrees" / "gone", "shared-name")
+    env = {**os.environ, "GIT_DIR": str(repo / ".git")}
+    proc = reconcile(repo, "-Json", "-NoPullRequests", env=env)
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["verdict"] == "UNKNOWN", row
+    assert "GIT_DIR or GIT_COMMON_DIR is set" in row["why"], row
 
 
 def test_the_default_path_writes_nothing(repo: Path, tmp_path: Path) -> None:
