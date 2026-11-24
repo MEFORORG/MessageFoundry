@@ -30,6 +30,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
+from messagefoundry.parsing.dicom.errors import DicomPeekError
 from messagefoundry.parsing.dicom.peek import DicomPeek
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
@@ -1084,7 +1085,7 @@ def test_dicomweb_a_broken_dicom_extra_does_not_fail_the_build(
 
 
 @pytest.mark.parametrize("fault", [RuntimeError, SyntaxError, AttributeError, TypeError])
-async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_each_post(
+async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_the_post(
     monkeypatch: pytest.MonkeyPatch, fault: type[Exception]
 ) -> None:
     # A pydicom found on disk whose load raises (an import can raise any class; load_dcmread
@@ -1107,26 +1108,7 @@ async def test_dicomweb_an_extra_that_does_not_load_builds_and_raises_before_eac
     assert opener.requests == []
 
 
-async def test_dicomweb_a_memory_error_in_the_extra_load_escapes_before_the_post(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    pytest.importorskip("pydicom")  # the real load_dcmread runs before the patched reader load
-    from messagefoundry.transports import dicomweb
-
-    def load() -> object:
-        raise MemoryError
-
-    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
-    monkeypatch.setattr(dicomweb, "load_header_readers", load)
-    dest = _dest()
-    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
-    dest._opener = opener  # type: ignore[assignment]
-    with pytest.raises(MemoryError):
-        await dest.send(PAYLOAD)
-    assert opener.requests == []
-
-
-async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_each_post(
+async def test_dicomweb_a_pydicom_blocked_in_sys_modules_raises_before_the_post(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A pydicom in sys.modules with no usable module: find_spec answers None for a None entry, so
@@ -1232,6 +1214,34 @@ async def test_dicomweb_the_pre_read_writes_its_held_lines_before_a_refusal(
         "synthetic pydicom line before the fault"
     ]
     assert opener.requests == []
+
+
+@pytest.mark.parametrize("fault", [DicomPeekError("synthetic parse failure"), MemoryError()])
+async def test_dicomweb_the_pre_read_drops_its_held_lines_on_the_other_exits(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fault: Exception
+) -> None:
+    # The other two exits from the hold write nothing: a parse failure, after which the object is
+    # still sent, and a MemoryError, which escapes (BACKLOG #5914 review).
+    pytest.importorskip("pydicom")
+    from messagefoundry.transports import dicomweb
+
+    def parse(data: bytes) -> object:
+        logging.getLogger("pydicom").warning("synthetic pydicom line before the fault")
+        raise fault
+
+    monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
+    monkeypatch.setattr(DicomPeek, "parse", staticmethod(parse))
+    dest = _dest()
+    opener = _FakeOpener(body=STORED_OK.encode(), status=200)
+    dest._opener = opener  # type: ignore[assignment]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        if isinstance(fault, MemoryError):
+            with pytest.raises(MemoryError):
+                await dest.send(PAYLOAD)
+        else:
+            assert await dest.send(PAYLOAD) is None
+    assert caplog.records == []
 
 
 def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(

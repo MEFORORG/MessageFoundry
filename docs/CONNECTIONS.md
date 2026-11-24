@@ -4007,9 +4007,9 @@ adds only the `multipart/related; type="application/dicom"` framing + `applicati
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
 adds the data set's UID to that comparison. **An installed extra that is broken can be worse than
-none.** Depending on how it is broken, a message is not sent and is handled as an internal error,
-or is refused before it is sent, or is sent and then refused on a 202 naming only its data set UID;
-*Status classification* below says which. So on a host running DICOMweb, fix or remove a broken
+none.** At least these can happen, depending on how it is broken: a message is not sent and is
+handled as an internal error, or is refused before it is sent; *Status classification* below says
+when. So on a host running DICOMweb, fix or remove a broken
 `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |

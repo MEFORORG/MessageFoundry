@@ -14,11 +14,10 @@ It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works withou
 202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
 (:func:`_sent_instance_uid`), and, when ``pydicom`` is installed, its data set SOP Instance UID
 (:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
-#5914). An installed ``pydicom`` that is broken can be worse than an absent one, in at least these
-ways: one that does not load raises an internal error before the POST, as the SCU's does; a parse
-fault of a class the codec does not wrap refuses the message before the POST
-(:func:`_sent_uids_unread`); and one of a class the codec wraps reads as an object it cannot parse,
-so the object is sent and a 202 naming only its data set UID is refused after the reply.
+#5914). An installed ``pydicom`` that is broken can be worse than an absent one: at least, one that
+does not load raises an internal error before the POST, as the SCU's does, and a parse fault of a
+class the codec does not wrap refuses the message before the POST. :func:`_data_set_instance_uid`
+says which faults do what.
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -925,10 +924,8 @@ class DicomWebDestination(DestinationConnector):
             # BACKLOG #2989: classified, so a refusal does not leave _post as a raw ValueError.
             self._hop_guard.assert_delivery_url(self.base_url, connector="DICOMweb")
         # BACKLOG #5914: the UIDs a 202 is compared with are read before a byte is sent, as the SCU
-        # parses before it associates. What the read raises (an extra that does not load, or a parse
-        # fault the codec does not wrap) is raised here, before the POST. A fault the codec does wrap
-        # reads as no data set UID, even from a broken extra: the object is then sent, and a 202
-        # naming only its data set UID is refused after the partner has answered.
+        # parses before it associates, so what the read raises is raised before the POST; not every
+        # fault raises (_data_set_instance_uid says which do).
         sent = _read_sent_uids(dicom_bytes, self.base_url)
         data, boundary = self._multipart_body(dicom_bytes)
         headers = {
