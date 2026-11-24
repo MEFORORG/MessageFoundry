@@ -3193,10 +3193,10 @@ def _audits_anchors_refused_before_the_lifespan(
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
     # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
-    # this module's other imports and argument parsing; this one covers a caller that reached
-    # `_serve` some other way, and adds no second copy otherwise (`install_remote_debug_guard` says
-    # why). A no-op where the interpreter was started with remote debugging disabled, which is
-    # every engine shard under `supervise`.
+    # this module's other imports and argument parsing. This one tries the add again where an
+    # earlier audit hook cut that call's probe off or refused its add, and adds no second copy
+    # (`install_remote_debug_guard` says how). A no-op where the interpreter was started with
+    # remote debugging disabled, which is every engine shard under `supervise`.
     install_remote_debug_guard()
 
     import uvicorn
