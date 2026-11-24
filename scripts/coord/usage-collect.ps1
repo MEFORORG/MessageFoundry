@@ -174,10 +174,11 @@ function Get-Percentage($Value) {
     return $d
 }
 
-# DID THIS SESSION CALL THE API SINCE ITS LAST FIRE? cost.total_api_duration_ms only rises when it did,
-# and rate_limits arrives on an API response, so a rise is the one thing in the payload that tells a live
-# session's reading from an idle one's cached number. A missing or unreadable mark, or a payload with no
-# counter, proves nothing: false, which leaves the age counting.
+# DID THIS SESSION CALL THE API SINCE ITS LAST FIRE? cost.total_api_duration_ms rises when it did, and
+# rate_limits arrives on an API response, so a rise is the one thing in the payload that tells a live
+# session's reading from an idle one's cached number. Whether a failed call moves it is unmeasured. A
+# true here is half of "live" in ADR 0211's live-session rule, which says what a live reading may do. A
+# missing or unreadable mark, or a payload with no counter, proves nothing: false, which is not live.
 #
 # ONE MARK FILE PER SESSION, BECAUSE THE COUNTER IS PER SESSION AND A SHARED FILE CANNOT HOLD IT. Every
 # session on a root fires here, unlocked, so with one file a session could write back the older counter
@@ -192,7 +193,7 @@ function Get-Percentage($Value) {
 # unreadable mark until at least a read that works again, a hand delete, or the prune below ends it.
 #
 # THIS DOES NOT MAKE A MARK MONOTONIC. At least two routes put a lower counter in place on one shared id,
-# and each can cost one false refresh, not a loop: unlocked writes can land the lower counter last, and
+# and each can cost one false live fire, not a loop: unlocked writes can land the lower counter last, and
 # a pruned mark takes whichever counter fires next.
 #
 # THE ID COMES FROM THE PAYLOAD AND NAMES A FILE, so anything but a plain name is refused rather than
@@ -200,7 +201,7 @@ function Get-Percentage($Value) {
 #
 # A RISE COUNTS ONLY ONCE ITS MARK IS WRITTEN. A failed write leaves the old counter, so every later idle
 # repeat would read as the same rise for as long as the write keeps failing, and a frozen number would
-# stay fresh. A lost write costs a live session one refresh. The try holds because Write-AtomicText can
+# pass as live. A lost write costs a live session one live fire. The try holds because Write-AtomicText can
 # throw, and that reaching the outer catch would cost the session its publish as well.
 function Test-SessionCalledApi([string]$Dir, $Payload) {
     $sid = [string]$Payload.session_id
@@ -220,7 +221,7 @@ function Test-SessionCalledApi([string]$Dir, $Payload) {
     try {
         [void][System.IO.Directory]::CreateDirectory($markDir)
         # A session's first mark clears the marks nobody touched for a week. A mark lost here costs its
-        # session one refresh, and nothing else bounds this directory. An unreadable mark that age goes
+        # session one live fire, and nothing else bounds this directory. An unreadable mark that age goes
         # too, but only through another session's first mark: its own session never reaches this line.
         if ($absent) {
             $cutoff = [datetime]::UtcNow.AddDays(-7)
@@ -328,47 +329,22 @@ try {
     try { $prevDoc = Get-Content -LiteralPath (Join-Path $StateDir "latest.json") -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction Stop } catch { }
     $published = if ($prevDoc) { $prevDoc.seven_day } else { $null }
 
-    # THE HIGHEST READING IN A RESET PERIOD BINDS. An idle session keeps reporting its cached number on
-    # a timer, and every session publishes here, so without this rule a stale 60 replaces a live 99 and
-    # reads as freshly observed. The level only rises inside a window. So against a published window
-    # of this root's, a reading is refused when it has the same reset and is not higher, or when its
-    # reset is earlier than the published one and has already passed: that is the number an idle
-    # session still holds after a reset. Any other reset is a new window, under the live-session rule
-    # (below, and ADR 0211), which applies only where both windows carry a readable reset. A
-    # refused reading leaves the published window whole, its own age included, so the
-    # staleness guard keeps counting from the last real observation.
+    # WHICH READING REPLACES THE PUBLISHED WINDOW. ADR 0211 states the rule once, under "The highest
+    # reading in a reset period binds" and "The live-session rule"; read it there rather than here. The
+    # why, in one line each:
     #
-    # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
-    # reach the history: one on an empty directory, one over a window stamped with another root or with
-    # no reset, one higher than the published window for the same gone reset, and one with a later reset
-    # than the published window that is higher than it or comes from a live session (below).
-    # Nothing here reads the clock against a lone reading. The reader reports
-    # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
-    # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
-    # so it refuses the rate only where those rows change reset or fall.
+    # An idle session keeps reporting its cached number on a timer and every session publishes here, so
+    # without the rule a stale 60 replaces a live 99 and reads as freshly observed.
     #
-    # AN EQUAL READING IS REFUSED TOO. The payload carries no time of its own, so an idle session's
-    # cached number looks like a live flat one. Restamping it let one idle terminal keep a frozen number
-    # fresh while sessions that never publish burned the pool, and the rung read OK on it. So the age
-    # counts from the last confirmation: the number changed, or a session of this root that has just
-    # called the API (Test-SessionCalledApi) reports the same number for the same running reset. That
-    # refreshes the age and nothing else. Past that, a flat account goes stale. On the conditions at
-    # level_floor in usage.ps1, the number still stands as a floor, and the gate's rung reads it as a
-    # HIT at the level or the ceiling.
+    # A refused reading leaves the published window whole, its own age included, so the staleness guard
+    # keeps counting from the last real observation. $confirmed is the one exception: a live session's
+    # equal reading for the same running reset refreshes the age and nothing else.
     #
-    # A READING WITH NO READABLE RESET CANNOT PROVE WHICH WINDOW IT BELONGS TO. So while the published
-    # reset is still ahead it is refused, higher or not. Taken bare, it would wipe the reset this rule
-    # and the reader's gone-window check both need. Given the published reset, it could set a floor no
-    # live reading could lower until that reset. With no published reset ahead there is nothing to hold
-    # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
-    #
-    # THE LIVE-SESSION RULE (BACKLOG #5178): $live below, used only in the both-resets branch. ADR 0211,
-    # "The live-session rule", states what it does, its scope and at least its known gaps; read it there
-    # rather than here. The else branch, where either side has no readable reset, ignores liveness.
-    #
-    # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
-    # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
-    # or absent stamp counts as ours, because sessions on one root can differ in having the pin at all.
+    # $guard is the live-session rule, and it binds on every path, a window stamped with another root or
+    # either side with no readable reset included: a reading at or below the published number is taken
+    # only from a live session. So a reading that drops the reset or restamps the window is a higher one
+    # or a live one, and an idle reading after it still has to beat that number.
+    # The per-reset tests below add to it, for this root's own window only, by the reader's own test.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
@@ -378,20 +354,24 @@ try {
     $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
     $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
     $stampOwn = Test-OwnStamp $stampEnv $ownRoot
-    if ($seven -and $published -and (Test-OwnStamp $publishedRoot $ownRoot)) {
+    if ($seven -and $published) {
         $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
+        $publishedOwn = Test-OwnStamp $publishedRoot $ownRoot
         # A window with no number in it holds no level to keep, so it is not a 0 this reading can equal.
         $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $live = $calledApi -and $stampOwn
-        $keepPublished = if ($seenEpoch -and $publishedEpoch) {
-            ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not $live)) -or
+        $guard = $notHigher -and -not $live
+        $perReset = if (-not $publishedOwn) { $false }
+        elseif ($seenEpoch -and $publishedEpoch) {
+            ($notHigher -and $seenEpoch -eq $publishedEpoch) -or
             ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
-        else { $publishedEpoch -gt $nowEpoch }
-        $confirmed = $live -and
+        else { -not $seenEpoch -and $publishedEpoch -gt $nowEpoch }
+        $keepPublished = $guard -or $perReset
+        $confirmed = $live -and $publishedOwn -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
             $seven.used_percentage -eq $publishedPct
     }

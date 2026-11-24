@@ -434,35 +434,46 @@ roster alias of the Lander.
 > wins.
 >
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
-> percentage, so no one session's reading is the truth; each is a valid floor. Against a published
-> window of this root's, the collector therefore refuses a reading with the same reset that is not
-> higher, and a reading whose reset is earlier than the published one and has already passed. A refused
-> reading reaches neither `latest.json` nor the history.
+> percentage, so no one session's reading is the truth; each is a valid floor. The collector holds two
+> tests, below, and refuses a reading that either refuses. A refused reading reaches neither
+> `latest.json` nor the history, and leaves the published window's age as it was.
 >
 > **The live-session rule, stated once here (BACKLOG #5178); the collector's comments and the limits
-> below point to it.** It applies only where the reading and the published window both carry a
-> readable reset. There, any other reset is a new window: a higher reading replaces the value from any
-> session, and a lower or equal one only from a live session, whether or not the published reset has
-> passed. A live session is one that has just called the API (its `cost.total_api_duration_ms` rose
-> past its mark) and is pinned to this root or unpinned, so an unpinned session of another root that
-> publishes here counts as live. Where either side has no readable reset, the rule does not apply: a
-> reading with no readable reset is refused while the published reset is ahead, higher or not, because
-> it cannot prove which window it belongs to, and is otherwise taken whatever its value; and any reading
-> over a published window with no readable reset is taken, from any session. A higher reading is taken
-> from any session because refusing it weakens a stop: while the published reset is ahead, the lower
-> published number could clear the gate, and past it the gone window reads UNKNOWN, so the gate would
-> answer REVIEW where the higher number halts it. A first fire is never live. **Known gaps, at least
-> these two, both open; the limits below name more, among them the trade between a live lower session
-> and an idle higher one, and a failed call that may still read as live:**
+> below point to it.** A reading at or below the published number is refused unless it comes from a
+> live session. It binds over every published window that holds a number, on every path: the same reset
+> or another, before or after the published reset, a reading or a published window with no readable
+> reset, and a published window stamped with another root. A higher reading passes it from any session.
+> A fire is live when all of these hold: its session id is a plain name, 1 to 128 letters, digits, `_`
+> or `-`; its `cost.total_api_duration_ms` is a finite number above the counter in that session's mark
+> file (`live-marks/mark-<session>.json`), which must exist and read; the new counter is written to that
+> file; and the session is pinned to this root or unpinned, so an unpinned session of another root that
+> publishes here counts as live. A first fire is never live, since it has no mark to rise past.
 >
-> - The no-reset path. Once the published reset has passed, one idle reading with no reset is taken
->   and drops the reset, and the next idle reading, a frozen low number on a new reset, is then taken
->   too, so the rung can read OK on a pool since spent. Measured 2026-11-24 and pinned, as the code
->   behaves, by `tests/test_coord_usage.py`,
->   `test_known_gap_after_a_real_reset_a_no_reset_reading_lets_a_frozen_number_in`.
-> - The foreign-root stamp path, which predates BACKLOG #5178. A higher reading from a session pinned to
->   another root is taken here, stamped with that root, so the reader refuses the window, and since a
->   window stamped with another root is no floor, the next reading of any value is taken.
+> **The per-reset tests** apply only against a published window of this root's: stamped with this root,
+> unset or unstamped, by the reader's own test. They refuse, from any session, a reading with the same
+> reset that is not higher; a reading whose reset is earlier than the published one and has already
+> passed; and a reading with no readable reset while the published reset is ahead, higher or not,
+> because it cannot prove which window it belongs to. A live session's equal reading on the same reset,
+> while that reset is ahead, is still refused, and refreshes the age and nothing else. A published window
+> stamped with another root has no per-reset test, so a live session of this root replaces it on any
+> reset, lower or not.
+>
+> So over a window that holds a number, a reading that replaces it is higher than it or comes from a
+> live session, on every path, and an idle reading after it has to beat that number. When the rule was
+> first written, earlier on 2026-11-24, it held only where both windows carried a readable reset, and two
+> paths let an idle reading past it: past a gone published reset, an idle reading with no reset was taken
+> and dropped the reset, and a frozen 5 on a new reset followed it in; and a higher reading from a
+> session pinned to another root restamped the window, after which a reading of any value was taken, as
+> on main. Both are closed, and `tests/test_coord_usage.py` pins each:
+> `test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule` and
+> `test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule`.
+>
+> A higher reading passes the live-session rule from any session because refusing it can weaken a stop.
+> For a reading of this root's: while the published reset is ahead, the lower published number could
+> clear the gate, and past it the gone window reads UNKNOWN, so the gate would answer REVIEW where the
+> higher number halts it. A higher reading from a session pinned to another root passes too, as on main,
+> though the reader refuses the window it publishes, so the gate answers REVIEW on it rather than
+> halting.
 >
 > **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
 > prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
@@ -537,24 +548,24 @@ roster alias of the Lander.
 > The rule has at least these limits, all of them open:
 >
 > - It needs a published window to compare with. At least these gone readings are published and reach
->   the history: one on an empty directory, one over a window stamped with another root or with no reset,
->   one higher than the published window for the same gone reset, and one with a later reset than the
->   published window that is higher than it or comes from a live session, as the live-session rule above
->   defines one. `usage.ps1`
->   reports any window past its reset as UNKNOWN with no percentage, so its level is not graded. With no current reset the rate cannot filter its rows by reset, so rows that
->   change reset or fall refuse it, under the 2026-11-23 amendment above.
-> - With no published reset ahead, the collector holds no floor: a reading with no reset is taken whatever
->   its value, and an equal one refreshes the age, until a reading brings a reset. Below the rung the gate
->   answers REVIEW for it, unless a burn is projected. A reading dated after now still sets the reader's
->   own `level_floor`.
+>   the history: one on an empty directory, one over a published window with no number, and one higher
+>   than the published window or from a live session, unless a per-reset test above refuses it. `usage.ps1`
+>   reports any window past its reset as UNKNOWN with no percentage, so its level is not graded. With no
+>   current reset the rate cannot filter its rows by reset, so rows that change reset or fall refuse it,
+>   under the 2026-11-23 amendment above.
+> - With no published reset ahead, only the live-session rule holds: a reading with no reset is taken
+>   when it is higher than the published one or comes from a live session, and it then drops the
+>   published reset. Below the rung the gate answers REVIEW for a reading with no reset, unless a burn is
+>   projected. A reading dated after now still sets the reader's own `level_floor`.
 > - Refusing a reading with no reset while the published reset is ahead drops true evidence too. A real
 >   99 over a published 89 cannot raise the number, so the rung does not hit on it until a reading that
 >   carries a reset arrives.
 > - A `level_floor` holds only while the published reset is right. After a re-login or a moved reset, a
 >   stale number can keep the gate at HALT on a refilled pool until the old reset, up to a week. At the
 >   ceiling only a new reading clears it, and only an interactive terminal session on that root publishes
->   one. A new reading at or below the stale number, on another reset, clears it only from a live
->   session, under the live-session rule above; on the same reset it never does. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
+>   one. A new reading at or below the stale number replaces it only from a live session, under the
+>   live-session rule above, and only on another reset: on the same reset a lower reading is refused
+>   from any session, and a live session's equal one only refreshes the age. Such a floor needs no verified stamp, so on an unpinned root that number may not be this
 >   account's. Below the ceiling a floor also ends when one unpinned fire rewrites the document's stamp,
 >   because the fire is refused but the document is still rewritten; the gate then answers REVIEW.
 > - A session pinned to another root that publishes here does the same at any level, the ceiling included
@@ -570,17 +581,18 @@ roster alias of the Lander.
 >   before this amendment did this too, and more widely: measured 2026-11-01, its `five_hour` window read
 >   OK at 5 after a spent 100, with the same or an earlier reset. The same-reset case is what this
 >   amendment closes.
->   **Narrowed 2026-11-24 (BACKLOG #5178)** by the live-session rule above, within that rule's scope:
->   both windows carry a readable reset. There, from a published 80, two idle sessions' 80, 5, 80, 5 now
+>   **Narrowed 2026-11-24 (BACKLOG #5178)** by the live-session rule above. From a published 80, two idle sessions' 80, 5, 80, 5 now
 >   leaves one history row, and an idle session's frozen 5 no longer replaces a published 100. A higher
 >   reading is still taken from any session, before or after the published reset: past it, refusing an
->   idle 99 over a gone 50 would turn the gate's HALT into a REVIEW. So a live lower session and an idle
+>   idle 99 of this root's over a gone 50 would turn the gate's HALT into a REVIEW. So a live lower session and an idle
 >   higher one can still trade the window. Whether a failed call moves the API-duration counter is not
 >   measured, so a frozen number from a session whose calls fail may still pass as live. After a real
 >   reset, a session that never reads as live cannot open the new window at or below the gone window's
->   number with a reading that carries a reset, and the gate answers REVIEW on the gone one until a live
->   session or a higher reading does; but the no-reset gap above lets two idle readings open it.
-> - It applies only against this root's own window. A window stamped with another root is no floor.
+>   number on any path, and the gate answers REVIEW on the gone one until a live session or a higher
+>   reading does.
+> - The per-reset tests apply only against this root's own window. A window stamped with another root
+>   holds only the live-session rule, so a live session of this root replaces it on any reset, and an
+>   idle one only with a higher number.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number, and
 >   the gate can clear on it. The next live reading corrects it.
 > - A fire whose percentage cannot be read is dropped as an absent window, at least NaN, "99%", a negative

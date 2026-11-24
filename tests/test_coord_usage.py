@@ -75,7 +75,7 @@ pytestmark = pytest.mark.skipif(
 OK, WARN, CRITICAL, UNKNOWN = 0, 10, 11, 20
 
 
-def collect(state: Path, payload: dict[str, Any] | str) -> str:
+def collect(state: Path, payload: dict[str, Any] | str, pin: Path | None = None) -> str:
     """Drive the collector exactly as Claude Code drives a statusLine: JSON on stdin, line on stdout.
 
     THE PIN IS POPPED, and that is not incidental. The collector stamps each freshly observed window
@@ -94,7 +94,7 @@ def collect(state: Path, payload: dict[str, Any] | str) -> str:
         text=True,
         timeout=TIMEOUT,
         check=False,
-        env=_env(None),
+        env=_env(pin),
     )
     # A statusLine that exits non-zero degrades the session it decorates; it must never do that.
     assert proc.returncode == 0, f"collector exited {proc.returncode}: {proc.stderr}"
@@ -437,29 +437,76 @@ def test_after_a_real_reset_an_idle_higher_reading_replaces_the_gone_window(tmp_
     assert read(tmp_path)[0] == CRITICAL
 
 
-def test_known_gap_after_a_real_reset_a_no_reset_reading_lets_a_frozen_number_in(
+def test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule(
     tmp_path: Path,
 ) -> None:
-    """KNOWN GAP, pinned as the code behaves, not as it should (BACKLOG #5178, open finding). The
-    live-session rule applies only where the reading and the published window both carry a readable
-    reset. Past a gone published reset, an idle reading with no reset is taken, because no published
-    reset is ahead to hold; the published window then has no reset, so the next idle reading, a
-    frozen low number on a new reset, is taken too, and the rung reads OK on it. A fix changes this."""
+    """BACKLOG #5178. Before this fix the live-session rule held only where both windows had a reset:
+    past a gone published reset, an idle reading with no reset was taken and dropped the reset, and
+    the next idle reading, a frozen low number on a new reset, was then taken too, so the rung read OK
+    on a pool since spent. The rule now binds on that path: an idle reading at or below the published
+    number is refused there too, and a higher one is still taken from any session, as on main."""
     now = int(time.time())
-    _session_fire(tmp_path, {"used_percentage": 100.0, "resets_at": now - 300}, "live", 1000)
+    _session_fire(tmp_path, {"used_percentage": 90.0, "resets_at": now - 300}, "live", 1000)
     assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
 
     # CONTROL. Straight from the gone window, the idle frozen number is refused.
     frozen = {"used_percentage": 5.0, "resets_at": now + 500000}
     _session_fire(tmp_path, frozen, "idle", 1000)
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(100.0)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(90.0)
 
-    # THE GAP. An idle no-reset reading drops the reset, and the frozen number then passes.
-    _session_fire(tmp_path, {"used_percentage": 100.0}, "bare", 1000)
+    # An idle equal reading with no reset is refused, so the reset stays and the frozen number with it.
+    _session_fire(tmp_path, {"used_percentage": 90.0}, "bare", 1000)
+    assert latest(tmp_path)["seven_day"].get("resets_at_epoch") == now - 300
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(90.0)
+    assert read(tmp_path)[0] == UNKNOWN
+
+    # CONTROL. A higher reading with no reset is still taken from an idle session and drops the reset,
+    # and the idle frozen number still cannot follow it in.
+    _session_fire(tmp_path, {"used_percentage": 95.0}, "bare2", 1000)
     assert latest(tmp_path)["seven_day"].get("resets_at_epoch") is None
     _session_fire(tmp_path, frozen, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+
+    # CONTROL. Not frozen: the same reading from a session that has just called the API is taken.
+    _session_fire(tmp_path, frozen, "idle", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(5.0)
     assert read(tmp_path)[0] == OK
+
+
+def test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule(tmp_path: Path) -> None:
+    """BACKLOG #5178. A session pinned to another root posts a higher reading, which is taken and
+    stamped with that root. Before this fix, as on main, no rule held over the window, so an idle
+    session's frozen 5 on another reset was taken next and the rung read OK on it. The live-session
+    rule now binds over a foreign window too."""
+    root = tmp_path / "this-root"
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    now = int(time.time())
+    reset = now + 500000
+    _session_fire(state, {"used_percentage": 90.0, "resets_at": reset}, "live", 1000)
+    foreign = {"used_percentage": 95.0, "resets_at": reset}
+    _session_fire(state, foreign, "F", 1000, pin=tmp_path / "other")
+    kept = latest(state)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(95.0), (
+        "control: the foreign higher one is taken"
+    )
+    assert kept["config_root_env"] == str(tmp_path / "other"), kept
+
+    frozen = {"used_percentage": 5.0, "resets_at": now + 100000}
+    _session_fire(state, frozen, "idle", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(95.0)
+    assert len(history(state)) == 2
+
+    # CONTROL. A higher reading of this root's still lands over the foreign window from an idle session.
+    _session_fire(state, {"used_percentage": 97.0, "resets_at": reset}, "hi", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(97.0)
+
+    # CONTROL. Not frozen: the lower reading from a session of this root that has just called the API
+    # opens the new window.
+    _session_fire(state, frozen, "idle", 2000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+    assert read(state)[0] == OK
 
 
 def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
@@ -523,17 +570,26 @@ def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(4.0)
 
 
-def test_with_no_published_reset_there_is_no_floor(tmp_path: Path) -> None:
-    """The stated limit, pinned so a change to it is a decision: with no reset to compare, the rule
-    has nothing to hold on to. A lower reading replaces, and an equal one refreshes the age."""
-    for pct in (70.0, 40.0):
-        seven = {"used_percentage": pct}
-        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
-        assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
+def test_with_no_published_reset_only_the_live_session_rule_holds(tmp_path: Path) -> None:
+    """The stated limit, pinned so a change to it is a decision. With no reset to compare there is no
+    per-reset test, but the live-session rule holds (BACKLOG #5178): an idle lower or equal reading is
+    refused, leaving the age as it was, and a live session's lower or equal one replaces. Until
+    2026-11-24 an idle lower reading replaced and an idle equal one refreshed the age."""
+    _session_fire(tmp_path, {"used_percentage": 70.0}, "A", 1000)
     first = captured_at(tmp_path)
     time.sleep(1.1)
-    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": {"used_percentage": 40.0}}})
-    assert captured_at(tmp_path) > first
+    _session_fire(tmp_path, {"used_percentage": 40.0}, "A", 1000)
+    _session_fire(tmp_path, {"used_percentage": 70.0}, "A", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(70.0)
+    assert captured_at(tmp_path) == first
+
+    # CONTROL. From a session that has just called the API, the lower and then the equal one replace.
+    _session_fire(tmp_path, {"used_percentage": 40.0}, "A", 2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(40.0)
+    second = captured_at(tmp_path)
+    time.sleep(1.1)
+    _session_fire(tmp_path, {"used_percentage": 40.0}, "A", 3000)
+    assert captured_at(tmp_path) > second
 
 
 def test_a_gone_reading_on_an_empty_directory_is_published_and_read_as_unknown(
@@ -637,9 +693,12 @@ def test_the_status_line_shows_no_number_for_a_gone_window(tmp_path: Path) -> No
     assert line == "7d reset passed, no current reading", line
 
 
-def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: Path) -> None:
-    """The highest reading binds inside one account's pool only. A foreign number kept as a floor
-    would block this root's own readings until the reset, and the reader would refuse it throughout."""
+def test_a_window_carried_from_another_root_holds_only_the_live_session_rule(
+    tmp_path: Path,
+) -> None:
+    """A window stamped with another root is no per-reset floor: a live session of this root replaces
+    it on the same reset, lower or not. It does hold the live-session rule (BACKLOG #5178), so an idle
+    session's lower reading cannot replace it; before this fix, as on main, it did."""
     seven = window(88.0, 280000)
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
     doc = latest(tmp_path)
@@ -647,7 +706,11 @@ def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: P
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
     mine = {**seven, "used_percentage": 12.0}
-    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": mine}})
+    _session_fire(tmp_path, mine, "B", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(88.0)
+
+    # CONTROL. The same reading from a session that has just called the API replaces it.
+    _session_fire(tmp_path, mine, "B", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(12.0)
 
 
@@ -972,12 +1035,16 @@ def _age_window(state: Path, minutes: float) -> None:
 
 
 def _session_fire(
-    state: Path, seven: dict[str, Any], session: str = "S", api_ms: float | str | None = None
+    state: Path,
+    seven: dict[str, Any],
+    session: str = "S",
+    api_ms: float | str | None = None,
+    pin: Path | None = None,
 ) -> None:
     payload: dict[str, Any] = {"session_id": session, "rate_limits": {"seven_day": seven}}
     if api_ms is not None:
         payload["cost"] = {"total_api_duration_ms": api_ms}
-    collect(state, payload)
+    collect(state, payload, pin)
 
 
 def _mark(state: Path, session: str = "S") -> Path:
