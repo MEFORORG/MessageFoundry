@@ -3318,6 +3318,7 @@ def test_prove_absences_screen_outer_refusal_with_two_live_definitions_claims_no
     (problem,) = _screen("def f(b):\n    return 1\n", target, tmp_path)
     assert "has shape decorator functools.cache" in problem
     assert "compared only" not in problem
+    assert "The screen refused because" not in problem
     assert "it may not have compared the rest of the signature" in problem
     assert "each of the others was refused too, perhaps for another reason" in problem
     assert "Copy the live signature and decorators" in problem
@@ -3326,6 +3327,22 @@ def test_prove_absences_screen_outer_refusal_with_two_live_definitions_claims_no
     assert "where a value was expected" in again
     # Control: a mutation matching one live definition is accepted.
     assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+    # Two live classes: the first's `f` matches and it is refused on `g`, so the text names the
+    # class as well as the name.
+    classes = (
+        "import functools\nimport os\n\nw = WRAP\n\nif os.environ.get('X'):\n    class C:\n"
+        "        def f(self, a):\n            return 1\n        def g(self, a):\n"
+        "            return 1\nelse:\n    class C:\n        @functools.cache\n        @w\n"
+        "        def f(self, a):\n            return 1\n        def g(self, a):\n"
+        "            return 1\n"
+    )
+    member = (
+        "class C:\n    def f(self, a):\n        return 1\n    def g(self, b):\n        return 1\n"
+    )
+    (nested,) = _screen(member, classes, tmp_path)
+    assert "redefines C.f() with no shape decorator" in nested
+    assert "Where the name, or a class that holds it, has more than one live definition" in nested
+    assert "or on another member" in nested
 
 
 def test_prove_absences_screen_outer_refusal_on_new_claims_no_binding(tmp_path: Path) -> None:

@@ -3251,8 +3251,9 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
     )
     clause.tail = (
         "For this definition the screen reads those outermost shape decorators as different, and "
-        "it may not have compared the rest of the signature. Where the name has more than one live "
-        "definition, each of the others was refused too, perhaps for another reason. It does not "
+        "it may not have compared the rest of the signature. Where the name, or a class that holds "
+        "it, has more than one live definition, each of the others was refused too, perhaps for "
+        "another reason or on another member. It does not "
         "read what either definition binds the name to when it runs, so the two may bind the same "
         "thing. Copy the live signature and decorators; the mutation lives in a different "
         "repository from the symbol it shadows, so nothing else keeps the two in step"
@@ -3295,7 +3296,9 @@ def _scope_mismatch(
     method: bool,
 ) -> str | None:
     """The first of the mutation's definitions in `mut` that matches none of the live definitions
-    `src` holds for its name, as a clause for the refusal; ``None`` if there is none.
+    `src` holds for its name, as a clause for the refusal; ``None`` if there is none. The clause is
+    the LAST live definition's reason, and the others' reasons are dropped; the tail
+    :func:`_outer_clause` writes is worded for that.
 
     Only definitions `src` does not already hold are the mutation's. A name is skipped where `src`
     does not bind it, or where some live binding of it on either side is not a ``def`` or ``class``
