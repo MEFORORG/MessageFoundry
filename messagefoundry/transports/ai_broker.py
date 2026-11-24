@@ -118,6 +118,15 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 #: as REST's and remotefile's cells do not on a relaxed hop (vault BACKLOG #4912).
 _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
+#: The ways across that refusal under an enforcing posture where no CRL can reach the hop: the
+#: attestation pair, or an endpoint on this machine. Each remedy is written out in full, with no
+#: text made from another, so a grep for its opening words finds it (BACKLOG #5527 item 13).
+_AI_ATTESTATION_LEVER = (
+    "Set [ai].endpoint_revocation_attested = true with an "
+    "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
+    "endpoint's certificate, or use an endpoint on this machine."
+)
+
 #: The ways across that refusal under an enforcing posture, besides an endpoint on this machine.
 #: ``[tls].crl_file`` reaches this hop since BACKLOG #5527, the later CRL lever ADR 0173 section 12
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
@@ -126,17 +135,12 @@ _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 #: embedder passed no ``tls_settings`` and set no ``app.state.tls_settings``, setting it would
 #: change nothing. No connection's attestation is offered either: the endpoint is not a
 #: connection. Naming either would be a remedy the operator cannot perform.
-#: What the attestation lever asks for, after the flag's name, shared by the two texts below so
-#: each of them reads as written, and a grep for either finds it (BACKLOG #5527 item 13).
-_AI_ATTESTATION_TERMS = (
-    " = true with an [ai].endpoint_revocation_attested_reason that says what covers revocation "
-    "of the AI endpoint's certificate, or use an endpoint on this machine."
-)
-_AI_ATTESTATION_LEVER = "Set [ai].endpoint_revocation_attested" + _AI_ATTESTATION_TERMS
 _AI_CRL_LEVER = (
     "Set [tls].crl_file to a CRL file that covers the issuer of the AI endpoint's certificate (it "
     "is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
-    "or its handshake fails), or set [ai].endpoint_revocation_attested" + _AI_ATTESTATION_TERMS
+    "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
+    "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
+    "endpoint's certificate, or use an endpoint on this machine."
 )
 
 
@@ -188,9 +192,9 @@ def endpoint_host_allowed(url: str, allowed: list[str]) -> bool:
 class AiOpenerSlot:
     """Where one app holds the AI endpoint's anchored opener, with the anchor it was built for
     (BACKLOG #5527 items 3 to 5). ``create_app`` puts one on ``app.state.ai_opener_slot`` and the
-    ``POST /ai/chat`` route hands it to the broker, so the held opener lives as long as that app
-    and two apps in one process each hold their own. :func:`_endpoint_opener` fills and clears
-    it; nothing else reads it."""
+    ``POST /ai/chat`` route hands it to the broker, so nothing outside the app's state holds the
+    opener, and two apps in one process each hold their own. Only :func:`_endpoint_opener` fills
+    and clears it."""
 
     __slots__ = ("_held", "_lock")
 
@@ -218,12 +222,15 @@ def _endpoint_opener(
 
     **The anchored opener is held in ``slot``**, though the broker is built for each request: the
     slot holds one, keyed on the resolved anchor, so a narrowing anchor that differs builds a new
-    one in its place, and an anchor that narrows nothing empties it. Held, its context is a live
-    hop as every connection's is, so ``loaded_crls`` records the CRL it holds, the expiry monitor
-    judges that copy, and ``crl_reload`` brings it current when the file is replaced. An opener
-    that is no longer held keeps its ``loaded_crls`` record until it is garbage-collected. With no
-    slot, as for a broker built directly, each call builds an opener of its own, which reads and
-    judges the CA and CRL files every time.
+    one in its place, and a call whose anchor narrows nothing empties it. A slot is emptied only by
+    such a call: until the next assist call that reaches the opener, it keeps what it held. Held,
+    its context is a live hop as every connection's is, so ``loaded_crls`` records the CRL it holds,
+    the expiry monitor judges that copy, and ``crl_reload`` brings it current when the file is
+    replaced. An opener that is no longer held keeps its ``loaded_crls`` record until it is
+    garbage-collected, which for an opener's handler cycle is the cyclic collector's next pass.
+    With no slot, as for a broker built directly, each call builds an opener of its own: it reads
+    and judges the CA and CRL files every time, and records a copy in ``loaded_crls`` for each
+    throwaway context until that is collected.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
     ``harden_crl_check`` refuses; a build that raises leaves the slot as it was."""
@@ -233,9 +240,10 @@ def _endpoint_opener(
     if not anchor.narrows:
         # BACKLOG #5527 item 3: an opener held for an anchor this app no longer resolves would
         # keep its context, and its loaded_crls record, live for nothing.
-        if slot is not None and slot._held is not None:
-            with slot._lock:
-                slot._held = None
+        # A plain store, not under the lock, so this call never waits on a build: the pair is
+        # replaced whole, and a build racing it for another anchor may fill the slot again.
+        if slot is not None:
+            slot._held = None
         return _shared_no_redirect_opener()
     if slot is None:
         return _no_redirect_opener(trust_anchor=anchor, connector="AI endpoint")

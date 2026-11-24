@@ -7,9 +7,10 @@ the opener chooser is a revocation-census site (item 22).
 Before this, ``transports/ai_broker.py`` held one module-global slot keyed on the resolved
 anchor: two apps with different ``[tls]`` policies evicted each other's opener on alternate
 requests, an app whose anchor stopped narrowing left the old opener held, and the opener outlived
-the app that built it. These tests drive ``POST /ai/chat`` and read which opener each request
-dialled, or whether a context the route held is still alive. They import no name the fix added,
-so each runs, and fails on its assertion, against the code before it. All certificates, CRLs,
+the app that built it. The route tests drive ``POST /ai/chat`` and read which opener each request
+dialled, or whether a context the route held is still alive; the others build a broker directly
+or read the source and the census. Each failed on its assertion against the code before the fix,
+run with this file's helper modules at their versions before it too. All certificates, CRLs,
 endpoints and keys are synthetic.
 """
 
@@ -167,14 +168,19 @@ def test_a_broker_built_with_no_app_slot_holds_no_opener(
     second = _broker(posture=_ENFORCING, policy=crl)
     assert first._opener is not second._opener
     assert _context(second).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+    # Held nowhere: once both brokers are dropped, neither context is alive or recorded.
+    refs = [weakref.ref(_context(first)), weakref.ref(_context(second))]
+    del first, second
+    assert not any(_still_held(ref) for ref in refs)
 
 
 def test_each_attestation_remedy_is_written_as_it_is_logged() -> None:
-    """Item 13 (and 26, 43): the remedy that opens with the attestation is written in the source
-    as it is logged, so a grep for the logged text finds it, and no text is made by upper-casing
-    another. Red before the fix: the text began "set [ai]..." and the code upper-cased it."""
+    """Item 13 (and 26, 43): each remedy is written out in the source, so a grep for the logged
+    opening words of either finds it, and no text is made by upper-casing another. Red before the
+    fix: the text began "set [ai]..." and the code upper-cased it."""
     source = Path(inspect.getfile(ai_broker_mod)).read_text(encoding="utf-8")
-    assert '"Set [ai].endpoint_revocation_attested"' in source
+    assert '"Set [ai].endpoint_revocation_attested = true with an "' in source
+    assert 'or set [ai].endpoint_revocation_attested = true with an "' in source
     assert ".upper()" not in inspect.getsource(ai_broker_mod._revocation_lever)
     with pytest.raises(ai_broker_mod.AiBrokerError) as info:
         _broker(posture=_ENFORCING)
@@ -189,3 +195,17 @@ def test_each_caller_of_the_ai_opener_chooser_is_a_census_site() -> None:
     sites = _scan().sites
     assert "messagefoundry/transports/ai_broker.py::AiBroker.__init__" in sites
     assert "messagefoundry/transports/ai_broker.py::_endpoint_opener" not in sites
+
+
+async def test_an_opener_slot_of_another_type_answers_503(
+    engine: Engine,  # noqa: F811 - the imported fixture
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An embedder that overwrites ``app.state.ai_opener_slot`` with something else is refused as
+    a misconfiguration, as a ``tls_settings`` stash of another type is, rather than built around
+    with a fresh opener on every request. Nothing is sent."""
+    dialled = _record_openers(monkeypatch)
+    app = create_app(engine, ai_settings=_managed_ai(), allow_no_auth=True)
+    app.state.ai_opener_slot = object()
+    assert await _chat(app) == 503
+    assert dialled == []

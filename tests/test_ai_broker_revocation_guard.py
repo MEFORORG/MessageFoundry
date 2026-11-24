@@ -992,8 +992,9 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
     loopback endpoint on an app that holds a ``[tls]`` section with a ``crl_file``, as ``serve``
     stashes it, which ``resolve_trust_anchor`` exempts from the CRL. In both arms a ``crl_file``
     is configured where it would matter if reached: the loopback app holds it, and for the direct
-    ``create_app`` the process environment names it and the process already holds the anchored
-    opener that CRL builds, as a ``serve``-hosted broker in the same process would. Each arm checks
+    ``create_app`` the process environment names it and the app's own slot already holds the
+    anchored opener that CRL builds for this endpoint (another app in the same process holds its
+    own slot, which this app's route never reads). Each arm checks
     the context the route really dials with, then reads the entry. Red on 547561b4da: the entry
     said "no CRL unless [tls].crl_file is set", a CRL check on both paths."""
     dialled: list[AiBroker] = []
