@@ -624,19 +624,19 @@ so. That case is the exception to the opening rule of this section.
 
 **What the owner approved.** On 2026-10-08 the owner approved this statement of the rule: *"the
 stamps name the last full read of every ground the verdict rests on; a partial re-read keeps them
-and dates its own layer"*. On 2026-10-09 the owner chose two option labels. Asked whether a partial
+and dates its own layer"*. On 2026-10-09 the owner chose two option labels in one dialog, and a third later that day. Asked whether a partial
 re-read may move a cell's `reviewed_by`, the owner chose *"Yes, if it set or held the verdict
 (Recommended)"*. Asked what a cell with no single full read on record should show, the owner chose
 *"Keep the old stamps, mark a full read owed (Recommended)"*. The owner chose those labels. The
 Manager seat wrote the options, and *(Recommended)* is the seat's mark. The paragraphs headed
-*A partial re-read that set or held the verdict* and *A cell whose current grounds are newer* give
-each option's description, which the Manager seat wrote and the owner chose with the label. Later on 2026-10-09 (US Central), a vault Builder asked whether a
+*A partial re-read that set or held the verdict* and *A cell whose current grounds are newer*
+paraphrase each option's description, which the Manager seat wrote and the owner chose with the label. Later on 2026-10-09 (US Central), a vault Builder asked whether a
 pass that weighs something new against a cell, finds it changes none of the cell's grounds, and
 says the verdict stands counts as holding it. The owner chose *"No: grounds must change"*. That
 option's description, which the Builder wrote, reads in part *"A pass holds the verdict only if it
 changed what the cell says about a ground, or why a ground holds. Recording a ruling and finding it
 changes nothing does not count."* The paragraph headed *Holding the verdict means changing a ground*
-restates that description. Everything else here is the reading of the seats that took the rulings
+paraphrases that description. Everything else here is the reading of the seats that took the rulings
 and wrote this section, and not the owner's words. That covers at least the definition of a full read, the line
 that an anchor-only pass moves neither stamp, and the sentence in rule 2 (§1.1) on a cell owed a
 full read.
