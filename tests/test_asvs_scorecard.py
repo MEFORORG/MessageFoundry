@@ -3303,6 +3303,31 @@ def test_prove_absences_screen_outer_refusal_names_only_the_decorators_compared(
     assert "code that inspects the name can see it" in renamed
 
 
+def test_prove_absences_screen_outer_refusal_with_two_live_definitions_claims_no_comparison(
+    tmp_path: Path,
+) -> None:
+    """Where the name has two live definitions, the screen refuses only when the mutation matches
+    neither, and reports the last one's reason. Here that is the outer clause, though the first
+    definition was refused on its signature, so the text must not say only the decorators were
+    compared. Copying the decorators is refused again, now on the signature."""
+    target = (
+        "import functools\nimport os\n\nw = WRAP\n\nif os.environ.get('X'):\n"
+        "    def f(a):\n        return 1\nelse:\n    @functools.cache\n    @w\n"
+        "    def f(a):\n        return 1\n"
+    )
+    (problem,) = _screen("def f(b):\n    return 1\n", target, tmp_path)
+    assert "has shape decorator functools.cache" in problem
+    assert "compared only" not in problem
+    assert "it may not have compared the rest of the signature" in problem
+    assert "each of the others was refused too, perhaps for another reason" in problem
+    assert "Copy the live signature and decorators" in problem
+    copied = "import functools\n\n@functools.cache\n@w\ndef f(b):\n    return 1\n"
+    (again,) = _screen(copied, target, tmp_path)
+    assert "where a value was expected" in again
+    # Control: a mutation matching one live definition is accepted.
+    assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+
+
 def test_prove_absences_screen_outer_refusal_on_new_claims_no_binding(tmp_path: Path) -> None:
     """Python's ``type()`` makes an undecorated ``__new__`` a staticmethod, so a mutation dropping
     the decorator binds what the live one does. The screen still refuses it (it reads the
