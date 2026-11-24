@@ -3,7 +3,7 @@
 import * as assert from "assert";
 
 import type { Graph } from "../../graphModel";
-import { buildWiringMap, graphOpenTarget, NODE_CAP, type MapNode } from "../../wiringMapModel";
+import { buildWiringMap, graphOpenTarget, handleOpenRequest, NODE_CAP, type MapNode } from "../../wiringMapModel";
 
 // Pure (vscode-free) view-model for the Wiring Map panel (ADR 0091 D3), exercised node-side like
 // graph-model.test.ts. Covers: focus-BFS hop membership (1 vs 2), the four-column assignment
@@ -298,8 +298,12 @@ suite("wiringMapModel — graphOpenTarget refuses a file the graph did not repor
     assert.strictEqual(graphOpenTarget(undefined, "/ws/cfg/a.py", 1), undefined);
   });
 
-  test("a location-less element does not make an empty file openable", () => {
-    const g: Graph = { ...G, handlers: [{ name: "h", edges: [], file: null, line: null }] };
+  test("an element reporting no file, or an empty one, does not make an empty file openable", () => {
+    const g: Graph = {
+      ...G,
+      routers: [{ name: "r", edges: [], file: "", line: 2 }],
+      handlers: [{ name: "h", edges: [], file: null, line: null }],
+    };
     assert.strictEqual(graphOpenTarget(g, "", 1), undefined);
   });
 
@@ -307,5 +311,62 @@ suite("wiringMapModel — graphOpenTarget refuses a file the graph did not repor
     for (const ln of [0, -4, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "9", undefined]) {
       assert.deepStrictEqual(graphOpenTarget(G, "/ws/cfg/a.py", ln), { file: "/ws/cfg/a.py", line: 1 }, String(ln));
     }
+  });
+});
+
+suite("wiringMapModel — handleOpenRequest is what the Wiring Map's open handler runs (BACKLOG #4277)", () => {
+  const G: Graph = {
+    version: 2,
+    inbound: [{ name: "IB_A", type: "mllp", router: "r", file: "/ws/cfg/a.py", line: 3 }],
+    outbound: [],
+    routers: [{ name: "r", edges: [], file: "/ws/cfg/a.py", line: 10 }],
+    handlers: [],
+  };
+
+  function recorder(fail?: Error): { calls: unknown[][]; warnings: string[]; host: Parameters<typeof handleOpenRequest>[3] } {
+    const calls: unknown[][] = [];
+    const warnings: string[] = [];
+    return {
+      calls,
+      warnings,
+      host: {
+        execute: (command: string, ...args: unknown[]) => {
+          calls.push([command, ...args]);
+          return fail ? Promise.reject(fail) : Promise.resolve(undefined);
+        },
+        warn: (message: string) => {
+          warnings.push(message);
+        },
+      },
+    };
+  }
+
+  test("a graph file opens through messagefoundry.openSource", async () => {
+    const r = recorder();
+    await handleOpenRequest(G, "/ws/cfg/a.py", 10, r.host);
+    assert.deepStrictEqual(r.calls, [["messagefoundry.openSource", "/ws/cfg/a.py", 10]]);
+    assert.deepStrictEqual(r.warnings, []);
+  });
+
+  test("a page-chosen file runs no command and warns", async () => {
+    const r = recorder();
+    await handleOpenRequest(G, "/etc/passwd", 1, r.host);
+    assert.deepStrictEqual(r.calls, []);
+    assert.strictEqual(r.warnings.length, 1);
+    assert.ok(!r.warnings[0].includes("/etc/passwd"), "the page's path is not echoed");
+  });
+
+  test("with no graph loaded, nothing opens and the warning says so", async () => {
+    const r = recorder();
+    await handleOpenRequest(undefined, "/ws/cfg/a.py", 1, r.host);
+    assert.deepStrictEqual(r.calls, []);
+    assert.match(r.warnings[0], /no wiring graph is loaded/);
+  });
+
+  test("a failed open warns instead of rejecting", async () => {
+    const r = recorder(new Error("file not found"));
+    await handleOpenRequest(G, "/ws/cfg/a.py", 3, r.host);
+    assert.strictEqual(r.calls.length, 1);
+    assert.match(r.warnings[0], /file not found/);
   });
 });
