@@ -3418,7 +3418,9 @@ async def test_the_census_names_a_covered_chosen_password_with_no_totp_and_only_
         await create_admin(service)
         await _created_holder(service, username="generated")
         enrolled_id, _ = await _created_holder(service, username="enrolled")
-        staged_cell = await store.set_totp_secret(enrolled_id, secret="JBSWY3DPEHPK3PXP")
+        staged_cell = await store.set_totp_secret(
+            enrolled_id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        )
         assert await store.enable_totp(
             enrolled_id, expected_secret_cell=staged_cell, recovery_code_hashes=[]
         )
@@ -3610,7 +3612,9 @@ async def test_the_census_reads_every_account_it_should_and_nothing_it_should_no
             password_generated=False,
             audits=(),
         )
-        staged_cell = await store.set_totp_secret("dir-totp", secret="JBSWY3DPEHPK3PXP")
+        staged_cell = await store.set_totp_secret(
+            "dir-totp", secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+        )
         assert await store.enable_totp(
             "dir-totp", expected_secret_cell=staged_cell, recovery_code_hashes=[]
         )

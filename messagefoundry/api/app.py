@@ -4774,6 +4774,9 @@ def create_app(
     approvals: ApprovalsSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     service_settings: ServiceStatusSettings | None = None,
+    # The [tls] section POST /ai/chat and POST /alerts/test-email resolve their trust anchor and
+    # CRL from (BACKLOG #5527 item 8), stashed on app.state. None stashes no [tls] policy.
+    tls_settings: TlsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     # ON by default (BACKLOG #1277), matching [diagnostics].audit_all_authz. Two defaults for one
@@ -4871,6 +4874,10 @@ def create_app(
         app.state.auth = auth
     if ai_settings is not None:
         app.state.ai = ai_settings
+    # #323 layer 3, BACKLOG #5527 item 8: the [tls] policy the AI broker and the alerts test send
+    # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
+    # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
+    app.state.tls_settings = tls_settings
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
     # store opens; here it supports the direct-construction (test) path.
@@ -5471,8 +5478,9 @@ def create_app(
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
-        # None goes down.
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
+        # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
@@ -13870,8 +13878,11 @@ def create_managed_app(
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
             app.state.secret_provider = secret_provider
-            # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
-            # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+            # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
+            # read, stashed at start from the argument the live notifier and the connections read,
+            # so a stash written before start cannot split the two. create_app below is not
+            # handed it, so it writes None at build and this overwrites that at start (BACKLOG
+            # #5527 item 8).
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail

@@ -3895,7 +3895,9 @@ class AuthSettings(_Section):
     # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
     # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
     oidc_issuer: str | None = None
-    oidc_client_id: str | None = None  # also the required `aud`/`azp`
+    # The id_token aud/azp rule this feeds, and its known limit: docs/CONFIGURATION.md, the
+    # oidc_client_id row, and _check_core_claims in auth/oidc/claims.py.
+    oidc_client_id: str | None = None
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
@@ -11327,10 +11329,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11339,8 +11341,10 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "

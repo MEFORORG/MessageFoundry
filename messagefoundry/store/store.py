@@ -629,23 +629,34 @@ class _GroupCommitter:
         self._wake = asyncio.Event()
         self._closed = False
         self._task: asyncio.Task[None] | None = None
+        # The task _on_stopped last handled, so it runs once per task whichever of its two callers
+        # (the done-callback, or aclose) reaches it first.
+        self._reaped: asyncio.Task[None] | None = None
 
     def start(self) -> None:
         if self._task is None or self._task.done():
             # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
             self._closed = False
+            self._reaped = None  # the old task is done; a callback still queued for it reads stale
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
             self._task.add_done_callback(self._on_stopped)
 
     def _on_stopped(self, task: asyncio.Task[None]) -> None:
         """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
         first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
-        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
-        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
-        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
-        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
-        if task is not self._task:
-            return  # a stale task; a newer one owns the committer now
+        no :meth:`submit` after this runs may enrol, and every member still pending is rejected, or
+        its caller (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather
+        than a ``finally`` in :meth:`_run`, because a task cancelled before its first step never
+        enters its body. On the clean :meth:`aclose` exit ``_pending`` is already empty.
+
+        :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
+        the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
+        finds the task done and gets past its ``await`` without yielding. Without the direct call
+        this callback would run only after ``aclose`` cleared ``_task``, read the task as stale, and
+        leave that member pending (BACKLOG #5664)."""
+        if task is not self._task or task is self._reaped:
+            return  # a stale task (a newer one owns the committer now), or one already handled
+        self._reaped = task
         self._closed = True
         stranded, self._pending = self._pending, []
         if task.cancelled() or task.exception() is not None:
@@ -658,7 +669,8 @@ class _GroupCommitter:
                 member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
-        """Stop the committer, flushing any enrolled members first so nothing is stranded."""
+        """Stop the committer, flushing the members it can still reach first. A member still pending
+        once the committer task has ended is rejected through :meth:`_on_stopped`, not left to park."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -668,15 +680,23 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier has already rejected its members (_on_stopped); that
-                # stale cancel must not abort the store's close. A cancel of OUR task during the
-                # await still propagates; the baseline keeps a caller that already caught an
+                # A committer cancelled earlier rejects its members in _on_stopped, which its
+                # done-callback or the call below runs once; that stale cancel must not abort the
+                # store's close. A cancel of OUR task during the await still propagates; asyncio
+                # passes it on to the committer, whose done-callback has already run _on_stopped by
+                # the time this re-raises. The baseline keeps a caller that already caught an
                 # earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
                     raise
-            self._task = None
+            # Before clearing _task, so the member a same-turn submit() enrolled is rejected rather
+            # than left to a done-callback that would read the task as stale (see _on_stopped).
+            self._on_stopped(task)
+            # An overlapping close and start() may have installed a newer task; leave that one.
+            if self._task is task:
+                self._task = None
+                self._reaped = None
 
     async def submit(
         self,
@@ -4471,10 +4491,11 @@ def discoverable_way_past(
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
-#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
-#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
-#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
-#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses or whose key is too
+#: short to compute with (BACKLOG #5340), or no secret at all. ``"unknown"``: it could not be judged
+#: (the cell did not open, a cipher service did not answer, or the value is not base32). Only a
+#: KNOWN refusal moves any decision away from the plain ``totp_enabled`` rule; an unknown answer is
+#: treated exactly as that rule treats it.
 TotpState = Literal["usable", "refused", "unknown"]
 
 #: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's
@@ -8430,7 +8451,10 @@ async def settle_audit_ranges(
                 problem = f"the audit key-range row at seq={seq} {refusal}"  # BACKLOG #3420
                 break
             out_secret = _audit_secret_for(current, keys, host._audit_mac_fn)
-            if out_secret is not None and not _audit_tag_ok(parsed, out_secret):
+            # Under the Transit MAC the tag check is a round trip, so it runs off the loop (#3929).
+            if out_secret is not None and not await cipher_call(
+                out_secret[1], _audit_tag_ok, parsed, out_secret
+            ):
                 problem = (
                     f"the audit key-range row at seq={seq} is not authorised by the key it closes"
                 )
@@ -8598,12 +8622,15 @@ async def roll_audit_key_range(host: AuditRangeHost) -> tuple[bool, str]:
         prev_hash=(rows[split - 1]["row_hash"] or "") if split else "",
     )
     sealed_head = rows[-1]["row_hash"] or ""
+    # The handover tag is a MAC under the outgoing key, routed like the open's tag check (#3929).
+    # docs/CONNECTIONS.md, the Vault Transit bulk-cipher row, says where it runs today.
+    detail = await cipher_call(out_secret[1], audit_epoch_detail, active_id, closes, out_secret)
     host._audit_range_key_id = active_id  # the range row is the first row of the new range
     try:
         await host.record_audit(
             AUDIT_KEY_EPOCH_ACTION,
             actor="system:rotate-key",
-            detail=audit_epoch_detail(active_id, closes, out_secret),
+            detail=detail,
             expect_prev=sealed_head,
         )
     except AuditHeadMovedError:

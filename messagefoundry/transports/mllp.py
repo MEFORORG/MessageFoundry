@@ -41,6 +41,7 @@ from messagefoundry.config.models import (
     Destination,
     Source,
     bool_setting,
+    flag_from_settings,
 )
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
@@ -707,12 +708,18 @@ def _mllp_ssl_context(
     ``tls_client_subjects`` (BACKLOG #4907). Handing over the loaded bytes, rather than the path, is
     the point: a second read of ``tls_ca_file`` could see a swapped file. ``None``, the default,
     changes nothing."""
+    # Read strictly, before the pin check, whose inbound arm reads tls by truthiness and whose
+    # outbound arm reads "" as off, so a non-bool is refused as itself rather than as an unread pin:
+    # bool("false") is True (vault BACKLOG #3234). The destination's tls_allow_expired is read here
+    # too, so it is refused with tls off.
+    tls = flag_from_settings(s, "tls")
+    allow_expired = False if server else flag_from_settings(s, "tls_allow_expired")
     refuse_an_unread_ca_pin(
         s,
         inbound=server,
         connector=_tls_label(listener_family if server else "MLLP destination", name),
     )
-    if not s.get("tls"):
+    if not tls:
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
     # Passphrase for an encrypted private key (both directions). None => unencrypted key, the prior behavior.
@@ -821,7 +828,7 @@ def _mllp_ssl_context(
         # unchecked too (vault BACKLOG #5089). Opt-in per connection (default False = byte-
         # identical); applied on the verify path only, so it composes with (never bypasses) the
         # tls_verify=false refusal above and the #200 cleartext/verify-off hop refusals.
-        if s.get("tls_allow_expired"):
+        if allow_expired:
             relax_verify_expiry(ctx, host=str(s.get("host", "127.0.0.1")))
     return ctx
 

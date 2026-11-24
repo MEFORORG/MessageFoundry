@@ -31,7 +31,7 @@ import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import (
@@ -46,8 +46,12 @@ from messagefoundry.config.code_sets import (
 )
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.path_reach import is_absent
 from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+
+if TYPE_CHECKING:
+    from messagefoundry.config.impact import PreparedRename
 
 _log = logging.getLogger(__name__)
 
@@ -62,7 +66,9 @@ def _policy_detail(policy: UnmappedPolicy) -> dict[str, Any]:
 
 #: Run before a write to prove the file loads; the CLI passes the real loader. It receives the
 #: CANDIDATE ``.csv`` (the live file's name, in a private directory beside it, with the policy sidecar
-#: copied next to it) and raises on any problem, which leaves the live file untouched.
+#: copied next to it) and raises on any problem, which leaves the live file untouched. A rename,
+#: whose bytes do not change, passes the LIVE source table in place instead, ``.csv`` or ``.toml``,
+#: its sidecar already beside it, so a validator must only read the path it is given.
 Validate = Callable[[Path], None]
 
 
@@ -165,7 +171,7 @@ def upsert_code_set(
             # A create must not silently overwrite an existing code set — refuse loud (mirrors the
             # wizard/form collision refusal, PR #1081). An edit (create=False) overwrites the .csv.
             raise WiringError(_create_collision_message(name, codesets_dir))
-        _reject_toml_collision(codesets_dir, name)
+        _reject_toml_collision(path)
 
         text = _build_csv_text(headers, emitted)
         _write_validated(path, text, validate)
@@ -178,15 +184,18 @@ def upsert_code_set(
 def rename_code_set(
     config_dir: str | Path, old: str, new: str, *, validate: Validate
 ) -> dict[str, Any]:
-    """Rename ``codesets/<old>.<ext>`` to ``codesets/<new>.<same ext>`` (atomic ``os.replace``).
+    """Rename ``codesets/<old>.<ext>`` to ``codesets/<new>.<same ext>`` (atomic ``os.replace``),
+    moving its ``<old>.policy.toml`` sidecar (#162) to ``<new>.policy.toml`` with it.
 
     **Both** ``old`` and ``new`` are checked with the same name-safety rules as ``upsert``; the rename
-    is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
-    :class:`WiringError` on at least a missing or unsafe ``old``/``new``, an absent source, a stem
-    collision, and a reference rewrite the rename cannot make (see ``docs/CODESETS.md``)."""
-    # Here, not at module top, so importing the config layer does not import the auth package.
-    from messagefoundry.restricted_file import replace_generated
-
+    is rejected if **any** supported file already exists for ``new`` (a stem collision), or if
+    ``<new>.policy.toml`` exists: beside the renamed table it would become that table's policy, or
+    be overwritten by the moving one (BACKLOG #5776). ``validate`` loads the source table with its
+    sidecar before anything moves; the bytes do not change and ``new`` is a checked bare stem, so a
+    table that loads there loads under the new name. Raises :class:`WiringError` on at least a
+    missing or unsafe ``old``/``new``, an absent source, a stem or sidecar collision, and a
+    reference rewrite the rename cannot make (see ``docs/CODESETS.md``); a refusal ``validate``
+    raises propagates as it is."""
     if not old:
         raise WiringError("--name is required for `codeset rename`")
     if not new:
@@ -205,12 +214,36 @@ def rename_code_set(
     # again under it, since it may have gone while this waited.
     with _directory_lock(codesets_dir):
         src = _existing_path(codesets_dir, old)
-        # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which may
-        # overwrite the same-stem .csv).
-        if _existing_path_or_none(codesets_dir, new) is not None:
+        # For a rename, ANY supported file for the new stem is a collision (unlike upsert, which
+        # may overwrite the same-stem .csv), an extension in another case included.
+        if any(
+            atomic_edit.is_file(codesets_dir / f"{new}{ext}", refused_error=WiringError)
+            for ext in _SUPPORTED_EXTS
+        ) or _case_variant(codesets_dir, new):
             raise WiringError(_collision_message(new, codesets_dir))
+        # Anything else at those names, such as a folder, refuses the move with a misleading
+        # error, or stays beside the renamed table.
+        for ext in _SUPPORTED_EXTS:
+            if _taken(other := codesets_dir / f"{new}{ext}"):
+                raise WiringError(
+                    f"cannot rename code set {old!r} to {new!r}: {_rel(other)} already exists "
+                    "and is not a code set file; rename or remove it first"
+                )
 
         dest = codesets_dir / f"{new}{src.suffix}"
+        # A <new>.policy.toml with no <new> table is a standalone code set: beside the renamed table
+        # it would silently become its policy, and a moving sidecar would overwrite it (#5776).
+        dest_sidecar = _policy_sidecar_path(dest)
+        if _taken(dest_sidecar):
+            raise WiringError(
+                f"cannot rename code set {old!r} to {new!r}: {dest_sidecar.name} already exists in "
+                f"{codesets_dir} and would become the renamed table's policy; rename or remove it "
+                "first"
+            )
+        # The injected loader's word on the table and its policy before anything moves (S10-52).
+        # The referent plan below loads the whole config again, which refuses the same table; this
+        # call keeps the callback's contract and gives the earlier, narrower refusal.
+        validate(src)
         # Referent pre-flight (#152): a code set is named by string literals in the Router/Handler
         # modules that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the
         # plan is built from the loaded graph while "old" still resolves (the loader would otherwise
@@ -234,53 +267,108 @@ def rename_code_set(
         # Checked against the files before the table moves: a referent file that changed since
         # the plan refuses here, with nothing moved (BACKLOG #5980).
         prepared = impact.prepare_rename(plan)
-        with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
-            replace_generated(src, dest)
+        had_sidecar = atomic_edit.is_file(_policy_sidecar_path(src), refused_error=WiringError)
+        # Where table and policy belong if the rename must be undone by hand. Built before the
+        # move, so the move's return leads straight into the try that undoes it.
+        home = _pair(src, had_sidecar)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
+        try:
+            _move_with_sidecar(src, dest, has_sidecar=had_sidecar)
+        except _SplitPairError as exc:
+            raise WiringError(
+                f"{exc}. No reference was rewritten, so they still name {old!r}: put the table "
+                f"back as {_rel(src)}, and any policy as {_rel(_policy_sidecar_path(src))}, by hand"
+            ) from exc
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
         try:
             rewritten = len(impact.write_rename(prepared))
         except impact.RenameWriteError as exc:
-            # A write failed and the files written were restored, so the table moves back to the
-            # name they read. A file the error names could not be restored and still reads the new
-            # name; the message says so.
-            try:
-                with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
-                    replace_generated(dest, src)
-            except (WiringError, OSError) as back:
+            # The write's own text is true only when it restored every file; otherwise the files
+            # it names are read again below, and the message says what that read found.
+            cause = str(exc)
+            still_new: list[str] = []
+            if exc.unrestored:
+                # A file the write could not restore, read again: one that holds the bytes the
+                # plan read names the old table after all, and one that cannot be read counts as
+                # left, as after an interrupt.
+                unrestored = set(exc.unrestored)
+                try:
+                    still_new = [f for f in impact.rewritten_files(prepared) if f in unrestored]
+                except BaseException:
+                    # Interrupted before the read could tell: the table stays where a reported
+                    # file may read it, and the log says where each file is.
+                    left, others = _reference_split(config_dir, prepared, exc.unrestored)
+                    _log.error(
+                        "code set rename interrupted while reading its references again: the "
+                        "code set stays as %s; these were not restored and may name %r: %s; "
+                        "these name %r: %s",
+                        _pair(dest, had_sidecar),
+                        new,
+                        left,
+                        old,
+                        others,
+                    )
+                    raise
+                cause = (
+                    f"cannot rename code set {old!r} to {new!r}: a reference write failed "
+                    f"({_cause_name(exc)}); the files it reported unrestored still read as before "
+                    f"the rename and name {old!r}: "
+                    f"{_reference_split(config_dir, prepared, exc.unrestored)[0]}"
+                )
+            if still_new:
+                # A reference that may be left naming the new table would lose it to a move back,
+                # so the code set stays. The message names the files config-relative, and the
+                # error by its type only.
+                left, others = _reference_split(config_dir, prepared, still_new)
                 raise WiringError(
-                    f"{exc}. The code set was then left as {dest.name}, because moving it back "
-                    f"failed ({back}), while its references still name {old!r}: rename "
-                    f"{dest.name} back to {src.name} by hand"
+                    f"cannot rename code set {old!r} to {new!r}: a reference write failed "
+                    f"({_cause_name(exc)}), and these could not be restored and may still name "
+                    f"{new!r}: {left}. The code set stays as {_pair(dest, had_sidecar)}; these "
+                    f"name {old!r}: {others}. Rewrite the references to one name by hand, and "
+                    f"move the code set to match: to keep {old!r}, put it back as {home}"
                 ) from exc
-            raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc
+            # A write failed and the files written were restored, so the table moves back to the
+            # name they read. The move back is never undone: a half that fails leaves what moved
+            # under the old name, which is where the references read it.
+            try:
+                _move_with_sidecar(dest, src, roll_back=False, has_sidecar=had_sidecar)
+            except _SplitPairError as back:
+                # Its text ends with where each file is.
+                raise WiringError(
+                    f"{cause}. Moving the code set back then failed ({back}), while its "
+                    f"references still name {old!r}: put it back as {home} by hand"
+                ) from exc
+            raise WiringError(f"{cause}. The code set was moved back to {home}") from exc
         except BaseException:
             # An interrupt (Ctrl-C, SystemExit) or an unexpected error. write_rename restores only
             # what was cut off inside a write, so an interrupt after a write returned, or while
             # its locks were released, can leave references naming the new table. Read the files:
             # the table goes back only when none is left rewritten, so table and references agree.
-            left = impact.rewritten_files(prepared)
-            if left:
+            rewritten_left = impact.rewritten_files(prepared)
+            if rewritten_left:
+                left, others = _reference_split(config_dir, prepared, rewritten_left)
                 _log.error(
                     "code set rename interrupted: %s left naming %r, so the code set stays as %s; "
                     "these still name %r: %s",
-                    ", ".join(left),
+                    left,
                     new,
-                    dest.name,
+                    _pair(dest, had_sidecar),
                     old,
-                    ", ".join(f for f, _raw, _new in prepared.files if f not in left) or "none",
+                    others,
                 )
                 raise
             try:
-                replace_generated(dest, src)
-            except OSError as back:
+                _move_with_sidecar(dest, src, roll_back=False, has_sidecar=had_sidecar)
+            except _SplitPairError as back:
+                # The error's type only: its text may carry a host path.
                 _log.error(
-                    "code set rename interrupted: moving %s back to %s failed (%s); rename it "
-                    "back by hand",
-                    dest.name,
-                    src.name,
-                    type(back).__name__,
+                    "code set rename interrupted: moving the code set back failed (%s), so %s; "
+                    "its references name %r, so put it back as %s by hand",
+                    _cause_name(back),
+                    back.layout,
+                    old,
+                    home,
                 )
             raise
         if rewritten:
@@ -289,8 +377,11 @@ def rename_code_set(
 
 
 def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) -> dict[str, Any]:
-    """Delete ``codesets/<name>.csv`` (else ``.toml``). Raises :class:`WiringError` if ``name`` is
-    missing or no such file exists.
+    """Delete ``codesets/<name>.csv`` (else ``.toml``) and its ``<name>.policy.toml`` sidecar
+    (#162), which left behind would load as a standalone code set (BACKLOG #5776). A sidecar a
+    second same-stem table still reads (a duplicate the loader refuses) is kept. Raises
+    :class:`WiringError` on at least a missing ``name``, no such file, and a sidecar that could not
+    be deleted after the table was.
 
     ``validate`` is accepted for signature symmetry with the other mutators (a delete has nothing to
     re-load) and is intentionally unused."""
@@ -316,8 +407,29 @@ def remove_code_set(config_dir: str | Path, name: str, *, validate: Validate) ->
         # (plan-before-move). Best-effort + additive: the delete is the core op, so an unloadable
         # graph yields no referrers.
         dangling = _code_set_referrers(config_dir, name)
-        with atomic_edit.refused_as(path, WiringError, "remove it"):
-            unlink_generated(path)
+        sidecar = _policy_sidecar_path(path)
+        # Decided before the unlink: a second same-stem table (a duplicate the loader refuses)
+        # still reads the sidecar as its policy, so it is kept for that table.
+        drop_sidecar = atomic_edit.is_file(
+            sidecar, refused_error=WiringError
+        ) and not _other_table_exists(path)
+        try:
+            with atomic_edit.refused_as(path, WiringError, "remove it"):
+                unlink_generated(path)
+            # After the table, so a failure here is loud rather than a table silently stripped of
+            # its policy.
+            if drop_sidecar:
+                _remove_orphan_sidecar(name, sidecar, dangling)
+        except WiringError:
+            # A refusal says itself: a refused table is still there, and a sidecar that could not
+            # be deleted is named in the error.
+            raise
+        except BaseException:
+            # An interrupt after the table's unlink, or in the sidecar's: the sidecar still must
+            # not outlive its table.
+            if drop_sidecar:
+                _drop_sidecar_if_table_gone(path, sidecar, dangling)
+            raise
     result: dict[str, Any] = {"op": "remove", "name": name}
     if dangling:
         result["referrers"] = dangling
@@ -427,12 +539,13 @@ def _has_drive(name: str) -> bool:
     return ntpath.splitdrive(name)[0] != ""
 
 
-def _reject_toml_collision(codesets_dir: Path, name: str) -> None:
-    """For an upsert: reject if a ``codesets/<name>.toml`` exists (the ``.csv`` is the overwrite
-    target, allowed). Mirrors the loader's duplicate-stem fail-loud."""
-    toml = codesets_dir / f"{name}.toml"
-    # The gate for its refusal, then exists() too, because a folder of that name has always collided.
-    if atomic_edit.is_file(toml, refused_error=WiringError) or toml.exists():
+def _reject_toml_collision(target: Path) -> None:
+    """For an upsert of ``target``, ``codesets/<name>.csv``: reject if a ``codesets/<name>.toml``
+    exists (``target`` is the overwrite target, allowed). Mirrors the loader's duplicate-stem
+    fail-loud."""
+    codesets_dir, name = target.parent, target.stem
+    # A folder of that name has always collided too.
+    if _taken(codesets_dir / f"{name}.toml") or _case_variant(codesets_dir, name, besides=target):
         raise WiringError(_collision_message(name, codesets_dir))
 
 
@@ -508,6 +621,280 @@ def _existing_path_or_none(codesets_dir: Path, name: str) -> Path | None:
         if atomic_edit.is_file(candidate, refused_error=WiringError):
             return candidate
     return None
+
+
+class _SplitPairError(WiringError):
+    """A move left the table, and any policy sidecar, off the names it was asked to leave them
+    under. ``layout`` says where each file is, by config-relative name only."""
+
+    def __init__(self, message: str, layout: str) -> None:
+        super().__init__(message)
+        self.layout = layout
+
+    def __reduce__(self) -> tuple[type[_SplitPairError], tuple[str, str]]:
+        # Exception pickles as cls(*args), and args holds only the message.
+        return (type(self), (str(self), self.layout))
+
+
+def _move_with_sidecar(
+    src: Path, dest: Path, *, roll_back: bool = True, has_sidecar: bool | None = None
+) -> bool:
+    """Move table ``src`` to ``dest`` and its policy sidecar (#162), if any, beside it (BACKLOG
+    #5776), returning whether a sidecar moved. ``has_sidecar`` says whether one moves; ``None``
+    reads it from the disk.
+
+    With ``roll_back``, a forward move: the table moves first, so a move cut off half way never
+    leaves a table under the name the references read without its policy. A reference then finds
+    no table (at load for a module-level capture, else at its first lookup) rather than running
+    with the wrong policy. A failure or an interrupt at any point moves back whatever had moved, read
+    from the files rather than assumed, since an interrupt can land on either side of a replace.
+    A stat that fails is not read as absent: the move back stops there. If the move back fails, a
+    failure raises :class:`_SplitPairError` saying where each file is, and an interrupt logs it.
+
+    Without ``roll_back``, a move that is itself the undo of an earlier one, toward the name the
+    references read: the sidecar moves first, for the same reason, and nothing is moved back,
+    which would carry the files away from that name again. A failure raises
+    :class:`_SplitPairError` and an interrupt logs, each saying where each file is."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import replace_generated
+
+    src_sidecar = _policy_sidecar_path(src)
+    dest_sidecar = _policy_sidecar_path(dest)
+    if has_sidecar is None:
+        has_sidecar = atomic_edit.is_file(src_sidecar, refused_error=WiringError)
+    steps = [(src, dest)] + ([(src_sidecar, dest_sidecar)] if has_sidecar else [])
+    if not roll_back:
+        steps.reverse()
+    try:
+        for moving, to in steps:
+            with atomic_edit.refused_as(moving, WiringError, f"rename it to {to.name}"):
+                replace_generated(moving, to)
+    except BaseException as exc:
+        back: WiringError | OSError | None = None
+        if roll_back:
+            try:
+                if has_sidecar and _present(dest_sidecar) and not _present(src_sidecar):
+                    with atomic_edit.refused_as(
+                        dest_sidecar, WiringError, f"rename it back to {src_sidecar.name}"
+                    ):
+                        replace_generated(dest_sidecar, src_sidecar)
+                if _present(dest) and not _present(src):
+                    with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
+                        replace_generated(dest, src)
+            except (WiringError, OSError) as failed:
+                back = failed
+        if roll_back and back is None:
+            raise
+        layout = _layout(src, dest, has_sidecar)
+        if isinstance(exc, (WiringError, OSError)):
+            undo = f"; moving back failed ({back})" if back is not None else ""
+            raise _SplitPairError(f"{exc}{undo}, so {layout}", layout) from exc
+        # Config-relative names and the error's type only: a log line carries no host path.
+        _log.error(
+            "code set move cut off by %s%s, so %s; they belong as %s",
+            type(exc).__name__,
+            f": moving back failed ({_cause_name(back)})" if back is not None else "",
+            layout,
+            _pair(src if roll_back else dest, has_sidecar),
+        )
+        raise
+    return has_sidecar
+
+
+def _rel(path: Path) -> str:
+    """``path``, a file in the codesets directory, named relative to the config dir, so a log line
+    that names it carries no host path."""
+    return f"{CODESETS_DIR_NAME}/{path.name}"
+
+
+def _pair(table: Path, has_sidecar: bool) -> str:
+    """``table``, and its policy sidecar when it has one, by config-relative name."""
+    return _rel(table) + (f" and {_rel(_policy_sidecar_path(table))}" if has_sidecar else "")
+
+
+def _reference_split(
+    config_dir: str | Path, prepared: PreparedRename, left: list[str]
+) -> tuple[str, str]:
+    """The referencing files of a rename ``prepared`` that are ``left`` rewritten, and the rest, each
+    joined by config-relative name, so a message or log line carries no host path."""
+    return (
+        ", ".join(_config_rel(config_dir, f) for f in left),
+        ", ".join(_config_rel(config_dir, f) for f, _raw, _new in prepared.files if f not in left)
+        or "none",
+    )
+
+
+def _config_rel(config_dir: str | Path, file: str) -> str:
+    """A referencing module ``file`` named relative to ``config_dir``, else by its bare name, so a
+    log line carries no host path."""
+    try:
+        return Path(file).resolve().relative_to(Path(config_dir).resolve()).as_posix()
+    except (ValueError, OSError):
+        return Path(file).name
+
+
+def _present(path: Path) -> bool:
+    """Whether anything is at ``path``, a link that leads nowhere included. Only a missing name
+    reads as absent (:func:`~messagefoundry.path_reach.is_absent`, which a share Windows cannot
+    reach is not); any other failed stat raises, so an unreadable entry is never taken for a free
+    name. Unlike ``Path.exists``, which answers ``False`` for every failed stat."""
+    try:
+        path.lstat()
+    except FileNotFoundError as exc:
+        if is_absent(exc):
+            return False
+        raise
+    return True
+
+
+def _taken(path: Path) -> bool:
+    """Whether a name is taken in the codesets directory, by a file, a folder or a link: the
+    shared gate's refusal for a stat it cannot make, then :func:`_present`."""
+    if atomic_edit.is_file(path, refused_error=WiringError):
+        return True
+    with atomic_edit.refused_as(path, WiringError, atomic_edit.READ_STEP):
+        return _present(path)
+
+
+def _case_variant(codesets_dir: Path, name: str, *, besides: Path | None = None) -> Path | None:
+    """A table file of stem ``name`` whose extension differs from ``.csv``/``.toml`` only in case
+    (``name.CSV``), which the loader reads too and a case-sensitive file system keeps apart.
+
+    ``besides`` is the table being edited, which is never its own variant. A case-insensitive file
+    system opens ``name.CSV`` under the name ``name.csv`` and lists it under its own spelling, so a
+    ``besides`` that is a file the listing does not spell exactly is the entry spelled like it in
+    another case. Compared by listed name, never by path (``WindowsPath`` equality ignores case)
+    or by inode (a link beside the table is a second table to the loader)."""
+    with atomic_edit.refused_as(codesets_dir, WiringError, atomic_edit.READ_STEP):
+        entries = list(codesets_dir.iterdir())
+    itself = (
+        besides.name.lower()
+        if besides is not None
+        and besides.name not in {p.name for p in entries}
+        and atomic_edit.is_file(besides, refused_error=WiringError)
+        else None
+    )
+    return next(
+        (
+            p
+            for p in entries
+            if p.stem == name
+            and p.suffix not in _SUPPORTED_EXTS
+            and p.suffix.lower() in _SUPPORTED_EXTS
+            and atomic_edit.is_file(p, refused_error=WiringError)
+            and p.name.lower() != itself
+        ),
+        None,
+    )
+
+
+def _cause_name(exc: BaseException) -> str:
+    """The type of the OS error under ``exc``, else of ``exc``: a refusal wraps the error that
+    says whether a file was held or denied, and a log line gives the type, never the text."""
+    cause: BaseException | None = exc
+    while cause is not None and not isinstance(cause, OSError):
+        cause = cause.__cause__
+    return type(cause or exc).__name__
+
+
+def _where(home: Path, away: Path) -> str:
+    """Which of two names a moved file is under, read without assuming: a stat that fails says
+    so rather than guessing."""
+    try:
+        if _present(home):
+            return _rel(home)
+    except OSError:
+        return f"{_rel(home)} or {_rel(away)} ({_rel(home)} could not be read)"
+    try:
+        if _present(away):
+            return _rel(away)
+    except OSError:
+        return f"{_rel(away)}, if anywhere (it could not be read)"
+    return f"under neither {_rel(home)} nor {_rel(away)}"
+
+
+def _layout(src: Path, dest: Path, has_sidecar: bool) -> str:
+    """Where a moved table, and its policy sidecar, are now, by config-relative name."""
+    layout = f"the table is {_where(src, dest)}"
+    if has_sidecar:
+        policy = _where(_policy_sidecar_path(src), _policy_sidecar_path(dest))
+        layout += f" and its policy {policy}"
+    return layout
+
+
+def _drop_sidecar_if_table_gone(table: Path, sidecar: Path, dangling: list[dict[str, str]]) -> None:
+    """After an interrupt in a remove: delete the policy ``sidecar`` once ``table`` is gone, since
+    it would load as a code set of its own. A table whose stat fails keeps its policy. Whatever is
+    left is logged at ``ERROR`` by config-relative name, with the error's type only."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import unlink_generated
+
+    try:
+        if _present(table):
+            return
+    except OSError as exc:
+        _log.error(
+            "code set remove interrupted: whether %s was removed could not be read (%s), so its "
+            "policy %s was kept; remove that by hand once the table is gone",
+            _rel(table),
+            type(exc).__name__,
+            _rel(sidecar),
+        )
+        return
+    try:
+        unlink_generated(sidecar)
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError) and is_absent(exc):
+            return
+        _log.error(
+            "code set remove interrupted: %s was removed, but its policy %s was not (%s); it "
+            "now loads as a code set of its own, so remove it by hand%s",
+            _rel(table),
+            _rel(sidecar),
+            type(exc).__name__,
+            _still_referenced(dangling),
+        )
+
+
+def _other_table_exists(path: Path) -> bool:
+    """Whether a second table of ``path``'s stem sits beside it, an extension in another case
+    included."""
+    return (
+        any(
+            atomic_edit.is_file(path.with_suffix(ext), refused_error=WiringError)
+            for ext in _SUPPORTED_EXTS
+            if ext != path.suffix
+        )
+        or _case_variant(path.parent, path.stem, besides=path) is not None
+    )
+
+
+def _remove_orphan_sidecar(name: str, sidecar: Path, dangling: list[dict[str, str]]) -> None:
+    """Delete the policy sidecar of the removed code set ``name``; one that cannot be deleted
+    would load as a code set of its own, so that raises :class:`WiringError` naming it."""
+    # Here, not at module top, so importing the config layer does not import the auth package.
+    from messagefoundry.restricted_file import unlink_generated
+
+    try:
+        with atomic_edit.refused_as(sidecar, WiringError, "remove it"):
+            unlink_generated(sidecar)
+    except (WiringError, OSError) as exc:
+        if isinstance(exc, FileNotFoundError) and is_absent(exc):
+            return  # already gone, which is the goal
+        raise WiringError(
+            f"code set {name!r} was removed, but its policy sidecar {sidecar.name} was not "
+            f"({exc}); it now loads as a code set of its own, so remove it by hand"
+            f"{_still_referenced(dangling)}"
+        ) from exc
+
+
+def _still_referenced(dangling: list[dict[str, str]]) -> str:
+    """The referrers a removed code set leaves dangling, by object name, as a message suffix."""
+    if not dangling:
+        return ""
+    return "; these still reference it: " + ", ".join(
+        f"{r['referrer_kind']} {r['referrer']!r}" for r in dangling
+    )
 
 
 def _load_all(codesets_dir: Path) -> dict[str, CodeSet]:
