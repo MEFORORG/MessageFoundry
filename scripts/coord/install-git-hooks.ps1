@@ -59,9 +59,32 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $common = (& git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir).Trim()
 if (-not $common) { throw "Not inside a git repository." }
 
-$hooksPath = (& git -C $RepoRoot config --get core.hooksPath)
+# core.hooksPath is resolved the way GIT resolves it, never re-derived here (BACKLOG #6258). Git
+# expands `~/` against HOME, and resolves a RELATIVE value against the root of whichever worktree runs
+# the hook -- so a relative value names a different directory in every worktree, and no install into
+# one of them governs the rest. Joining the raw value under $RepoRoot got both wrong, and the summary
+# below still printed "governs: all N worktree(s)". `--type=path` gives the ~-expanded value to test;
+# `rev-parse --git-path hooks` gives the directory git itself would run hooks from.
+$hooksPath = (& git -C $RepoRoot config --type=path --get core.hooksPath)
+$hooksPathExit = $LASTEXITCODE
+# Exit 1 is git's "not set"; anything else (an unexpandable `~user/`, a broken config) is a failure.
+if ($hooksPathExit -ne 0 -and $hooksPathExit -ne 1) {
+    throw "Could not read core.hooksPath (git config exit $hooksPathExit); refusing to guess where git runs hooks."
+}
+if ($hooksPathExit -eq 0 -and -not $hooksPath) {
+    throw "core.hooksPath is set but empty; refusing to guess where git runs hooks. Unset it or give an absolute path."
+}
 if ($hooksPath) {
-    $hooksDir = if ([System.IO.Path]::IsPathRooted($hooksPath)) { $hooksPath } else { Join-Path $RepoRoot $hooksPath }
+    if (-not [System.IO.Path]::IsPathFullyQualified($hooksPath)) {
+        throw ("core.hooksPath is '$hooksPath', which is relative (or, on Windows, has no drive). Git resolves " +
+            "it against each worktree's own root, so no single install reaches every worktree. Refusing. " +
+            "Unset it (git config --unset core.hooksPath) or set it to an absolute path, then re-run.")
+    }
+    $hooksDir = (& git -C $RepoRoot rev-parse --path-format=absolute --git-path hooks)
+    if ($LASTEXITCODE -ne 0 -or -not $hooksDir -or -not [System.IO.Path]::IsPathFullyQualified($hooksDir)) {
+        throw "Could not resolve core.hooksPath '$hooksPath' to an absolute hooks directory; refusing to guess."
+    }
+    $hooksDir = $hooksDir.Trim()
 } else {
     $hooksDir = Join-Path $common "hooks"
 }
