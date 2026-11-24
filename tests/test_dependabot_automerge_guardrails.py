@@ -29,13 +29,12 @@ uv/pip, ``eligible=true`` only for github-actions, and the merge ``if`` requires
 track -- disjoint sets. #2's step does hold a PR the allow-set would pass (an ungrouped or unknown-group PR is
 reported as ``security_track=true`` with ``advisory_ok=false``). The confirming halves are tested as FORWARD
 guards, so that they are a control that already works, not one to be written under pressure.
-A populated Python allow row is necessary for them to confirm a PR for merge, not sufficient; the
-workflow header's READ THIS BEFORE CITING #2 OR #4 names at least the further conditions (a uv
-PR's lock-resync second commit fails the sole-author step, and npm needs its names on the allow
-row as well as an npm-aware #2 query and an npm publish-date source for #4).
-``test_release_age_is_gated_on_the_allow_set`` checks only that the age step's ``if`` contains
-the allow-set conjunct as a substring, so an ``if`` that also ORs in a loosening such as
-``|| always()`` would pass it; it pins nothing about #2, or about whether #4 can confirm a PR.
+What else must hold before either can confirm a PR for merge, for a uv/pip PR and for any other
+ecosystem, is stated once, in the workflow header's READ THIS BEFORE CITING #2 OR #4; a populated
+Python allow row is not by itself enough. ``test_release_age_is_gated_on_the_allow_set`` checks
+only that the age step's ``if`` contains the allow-set conjunct as a substring, so an ``if`` that
+also ORs in a loosening such as ``|| always()`` would pass it; it pins nothing about #2, or about
+whether #4 can confirm a PR for merge.
 """
 
 from __future__ import annotations
@@ -352,12 +351,12 @@ def test_release_age_is_gated_on_the_allow_set() -> None:
 
     The reason is privacy/egress: this step makes an UNAUTHENTICATED outbound GET from a job holding
     ``contents: write``, so making it for a PR that was going to be held anyway is gratuitous. The
-    assertion is the substring check the module docstring describes, which a loosened ``if`` such
-    as ``... || always()`` would still pass. It pins nothing about whether #4 can confirm a PR:
-    what keeps #4 from confirming today is the merge ``if`` requiring ``eligible`` and, on the
-    security track, ``age_ok`` (``age_ok=true`` needs uv/pip, ``eligible=true`` needs
-    github-actions), and populating a uv allow row would widen #4 while this test still passes.
-    It pins nothing about #2 either.
+    assertion is the substring check the module docstring describes. It pins nothing about whether
+    #4 can confirm a PR for merge: what keeps #4 from confirming is the merge ``if`` requiring
+    ``eligible`` and, on the security track, ``age_ok`` (``age_ok=true`` needs uv/pip,
+    ``eligible=true`` needs github-actions), and populating a uv allow row would widen #4 while
+    this test still passes. The gate does stop the age step emitting ``age_ok=true`` for a uv/pip
+    PR today, but such a PR holds on ``eligible`` whatever the step emits. It pins nothing about #2.
     """
     age = _step("age")
     cond = str(age.get("if", ""))
