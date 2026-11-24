@@ -253,8 +253,11 @@ if ($Rehome) {
     # (no heartbeat, and registry writes are event-driven), so only the positive answer is trustworthy.
     # A negative from one signal must never by itself authorise a destructive move.
     . "$PSScriptRoot\..\coord\session-registry.ps1"
-    # Listed both BEFORE and AFTER the fence reads the registry: a record that is half-written at either
-    # neighbouring read is then seen by one check or the other, whichever way it changes (BACKLOG #7622).
+    # Listed both BEFORE and AFTER the fence reads the registry, so a file that is unparsed at either of
+    # these two reads vetoes below. This does NOT fence a record that is unparsed only at the fence's own
+    # read, for example absent before it and readable after it: one enumeration inside
+    # Get-SessionLiveness is the remaining fix
+    # (BACKLOG #7622).
     $unparsed = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable -and -not $_.Directory })
     $reg = Get-SessionLiveness -SessionId $s.Id -Worktree $s.BornCwd
     $unparsed += @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable -and -not $_.Directory })
@@ -292,9 +295,15 @@ if ($Rehome) {
         -not $item -or ($wall - $item.LastWriteTimeUtc).TotalHours -lt 24
     })
     if ($unreadable.Count -gt 0 -and -not $Force -and -not $WhatIfPreference) {
-        $named = @($unreadable | ForEach-Object { "$($_.File) ($($_.Error))" })
-        throw ("Session $($s.Id) cannot be shown not to be running: $($unreadable.Count) session registry " +
-               "file(s) written in the last 24h cannot be read, and may be this session's own record " +
+        $named = @($unreadable | ForEach-Object {
+            $item = Get-Item -LiteralPath $_.File -Force -EA SilentlyContinue
+            $when = if (-not $item) { 'vanished since it was read' }
+                    elseif ($item.LastWriteTimeUtc -gt $wall) { 'stamped in the future' }
+                    else { 'written in the last 24h' }
+            "$($_.File) ($when; $($_.Error))"
+        })
+        throw ("Session $($s.Id) cannot be shown not to be running: $($unreadable.Count) fresh session registry " +
+               "file(s) cannot be read, and may be this session's own record " +
                "mid-write: $($named -join '; '). Wait for it to become readable or go away, then retry " +
                "(or -Force once you have checked it).")
     }
@@ -348,7 +357,7 @@ if ($Rehome) {
         if (-not $item -or $item -isnot [System.IO.FileInfo]) { $why = "it is not a readable file" }
         elseif ($item.Length -gt 65536) { $why = "it is $($item.Length) bytes, far more than a title stub" }
         else {
-            try { $stubLines = @(Get-Content -LiteralPath $dest -EA Stop | Where-Object { $_.Trim() }) }
+            try { $stubLines = @(Get-Content -LiteralPath $dest -Encoding UTF8 -EA Stop | Where-Object { $_.Trim() }) }
             catch { $why = "it cannot be read: $($_.Exception.Message)" }
             if (-not $why) {
                 if ($stubLines.Count -eq 0) { $why = "it holds no title record" }

@@ -1096,7 +1096,7 @@ def test_sessions_rehome_starts_the_stub_on_its_own_line_and_names_a_stranded_si
     proc = _rehome(paths)
     assert proc.returncode == 0 and "Rehomed session" in proc.stdout, proc.stdout + proc.stderr
     lines = paths["dest"].read_text(encoding="utf-8-sig").splitlines()
-    assert lines[-1].lstrip("﻿") == _STUB, lines
+    assert lines[-1].lstrip("\ufeff") == _STUB, lines
     assert "was NOT moved" in proc.stdout + proc.stderr
     assert (paths["source"].parent / _REHOME_SID / "subagents").is_dir()
 
