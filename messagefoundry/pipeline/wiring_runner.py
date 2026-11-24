@@ -6607,7 +6607,7 @@ class RegistryRunner:
         for stage in kept:
             log.warning(
                 "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
-                "never landed and that it would not re-pend before its next claim; any later "
+                "never landed and that it might not re-pend before its next claim; any later "
                 "notify_work broadcast (at least a reload, replay, resend or inject) re-arms it, "
                 "and it can claim past them",
                 stage.value,

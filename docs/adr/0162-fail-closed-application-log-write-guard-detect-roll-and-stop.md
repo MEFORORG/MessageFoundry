@@ -164,9 +164,9 @@ re-binds (reload quiesces every source and re-binds from the new graph). The inb
 declines to bind — `deployed=False`, `auto_start=False` and not previously listening, DR-filtered —
 stay halted, as do the connections a per-connection restart does not name. *(Note, BACKLOG #5704:
 under the pooled claim mode a router, transform or response lane that is STOPPED at a
-per-connection restart of its inbound is re-armed by it and its hold released, except a lane that
-could claim past claimed rows it holds in flight, which stays STOPPED with a WARNING; section 7
-says which.)*
+per-connection restart of its inbound is re-armed by it, except a lane that could claim past
+claimed rows it holds in flight, which stays STOPPED with a WARNING; section 7 says which. The
+inbound's hold is released unless one of its lanes is kept so.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other
@@ -245,8 +245,10 @@ while holding claimed rows whose re-pend never landed is re-armed by the lift of
 next chunk assembly would re-pend those rows before it claims (BACKLOG #5744), at least after the
 stop policy's bound ended their re-pend on a node that still holds the lease it claimed them under.
 One that could claim past them instead, at least when no record covers them because the hold
-ended on a moved lease, or when the lease moved since, is not re-armed by the lift, which logs a
-WARNING (`StageDispatcher.stopped_past_unrecorded_rows`). Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
+ended on a moved lease, or when, leading, it holds another lease since, is not re-armed by the
+lift, which logs a WARNING (`StageDispatcher.stopped_past_unrecorded_rows`). The lift reads this
+once; the re-pend reads ownership and the lease again when it runs, and a change between the two
+can still let the re-armed lane claim past the rows. Any later `notify_work` broadcast re-arms such a lane, at least a reload, a
 replay, a resend, an inject or a dead-letter replay, and it can then claim past the unlanded rows;
 until one arrives it stays STOPPED. At least a service restart returns its rows to the queue first. Under per_lane, a worker that a content STOP ended during the halt
 is respawned by the reload or restart that lifts its inbound's gate, and it retries that STOP's row.

@@ -1740,9 +1740,7 @@ class StageDispatcher:
         # is sent (the lane parks below); leading, the fence decides.
         disowned = False
         try:
-            disowned = lane not in self._lane_provider()
-            leading = not disowned and fence.is_leader()
-            moved = leading and fence.superseded()
+            disowned, leading, moved = self._stranded_owner(lane, fence)
         except Exception:  # noqa: BLE001 — a lease read fault must not wedge the held lane
             st0 = self._states.get(lane)
             # Once per record, then quiet: the park below backs off, and its next pass reads again.
@@ -1832,6 +1830,16 @@ class StageDispatcher:
             self._park(lane, st, due)  # the head is not due yet, as _run_lane parks a T17 head
         else:  # a wake during the episode makes it wake-sourced, as T14 does
             self._to_ready(lane, woken=st.dirty_woken if st.dirty else st.ready_woken)
+
+    def _stranded_owner(self, lane: str, fence: RependFence) -> tuple[bool, bool, bool]:
+        """``(disowned, leading, moved)`` for a stranded record of ``lane``: whether this engine no
+        longer owns the lane, whether this node leads, and whether, leading, its lease is not the
+        one ``fence`` captured. :meth:`_repend_stranded` drops the record unwritten when
+        ``disowned`` or ``moved``, and :meth:`stopped_past_unrecorded_rows` predicts that from
+        this same read. Raises what the ownership or lease read raises."""
+        disowned = lane not in self._lane_provider()
+        leading = not disowned and fence.is_leader()
+        return disowned, leading, leading and fence.superseded()
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
@@ -2666,17 +2674,19 @@ class StageDispatcher:
         """Whether ``key`` is STOPPED holding claimed rows in flight that a re-arm could claim past
         (BACKLOG #5704, #5744), so the log halt's recovery restart leaves it STOPPED. True when no
         stranded record covers them, at least after a hold that ended on a moved lease, and when
-        :meth:`_repend_stranded` would drop the record unwritten: the lane is no longer this
-        engine's, or its lease is superseded. A lease read that raises counts as True, which is
-        logged, so a fault keeps the lane as it was. A lane with a record this node may still write
-        re-pends its rows before it claims. False for an unknown lane."""
+        :meth:`_repend_stranded` would drop the record unwritten if it ran now
+        (:meth:`_stranded_owner`). An ownership or lease read that raises counts as True, which is
+        logged, so a fault keeps the lane as it was. False otherwise: the lane's next chunk
+        assembly starts a re-pend episode before any claim, which re-reads ownership and the lease
+        when it runs. False for an unknown lane."""
         if not self.stopped_holding_rows(key):
             return False
         stranded = self._states[key].stranded
         if stranded is None:
             return True
         try:
-            return key not in self._lane_provider() or stranded.fence.superseded()
+            disowned, _leading, moved = self._stranded_owner(key, stranded.fence)
+            return disowned or moved
         except Exception:  # noqa: BLE001 — a lease or ownership read fault keeps the lane STOPPED
             log.warning(
                 "StageDispatcher %s lane %s: reading ownership or leadership for its stranded "

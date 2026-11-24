@@ -4277,7 +4277,8 @@ def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_fli
 ) -> None:
     # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
     # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
-    # flight, which a re-arm would claim past (the T16 STOP branch's own rule in _run_lane).
+    # flight that no stranded record covers, which a re-arm would claim past. A lane whose record
+    # would re-pend them first is re-armed: the test after the next one.
     # MEASURED on main: the lift left every STOPPED lane STOPPED.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
@@ -4322,7 +4323,9 @@ def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_lane_holds_rows(
     assert ("inbound", INBOUND) in runner._stop_held
 
 
-@pytest.mark.parametrize("record", ["writable", "none", "lease_moved"])
+@pytest.mark.parametrize(
+    "record", ["writable", "none", "lease_moved", "disowned", "read_fault", "not_leading"]
+)
 async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_first(
     store: MessageStore, record: str
 ) -> None:
@@ -4331,27 +4334,45 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     # claims. The lift at the inbound's restart re-arms it, and its next claim takes the first of
     # those rows, in order. Rows no record covers (at least a hold that ended on a moved lease),
     # or whose record the re-pend would drop unwritten because the lease moved since, would be
-    # claimed past, so that lane stays STOPPED, with the hold.
+    # claimed past, so that lane stays STOPPED, with the hold; so does one whose ownership or
+    # lease read raises. A node that does not lead now keeps the record, so its lane is re-armed
+    # and waits to re-pend rather than claim.
     # MEASURED on main: the lift kept the recorded lane STOPPED too, and nothing drained it.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
     dispatcher = runner._make_dispatcher(Stage.INGRESS)
     runner._dispatchers[Stage.INGRESS] = dispatcher
+    dispatcher._call_later = asyncio.get_running_loop().call_later  # start() sets it; parks need it
     for raw in (RAW, RAW.replace("|M1|", "|M2|")):
         await store.enqueue_ingress(channel_id=INBOUND, raw=raw, now=1.0)
     first = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value, now=2.0)
     assert first is not None
     st = stage_dispatcher._LaneState(phase=stage_dispatcher._LanePhase.STOPPED, unlanded=True)
     epoch = [7]
+    lease = {"leading": True, "fault": False}
+
+    def is_leader() -> bool:
+        if lease["fault"]:
+            raise RuntimeError("simulated lease read fault")
+        return lease["leading"]
+
     if record != "none":
         st.stranded = stage_dispatcher._Stranded(
             None,
             (first.id,),
-            stage_dispatcher.RependFence.capture(lambda: True, lambda: epoch[0]),
+            stage_dispatcher.RependFence.capture(
+                is_leader, lambda: epoch[0] if lease["leading"] else None
+            ),
         )
     if record == "lease_moved":
         epoch[0] = 8  # another node led meanwhile, and this one leads again under a new lease
-    recorded = record == "writable"
+    elif record == "disowned":
+        dispatcher._lane_provider = set  # a reload moved the lane to another engine shard
+    elif record == "read_fault":
+        lease["fault"] = True
+    elif record == "not_leading":
+        lease["leading"] = False
+    recorded = record in ("writable", "not_leading")
     dispatcher._states[INBOUND] = st
     runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)
     runner._log_halted.add(INBOUND)
@@ -4374,7 +4395,10 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
         if task is None:
             break
         await asyncio.wait_for(task, timeout=5.0)
-    if recorded:
+    if record == "not_leading":
+        assert claimed is None, "a node that does not lead claimed"
+        assert dispatcher._states[INBOUND].stranded is not None, "the record was dropped"
+    elif recorded:
         assert claimed == first.message_id, "the re-armed lane claimed past its rows in flight"
     else:
         assert claimed is None, f"{record}: a lane that would claim past its rows was re-armed"
