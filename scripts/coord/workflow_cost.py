@@ -96,7 +96,6 @@ _TOKEN_PATTERN = (
     r"|\.\s*(?P<fan>" + "|".join(_FAN_METHODS) + r")\s*\("
     r"|(?<![\w$.])(?P<loop>while|for|do)\b"
 )
-_AGENT_WORD_RE = re.compile(r"(?<![\w$.])agent\b")
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 _OF_RE = re.compile(r"\b(?:of|in)\b")
 _ARRAY_FROM_RE = re.compile(r"^\s*Array\s*\.\s*from\s*\(")
@@ -856,9 +855,11 @@ def _is_declared_at(ctx: _Ctx, i: int) -> bool:
     return i in ctx.declared
 
 
-def _word_re(name: str) -> re.Pattern[str]:
-    """A reference to ``name``: not a member (``x.name``), but a spread (``...name``) counts."""
-    return re.compile(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(name) + r"(?![\w$])")
+def _word_re(*names: str) -> re.Pattern[str]:
+    """A reference to any of ``names``: not a member (``x.name``), but a spread (``...name``)
+    counts."""
+    alternatives = "|".join(map(re.escape, names))
+    return re.compile(r"(?:(?<=\.\.\.)|(?<![\w$.]))(?:" + alternatives + r")(?![\w$])")
 
 
 def _declaration_count(ctx: _Ctx, name: str) -> int:
@@ -1521,33 +1522,58 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
     happened to enumerate. ``ROWS.map(agent)`` passes the hook as a VALUE and matches no call
     pattern at all; this is what catches it, and ``ROWS.map(review)`` over a helper likewise.
     """
+
     # The helpers that can reach an agent, through any chain of helpers. A helper that starts
     # nothing may be passed around freely; flagging it would bury the terms that matter.
+    # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
+    # pricer. Read the raw text there, for the reach as for the references (BACKLOG #7599); an
+    # `agent` in a string inside one reads as a false hit, which costs a floor label rather than a
+    # silent under-count.
+    def found(word: re.Pattern[str], lo: int, hi: int) -> list[re.Match[str]]:
+        hits = list(word.finditer(ctx.masked, lo, hi))
+        for a, b in ctx.interps:
+            if a < hi and b > lo:
+                hits += word.finditer(ctx.raw, max(a, lo), min(b, hi))
+        return hits
+
     reach = {"agent", "workflow"}
     while True:
-        starts = re.compile(r"(?<![\w$.])(?:" + "|".join(map(re.escape, reach)) + r")(?![\w$])")
+        word = _word_re(*reach)
         grown = {
             n
             for n, h in ctx.helpers.items()
-            if n not in reach and starts.search(ctx.masked, h.body_start, h.body_end)
+            if n not in reach and found(word, h.body_start, h.body_end)
         }
         if not grown:
             break
         reach |= grown
-    words = [_AGENT_WORD_RE] + [_word_re(n) for n in reach - {"agent"}]
-    hits = [m for word in words for m in word.finditer(ctx.masked)]
-    # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
-    # pricer. Read the raw text there; an `agent` in a string inside one reads as a false hit,
-    # which costs a floor label rather than a silent under-count.
-    hits += [m for lo, hi in ctx.interps for m in starts.finditer(ctx.raw, lo, hi)]
+    refs = sorted(
+        (
+            m
+            for m in found(word, 0, len(ctx.raw))
+            if m.start() not in ctx.def_names
+            and m.start() not in ctx.method_heads  # names a method, wherever the scan reached
+            and not _is_declared_at(ctx, m.start())
+        ),
+        key=lambda m: m.start(),
+    )
+    flagged = {m.start() for m in refs if m.start() not in ctx.attributed}
+    # A helper whose body holds an unattributed reference was priced short at every call, and a
+    # fan over it multiplies that shortfall, so its attributed calls are residue too: the report
+    # then names the line that carries the width, not only the body.
+    while True:
+        short = {
+            n
+            for n, h in ctx.helpers.items()
+            if any(h.body_start <= i < h.body_end for i in flagged)
+        }
+        calls = {m.start() for m in refs if m.group() in short} - flagged
+        if not calls:
+            break
+        flagged |= calls
     out: list[Unknown] = []
-    for m in sorted(hits, key=lambda m: m.start()):
-        if (
-            m.start() in ctx.attributed
-            or m.start() in ctx.def_names
-            or m.start() in ctx.method_heads  # names a method, wherever the scan reached
-            or _is_declared_at(ctx, m.start())
-        ):
+    for m in refs:
+        if m.start() not in flagged:
             continue
         line_end = ctx.raw.find("\n", m.start())
         out.append(

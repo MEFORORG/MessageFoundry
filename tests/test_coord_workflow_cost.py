@@ -1109,31 +1109,57 @@ def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
 
 
 @pytest.mark.parametrize(
-    ("script", "agent_lines"),
+    ("script", "agents", "flagged"),
     [
-        ("const s = `${await agent(1)}`\n", [1]),
-        ("const R = [1, 2, 3]\nconst s = `${await parallel(R.map(r => () => agent(r)))}`\n", [2]),
-        ("const R = [1, 2, 3]\nconst s = `${Promise.all(R.map(r => agent(r)))}`\n", [2]),
-        ("const R = [1, 2]\nconst s = `${R.map(agent)}`\n", [2]),
-        ("const s = `a ${`b ${await agent(1)}`}`\n", [1]),
-        ("const s = `${(await agent(1)) + `${agent(2)}`}`\n", [1, 1]),
-        ("const s = `x${ /* c */ agent?.(1)}`\n", [1]),
-        ("const s = tag`${agent(1)}`\n", [1]),
-        ("const f = r => `${agent(r)}`\nawait f(1)\n", [1]),
+        pytest.param("const s = `${await agent(1)}`\n", 1, {1}, id="plain"),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst s = `${await parallel(R.map(r => () => agent(r)))}`\n",
+            3,
+            {2},
+            id="parallel",
+        ),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst s = `${Promise.all(R.map(r => agent(r)))}`\n",
+            3,
+            {2},
+            id="promise-all",
+        ),
+        pytest.param("const R = [1, 2]\nconst s = `${R.map(agent)}`\n", 2, {2}, id="hook-value"),
+        pytest.param("const s = `a ${`b ${await agent(1)}`}`\n", 1, {1}, id="nested-template"),
+        pytest.param("const s = `${(await agent(1)) + `${agent(2)}`}`\n", 2, {1}, id="two-agents"),
+        pytest.param("const s = `x${ /* c */ agent?.(1)}`\n", 1, {1}, id="comment-optional"),
+        pytest.param("const s = tag`${agent(1)}`\n", 1, {1}, id="tagged"),
+        pytest.param("const s = `${[...agent(1)]}`\n", 1, {1}, id="spread"),
+        pytest.param(
+            "function two() { return [agent(1), agent(2)] }\nawait Promise.all(two())\n"
+            "const s = `${(await Promise.all([...two()])).join()}`\n",
+            4,
+            {3},
+            id="spread-helper",
+        ),
+        pytest.param(
+            "const R = [1, 2, 3]\nconst f = r => `${agent(r)}`\n"
+            "await parallel(R.map(r => () => f(r)))\n",
+            3,
+            {2, 3},
+            id="helper-fanned",
+        ),
+        pytest.param("const t = [...agent(1)]\n", 1, {1}, id="bare-spread"),
     ],
-    ids=["plain", "parallel", "promise-all", "hook-as-value", "nested-template"]
-    + ["two-agents", "comment-optional-call", "tagged", "helper-body"],
 )
-def test_an_agent_inside_a_template_interpolation_is_residue_not_zero(
-    mod: ModuleType, script: str, agent_lines: list[int]
+def test_an_agent_inside_a_template_interpolation_is_never_an_exact_low_count(
+    mod: ModuleType, script: str, agents: int, flagged: set[int]
 ) -> None:
     """BACKLOG #7599: the mask blanks a template whole, ``${...}`` included, so no pricer sees a
-    call there. Before PR 2982 each of these priced 0 agents as EXACT; ``_residue`` now reads the
-    raw text of every interpolation, so each ``agent`` there is an ``unattributed`` term and the
-    total is a floor. Pinned so a mask change cannot reopen the silent zero."""
+    call there. Before PR 2982 the plain cases priced 0 agents as EXACT, and before this change
+    the spread and helper-fanned ones still did. Each case states its true agent count, so a
+    lexer that prices interpolation code exactly passes too; until one does, the agent or the
+    helper call is an ``unattributed`` term on each line in ``flagged``. At least these shapes are
+    pinned; the residue's guarantee is the reach of its word pattern, not this list."""
     cost = mod.price_script(script)
-    assert not cost.exact
-    assert [u.line for u in cost.unknowns if u.kind == "unattributed"] == agent_lines
+    assert cost.agents >= agents or not cost.exact, script
+    if not cost.exact:
+        assert flagged <= {u.line for u in cost.unknowns if u.kind == "unattributed"}, script
 
 
 def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:
