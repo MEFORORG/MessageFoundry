@@ -76,9 +76,8 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _insecure_opener,
     _latin1_refusal_position,
-    _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     assert_probe_hop,
     auth_challenge_refused,
     egress_route_from_settings,
@@ -531,10 +530,8 @@ class DicomWebDestination(DestinationConnector):
                 refuse_chain_check_on_os_roots(
                     anchor, cleartext=True, connection_kind="DICOMweb connection"
                 )
-            self._opener: urllib.request.OpenerDirector = (
-                _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
-                if proxy_handlers or anchor.narrows
-                else _shared_no_redirect_opener()
+            self._opener: urllib.request.OpenerDirector = _verifying_opener(
+                *proxy_handlers, trust_anchor=anchor
             )
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
             # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI

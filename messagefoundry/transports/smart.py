@@ -81,7 +81,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     auth_challenge_refused,
     digest_proxy_meets_the_token_connect,
     ech_readdressed_request,
@@ -444,9 +444,9 @@ class _TokenEndpointProvider(abc.ABC):
         ):
             raise self.digest_proxy_refusal(connection)
         # #1660: a PER-PROVIDER opener whenever the token hop needs a handler the shared one lacks (a
-        # forward proxy) OR a trust anchor that ``narrows`` -- read through the one ``narrows``
-        # predicate, exactly as the four HTTP-family destinations do, so the token hop cannot drift
-        # from them. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
+        # forward proxy) OR a trust anchor that ``narrows`` -- chosen by rest._verifying_opener
+        # (BACKLOG #5527 item 10), on the one ``narrows`` predicate the HTTP-family destinations
+        # read. Neither -> the shared opener, unmutated (ADR 0126), byte-identical.
         #
         # With an ECH sidecar the POST goes to the loopback sidecar, never to the token host, so the
         # opener is the plain one the REST destination's own ECH hop uses: no proxy, and no anchor
@@ -455,13 +455,11 @@ class _TokenEndpointProvider(abc.ABC):
         self._opener: urllib.request.OpenerDirector
         if ech_sidecar is not None:
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        elif token_proxy is not None or trust_anchor.narrows:
-            self._opener = _no_redirect_opener(
+        else:
+            self._opener = _verifying_opener(
                 *(token_proxy.opener_handlers() if token_proxy is not None else ()),
                 trust_anchor=trust_anchor,
             )
-        else:
-            self._opener = _shared_no_redirect_opener()
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
         # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired

@@ -333,7 +333,8 @@ try {
     # no reset, one higher than the published window for the same gone reset, and one with a later reset
     # than the published window. Nothing here reads the clock against a lone reading. The reader reports
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
-    # row can still be read: with no current reset, usage.ps1's rate skips its reset filter.
+    # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
+    # so it refuses the rate only where those rows change reset or fall.
     #
     # AN EQUAL READING IS REFUSED TOO. The payload carries no time of its own, so an idle session's
     # cached number looks like a live flat one. Restamping it let one idle terminal keep a frozen number
@@ -447,11 +448,23 @@ try {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch) {
+        # THE READER'S TEST DECIDES. usage.ps1 counts a row for this directory's root when it is unstamped,
+        # unset or stamped with that root. A last row it would skip does not suppress a row it would
+        # count. Otherwise a flat repeat adds nothing, since a timed row would read as a measured rate of
+        # zero: so a collector pinned to another root, whose rows the reader skips, appends once rather
+        # than on every fire, and an unset and a pinned collector of this root do not both append.
+        $prevEnv = [string]$prev.config_root_env
+        $prevCounted = -not $prevEnv -or $prevEnv -eq "unset" -or $prevEnv -ieq $ownRoot
+        $rowCounted = $stampEnv -eq "unset" -or $stampEnv -ieq $ownRoot
+        $prevForeign = $rowCounted -and -not $prevCounted
+        if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch -or $prevForeign) {
+            # STAMPED WITH THE ROOT THAT OBSERVED IT, as the window is, so usage.ps1's rate can skip a row
+            # another root's collector wrote here when it was wired to publish into this directory.
             $row = [ordered]@{
-                at          = $now
-                seven_day   = $freshSeven
-                seven_reset = $seven.resets_at_epoch
+                at              = $now
+                seven_day       = $freshSeven
+                seven_reset     = $seven.resets_at_epoch
+                config_root_env = $stampEnv
             } | ConvertTo-Json -Compress
             Add-Content -LiteralPath $histPath -Value $row -Encoding UTF8
         }
