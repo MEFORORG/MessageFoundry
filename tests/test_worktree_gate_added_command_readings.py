@@ -333,7 +333,8 @@ def test_each_git_question_is_asked_once_across_the_passes(
     starts, with its argument list, so a repeated question shows as a repeated line. At
     PRE_CACHE_HEAD a command of this shape, with one `-C` on every line, made 108 git calls, one of
     them 90 times (measured 2026-11-23). Each line here names its own directory, so each hoist has a
-    question of its own, and the floor below fails if the hoists stop being judged.
+    question of its own. The directories exist, so every question succeeds: a question git cannot
+    answer is asked again on every ask by design, and this test does not bound how often.
     """
     trace = tmp_path / "trace2.log"
     for i in range(9):

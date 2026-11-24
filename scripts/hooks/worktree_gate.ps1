@@ -1220,8 +1220,9 @@ function Test-TrueSeparatorIn([string]$Text) {
 #
 # COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
 # command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
-# pass re-reads that text and re-asks git about the invocations in it; Invoke-GitRead answers a repeated
-# git question from its cache, by the rule its own note states. A hoist is not cut down to its own
+# pass re-reads that text and re-asks git about the invocations in it. Invoke-GitRead answers a
+# repeated question from its cache only where git answered it; a failing question is asked again on
+# every ask, its note says why. A hoist is not cut down to its own
 # segment: the text before it carries the chdir and the assignments the hoist exists to read (`cd <p>
 # && echo $(date); git -C <o> log $(git reset --hard)`). Before the cache, the Lander measured 7.8 s,
 # 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of 2026-11-23). With it, on one
@@ -1232,9 +1233,13 @@ function Test-TrueSeparatorIn([string]$Text) {
 # a run took 16.5 s and 12.1 s for the two shapes whose `-C` paths name no directory, against 1.8 s
 # and 1.3 s at BASELINE and 19.2 s and 11.4 s before the cache: every git question on those paths
 # fails, and Invoke-GitRead's note says what a failure costs. The other three shapes took 2.1 s to
-# 3.1 s, against 32.9 s to 45.6 s before the cache. Each hoist also re-reads the whole text before its
-# cut. Under the 60 s timeout a slow run blocks the command rather than letting it through
-# (install-gate.ps1 installs `onFailure = block`).
+# 3.1 s, against 32.9 s to 45.6 s before the cache. No TIMED shape has several lines whose `-C` paths
+# name no directory, and that is the slowest shape measured: review round 2c9e3d7a9b timed nine such
+# lines at 44.1 s, where each hoist re-asks the failing questions of the lines before it, against 9.9 s
+# at BASELINE and 12.0 s when a failure was kept. That is past the 20 s proof wait, where the shell
+# entry starts its own run, so with the wait a run can pass the 60 s timeout below. Each hoist also
+# re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
+# than letting it through (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
@@ -3276,11 +3281,9 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # so their invocations were resolved once per hoist. Its COST note has the measured times. The cache is
 # keyed by the argument list, with the one fold below, and it keeps the output lines and the exit code,
 # which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
-# rule for a failed answer is in the function's note. Get-RootCommonDirCmp and Get-CommonDirAnswer
-# kept their own caches before this one, and still do, a failure included; their notes say why. The
-# hook runs
-# before the tool call, so nothing it judges has run yet; another process could still change the
-# repository during the run, as it could between two uncached calls.
+# rule for a failed answer is in the function's note. The hook runs before the tool call, so nothing
+# it judges has run yet; another process could still change the repository during the run, as it
+# could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
@@ -3296,13 +3299,14 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    # ONLY A SUCCESS IS KEPT: an exit code of 0 with some output. A failure, or an empty answer, is
-    # never kept, so the next ask spawns git again, and a question that fails is asked on every ask, as
-    # it was with no cache; Get-RootCommonDirCmp and Get-CommonDirAnswer keep their own first answers
-    # above this, as their notes say (Manager decision of 2026-11-23 under the owner's instruction to
-    # take the strictly safer option). Keeping a failure let one spawn that failed under load stand for
-    # every later ask of that question, where an uncached ask could have read the answer and denied. A
-    # question that cannot succeed, such as a `-C` that names no directory, costs a spawn per ask.
+    # ONLY A SUCCESS IS KEPT: an exit code of 0 with at least one output line, which may be blank. A
+    # failure, or an answer with no line, is never kept, so the next ask spawns git again, and a
+    # question that fails is asked on every ask that reaches here, as it was with no cache (Manager
+    # decision of 2026-11-23 under the owner's instruction to take the strictly safer option).
+    # A kept success is replayed where an uncached ask could have failed instead. Keeping a failure
+    # let one spawn that failed under load stand for every later ask of that question, where an
+    # uncached ask could have read the answer and denied. A question that cannot succeed, such as a
+    # `-C` that names no directory, costs a spawn per ask.
     $hit = $null
     if ($gitReadCache.TryGetValue($key, [ref]$hit)) {
         $global:LASTEXITCODE = $hit.Code
@@ -3491,10 +3495,12 @@ function Test-GovernedEitherForm([string]$Path, [string]$Base) {
 # allowlist entry may legitimately name a directory that merely CONTAINS checkouts, and a root that is a
 # SUBDIRECTORY of some repo would otherwise report THAT repo's git dir and quietly govern all of it.
 #
-# Cached because the roots cannot change within one invocation, a failed git call's empty answer
-# included. That is kept on purpose: an empty answer sends Get-GovernedRootForCommon to its wider path
-# test, so a failure kept for the run errs toward a deny, and asking again could narrow a later
-# segment's verdict partway through the run (review round 04cd8e041a). Rule
+# Cached per path form because the roots cannot change within one invocation, a failed git call's
+# empty answer included, as on origin/main. Neither choice errs one way: an empty answer sends
+# Get-GovernedRootForCommon to its path test, which is wider for a root whose git dir sits under it
+# and narrower for one whose git dir does not (a separate git dir, a linked worktree as a root).
+# Asking again could therefore narrow a later segment's verdict, and keeping it can allow for the run
+# (review rounds 04cd8e041a and 2c9e3d7a9b); this keeps main's behaviour. Rule
 # 3c reaches here only once a disarm key is already present, so this is never on the ordinary path.
 $rootCommonCache = @{}
 function Get-RootCommonDirCmp($Root) {
@@ -3577,10 +3583,12 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # (`--path-format=absolute`, which Get-RootCommonDirCmp already asks for). That one is git's own
 # resolution of the value, so it names the real repository through at least some device spellings that
 # neither path form folds onto the drive (review round 1850f169 measured `\\?\X:\..\C:\<governed>` and
-# `\\?\.\C:\<governed>`). The git outputs are cached once, a failure included, as before
-# Invoke-GitRead: asking again could let a candidate that failed first answer later and change which
-# candidate answers first, so re-asking is not shown to deny at least as much (review round
-# 04cd8e041a). The comparable forms are built in the path form current at the call.
+# `\\?\.\C:\<governed>`). The git outputs are cached once, a failure included, as on origin/main.
+# For rule 3c, which takes the first candidate that answers, asking again could let a candidate that
+# failed first answer later and change which one answers first (review round 04cd8e041a). For rule 3d,
+# which denies if any base matches, and for a failed absolute form, asking again could only add a
+# deny, so keeping the failure there is a fail-open kept from main and left open (review round
+# 2c9e3d7a9b). The comparable forms are built in the path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Get-CommonDirAnswer([string]$CandRaw) {
     if (-not $commonDirAnswers.ContainsKey($CandRaw)) {
