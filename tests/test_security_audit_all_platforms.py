@@ -1113,11 +1113,14 @@ def test_a_stdout_that_cannot_take_the_summary_exits_2(
 
 
 def _cli_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int) -> None:
-    """Point ``cli`` at a clean lock, with both subprocesses answering ``status``."""
+    """Point ``cli`` at a clean lock, the pip check answering 0 and pip-audit ``status``."""
     src = tmp_path / "x.lock"
     src.write_text(LOCK, encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["audit_all_platforms", str(src)])
-    monkeypatch.setattr(audit_module, "_run", lambda cmd, pass_environment: status)
+    # The pip check answers 0, so the status cli returns is pip-audit's own.
+    monkeypatch.setattr(
+        audit_module, "_run", lambda cmd, pass_environment: status if "pip_audit" in cmd else 0
+    )
 
 
 @pytest.mark.parametrize("status", [0, 1])

@@ -74,34 +74,35 @@ With it and a hashed file, pip-audit reads the pins as already resolved and refu
 that lacks a hash. ``--strict`` makes a pin pip-audit could not look up (a release PyPI has removed,
 say) fail the audit instead of being skipped.
 
-WHAT IT REFUSES, exit 2, at least: a lock with no requirement lines at all, so an empty input cannot read as
-a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv export
-never writes and which would resolve against the temporary copy's directory, or escape the strip,
-rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
+WHAT IT REFUSES, exit 2, at least: a lock with no requirement lines at all, so an empty input cannot
+read as a clean audit; and a pip option line (``-r``, ``-c``, ``-e``, an index URL), which a uv
+export never writes and which would resolve against the temporary copy's directory, or escape the
+strip, rather than audit what it names (``uv export --no-emit-project`` writes none; a lock tool can
 write at least an index URL, ``--trusted-host`` and ``--find-links`` lines unless told not to); and
-a requirement that continues onto a line other than a hash, option or comment, where a marker
-would stay in place; and a copy from which pip-audit's parser would read a number of requirements
-other than the number counted, as ``_pip_audit_requirement_count`` reads it, which says what that
-covers; and a copy holding a requirement in which that parser could still find an environment
-marker, as ``_pip_audit_may_see_marker`` reads it, which pip-audit would skip unaudited where the
-host fails the marker (the ``;`` the strip leaves inside a bare URL's ``#egg=`` fragment, say); and
-a ``--skip-private`` that names the engine or another published
-MessageFoundry package, a package the lock does not pin, or every pin, or that holds ``=``; and a
-``--pass-environment`` entry the paragraph above says it refuses; and either flag after the lock,
-or an abbreviation of it that is no abbreviation of a pip-audit option, in the ``=`` form or not;
-and any other word after the lock that holds ``=`` and is not ``--option=value`` for a pip-audit
-option that takes a value, named in full (``_after_lock_refusal``), since pip-audit's usage error
-would print a ``NAME=value`` typed there; and a pip-audit option after the lock that can exit 0
-on pins it did not audit, ``-r`` among them, as ``_FAIL_OPEN_LONG`` says of each, short,
-abbreviated or in the ``=`` form; and a lock path that holds ``=``; and a summary that cannot
-be written to stdout (a reader that closed the pipe, say), refused before pip runs; a reader that
-leaves after the summary is written is not caught here. Every refusal prints its
-``::error::`` line through ``_refuse``, which still returns 2 when stderr's reader has gone; run
-as a script (``cli``), what stayed buffered is discarded at exit, so the process exits 2 then
-too, not 120. No refusal quotes a
-word that holds ``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value after the lock that holds ``=``, as in ``--index-url=URL``, still
-reaches pip-audit, which can print it in its own output. It does not judge
-whether a non-empty lock is complete; released-line-audit carries its own floor for that.
+a requirement that continues onto a line other than a hash, option or comment, where a marker would
+stay in place; and a copy from which pip-audit's parser would read a number of requirements other
+than the number counted, as ``_pip_audit_requirement_count`` reads it, which says what that covers;
+and a copy holding a requirement in which that parser could still find an environment marker, as
+``_pip_audit_may_see_marker`` reads it, which pip-audit would skip unaudited where the host fails
+the marker (the ``;`` the strip leaves inside a bare URL's ``#egg=`` fragment, say); and a
+``--skip-private`` that names the engine or another published MessageFoundry package, a package the
+lock does not pin, or every pin, or that holds ``=``; and a ``--pass-environment`` entry the
+paragraph above says it refuses; and either flag after the lock, or an abbreviation of it that is no
+abbreviation of a pip-audit option, in the ``=`` form or not; and any other word after the lock that
+holds ``=`` and is not ``--option=value`` for a pip-audit option that takes a value, named in full
+(``_after_lock_refusal``), since pip-audit's usage error would print a ``NAME=value`` typed there;
+and a pip-audit option after the lock that can exit 0 on pins it did not audit, ``-r`` among them,
+as ``_FAIL_OPEN_LONG`` says of each, short, abbreviated or in the ``=`` form; and a lock path that
+holds ``=``; and a summary that cannot be written to stdout (a reader that closed the pipe, say),
+refused before pip runs; a reader that leaves after the summary is written is not caught here. Each
+of the refusals above prints its ``::error::`` line through ``_refuse``, which returns 2 even when
+that line cannot be written; run as a script (``cli``), what stayed buffered for a reader that has
+gone is discarded at exit, so the process exits 2 then too, not 120. The module's usage error is
+argparse's own line, not an ``::error::`` one, and exits 2. No refusal quotes a word that holds
+``=``, and the module's own usage error quotes nothing once a word holds one. A free-text value
+after the lock that holds ``=``, as in ``--index-url=URL``, still reaches pip-audit, which can print
+it in its own output. It does not judge whether a non-empty lock is complete; released-line-audit
+carries its own floor for that.
 
 It reads lines as pip does: a requirement or option is any line that does not continue the one
 before it (a line ending in a backslash continues, unless it is a comment), indented or not, and
@@ -764,12 +765,14 @@ def _distinct_count(requirements: Sequence[str]) -> int:
 
 
 def _refuse(message: str) -> int:
-    """Print ``::error::<message>`` to stderr and return 2, the refusal's exit code.
+    """Print ``::error::<message>`` with ``print``'s stderr and return 2, the refusal's exit code.
 
-    A reader that has gone from stderr (``2>&1`` into a closed pipe, say) makes the write raise.
-    That is not re-raised: the refusal still exits 2. Nothing else records it, since stderr is
-    the stream that failed; :func:`cli` then discards what stayed buffered, so the exit-time flush
-    does not turn the 2 into 120.
+    Where ``sys.stderr`` is None, ``print`` writes the line to stdout instead, or nowhere when
+    both are None. A write that raises OSError or ValueError (a reader gone from ``2>&1`` into a
+    closed pipe, say, or a full disk under ``2>file``) is not re-raised, and the line is lost: the
+    refusal still exits 2, and nothing else records which one fired. For a reader that has gone,
+    :func:`cli` then discards what stayed buffered, so the exit-time flush does not turn the 2
+    into 120.
     """
     with contextlib.suppress(OSError, ValueError):
         print(f"::error::{message}", file=sys.stderr)
@@ -800,8 +803,9 @@ def _flush_or_discard(stream: TextIO | None) -> None:
     the recipe in the Python docs' note on SIGPIPE. Only the script entry calls this, never
     :func:`main`, which would otherwise redirect an in-process caller's stream. Any other flush
     error (EAGAIN from a slow live reader, say) leaves the stream as it is, buffer included, so
-    the interpreter's exit-time flush tries again and, if that fails, reports it on stderr itself
-    and exits 120. So does a redirect that fails: neither is swallowed, and neither exits 0.
+    the interpreter's exit-time flush tries again; if that fails, the exit code is 120, and for
+    stdout the interpreter also prints an ``Exception ignored`` line on stderr, while for stderr
+    it records nothing. A redirect that fails ends the same way. Neither exits 0.
     """
     if stream is None:
         return
@@ -819,13 +823,14 @@ def _flush_or_discard(stream: TextIO | None) -> None:
             finally:
                 os.close(devnull)
         except (OSError, ValueError):
-            return  # left for the exit-time flush to report, as the docstring says
+            return  # left for the exit-time flush, as the docstring says
 
 
 def cli() -> int:
     """The command-line entry: :func:`main`, then :func:`_flush_or_discard` on both console
-    streams, however ``main`` ends, a usage error's ``SystemExit`` and a traceback included.
-    An exception from ``main`` still propagates, so it ends as a traceback and exit 1."""
+    streams, however ``main`` ends, a usage error's ``SystemExit`` included. An exception from
+    ``main`` still propagates after that: a traceback and exit 1 where stderr can take it, and
+    exit 120 where stderr's reader has gone, since the traceback is written after the discard."""
     try:
         return main()
     finally:
