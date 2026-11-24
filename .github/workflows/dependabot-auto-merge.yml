@@ -65,9 +65,9 @@ name: Dependabot auto-merge
 #      READ THIS BEFORE CITING #2 OR #4 AS A CONTROL: both hold every eligible security-track PR
 #      today, so as shipped neither can ever CONFIRM a PR for merge. For a uv/pip PR, a populated
 #      allow row is NECESSARY before either can confirm a PR for merge, and not sufficient: at least
-#      a uv PR that dependabot-lock-resync.yml pushes a second commit to still holds, because that
-#      push's run disarms it and its sole-author step then fails the sender and single-commit
-#      checks. For any other ecosystem, github-actions included, #2's query must be made aware of it
+#      a uv PR that dependabot-lock-resync.yml pushes a second commit to still holds when that
+#      push's run disarms it, because its sole-author step stops at the sender check (a failed
+#      disarm leaves an arm made on an earlier head live). For any other ecosystem, github-actions included, #2's query must be made aware of it
 #      and #4 given a publish-date source for it, and an npm PR's names must also be on the allow
 #      row. Recording either as confirming would be exactly
 #      the false premise docs/Secure_Development_Standards.md §3 forbids. Among the checks that can
