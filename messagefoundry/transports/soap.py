@@ -532,13 +532,12 @@ def _names_expired_timestamp(body: str) -> bool:
     span = _code_element_span(body, fault)
     if span is not None:
         # An approximation of the text content: comments and processing instructions out
-        # (_scan_markup), the CDATA delimiters out wherever they appear, then each tag up to its
-        # first '>'. So a comment, or an attribute holding no '>', does not decide whether the
-        # element names a WS-Security code; CDATA text that itself holds a tag-shaped run, a
-        # '>' inside an attribute value, or a stray ']]>' can still change the read. Where the
-        # element names no WS-Security code, the range search below reads all of it.
-        kept = _scan_markup(body[span[0] : span[1]])[0]
-        text = _TAG_RE.sub(" ", kept.replace("<![CDATA[", " ").replace("]]>", " "))
+        # (_scan_markup), then each tag up to its first '>'. So a comment, or an attribute holding
+        # no '>', does not decide whether the element names a WS-Security code; a '>' inside an
+        # attribute value can still change the read, and a CDATA section holding no '<' or '>' is
+        # stripped as a tag, so its text does not count. Where the element names no WS-Security
+        # code, the range search below reads all of it.
+        text = _TAG_RE.sub(" ", _scan_markup(body[span[0] : span[1]])[0])
         if _WSSE_FAULT_RE.search(text) is not None:
             return _WSSE_EXPIRED_RE.search(text) is not None
     return _WSSE_EXPIRED_RE.search(body, start) is not None

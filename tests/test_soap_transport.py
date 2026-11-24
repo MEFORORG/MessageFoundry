@@ -612,10 +612,6 @@ _FAILED_AUTH_EXPIRED_ELSEWHERE = {
         b'<soap:Fault><faultcode a="MessageExpired">wsse:FailedAuthentication</faultcode>'
         b"</soap:Fault>"
     ),
-    "cdata-code": (
-        b"<soap:Fault><faultcode><![CDATA[wsse:FailedAuthentication]]></faultcode>"
-        b"<faultstring>MessageExpired</faultstring></soap:Fault>"
-    ),
     "after-the-fault": (
         b"<soap:Envelope><soap:Body><soap:Fault><faultcode>wsse:InvalidSecurityToken</faultcode>"
         b"</soap:Fault></soap:Body></soap:Envelope><!-- MessageExpired -->"
@@ -660,6 +656,10 @@ _EXPIRED_IN_THE_CODE = {
     "credential-code-in-a-comment": (
         b"<soap:Fault><faultcode><!-- FailedAuthentication -->soap:Client</faultcode>"
         b"<faultstring>wsse:MessageExpired</faultstring></soap:Fault>"
+    ),
+    "cdata-code-reads-as-main": (
+        b"<soap:Fault><faultcode><![CDATA[wsse:FailedAuthentication]]></faultcode>"
+        b"<faultstring>MessageExpired</faultstring></soap:Fault>"
     ),
     "comment-in-the-faultcode": (
         b"<soap:Fault><faultcode><!-- </faultcode> -->wsse:MessageExpired</faultcode>"
