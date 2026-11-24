@@ -631,10 +631,17 @@ def test_the_real_usage_reader_feeds_the_rung(
 
 
 def _fire(
-    sb: Sandbox, state: Path, seven: dict[str, Any], env: dict[str, str]
+    sb: Sandbox,
+    state: Path,
+    seven: dict[str, Any],
+    env: dict[str, str],
+    api_ms: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """One statusLine fire through the real collector."""
-    payload = json.dumps({"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+    """One statusLine fire through the real collector, with an API-duration counter if given."""
+    body: dict[str, Any] = {"session_id": "fixture", "rate_limits": {"seven_day": seven}}
+    if api_ms is not None:
+        body["cost"] = {"total_api_duration_ms": api_ms}
+    payload = json.dumps(body)
     return sb.run(COORD / "usage-collect.ps1", "-StateDir", str(state), stdin=payload, **env)
 
 
@@ -1090,17 +1097,25 @@ def test_a_numeric_string_from_a_fire_halts_at_the_ceiling(sb: Sandbox, tmp_path
 def test_a_bare_reading_after_a_gone_window_cannot_clear_through_the_real_scripts(
     sb: Sandbox, tmp_path: Path
 ) -> None:
-    """The collector takes it, because no reset is ahead to protect. It used to clear the rung: a
-    40 that cannot say which window it belongs to, on a pool that may be spent."""
+    """The collector takes a lower bare reading over a gone window only from a live session (ADR
+    0211, the live-session rule). It used to clear the rung: a 40 that cannot say which window it
+    belongs to, on a pool that may be spent."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
     env = {"CLAUDE_CONFIG_DIR": str(root)}
     _wire(sb, root, tmp_path, env)
     gone = {"used_percentage": 95, "resets_at": int(ago().timestamp()) - 300}
-    assert _fire(sb, state, gone, env).returncode == 0
-    assert _fire(sb, state, {"used_percentage": 40}, env).returncode == 0
+    assert _fire(sb, state, gone, env, api_ms=1000).returncode == 0
     seed_vault(sb, calibrated("manager"))
+
+    # An idle bare 40 is refused, so the gone window stands and the gate still answers REVIEW.
+    assert _fire(sb, state, {"used_percentage": 40}, env, api_ms=1000).returncode == 0
+    code, doc = _real_gate(sb, env)
+    assert code == REVIEW and "no reset time" not in why(doc), why(doc)
+
+    # A live session's bare 40 is taken, and the gate answers REVIEW on it rather than clearing.
+    assert _fire(sb, state, {"used_percentage": 40}, env, api_ms=2000).returncode == 0
     code, doc = _real_gate(sb, env)
     assert code == REVIEW and "no reset time" in why(doc), why(doc)
 

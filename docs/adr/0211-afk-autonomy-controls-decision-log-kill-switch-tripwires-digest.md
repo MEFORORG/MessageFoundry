@@ -440,14 +440,16 @@ roster alias of the Lander.
 >
 > **The live-session rule, stated once here (BACKLOG #5178); the collector's comments and the limits
 > below point to it.** A reading at or below the published number is refused unless it comes from a
-> live session. It binds over every published window that holds a number, on every path: the same reset
-> or another, before or after the published reset, a reading or a published window with no readable
+> live session. The collector checks it over every published window that holds a number, on every
+> path: the same reset or another, before or after the published reset, a reading or a published window with no readable
 > reset, and a published window stamped with another root. A higher reading passes it from any session.
 > A fire is live when all of these hold: its session id is a plain name, 1 to 128 letters, digits, `_`
 > or `-`; its `cost.total_api_duration_ms` is a finite number above the counter in that session's mark
 > file (`live-marks/mark-<session>.json`), which must exist and read; the new counter is written to that
 > file; and the session is pinned to this root or unpinned, so an unpinned session of another root that
-> publishes here counts as live. A first fire is never live, since it has no mark to rise past.
+> publishes here counts as live. A first fire is never live, since it has no mark to rise past. A
+> session whose counter restarted, through a resume or a new process on the same id, is not live until
+> its counter passes its old mark.
 >
 > **The per-reset tests** apply only against a published window of this root's: stamped with this root,
 > unset or unstamped, by the reader's own test. They refuse, from any session, a reading with the same
@@ -458,13 +460,14 @@ roster alias of the Lander.
 > stamped with another root has no per-reset test, so a live session of this root replaces it on any
 > reset, lower or not.
 >
-> So over a window that holds a number, a reading that replaces it is higher than it or comes from a
-> live session, on every path, and an idle reading after it has to beat that number. When the rule was
-> first written, earlier on 2026-11-24, it held only where both windows carried a readable reset, and two
-> paths let an idle reading past it: past a gone published reset, an idle reading with no reset was taken
-> and dropped the reset, and a frozen 5 on a new reset followed it in; and a higher reading from a
-> session pinned to another root restamped the window, after which a reading of any value was taken, as
-> on main. Both are closed, and `tests/test_coord_usage.py` pins each:
+> So over a window that holds a number, a reading that replaces it is higher than the number it read
+> or comes from a live session. The unlocked read and write, a limit below, is the exception: an idle
+> reading can still land over a higher one written in between. When the rule was first written, earlier
+> on 2026-11-24, it held only where both windows carried a readable reset. Two paths then let an idle
+> reading past it. In the first, past a gone published reset, an idle reading with no reset was taken
+> and dropped the reset, and a frozen 5 on a new reset followed it in. In the second, a higher reading
+> from a session pinned to another root restamped the window. Any reading was then taken, as on main.
+> Both are closed, and `tests/test_coord_usage.py` pins each:
 > `test_after_a_real_reset_a_no_reset_reading_cannot_open_a_path_past_the_rule` and
 > `test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule`.
 >
@@ -474,6 +477,12 @@ roster alias of the Lander.
 > higher number halts it. A higher reading from a session pinned to another root passes too, as on main,
 > though the reader refuses the window it publishes, so the gate answers REVIEW on it rather than
 > halting.
+>
+> **The rule can turn a HALT into a REVIEW past a gone reset, where main halted.** A published 99 whose
+> reset has passed reads UNKNOWN. An idle session's 93 for the new window is refused, because it is not
+> higher, so the gate answers REVIEW. Main took that 93 and halted on it at the 90 percent level. This
+> is the price of refusing an idle session's frozen 5 there, which main took and cleared on. It lasts
+> until a live session or a higher reading opens the new window.
 >
 > **A reading below the rung with no reset time answers UNKNOWN**, so the gate answers REVIEW. It cannot
 > prove which window it belongs to, so it may be last week's number. At the rung it still hits, because a
@@ -492,7 +501,8 @@ roster alias of the Lander.
 > that mark may hide a higher counter. A mark that cannot be written proves nothing. Each of these leaves
 > the age counting. This does not make a mark monotonic: at least unlocked writes on one shared session
 > id, which can land the lower counter last, and a pruned mark, which takes whichever counter fires next,
-> can each still cost one false refresh, and neither loops. A pool nobody has called for 20
+> can each still cost one false live fire, and neither loops. A false live fire can refresh the age,
+> and under the live-session rule it can also let a lower reading replace the window. A pool nobody has called for 20
 > minutes goes stale and reads UNKNOWN unless a floor or a projected run-out holds it, so a healthy live
 > flat account stays fresh and an idle one does
 > not. The statusLine docs list the counter, as read on 2026-11-01. No real payload on this box was checked

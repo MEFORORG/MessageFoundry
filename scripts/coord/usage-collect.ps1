@@ -340,11 +340,10 @@ try {
     # keeps counting from the last real observation. $confirmed is the one exception: a live session's
     # equal reading for the same running reset refreshes the age and nothing else.
     #
-    # $guard is the live-session rule, and it binds on every path, a window stamped with another root or
-    # either side with no readable reset included: a reading at or below the published number is taken
-    # only from a live session. So a reading that drops the reset or restamps the window is a higher one
-    # or a live one, and an idle reading after it still has to beat that number.
-    # The per-reset tests below add to it, for this root's own window only, by the reader's own test.
+    # $guard is the live-session rule, checked on every path, a window stamped with another root or
+    # either side with no readable reset included: a reading at or below the published number it read
+    # is taken only from a live session. The per-reset tests below add to it, for this root's own window
+    # only, by the reader's own test. The unlocked write below is the exception it cannot cover.
     #
     # THE READ AND THE WRITE ARE NOT LOCKED. Every session publishes here, so a reading can pass this
     # check and then land over a higher one written in between. The next live fire corrects it.
@@ -369,7 +368,7 @@ try {
             ($notHigher -and $seenEpoch -eq $publishedEpoch) -or
             ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
-        else { -not $seenEpoch -and $publishedEpoch -gt $nowEpoch }
+        else { $publishedEpoch -gt $nowEpoch }
         $keepPublished = $guard -or $perReset
         $confirmed = $live -and $publishedOwn -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and

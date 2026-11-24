@@ -498,15 +498,17 @@ def test_a_foreign_stamp_cannot_open_a_path_past_this_roots_rule(tmp_path: Path)
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(95.0)
     assert len(history(state)) == 2
 
-    # CONTROL. A higher reading of this root's still lands over the foreign window from an idle session.
-    _session_fire(state, {"used_percentage": 97.0, "resets_at": reset}, "hi", 1000)
-    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(97.0)
-
     # CONTROL. Not frozen: the lower reading from a session of this root that has just called the API
-    # opens the new window.
+    # replaces the foreign window.
     _session_fire(state, frozen, "idle", 2000)
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(5.0)
     assert read(state)[0] == OK
+
+    # CONTROL. A higher reading of this root's still lands over a foreign window from an idle session.
+    _session_fire(state, {**foreign, "used_percentage": 96.0}, "F", 2000, pin=tmp_path / "other")
+    assert latest(state)["seven_day"]["config_root_env"] == str(tmp_path / "other")
+    _session_fire(state, {"used_percentage": 97.0, "resets_at": reset}, "hi", 1000)
+    assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(97.0)
 
 
 def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:
@@ -519,29 +521,7 @@ def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path:
     _session_fire(state, {"used_percentage": 100.0, "resets_at": now + 500000}, "live", 1000)
     low = {"used_percentage": 5.0, "resets_at": now + 100000}
     for api_ms in (1000, 2000):
-        payload = {
-            "session_id": "S",
-            "cost": {"total_api_duration_ms": api_ms},
-            "rate_limits": {"seven_day": low},
-        }
-        proc = run_single(
-            [
-                "pwsh",
-                "-NoProfile",
-                "-NonInteractive",
-                "-File",
-                str(COLLECT),
-                "-StateDir",
-                str(state),
-            ],
-            input=json.dumps(payload),
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT,
-            check=False,
-            env=_env(tmp_path / "other-root"),
-        )
-        assert proc.returncode == 0, proc.stderr
+        _session_fire(state, low, "S", api_ms, pin=tmp_path / "other-root")
     assert latest(state)["seven_day"]["used_percentage"] == pytest.approx(100.0)
 
     # CONTROL. The same live reading from an unpinned session of this root is taken.
@@ -619,13 +599,15 @@ def test_a_lower_reading_with_no_reset_cannot_disarm_the_floor(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     "stamp",
-    ["own-root", "own-root-respelled", "unset", None],
-    ids=["own", "own-respelled", "unset", "absent"],
+    ["own-root", "own-root-respelled", "unset", None, "other-root"],
+    ids=["own", "own-respelled", "unset", "absent", "control-foreign"],
 )
 def test_a_differently_stamped_session_on_this_root_still_meets_the_floor(
     tmp_path: Path, stamp: str | None
 ) -> None:
-    """A pinned session and an unpinned one can share a root, and the reader calls both its own."""
+    """A pinned session and an unpinned one can share a root, and the reader calls both its own. The
+    lower reading comes from a live session, because then only the same-reset test refuses it, and
+    that test holds only over this root's own window: the foreign stamp is the control."""
     seven = window(99.0, 280000)
     collect(tmp_path, {"session_id": "live", "rate_limits": {"seven_day": seven}})
     doc = latest(tmp_path)
@@ -639,12 +621,15 @@ def test_a_differently_stamped_session_on_this_root_still_meets_the_floor(
         doc["seven_day"]["config_root_env"] = {
             "own-root": own,
             "own-root-respelled": respelled,
+            "other-root": str(tmp_path / "other-root"),
         }.get(stamp, stamp)
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
-    idle = {**seven, "used_percentage": 60.0}
-    collect(tmp_path, {"session_id": "idle", "rate_limits": {"seven_day": idle}})
-    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(99.0)
+    lower = {**seven, "used_percentage": 60.0}
+    _session_fire(tmp_path, lower, "lower", 1000)
+    _session_fire(tmp_path, lower, "lower", 2000)
+    expected = 60.0 if stamp == "other-root" else 99.0
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(expected)
 
 
 def test_an_unchanged_reading_does_not_refresh_the_age(tmp_path: Path) -> None:
