@@ -1525,9 +1525,10 @@ OPERATION_INVENTORY: dict[str, frozenset[str]] = {
             # (store.crypto seal_rotation_fingerprint / open_rotation_fingerprint), and its per-row
             # HMAC key is drawn from the CSPRNG.
             "cipher:via messagefoundry.store.crypto",
-            # BACKLOG #5615: _UnchargedCipher forwards decrypt to the store cipher, so the
-            # pre-graph expiry prediction opens the same cells. It adds no algorithm or key use.
+            # BACKLOG #5615: the pre-graph expiry check's cipher wrappers forward decrypt, and a
+            # first sighting's encrypt, to the store cipher. No new algorithm or key use.
             "cipher:.decrypt()",
+            "cipher:.encrypt()",
             "compare:hmac.compare_digest",
             "csprng:secrets.token_bytes",
             "mac:hmac.new[sha256]",

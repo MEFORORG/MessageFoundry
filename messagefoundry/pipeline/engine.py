@@ -2366,8 +2366,8 @@ class Engine:
             # is a non-bool literal on a boolean source setting (vault BACKLOG #3234).
             refuse_reference_hop_flags(self._registry_runner.registry)
             if not self._coordinator.is_clustered():
-                # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
-                # before — byte-identical. The config-drift sweeps + reference materialize + listener
+                # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, unless the
+                # expiry check refuses. The config-drift sweeps + reference materialize + listener
                 # bring-up live in _start_graph (shared with the clustered leader path).
                 # BACKLOG #5615: an expired key or secret is refused before a listener binds. The
                 # [secret_rotation] block below still decides every start this does not refuse.

@@ -591,6 +591,23 @@ async def test_a_seal_failure_on_an_opted_in_class_refuses_after_the_graph(
     assert rig.graph_starts == 1
 
 
+def test_a_refused_start_charges_a_real_seal_only_for_a_first_sighting() -> None:
+    class _Recording:
+        def __init__(self) -> None:
+            self.sealed: list[str] = []
+
+        def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+            self.sealed.append(plaintext)
+            return "real"
+
+    real = _Recording()
+    cipher = sr._FirstSightingCipher(real, {"KNOWN"})  # type: ignore[arg-type]
+    assert cipher.encrypt("aa:bb:KNOWN") == "predicted"
+    assert real.sealed == []
+    assert cipher.encrypt("aa:bb:NEW") == "real"
+    assert real.sealed == ["aa:bb:NEW"]
+
+
 # --- the siting -----------------------------------------------------------------------------------
 
 

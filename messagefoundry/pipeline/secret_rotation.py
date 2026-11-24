@@ -1222,6 +1222,21 @@ class _UnchargedCipher:
         return self._cipher.is_encrypted(stored)
 
 
+class _FirstSightingCipher(_UnchargedCipher):
+    """A refused start's cipher: it charges a real seal only for a class with no row yet. Any other
+    row's write is withheld, so a real seal of it would be spent again at every refused restart."""
+
+    def __init__(self, cipher: AesGcmCipher, before: Collection[str]) -> None:
+        super().__init__(cipher)
+        self._before = before
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        # The class id is the cell's last field: see _fingerprint_cell.
+        if plaintext.split(":", 2)[2] in self._before:
+            return super().encrypt(plaintext, aad=aad)
+        return self._cipher.encrypt(plaintext, aad=aad)
+
+
 class _InMemoryRotationMeta:
     """The real rows with this run's writes laid over them. With no ``first_sightings_against``
     nothing reaches the store.
@@ -1340,10 +1355,11 @@ async def refuse_expiry_before_graph(
             with contextlib.suppress(StoreKeyRotationOverdueError, SecretRotationOverdueError):
                 await refuse(predicted, silent)
                 return
+        before = await meta_store.get_secret_rotation_meta()
         refused_view = _InMemoryRotationMeta(
             meta_store,
-            cipher,
-            first_sightings_against=await meta_store.get_secret_rotation_meta(),
+            cast("AesGcmCipher", _FirstSightingCipher(cipher, before.keys())),
+            first_sightings_against=before,
         )
         stamps = await reconcile(refused_view, alert_sink)
     except Exception as exc:
@@ -1355,11 +1371,12 @@ async def refuse_expiry_before_graph(
         )
         return
     if refused_view.withheld:
-        # The reconcile's own lines say "opened", "re-stamped" or "sealed" for these rows.
+        # The reconcile's own lines can say "opened", "re-stamped" or "sealed" for these rows.
         log.warning(
             "secret rotation: this start is being refused before the graph, so %d rotation "
-            "row write(s) the lines above describe were NOT saved, a rotation record or new "
-            "fingerprint included. A later start that is not refused makes them.",
+            "row write(s) were NOT saved, whatever any line above says: a changed or re-sealed "
+            "fingerprint, a re-stamp, or a rotation record. A later start that is not refused "
+            "makes them, and dates a changed secret from that start.",
             refused_view.withheld,
         )
     # Outside the handler above, for the reason enforce_store_key_expiry gives.
