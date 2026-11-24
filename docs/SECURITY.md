@@ -7961,7 +7961,8 @@ when the notice is handed to the relay. It reads `mailed: true` only when the re
 notice: one its full queue dropped, or one it refused because it had begun to close, reads
 `mailed: false`, so the next lock of the kind mails again (vault BACKLOG #3120). When the relay's queue is full, the relay refuses the notice because it has
 begun to close, a cut close leaves the notice queued or cuts its send, or the send fails, the
-engine writes one more row, with the notice's recipient as the actor. A lock
+engine tries to write one more row, with the notice's recipient as the actor; when that write
+can fail is under *Still open* below. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
 `auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
 notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
