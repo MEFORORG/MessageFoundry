@@ -585,10 +585,12 @@ class _StderrRelay:
         except OSError:
             pass  # the pipe died with the worker; the kill path reports that, this thread does not
         finally:
-            self.close()
-            # This thread is the stream's only reader, so it closes it once the drain ends, rather
-            # than leave the descriptor to the collector (BACKLOG #6831).
-            _close_quietly(stream)
+            try:
+                self.close()
+            finally:
+                # This thread is the stream's only reader, so it closes it once the drain ends,
+                # rather than leave the descriptor to the collector (BACKLOG #6831).
+                _close_quietly(stream)
 
     def feed(self, chunk: bytes) -> None:
         """Accumulate ``chunk`` and emit every complete line (or cap-length run) it completes."""
@@ -1352,10 +1354,11 @@ class SandboxSession:
                 type(exc).__name__,
             )
         # The engine's end of the request pipe, closed here rather than left to the collector
-        # (BACKLOG #6831). Only the thread holding the session lock writes it, except a lookup
-        # helper its dispatch gave up on, which may still be inside a write: that helper closes it
-        # itself when it ends, because a close under another thread's write can free the descriptor
-        # number for reuse before that write reaches the kernel.
+        # (BACKLOG #6831). The thread holding the session lock writes it, and so does a lookup
+        # helper while that thread waits on it. A helper its dispatch gave up on may still be inside
+        # a write: that helper closes the pipe itself when it ends, because a close under another
+        # thread's write can free the descriptor number for reuse before that write reaches the
+        # kernel. Any other helper has ended before the reap.
         if proc.stdin is not None and proc not in self._stdin_held:
             _close_quietly(proc.stdin)
         if proc is self._proc:

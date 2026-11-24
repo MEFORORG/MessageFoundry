@@ -22,18 +22,7 @@ from messagefoundry.config.run_context import RunContext
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline import sandbox as sandbox_mod
 from messagefoundry.pipeline.dryrun import transform_one
-from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
-from tests.test_sandbox import RAW, graph  # noqa: F401 - graph is a fixture
-
-
-def _session(config_dir: str) -> SandboxSession:
-    return SandboxSession(
-        SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=15.0),
-        inbound="IB_T",
-        config_dir=config_dir,
-        env=None,
-        graph=None,
-    )
+from tests.test_sandbox import RAW, _session, graph  # noqa: F401 - graph is a fixture
 
 
 def test_close_closes_the_workers_pipes(graph: tuple[Registry, str]) -> None:  # noqa: F811
@@ -68,14 +57,25 @@ def test_a_closed_worker_leaves_no_unclosed_file_for_the_collector(
         try:
             transform_one(registry, "h_ok", RAW, sandbox=session, run_context=RunContext())
             threads = list(session._threads)
+            proc = session._proc
+            assert proc is not None
+            pipes = (proc.stdin, proc.stdout, proc.stderr)
+            # This worker's pipes, by descriptor: another test's unclosed file is not this one's.
+            names = {f"name={pipe.fileno()} " for pipe in pipes if pipe is not None}
+            del proc, pipes
         finally:
             session.close()
         for thread in threads:
             thread.join(timeout=10)
         del session, threads
         gc.collect()
-    unclosed = [w for w in caught if issubclass(w.category, ResourceWarning)]
-    assert unclosed == [], [str(w.message) for w in unclosed]
+    assert len(names) == 3
+    unclosed = [
+        str(w.message)
+        for w in caught
+        if issubclass(w.category, ResourceWarning) and any(n in str(w.message) for n in names)
+    ]
+    assert unclosed == [], unclosed
 
 
 def test_a_worker_still_running_after_the_reaps_wait_is_logged(
