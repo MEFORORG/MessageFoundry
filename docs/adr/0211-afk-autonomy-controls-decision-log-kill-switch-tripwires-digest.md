@@ -407,6 +407,24 @@ roster alias of the Lander.
 > Either can stop work on a pool that has room, and a false stop is the safe direction. The highest
 > percentage is taken as the level reached, so a low row cannot turn the rate negative.
 >
+> **Amended 2026-11-23 (BACKLOG #5494): the rate refuses history it cannot trust.** At least these
+> refuse it: rows spanning under one minute that climbed one tick or less, which is mostly rounding;
+> rows across a reset when the reading carries none; too few rows once those dated more than 5 minutes
+> after now are set aside; rows stamped with another config root, which are skipped, filling a read
+> that widens to 6400 lines without finding two rows of this root's; and a history that cannot
+> be read. A row set aside for its date keeps its level but not its date, which would stretch the span
+> toward a rate of zero. A refusal is not "no rate": a fresh reading with a refused rate reads UNKNOWN in
+> `usage.ps1` below its ceiling, and the gate then answers REVIEW below its weekly HOLD level and hits
+> at it, as with no rate. **The rate of the code before this amendment is kept as a floor under the
+> guards.** That code's rate over the same rows, read as it read them, is computed beside the guarded
+> one. No rate `usage.ps1` reports is below it, and a refused rate is still projected from it, so a
+> run-out it puts before the reset stays CRITICAL and the gate halts on it inside `HoldMin` as before.
+> Where that rate is not positive and the guarded one is, the guarded rate is refused and projected the
+> same way, so that code's level backstop still stands. Short of a hit, a refused rate answers REVIEW
+> rather than OK. So at least a single tick seconds apart, and a uniform backward clock step of more
+> than 5 minutes, still halt where that code halted. Where this note and the paragraph above differ,
+> this note wins.
+>
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
 > percentage, so no one session's reading is the truth; each is a valid floor. Against a published
 > window of this root's, the collector therefore refuses a reading with the same reset that is not
@@ -480,7 +498,9 @@ roster alias of the Lander.
 > A projection to run out before the reset stays CRITICAL, and with no reset any projection does. The gate
 > halts on a projection only inside `HoldMin`, 60 minutes by default, and answers REVIEW beyond that. Any
 > distance ahead counts, with no tolerance: the collector stamps before it writes, and the reader opens the
-> document before it reads the clock. A history row dated ahead stays in the rate at its own date. When the
+> document before it reads the clock. A history row dated up to 5 minutes ahead stays in the rate at its
+> own date; past that its date is set aside and its level kept, as the 2026-11-23 amendment above says,
+> and the rate of the code before it still stands as a floor. When the
 > gate halts on such a reading, its reason and the spawn hook's line say the machine's clock looks wrong.
 >
 > The rule has at least these limits, all of them open:
@@ -489,8 +509,8 @@ roster alias of the Lander.
 >   the history: one on an empty directory, one over a window stamped with another root or with no reset,
 >   one higher than the published window for the same gone reset, and one with a later reset than the
 >   published window. `usage.ps1` reports any window past its reset as UNKNOWN with no percentage, so its
->   level is not graded. Its history row can still feed a rate, because with no current reset the rate
->   skips its reset filter.
+>   level is not graded. With no current reset the rate cannot filter its rows by reset, so rows that
+>   change reset or fall refuse it, under the 2026-11-23 amendment above.
 > - With no published reset ahead, the collector holds no floor: a reading with no reset is taken whatever
 >   its value, and an equal one refreshes the age, until a reading brings a reset. Below the rung the gate
 >   answers REVIEW for it, unless a burn is projected. A reading dated after now still sets the reader's
