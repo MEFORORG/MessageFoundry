@@ -219,6 +219,7 @@ tests/test_semgrep_install_retry.py
 tests/test_session_context_presence.py
 tests/test_session_mail_held.py
 tests/test_session_mail.py
+tests/test_session_mail_toplevel.py
 tests/test_session_mail_watch_standdown.py
 tests/test_install_coordination_retired.py
 tests/test_session_registry.py
