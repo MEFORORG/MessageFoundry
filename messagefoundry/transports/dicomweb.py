@@ -469,7 +469,7 @@ class _SentUids(NamedTuple):
 # pydicom modules already imported, so a restart is what loads a fixed one.
 _DICOM_EXTRA_REMEDY = (
     "the [dicom] extra (pydicom) on this host, which is installed but does not load: repair or "
-    "remove it, then restart the engine"
+    "remove it, then restart the engine, since a reload keeps the pydicom already imported"
 )
 
 
@@ -477,8 +477,9 @@ def _dicom_extra_fault() -> str | None:
     """The class name of what the ``[dicom]`` extra raised when loaded, or ``None`` when it loads:
     the ``dcmread`` reader and the readers the deflate guard replays
     (:mod:`messagefoundry.parsing.dicom._deps`), checked apart from any object, as the SCU loads
-    them before its parse. An import can raise any class, so any :class:`Exception` but a
-    :class:`MemoryError` counts (BACKLOG #5914)."""
+    them before its parse. An import can raise an exception of any class, so any
+    :class:`Exception` but a :class:`MemoryError` counts; a :class:`BaseException` that is not an
+    :class:`Exception` is not caught (BACKLOG #5914)."""
     try:
         load_dcmread()
         load_header_readers()
@@ -498,8 +499,8 @@ def _dicom_extra_unusable(fault: str, base_url: str) -> NegativeAckError:
     names the class only (PHI-safe)."""
     return NegativeAckError(
         f"DICOMweb dicom-extra-unusable: the installed [dicom] extra did not load ({fault}), so "
-        f"the SOP Instance UIDs of the object could not be read before sending it; nothing was "
-        f"sent ({_redact_url(base_url)})",
+        f"the data set SOP Instance UID of the object could not be read before sending it; "
+        f"nothing was sent ({_redact_url(base_url)})",
         code="dicom-extra-unusable",
         permanent=True,
         config_fault=True,

@@ -593,7 +593,7 @@ every queued row meets because of the connection rather than the message or the 
 own settings, or the endpoint those settings name. `NegativeAckError.remedy` carries where to fix
 it, and the stop's log line and alert name that place instead of the connection's configuration.
 
-### B.3 A broken optional package the connection needs is a configuration fault (2026-11-24, BACKLOG #5914)
+### B.3 A broken optional package the connection loads is a configuration fault (2026-11-24, BACKLOG #5914)
 
 > **Recorded 2026-11-24 by a Builder seat.** It describes the code on branch `w10-5914`, after a
 > Manager decision of 2026-11-24 to stop the lane on this fault. B.2's text above is unchanged.
@@ -609,14 +609,20 @@ the B.2 lane alert.
 
 Without this, the load failure would be an internal error. Under the default
 `internal_error="continue"` that dead-letters each row in turn, with no lane alert, while the same
-host without the extra would deliver every row.
+host without the extra would deliver every row. Before BACKLOG #5914 DICOMweb did not load the
+extra at all, so a host with a broken one delivered; the lane stop is a cost of reading the data
+set UID that this amendment accepts.
 
-This widens B.2's definition once more. From this amendment a configuration fault is a permanent
-refusal every queued row meets because of the connection rather than the message or the
-credential: its own settings, the endpoint those settings name, or an optional package the
-connection needs on the host that is installed but broken. `NegativeAckError.remedy` for
-`dicom-extra-unusable` says that the extra is installed but does not load, and to repair or remove
-it, then restart the engine. It does not say to install it.
+This widens B.2's definition. A missing `[sqlserver]` extra on a DATABASE outbound was already
+raised as a configuration fault (BACKLOG #5713), and B.2's text did not say so. From this
+amendment a configuration fault is a permanent refusal every queued row meets because of the
+connection rather than the message or the credential: its own settings, the endpoint those
+settings name, or an optional package on the host that the connection loads, missing or broken.
+DICOMweb does not need the `[dicom]` extra, and uses it where it is found. `NegativeAckError.remedy`
+for `dicom-extra-unusable` says that the extra is installed but does not load, and to repair or
+remove it, then restart the engine. It does not say to install it. A reload re-arms the lane but
+keeps the `pydicom` modules already imported, so after a reload alone the next send can stop the
+lane again.
 
 The DICOM SCU loads the same extra before its parse and still raises the load's error as an
 internal error. That difference is not settled by this amendment.

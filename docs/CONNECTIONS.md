@@ -4068,7 +4068,8 @@ every queued row would meet it, so under the default `credential_fault_policy` t
 keeps its queue, and the alert says the extra is installed but does not load. Under `dead_letter`
 the row is dead-lettered instead. A `pydicom` directory with no `__init__.py`, as an uninstall can
 leave, is taken as no extra. After fixing or removing `pydicom`, restart the engine: the `pydicom`
-modules an import has already loaded stay loaded until a restart. Any other fault in the read of the object itself, such as a `TypeError` or
+modules an import has already loaded stay loaded until a restart, so a reload re-arms the lane
+without loading a fixed one. Any other fault in the read of the object itself, such as a `TypeError` or
 a warning the filters turn into an error, refuses the message before a byte is sent, whatever
 status the partner would have answered, naming the exception class only (code `sent-uid-unread`),
 even when a broken extra caused it. A `MemoryError` is not caught there. The data set UID is read
