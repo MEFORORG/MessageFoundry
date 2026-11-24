@@ -98,6 +98,22 @@ The sanctioned non-pure reads (ADR 0010/0043) are **unavailable in dry-run and r
 - **AST instrumentation / bytecode rewriting.** Could attribute values to sub-expressions more precisely, but it rewrites author code, is fragile across Python versions, and risks diverging behavior from the real run (violating the byte-identical guarantee). Rejected for v1; a bounded AST-assisted *value-timing* refinement is a possible v2.
 - **Enrich the existing `--json` with per-handler attribution only** (add a `handler` tag to `DeliveryPreview`). Cheap, and it would let #92 **v1** show accurate multi-handler summaries — but it yields **no per-statement data**, so it cannot drive #92 v2 or #84 profiling/coverage. Noted as the **owner option** in MULTISESSION-PLAN-7 §H for v1 only; insufficient as the v2 contract.
 
+## Amendment 2026-11-24 (BACKLOG #6823) — `lazy_result` on the Handler half
+
+The §3 `lazy_result` text and the gate 1b carve-out above are kept as accepted; this note records
+what shipped since. Gate 1b names "the `_sends_from` iterator guard". That guard tested
+`isinstance(result, Iterator)`, and it was not enough: an object whose `__iter__` returns a stored
+generator is single-pass but not an `Iterator`, so the tracer walked it, `_partition` then found it
+empty, and a traced run read `FILTERED` with zero deliveries where the untraced run delivered —
+a gate 1a break. The guard is removed. The tracer now walks a Handler return only when its exact
+type is `list`, `tuple`, `set` or `frozenset` (checked by identity). For any other iterable Handler
+return except `str`/`bytes`/`bytearray`, the invocation reports `sends: []` and carries
+`"lazy_result": true`. On the Handler half, `lazy_result` therefore means: *the return was such an
+iterable, so the trace reports no per-invocation sends*. It no longer implies the body was not
+traced: only a generator Handler also has no line events. Gate 1a is unchanged and still absolute.
+→ `tests/test_dryrun_trace.py::test_gate_1a_a_single_pass_iterable_handler_traces_byte_identically`,
+`tests/test_dryrun_trace.py::test_gate_1a_a_single_pass_container_subclass_handler_is_not_drained`.
+
 ---
 
 *This ADR is Proposed / direction-setting. It fixes the trace contract, the capture semantics, the live-lookup rule, and the PHI posture; it is ratified (Accepted) before L5 writes code, and nothing here changes the shipped `dryrun` default.*

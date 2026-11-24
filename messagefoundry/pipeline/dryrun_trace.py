@@ -175,7 +175,7 @@ def _sends_from(result: object) -> list[str]:
     ``deque``, therefore under-reports too."""
     if result is None:
         return []
-    if type(result) in _ROUTED_CONTAINERS:
+    if _is_exact_container(result):
         items: Iterable[object] = cast("Iterable[object]", result)
     elif _handler_return_is_untraceable(result):
         return []
@@ -189,6 +189,15 @@ def _sends_from(result: object) -> list[str]:
 _HANDLER_SINGLE_VALUES = (str, bytes, bytearray)
 
 
+def _is_exact_container(result: object) -> bool:
+    """True when ``result``'s exact type is one of :data:`_ROUTED_CONTAINERS`.
+
+    Identity, not ``type(result) in ...``: membership compares with ``==``, which would run a user
+    metaclass ``__eq__`` inside this observer."""
+    t = type(result)
+    return t is list or t is tuple or t is set or t is frozenset
+
+
 def _handler_return_is_untraceable(result: object) -> bool:
     """True when :func:`_sends_from` declines to walk this Handler return, so the record is incomplete.
 
@@ -198,7 +207,7 @@ def _handler_return_is_untraceable(result: object) -> bool:
     return (
         isinstance(result, Iterable)
         and not isinstance(result, _HANDLER_SINGLE_VALUES)
-        and type(result) not in _ROUTED_CONTAINERS
+        and not _is_exact_container(result)
     )
 
 
