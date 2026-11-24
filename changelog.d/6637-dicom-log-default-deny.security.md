@@ -1,0 +1,4 @@
+- **pynetdicom's and pydicom's log lines are now default-deny.** A line from either library is
+  written only if it is one of the value-free lines or fully matches one of the templates pinned
+  in `messagefoundry/transports/_dicom_log_lines.py`; a line that matches none is withheld. See
+  [DICOM.md](../docs/DICOM.md) section 5 for what stays and what is lost. (`BACKLOG #6637`)
