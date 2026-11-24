@@ -22,12 +22,13 @@ from __future__ import annotations
 import base64
 
 import pytest
+from _totp_clock import fresh_totp
 
 from messagefoundry.auth import totp
-from messagefoundry.auth.service import AuthService, FirstAdministratorRefused
+from messagefoundry.auth.service import AuthService, FirstAdministratorRefused, _opened_totp_state
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
-from tests._admin_account import PROVISION_EMAIL
+from tests._admin_account import ADMIN_USERNAME, PROVISION_EMAIL, login_admin
 
 # Synthetic keys of a chosen length, encoded the way an authenticator app holds them.
 _KEY_160 = base64.b32encode(bytes(range(20))).decode("ascii")
@@ -142,5 +143,71 @@ async def test_provisioning_refuses_cleanly_and_writes_nothing(secret: str) -> N
                 totp_code_read_at=0.0,
             )
         assert await store.count_users() == 0
+    finally:
+        await store.close()
+
+
+# A stored secret no code can be computed from, by each way it reaches a cell: not base32, not
+# ASCII (one upper() would fold into the alphabet included), or decoding to a short key.
+_UNDECODABLE_STORED = [
+    pytest.param("not base32 at all!", id="non-base32"),
+    pytest.param("ß" * 16, id="non-ascii-folding-into-base32"),
+    pytest.param("totp1:SHA256:6:30:" + "é" * 32, id="marked-non-ascii"),
+]
+_SHORT_STORED = [
+    pytest.param(_KEY_128, id="128-bit"),
+    pytest.param("totp1:SHA256:6:30:" + _KEY_80, id="marked-80-bit"),
+]
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_STORED + _SHORT_STORED)
+def test_an_undecodable_or_short_stored_secret_computes_and_matches_no_code(stored: str) -> None:
+    """Fails closed in the module: refused, never a ``binascii.Error``, and a fresh enrolment is
+    the way past it."""
+    with pytest.raises(totp.RefusedTotpSecret):
+        totp.totp(stored, now=0)
+    assert totp.verify_totp_step(stored, "123456", now=0, window=0) is None
+    assert totp.needs_reenrolment(stored) is True
+
+
+@pytest.mark.parametrize("stored", _SHORT_STORED)
+def test_a_short_stored_key_is_a_known_refusal_to_the_service(stored: str) -> None:
+    assert _opened_totp_state(stored) == "refused"
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_STORED)
+def test_an_undecodable_stored_secret_stays_unknown_to_the_service(stored: str) -> None:
+    """CONTROL: a value that is not base32 cannot be judged, so the gates keep counting it as the
+    plain enabled-TOTP rule does (BACKLOG #3422). It now computes no code; its state is unchanged."""
+    assert _opened_totp_state(stored) == "unknown"
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_STORED + _SHORT_STORED)
+async def test_the_two_step_verify_fails_closed_on_a_bad_stored_secret(
+    stored: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``verify_mfa`` raised ``binascii.Error`` (a 500) on a stored secret that was not base32,
+    before it tried a recovery code. Now the TOTP code is refused, nothing raises, and a recovery
+    code still signs in."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = AuthService(
+            store, AuthSettings(mfa_verify_min_elapsed_seconds=0, mfa_recovery_code_count=2)
+        )
+        identity, token, password = await login_admin(service)
+        enroll = await service.begin_mfa_enrollment(identity)
+        enrolled = await service.confirm_mfa_enrollment(
+            identity, fresh_totp(enroll.secret), token=token
+        )
+        assert enrolled.ok and enrolled.recovery_codes
+
+        def opener(_user_id: str, _cell: str | None) -> str:
+            return stored
+
+        monkeypatch.setattr(store, "open_totp_secret", opener)
+        out = await service.login(ADMIN_USERNAME, password)
+        assert out.token is not None
+        assert (await service.verify_mfa(out.token, fresh_totp(enroll.secret))).ok is False
+        assert (await service.verify_mfa(out.token, enrolled.recovery_codes[0])).ok is True
     finally:
         await store.close()

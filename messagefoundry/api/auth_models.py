@@ -631,8 +631,10 @@ class MfaStatusResponse(BaseModel):
     ``webauthn_enrolled`` is the ADR 0068 additive field (defaulted, so an older client's decode
     is unaffected). ``required`` accounts for either factor being enrolled.
     ``totp_reenrolment_recommended`` (BACKLOG #3422, defaulted for the same reason) says the TOTP
-    enrolment was made with parameters other than this release's default, so the holder should be
-    offered a fresh one."""
+    enrolment was made with parameters other than this release's default, or holds a secret no code
+    is computed from (BACKLOG #5340), so the holder should be offered a fresh one. The cell is read
+    for it only when this release compiles in a set other than its default, so otherwise it is
+    false whatever the cell holds."""
 
     enabled: bool
     enrolled_at: float | None = None

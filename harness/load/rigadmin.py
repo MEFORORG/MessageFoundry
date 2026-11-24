@@ -282,9 +282,10 @@ def rig_admin() -> RigAdmin:
 # --- the second factor -------------------------------------------------------
 
 
-#: The shortest key the rig takes: 32 base32 characters, which decode to 20 bytes, the 160 bits
-#: RFC 4226 recommends and the engine's own enrolment floor (BACKLOG #5340). The shipped enrolment
-#: draws exactly that. Checked here too, so the rig refuses a short key by name.
+#: The shortest key the rig takes: the engine's floor, ``totp._MIN_SECRET_BYTES``, in base32
+#: characters (BACKLOG #5340), written out because this module imports nothing from the engine at
+#: module level. The engine's own code computation refuses a shorter key as well, so this is not
+#: the control; it only lets the refusal state the length.
 _MIN_KEY_CHARS = 32
 
 #: How far from each edge of its TOTP step the rig sends a code. The engine judges a code against
@@ -321,7 +322,7 @@ def _check_key(key: str) -> None:
         raise refusal
     try:
         totp.totp(key, now=0.0)  # the engine's own base32 read
-    except ValueError:  # binascii.Error, the engine's base32 refusal, is a ValueError
+    except ValueError:  # totp.RefusedTotpSecret, the engine's short or non-base32 refusal
         raise refusal from None
 
 
