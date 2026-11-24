@@ -76,20 +76,28 @@ class _Probe:
                 self.running -= 1
                 self.finished += 1
 
-    async def finish_hung(self) -> None:
-        """Let every hung call end, its thread exit, and its completion reach the event loop."""
+    async def wait_started(self, count: int) -> None:
+        """Wait for ``count`` calls to have entered the fake: a thread is scheduled when it is."""
+        for _ in range(2000):
+            if self.started >= count:
+                return
+            await asyncio.sleep(0.005)
+        raise AssertionError(f"only {self.started} of {count} probes started")
+
+    async def finish_hung(self, monitor: IntakeBoundMonitor) -> None:
+        """Let every hung call end, retired threads exit, and each completion reach the loop."""
         self.hang = False
         self.release.set()
         for _ in range(2000):
-            if self.finished == self.started:
+            # At most the current worker stays alive, idle, once its completion has been delivered.
+            alive = {t for t in self.threads if t.daemon and t.is_alive()}
+            worker = getattr(monitor, "_probe_worker", None)
+            settled = worker is None or worker.busy_since is None
+            if self.finished == self.started and len(alive) <= 1 and settled:
                 break
             await asyncio.sleep(0.005)
-        assert self.finished == self.started, "a released probe did not finish"
-        # A pool worker outlives its call by design, so only a dedicated daemon thread is joined.
-        for thread in [t for t in self.threads if t.daemon]:
-            await asyncio.to_thread(thread.join, 10.0)
-            assert not thread.is_alive(), "a released probe thread did not exit"
-        await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("a released probe did not finish and settle")
         self.release = threading.Event()
 
 
@@ -192,12 +200,13 @@ async def test_the_abandoned_count_never_exceeds_the_cap_and_logs_once(
         for _ in range(CAP * 5):
             await monitor.check_once()
             clock.now += _PAST_STUCK_LIMIT
-    await asyncio.sleep(0.05)
+    await probe.wait_started(CAP)
+    await asyncio.sleep(0.05)  # a probe past the cap would have entered the fake by now
     assert probe.started == CAP, "probes must stop starting at the cap"
     assert probe.peak == CAP
     at_cap = [r for r in caplog.records if "stopped starting" in r.getMessage()]
     assert len(at_cap) == 1, "the cap is logged once"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_no_replacement_before_the_stuck_limit(
@@ -209,7 +218,7 @@ async def test_no_replacement_before_the_stuck_limit(
         await monitor.check_once()
     await asyncio.sleep(0.05)
     assert probe.started == 1, "a tick started a probe while the live one was inside its limit"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_a_working_probe_after_a_hang_releases_a_held_pause(
@@ -228,7 +237,7 @@ async def test_a_working_probe_after_a_hang_releases_a_held_pause(
     await monitor.check_once()
     assert probe.running == 1, "control: the first probe is still blocked"
     assert gate.is_open, "a working probe after a hang must release the pause"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_a_working_probe_after_a_hang_pauses_on_a_full_disk(
@@ -244,7 +253,7 @@ async def test_a_working_probe_after_a_hang_pauses_on_a_full_disk(
     await monitor.check_once()
     assert probe.running == 1, "control: the first probe is still blocked"
     assert gate.reasons == {DISK_REASON}, "a filling disk must still raise a pause after a hang"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_probing_resumes_once_a_stuck_thread_exits_at_the_cap(
@@ -263,10 +272,11 @@ async def test_probing_resumes_once_a_stuck_thread_exits_at_the_cap(
     for _ in range(CAP * 3):
         await monitor.check_once()
         clock.now += _PAST_STUCK_LIMIT
+    await probe.wait_started(1 + CAP)
     assert probe.started == 1 + CAP, "control: the monitor reached the cap"
     assert gate.reasons == {DISK_REASON}
 
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", _HEALTHY_TIMEOUT)
     probe.free_mib = HIGH_MIB
     await monitor.check_once()
@@ -281,7 +291,40 @@ async def test_probing_resumes_once_a_stuck_thread_exits_at_the_cap(
             await monitor.check_once()
             clock.now += _PAST_STUCK_LIMIT
     assert len([r for r in caplog.records if "stopped starting" in r.getMessage()]) == 1
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
+
+
+async def test_healthy_ticks_reuse_one_thread(tmp_path: Path, probe: _Probe) -> None:
+    """``Thread.start`` blocks the event loop until the thread runs, so a tick must not pay it."""
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    for _ in range(5):
+        await monitor.check_once()
+    assert probe.started == 5
+    assert len(set(probe.threads)) == 1, "a healthy tick started a new thread"
+    await monitor.stop()
+    for _ in range(2000):
+        if not probe.threads[0].is_alive():
+            break
+        await asyncio.sleep(0.005)
+    assert not probe.threads[0].is_alive(), "stop must retire an idle worker"
+
+
+async def test_a_thread_start_failure_is_an_unmeasured_tick(
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(_: threading.Thread) -> None:
+        raise MemoryError("no thread")
+
+    gate = IntakeGate()
+    monitor = _disk_monitor(tmp_path, gate)
+    probe.free_mib = LOW_MIB
+    await monitor.check_once()
+    await monitor.stop()
+    gate.hold(DISK_REASON)
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+    await monitor.check_once()  # must not raise
+    monkeypatch.undo()
+    assert gate.reasons == {DISK_REASON}, "an unmeasured tick leaves the pause as it was"
 
 
 async def test_a_late_high_reading_does_not_release_a_held_pause(
@@ -296,7 +339,7 @@ async def test_a_late_high_reading_does_not_release_a_held_pause(
     probe.free_mib = HIGH_MIB
     await _tick_into_hang(monitor, probe, monkeypatch)  # leaves a probe that will report HIGH
     probe.free_mib = LOW_MIB
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     assert gate.reasons == {DISK_REASON}, "a result nobody was waiting for released the pause"
 
     await monitor.check_once()
@@ -312,7 +355,7 @@ async def test_a_late_low_reading_does_not_newly_hold(
     probe.free_mib = LOW_MIB
     await _tick_into_hang(monitor, probe, monkeypatch)
     probe.free_mib = HIGH_MIB
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
     assert gate.is_open, "a result nobody was waiting for started a pause"
     await monitor.check_once()
     assert probe.started == 2 and gate.is_open
@@ -336,7 +379,7 @@ async def test_a_late_failure_is_not_logged_as_unretrieved(
         probe.error = late
         with caplog.at_level(logging.INFO, logger=_LOGGER):
             await _tick_into_hang(monitor, probe, monkeypatch)
-            await probe.finish_hung()
+            await probe.finish_hung(monitor)
             gc.collect()  # an unretrieved exception is reported when its future is collected
             await asyncio.sleep(0)
     finally:
@@ -362,7 +405,7 @@ async def test_normal_ticks_measure_each_tick_and_leave_no_thread(
     await monitor.check_once()
     assert gate.is_open
     assert probe.started == 4, "every normal tick takes its own measurement"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 async def test_a_probe_failing_inside_its_own_tick_logs_once_with_its_cause(
@@ -394,7 +437,7 @@ async def test_stop_does_not_wait_for_a_hung_probe(tmp_path: Path, probe: _Probe
     await asyncio.wait_for(monitor.stop(), 2.0)
     assert gate.is_open
     assert probe.running == 1, "control: the probe really was still blocked through the stop"
-    await probe.finish_hung()
+    await probe.finish_hung(monitor)
 
 
 _EXIT_SCRIPT = """
