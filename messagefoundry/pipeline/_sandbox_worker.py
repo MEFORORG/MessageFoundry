@@ -42,6 +42,7 @@ this process never needs its own watchdog.
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import os
 import re
@@ -68,7 +69,7 @@ log = logging.getLogger("messagefoundry.sandbox.worker")
 #: reference, ``TextIOWrapper.__del__`` closes its buffer, and admin config -- which runs after the
 #: rebind -- may assign ``sys.__stdout__``. A one-line ``sys.__stdout__ = None`` in a config module
 #: would otherwise close fd 1 and make the next frame write raise ``ValueError``, which none of
-#: :func:`main`'s ``except (OSError, SandboxError)`` clauses catch.
+#: :func:`main`'s ``OSError`` or ``SandboxError`` clauses catch.
 _ORIGINAL_STDOUT: Any = None
 
 
@@ -505,6 +506,22 @@ def _encode_sends(result: object) -> object:
     return encoded_items if isinstance(result, list) else encoded_items[0]
 
 
+#: The builtin setter of ``__context__``/``__cause__``, read off ``BaseException`` so a Handler's own
+#: ``MemoryError`` subclass cannot run code of its own when :func:`_without_frames` clears them.
+_SET_CONTEXT = BaseException.__dict__["__context__"].__set__
+_SET_CAUSE = BaseException.__dict__["__cause__"].__set__
+
+
+def _without_frames(exc: BaseException) -> BaseException:
+    """``exc`` with its traceback and chain cleared, so it no longer keeps the frames of the call
+    that raised it, or the memory their locals hold, alive (BACKLOG #6813). Through the builtin
+    methods, never the exception's own, which a subclass from user code may override."""
+    BaseException.with_traceback(exc, None)
+    _SET_CONTEXT(exc, None)
+    _SET_CAUSE(exc, None)
+    return exc
+
+
 def _error_text(exc: BaseException) -> str:
     """``Type: message`` for an error reported across the process boundary. A Unicode error's str()
     names the character or byte it failed on (vault BACKLOG #3185), and mode=off renders it from its
@@ -640,8 +657,7 @@ def main() -> int:
             # answered the same way. The error is kept without its traceback or chain, which hold
             # the Handler's frames and the memory their locals hold, and is formatted only once
             # those are gone, below (BACKLOG #6813).
-            resp, oom = None, exc.with_traceback(None)
-            oom.__context__ = oom.__cause__ = None
+            resp, oom = None, _without_frames(exc)
         if broker is not None:
             broker.end()  # before the answer: no lookup frame may follow it
             if broker.broken:
@@ -652,11 +668,14 @@ def main() -> int:
         if resp is None:
             # A call that ran out of memory may leave memory held (a module global, a cache, a
             # fragmented heap), and the next innocent message would pay for it. Answer, then exit so
-            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). The raw frame and the
-            # decoded request are let go first, so the reply is not built beside them (BACKLOG #6813).
+            # the parent starts a fresh worker (vault BACKLOG #3133 part 2). This loop's raw frame and
+            # decoded request are let go first, and a collection frees what only a cycle still held,
+            # so the reply is not built beside them (BACKLOG #6813). That cannot free what the call
+            # left in a global, a cache or a thread, so the reply can still fail for want of memory.
             request_id, phase, name = req.request_id, req.phase, req.name
             del frame, req
             with contextlib.suppress(OSError, SandboxError, MemoryError):
+                gc.collect()
                 _write_frame(
                     stdout,
                     codec.encode_fail(
@@ -670,10 +689,12 @@ def main() -> int:
             return 1  # with no reply sent, the parent reads EOF and reports a crash instead
         try:
             _write_frame(stdout, resp)
-        except OSError:
+        except OSError as exc:
             # Part of the frame may be on the pipe already, so another frame after it would put the
-            # stream out of step with the parent. Exit: the parent fails this message on EOF or on
-            # the torn frame, and starts a fresh worker (BACKLOG #6813).
+            # stream out of step with the parent. Exit without writing one (BACKLOG #6813). The parent
+            # then reads EOF, or the whole frame where the flush at interpreter exit completes it,
+            # and either way starts a fresh worker for the next message.
+            log.error("sandbox worker: could not write a reply frame (%s)", type(exc).__name__)
             return 1
         except SandboxError as exc:
             # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time,
