@@ -14,8 +14,8 @@ test uses; rows with other placeholders, rows no rewrite could act on, and tests
 mark, are not harvested. It also
 checks that each ``DENIED`` row really was an ALLOW there, so a row that pinned nothing new would be
 seen. The differential is skipped in a clone that does not hold ``BASELINE``; on Windows the same
-test still pins each row's verdict at ``PRE_CACHE_HEAD``, the head before the hook cached its git
-calls.
+test still pins the verdicts recorded for ``PRE_CACHE_HEAD``, the head before the hook cached its git
+calls, and its docstring says which rows that covers.
 """
 
 from __future__ import annotations
@@ -331,23 +331,33 @@ def test_each_git_question_is_asked_once_across_the_passes(
     Before Invoke-GitRead cached the hook's git calls, each pass asked git again what an earlier pass
     had asked; the hook's COST note has the times. Git's trace2 log records each process the hook
     starts, with its argument list, so a repeated question shows as a repeated line. At
-    PRE_CACHE_HEAD this command made 108 git calls, one of them 90 times (measured 2026-11-23).
+    PRE_CACHE_HEAD a command of this shape, with one `-C` on every line, made 108 git calls, one of
+    them 90 times (measured 2026-11-23). Each line here names its own directory, so each hoist has a
+    question of its own, and the floor below fails if the hoists stop being judged.
     """
     trace = tmp_path / "trace2.log"
-    lines = [f"echo line{i} $(git -C {{o}} checkout -q y{i})" for i in range(9)]
+    for i in range(9):
+        (rig.outside / f"d{i}").mkdir()
+    lines = [f"echo line{i} $(git -C {{o}}/d{i} checkout -q y{i})" for i in range(9)]
     command = _fmt(rig, "echo start\n" + "\n".join(lines))
     monkeypatch.setenv("GIT_TRACE2", str(trace))
+    # The brief format drops the leading time and file name; the parse below needs neither, but a
+    # global trace2.normalBrief would still change the line, so the environment pins the format.
+    monkeypatch.setenv("GIT_TRACE2_BRIEF", "false")
     result = run_gate(shell(command, rig.wt, "Bash"), rig.repos)
     monkeypatch.delenv("GIT_TRACE2")
+    monkeypatch.delenv("GIT_TRACE2_BRIEF")
     assert result is None, result
     assert trace.exists(), "git wrote no trace2 log, so this measured nothing"
     starts = [
-        line.split(" start ", 1)[1].strip()
+        m.group(1).strip()
         for line in trace.read_text(encoding="utf-8", errors="replace").splitlines()
-        if " start " in line
+        if (m := re.search(r"(?:^|\s)start\s(.*)", line))
     ]
-    assert starts, "the hook started no git process, so this measured nothing"
-    repeated = {argv: n for argv, n in Counter(starts).items() if n > 1}
+    asked = Counter(starts)
+    # Nine lines, each naming its own directory: at least one question per line.
+    assert len(asked) >= 9, f"{len(asked)} distinct git questions: the hoists were not judged"
+    repeated = {argv: n for argv, n in asked.items() if n > 1}
     assert not repeated, f"{len(starts)} git calls, repeated: {repeated}"
 
 
@@ -409,7 +419,7 @@ def test_a_long_command_is_timed_against_the_proof_wait(
     """
     _shape, template, where, tool = case
     payload = shell(_fmt(rig, template), _cwd(rig, where), tool)
-    gates: list[tuple[str, Path | None]] = [("now", None)]
+    gates: list[tuple[str, Path]] = [("now", _REPO_ROOT / _HOOK)]
     # PRE_CACHE_HEAD is a commit of this pull request's branch, so a clone of main may not hold it.
     for commit in (BASELINE, PRE_CACHE_HEAD):
         probe = subprocess.run(
@@ -423,23 +433,21 @@ def test_a_long_command_is_timed_against_the_proof_wait(
             gates.append((commit[:11], hook))
     times = {}
     for label, gate in gates:
+        # Every hook is launched the same way. Not run_gate: its 45 s launch limit is shorter than the
+        # older hooks took on these commands, and a slow gate past it would read as a launch hang. This
+        # also skips run_single's spawn lock, so run this test alone.
         start = time.perf_counter()
-        if gate is None:
-            assert run_gate(payload, rig.repos) is None
-        else:
-            # Not run_gate: its 45 s launch limit is shorter than this hook took on these commands.
-            # It also skips run_single's spawn lock, so run this test alone.
-            done = subprocess.run(
-                ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(gate), "-ReposFile"]
-                + [str(rig.repos)],
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-            )
-            assert done.returncode == 0 and not done.stdout.strip(), (label, done.stderr[:500])
+        done = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(gate), "-ReposFile"]
+            + [str(rig.repos)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
         times[label] = round(time.perf_counter() - start, 2)
+        assert done.returncode == 0 and not done.stdout.strip(), (label, done.stderr[:500])
     print(f"\n{case[0]}: {times}")
     assert times["now"] < 20, times
 
@@ -557,26 +565,17 @@ _REWRITE_TRIGGER = re.compile(r"\$\(|`|\{bt\}|\\git|/git|(?i:git\.exe)|\bGIT\b")
 
 
 #: The rows the harvest adds that the hook denied at PRE_CACHE_HEAD, measured on Windows on 2026-11-23.
-#: With this file's own DENIED, DENIED_WINDOWS and ALREADY_DENIED rows they were that head's whole deny
-#: set over the 124 differential rows then: 69 of them, and the hook with the git cache gave the same
-#: verdict on all 124.
+#: That head denied 69 of the 124 differential rows then, and the hook with the git cache gave the same
+#: verdict on all 124. Six more harvested denies are left out here: they are known false denies that
+#: test_known_false_denies_of_the_added_readings_still_deny pins in the quoted-path file, which moves a
+#: fixed one to its ALLOW controls, so pinning them here as well would fail that fix.
 HARVESTED_DENIED_AT_PRE_CACHE_HEAD: list[tuple[str, str, str]] = [
-    (
-        "(cd {tmp} && ls)\ngit -C '{o}' log $(git -C '{p}' rev-parse HEAD) -- config core.hooksPath x",
-        "outside",
-        "Bash",
-    ),
-    ("(cd {tmp} && ls)\ngit -c a=$(git -C '{p}' log -1) config {k}", "outside", "Bash"),
     ("cd {p}\necho $(date)\ngit -C {o} status ; git reset --hard", "outside", "Bash"),
     ("cd {p} && git -C {o} log $(git config {k})", "outside", "Bash"),
     ("cd {p} && git -C {o} log $(git config {k})", "outside", "PowerShell"),
     ("cd {p} && git -C {o} log $(git reset --hard)", "outside", "PowerShell"),
-    ("echo $(git -C '{p}' log -1) $(/usr/bin/git config {k})", "outside", "Bash"),
     ("git -C '{p}' --git-dir=$(pwd)/.git reset --hard", "outside", "Bash"),
     ("git -C '{p}' -c user.name=$(git log -1 --format=%an) config {k}", "outside", "Bash"),
-    ("git -C '{p}' log $(git rev-parse HEAD) -- config core.hooksPath x", "outside", "Bash"),
-    ("git -C {o} --git-dir=$(echo .git) config {k}", "primary", "Bash"),
-    ("git -C {o} -c user.name=$(git log -1 --format=%an) config {k}", "primary", "Bash"),
     ("git -C {o} stash list ; git.EXE reset --hard", "primary", "Bash"),
     ("git -C {o} status ; git.EXE config {k}", "primary", "Bash"),
     ("git config alias.lg log ; /usr/bin/git -C '{p}' config {k}", "outside", "Bash"),

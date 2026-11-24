@@ -270,7 +270,8 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
     without denying (review round 8e7d5e24 measured `git -C \\?\.\<primary> reset --hard` allowed). Also
     open: under the Bash tool, a DOUBLE-QUOTED device spelling written with escaped backslashes, which the
     gate reads as written while bash unescapes it; and the cost, unbatched: the extra git call per
-    candidate in rules 3c and 3d, and rule 3b's git calls, which run once per path form.
+    candidate in rules 3c and 3d, and rule 3b's git calls, which Invoke-GitRead now asks once per
+    run, or twice where the first answer is a failure.
     #>
     # Read through Test-Path, as in Get-FullPathRaw: a strict-mode caller of this function alone has no flag.
     if ((Test-Path variable:script:PathFormLexical) -and $script:PathFormLexical) {
@@ -1195,7 +1196,7 @@ function Test-TrueSeparatorIn([string]$Text) {
 #     -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o> log $(\git reset --hard)`) only
 #     where two things hold. The word follows the line start, a separator, an opener, `$(` or a
 #     backtick, with only blanks and plain `NAME=value` assignments between. A value holding a blank,
-#     even a quoted one, `=`, a bracket, `;`, `&` or `|` is not plain, so `X=$(pwd) GIT reset --hard`
+#     even a quoted one, `=`, a parenthesis, `;`, `&` or `|` is not plain, so `X=$(pwd) GIT reset --hard`
 #     and `X=a=b GIT reset --hard` keep `GIT`, and so does the outer reading's `X=_ GIT reset --hard`,
 #     which is not respelled. After a keyword or a prefix command, at least `then`, `do`, `!`, `time`,
 #     `env` and `exec`, it is not rewritten (`if true; then GIT reset --hard; fi`). And the walk reads
@@ -1220,8 +1221,8 @@ function Test-TrueSeparatorIn([string]$Text) {
 # COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
 # command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
 # pass re-reads that text and re-asks git about the invocations in it; Invoke-GitRead answers a repeated
-# git question from its cache, so a later pass spawns git only for a question no earlier pass asked. A
-# hoist is not cut down to its own segment: the text before it carries the chdir and the assignments
+# git question from its cache, so a later pass spawns git only for a question no earlier pass asked,
+# or one whose only answer so far is a failure. A hoist is not cut down to its own segment: the text before it carries the chdir and the assignments
 # the hoist exists to read (`cd <p> && echo $(date); git -C <o> log $(git reset --hard)`). Before the
 # cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of
 # 2026-11-23). With it, on one loaded Windows box the same day, the slowest of the five TIMED shapes in
@@ -3271,7 +3272,7 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # and Get-CommonDirAnswer kept their own caches before this one, and still do; this one covers every
 # call, theirs included. The cache is keyed by the argument list, with the one fold below, and it keeps
 # the output lines and the exit code, which it puts back in $LASTEXITCODE, so a caller reads what the
-# git call would have given it. The hook runs
+# git call would have given it; a failure is asked twice before it is kept. The hook runs
 # before the tool call, so nothing it judges has run yet; another process could still change the
 # repository during the run, as it could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3279,8 +3280,9 @@ function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
     # into an empty argument, which git reads differently.
     $GitArgs = @($GitArgs | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
-    # On Windows `C:/x` and `C:\x` name one directory, and rules 3 and 3b ask about both spellings of a
-    # `-C` path, so the key folds the slashes of that one argument. The call itself keeps the spelling.
+    # On Windows `C:/x` and `C:\x` name one directory, and rule 3b's Test-WorktreeHijack asks about a
+    # `-C` path in both spellings, the raw one and the rooted one, so the key folds the slashes of that
+    # one argument. The call itself keeps the spelling.
     $keyArgs = $GitArgs.Clone()
     if ($IsWindows) {
         for ($k = 0; $k -lt $keyArgs.Count - 1; $k++) {
@@ -3288,11 +3290,18 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    if (-not $gitReadCache.ContainsKey($key)) {
+    # A FAILED ANSWER IS ASKED ONCE MORE before it is kept. Uncached, a failed call was asked again by
+    # the next pass, so one spawn that failed under load did not decide the run; a failure is replayed
+    # only once it has failed twice. A question that cannot succeed, such as a `-C` that names no
+    # directory, then costs two spawns rather than one.
+    $hit = $null
+    if (-not ($gitReadCache.TryGetValue($key, [ref]$hit) -and ($hit.Code -eq 0 -or $hit.Fails -ge 2))) {
+        $fails = $(if ($null -ne $hit) { $hit.Fails } else { 0 })
         $out = @(& git @GitArgs 2>$null)
-        $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $LASTEXITCODE }
+        $code = $LASTEXITCODE
+        $hit = [pscustomobject]@{ Out = $out; Code = $code; Fails = $(if ($code -eq 0) { 0 } else { $fails + 1 }) }
+        $gitReadCache[$key] = $hit
     }
-    $hit = $gitReadCache[$key]
     $global:LASTEXITCODE = $hit.Code
     $hit.Out
 }
