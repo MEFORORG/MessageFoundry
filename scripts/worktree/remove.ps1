@@ -148,7 +148,7 @@
 
     -Name KEEPS ITS OLD RULES OTHERWISE. It shares at least the detached HEAD, nested worktree and
     reflog-only refusals above; docs/WORKTREES.md lists what -Name refuses. Tracked changes refuse
-    without -Force, and so do untracked files .gitignore does not cover (BACKLOG #2554 finding 3)
+    without -Force, and so do untracked files no exclude rule covers (BACKLOG #2554 finding 3)
     and files flagged skip-worktree or
     assume-unchanged (BACKLOG #5648), which git status does not read. -Force overrides all three, and the
     run names the flagged files it lets go. Ignored
@@ -1166,13 +1166,15 @@ else {
     # UNTRACKED FILES REFUSE TOO, WITHOUT -Force (BACKLOG #2554 finding 3). This filter used to drop
     # every `??` line, on the reasoning that the .venv and node_modules are expected; but those are
     # gitignored, and this read does not pass --ignored, so they never print here. What a `??` line
-    # names is untracked work .gitignore does not cover, and `worktree remove --force` deleted it.
+    # names is untracked work no exclude rule covers (.gitignore, .git/info/exclude or
+    # core.excludesFile), and `worktree remove --force` deleted it. The untracked mode is named,
+    # because status.showUntrackedFiles=no in any config would otherwise hide every `??` line.
     # Ignored files still go with the tree. -Force overrides, as it does for tracked changes, and
     # -Discard parks them instead.
     # The exit code is read BEFORE the filter: a git that cannot read this worktree (a corrupt index, say)
     # prints nothing, and nothing read as "no changes" here would hand `worktree remove --force` the very
     # edits this guard exists for. -Force does not override it (BACKLOG #1038).
-    $status = @(& git -C $WorktreePath status --porcelain 2>$null)
+    $status = @(& git -C $WorktreePath status --porcelain --untracked-files=normal 2>$null)
     if ($LASTEXITCODE -ne 0) {
         throw "git status failed in '$WorktreePath' (exit $LASTEXITCODE), so its changes are unknown. Nothing was removed."
     }
@@ -1193,7 +1195,7 @@ else {
         if ($untracked -and -not $Discard) {
             $untracked | Select-Object -First 20 | ForEach-Object { Write-Host $_ }
             if (@($untracked).Count -gt 20) { Write-Host "... and $(@($untracked).Count - 20) more" }
-            $why += 'untracked files that .gitignore does not cover'
+            $why += 'untracked files that no exclude rule covers'
         }
         if ($flagged.Count -gt 0 -and -not $Discard) {
             $flagged | Select-Object -First 20 | ForEach-Object { Write-Host "flagged $($_.Substring(2))" }
@@ -1426,8 +1428,9 @@ if ($Discard) {
     }
 }
 
-# -Name passes --force regardless: an untracked .venv makes git consider the worktree non-empty, and
-# that route lets untracked files go.
+# -Name passes --force regardless. The reason this comment gave, that -Name lets untracked files
+# go, stopped holding at BACKLOG #2554 finding 3, which refuses them without -Force; whether -Name
+# should drop the unconditional --force as -Path does is left open on that row.
 # -Path WITHOUT -Force PASSES NO --force, so git makes its own check at the moment it deletes: it
 # refuses a tree with modified or untracked files. That closes the gap between the status read above
 # and the removal, for those two kinds. Git's check does not list ignored files, so the tolerated

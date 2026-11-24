@@ -375,7 +375,7 @@ pwsh -NoProfile -File <that-checkout>\scripts\worktree\remove.ps1 -Name alerts  
 ```
 
 The gitignored `.venv` / `node_modules` are expected and removed automatically. Without `-Force`,
-uncommitted **tracked** changes, untracked files `.gitignore` does not cover (BACKLOG #2554), a file flagged skip-worktree or assume-unchanged, and a git
+uncommitted **tracked** changes, untracked files no exclude rule covers (BACKLOG #2554), a file flagged skip-worktree or assume-unchanged, and a git
 repository inside the tree block removal. With `-Force` the run names the flagged files it lets
 go. `-Discard`
 parks the tracked changes and untracked files instead, as described above. Uncommitted work

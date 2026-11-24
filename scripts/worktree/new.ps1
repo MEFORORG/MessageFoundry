@@ -267,7 +267,7 @@ function Show-NextSteps {
     Write-Host "  #   git -C `"$RepoRoot`" worktree remove --force `"$WorktreePath`""
     # --force because the untracked .venv makes git consider the worktree non-empty. The first form is
     # the one to reach for: it refuses on uncommitted tracked changes and untracked files that
-    # .gitignore does not cover, which the bare git call with --force does not.
+    # no exclude rule covers, which the bare git call with --force does not.
 }
 
 if ($NoInstall) {
