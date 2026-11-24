@@ -90,6 +90,9 @@ _BUILDERS = frozenset(
         # transports/
         "build_strict_opener",  # with no HTTPS handler, urllib supplies a verifying one
         "_no_redirect_opener",
+        # The shared-or-own choice over the two openers (BACKLOG #5527 item 10), so the hops that
+        # call it stay the sites, as for the IdP wrapper below.
+        "_verifying_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
         "_client_ssl_context",

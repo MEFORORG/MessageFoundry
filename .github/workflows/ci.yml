@@ -3324,7 +3324,8 @@ jobs:
           # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
           # diff degrades a path gate into skipping everything while still reading as path-gated,
           # which is the defect this comment exists to stop hiding.
-          changed=$(git diff --name-only "$BASE_SHA...HEAD")
+          # --no-renames: both sides of a rename (BACKLOG #5472)
+          changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
@@ -3399,10 +3400,10 @@ jobs:
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
-          # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
+          # The container image smoke runs on PRs that touch the image, the per-profile locks, pyproject,
           # this workflow, an engine module on the image's start path, or a rig file its steps run.
           # ci/locks/release-tools.lock is in because the image's builder stage installs from it
-          # (BACKLOG #1193), so a bump to it can break the image build.
+          # (BACKLOG #1193), so a bump to it can break the image build. #5472: root COPY sources.
           #
           # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
           # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
@@ -3434,7 +3435,7 @@ jobs:
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
           # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
           # run rate is in that file's docstring.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -3452,7 +3453,8 @@ jobs:
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|\.github/workflows/(ci|release)\.yml)'; then
+          # BACKLOG #5472: tests/test_ci_packaging_gate.py
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|((README|CHANGELOG)\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore|messagefoundry/_vendor/defusedxml/LICENSE)$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -3508,9 +3510,9 @@ jobs:
           # this job now fires on essentially every dependency PR. The hole if it is dropped is concrete
           # rather than theoretical: `uv lock --upgrade-package ruff` edits the lockfiles and does NOT
           # edit pyproject.toml, so a lock-only ruff bump past the cap changes exactly what that test
-          # asserts while matching no other arm here. This lock is listed rather than its siblings
-          # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
-          # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
+          # asserts while matching no other arm here. This lock is listed rather than uv.lock
+          # because it is the file the test READS -- uv.lock moves with it in one re-export, but a
+          # uv.lock edit that was never exported has not changed the guard's subject.
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
           # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
@@ -3519,7 +3521,8 @@ jobs:
           # (BACKLOG #5641): tests/test_new_dependency_check.py, a manifest entry, sweeps every
           # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
           # alone must still run this tier.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # BACKLOG #5472: tests/test_ci_tooling_gate.py
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|(ci|docker|security)/locks/|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.gitleaks\.toml|\.semgrep/|\.codex/|\.pre-commit-config\.yaml|constraints\.lock|requirements\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
@@ -5860,18 +5863,27 @@ jobs:
           # the always-TLS change does not touch it. The /messages read below IS an API call and does;
           # it pins the same minted certificate as the previous step.
           #
-          # THE READ IS SIGNED IN (vault BACKLOG #2719). `rigadmin get` first checks that the service
-          # refuses /messages to a request with no session, then signs in ONCE as the Administrator the
-          # install step provisioned and asks again until a message shows, for up to 10 seconds. One
-          # sign-in, because the engine paces sign-ins per client address. It prints the count. It
-          # exits 1 when the count never reached 1, and 4 when the rig could not sign in or the
-          # service answered /messages with no session.
+          # THE READ IS SIGNED IN (vault BACKLOG #2719). #5473: tests/test_ci_windows_smoke_mllp_read.py
+          $PSNativeCommandUseErrorActionPreference = $false
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
-          python samples\send_mllp.py samples\messages\adt_a01.hl7
-          $total = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout 10 /messages
-          if ($LASTEXITCODE -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
-          if ($LASTEXITCODE -ne 0) { throw "message was not recorded by the engine (messages.total = '$total')" }
-          "messages.total = $total"
+          $ack = @(& python samples\send_mllp.py samples\messages\adt_a01.hl7)
+          $sent = $LASTEXITCODE
+          $ack
+          if ($sent -ne 0) { throw "send_mllp.py exited $sent" }
+          if (-not @($ack | Where-Object { $_ -match '^MSA\|AA\|' })) { throw "no MSA|AA in the ACK" }
+          $base = "/messages?channel_id=IB_Test_ADT"
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $reads = @(, @("processed", 30)) } else { $reads = @(@("processed", 10), @("routed", 10), @("processed", 0)) }
+          foreach ($read in $reads) {
+            $count = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout $read[1] "$base&status=$($read[0])"
+            $rc = $LASTEXITCODE
+            if ($rc -eq 0) { $found = $read[0]; break }
+            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc with no count (4: could not sign in)" }
+          }
+          if (-not $found) {
+            & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert $base
+            throw "no IB_Test_ADT message at the expected status"
+          }
+          "IB_Test_ADT messages $found = $count"
 
       # vault BACKLOG #2701, #2700: install-service.ps1 registers the engine as the Python
       # interpreter with `-I -X disable-remote-debug -m messagefoundry serve ...`, and no longer as

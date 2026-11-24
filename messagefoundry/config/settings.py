@@ -2240,7 +2240,8 @@ class TlsSettings(_Section):
     # secret -- a path, the same status as internal_ca_file. Empty (default) = no outbound
     # revocation checking, which is exactly the gap the #201 RevocationHopGuard refuses on an
     # enforcing hop. Set it and every hop that resolves a trust anchor loads the CRL onto its OWN
-    # context and sets VERIFY_CRL_CHECK_LEAF.
+    # context and sets VERIFY_CRL_CHECK_LEAF, or with crl_check_chain the whole-chain check
+    # (vault BACKLOG #5511; build_verifying_client_context says what that refuses).
     #
     # WARNING, and it is the operational half of this setting: VERIFY_CRL_CHECK_LEAF refuses a peer whose
     # issuer has NO CRL in the store, not only a revoked one. So the file must cover every issuer the
@@ -2251,6 +2252,12 @@ class TlsSettings(_Section):
     # local PKI the org CRL does not cover, and the revocation guard already ALLOWs a loopback hop, so
     # applying a CRL there would break on-box traffic to close a gap the gate does not consider open.
     crl_file: str | None = None
+    # Opt-in (vault BACKLOG #5511): check revocation for every certificate in the peer's chain on
+    # the outbound hops crl_file reaches, not only the leaf, so a revoked intermediate CA refuses
+    # the servers under it. Default False keeps the leaf check. It needs crl_file. A hop on the OS
+    # trust store refuses it at build, for the reason tls_policy.OS_ROOTS_CHAIN_CHECK_REASON gives;
+    # docs/CONFIGURATION.md says what each hop refuses with it on.
+    crl_check_chain: bool = False
 
     @field_validator("crl_file")
     @classmethod
@@ -2275,6 +2282,17 @@ class TlsSettings(_Section):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_chain_requires_crl_file(self) -> TlsSettings:
+        # With no CRL file the chain check has nothing to check against, so the flag would read as a
+        # control that is on while every hop keeps no revocation check at all.
+        if self.crl_check_chain and not self.crl_file:
+            raise ValueError(
+                "[tls].crl_check_chain = true requires [tls].crl_file: the whole-chain check reads "
+                "the CRLs in that file, and with none set no hop would check revocation"
+            )
+        return self
+
     def policy(self) -> TrustAnchorPolicy:
         """The resolved :class:`~messagefoundry.config.tls_policy.TrustAnchorPolicy` threaded onto each
         outbound, and onto each inbound ``Source`` for the FTPS poll (vault BACKLOG #2370), so a
@@ -2287,6 +2305,7 @@ class TlsSettings(_Section):
             internal_ca_file=self.internal_ca_file,
             mode=self.trust_anchor_mode,
             crl_file=self.crl_file,
+            crl_check_chain=self.crl_check_chain,
         )
 
 
@@ -11329,10 +11348,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11341,8 +11360,10 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "
