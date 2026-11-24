@@ -1376,8 +1376,8 @@ def test_provision_admin_keyless_refusal_at_the_write_keys_the_pre_check_from_th
     open does not show the pre-check's open was keyless: under keyed settings it may have bound
     the salt and written the genesis record, and the text names both, once. Under keyless
     settings it names neither (Manager decision on the w10-provision-twin review, finding 3).
-    A keyless-chain refusal is no exception: at the write's open it can follow only a log that
-    lost rows after the pre-check's open, and that open may have been keyed (PR 3221 hold).
+    A keyless-chain refusal is no exception: at the write's open it can follow, at least, a log
+    that lost rows after the pre-check's open, and that open may have been keyed (PR 3221 hold).
 
     Mutation: take the pre-check open's keyedness from the refused class alone, or exempt a
     keyless-chain refusal from the settings."""
