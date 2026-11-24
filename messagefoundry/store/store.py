@@ -3236,7 +3236,7 @@ class UserRecord:
     password_claimed_at: float | None = None
     # THE ENGINE-OWNED NOTIFICATION ADDRESS (BACKLOG #1139, ASVS 6.3.7). Every out-of-band security
     # notice about this account is addressed here, and NOTHING in the directory-sync path writes it:
-    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on every AD/OIDC login --
+    # ``update_user_profile`` -- the one call ``_upsert_ad_user`` makes on an AD/OIDC login --
     # touches ``display_name`` and ``email`` only.
     #
     # WHY THE COLUMN EXISTS AT ALL. Before the split, one nullable column was simultaneously the
@@ -20739,7 +20739,7 @@ class MessageStore:
         audits: Sequence[AuditAppend],
     ) -> None:
         """Write the account's profile fields. **This is the directory-sync write** — ``_upsert_ad_user``
-        calls it on every AD/OIDC login — so it deliberately does NOT name ``notify_email`` (BACKLOG
+        calls it on an AD/OIDC login whose profile changed — so it deliberately does NOT name ``notify_email`` (BACKLOG
         #1139). Adding that column to this SET list would hand the directory the notification target
         back and restore the defect the split removes. ``audits``: see
         ``AuthStore.update_user_profile``."""

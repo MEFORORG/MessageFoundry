@@ -2652,9 +2652,9 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # ``email`` here is the account's PROFILE address, and on an AD/OIDC account the directory's
-    # mirror: ``_upsert_ad_user`` calls this on every directory login whose profile values differ from
-    # the row's (BACKLOG #5653 item 1), so whatever the directory's ``mail`` attribute says wins. IT IS NOT THE NOTIFICATION TARGET, and
-    # this method must never gain that column (BACKLOG #1139) -- handing the directory sync the
+    # mirror: ``_upsert_ad_user`` calls this on every directory login whose profile values differ
+    # from the row's (BACKLOG #5653 item 1), so whatever the directory's ``mail`` attribute says
+    # wins. IT IS NOT THE NOTIFICATION TARGET, and this method must never gain that column (BACKLOG #1139) -- handing the directory sync the
     # notification address back is the whole defect the split removes.
     async def update_user_profile(
         self,

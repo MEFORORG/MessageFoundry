@@ -10,7 +10,7 @@ Three claims, each driven by injecting a write at the moment the race would need
 * a lock that commits after the mint is not cleared by the sign-in's counter reset, which is a
   compare-and-set on the row it judged;
 * two sign-ins of one account that both move its roles do not end each other's new session,
-  because both legs complete in the account's credential queue.
+  because both legs complete in a per-account directory sign-in queue.
 
 Item 1 (S11-33) is here too: a returning sign-in whose directory profile is unchanged writes no
 profile row.

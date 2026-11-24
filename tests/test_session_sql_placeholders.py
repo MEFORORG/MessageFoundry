@@ -563,3 +563,37 @@ async def test_create_session_inserts_only_for_an_account_it_found(
     assert await _CALLS["create_session"](store) is account_found
     inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
     assert len(inserts) == (1 if account_found else 0), seen
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize(
+    ("row", "refused"),
+    [
+        ((None, None, 0, 0, None, None), False),
+        ((None, None, 0, 1, None, None), True),
+        ((None, None, 0, 0, _NOW + 60, None), True),
+        ((None, None, 0, 0, None, _NOW + 60), True),
+        ((None, None, 0, 0, _NOW - 60, _NOW - 60), False),
+    ],
+)
+async def test_create_session_eligibility_reads_each_column_by_position(
+    monkeypatch: pytest.MonkeyPatch, backend: str, row: tuple[Any, ...], refused: bool
+) -> None:
+    """BACKLOG #5653: with ``require_sign_in_eligible`` each server backend refuses a disabled row
+    and one holding either live lock, with no INSERT, and inserts for a lapsed lock. SQL Server
+    reads the columns by position, so each column is set alone."""
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    monkeypatch.setitem(globals(), "_ACCOUNT_ROW", row)
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    issued = await store.create_session(
+        token_hash=_HASH,
+        user_id="u",
+        expires_at=_NOW + 60,
+        now=_NOW,
+        auth_mechanism="kerberos",
+        require_federated_subject=(None, None),
+        require_sign_in_eligible=True,
+    )
+    assert issued is not refused
+    inserts = [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert len(inserts) == (0 if refused else 1), seen

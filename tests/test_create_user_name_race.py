@@ -138,7 +138,7 @@ async def test_two_concurrent_first_sign_ins_of_one_account_make_one_row_and_bot
             return found
 
         monkeypatch.setattr(store, "get_user_by_directory_object_id", held)
-        # The body outside the account's credential queue (BACKLOG #5653): in one process the queue
+        # The body outside the per-account directory sign-in queue (BACKLOG #5653): in one process the queue
         # runs the two in turn, so this drives the race two engine shards still have.
         unqueued = inspect.unwrap(AuthService._complete_ad_login)
         first, second = await asyncio.gather(

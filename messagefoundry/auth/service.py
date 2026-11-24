@@ -2729,37 +2729,38 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
 def _in_principal_credential_queue[**P](
     method: Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]],
 ) -> Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]]:
-    """Run a directory sign-in's completion inside the account's credential queue, the one
-    :meth:`AuthService.login` and :meth:`AuthService.verify_mfa` hold (BACKLOG #5653).
+    """Run a directory sign-in's completion inside a per-account queue (BACKLOG #5653).
 
-    **ONE DIRECTORY SIGN-IN PER ACCOUNT AT A TIME, AS ON THE PASSWORD LEG.** The completion reads
-    the row, writes its roles, scope and profile, revokes the other sessions on a role change,
-    mints, and clears the failure counters. Without the queue two sign-ins of one account could
-    each read the roles before either wrote them; the second then found its target already
-    written, counted the change as its own, and revoked every session of the account, the first
-    sign-in's new one included. In the queue the second reads the roles the first wrote and revokes
-    nothing. A second-step check waits behind it too, so a lock that check sets cannot land between
-    this sign-in's checks and its clear.
+    **ONE DIRECTORY SIGN-IN PER ACCOUNT AT A TIME.** The completion reads the row, writes its
+    roles, scope and profile, revokes the other sessions on a role change, mints, and clears the
+    failure counters. Without the queue two sign-ins of one account could each read the roles
+    before either wrote them; the second then found its target already written, counted the change
+    as its own, and revoked every session of the account, the first sign-in's new one included. In
+    the queue the second reads the roles the first wrote and revokes nothing.
 
-    **WHAT THE QUEUE DOES NOT COVER, AND WHAT DOES.** An administrator's disable, a lock a re-proof
-    sets, and a sign-in on another engine shard take no queue of this process: the queue is per API
-    process, as the password leg's is. For those the store refuses the mint of an account disabled
-    or locked when it inserts (``require_sign_in_eligible``), and the counter clear is a
-    compare-and-set on the row read before the mint, so it never clears a lock that landed after
-    that read. Two sign-ins on different engine shards can still end each other's new session on
-    a role change.
+    **ITS OWN QUEUE, NOT THE PASSWORD LEG'S.** :meth:`AuthService.login` holds the credential queue
+    across each attempt's padded failure window, so a directory sign-in waiting in it could be
+    stalled by anyone sending passwords for that name. The disable and lock states that queue
+    protects on the password leg are held here by the store instead: the mint is refused for an
+    account disabled or locked when it inserts (``require_sign_in_eligible``), and the counter
+    clear is a compare-and-set on the row read before the mint, so it never clears a lock that
+    landed after that read.
 
-    The key is the directory's name for the account, which is what ``verify_mfa`` keys a directory
-    account by once its row is current. A directory-side rename lands on the row under the new
-    name, so the two can name different queues for that one sign-in. A decorator rather than a
-    wrapper method so the completion keeps its one name for every caller; ``__wrapped__`` is the
-    body outside the queue, for a test that drives the cross-process race."""
+    **WHAT THE QUEUE DOES NOT ORDER.** At least an administrator's disable or role change, a lock a
+    re-proof or a second-step check sets, a directory reconciler pass, and a sign-in on another
+    engine shard take no part in it: it is per API process, keyed by name. A reconciler pass or a
+    sign-in on another shard that moves the roles can still end this sign-in's new session.
+
+    The key is the directory's name for the account. A decorator rather than a wrapper method so
+    the completion keeps its one name for every caller; ``__wrapped__`` is the body outside the
+    queue, for a test that drives the cross-process race."""
 
     @wraps(method)
     async def queued(
         self: AuthService, principal: AdPrincipal, /, *args: P.args, **kwargs: P.kwargs
     ) -> LoginOutcome:
-        async with self._account_credential_lock(principal.username):
+        key = _credential_lock_key(principal.username)
+        async with _hold_keyed_lock(self._directory_sign_in_locks, key):
             return await method(self, principal, *args, **kwargs)
 
     return queued
@@ -4483,6 +4484,11 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #5653: one directory sign-in per account name at a time
+        # (:func:`_in_principal_credential_queue`). Its own table, not the credential queue above:
+        # a password attempt holds that one across its padded failure window, so sharing it would
+        # let anyone who knows a directory name stall that user's Windows SSO and OIDC sign-ins.
+        self._directory_sign_in_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #2216: one in-flight ACCOUNT_LOCKED notice per (user id, lock kind), so two locks of
         # one kind landing together read the throttle one after the other and mail once. Its own table:
         # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
@@ -8784,12 +8790,14 @@ class AuthService:
         # ran on reads taken before the role, scope and profile writes, and a disable or a lock can
         # commit during them. ``decided`` is also what the counter clear below compares against,
         # so a lock that lands after this read is never cleared by it.
-        decided = (await self._lookup_user_settled(user.id)).user
-        ineligible = (
-            ACCOUNT_REFUSED
-            if decided is None
-            else _directory_login_refusal(decided, time.time(), federated=federated)
-        )
+        settled = await self._lookup_user_settled(user.id)
+        decided = settled.user
+        if decided is None:
+            # A row gone is named as the insert's refusal names it (BACKLOG #5624); a row still
+            # there that fails its seal is refused as everywhere else in this method.
+            ineligible: str | None = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+        else:
+            ineligible = _directory_login_refusal(decided, time.time(), federated=federated)
         if ineligible is not None or decided is None:
             refused = await self._refuse_directory_row(
                 principal.username,
