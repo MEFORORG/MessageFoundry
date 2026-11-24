@@ -253,13 +253,21 @@ function Show-NextSteps {
         Write-Host "  # When done, from any directory OUTSIDE the worktree:"
         Write-Host ("  #   " + "git -C `"$RepoRoot`" worktree remove `"$WorktreePath`"")
         Write-Host "  # git refuses a dirty tree without --force, but nothing checks whether a session is still in it."
+        # BACKLOG #2554 finding 1: plain git also skips remove.ps1's other refusals (its header lists
+        # them), so the advice names at least three, and says "at least" because there are more.
+        # The prose does not say "remove.ps1": a nested tree has no scripted teardown, and the nested
+        # test in tests/test_worktree_new_cleanup_advice.py asserts the output never names one.
+        Write-Host "  # Nor does git check, at least: a work claim the tree still holds (claim.ps1),"
+        Write-Host "  # a ledger number the tree allocated that is not on origin/main (alloc.ps1), which its removal"
+        Write-Host "  # strands for good, or a detached HEAD whose commit no ref holds. Check those before you run it."
         return
     }
     Write-Host "  # When done, from any directory OUTSIDE the worktree, either of:"
     Write-Host "  #   pwsh -NoProfile -File `"$RepoRoot\scripts\worktree\remove.ps1`" -Name $Name"
     Write-Host "  #   git -C `"$RepoRoot`" worktree remove --force `"$WorktreePath`""
     # --force because the untracked .venv makes git consider the worktree non-empty. The first form is
-    # the one to reach for: it refuses on uncommitted TRACKED changes, which the bare git call does not.
+    # the one to reach for: it refuses on uncommitted tracked changes and untracked files that
+    # .gitignore does not cover, which the bare git call with --force does not.
 }
 
 if ($NoInstall) {
