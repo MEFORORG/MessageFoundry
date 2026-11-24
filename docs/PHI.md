@@ -366,11 +366,9 @@ path** (no separate at-rest tier):
   third-party library loggers too, such as pynetdicom's and pydicom's, and a peer-sent value either
   library refuses or flags as non-conformant must never be logged verbatim (owner ruling 2026-11-03,
   BACKLOG #5081). The DICOM transport applies that rule by default-deny on those libraries' loggers
-  (BACKLOG #6637): a line that matches no pinned template is withheld. In its place the record holds
-  its logger name, its level, a fixed note and, where the record carries an exception, that
-  exception's class name. That exception's traceback is written where it renders, with its frames
-  and class names and each exception's message screened the same way; its notes and group members
-  are not written. A line a library upgrade adds is therefore withheld until it is pinned.
+  (BACKLOG #6637): a line that matches no pinned template is withheld, so a line a library upgrade
+  adds is withheld until it is pinned. What a withheld library line keeps is in
+  [DICOM.md](DICOM.md) section 5.
   The pin tests fail when either library's version changes in the environment they run in,
   which is not a site's own install. What stays, what an operator loses and the limits are in
   [DICOM.md](DICOM.md) section 5. (Pixel data can carry
