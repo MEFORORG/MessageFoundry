@@ -57,6 +57,7 @@ from messagefoundry.store.crypto import (
     BATCH_MAX_CHARS,
     BATCH_MAX_ITEMS,
     NO_STORE_ID,
+    BatchCipher,
     Cipher,
     CipherError,
     CipherUnavailableError,
@@ -585,6 +586,11 @@ async def cipher_call[**P, T](
     return call(*args, **kwargs)
 
 
+def _batch_cost(plaintext: str, aad: bytes | None) -> int:
+    """What ``TransitCipher.encrypt_many`` counts a value as against :data:`BATCH_MAX_CHARS`."""
+    return b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+
+
 async def seal_chunks(
     cipher: Cipher,
     table: str,
@@ -594,18 +600,21 @@ async def seal_chunks(
     aad_cols: tuple[str, ...],
     aad_of: Callable[[Any], bytes] | None = None,
 ) -> AsyncIterator[tuple[Sequence[Any], list[str]]]:
-    """Yield ``(chunk, sealed)``: each chunk of ``rows`` with every row's ``v`` sealed under its
-    cell AAD, in row order. The at-open seal's page (BACKLOG #6706), shared by the three stores'
-    ``_seal_surface``, which write each chunk before the next is sealed.
+    """Yield ``(chunk, sealed)``: each chunk of ``rows`` with every row's ``v`` encrypted under its
+    cell AAD, in row order. "Seal" here is the at-rest cell encryption (``mfenc:``), not this
+    module's row seal. The three stores' at-open ``_seal_surface`` share it (BACKLOG #6706). Each
+    writes a chunk's rows before the next chunk is encrypted.
 
     The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
-    :func:`cell_aad` over ``aad_cols``. A chunk is cut at :data:`BATCH_MAX_ITEMS` values and
-    :data:`BATCH_MAX_CHARS` of base64, the cost ``TransitCipher.encrypt_many`` cuts its requests
-    by, so a batching Transit cipher seals one chunk in one request, and a value over the character
-    bound is a chunk of its own. Each chunk is one :func:`cipher_call` of :func:`encrypt_many`:
-    while the cipher batches, a cancelled seal leaves at most one request's values running on in
-    the Transit pool. Once it sends values alone, one chunk is up to :data:`BATCH_MAX_ITEMS`
-    requests. Any failure raises, as :func:`encrypt_many` does."""
+    :func:`cell_aad` over ``aad_cols``. For a :class:`BatchCipher`, a chunk is cut at
+    :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64. That is the cost
+    ``TransitCipher.encrypt_many`` cuts its requests by, so while it batches one chunk is one
+    request. A cancelled seal then leaves at most that request's values running on in the Transit
+    pool. A value over the character bound is a chunk of its own. Once a Transit cipher sends values
+    alone, one chunk can still be up to :data:`BATCH_MAX_ITEMS` requests. Any other cipher gets one
+    value per chunk, so each call is followed by its write and no sizing copy of the plaintext is
+    made. Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as
+    that does."""
     items = [
         (
             r["v"],
@@ -613,20 +622,20 @@ async def seal_chunks(
         )
         for r in rows
     ]
-    first = True
+    batching = isinstance(cipher, BatchCipher)
     start = 0
     while start < len(items):
-        end, size = start, 0
-        while end < len(items) and end - start < BATCH_MAX_ITEMS:
-            plaintext, aad = items[end]
-            cost = b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
-            if end > start and size + cost > BATCH_MAX_CHARS:
-                break
-            size += cost
-            end += 1
-        if not first:
+        end = start + 1
+        if batching:
+            size = _batch_cost(*items[start])
+            while end < len(items) and end - start < BATCH_MAX_ITEMS:
+                cost = _batch_cost(*items[end])
+                if size + cost > BATCH_MAX_CHARS:
+                    break
+                size += cost
+                end += 1
+        if start:
             await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
-        first = False
         yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])
         start = end
 

@@ -3,7 +3,7 @@
 """The PostgreSQL and SQL Server at-open seal opens many cells per Transit request (vault BACKLOG
 #6706).
 
-The SQLite seal already sends each page through ``encrypt_many`` (``test_transit_batch.py``). The two
+All three stores' seals now encrypt each page in chunks through ``row_seal.seal_chunks``. The two
 server ``_seal_surface`` sweeps sealed each cell with its own ``cipher.encrypt``, so under
 ``vault_transit`` a surface of N legacy values cost N Transit requests. These tests drive the real
 ``_seal_surface`` of each server store against an in-memory stand-in for its connection, so no
@@ -12,6 +12,7 @@ server is needed, and count requests against the batch-answering fake Transit. S
 
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,7 +22,8 @@ import pytest
 pytest.importorskip("requests", reason="Transit batch tests need the [vault] extra")
 pytest.importorskip("hvac", reason="Transit batch tests need the [vault] extra")
 
-from messagefoundry.store.crypto import BATCH_MAX_ITEMS, cell_aad
+from messagefoundry.store import row_seal
+from messagefoundry.store.crypto import BATCH_MAX_ITEMS, AesGcmCipher, cell_aad
 from messagefoundry.store.postgres import PostgresStore
 from messagefoundry.store.row_seal import seal_chunks
 from messagefoundry.store.sqlserver import SqlServerStore
@@ -275,3 +277,74 @@ async def test_chunks_cost_no_more_transit_requests_than_one_call_over_the_page(
     chunks = await _chunks(_cipher(chunked), rows)
     assert sum(n for n, _ in chunks) == len(rows)
     assert chunked.encrypt_requests == whole.encrypt_requests == len(chunks)
+
+
+class _SingleValueCipher:
+    """A cipher with no batch path, logging each encrypt into a log the writes share."""
+
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        self.log.append("encrypt")
+        return f"mfenc:{plaintext}"
+
+    def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+        raise AssertionError("unused")
+
+
+class _LoggedPgConn(_PgConn):
+    def __init__(self, rows: list[dict[str, Any]], log: list[str]) -> None:
+        super().__init__(rows)
+        self.log = log
+
+    async def execute(self, sql: str, value: str, namespace: str, key: str) -> None:
+        self.log.append("write")
+        await super().execute(sql, value, namespace, key)
+
+
+class _LoggedMssqlCursor(_MssqlCursor):
+    def __init__(self, rows: list[dict[str, Any]], log: list[str]) -> None:
+        super().__init__(rows)
+        self.log = log
+
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        if sql.startswith("UPDATE"):
+            self.log.append("write")
+        await super().execute(sql, params)
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_single_value_cipher_writes_each_value_before_the_next_call(backend: str) -> None:
+    """A cipher that sends values one at a time gets one value per chunk, so the seal's
+    transaction is never idle for more than one call, as before batching."""
+    log: list[str] = []
+    store: PostgresStore | SqlServerStore
+    if backend == "postgres":
+        conn = _LoggedPgConn(_legacy_rows(), log)
+        store = _pg_store(conn, _BatchTransit())
+    else:
+        cur = _LoggedMssqlCursor(_legacy_rows(), log)
+        store = _mssql_store(cur, _BatchTransit())
+    store._cipher = _SingleValueCipher(log)  # type: ignore[assignment]
+    sealed = await store._seal_surface("state", "value", _LIKE, aad_cols=("namespace", "key"))
+    assert sealed == _ROWS
+    assert log == ["encrypt", "write"] * _ROWS
+
+
+async def test_an_aes_gcm_page_makes_no_sizing_copy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a batch cipher is cut by size, so no unwiped UTF-8 copy of an AES-GCM plaintext is
+    made to measure it."""
+    sized: list[object] = []
+
+    def counted(*args: Any) -> int:
+        sized.append(args)
+        return 0
+
+    for name in ("b64_chars", "batch_chars", "_batch_cost"):
+        monkeypatch.setattr(row_seal, name, counted, raising=False)
+    cipher = AesGcmCipher(bytearray(os.urandom(32)), write_v2=True)
+    rows = _pending(_legacy_rows(), _ROWS)
+    chunks = await _chunks(cipher, rows)
+    assert sized == []
+    assert sum(n for n, _ in chunks) == _ROWS
