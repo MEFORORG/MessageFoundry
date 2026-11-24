@@ -566,7 +566,7 @@ SITES: dict[str, Site] = {
         1, REVIEWED, "The guard itself: it resolves the candidate to check its parent."
     ),
     "messagefoundry/config/codeset_edit.py::rename_code_set": Site(
-        1,
+        3,
         GUARDED,
         _CODESET_NAME,
         "messagefoundry/config/codeset_edit.py::_validate_name",
@@ -723,6 +723,15 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/log_spool.py::LogSpool.open": Site(
         1, INTERNAL, "A fixed lock name in the spool directory."
+    ),
+    "messagefoundry/parsing/x12/_deps.py::_read_map_segment_ids": Site(
+        2,
+        INTERNAL,
+        "The fixed index name, and map names read from that index inside the installed pyx12 "
+        "package, each refused unless a bare file name; no interchange value reaches either.",
+    ),
+    "messagefoundry/parsing/x12/_deps.py::load_x12_map_segment_ids": Site(
+        1, INTERNAL, "The fixed name map under the installed pyx12 package."
     ),
     "messagefoundry/parsing/xml/schema.py::_bundled_root": Site(
         1, INTERNAL, "A fixed name, schemas, beside the installed xmlschema package's own file."
@@ -1055,18 +1064,18 @@ SITES: dict[str, Site] = {
     "messagefoundry/transports/remotefile.py::RemoteFileSource._after_processing": Site(
         1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
-        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
-    ),
-    "messagefoundry/transports/remotefile.py::RemoteFileSource._poll_once": Site(
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._examine": Site(
         1,
         GUARDED,
         _LISTING,
         "messagefoundry/transports/remotefile.py::_is_contained_name",
         called=True,
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._file_key_forms": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
+    ),
+    "messagefoundry/transports/remotefile.py::RemoteFileSource._move": Site(
+        1, GUARDED, _LISTING, "messagefoundry/transports/remotefile.py::_is_contained_name"
     ),
     "messagefoundry/transports/remotefile.py::_FtpClient._list": Site(
         1,
