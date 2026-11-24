@@ -1164,8 +1164,10 @@ else {
     # commits -- `status --porcelain` is empty for a clean worktree holding them; -DeleteBranch's own
     # containment check below is what covers those.
     # UNTRACKED FILES REFUSE TOO, WITHOUT -Force (BACKLOG #2554 finding 3). This filter used to drop
-    # every `??` line, on the reasoning that the .venv and node_modules are expected; but those are
-    # gitignored, and this read does not pass --ignored, so they never print here. What a `??` line
+    # every `??` line, on the reasoning that the .venv and node_modules are expected; but this
+    # repository ignores a .venv directory and ide/node_modules, and this read does not pass
+    # --ignored, so those do not print here. A .venv that is a link, or a node_modules no rule
+    # ignores, does print, and now refuses without -Force. What a `??` line
     # names is untracked work no exclude rule covers (.gitignore, .git/info/exclude or
     # core.excludesFile), and `worktree remove --force` deleted it. The untracked mode is named,
     # because status.showUntrackedFiles=no in any config would otherwise hide every `??` line.

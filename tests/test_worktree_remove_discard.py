@@ -66,8 +66,8 @@ def _show(rig: Rig, rev: str) -> str:
 def test_discard_parks_tracked_and_untracked_work_and_removes_the_tree(
     rig: Rig, route: str
 ) -> None:
-    """The one thing it is for. Without -Discard both kinds of work refuse on both routes (on -Name
-    the untracked file since BACKLOG #2554 finding 3); with it, both land in the parked commit and the tree goes."""
+    """The one thing it is for. Without -Discard the tree refuses on both routes (the tracked edit alone
+    would refuse it, so this does not test the untracked refusal on its own); with it, both land in the parked commit and the tree goes."""
     wt = _sibling(rig, "parked")
     tip = _git(wt, "rev-parse", "HEAD").strip()
     (wt / "seed.txt").write_text("tracked edit\n", encoding="utf-8")
