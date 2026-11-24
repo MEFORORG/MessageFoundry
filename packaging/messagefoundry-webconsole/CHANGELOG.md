@@ -149,9 +149,9 @@ this line.**
   rows that name no channel with `"operation"` in their detail (`connection_control` or
   `connection_purge`). A row the engine writes for a well-formed name it refuses names that
   channel and carries no operation. A bulk
-  selection whose name fails the connection-name rule is handed to the engine's helper, which
-  writes no channel for it and marks it `"malformed_name": true`, so it is told apart from the
-  confirm page's refusal. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
+  selection whose name fails the connection-name rule is audited with an empty name in place of
+  the caller's text, which the engine's helper writes as no channel and marks
+  `"malformed_name": true`, so it is told apart from the confirm page's refusal. A failed write still lets the batch go on. Needs an engine whose `audit_channel_denied` takes
   `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
   carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
   digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
