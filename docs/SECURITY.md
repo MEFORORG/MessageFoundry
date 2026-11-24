@@ -7729,6 +7729,7 @@ still writes every lock row (ADR 0197 AC-10), and an Administrator reads them al
 | `auth.directory_login_locked` | a Kerberos or OIDC sign-in refused by a live lock, with any `callback_floor_exempt_amr` marker it carries (BACKLOG #3726) |
 | `auth.admin_unlocked` (the whole row) | its detail records both lock expiries and both cycle counts |
 | `auth.mfa_failed` and `auth.webauthn_failed` with detail `{"reason": "locked"}`, and `auth.login_failed` with detail `{"provider": "ad", "reason": "locked"}` | the lock refusals of the factor legs, which say a lock is live only in their detail; the directory text is no longer written (BACKLOG #3726) and stays hidden |
+| `auth.login_failed` with `provider: local` and reason `session_mint_contended`, each exact detail `audit_visibility.LOCAL_MINT_CONTENDED_DETAILS` names | a local sign-in whose session insert met contention on every attempt; only a right password reaches that insert, so the row says the password was right (BACKLOG #5653). The directory leg's contended rows are not hidden |
 
 In their place, every refused sign-in on an existing, enabled local account that reaches the engine
 writes one `auth.login_failed` row with reason `bad_credentials` (plus `combined: true` for a
@@ -7736,11 +7737,16 @@ combined sign-in), whether a wrong credential or a live lock refused it. A sign-
 sign-in length bounds never reaches the engine and writes no row: the JSON route's 422, and the
 console refusal [Off-loopback browser console](#off-loopback-browser-console-l5b-adr-0068-8)
 describes, which measures the authenticator code with surrounding space stripped, so a padded code
-within the bound does reach the engine (BACKLOG #5397). Two refusals keep their own rows: an unknown or
+within the bound does reach the engine (BACKLOG #5397). At least three refusals keep their own rows: an unknown or
 disabled name (`reason: unknown_or_disabled`, also written for an account deleted before the
 sign-in's session was written, BACKLOG #2733; a directory sign-in whose row is gone at its session
-insert writes `reason: account_deleted`, BACKLOG #5624), and a right password on an expired temporary
-credential (`auth.temp_password_expired`). That action also records a session ended because its
+insert writes `reason: account_deleted`, BACKLOG #5624), a right password on an expired temporary
+credential (`auth.temp_password_expired`), and a right password whose session insert met contention
+on every attempt (`reason: session_mint_contended`, BACKLOG #5653), which the table above hides
+from a reader without `users:manage`. Such a sign-in first writes the same `bad_credentials` row a
+wrong password writes, byte for byte, as a refusal by a lock does, so that reader sees one row
+whichever it was; an administrator reads both rows. The sign-in burst signal counts such a
+sign-in once. The `auth.temp_password_expired` action also records a session ended because its
 temporary credential lapsed, with at least these `at` values: `"session"` with no sign-in attempt
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant

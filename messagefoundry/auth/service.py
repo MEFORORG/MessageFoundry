@@ -42,9 +42,9 @@ from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from functools import cache, partial
+from functools import cache, partial, wraps
 from types import MappingProxyType
-from typing import Any, Final, Literal, NamedTuple, NoReturn, TypeVar
+from typing import Any, Concatenate, Final, Literal, NamedTuple, NoReturn, TypeVar
 from uuid import uuid4
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS, write_audit_soft
@@ -217,6 +217,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     RevokeResult,
     RoleRow,
+    SessionMintContended,
     SessionRecord,
     TotpState,
     UnknownRoleError,
@@ -1193,6 +1194,14 @@ DIRECTORY_OBJECT_ID_MISSING = "directory_object_id_missing"
 #: during the role sync, can be refused there first, as ``account_refused``.
 ACCOUNT_DELETED = "account_deleted"
 
+#: The closed-set reason a directory sign-in is refused with when the store refused its session
+#: insert and the read after that refusal cannot name why (BACKLOG #5653): the row then reads
+#: enabled, unlocked and bound as the insert required, or could not be read. The account changed
+#: between the check and the insert (a lock that lapsed by the read, or a binding moved and moved
+#: back), and nothing read afterwards says how, so neither a lock nor a binding change is claimed.
+#: Absent from the browser layer's code map, so it shows as generic there.
+ACCOUNT_STATE_CHANGED_AT_INSERT = "account_state_changed_at_insert"
+
 #: The closed-set reason a directory answer is refused with when it names another directory object
 #: than the row's own (BACKLOG #1471 at sign-in, #2027 at the step-up re-bind).
 DIRECTORY_IDENTITY_CONFLICT = "directory_identity_conflict"
@@ -1213,6 +1222,18 @@ DIRECTORY_LOCKED = "locked"
 #: this sign-in's directory-derived one (vault BACKLOG #3085). The sign-in is refused, not the role
 #: write: whatever the other writer left stands, and nothing is written over it.
 ROLE_SYNC_CONTENDED = "role_sync_contended"
+
+#: The closed-set reason a sign-in fails with when its session insert met contention on every
+#: bounded attempt, a busy SQLite database or a session epoch a revoke kept raising, and wrote
+#: nothing (BACKLOG #5653; :class:`~messagefoundry.store.SessionMintContended`). The account did
+#: not refuse it, so it is neither an invalid credential nor a binding or eligibility refusal:
+#: the credential was proved, and the caller may try again. The row's ``contention`` field names
+#: which cause. Absent from the browser layer's code map, so it shows as generic there.
+SESSION_MINT_CONTENDED = "session_mint_contended"
+
+#: ``LoginOutcome.error`` for a sign-in that failed on :data:`SESSION_MINT_CONTENDED`: a temporary
+#: server-side failure, never ``invalid credentials``.
+_SIGN_IN_UNAVAILABLE = "sign-in temporarily unavailable"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -1987,7 +2008,10 @@ class _BindingChangedMidLogin(Exception):
     "returns the token". The store's one ``False`` does not say which cause it was, so
     :meth:`AuthService._issue_session` reads the account once more to tell them apart. An id that
     names no row then was deleted: no later write brings it back. An id that names a row was refused
-    for its binding, because the guarded insert refuses a present row only on its pair.
+    for its binding, or, on an insert that also passed ``require_sign_in_eligible`` (the directory
+    leg, BACKLOG #5653), because the row was disabled or locked at the insert. ``account_deleted``
+    is ``False`` for both; :meth:`AuthService._complete_ad_login` reads the row once more to name
+    which.
     """
 
     def __init__(self, account_deleted: bool = False) -> None:
@@ -2526,12 +2550,15 @@ async def _write_through_cancellation(
     task.result()
 
 
-def _local_refusal_detail(reason: str, *, combined: bool) -> str:
+def _local_refusal_detail(
+    reason: str, *, combined: bool, extra: Mapping[str, object] | None = None
+) -> str:
     """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
 
     The one builder for both the verified refusal and the refusal by a lock, so the row a reader
-    without ``users:manage`` sees cannot differ between them by a key, a value or their order."""
-    detail: dict[str, Any] = {"provider": "local", "reason": reason}
+    without ``users:manage`` sees cannot differ between them by a key, a value or their order.
+    ``extra`` adds fields only a contended insert writes (BACKLOG #5653); the others pass none."""
+    detail: dict[str, Any] = {**(extra or {}), "provider": "local", "reason": reason}
     if combined:
         detail["combined"] = True
     return _json(detail)
@@ -2724,6 +2751,52 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     if not federated and _holds_federated_binding(user):
         return FEDERATED_SIGN_IN_REQUIRED
     return None
+
+
+def _in_directory_sign_in_queue[**P](
+    method: Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]],
+) -> Callable[Concatenate[AuthService, AdPrincipal, P], Awaitable[LoginOutcome]]:
+    """Run a directory sign-in's completion inside a per-account queue (BACKLOG #5653).
+
+    **ONE DIRECTORY SIGN-IN PER ACCOUNT AT A TIME.** The completion reads the row, writes its
+    roles, scope and profile, revokes the other sessions on a role change, mints, and clears the
+    failure counters. Without the queue two sign-ins of one account could each read the roles
+    before either wrote them; the second then found its target already written, counted the change
+    as its own, and revoked every session of the account, the first sign-in's new one included. In
+    the queue the second reads the roles the first wrote and revokes nothing.
+
+    **ITS OWN QUEUE, NOT THE PASSWORD LEG'S.** :meth:`AuthService.login` holds the credential queue
+    across each attempt's padded failure window, so a directory sign-in waiting in it could be
+    stalled by anyone sending passwords for that name. That queue orders only concurrent sign-in
+    attempts (``login`` and ``verify_mfa``); an administrator's disable never takes it. Here the
+    disable and lock states are held by the store guard alone: the mint is refused for an account
+    disabled or locked when it inserts (``require_sign_in_eligible``), and the counter clear is a
+    compare-and-set on the row read before the mint, so it never clears a lock that landed after
+    that read.
+
+    **WHAT THE QUEUE DOES NOT ORDER.** At least an administrator's disable or role change, a lock a
+    re-proof or a second-step check sets, a directory reconciler pass, and a sign-in on another
+    engine shard take no part in it: it is per API process, keyed by the account's directory
+    object id (by name only for a principal that carries none). A reconciler pass or a
+    sign-in on another shard that moves the roles can still end this sign-in's new session.
+
+    The key is the account's directory object id. A decorator rather than a wrapper method so
+    the completion keeps its one name for every caller; ``__wrapped__`` is the body outside the
+    queue, for a test that drives the cross-process race."""
+
+    @wraps(method)
+    async def queued(
+        self: AuthService, principal: AdPrincipal, /, *args: P.args, **kwargs: P.kwargs
+    ) -> LoginOutcome:
+        # The directory's immutable id where the principal carries one, so a sign-in under an
+        # old name and one under a renamed one queue together; the name only where it does not,
+        # which the completion refuses anyway (BACKLOG #2027).
+        oid = principal.directory_object_id
+        key = f"id\x00{oid}" if oid else f"name\x00{_credential_lock_key(principal.username)}"
+        async with _hold_keyed_lock(self._directory_sign_in_locks, key):
+            return await method(self, principal, *args, **kwargs)
+
+    return queued
 
 
 @dataclass(frozen=True)
@@ -4486,6 +4559,12 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
+        # BACKLOG #5653: one directory sign-in per account at a time, keyed by its directory
+        # object id, by name only where the principal carries none
+        # (:func:`_in_directory_sign_in_queue`). Its own table, not the credential queue above:
+        # a password attempt holds that one across its padded failure window, so sharing it would
+        # let anyone who knows a directory name stall that user's Windows SSO and OIDC sign-ins.
+        self._directory_sign_in_locks: dict[str, _KeyedLock] = {}
         # BACKLOG #2216: one in-flight ACCOUNT_LOCKED notice per (user id, lock kind), so two locks of
         # one kind landing together read the throttle one after the other and mail once. Its own table:
         # the credential queue above is held across a sign-in's pad, and the notice runs off it. Per
@@ -6541,6 +6620,38 @@ class AuthService:
             # minted. The answer, and its deferred row, are an unknown account's.
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt and wrote nothing. The
+            # password was right and the account is there, so this is neither an unknown account
+            # nor a wrong credential, and nothing is charged to the lockout.
+            cause = contended.cause
+
+            # As for a refusal by a lock (owner ruling 2026-09-28, BACKLOG #1131): first the row
+            # every reader sees, byte-identical to a wrong credential's, then the true row only
+            # ``users:manage`` reads. Only a right password reaches this insert, so without the
+            # first a reader without ``users:manage`` would see a missing row where a wrong
+            # password leaves one. The first is exactly the row a wrong password for an existing account
+            # writes (:data:`_LOCAL_REFUSAL_REASON`), which is the case a correct-password
+            # contention must be indistinguishable from; the administrator reads the row naming
+            # the cause beside it.
+            async def contended_rows() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(_LOCAL_REFUSAL_REASON, combined=combined),
+                    client=client,
+                )
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(
+                        SESSION_MINT_CONTENDED, combined=combined, extra={"contention": cause}
+                    ),
+                    client=client,
+                )
+
+            await later(contended_rows)
+            return LoginOutcome(ok=False, error=_SIGN_IN_UNAVAILABLE, reason=SESSION_MINT_CONTENDED)
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
@@ -8444,6 +8555,7 @@ class AuthService:
             return None
         return set(stored.user.role_ids) == set(role_ids)
 
+    @_in_directory_sign_in_queue
     async def _complete_ad_login(
         self,
         principal: AdPrincipal,
@@ -8795,6 +8907,36 @@ class AuthService:
         # already mints with seed_reauth=False below, so a NEW verdict is challenged by construction
         # and this leg adds the audit row and the notice.
         address = await self._classify_login_address(user, client)
+        # BACKLOG #5653. THE ROW IS READ AGAIN, AND JUDGED, RIGHT BEFORE THE MINT. The checks above
+        # ran on reads taken before the role, scope and profile writes, and a disable or a lock can
+        # commit during them. ``decided`` is also what the counter clear below compares against,
+        # so a lock that lands after this read is never cleared by it.
+        settled = await self._lookup_user_settled(user.id)
+        decided = settled.user
+        if decided is None:
+            # A row gone is named as the insert's refusal names it (BACKLOG #5624); a row still
+            # there that fails its seal is refused as everywhere else in this method.
+            ineligible: str | None = ACCOUNT_REFUSED if settled.held else ACCOUNT_DELETED
+        else:
+            ineligible = _directory_login_refusal(decided, time.time(), federated=federated)
+        if federated and ineligible == ACCOUNT_DELETED:
+            await self._directory_reject_audit(
+                principal.username, "oidc", ACCOUNT_DELETED, client=client, extra=outcome_extra
+            )
+            return LoginOutcome(
+                ok=False,
+                error="federated sign-in failed",
+                reason=ACCOUNT_DELETED,
+                roles_gained=roles_gained,
+            )
+        if ineligible is not None or decided is None:
+            refused = await self._refuse_directory_row(
+                principal.username,
+                ineligible or ACCOUNT_REFUSED,
+                client=client,
+                extra=outcome_extra,
+            )
+            return replace(refused, roles_gained=roles_gained)
         # ASVS 6.3.4 / 6.8.4: the second-factor grant is the CALLER's per-mechanism decision, not a
         # blanket literal. Kerberos passes False -- a ticket asserts nothing about directory-side
         # strength, so the engine assumes the minimum (BACKLOG #1144); the federated leg passes the
@@ -8836,6 +8978,13 @@ class AuthService:
                 # takes. That also covers a rebind's gap, where the row is unbound between the
                 # clear and the write.
                 require_federated_subject=federated_subject if federated else _UNBOUND,
+                # BACKLOG #5653: the insert also requires the row enabled and unlocked, judged by
+                # the insert's own read under the lock a disable or a lockout takes. Either can
+                # still commit between the re-read above and that read; the insert's read then
+                # sees it and refuses. What the lock closes is the window from that read to the
+                # INSERT: a disable or lockout arriving there waits until the INSERT commits. A
+                # disable's session sweep cannot see a session that does not exist yet.
+                require_sign_in_eligible=True,
                 idp_auth_time=idp_auth_time,
                 supersedes_hash=supersedes_hash,
             )
@@ -8850,13 +8999,51 @@ class AuthService:
             # set, and the set this sign-in first read was a different one, those sessions were
             # ended too, with no role write and no ``auth.ad_roles_resynced`` row of this
             # sign-in's own (``_SignInRoleSync``, vault BACKLOG #3085).
+            # BACKLOG #5653: the store also refuses a row disabled or locked at the insert. The
+            # account is read once more to name that cause. A binding reason is written only when
+            # that read shows the binding moved off what the insert required; a row that reads
+            # eligible and bound as required (a lock that lapsed by the read, say), or that could
+            # not be read, gets the neutral reason, so no binding change is claimed that the read
+            # does not show.
+            now_ineligible: str | None = None
+            binding_moved = False
+            if not changed.account_deleted:
+                try:
+                    again = await self._load_user(user.id)
+                except (*store_call_errors(), *store_connect_errors()) as exc:
+                    if isinstance(exc, AUDIT_WRITE_DEFECTS):
+                        raise
+                    # Only the reason depends on this read; the refusal stands without it.
+                    _log.warning(
+                        "a directory sign-in of account id %r was refused at its session insert, "
+                        "and the account could not be read again to name why (%s)",
+                        user.id,
+                        type(exc).__name__,
+                    )
+                    again = None
+                if again is not None:
+                    # ``federated=True`` here is NOT a claim that this sign-in is federated (on the
+                    # Windows SSO leg it is not). It is passed only because that value skips
+                    # ``_directory_login_refusal``'s one binding check, its last, so the result
+                    # names the disabled and lock states alone; a binding change keeps the reason
+                    # chosen below, and the insert's own guard already judged the binding.
+                    now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
+                    binding_moved = (
+                        (again.oidc_issuer, again.oidc_subject) != federated_subject
+                        if federated
+                        else _holds_federated_binding(again)
+                    )
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
+            elif now_ineligible is not None:
+                reason = now_ineligible
+            elif not binding_moved:
+                reason = ACCOUNT_STATE_CHANGED_AT_INSERT
             elif federated:
                 reason = "federated_subject_unbound"
             else:
                 reason = FEDERATED_SIGN_IN_REQUIRED
-            if not federated:
+            if not federated or now_ineligible is not None:
                 refused = await self._refuse_directory_row(
                     principal.username, reason, client=client, extra=outcome_extra
                 )
@@ -8870,6 +9057,29 @@ class AuthService:
                 reason=reason,
                 roles_gained=roles_gained,
             )
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt (a busy SQLite database, or
+            # a session epoch a revoke kept raising) and wrote nothing. That says nothing about the
+            # account or its binding, so it is audited under its own reason, never as a binding or
+            # eligibility refusal. The role and profile sync above already ran, as on a refusal.
+            contended_extra = {**(outcome_extra or {}), "contention": contended.cause}
+            if federated:
+                await self._directory_reject_audit(
+                    principal.username,
+                    "oidc",
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+                refused = LoginOutcome(ok=False, reason=SESSION_MINT_CONTENDED)
+            else:
+                refused = await self._refuse_directory_row(
+                    principal.username,
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+            return replace(refused, error=_SIGN_IN_UNAVAILABLE, roles_gained=roles_gained)
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
         # Only the federated path passes mech/evidence/outcome_extra, so it alone grows the row.
@@ -8903,14 +9113,28 @@ class AuthService:
             #
             # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
             # and both clear the counter themselves.
-            await self._store.record_login_success(user.id, audits=())
+            #
+            # BACKLOG #5653: a compare-and-set on ``decided``, the row judged eligible before the
+            # mint, as the re-auth leg's clear is (BACKLOG #5900). A lock, a failure or a disable
+            # that commits after that read leaves the counters as that writer left them.
+            cleared = await self._store.record_login_success(
+                user.id, expected=full_authentication_snapshot(decided), audits=()
+            )
+            if cleared != "written":
+                _log.info(
+                    "a directory sign-in of account id %r found the account %s since its check "
+                    "before the mint, so it cleared no lockout state",
+                    user.id,
+                    "missing" if cleared == "gone" else "changed",
+                )
             # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
             # nothing more marks its address known. The audit baseline this replaced counted a
             # directory row that still owed a factor, because that row carries no marker of it.
             # NEW is written too: no directory session is ever seeded, so withholding the write
             # would challenge nothing and would only repeat the notice at every sign-in from an
             # address its owner keeps using. A failed read is no evidence, so it writes nothing.
-            if address is not _LoginAddress.UNEVALUATED_READ_FAILED:
+            # A clear refused above (BACKLOG #5653) is no full authentication either.
+            if cleared == "written" and address is not _LoginAddress.UNEVALUATED_READ_FAILED:
                 await self._mark_login_address_known(user.id, client)
         return LoginOutcome(
             ok=True,
@@ -9184,9 +9408,14 @@ class AuthService:
                         client=client,
                     )
                 )
-            await self._store.update_user_profile(
-                user_id, display_name=display_name, email=email, audits=repoint
-            )
+            # BACKLOG #5653 item 1 (S11-33): a returning sign-in whose directory profile matches the
+            # row writes nothing, rather than re-seal the row with the same two values on every
+            # sign-in. ``existing`` is the row this sign-in read, so a value another writer moved
+            # since is written back on the next sign-in, as the unconditional write would have.
+            if email_changed or display_name != existing.display_name:
+                await self._store.update_user_profile(
+                    user_id, display_name=display_name, email=email, audits=repoint
+                )
             if email_changed:
                 # ADDRESSED TO THE ENGINE-OWNED ``notify_email`` FIRST (BACKLOG #1139, ADR 0182).
                 # This read used to start at ``existing.email``, the profile mirror, which is the one
@@ -12396,9 +12625,13 @@ class AuthService:
         max_expires_at: float | None = None,
         require_federated_subject: tuple[str | None, str | None] | None = None,
         supersedes_hash: str | None = None,
+        require_sign_in_eligible: bool = False,
     ) -> str:
         """Mint a session token and persist the row. Every caller must handle
-        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
+        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too, and
+        :class:`~messagefoundry.store.SessionMintContended`, which the store raises when its insert
+        met contention on every attempt (BACKLOG #5653). That one is not a refusal: the caller
+        fails the sign-in as a temporary failure under :data:`SESSION_MINT_CONTENDED`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new
@@ -12457,14 +12690,20 @@ class AuthService:
             # seal ended the row, yet this method went on to supersede the caller's prior session
             # and hand back a dead token as a success.
             mfa_verified=mfa_verified,
+            # BACKLOG #5653: the directory leg also requires the row enabled and unlocked.
+            require_sign_in_eligible=require_sign_in_eligible,
         )
         if not issued:
             # An unbind or a bind revoked this account's sessions while this login was in flight,
-            # so issuing now would hand back a token the revocation could never have seen; or the
-            # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
-            # nothing to undo. One more read tells the two apart (BACKLOG #5624).
-            # An unguarded insert is refused only for a missing row, so it needs no read.
-            deleted = require_federated_subject is None or not await self._user_id_held(user_id)
+            # so issuing now would hand back a token the revocation could never have seen; or,
+            # under ``require_sign_in_eligible``, the row was disabled or locked at the insert
+            # (BACKLOG #5653); or the account was deleted under it (BACKLOG #2733). Nothing was
+            # written, so there is nothing to undo. One more read tells a deleted row from a
+            # present one (BACKLOG #5624); a present row's cause is the caller's to name.
+            # An insert with neither guard is refused only for a missing row, so it needs no read.
+            deleted = (
+                require_federated_subject is None and not require_sign_in_eligible
+            ) or not await self._user_id_held(user_id)
             raise _BindingChangedMidLogin(account_deleted=deleted)
         if supersedes_hash is not None:
             await self._supersede_session_hash(supersedes_hash, client=client)

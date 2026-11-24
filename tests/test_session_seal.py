@@ -775,7 +775,9 @@ _SEALING_STATEMENTS: dict[str, frozenset[str]] = {
     "postgres.py": frozenset({"_PG_SESSION_INSERT", "_PG_SESSION_RESEAL"}),
     "sqlserver.py": frozenset({"_SESSION_INSERT", "_MSSQL_SESSION_RESEAL"}),
 }
-_SEALING_FUNCTIONS = frozenset({"create_session", "_write_session"})
+#: ``_insert_sealed_session`` is ``create_session``'s locked transaction, handed a row
+#: ``create_session`` already sealed before it took the lock (BACKLOG #5653).
+_SEALING_FUNCTIONS = frozenset({"create_session", "_insert_sealed_session", "_write_session"})
 _WRITE_PREFIXES = ("INSERT INTO SESSIONS", "UPDATE SESSIONS", "DELETE FROM SESSIONS", "MERGE")
 
 
