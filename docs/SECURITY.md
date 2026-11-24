@@ -6749,9 +6749,10 @@ the email channel sends:
   account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
   directory's groups, not that the console played no part: those groups map to roles through the
   group-to-role map an administrator edits. Like the disable notice, it says the sessions already
-  open on the account were ended, which both of its senders do first. An administrator's role
-  change, account disable or MFA reset closes the same way, since each route refuses a
-  self-target (BACKLOG #6034).
+  open on the account were ended, which both of its senders do first. The notice for an
+  administrator's role change, account disable or MFA reset also closes with "If you did not
+  expect this change, contact your MessageFoundry administrator", since each route refuses a
+  self-target (BACKLOG #6034); it does not say that sessions were ended.
   The rename notice, `username_changed`, names the old and the new name, and is sent only when
   the new name was written (BACKLOG #2017). An **unreplaced temporary password** near its deadline
   (ASVS 6.4.5, BACKLOG #2007) sends two reminders, beside the operator's `initial_credential_expiring`
