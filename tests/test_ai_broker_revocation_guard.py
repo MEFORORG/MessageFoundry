@@ -9,8 +9,8 @@ reaches the app serving ``POST /ai/chat``, and the endpoint is not loopback
 (docs/SECURITY-LOOSENING.md states it in full). So an off-box endpoint is refused under an
 enforcing or unknown posture unless that CRL is checked or ``[ai].endpoint_revocation_attested``
 is set with its reason. Since BACKLOG #5527 the broker resolves the instance ``[tls]`` policy, so
-``[tls].internal_ca_file`` under ``augment`` or ``pinned`` and ``[tls].crl_file`` reach its
-opener; the section "the [tls] policy reaches the broker's opener" pins that.
+``[tls].internal_ca_file`` under ``augment`` or ``pinned``, and ``[tls].crl_file`` in any mode,
+reach its opener; the section "the [tls] policy reaches the broker's opener" pins that.
 All endpoints, keys, certificates and CRLs here are synthetic.
 """
 
@@ -61,7 +61,12 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.transports import ai_broker as ai_broker_mod
 from messagefoundry.transports import rest
-from messagefoundry.transports.ai_broker import AiBroker, AiBrokerError, ai_broker_from_settings
+from messagefoundry.transports.ai_broker import (
+    AiBroker,
+    AiBrokerError,
+    AiOpenerSlot,
+    ai_broker_from_settings,
+)
 from messagefoundry.transports.rest import _shared_no_redirect_opener, opener_tls_context
 from tests.test_revocation_guard_remaining_hops import _guard_log
 
@@ -76,14 +81,12 @@ _LOGGER = "messagefoundry.transports.ai_broker"
 
 @pytest.fixture(autouse=True)
 def _fresh_crossings(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Each test starts with no crossing logged, no anchored opener held, no CRL load, refusal or
-    unconfirmed signature recorded, and no process-wide attestation set. Each is restored after
-    the test."""
+    """Each test starts with no crossing logged, no CRL load, refusal or unconfirmed signature
+    recorded, and no process-wide attestation set. Each is restored after the test. An anchored
+    opener is held only in an :class:`AiOpenerSlot` a test makes, so none leaks across tests."""
     # raising=False only so this file fails on its assertions, not in setup, where the set is
     # absent; the once-per-process tests below go red if it is renamed.
     monkeypatch.setattr(ai_broker_mod, "_LOGGED_CROSSINGS", set(), raising=False)
-    # raising=True: a renamed slot must fail here, or held openers would leak across tests.
-    monkeypatch.setattr(ai_broker_mod, "_anchored_opener", None, raising=True)
     # The anchored contexts these tests build are recorded here; other suites reset it the same way.
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary(), raising=True)
     monkeypatch.setattr(loaded_crls, "_REFUSED", {}, raising=True)
@@ -100,6 +103,7 @@ def _broker(
     attested: bool = False,
     reason: str | None = None,
     policy: TrustAnchorPolicy | None = None,
+    slot: AiOpenerSlot | None = None,
 ) -> AiBroker:
     return AiBroker(
         endpoint=endpoint,
@@ -109,6 +113,7 @@ def _broker(
         revocation_attested=attested,
         revocation_attested_reason=reason,
         trust_anchor_policy=policy,
+        opener_slot=slot,
     )
 
 
@@ -786,12 +791,13 @@ def test_a_broker_handed_a_tls_policy_offers_the_crl_lever(ai_log: list[str]) ->
 
 
 def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
-    """The broker is built per request, but its anchored opener is built once for an anchor, so
-    ``crl_reload`` can bring its CRL current and the expiry monitor sees one live copy. A changed
-    policy builds a new one."""
+    """The broker is built per request, but its anchored opener is built once for an anchor in the
+    app's slot, so ``crl_reload`` can bring its CRL current and the expiry monitor sees one live
+    copy. A changed policy builds a new one."""
+    slot = AiOpenerSlot()
     crl = TrustAnchorPolicy(crl_file=pki.crl_file)
-    first = _broker(posture=_ENFORCING, policy=crl)
-    second = _broker(posture=_ENFORCING, policy=crl)
+    first = _broker(posture=_ENFORCING, policy=crl, slot=slot)
+    second = _broker(posture=_ENFORCING, policy=crl, slot=slot)
     assert second._opener is first._opener
     # Held, the context is recorded as a live copy of the CRL, which is what the expiry monitor
     # judges and crl_reload brings current.
@@ -802,9 +808,9 @@ def test_the_anchored_opener_is_held_across_requests(pki: _Pki) -> None:
     handlers = vars(first._opener)["handlers"]
     assert any(isinstance(h, rest._NoRedirectHandler) for h in handlers)
     pinned = TrustAnchorPolicy(internal_ca_file=pki.ca_file, mode="pinned", crl_file=pki.crl_file)
-    third = _broker(posture=_ENFORCING, policy=pinned)
+    third = _broker(posture=_ENFORCING, policy=pinned, slot=slot)
     assert third._opener is not first._opener
-    assert _broker(posture=_ENFORCING, policy=pinned)._opener is third._opener
+    assert _broker(posture=_ENFORCING, policy=pinned, slot=slot)._opener is third._opener
 
 
 def test_a_tls_file_that_cannot_be_loaded_is_the_brokers_own_error(tmp_path: Path) -> None:
@@ -1003,17 +1009,21 @@ async def test_the_posture_entry_claims_no_crl_check_where_crl_file_does_not_rea
         # test_a_direct_create_app_takes_the_tls_section_the_route_hands_the_broker pins.
         # The instance's [tls] does name a CRL: the process environment carries it.
         monkeypatch.setenv("MEFOR_TLS_CRL_FILE", pki.crl_file)
-        # And the process already holds the CRL-checking opener that policy builds for this very
-        # endpoint, so a route that fell back to the environment or reused the held slot would
-        # dial a CRL here.
-        primed = _broker(posture=_ENFORCING, policy=TlsSettings(crl_file=pki.crl_file).policy())
-        assert _context(primed).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
-        assert ai_broker_mod._anchored_opener is not None
         ai = _managed_ai(
             endpoint_revocation_attested=True, endpoint_revocation_attested_reason=_REASON
         )
         app = create_app(engine, ai_settings=ai, allow_no_auth=True)
         assert getattr(app.state, "tls_settings", None) is None
+        # And the app's slot already holds the CRL-checking opener that policy builds for this
+        # very endpoint, so a route that fell back to the environment or reused the held opener
+        # would dial a CRL here.
+        primed = _broker(
+            posture=_ENFORCING,
+            policy=TlsSettings(crl_file=pki.crl_file).policy(),
+            slot=app.state.ai_opener_slot,
+        )
+        assert _context(primed).verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
+        assert app.state.ai_opener_slot._held is not None
     else:
         ai = _managed_ai(
             endpoint="https://127.0.0.1:8443/v1/messages",
