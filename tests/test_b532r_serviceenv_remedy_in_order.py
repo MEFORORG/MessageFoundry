@@ -287,7 +287,7 @@ def _follow_installer_clause(
     # Any wording that adds a line back fails here, each phrasing the clause has used among
     # them (code review round 1 on the repair of that hold).
     assert "entry of its own" not in clause, clause
-    assert not re.search(r"\badd\b.*\bback\b", clause), clause
+    assert not re.search(r"\badd\b[^,;.]*\bback\b", clause), clause
     for where, string in list(registry.entries):
         if (where, string) not in registry.entries:
             continue  # removed already, as a string a value ran on into
@@ -340,7 +340,11 @@ def _follow_installer_clause(
         registry.read_out |= read if every_line else read - set(KEY_CLASS_NAMES)
         # A refused variable whose value it held goes with it: the string before it, when that
         # is the refused name set to nothing that ran on into it.
-        if index and registry.entries[index - 1][1].partition("=")[2] == "":
+        if (
+            index
+            and registry.entries[index - 1][0] == where
+            and registry.entries[index - 1][1].partition("=")[2] == ""
+        ):
             before = registry.entries[index - 1]
             if _names_refused(before[1], refused):
                 del registry.entries[index - 1]
@@ -783,6 +787,18 @@ def test_the_remedy_followed_in_order_keeps_each_value_until_the_step_that_moves
     assert joined == set()
 
 
+def test_the_clause_loses_the_ordinary_lines_of_a_string_it_removes() -> None:
+    """The clause removes its strings whole, so an ordinary line in one is lost, and the
+    remedy says nothing of it (the Lander's hold on PR 3142, comment 7125522135). Pinned so
+    that a change restoring such lines, the open follow-up, turns this test."""
+    entries, runs_on_into, moves, exists = _CASES["ordinary-line-in-a-string-led-by-a-refused-name"]
+    refusal = service_env_refusal(read_service_env_posture(probe=_Probe(entries), environ={}))
+    assert refusal is not None
+    registry = _Registry(list(entries), runs_on_into, directory=exists)
+    assert _walk(refusal, registry, moves) == "ok"
+    assert not any("HTTP_PROXY" in string for _where, string in registry.entries)
+
+
 def test_each_per_case_table_names_only_walk_cases() -> None:
     """A misspelt key in a per-case table would turn its check off unseen (code review round 1
     on the repair of the Lander's hold on PR 3142, comment 7125522135)."""
@@ -819,9 +835,11 @@ def _refused_text_left(
 
 
 #: Secret text a case holds beside the values it moves, by case, which no line the steps leave
-#: may hold: key text the reader reads as part of a directory line's value, which no refused
-#: variable holds, and a line the reader reads as part of a refused value (the Lander's hold
-#: on PR 3142, comment 7125522135).
+#: may hold (the Lander's hold on PR 3142, comment 7125522135). K3 is key text the reader
+#: reads as part of a directory line's value, which no refused variable holds, so only this
+#: table checks it. SEKz=Q the reader reads as part of the store password's value, so the
+#: reader-based check already covers it; the hold names it, and the entry keeps it checked
+#: should the reader read the group otherwise.
 _SECRET_TEXT: dict[str, frozenset[str]] = {
     "below-dir-line-key": frozenset({_KEY_B64_3}),
     "joined-group": frozenset({"SEKz=Q"}),

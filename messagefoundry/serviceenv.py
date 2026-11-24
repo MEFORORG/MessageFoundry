@@ -1513,10 +1513,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # in them to read as the directory, and no line of a refused value they hold is left as
         # an entry of its own. The ordinary lines they hold are lost with them: the clause has
         # the operator read them out but gives them nowhere to go, and says nothing of their
-        # loss. The add-back step this clause carried before put back at least a
-        # store key below a directory line and a line of a joined group's value, so it was
-        # removed (the Lander's hold on PR 3142, comment 7125522135). Restoring those ordinary
-        # lines safely is open work, unfiled.
+        # loss. The per-line restoration this clause carried before, not the directory
+        # add-back step, put back at least a store key below a directory line and a line of a
+        # joined group's value, so it was removed (the Lander's hold on PR 3142, comment
+        # 7125522135). Restoring those ordinary lines safely is open work, unfiled.
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
