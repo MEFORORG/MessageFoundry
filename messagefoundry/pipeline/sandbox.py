@@ -201,9 +201,14 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     reaps: closing a session whose worker is gone, the prior generation's reap at the top of a
     spawn (a worker that died between dispatches on its own), and the reap after a queued EOF from
     a worker that has exited, which only says the peer died, the check after an answer included
-    unless the answer announced the exit (:attr:`MEMORY_CAP`). A worker that exits right after its
-    boot is the exception, recorded as :attr:`EXITED_AFTER_BOOT`, because a
-    feed whose workers keep doing so is a crash loop, not a peer that happened to die.
+    unless the answer announced the exit (:attr:`MEMORY_CAP`). There are at least two exceptions,
+    found by :meth:`SandboxSession._live_worker` before a request is written. A worker spawned in
+    the dispatch that exits before its request is recorded as :attr:`EXITED_AFTER_BOOT`, because
+    a feed whose workers keep doing so is a crash loop, not a peer that happened to die. A worker
+    kept from an earlier dispatch that the check right before the write finds exited, or whose
+    queued EOF it finds, is recorded as :attr:`CRASH`, with its WARNING, unless the worker's
+    response pipe reached EOF before the dispatch's first check ended (vault BACKLOG #3135 step 7;
+    :meth:`SandboxSession._died_before_first_check` says when such a worker is still recorded).
 
     There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
     cap is the bound. A request the codec cannot encode, or one over the frame cap, is refused before a
@@ -665,8 +670,9 @@ _EOF_EXIT_POLL_SECONDS: Final = 0.02
 #: dispatch meets at most a handful of EOFs, so its total wait stays bounded.
 _EOF_EXIT_FLOOR_SECONDS: Final = 0.1
 
-#: How many times :meth:`SandboxSession._live_worker` respawns after a leftover EOF before it
-#: fails the call.
+#: How many workers a dispatch may replace for exiting, or closing their pipe, before its request
+#: before its call fails. The bound is per dispatch, shared by both of its
+#: :meth:`SandboxSession._live_worker` calls, so the call before the write does not restart it.
 _LIVE_WORKER_EOF_RESPAWNS: Final = 2
 
 
@@ -1027,6 +1033,13 @@ class SandboxSession:
         self._stray_retried = False
         self._eof_respawns = 0
         self._dispatch_generation = self._generation
+        # When the current dispatch's first _live_worker call handed out its worker, and when the
+        # current worker's frame reader read EOF on its response pipe (empty until it does; a fresh
+        # list per spawn, so a stale reader's stamp lands in a list nothing reads). Together they
+        # tell the second call whether a kept worker it finds dead died before the first call ended
+        # (see _died_before_first_check).
+        self._first_check_at = float("-inf")
+        self._eof_at: list[float] = []
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -1097,6 +1110,7 @@ class SandboxSession:
         # A fresh response queue per spawn so a prior (killed) worker's trailing EOF can't leak into
         # this generation's reads.
         self._responses = queue.Queue()
+        self._eof_at = []
         self._generation += 1
         # Fixed argv (this interpreter + our own worker module), no shell, no
         # untrusted input in the command line — so B603 does not apply. ``start_new_session`` puts the
@@ -1130,7 +1144,7 @@ class SandboxSession:
         self._threads = [
             threading.Thread(
                 target=self._reader_loop,
-                args=(proc.stdout, self._responses),
+                args=(proc.stdout, self._responses, self._eof_at),
                 name=f"mf-sandbox-frames-{self._inbound}-{gen}",
                 daemon=True,
             ),
@@ -1230,21 +1244,23 @@ class SandboxSession:
             self._snapshot = read_trusted_snapshot(self._config_dir)
         return self._snapshot
 
-    def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
+    def _reader_loop(self, stdout: Any, sink: queue.Queue[Any], eof_at: list[float]) -> None:
         """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see
         :func:`_read_frame_or_oversize`). Runs on a daemon thread; a fresh queue per spawn means a stale
-        reader's writes are harmlessly ignored."""
+        reader's writes are harmlessly ignored. Before it queues :data:`_EOF` it appends the time it
+        read the EOF to ``eof_at``, which :meth:`_died_before_first_check` reads."""
         try:
             while True:
                 body = _read_frame_or_oversize(stdout)
                 if body is None:
-                    sink.put(_EOF)
-                    return
+                    break
                 sink.put(body)
                 if body is _OVERSIZE:
                     return  # the stream is out of step, so nothing after the header is a frame
         except OSError:
-            sink.put(_EOF)
+            pass
+        eof_at.append(time.monotonic())
+        sink.put(_EOF)
 
     def _kill(self, proc: subprocess.Popen[bytes] | None, cause: KillCause, phase: str) -> None:
         """Kill ``proc`` for ``cause``: record the cause, write its WARNING, and reap the tree.
@@ -1451,10 +1467,14 @@ class SandboxSession:
         A worker spawned in this dispatch and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
         check asks the process too, the second call included, and it counts toward the bound. At
-        the second call (``before_write``), a worker kept from an earlier dispatch and found exited
-        died during this dispatch, so it is recorded as :attr:`KillCause.CRASH` and counted, as
-        it would have been had the request been written to it. At the first call such a worker
-        died between dispatches and is replaced with no cause. The check cannot see an exit that
+        the second call (``before_write``), a worker kept from an earlier dispatch and found exited,
+        or whose EOF is queued, is taken to have died during this dispatch, so it is recorded as
+        :attr:`KillCause.CRASH` and counted, as it would have been had the request been written to
+        it, unless :meth:`_died_before_first_check` says its pipe reached EOF before the first call
+        ended. Then, as at the first call, it died between dispatches and is handled as the first
+        call handles such a worker: an exited one is replaced with no cause and not counted, and a
+        queued EOF reaps it with no cause, or as :attr:`KillCause.STDOUT_CLOSED` if it is still
+        running once the grace is spent, and is counted. The check cannot see an exit that
         comes after it, so a worker that exits as its request is written is recorded under another
         cause, such as
         :attr:`KillCause.REQUEST_WRITE` or :attr:`KillCause.CRASH`, and that message's call fails.
@@ -1464,7 +1484,8 @@ class SandboxSession:
         while True:
             if self._proc is None or _has_exited(self._proc):
                 booted = self._generation != self._dispatch_generation
-                if self._proc is not None and (booted or before_write):
+                crashed = before_write and not self._died_before_first_check()
+                if self._proc is not None and (booted or crashed):
                     # Died during this dispatch: a death to record and count, not a silent reap
                     # in _spawn.
                     died = KillCause.EXITED_AFTER_BOOT if booted else KillCause.CRASH
@@ -1473,9 +1494,11 @@ class SandboxSession:
                 self._spawn(phase)
             # Booted in this dispatch, by this call or by the dispatch's first one.
             fresh = self._generation != self._dispatch_generation
-            exited = (
-                KillCause.EXITED_AFTER_BOOT if fresh else KillCause.CRASH if before_write else None
-            )
+            exited: KillCause | None = None
+            if fresh:
+                exited = KillCause.EXITED_AFTER_BOOT
+            elif before_write and not self._died_before_first_check():
+                exited = KillCause.CRASH
             if self._drop_unsolicited(self._proc, "before", phase, exited=exited):
                 if self._stray_retried:
                     raise _unsolicited_error("before")
@@ -1486,9 +1509,24 @@ class SandboxSession:
                 # The queue says nothing about a fresh worker whose exit the reader has not yet
                 # queued as an EOF, so ask the process itself, without reaping it.
                 if not (fresh and _has_exited(proc)):
+                    if not before_write:
+                        self._first_check_at = time.monotonic()
                     return proc
                 self._kill(proc, KillCause.EXITED_AFTER_BOOT, phase)
             self._count_eof_respawn()
+
+    def _died_before_first_check(self) -> bool:
+        """Whether the current worker's frame reader read EOF on its response pipe before this
+        dispatch's first :meth:`_live_worker` call handed the worker out, so that a death the second
+        call finds predates the request's encode. False when no EOF has been read yet, or it was
+        read later.
+
+        The reader stamps the EOF once its read returns, which is after the pipe closed, so a
+        worker that dies while the request is encoded never reads True, and its death is recorded.
+        A worker that died before the first call ended still reads False, and is recorded as a
+        ``CRASH``, when the reader read its EOF only after that call ended, or read none because
+        another holder kept the pipe open, such as a grandchild that inherited fd 1."""
+        return bool(self._eof_at) and self._eof_at[0] < self._first_check_at
 
     def _count_eof_respawn(self) -> None:
         """Count one more worker this dispatch replaced for exiting, or closing its pipe, before its

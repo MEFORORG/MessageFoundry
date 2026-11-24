@@ -1178,8 +1178,8 @@ def test_the_second_check_shares_the_one_retry_a_dispatch_gets(
 
 
 # A Handler that spawns a grandchild the ordinary way, inheriting its standard streams, and reports
-# what the grandchild's fd 0 is. Before vault BACKLOG #3135 step 8 that was the worker's request
-# pipe, through which the grandchild could read a later request's id and forge its answer.
+# whether the grandchild's fd 0 is a pipe. Before vault BACKLOG #3135 step 8 fd 0 was the worker's
+# request pipe, through which the grandchild could read a later request's id and forge its answer.
 _FD0_GRAPH = """
 from messagefoundry import inbound, outbound, router, handler, MLLP, Send
 
@@ -1202,25 +1202,32 @@ def h_fd0(msg):
         "mode = os.fstat(0).st_mode\\n"
         "sys.exit(3 if stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) else 0)\\n"
     )
-    inherited = subprocess.run([sys.executable, "-c", probe], timeout=30).returncode
-    every_fd = subprocess.run(
-        [sys.executable, "-c", probe], timeout=30, close_fds=False
-    ).returncode
+    argv = [sys.executable, "-c", probe]
+    inherited = subprocess.run(argv, timeout=30).returncode
+    every_fd = subprocess.run(argv, timeout=30, close_fds=False).returncode
     # The negative control: the probe must see a pipe it is handed.
-    piped = subprocess.run(
-        [sys.executable, "-c", probe], timeout=30, stdin=subprocess.PIPE
-    ).returncode
+    piped = subprocess.run(argv, timeout=30, stdin=subprocess.PIPE).returncode
     return Send("OB_F", f"{inherited},{every_fd},{piped}")
 """
 
 
-def test_a_process_a_handler_spawns_cannot_read_the_request_pipe(tmp_path: Path) -> None:
-    """Vault BACKLOG #3135 steps 8 and 13: the worker's request pipe is not on fd 0.
+# A sandbox worker boot plus six interpreter starts, each a fresh process: unloaded this took
+# about 14 s on Windows (2026-11-24), and under a loaded runner it has reached the 60 s per-test cap
+# the Ubuntu leg passes with --timeout, which this marker overrides. Each probe keeps its own 30 s
+# subprocess timeout, so 240 s still bounds a hang. Starting with -I -S measured no faster.
+@pytest.mark.timeout(240)
+def test_a_process_a_handler_spawns_does_not_get_the_request_pipe_on_fd_0(tmp_path: Path) -> None:
+    """Vault BACKLOG #3135 steps 8 and 13: a process a Handler spawns finds no pipe on its fd 0.
 
     The worker moves the pipe to a private, non-inheritable descriptor before it reads the boot
     frame, and points fd 0 at the null device, so a process a Handler spawns, with its descriptors
     inherited or not, finds no pipe on fd 0. Exit status 3 means the grandchild's fd 0 was a pipe;
-    the third probe is handed one, to show the probe can see it."""
+    the third probe is handed one, to show the probe can see it.
+
+    This proves only what fd 0 is, not that the grandchild cannot reach the request pipe another
+    way. On Windows, a worker started through a virtual environment's ``python.exe`` launcher
+    holds a second inheritable handle to the pipe, which the ``close_fds=False`` probe inherits
+    while its fd 0 is not the pipe (ADR 0087, the step 8 notes)."""
     (tmp_path / "graph.py").write_text(_FD0_GRAPH, encoding="utf-8")
     registry = load_config(tmp_path)
     session = _session(str(tmp_path), inbound="IB_F")
@@ -1341,6 +1348,53 @@ def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_
         assert KillCause.REQUEST_WRITE not in session.kill_counts
         # It died during this dispatch, so the death is recorded, as a write to it would have been.
         assert session.kill_counts[KillCause.CRASH] == 1
+    finally:
+        session.close()
+
+
+def test_a_kept_worker_already_dying_at_the_first_check_is_not_recorded_as_a_crash(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Vault BACKLOG #3135 step 7: a kept worker that died between dispatches, and was still in its
+    exit tail at the dispatch's first check (not yet a zombie, its EOF not yet queued), is found
+    dead by the second check. Its response pipe closed before the first check ended, so it did not
+    die during this dispatch: it is replaced as the first check replaces such a worker, with no
+    kill recorded and no WARNING, not as a ``CRASH``. The test above is the control: a worker that
+    dies while the request is encoded is still recorded."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        doomed.kill()
+        _wait_exited(doomed)
+        # Hold the EOF the reader queued, and hide the exit from the first check, so the first
+        # check meets the exit tail: a running process with nothing queued.
+        eof = session._responses.get(timeout=10.0)
+        assert eof is sandbox_mod._EOF
+        real_exited = sandbox_mod._has_exited
+        monkeypatch.setattr(sandbox_mod, "_has_exited", lambda proc: False)
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            # The tail ends while the request is encoded: the exit and the EOF become visible.
+            monkeypatch.setattr(sandbox_mod, "_has_exited", real_exited)
+            session._responses.put(eof)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        with caplog.at_level(logging.WARNING, logger=sandbox_mod.log.name):
+            assert (
+                _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+            )
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert not session.kill_counts, session.kill_counts
+        assert session.last_kill_cause is None
+        assert not [r for r in caplog.records if "cause=" in r.getMessage()]
     finally:
         session.close()
 

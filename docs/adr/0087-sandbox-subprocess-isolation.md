@@ -392,9 +392,18 @@ target, no `pickle` import left to mis-suppress:
   >   found there is handled as at `_live_worker`'s check, since it is a second `_live_worker`
   >   call: the worker is dropped and the message is retried on a fresh worker, sharing the one
   >   retry each dispatch gets, so a second stray frame fails the call. A worker found exited
-  >   there, or whose EOF is queued, is replaced before the write. One spawned in the same
-  >   dispatch is recorded as `EXITED_AFTER_BOOT` and counts toward the dispatch's respawn bound;
-  >   one kept from an earlier dispatch is replaced as at the first check.
+  >   there, or whose EOF is queued, is replaced before the write, and the respawn bound is the
+  >   dispatch's, shared by both checks. One spawned in the same dispatch is recorded as
+  >   `EXITED_AFTER_BOOT`, or as `STDOUT_CLOSED` when only its EOF is found and it is still
+  >   running once the EOF grace is spent, and counts toward that bound. One kept from an earlier
+  >   dispatch is recorded the same way with `CRASH` in place of `EXITED_AFTER_BOOT`, writes its
+  >   WARNING, and counts, unless the engine read its EOF before the first check ended. Then it is
+  >   handled as at the first check: found exited, it is replaced with no cause recorded and is not
+  >   counted; found by its EOF, it is reaped with no cause, or recorded as `STDOUT_CLOSED` when it
+  >   is still running once the grace is spent, and counts. So a kept worker that died before the
+  >   first check is still recorded as `CRASH` when the engine read its EOF only after that check
+  >   ended, or read none because another holder, such as a grandchild, kept its response pipe
+  >   open (`_died_before_first_check` in `messagefoundry/pipeline/sandbox.py`).
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
   >   arrives after that call's check before its request is not read by that call.
@@ -457,8 +466,11 @@ target, no `pickle` import left to mis-suppress:
   >   *Note 2026-11-24 (vault BACKLOG #3135 step 7), not the owner's words:* a fix narrowed this
   >   window; the AC-10 amendment's second check, above, says how. A frame that arrives between that
   >   check and the call's answer is still read in the answer slot. The acceptance ran until a fix
-  >   narrows or closes the window, so whether it still covers the window that remains is for the
-  >   owner to rule, and this note does not record it as accepted.
+  >   narrows or closes the window. The owner ruling of 2026-11-24 recorded under the next record
+  >   asked whether this acceptance carries over to what remains after steps 7 and 8, and the owner
+  >   answered *"Carry over; merge"*. This note reads that answer as carrying this acceptance over
+  >   to the window that remains after step 7, in the scope the record and its 2026-11-10 scope
+  >   ruling give it.
   > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
   >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
   >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
@@ -485,6 +497,15 @@ target, no `pickle` import left to mis-suppress:
   >   `/proc/<pid>/fd/<n>` instead, and fd 0 is the null device; the route is otherwise as
   >   described. Where it speaks of reading fd 0, read the private descriptor.
   >
+  >   *Owner ruling 2026-11-24, in the batch 673 Manager's chat:* asked whether acceptances
+  >   d20261110T144543956-d8f55a and d20261110T165507353-b70f7b carry over to the routes that remain
+  >   after steps 7 and 8 (fork without exec, `/proc`, Windows handle duplication, and the venv
+  >   `python.exe` launcher's second inheritable pipe handle), the owner answered *"Carry over;
+  >   merge"*. *Not the owner's words:* this note reads the answer as carrying both acceptances over
+  >   to those routes, so a forged answer through one of them is accepted in the scope each record
+  >   and its 2026-11-10 scope ruling give it, including the `/proc` and Windows handle-duplication
+  >   routes the Manager's 2026-11-10 reading below lists as accepted by neither record.
+  >
   > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
   > least these are not accepted by either owner record, and each is to be added as a step on vault
   > BACKLOG #3135 (ledger ruling R2).
@@ -501,6 +522,10 @@ target, no `pickle` import left to mis-suppress:
   > *One Handler is not confined from another inside a worker*.
   >
   > Closing the fd-0 path alone does not close the `/proc` route; see the grandchild residual.
+  >
+  > *Note 2026-11-24, not the owner's words:* the first two items in this list fall under the
+  > owner ruling of 2026-11-24 recorded under record d20261110T165507353-b70f7b above, as the note
+  > beside that ruling reads it. The last two are not named in that ruling.
   → `tests/test_sandbox.py::test_a_desynced_or_forged_response_is_rejected`,
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
@@ -508,10 +533,11 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`,
   `tests/test_sandbox.py::test_a_stray_frame_queued_after_the_check_is_found_before_the_request_is_written`,
   `tests/test_sandbox.py::test_the_second_check_shares_the_one_retry_a_dispatch_gets`,
-  `tests/test_sandbox.py::test_a_process_a_handler_spawns_cannot_read_the_request_pipe`,
+  `tests/test_sandbox.py::test_a_process_a_handler_spawns_does_not_get_the_request_pipe_on_fd_0`,
   `tests/test_sandbox.py::test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs`,
   `tests/test_sandbox.py::test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write`,
   `tests/test_sandbox.py::test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded`,
+  `tests/test_sandbox.py::test_a_kept_worker_already_dying_at_the_first_check_is_not_recorded_as_a_crash`,
   `tests/test_sandbox.py::test_the_private_request_pipe_is_not_inheritable`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (under the default `[delivery] internal_error` it previously
