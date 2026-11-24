@@ -16465,10 +16465,21 @@ class AuthService:
         # and notice are written at the clear, above.
         return elevation
 
+    #: The actions of :data:`_PENDING_REFUSED_ACTIONS` that end sessions. Refused to a pending
+    #: session whether or not its account holds a factor (BACKLOG #1149). Part of that set by
+    #: construction, so an action added here is refused.
+    _PENDING_SESSION_ENDING_ACTIONS = frozenset(
+        {
+            STEP_UP_ACTION_SESSION_TERMINATE,
+            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
+            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
+        }
+    )
+
     #: The step-up actions a pending session may NOT be granted once its account HAS a factor (and,
-    #: for the session-ending ones below, even when it has none). Every
+    #: for the session-ending ones above, even when it has none). Every
     #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
-    #: account with no factor is not locked out of it. For an account that already has one:
+    #: account with no factor is not locked out of enrolment. For an account that already has one:
     #:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
@@ -16496,25 +16507,15 @@ class AuthService:
     #: ``require_mfa`` a session on an account with no factor is MFA-pending, so it is confined like
     #: any other pending session: it enrols first, and the confirm that binds its first factor
     #: satisfies the session. Only the enrolment actions keep the first-enrolment carve-out.
-    _PENDING_REFUSED_ACTIONS = frozenset(
-        {
-            STEP_UP_ACTION_MFA_ENROLL,
-            STEP_UP_ACTION_MFA_CONFIRM,
-            STEP_UP_ACTION_WEBAUTHN_ENROLL,
-            STEP_UP_ACTION_SESSION_TERMINATE,
-            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
-            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
-        }
-    )
-
-    #: The actions of :data:`_PENDING_REFUSED_ACTIONS` that end sessions. Refused to a pending
-    #: session whether or not its account holds a factor (BACKLOG #1149).
-    _PENDING_SESSION_ENDING_ACTIONS = frozenset(
-        {
-            STEP_UP_ACTION_SESSION_TERMINATE,
-            STEP_UP_ACTION_SAVE_ENDS_OWN_SESSIONS,
-            STEP_UP_ACTION_REVOKE_ALL_SESSIONS,
-        }
+    _PENDING_REFUSED_ACTIONS = (
+        frozenset(
+            {
+                STEP_UP_ACTION_MFA_ENROLL,
+                STEP_UP_ACTION_MFA_CONFIRM,
+                STEP_UP_ACTION_WEBAUTHN_ENROLL,
+            }
+        )
+        | _PENDING_SESSION_ENDING_ACTIONS
     )
 
     async def _factor_binding_is_blocked(self, token: str | None, purpose: str) -> bool:

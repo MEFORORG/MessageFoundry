@@ -209,8 +209,9 @@ _MFA_EXEMPT_ROUTES: frozenset[tuple[str, str]] = frozenset(
 # out of the two gates that run first, so neither can deadlock behind this one.
 #
 # THE ``mfa_gate=False`` ROUTES ARE EXEMPT TOO, and they are not listed. Those are the reauth-only
-# factories (TOTP enrolment and confirm, session termination): the escapes an account under
-# ``require_mfa`` with no factor needs. Keying on the flag rather than on a copy of their paths is
+# factories (TOTP enrolment and confirm, session termination). Enrolment is the escape an account
+# under ``require_mfa`` with no factor needs; termination refuses such a pending session (BACKLOG
+# #1149). Keying on the flag rather than on a copy of their paths is
 # what keeps this plane and the console's (which exempts every ``allow_mfa_pending`` route) the same.
 #
 # /me/notify-email is deliberately NOT in the MFA set above. A session still owing its factor has
@@ -1632,8 +1633,7 @@ async def _mfa_refusal(request: Request, auth: AuthService, identity: Identity) 
 #: The 403 detail for a pending session whose account holds no factor (BACKLOG #1149).
 _MFA_ENROL_FIRST_DETAIL = (
     "multi-factor verification required; no second factor is enrolled, so enrol one first"
-    " (POST /me/reauth with purpose mfa_enroll, POST /me/mfa/enroll, POST /me/mfa/confirm),"
-    " then retry"
+    " (POST /me/mfa/enroll, then POST /me/mfa/confirm, each behind its own step-up), then retry"
 )
 
 
@@ -1643,8 +1643,23 @@ async def _pending_holds_no_factor(auth: AuthService, token: str | None) -> bool
     Asks the ``mfa_enroll`` factor-binding refusal, which is True for a pending session exactly
     when its account holds a factor, and fails closed (True) on a session or account it cannot
     find. So a False here means a found, pending session with no factor; the unknown case keeps
-    the verify wording. No new service member, so the console's seam does not move."""
-    return not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL)
+    the verify wording.
+
+    The read only picks the wording, and the gate has already refused, so a store fault keeps the
+    403 and its ``X-MFA-Required`` with the verify wording rather than becoming a 500, as
+    :func:`_step_up_refusal`'s wording read does (vault BACKLOG #3145 item 6)."""
+    try:
+        return not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL)
+    except AUDIT_WRITE_DEFECTS:
+        raise
+    except store_call_errors() as exc:
+        log.warning(
+            "an MFA refusal could not read whether the account holds a factor (%s); it answers"
+            " with the verify wording",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        return False
 
 
 async def refuse_from_new_address(request: Request) -> None:

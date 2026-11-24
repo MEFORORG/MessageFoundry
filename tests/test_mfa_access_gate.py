@@ -735,6 +735,28 @@ async def test_the_access_gate_names_enrolment_to_a_pending_session_with_no_fact
     )
 
 
+async def test_a_store_fault_on_the_wording_read_keeps_the_mfa_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RED when: the read that picks the refusal's wording is unguarded, so a store fault there
+    turns the 403 + ``X-MFA-Required`` into a 500. The fault answers with the verify wording."""
+    service = await _service(engine)
+    await _add(service, "fresh", Role.VIEWER)
+
+    async def broken(*_: object, **__: object) -> bool:
+        raise OSError("synthetic store fault")
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, "fresh")
+        monkeypatch.setattr(service, "factor_binding_is_blocked", broken)
+        r = await c.get("/messages", headers=_auth(tok))
+    assert r.status_code == 403
+    assert r.headers.get("X-MFA-Required") == "1"
+    assert r.json()["detail"] == (
+        "multi-factor verification required; POST /auth/mfa-verify then retry"
+    )
+
+
 async def test_a_no_factor_session_without_require_mfa_still_ends_sessions(
     engine: Engine,
 ) -> None:

@@ -534,7 +534,8 @@ def require_ui(
     must reach (enrollment, the confinement page, the account pages).
 
     ``pending_refusal`` is for a route that passes ``allow_mfa_pending`` for an account with NO factor
-    and must still refuse a pending session on an account that HAS one. It runs where the 6.3.3 gate
+    and must still refuse some pending sessions, at least one on an account that HAS a factor. It
+    runs where the 6.3.3 gate
     runs, so the refusal comes before the permission loop and before either budget is charged
     (BACKLOG #1973). Checked later, the refused request had already spent the user's admin-write
     budget, so a password holder could throttle the real user by being refused in a loop. On a
@@ -2172,7 +2173,8 @@ def require_ui_reauth_only_action(
     async def refuse_pending(
         request: Request, auth: AuthService, _identity: Identity
     ) -> HTTPException | None:
-        # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS). Run by
+        # A pending session on an account that HAS a factor (see _PENDING_REFUSED_ACTIONS), or on a
+        # session-ending action any pending session (BACKLOG #1149). Run by
         # the base, so it is refused before the admin-write charge (BACKLOG #1973), and audited there
         # like require_ui's own MFA refusal and like the JSON twin; /ui/reauth then asks for the
         # code before the password.
@@ -2191,9 +2193,9 @@ def require_ui_reauth_only_action(
         return _reauth_redirect(request, continuation(request))
 
     # allow_mfa_pending: a genuine exemption, not a re-route. It serves an account with NO factor,
-    # which can never satisfy a gate standing in front of the route that enrolls it, or that ends
-    # a session it does not recognise. An account that HAS a factor is refused by refuse_pending
-    # (#1951), inside the base so that the refusal spends no budget (#1973).
+    # which can never satisfy a gate standing in front of the route that enrolls it. An account
+    # that HAS a factor is refused by refuse_pending (#1951), and so is any pending session on a
+    # session-ending action (#1149), inside the base so that the refusal spends no budget (#1973).
     base = require_ui(
         *permissions,
         allow_mfa_pending=True,
