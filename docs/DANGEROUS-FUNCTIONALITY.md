@@ -1085,7 +1085,7 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 `messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
 folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
 a small Python program into its own global storage folder, under `testbench-debug`, and has the
-debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
+debugger run that program. At least debugpy 1.8.0 and 1.8.21 put that folder at `sys.path[0]`, so a module
 placed there shadows any module of that name the debuggee has not yet imported, the installed
 `messagefoundry` package and the standard library included. The folder is not pruned, and nothing
 checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).

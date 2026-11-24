@@ -69,6 +69,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
 from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
@@ -244,7 +245,7 @@ from messagefoundry.api.outlive import (
 )
 from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
-from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
+from messagefoundry.api.request_timeout import BODY_REFUSED_KEY, RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
@@ -1833,32 +1834,47 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     and a tight cut would drop the page that explains this refusal. The test that pins #2597,
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
-    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered
+    when that count is not zero, or when the cut reached a send still running
+    (NotifierAlertSink.sends_cut), even at a zero count, which a send cut beside a sibling that took
+    the alert leaves. A cut that reached no running send and left nothing counted logs
+    nothing, as a drain that ends in time with nothing counted does. NotifierAlertSink._handle says
+    what that count holds, the same rule on a cut as on a drain that ends in time.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut does not
-    end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
-    which run on."""
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). A send still
+    running at the cut is named by transport in NotifierAlertSink._cut_sends's WARNING. The cut
+    does not end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring
+    say which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
 
         async def _close_notifier(bound: float) -> None:
             notifier.start()
+            sends_cut_before = notifier.sends_cut
             wait = bound * _INNER_SHARE
+            was_cut = False
             try:
                 async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
                 if not deadline.expired():
                     raise
-                if not notifier.undelivered:
-                    return  # the last send ended at the deadline: nothing was lost
-                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
+                was_cut = True
+            # BACKLOG #5907: a cut that reached a running send is logged at a zero count too,
+            # since a send cut beside one that took the alert leaves no count. Counts only: an
+            # alert's content can carry a partner's text (docs/PHI.md).
+            sends_cut = notifier.sends_cut - sends_cut_before if was_cut else 0
+            if sends_cut or notifier.undelivered:
+                cut = (
+                    f"the alert notifier did not drain within {wait:.2f}s, "
+                    f"cutting {sends_cut} running send(s); "
+                    if was_cut
+                    else ""
+                )
                 _log.error(
-                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
-                    "not confirmed delivered",
-                    wait,
+                    "startup unwind: %s%d alert(s) not confirmed delivered",
+                    cut,
                     notifier.undelivered,
                 )
 
@@ -5124,8 +5140,10 @@ def create_app(
 
             async def send_with_headers(message: Message) -> None:
                 # The response start is where the router has run, so the matched route the
-                # no-store arm reads is in the scope by now.
-                if message["type"] == "http.response.start":
+                # no-store arm reads is in the scope by now. After a counted 413 the body limit
+                # drops this response, and building its headers reads request.url, which raises on
+                # a query string that is not UTF-8.
+                if message["type"] == "http.response.start" and not scope.get(BODY_REFUSED_KEY):
                     _apply_security_headers(request, MutableHeaders(scope=message))
                 await send(message)
 
@@ -5177,20 +5195,115 @@ def create_app(
 
     def _limit_request_body(inner: ASGIApp) -> ASGIApp:
         async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
-            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
-            if refusal is None:
+            if scope["type"] != "http":
                 await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            refusal = _body_refusal(request)
+            if refusal is None:
+                await _run_counting_body(inner, request, receive, send)
             else:
                 await refusal(scope, receive, send)
 
         return middleware
 
+    async def _run_counting_body(
+        inner: ASGIApp, request: Request, receive: Receive, send: Send
+    ) -> None:
+        """Run ``inner`` on an admitted HTTP request, holding the body it delivers to the cap.
+
+        ``_body_refusal`` judges what the request declares, and a host need not deliver that, so
+        every chunk is counted as the route pulls it; docs/SECURITY.md control 5 says on which hosts
+        the count can fire. The body is not read ahead of the route: that would buffer a body for a
+        caller the route's own gate refuses before reading (AuthenticatedBeforeBodyRoute).
+
+        At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
+        so it never holds a partial body as if it were whole, and no later read pulls anything. The
+        413 goes out unless the route already started a response, which cannot then be replaced."""
+        seen = 0
+        over_cap = False
+        started = False
+
+        async def counted_receive() -> Message:
+            nonlocal seen, over_cap
+            if over_cap:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if over_cap:  # a concurrent read crossed the cap while this one waited
+                return {"type": "http.disconnect"}
+            if message["type"] != "http.request" or not message.get("body"):
+                return message
+            seen += len(message["body"])
+            # Read here, not up front: most requests through this path carry no body.
+            if seen <= _body_cap(request):
+                return message
+            over_cap = True  # before the first await, so no route response can interleave
+            if started:
+                _log.warning(
+                    "oversized request body on %s from %s after a response started: "
+                    "no 413 was sent, and the route's read got a disconnect",
+                    scrub_log_argument(request.scope["path"]),
+                    scrub_log_argument(client_ip(request) or "unknown"),
+                )
+            else:
+                # Before the 413's start: the request deadline must see that the route still runs.
+                request.scope[BODY_REFUSED_KEY] = True
+                refusal = _refuse_body(
+                    request, 413, "request body too large", "oversized request body"
+                )
+                try:
+                    await refusal(request.scope, receive, send)
+                except OSError as exc:  # the client went away; the route still gets its disconnect
+                    _log.warning(
+                        "could not send the 413 for an oversized request body on %s from %s: %s",
+                        scrub_log_argument(request.scope["path"]),
+                        scrub_log_argument(client_ip(request) or "unknown"),
+                        type(exc).__name__,
+                    )
+            return {"type": "http.disconnect"}
+
+        async def route_send(message: Message) -> None:
+            nonlocal started
+            # Past the cap with no response started, the 413 is the response.
+            if started or not over_cap:
+                started = started or message["type"] == "http.response.start"
+                await send(message)
+
+        try:
+            await inner(request.scope, counted_receive, route_send)
+        except ClientDisconnect:
+            # The route's read of the disconnect above, already answered or logged. A real client
+            # disconnect under the cap is not this refusal's to absorb. A response the route had
+            # started stays unfinished: uvicorn closes the connection on that return, and what
+            # another host does with it has not been measured.
+            if not over_cap:
+                raise
+
+    def _body_cap(request: Request) -> int:
+        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        # The scope's decoded path: request.url drops a TAB, CR or LF from it, and raises on a query
+        # string that is not UTF-8, which would stop the refusal.
+        upload_store = getattr(request.app.state, "upload_store", None)
+        if upload_store is not None and request.scope["path"] in _UPLOAD_BODY_PATHS:
+            return int(upload_store.max_bytes)
+        return _MAX_REQUEST_BODY_BYTES
+
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
-        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        # `Connection: close` makes the server drop the connection after every refusal, so bytes
-        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
-        # client never sent, are never read as a next request.
-        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+        _log.warning(
+            "rejected %s on %s from %s",
+            what,
+            scrub_log_argument(request.scope["path"]),
+            scrub_log_argument(client_ip(request) or "unknown"),
+        )
+        # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
+        # so bytes it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body
+        # the client never sent, are never read as a next request. HTTP/2 and HTTP/3 frame each
+        # stream and make a response with this field malformed (RFC 9113 §8.2.2, RFC 9114 §4.2).
+        # Exact ASGI tokens: llhttp takes an `HTTP/2.0` request line on HTTP/1 framing and reports
+        # `2.0`, so a prefix test would let any client turn this close off.
+        multiplexed = request.scope.get("http_version") in ("2", "3")
+        headers = None if multiplexed else {"Connection": "close"}
+        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
@@ -5200,8 +5313,8 @@ def create_app(
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
-        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
-        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # A chunked body is not accepted: ANY Transfer-Encoding is refused, by presence on any line
+        # and whatever its value, and on HTTP/1.x the connection is closed. Beside a Content-Length
         # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
         # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
         # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
@@ -5232,19 +5345,16 @@ def create_app(
                 "chunked request body",
             )
         if not lengths:
+            # Nothing declared to judge. A bodyless POST, PUT or DELETE looks like this, so it is
+            # not refused here: _run_counting_body holds whatever body does arrive to the cap.
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        # and a repeated line is a second framing claim (on HTTP/1.x an invalid length closes the
+        # connection, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
-        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
-        upload_store = getattr(request.app.state, "upload_store", None)
-        cap = (
-            upload_store.max_bytes
-            if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
-            else _MAX_REQUEST_BODY_BYTES
-        )
+        cap = _body_cap(request)
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
@@ -9052,7 +9162,8 @@ def create_app(
                         actor=identity.username,
                     )
                 except ResendError as exc:
-                    # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                    # At least an empty edited body, an idempotency key reused for a different target,
+                    # or origin metadata with unreadable lineage (BACKLOG #5758) gives 409. str(exc)
                     # carries ids only (never the body — the messages don't interpolate ``raw``).
                     raise HTTPException(409, str(exc)) from None
                 return EditResendResult(
@@ -11905,7 +12016,8 @@ def create_app(
     # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
     # (registered after it, so further out): a refused address must be rejected before it can occupy
     # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
-    # streaming is never cut mid-body — see api/request_timeout.py.
+    # streaming is never cut mid-body; the body limit's counted 413 is the exception, because the
+    # route is still running behind it — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
     # [security].allowed_client_networks — registered so that only the response-header floor below is

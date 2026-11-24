@@ -68,6 +68,7 @@ from messagefoundry.config.models import (
     _check_revocation_attestation,
     bool_setting,
     check_attested_and_accepted,
+    flag_from_settings,
     hop_attestation_from_settings,
 )
 from messagefoundry.config.settings import EgressSettings
@@ -1077,6 +1078,9 @@ class FhirDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly, and first: on every branch, and before a hop guard can log a crossing for
+        # a build this refuses. bool("false") is True (vault BACKLOG #3234 added step 8).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError(
@@ -1313,7 +1317,7 @@ class FhirDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
             )
-            if bool(s.get("tls_allow_expired", False)):
+            if allow_expired:
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.base_url).hostname or "",
                     *proxy_handlers,
@@ -1366,7 +1370,6 @@ class FhirDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with tls_allow_expired: see refuse_unrevoked_verified_hop.
-            allow_expired = bool(s.get("tls_allow_expired", False))
             refuse_unrevoked_verified_hop(
                 scheme,
                 self.base_url,

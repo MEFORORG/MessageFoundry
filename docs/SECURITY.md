@@ -1616,8 +1616,8 @@ Managed at `GET /roles/custom` (`users:read`) and `POST` / `PUT` / `DELETE /role
 [`api/app.py`](../messagefoundry/api/app.py) (74 HTTP + 1 WebSocket) and 46 declared in
 [`api/auth_routes.py`](../messagefoundry/api/auth_routes.py). No other module in `api/` declares routes
 and there is no `include_router` anywhere. `create_app(expose_docs=True)` yields 125 (`/openapi.json`,
-`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 251
-(121 + the 129 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
+`/docs`, `/docs/oauth2-redirect`, `/redoc`; off by default) and `create_app(serve_ui=True)` yields 252
+(121 + the 130 console routes + the `/ui/static` mount). Of the 121: **102 are permission-gated**, 19 are
 not. Every one is listed below — none is collapsed away.
 
 #### Functions requiring no authorization
@@ -1692,7 +1692,12 @@ tuple: they act only on the caller's own account.
 record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/permissions`,
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
 and in the web console (BACKLOG #5559) at least these. `GET /ui/users` answers 200 and lists a
-failing account by its id alone, with its delete. `GET /ui/users/{user_id}`,
+failing account by its id alone; to a caller holding `users:manage` it links that account's
+delete to `GET /ui/users/{user_id}/delete-confirm`, which, for a record its checked read refuses
+with 423, shows a confirmation naming the id alone rather than the 423 this paragraph gives a
+failing record. Where the id in its path is the caller's own, that page shows a note that the
+caller cannot delete their own account, and no delete form.
+`GET /ui/users/{user_id}`,
 `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
@@ -1702,7 +1707,8 @@ per account and rate-limited, in each engine process: only the first refusal of 
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
 inside that interval, from any of these routes or any other reader of the same account in that
-process, answers 423 or lists the account as failed and adds no row and no alert. Each engine
+process, answers 423, lists the account as failed or, on the delete confirmation, shows its page,
+and adds no row and no alert. Each engine
 process sharing the store keeps its own interval, so each may report the same account once. The
 interval holds only while the process still remembers the account: it remembers at most
 `SEAL_FAILURE_TRACK_MAX` failing rows of every kind together, and past that it forgets the oldest,
@@ -1732,7 +1738,7 @@ for a changed display name the name rule refuses (BACKLOG #5784), which the rout
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
 answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
-answered the same way, a 423 or listed as failed, but reported under
+answered the same way as a failing record, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
@@ -1947,14 +1953,14 @@ rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
-When the console is served, the `/ui` plane adds **129 routes + one `/ui/static` mount** (federation off,
+When the console is served, the `/ui` plane adds **130 routes + one `/ui/static` mount** (federation off,
 the default — the three `/ui/oidc/*` routes, `GET`/`POST /ui/oidc/start` and `GET /ui/oidc/callback`,
 and the IdP step-up start `POST /ui/reauth/oidc` are registered only when `[auth].oidc_enabled`). They are
 functions too, and they gate on the **same 29-permission catalogue** through parallel wrappers —
 `require_ui`, `require_ui_step_up`, `require_ui_reauth_only`, `require_ui_step_up_action`,
 `require_ui_reauth_only_action` — but authenticate by the `SameSite=Strict` **session cookie**
 rather than a bearer token, and refuse cross-site state changes on `Sec-Fetch-Site`/`Origin`.
-**Route → permission map (`/ui` plane).** 118 of the 129 carry a gate. The 11 that do not are the
+**Route → permission map (`/ui` plane).** 119 of the 130 carry a gate. The 11 that do not are the
 sign-in, sign-out, re-auth and second-factor entry points and the CSP report sink, listed after the table. Where the console is served it is the
 *sole* operator UI, so ~20 of these have no JSON counterpart from which their authorization could be
 inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bulk`, the
@@ -2078,6 +2084,7 @@ the console routes with a rule of their own.
 | `GET` | `/ui/users/{user_id}` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/channel-scope` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/delete` | `users:manage` | `require_ui_step_up` |
+| `GET` | `/ui/users/{user_id}/delete-confirm` | `users:manage` | `require_ui_step_up`; see *What an admin user read reports* (BACKLOG #5559) |
 | `GET` | `/ui/users/{user_id}/federated-identity` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/federated-identity/link` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
 | `POST` | `/ui/users/{user_id}/federated-identity/unlink` | `users:manage` | `require_ui_step_up_action` (action `admin_federated_identity`) |
@@ -7221,7 +7228,7 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 2 | **Sign-in sliding window** (`allow_login_attempt`) | password-spraying across many usernames, which never trips a single account's lockout | > 10 attempts per client IP **or** > 60 across all clients, per 60 s (either dimension alone refuses — `global_full or key_full`); how a paid passkey sign-in `POST /ui/login` is counted is stated once, under [WebAuthn passkeys](#webauthn-passkeys-wp-14b-adr-0068), *The combined passkey sign-in* | `[auth].login_rate_limit_enabled = false` | lockout only — **and limiter 3 disappears with it** (see below). Nothing then bounds how many sign-ins wait in one account's queue (control 1), so a flood on one username also delays that account's own sign-ins (BACKLOG #1943) |
 | 3 | **Per-actor credential-ceremony budget** (`allow_reauth_attempt`) | a session holder guessing a password at the re-proof surface, **before** the per-session cap revokes the session | > 10 ceremonies per acting **user**, per 60 s, on each of the user's keys: an `oidc` session's IdP step-up return draws a key of its own (the *Credential ceremonies* row of [Business-logic limits](#business-logic-limits-asvs-213) says so). **No global dimension** (`glob=0`) | *the same* `[auth].login_rate_limit_enabled`, among others ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) lists every value that turns it off) | the per-session cap — `POST /me/reauth` and `POST /me/password` still count each failure, and a session is revoked at `lockout_threshold` failures. An AD re-bind the engine does not count, such as one the DC ends busy, keeps no bound at all (BACKLOG #3169). Re-proofs run one at a time per account, so a burst on one session is checked one at a time against its cap, within one engine process |
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
-| 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | ASGI middleware ahead of every route: any `Transfer-Encoding` (**411** for a coding list ending in a single `chunked` with no `Content-Length`, otherwise **400**), a `Content-Length` that is not one line of plain decimal digits (**400**), and a declared length over 1 MiB (**413**; the upload routes `/uploads` and `/ui/uploaded-logs/upload` alone admit up to `[store].max_upload_bytes`), each refused with the connection closed. Under `serve`, the pinned llhttp parser refuses some framing with its own **400**: most in the request head, so the middleware never runs; a malformed chunk in the body, unless the middleware's 411 has already closed the connection. [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses) lists the measured shapes | none | n/a |
+| 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | ASGI middleware ahead of every route: any `Transfer-Encoding` (**411** for a coding list ending in a single `chunked` with no `Content-Length`, otherwise **400**), a `Content-Length` that is not one line of plain decimal digits (**400**), and a declared length over 1 MiB (**413**; the upload routes `/uploads` and `/ui/uploaded-logs/upload` alone admit up to `[store].max_upload_bytes`), each refused with the connection closed on HTTP/1.x (HTTP/2 and HTTP/3 forbid the `Connection` field, so a refusal there does not ask for a close). Every admitted request's body is also counted as the route reads it and held to the same cap, because a host need not deliver what the headers declare: at the first chunk past the cap the route gets a disconnect, and the client a **413** unless a response has already started, when no 413 is sent and the log says so. The count is held to the cap, not to the declared length. Under `serve`, llhttp ends a body at its `Content-Length` and frames a request with neither header as an empty body, so the count cannot pass the cap there; at least HTTP/2, HTTP/3 and an in-process ASGI call can deliver a body no header announced, or more than its `Content-Length`. A call with no body is admitted. Under `serve`, the pinned llhttp parser refuses some framing with its own **400**: most in the request head, so the middleware never runs; a malformed chunk in the body, unless the middleware's 411 has already closed the connection. [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses) lists the measured shapes | none | n/a |
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
 | 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`), and the **pre-auth sign-in pool** (`PreAuthChallengePool.put`, ADR 0197 Amendment A wave 2) | flooding passkey registration/assertion ceremonies, and the usernameless passkey sign-in's challenges | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL. The pre-auth pool is its own: 4096 challenges, 120 s TTL, keyed by an opaque per-begin handle and never by client address, and a full pool **evicts its oldest** rather than refusing, so a flood can cost the owner a retry but never refuses the ceremony. Its begin leg (`POST /ui/login/passkey`) charges limiter 2 first; with limiter 2 off a fast enough flood can evict an owner's challenge before they finish | none | limiter 3 where the console charges it — `POST /ui/reauth/webauthn` (`ui_reauth_webauthn`, the assertion **finish** leg), plus `POST /ui/reauth` (`ui_reauth`) and `POST /ui/mfa` (`ui_mfa_submit`), whose code and password error re-renders re-stage fresh assertion options, for a session they read as not having met its factor, after the route has already charged `allow_reauth_attempt`. One `POST /ui/reauth` branch is the exception: its passkey-first refusal for a passkey-only session re-stages options **before** the limiter and charges nothing. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge no **auth-surface** limiter, but they are not unpaced: `POST /ui/account/webauthn/enroll` charges the per-actor **admin-write floor** (`allow_admin_write`, non-GET only, in `require_ui` — see 2.1.3 below). `GET /ui/reauth` and `GET /ui/mfa`, which re-stage fresh assertion options on **every** render for a session they read as not having met its factor, charge nothing at all, because that floor is non-GET only. There this bound plus cookie-holder-only reachability is all there is |

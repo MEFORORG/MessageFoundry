@@ -54,6 +54,7 @@ GET /ui/uploaded-logs/file/{file_id}/delete-confirm	file_id	path	-	-
 GET /ui/uploaded-logs/file/{file_id}/resend-confirm	file_id	path	-	-
 GET /ui/uploaded-logs/file/{file_id}/resend-confirm	to	query	-	-
 GET /ui/users/{user_id}	user_id	path	-	-
+GET /ui/users/{user_id}/delete-confirm	user_id	path	-	-
 GET /ui/users/{user_id}/federated-identity	m	query	-	-
 GET /ui/users/{user_id}/federated-identity	user_id	path	-	-
 GET /ui/users/{user_id}/federated-identity/unlink-confirm	user_id	path	-	-

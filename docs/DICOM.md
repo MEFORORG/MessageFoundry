@@ -106,7 +106,8 @@ a PDU is ended there. This is a deadline per read, not per object, so at the def
 sender sending PDUs of the shipped 16 KiB `max_pdu_size` has to keep up about 0.5 KiB per second
 within each PDU. Raising `max_pdu_size`, or lowering `timeout_seconds`, raises that floor. The
 deadline for each message, below, sets a far higher one for a whole object: it has
-`timeout_seconds` plus its size at 64 KiB a second, so a large object has to arrive at nearly that.
+`timeout_seconds` plus its size at `min_message_bytes_per_second`, 64 KiB a second unless that is
+set, so a large object has to arrive at nearly that rate.
 A peer that keeps finishing PDUs is not ended by the per-read deadline, and pynetdicom's idle timer
 restarts on each PDU; the deadline for each message is what ends one that never finishes its
 message. Each send has a `timeout_seconds` deadline for the whole send too, so a peer that stops
@@ -141,27 +142,56 @@ it. So is any command but a C-STORE or C-ECHO request, the two the SCP serves, s
 serves some others on a thread of their own, outside the hold below.
 
 **Each DIMSE message has a deadline too** (BACKLOG #5080). From the PDU that brings a message's first
-fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at 64 KiB a
-second. A message still incomplete past that ends the association with an A-ABORT. The check runs
+fragment, the SCP allows `timeout_seconds` plus the message's data set bytes so far at
+`min_message_bytes_per_second`, which is 64 KiB a second unless it is set. A message still incomplete past that ends the association with an A-ABORT. The check runs
 as each P-DATA-TF lands, so the end can come as late as the next PDU's header and body reads, each
 of which has `timeout_seconds`. A peer that sends nothing more is ended by pynetdicom's idle timer,
 after `timeout_seconds`, and one that stops part way through a PDU by the read deadline. A
 message whose last fragment arrives is served however long it took, and the next message's clock
-starts at its own first fragment. The 64 KiB a second is a constant, not a setting. The bound is
-per message, not per association. At least these limits apply:
+starts at its own first fragment. The bound is per message, not per association. At least these
+limits apply:
 
 - The SCP counts at most twice the effective `max_object_bytes` of one object, and the effective
   cap is at most 16 MiB, so one message lasts at most
-  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / (64 KiB a second)` from the end of its
-  first PDU's reads to the start of the next PDU's: 30 + 512 seconds, about 9 minutes, at the
-  defaults. Those two PDUs' header and body reads, each up to `timeout_seconds`, come on top.
-- A link slower than 64 KiB a second has its larger objects cut. At a link rate of `r` bytes a
-  second, an object is cut once its data set is over `timeout_seconds * r * 64 KiB / (64 KiB - r)`.
-  At the default 30 seconds that is objects over about 2 MiB at 32 KiB a second, and over about
-  640 KiB at 16 KiB a second. The cut falls at the same point on every attempt, so such an object
-  is never delivered over that link. This engine's own C-STORE client reads the failed association
-  as transient and retries the object at the head of its lane, so the lane stops there until the
-  object is moved aside. Raising `timeout_seconds` on the SCP raises the size that is cut.
+  `timeout_seconds + 2 * min(max_object_bytes, 16 MiB) / min_message_bytes_per_second` from the
+  end of its first PDU's reads to the start of the next PDU's: 30 + 512 seconds, about 9 minutes, at
+  the defaults. Those two PDUs' header and body reads, each up to `timeout_seconds`, come on top.
+- A link slower than that rate has its larger objects cut. At a link rate of `r` bytes a second and
+  a setting of `f`, an object is cut once its data set is over `timeout_seconds * r * f / (f - r)`.
+  At the defaults that is roughly 1.9 MiB at 32 KiB a second and 640 KiB at 16 KiB a second. Those
+  two figures are computed from the formula. What was measured is the cut and the remedy below, on
+  a throttled loopback link at 32 KiB a second and a `timeout_seconds` of 2, for a 200 KiB object
+  (`tests/test_dicom_scp_message_deadline.py`). So at 32 KiB a second the band is objects of roughly
+  2 to 32 MiB: a smaller one arrives in time, and one past 32 MiB, twice the effective cap, is
+  aborted over any link. The cut falls at the same point on every attempt, so an object in the band
+  is never delivered over that link as configured. This engine's own C-STORE client reads the
+  failed association as transient and retries the object at the head of its lane, so the lane stops
+  there until the object dead-letters at the retry cap, or for as long as it is sent with
+  `max_attempts=None`.
+- **The remedy for that band is `min_message_bytes_per_second` on the SCP** (BACKLOG #6637). Set it
+  at or under the link's real rate, down to the least below, and an object up to the effective `max_object_bytes` arrives
+  inside its deadline on its first attempt. One over that cap, up to twice it, then gets the final
+  `0xC010` once it has arrived, so it dead-letters on its first attempt instead of being cut and
+  retried. The link also has to carry each whole PDU inside the read deadline above, which is
+  `max_pdu_size / timeout_seconds` and which this setting does not move. It moves only this rate. Raising `timeout_seconds` instead would also loosen every read and send
+  deadline above. It takes a whole number of at least 16384, which is 16 KiB a second. A smaller
+  value, zero and `None` are refused when the connection is built, so the deadline cannot be turned
+  off. At that least rate one message can hold a `max_associations` slot for about 34 minutes plus
+  `timeout_seconds`, and the two PDU reads above, each up to `timeout_seconds`, come on top of that,
+  so set it no lower than the link needs.
+- **A link slower than that least rate is not cured by this setting alone.** The setting cannot go
+  below 16384, so such a site also raises `timeout_seconds`, which loosens every read and send
+  deadline above, as that bullet says. The data set arrives at less than the raw link rate, because
+  PDU and TLS framing take part of it, so a link rated near 16 KiB a second may still be under the
+  least. Computed from the cut formula above, not measured: at a link rate of 10 KiB a second, the
+  setting at 16384 and the default `timeout_seconds` of 30, an object is cut once its data set is
+  over 30 * 10 * 16 / 6 = 800 KiB.
+- **A sender's own timer can cut the object first.** This engine's C-STORE client applies its
+  `timeout_seconds` from the start of a store to the response, with nothing coming back in between,
+  so at the default 30 seconds it ends a store that takes longer than that on the link, about
+  960 KiB at 32 KiB a second, whatever the SCP allows (measured at a 3 second client timeout on the
+  same throttled link). Over a slow link, raise the client's `timeout_seconds` past the object's
+  time on the link as well as setting the SCP's rate.
 - A peer that sends small complete messages one after another, such as a C-ECHO every few seconds,
   still holds a `max_associations` slot for as long as it keeps sending. Each of its messages
   completes, so no deadline ends it, and this bound does not close that case.
@@ -314,9 +344,17 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   least these lines, which stay with the element's name and the reason while the value reads `[redacted]`:
   pynetdicom's non-conformant and refused value lines; its non-conformant transfer syntax and related SOP
   class lines, and its line naming a transfer syntax under the DICOM root that is no transfer syntax; the
-  exception its DUL logs when a received PDU does not decode, with its traceback; pydicom's invalid value
-  line; and the UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
-  association acceptance and a DIMSE message. A dump field keeps at least these values: an empty one; a
+  refusal in an exception logged by any pynetdicom module that logs one, such as its DUL when a received PDU
+  does not decode or its DIMSE provider when a received message does not convert, in the record's message
+  and in each link of its traceback's chain; pydicom's invalid value, Specific Character Set, VR IS and
+  DS, and invalid private creator lines, as lines and as refusals inside such an exception; pynetdicom's `No presentation context for`
+  line, which keeps its SOP class and transfer syntax only when both are conformant or named in pydicom's
+  UID dictionary; its `No supported service class` line, which keeps a SOP class on the same terms; the
+  UID and AE title fields of pynetdicom's DEBUG dumps of an association request, an
+  association acceptance and a DIMSE message; and the username and password of a user identity and the
+  hex of an extended negotiation item's application information in those dumps, which are never kept. A
+  dump field otherwise keeps at
+  least these values: an empty one; a
   conformant UID; a name in pydicom's UID dictionary, on a field that is no instance UID; and, on the AE title
   fields and on Their Implementation Version Name, a value that passes pynetdicom's AE title check, which an
   empty or all-space value does. `_kept` in `messagefoundry/transports/dicom.py` is the source of record.
@@ -329,21 +367,24 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   run in, and when a line they read changes, so a change to the lock has to re-read the shapes. They do not
   reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom resolve to any
   release from 3.0.2 below 3.1, and the tests run only the release the lock names. Known shapes not covered
-  yet, at least: the exception pynetdicom logs when a received DIMSE message does not convert, which only the
-  SCU can reach, since the SCP ends such an association first; a flagged UID that spells a name in
-  pydicom's UID dictionary, which a dump field keeps; pydicom's `Incorrect value for Specific Character Set`
-  and `Value "<value>" is not valid for elements with a VR of` lines, which name the value whole; and
-  pynetdicom's `No presentation context for` line, on `pynetdicom.association`, which the filter is not on,
-  and which names the SOP class of an object the SCU sends. The SCP reads each association
+  yet, at least: a flagged UID that spells a name in pydicom's UID dictionary, which a dump field, the
+  `No presentation context for` line and the `No supported service class` line keep; and pydicom's
+  `Unknown VR` line, which names two bytes of an object and is written only with pydicom's own debug
+  switched on. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the loggers the SCP filters is
   written only where the command set itself ends the association. Where a later PDU ends it, before
   pynetdicom reads the message, that read's lines are written nowhere. A line on any other logger is written
-  twice. pydicom also raises its invalid value line as a `UserWarning`, which would carry the value to stderr.
-  A warnings filter, installed at import and again at each SCP start, ignores that copy and no other pydicom
-  warning; a host that resets the process's
-  warnings filters after that brings the copy back. The engine's
+  twice. pydicom also raises each of its lines above as a `UserWarning`, which would carry the value to
+  stderr. A warnings filter, installed at import, at each SCP start, at each C-STORE the SCP serves and
+  before each SCU read and association, ignores those copies and no other pydicom warning; a host that resets
+  the process's warnings filters between those points brings the copy back until the next one, and the SCP's
+  pre-read of a command set is not one of them. Under context-aware warnings, the free-threaded default, the
+  filter is installed at every one of those points, which also repeats another library's once-per-location
+  warning. The filter also renders a codec error on these loggers
+  without the byte it failed on, for a host whose handlers lack the engine's log chain. The engine's
   own C-STORE lines name an object's SOP class and instance UIDs only when they are conformant, and `[redacted]`
-  otherwise.
+  otherwise, and redact a refused value of a shape the filter knows from a library error they quote; a
+  library error of another shape is quoted through `safe_exc` alone.
 - **Egress is fail-closed.** A DIMSE destination is gated by `[egress].allowed_tcp`; a DICOMweb destination by
   `[egress].allowed_http` — both enforced at load/reload/start.
 

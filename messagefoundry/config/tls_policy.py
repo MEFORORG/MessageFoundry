@@ -2323,9 +2323,9 @@ def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
 # it carry PHI? is it production?) so every cell decides identically, and a legitimately-secure hop is
 # opted in per-connection (an AUDITED attestation) rather than via the blunt global escape.
 
-#: Host tokens that name the local box (loopback) with no DNS resolution. ``""`` (empty host) is
-#: treated as loopback (an on-box bind with no host component).
-_LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost", ""})
+#: Host names that name the local box (loopback) with no DNS resolution. The empty host is not one
+#: (BACKLOG #5512): :func:`is_loopback_hop_host` says why.
+_LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost"})
 
 
 class HopDisposition(enum.Enum):
@@ -2436,27 +2436,34 @@ def is_loopback_hop_host(host: str) -> bool:
     this authority agree on exactly one definition.
 
     Covers all of ``127.0.0.0/8`` and ``::1`` via :mod:`ipaddress` (not just the literal
-    ``127.0.0.1``), plus the ``localhost`` name and an empty host. It **never resolves DNS**: any other
-    name cannot be *proven* loopback, so it is treated as remote, which fails closed at the cleartext
-    guards — a name that happens to resolve to a loopback address is still refused, because
+    ``127.0.0.1``), plus the ``localhost`` name. It **never resolves DNS**: any other
+    name cannot be *proven* loopback, so it is treated as remote and gets no on-box carve-out. A
+    name that happens to resolve to a loopback address is judged as any off-box hop is, because
     resolution is attacker-influenceable and would let a hostname smuggle an off-box hop past the
-    on-box carve-out.
+    carve-out. Judged off-box means the caller's gate applies: an enforcing instance refuses unless
+    a per-hop declaration covers the hop, and some transports only warn at
+    ``[security].enforcement = warn``. It does not mean always refused.
+
+    **An empty host is not loopback (BACKLOG #5512).** It names no destination, so this predicate
+    cannot place it, and what it means belongs to the caller. A listener whose blank host binds a
+    local default reads that default before it asks. A feature with no host has no hop and returns
+    before it asks. A caller that cannot say where the hop goes lets this answer stand, so the hop
+    is judged off-box, as above.
 
     **A limit (vault BACKLOG #2706): apart from case, a name is read as written, and a host is an
-    address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``
-    and ``%6cocalhost`` read as remote here, though a resolver may take the first two as this box,
-    and urllib decodes the third to ``localhost`` before it dials. The cleartext guards judge them
-    as they judge any remote hop, and a proxy that applies takes them with the connection's proxy
-    credential, so a hop spelled this way can leave the box through a proxy. This limit only ever
-    reads a spelling as remote, so it adds no hop to the ones judged on-box. Where remote is the
+    address only where :mod:`ipaddress` reads it as one.** So at least ``localhost.``, ``127.0.0.1.``,
+    ``[::1]`` and ``%6cocalhost`` read as remote here, though a resolver may take the first two as
+    this box, the Windows resolver takes ``[::1]`` as ``::1`` (measured on Windows 11, BACKLOG
+    #5512), and urllib decodes the last to ``localhost`` before it dials. The cleartext guards judge
+    them as they judge any remote hop, and a proxy that applies takes them with the connection's
+    proxy credential, so a hop spelled this way can leave the box through a proxy. This limit only
+    ever reads a spelling as remote, so it adds no hop to the ones judged on-box. Where remote is the
     permissive answer this reading is not enough, as ``config.settings._names_this_host`` records.
 
     ``transports.rest._proxy_bypasses`` strips a trailing dot and this does not, so a
     ``proxy_no_proxy`` entry ``localhost`` matches ``localhost.``, which still reads as remote here.
     The two disagree only toward "remote": that match opens no on-box carve-out, and
-    ``transports.rest.ProxyConfig.for_host`` says what it does to the route. A plain
-    ``rstrip(".")`` is not the fix, because the host of ``http://./x`` is ``.``, and stripping it
-    leaves the empty host, which reads as loopback."""
+    ``transports.rest.ProxyConfig.for_host`` says what it does to the route."""
     h = host.lower()
     if h in _LOOPBACK_HOP_HOST_NAMES:
         return True
@@ -2475,11 +2482,10 @@ def hop_url_host(url: str, *, cell: str) -> str:
     Vault hop guard in ``transports.strict_requests`` reads its address another way on purpose:
     with the parser that requests dials by.
 
-    Each caller keys an on-box carve-out on :func:`is_loopback_hop_host`, which reads ``""`` as
-    loopback, and at least one caller elsewhere relies on that. So a site that wrote
-    ``hostname or ""`` let the one hop it cannot classify cross as on-box. What such a URL dials is
-    not knowable here: an empty host can resolve to this box's own network addresses rather than to
-    loopback. So the remedy is the URL, and no posture, attestation or acceptance crosses this.
+    Each caller keys an on-box carve-out on :func:`is_loopback_hop_host`. What a URL with no host
+    dials is not knowable here: an empty host can resolve to this box's own network addresses
+    rather than to loopback. So the remedy is the URL, and no posture, attestation or acceptance
+    crosses this, where the predicate alone would only judge the hop as remote (BACKLOG #5512).
 
     A plain ``ValueError`` and not :class:`InsecureHopRefused`: the token-endpoint and Digest seams
     re-raise that type with posture advice ("attest the hop", "declare cleartext_accepted") that
@@ -3773,10 +3779,9 @@ def vault_client_verify_kwargs(
         # A malformed bracketed host, or an address that names no host (BACKLOG #2207). Not
         # raised here: the client build refuses a given address it cannot read as one URL, with
         # fixed text and the provider's own error type (BACKLOG #2317). An unset address does
-        # not reach here from a provider, which refuses it first (BACKLOG #2851). NOT "":
-        # is_loopback_hop_host("") is True, and a host this function cannot read must not count
-        # as on-box.
-        host = "(unreadable host)"
+        # not reach here from a provider, which refuses it first (BACKLOG #2851). The empty host
+        # is not on-box (BACKLOG #5512), so the anchor keeps what an off-box hop gets.
+        host = ""
     anchor = resolve_trust_anchor(connection_ca_file=ca_file, host=host, policy=TrustAnchorPolicy())
     verify = requests_verify_from_anchor(anchor, cell=cell)
     return {} if verify is None else {"verify": verify}

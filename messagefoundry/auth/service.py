@@ -2288,7 +2288,9 @@ class UserSealRefused(RuntimeError):
     writes the audit row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
-    may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
+    may still delete it. ``auth_routes._checked_user``, and so the JSON admin routes that read an
+    account through it, answer it 423; docs/SECURITY.md, *What an admin user read reports*, states
+    what at least some web console pages answer. A record Vault transit cannot verify is
     refused the same way, reported under ``integrity.authority_seal_unverifiable`` (ADR 0217)."""
 
 
@@ -5159,8 +5161,15 @@ class AuthService:
         totp_secret: str | None = None,
         totp_code: str | None = None,
         totp_code_read_at: float | None = None,
+        on_first_write: Callable[[], None] | None = None,
     ) -> ProvisionedAdministrator:
         """Create the first administrator from an operator-supplied name and credential (#1136).
+
+        ``on_first_write`` is called once, at the first account write that may have landed: right
+        after a fresh row's INSERT returns, or on a repair right before the clear of the earlier
+        holder's factors (BACKLOG #5067). A caller uses it to tell a refusal raised before any
+        account write from one that may follow one. A read before it can still write an audit row
+        of its own, such as a seal failure's.
 
         **IT ENROLS TOTP FROM BIRTH (ADR 0197 Amendment A, N-A, AC-A5).** ``totp_secret`` is the
         secret the command generated and showed at the terminal, and ``totp_code`` the code the
@@ -5312,6 +5321,8 @@ class AuthService:
             # or a session of theirs, onto the new Administrator. Cleared BEFORE anything is
             # written for the new holder, and before the role that would make a kept session an
             # Administrator session.
+            if on_first_write is not None:
+                on_first_write()
             await self._store.disable_totp(user_id)
             await self._store.delete_all_webauthn_credentials(user_id)
             # The command's longer budget here too (vault BACKLOG #3023 residual (4)): no request
@@ -5363,6 +5374,10 @@ class AuthService:
                     "provision-admin run is in progress, let it finish. Then run the command again: "
                     "it reads that account and either completes it or says why it cannot"
                 ) from exc
+            # After the INSERT, not before it: a refused INSERT wrote no row, so a refusal from it
+            # is still one raised before any account write (BACKLOG #5067).
+            if on_first_write is not None:
+                on_first_write()
         await self._seed_roles()
         # ADR 0197 Amendment A (N-A): the step is consumed FIRST, before the credential or the
         # secret is written, so a code this row already spent (an interrupted earlier run in the

@@ -933,6 +933,67 @@ def test_estate_reconcile_clean_run_still_reports_the_flat_claim() -> None:
     assert result.detail == "read>=sent, sink_received>=written, backlog drained"
 
 
+# --- estate outbound dead-letters (BACKLOG #5436) -------------------------------------------------
+
+
+def test_estate_reconcile_outbound_dead_letters_are_loss() -> None:
+    c = Counters(sent=100, acked=100, sink_received=40)
+    final = replace(_sample(read=100, written=40), out_dead=60)
+    result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "60 outbound row(s) dead-lettered" in result.detail
+
+
+def test_estate_reconcile_outbound_dead_letter_is_loss_beside_a_fanout_surplus() -> None:
+    c = Counters(sent=100, acked=100, sink_received=150)
+    final = replace(_sample(read=100, written=150), out_dead=1)
+    result = estate_reconcile(c, _BASE, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and not result.inconclusive, result.detail
+    assert "1 outbound row(s) dead-lettered" in result.detail
+
+
+def test_estate_reconcile_dead_letters_from_before_the_baseline_do_not_count() -> None:
+    base = replace(_BASE, out_dead=7)
+    final = replace(_RIG_FINAL, out_dead=7)
+    result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
+
+
+def test_estate_reconcile_dead_count_that_fell_is_inconclusive() -> None:
+    # A replay or a stats reset lowers the count, and could hide new dead-letters: 7 removed, 2 new.
+    base = replace(_BASE, out_dead=7)
+    final = replace(_RIG_FINAL, out_dead=2)
+    result = estate_reconcile(_RIG_CLEAN, base, final, unconfirmed_budget=_BUDGET)
+    assert not result.ok and result.inconclusive, result.detail
+    assert "outbound dead count fell by 5" in result.detail
+
+
+def test_estate_reconcile_dead_delta_across_a_counter_reset_is_not_judged() -> None:
+    final = replace(_RIG_FINAL, out_dead=5)
+    result = estate_reconcile(
+        _RIG_CLEAN,
+        _BASE,
+        final,
+        unconfirmed_budget=_BUDGET,
+        counter_reset="the engine restarted mid-run",
+    )
+    assert not result.ok and result.inconclusive, result.detail
+    assert "dead-lettered" not in result.detail
+
+
+def test_estate_reconcile_known_remainder_routed_dead_letter_is_not_seen() -> None:
+    # PINS A KNOWN GAP, BACKLOG #5436 stays open on it. A routed dead-letter has no outbound row, so
+    # out_dead stays 0. Without hubs, 40 of 100 are written. With hubs, of 80 simple-feed messages
+    # 60 die and 20 write 20, and 20 hub messages at fan-out 5 write 100. Both must flip to a LOSS
+    # once the check can see a dead-letter at every stage.
+    for written in (40, 120):
+        c = Counters(sent=100, acked=100, sink_received=written)
+        result = estate_reconcile(
+            c, _BASE, _sample(read=100, written=written), unconfirmed_budget=_BUDGET
+        )
+        assert result.ok, result.detail
+
+
 # --- the copies, and where they deliberately part ------------------------------------------------
 
 

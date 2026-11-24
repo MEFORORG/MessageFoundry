@@ -40,8 +40,9 @@ the version does not define, and a dropped bare defined ID with no field separat
 refused, and so is a dropped MSH, DSC, MSA, ERR, QAK or MFA line (``_NEVER_EXEMPT`` says why).
 The exemption is per structure, not per slot: it does not count against the slot's
 cardinality or position. It holds only where MSH-9.1 names the structure's own message code, so a
-structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none; one
-borrowed under the same code (``MFN^M02^MFN_M01``) still gets it. Where the slot sits inside a
+structure borrowed through MSH-9.3 under another message code (``ADT^A01^MFN_M01``) gets none.
+Under the same code, MSH-9.2 decides whether a borrow keeps it (``MFN^M02^MFN_M01`` does not;
+some do), by the rule :func:`_exempts_defined_segments` states. Where the slot sits inside a
 nested group (at least PRR_PC5 and PPV_PCA), such a segment can still break hl7apy's grouping of
 what follows. Segment order is not checked as such: hl7apy keeps each segment where the message
 has it, so an out-of-order message may pass.
@@ -351,18 +352,59 @@ def _has_any_segment_slot(name: str, classname: str, hl7_version: str) -> bool:
 
 
 def _exempts_defined_segments(message: Any) -> bool:
-    """True if ``message``'s structure has the "any HL7 segment" slot and is its own.
+    """True if ``message``'s structure has the "any HL7 segment" slot and MSH-9 passes the
+    consistency check below, which some borrowed structures pass too.
 
     hl7apy takes the structure from MSH-9.3 when one is given, so ``ADT^A01^MFN_M01`` would
     borrow MFN_M01's slot for an ADT body. The exemption holds only where MSH-9.1 names the
     structure's own message code, which fails closed on a structure borrowed under another code.
-    One borrowed under the same code (``MFN^M02^MFN_M01``) still gets it: MSH-9.2 is not
-    compared, since one structure can serve several trigger events (PGL_PC6 serves PC6 to PC8,
-    for one)."""
+    Under the same code, MSH-9.2 is compared too (BACKLOG #5920 step 1). A message with no
+    MSH-9.3 borrows nothing: hl7apy names its structure from MSH-9.1 and MSH-9.2. One with an
+    MSH-9.3 is checked in this order. Where the structure is ``<MSH-9.1>_<MSH-9.2>``, MSH-9.2
+    stripped and upper-cased, it keeps the exemption. Otherwise, where hl7apy's tables have a
+    structure named ``<MSH-9.1>_<MSH-9.2>``, it gets none: ``MFN^M02^MFN_M01``, since MFN_M02 is
+    a structure, and ``QBP^Z73^QBP_Q15`` in 2.5, since QBP_Z73 is one. Otherwise it keeps the
+    exemption where MSH-9.2 starts with Z, taken as a site-defined event (``QBP^Z44^QBP_Q15``)
+    that table 0003 need not list, or is a value in the version's HL7 table 0003 as hl7apy ships
+    it, and gets none for any other value (empty, lower-case, padded or made up, such as
+    ``XY1``). Any Z-led value passes the Z test (``MFN^Zebra^MFN_M01``), and the table holds at
+    least one placeholder that is no event (``Varies`` from 2.4), which passes too. So ``PGL^PC7^PGL_PC6`` in 2.5 keeps it, one structure serving several trigger
+    events (PGL_PC6 serves PC6 to PC8, for one). So does an event in the table that the borrowed
+    structure does not serve in the standard, such as ``MFN^M14^MFN_M01``, or one of another
+    message's family, such as ``MFN^A01^MFN_M01``: hl7apy has no table of which structure serves
+    which event, and only ``<MSH-9.1>_<MSH-9.2>`` is looked up. A Z test is on the raw MSH-9.2, so
+    ``MFN^Z44 ^MFN_M01`` keeps the exemption and ``MFN^z44^MFN_M01`` does not."""
     code = message.msh.msh_9.msh_9_1.to_er7()
-    return code == message.name.split("_", 1)[0] and _has_any_segment_slot(
-        message.name, message.classname, message.version
-    )
+    if code != message.name.split("_", 1)[0]:
+        return False
+    if not _has_any_segment_slot(message.name, message.classname, message.version):
+        return False
+    if len(message.msh.msh_9.to_er7().split(message.encoding_chars["COMPONENT"])) < 3:
+        return True
+    event = message.msh.msh_9.msh_9_2.to_er7()
+    # Normalized so a padded or lower-case own event (``MFN^m01^MFN_M01``) keeps the exemption,
+    # as ``MFN^m01`` with no MSH-9.3 does.
+    own = f"{code}_{event.strip().upper()}"
+    if own == message.name:
+        return True
+    structures, events = _structures_and_events(message.version)
+    if own in structures:
+        return False
+    # A site-defined Z event borrows a structure by design, and table 0003 need not list it.
+    return event.startswith("Z") or event in events
+
+
+# Keyed by version alone, so the cache holds none of a sender's MSH-9.2 text.
+@cache
+def _structures_and_events(hl7_version: str) -> tuple[frozenset[str], frozenset[str]]:
+    """The message structures and the trigger events (HL7 table 0003) hl7apy's tables for
+    ``hl7_version`` define; no events where hl7apy ships no tables for the version."""
+    import hl7apy
+
+    library = hl7apy.load_library(hl7_version)
+    tables = getattr(library, "TABLES", {})
+    events = tables["HL70003"][1] if "HL70003" in tables else ()
+    return frozenset(library.MESSAGES), frozenset(events)
 
 
 # Six IDs a dropped line of which is refused even in a structure with the "any HL7 segment" slot

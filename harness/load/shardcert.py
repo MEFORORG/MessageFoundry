@@ -1583,6 +1583,15 @@ async def _queue_breakdown(env: Mapping[str, str]) -> QueueBreakdown:
 # --- the bench ---------------------------------------------------------------
 
 
+def _store_view_rounded_up(summed: int, n_shards: int) -> int:
+    """The summed in-pipeline gauge over ``n_shards`` engine shards, rounded UP (BACKLOG #5950).
+
+    Engine shards read the store one after another, so the last rows can show on only some of them,
+    and a floor division would read that nonzero residual as 0, which is the drained value. A
+    negative value is returned as a floor division leaves it, because rounding it up could make 0."""
+    return summed // n_shards if summed < 0 else -(-summed // n_shards)
+
+
 async def _sample_in_pipeline_peak(
     urls: list[str], stop: asyncio.Event, out: list[int], *, interval: float = 0.5
 ) -> None:
@@ -1600,7 +1609,7 @@ async def _sample_in_pipeline_peak(
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                depth = sample.in_pipeline // n_shards
+                depth = _store_view_rounded_up(sample.in_pipeline, n_shards)
                 if depth > out[0]:
                     out[0] = depth
             with contextlib.suppress(TimeoutError):
@@ -2008,7 +2017,9 @@ async def run_shardcert(
         engine_dead=(final.dead if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
-        in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
+        in_pipeline_final=(
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        ),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
@@ -3748,7 +3759,9 @@ async def run_shardcert_engine(
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
-        in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
+        in_pipeline_final = (
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        )
         # On an abort the store's stranded/dead are a teardown artifact, not a measurement — do not read them
         # (they would only re-confirm the fabricated collapse). A genuine failed drain still reads them.
         if rung_aborted:

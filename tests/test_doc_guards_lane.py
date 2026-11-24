@@ -139,8 +139,10 @@ def test_the_risky_component_guard_is_IN_the_lane() -> None:
         "security/bundled-code-survey.json",
         "security/runtime-closure-core.txt",
         "security/runtime-closure-sqlserver.txt",
+        "security/runtime-closure-postgres.txt",
         "security/runtime-closure-harness.txt",
         "docker/locks/requirements-core.lock",
+        "docker/locks/requirements-postgres.lock",
         "security/locks/requirements-harness.lock",
     ):
         assert classify([ref], **patterns), (

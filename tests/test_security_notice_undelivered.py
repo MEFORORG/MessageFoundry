@@ -86,6 +86,7 @@ async def test_a_failed_send_writes_an_audit_row_without_the_address(
         )
     )
     await notifier.aclose()
+    assert notifier.undelivered == 1  # BACKLOG #5907 step 4: a failed send stays counted
 
     assert await _undelivered(store) == [
         (
@@ -164,6 +165,7 @@ async def test_a_delivered_notice_writes_no_row_and_no_audit_writer_writes_nothi
     notifier.start()
     await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
     await notifier.aclose()
+    assert notifier.undelivered == 0
     assert await _undelivered(store) == []
 
     def boom(**_: Any) -> None:

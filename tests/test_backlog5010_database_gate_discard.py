@@ -33,6 +33,7 @@ from messagefoundry import odbc_call_gate
 from messagefoundry.odbc_call_gate import call_gate, install_call_gate, raw_cursor
 from messagefoundry.transports import database
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from tests._fake_dbapi_driver import RuntimeDriverError
 from tests._odbc_cancel_fakes import (
     USE_AFTER_FREE,
     AioConn,
@@ -159,7 +160,7 @@ class _DriverErrorCursor(RawCursor):
             return super().execute(sql, *params)
         except RuntimeError as exc:
             state = getattr(self._conn, "statement_state", "08S01")
-            raise RuntimeError(state, f"[{state}] stand-in driver error") from exc
+            raise RuntimeDriverError(state, f"[{state}] stand-in driver error") from exc
 
 
 class _LinkLostRollbackRefused(_RollbackRefused):
@@ -182,7 +183,7 @@ class _RejectedThenLinkLost(_LinkLostRollbackRefused):
 
     def rollback(self) -> None:
         self.note("rollback:link-lost")
-        raise RuntimeError("08S01", "[08S01] communication link failure")
+        raise RuntimeDriverError("08S01", "[08S01] communication link failure")
 
 
 async def test_a_driver_error_whose_rollback_fails_is_classified_and_discarded(

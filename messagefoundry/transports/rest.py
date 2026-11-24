@@ -497,9 +497,8 @@ def http_family_trust_anchor(
     :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
     default resolves to, so callers have ONE "nothing configured" value to handle rather than two.
 
-    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
-    ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
-    place. ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
+    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207).
+    ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
     their provider checks the URL, so they pass the setting's name and the operator learns which
     URL to fix."""
     ca = settings.get("tls_ca_file")
@@ -814,8 +813,9 @@ class InsecureHopGuard:
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture.
 
-        An empty ``host`` is refused whatever the posture (BACKLOG #2207): the authority below reads
-        ``""`` as loopback and would ALLOW it. The text is fixed and names no part of the URL."""
+        An empty ``host`` is refused whatever the posture (BACKLOG #2207), where the authority below
+        could still let an attested or accepted hop cross. The text is fixed and names no part of
+        the URL."""
         if not host:
             raise InsecureHopRefused(
                 f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal: the URL names "
@@ -2944,6 +2944,8 @@ class RestDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly and first, on every branch: bool("false") is True (vault BACKLOG #3234).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
@@ -3155,7 +3157,7 @@ class RestDestination(DestinationConnector):
                 # Vault BACKLOG #5511: the opener built below is replaced by the sidecar's, so the
                 # whole-chain refusal is worded for an ECH hop before the generic one can fire.
                 refuse_chain_check_on_os_roots(anchor, ech_sidecar=True)
-            if bool(s.get("tls_allow_expired", False)):
+            if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
                     *proxy_handlers,
@@ -3226,7 +3228,6 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            allow_expired = bool(s.get("tls_allow_expired", False))
             no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,

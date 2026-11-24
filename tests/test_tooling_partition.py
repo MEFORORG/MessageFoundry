@@ -164,6 +164,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # (BACKLOG #1193). A Dockerfile edit sets `code=true` but NOT `tooling=true`, so listed as
         # tooling it would be deselected on the engine legs and unreached by the tooling path gate.
         "test_container_build_pins.py",
+        # Same widening as test_container_build_pins.py above: its subject is docker/Dockerfile, the
+        # postgres lock and the two HA templates (BACKLOG #5933), shipped artifacts whose diff sets
+        # `code=true` but NOT `tooling=true`.
+        "test_container_postgres_variant.py",
         # Reads docker/Dockerfile's ENTRYPOINT and rglobs messagefoundry/**.py, and holds ci.yml's
         # `docker` path arm to the named engine start-path modules (vault BACKLOG #3455). What
         # breaks it includes at least a start-path module renamed or removed, an ENGINE diff, and an
@@ -389,6 +393,7 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # each stopped before any worker spawns.
         "test_xdist_auto_worker_cap.py",
         "test_b622_5828_compose_host_ports.py",  # docker/compose.yaml: no tooling=true path
+        "test_b622_8298_compose_ha_postgres_start.py",  # docker/compose.yaml: no tooling=true path
     }
 )
 

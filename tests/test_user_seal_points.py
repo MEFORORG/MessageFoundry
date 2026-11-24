@@ -259,7 +259,9 @@ def test_admin_unlock_refuses_a_record_that_fails_its_seal(
     _refuse_with_a_seal_error(monkeypatch, "clear_lockout")
     assert main(["admin-unlock", "--username", "admin", "--db", str(db), "--json"]) == 1
     error = json.loads(capsys.readouterr().out)["error"]
-    assert "integrity seal" in error and "nothing was written" in error.lower()
+    # The clear wrote nothing, but the open before it may have (BACKLOG #5067).
+    assert "integrity seal" in error and "this command makes did not land" in error
+    assert "nothing was written" not in error.lower(), error
     assert "store key" in error and "outside the engine" in error  # both causes named
     monkeypatch.undo()
     locked_until, _ = _read_lock(db)
