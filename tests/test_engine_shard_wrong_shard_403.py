@@ -9,14 +9,15 @@ config's inbound names on it. This module runs two engine shards of one config, 
 filter as ``serve --shard`` builds it, over ONE store, and asks each about the other's inbound.
 
 What it runs, and what it does not: two in-process engines and their API apps, each on its own
-filtered graph, sharing one SQLite store. ``serve --shard`` with more than one engine shard refuses
-SQLite (ADR 0063, ``require_unified_store``), so this is not two ``serve --shard`` subprocesses on a
-server-DB store; the API code and the graph each answers from are the ones those processes run.
+filtered graph, sharing one SQLite store. It runs no ``serve --shard`` subprocess, and no server-DB
+store, the only kind ``serve --shard`` accepts with more than one engine shard (ADR 0063,
+``require_unified_store``). So the shared audit rows and the flag write are run on SQLite only.
 
 Two answers are pinned:
 
 * ``GET /connections/{name}/metadata`` for an in-scope inbound the OTHER engine shard holds gets the
-  403 and an ``auth.channel_denied`` row, byte for byte the answer an out-of-scope inbound gets.
+  403 and an ``auth.channel_denied`` row; the status and raw body are byte for byte the answer an
+  out-of-scope inbound gets.
 * ``POST /connections/{name}/flag`` for that same inbound is NOT refused: its check reads
   ``Registry.inbound_names()``, which on an engine shard spans the whole config, so the flag and its
   ``connection_flag_set`` row land in the shared store. ``docs/SECURITY.md`` states both.
@@ -24,23 +25,21 @@ Two answers are pinned:
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-import httpx
 import pytest
 
-from messagefoundry.api import create_app
 from messagefoundry.api.message_scope import CONNECTION_DENIED_DETAIL
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS
-from messagefoundry.auth.service import AuthService
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, Registry, build_inbound_connection
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
-from tests.test_channel_rbac import _add, _login, _probe, _service
+from tests.test_channel_rbac import _add, _client, _login, _probe, _service
 from tests.test_dual_control_reload import _settle_unlanded
 
 _A_OWN = "IB_SHARD_A"  # held by engine shard a, in the operator's scope
@@ -82,12 +81,6 @@ async def shards(tmp_path: Path) -> AsyncIterator[tuple[Engine, Engine]]:
             await eng.stop()
 
 
-def _client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=create_app(engine, auth=service)), base_url="http://t"
-    )
-
-
 async def test_the_engine_shard_graphs_are_the_filtered_views(
     shards: tuple[Engine, Engine],
 ) -> None:
@@ -126,6 +119,9 @@ async def test_a_scoped_caller_asking_the_wrong_engine_shard_gets_the_403_and_a_
         assert ("auth.channel_denied", _B_OWN) in wrong[2], wrong
         assert ("auth.channel_denied", _A_OUT) in out[2], out
         assert sorted(act for act, _ in wrong[2]) == sorted(act for act, _ in out[2])
+        raw_wrong = await ca.get(f"/connections/{_B_OWN}/metadata", headers=ha)
+        raw_out = await ca.get(f"/connections/{_A_OUT}/metadata", headers=ha)
+        assert (raw_wrong.status_code, raw_wrong.content) == (raw_out.status_code, raw_out.content)
 
         # The other direction: engine shard b refuses engine shard a's in-scope inbound the same way.
         status, _, audit = await _probe(cb, b, hb, "GET", f"/connections/{_A_OWN}/metadata")
@@ -138,9 +134,14 @@ async def test_a_scoped_caller_asking_the_wrong_engine_shard_gets_the_403_and_a_
         assert status == 404
         assert not [x for x in audit if x[0] == "auth.channel_denied"], audit
 
-    # The rows are in the ONE store both engine shards share, and say nothing of which one answered.
+    await service_a.close_background()
+    await service_b.close_background()
+    # The rows are in the ONE store both engine shards share, and say nothing of which one answered:
+    # each detail names its channel and nothing else.
     rows = await b.store.list_audit(actor="op", action="auth.channel_denied")
     assert {r["channel_id"] for r in rows} == {_A_OWN, _A_OUT, _B_OWN}
+    for row in rows:
+        assert json.loads(str(row["detail"])) == {"channel": row["channel_id"]}, row
 
 
 async def test_the_flag_route_on_the_wrong_engine_shard_writes_the_flag(
@@ -167,4 +168,5 @@ async def test_the_flag_route_on_the_wrong_engine_shard_writes_the_flag(
         )
         assert (status, reply) == (403, {"detail": CONNECTION_DENIED_DETAIL})
         assert ("auth.channel_denied", "IB_NOWHERE") in audit
+    await service.close_background()
     assert await a.store.list_connection_flags() == {(_B_OWN, "inbound")}
