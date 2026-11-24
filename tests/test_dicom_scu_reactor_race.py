@@ -10,8 +10,8 @@ The ``gated`` fixture below orders each step of that interleaving on threading e
 sleep-based version only made it likely. That version lost the race on a loaded CI runner and
 failed its control. The gate's one time-based step is a 1 ms poll for the response to reach the
 queue. Each wait the gate adds is bounded, and a bound that runs out is a recorded fault the tests
-fail on. The SCU's own timeouts still apply: the control's 1 s also bounds association setup.
-Every object is a synthetic SR from ``tests/_dicom_sample.py``, on a loopback listener.
+fail on. The SCU's ACSE and network timeouts are 30 s, well clear of a loaded runner. Only its
+DIMSE timeout is short: the control waits that out for the response it lost. Every object is a synthetic SR from ``tests/_dicom_sample.py``, on a loopback listener.
 
 **These tests need the ``[dicom]`` extra and SKIP without it.** A skipped test is not evidence: see
 the note at the top of ``tests/test_dicom_scp_admission.py``.
@@ -24,6 +24,7 @@ import logging
 import threading
 import time
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -41,20 +42,25 @@ from tests.test_dicom_scu import _carry, _scu, _storage_scp  # noqa: E402
 # fault, which the tests assert on before anything else, so the failure names the lost step.
 _STEP_BOUND = 10.0
 
+# The SCU's ACSE and network (DUL idle) timeouts in both tests. They bound association setup and
+# the reactor's idle check, neither of which these tests are about, so they sit well clear of a
+# loaded runner. Only the DIMSE timeout is short, since the control waits it out for its lost
+# response.
+_SETUP_TIMEOUT = 30.0
+
 
 class _GatedCheckpoint(threading.Event):
     """An SCU association's reactor checkpoint that sequences the reactor's FIRST pass.
 
-    Held (the checkpoint is clear when the reactor reaches it, which is what the hold does), the
-    reactor blocks here as pynetdicom intends, until the send's own ``set()``. Not held, the wait
-    returns at once and the reactor then stays in the window, ``_is_paused`` still ``True``, until
-    the send's response is on the queue. Only then does it run the pass that reads the queue, and
-    ``pass_done`` is set when it comes back to its checkpoint, after it has served what it read."""
+    The hold leaves the checkpoint clear. A held reactor blocks here, as pynetdicom intends, until
+    the send's own ``set()``. An unheld one passes at once. It then waits in the window, with
+    ``_is_paused`` still ``True``, until the send's response is on the queue. Then it runs the pass
+    that reads the queue. ``pass_done`` is set when it comes back to its checkpoint."""
 
-    def __init__(self) -> None:
+    def __init__(self, faults: list[str]) -> None:
         super().__init__()
         self.set()  # as pynetdicom builds it: the reactor runs until something pauses it
-        self.faults: list[str] = []
+        self.faults = faults  # the fixture's list, shared by every checkpoint
         self.reached = threading.Event()  # the reactor is at, or past, its first checkpoint
         self.go = threading.Event()  # the send lets a reactor held in the window run its pass
         self.pass_done = threading.Event()  # the reactor is back at its checkpoint after that pass
@@ -78,23 +84,51 @@ class _GatedCheckpoint(threading.Event):
         return passed
 
 
+@dataclass
+class _Gate:
+    checkpoints: list[_GatedCheckpoint] = field(default_factory=list)
+    faults: list[str] = field(default_factory=list)
+
+    def read_faults(self) -> list[str]:
+        """The faults so far, plus one for a reactor still in the window, whose own fault would
+        land only after the test had read this list."""
+        for checkpoint in self.checkpoints:
+            if checkpoint.in_window and not checkpoint.go.is_set():
+                self.faults.append("the send left without letting the reactor out of the window")
+        return list(self.faults)
+
+
 def _dropped(caplog: pytest.LogCaptureFixture) -> list[str]:
     """pynetdicom's line for each response its reactor took and could not serve."""
     return [r.getMessage() for r in caplog.records if "Received unexpected" in r.getMessage()]
 
 
+def _short_dimse_scu(
+    monkeypatch: pytest.MonkeyPatch, port: int, dimse_timeout: float
+) -> dicom_module.DicomScuDestination:
+    """The SCU with ``_SETUP_TIMEOUT`` for ACSE and network, and ``dimse_timeout`` for DIMSE."""
+    scu = _scu(port, timeout_seconds=_SETUP_TIMEOUT)
+    build_ae = scu._build_ae
+
+    def short_dimse() -> Any:
+        ae = build_ae()
+        ae.dimse_timeout = dimse_timeout
+        return ae
+
+    monkeypatch.setattr(scu, "_build_ae", short_dimse)
+    return scu
+
+
 @pytest.fixture
-def gated(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> Iterator[list[_GatedCheckpoint]]:
-    """Each SCU association's reactor reaches its first checkpoint before the send starts, and a
+def gated(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> Iterator[_Gate]:
+    """Each SCU association's reactor reaches its first checkpoint before the send starts. A
     reactor that passes it unheld runs its next pass only once the response is on the queue. The
-    SCP's own associations are left alone. pynetdicom's WARNING lines are captured. Yields the SCU
-    associations' checkpoints; ``faults`` on each names any step that never happened."""
+    SCP's own associations are left alone. pynetdicom's WARNING lines are captured. The tests read
+    ``_Gate.read_faults()``, which names any step that never happened."""
     from pynetdicom.association import Association
     from pynetdicom.dimse import DIMSEServiceProvider
 
-    checkpoints: list[_GatedCheckpoint] = []
+    gate = _Gate()
     build, store, read = (
         Association.__init__,
         Association.send_c_store,
@@ -104,16 +138,19 @@ def gated(
     def gated_build(self: Any, *args: Any, **kwargs: Any) -> None:
         build(self, *args, **kwargs)
         if self.is_requestor:
-            checkpoint = _GatedCheckpoint()
+            checkpoint = _GatedCheckpoint(gate.faults)
             self._reactor_checkpoint = checkpoint
-            checkpoints.append(checkpoint)
+            gate.checkpoints.append(checkpoint)
 
     def gated_store(self: Any, *args: Any, **kwargs: Any) -> Any:
         checkpoint = self._reactor_checkpoint
-        if isinstance(checkpoint, _GatedCheckpoint) and not checkpoint.reached.wait(_STEP_BOUND):
-            checkpoint.faults.append("the reactor never reached its first checkpoint")
+        if not isinstance(checkpoint, _GatedCheckpoint):
+            # Something replaced the checkpoint, so nothing here is sequenced any more.
+            gate.faults.append("an SCU association's checkpoint is not the gated one")
+        elif not checkpoint.reached.wait(_STEP_BOUND):
+            gate.faults.append("the reactor never reached its first checkpoint")
             # Not the real send: its spin on _is_paused has no bound of its own.
-            raise RuntimeError(checkpoint.faults[-1])
+            raise RuntimeError(gate.faults[-1])
         return store(self, *args, **kwargs)
 
     def gated_read(self: Any, block: bool = False) -> Any:
@@ -125,19 +162,26 @@ def gated(
             and checkpoint.in_window
             and not checkpoint.go.is_set()
         ):
-            deadline = time.monotonic() + _STEP_BOUND
-            while self.msg_queue.empty():
-                if time.monotonic() > deadline:
-                    checkpoint.faults.append("the response never reached the queue")
-                    break
-                time.sleep(0.001)
-            closed = not checkpoint.faults and self.peek_msg()[1] is None
-            if closed:
-                checkpoint.faults.append("the connection closed before the response came")
-            checkpoint.go.set()
+            closed = False
+            try:
+                deadline = time.monotonic() + _STEP_BOUND
+                while self.msg_queue.empty():
+                    if time.monotonic() > deadline:
+                        gate.faults.append("the response never reached the queue")
+                        break
+                    time.sleep(0.001)
+                else:
+                    closed = self.peek_msg()[1] is None
+                    if closed:
+                        gate.faults.append("the connection closed before the response came")
+            except BaseException as exc:
+                gate.faults.append(f"the gate's wait for the response raised {exc!r}")
+                raise
+            finally:
+                checkpoint.go.set()  # whatever happened above, the reactor is not left waiting
             # A reactor that takes the closed connection's marker leaves without coming back.
             if not closed and not checkpoint.pass_done.wait(_STEP_BOUND):
-                checkpoint.faults.append("the reactor in the window never finished its pass")
+                gate.faults.append("the reactor in the window never finished its pass")
         return read(self, block=block)
 
     monkeypatch.setattr(Association, "__init__", gated_build)
@@ -145,31 +189,31 @@ def gated(
     monkeypatch.setattr(DIMSEServiceProvider, "get_msg", gated_read)
     with caplog.at_level(logging.WARNING, logger="pynetdicom.association"):
         try:
-            yield checkpoints
+            yield gate
         finally:
-            for checkpoint in checkpoints:  # no reactor stays in the window past its test
+            for checkpoint in gate.checkpoints:  # no reactor stays in the window past its test
                 checkpoint.go.set()
 
 
 async def test_the_reactor_never_takes_the_response_to_the_one_store(
-    gated: list[_GatedCheckpoint], caplog: pytest.LogCaptureFixture
+    gated: _Gate, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data = _carry(make_sr_part10())
     failure: DeliveryError | None = None
     with _storage_scp() as port:
         try:
-            await _scu(port, timeout_seconds=2.0).send(data)
+            await _short_dimse_scu(monkeypatch, port, dimse_timeout=2.0).send(data)
         except DeliveryError as exc:  # a dropped response raises here; read the gate first
             failure = exc
-    assert [c.faults for c in gated] == [[]]
+    assert gated.read_faults() == []
     # The reactor was at its checkpoint before the send started, and the hold kept it there.
-    assert [c.in_window for c in gated] == [False]
+    assert [(c.reached.is_set(), c.in_window) for c in gated.checkpoints] == [(True, False)]
     assert failure is None
     assert _dropped(caplog) == []
 
 
 async def test_the_same_gate_loses_a_response_without_the_hold(
-    gated: list[_GatedCheckpoint], caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    gated: _Gate, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The CONTROL for the test above: without the hold, the same gate reproduces the race, on
     # every run. If it ever does not, the test above proves nothing.
@@ -178,11 +222,11 @@ async def test_the_same_gate_loses_a_response_without_the_hold(
     failure: DeliveryError | None = None
     with _storage_scp() as port:
         try:
-            await _scu(port, timeout_seconds=1.0).send(data)
+            await _short_dimse_scu(monkeypatch, port, dimse_timeout=1.0).send(data)
         except DeliveryError as exc:
             failure = exc
-    assert [c.faults for c in gated] == [[]]
-    assert [c.in_window for c in gated] == [True]
+    assert gated.read_faults() == []
+    assert [(c.reached.is_set(), c.in_window) for c in gated.checkpoints] == [(True, True)]
     assert len(_dropped(caplog)) == 1, "the gate did not reproduce the race"
     assert failure is not None
     assert "got no response status" in str(failure)
