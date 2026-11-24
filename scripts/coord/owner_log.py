@@ -193,9 +193,16 @@ def ensure(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    if not os.path.isfile(path):
-        with open(path, "wb") as fh:
+    if os.path.isfile(path):
+        return
+    # Exclusive create, never truncate: the ledger is shared across sessions and PCs, and a writer
+    # that loses the race between the check above and a plain "wb" open would wipe the rows the
+    # winner just appended. The check above only saves a syscall; "xb" is what is safe.
+    try:
+        with open(path, "xb") as fh:
             fh.write(("\n".join(HEADER) + "\n").encode())
+    except FileExistsError:
+        pass  # another writer created it first; its header and rows stand
 
 
 def append(path: str, rec: dict[str, str]) -> None:
@@ -246,11 +253,14 @@ def by_item(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
     return items
 
 
-def age_minutes(ts: str) -> float:
+def age_minutes(ts: str) -> float | None:
+    """Minutes since ``ts``, or None when it is not the stamp now() writes. A sentinel number here
+    once compared below every stale threshold, so a hand-appended row with an odd stamp read as
+    fresh and its item was never flagged."""
     try:
         t = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
     except ValueError:
-        return -1.0
+        return None
     return (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
 
 
@@ -287,6 +297,7 @@ def cmd_check(a: argparse.Namespace) -> int:
     stale = []
     waiting = []
     misdelivered = []
+    unreadable = []
     for item, evs in sorted(items.items()):
         seen = {r.get("event") for r in evs}
         if seen & TERMINAL:
@@ -313,6 +324,10 @@ def cmd_check(a: argparse.Namespace) -> int:
             continue
         lastev = [r for r in evs if r.get("event") == last][-1]
         mins = age_minutes(lastev.get("ts", ""))
+        if mins is None:
+            # An open item whose age cannot be read cannot be shown NOT stalled, so it needs a look.
+            unreadable.append((item, last, lastev))
+            continue
         if last == "presented":
             # Waiting on a person who may be asleep. Only alarm if it has been far too long.
             if mins >= PRESENTED_STALE_HOURS * 60:
@@ -342,8 +357,18 @@ def cmd_check(a: argparse.Namespace) -> int:
         for item, mins, ev in sorted(waiting, key=lambda r: -r[1]):
             print(f"      {item}  ({mins / 60:.1f}h)  {(ev.get('summary') or '')[:70]}")
         print("")
+    if unreadable:
+        print(f"  *** {len(unreadable)} OPEN ITEM(S) WITH AN UNREADABLE TIMESTAMP ***")
+        print("  Their age cannot be computed, so they cannot be shown not stalled. Expected a")
+        print("  stamp like 2026-01-31T09:05:00Z; fix it by appending a corrected event.")
+        print("")
+        for item, last, ev in unreadable:
+            print(f"  {item}")
+            print(f"      last leg   : {last}  (ts {ev.get('ts')!r}, by {ev.get('actor')})")
+            print(f"      meaning    : {MEANING.get(last, '?')}")
+            print("")
     if not stale:
-        if misdelivered:
+        if misdelivered or unreadable:
             return 1
         print(f"  {len(items)} item(s). NO GAPS older than {a.stale_minutes:g} min. Exit 0.")
         return 0
