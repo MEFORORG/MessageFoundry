@@ -945,9 +945,11 @@ read on 2026-11-24.
    <https://nodejs.org/docs/v20.18.0/api/crypto.html> says what the v26.11.1 page cited above says
    on the points that amendment's table uses: the call does not complete until there is enough
    entropy, a longer wait is named only right after boot, and the synchronous form throws "if
-   there is a problem generating the bytes". Two things stay unchecked. A newer VS Code ships a newer
-   Node, and no page for those versions was read. The crypto library under that Node's `randomBytes`
-   inside Electron was not checked either.
+   there is a problem generating the bytes". At least these stay unchecked. A newer VS Code ships a
+   newer Node, and no page for those versions was read. The crypto library under that Node's
+   `randomBytes` inside Electron was not checked. And `ide/package.json` declares no
+   `extensionKind`, so in a remote workspace the extension can run in the remote extension host, on
+   the Node that VS Code Server ships, which was not checked.
 
 4. **The 2026-09-28 amendment's correction note is not a source for the Transit gate.** That note,
    dated 2026-10-10, follows the amendment's *What this statement does not cover* paragraph. Its last
@@ -955,5 +957,7 @@ read on 2026-11-24.
    record of what that gate checks and what it does not catch, and it governs wherever this ADR's
    wording differs.
 
-5. **An enforced bound for DR archives under `vault_transit` is not built.** This ADR does not cover
-   it. Vault BACKLOG #3568 holds that follow-up.
+5. **Point 4's volume reasoning does not cover DR archives under `vault_transit`.** Those archives'
+   frames are sealed in the process under the local key, with random nonces (the library table's
+   *Backup frame nonces* row), and no enforced bound covers them on that path. This is a known gap
+   in this design statement, not a scope boundary. Vault BACKLOG #3568 holds the follow-up.
