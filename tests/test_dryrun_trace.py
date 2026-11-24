@@ -16,7 +16,6 @@ Gates asserted here (ADR 0072):
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sys
 from collections.abc import Iterator
@@ -909,26 +908,65 @@ def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) 
     assert len(_all_writes(inv)) == _MAX_WRITES
 
 
-def test_a_refused_write_is_not_recorded_and_spends_no_write_budget() -> None:
-    # Only a write that took is recorded, so refused writes cannot push a real one past the cap.
-    from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
-
-    def try_absent(msg: Message) -> None:
-        for _ in range(_MAX_WRITES):
-            with contextlib.suppress(KeyError, ValueError):
-                msg["ZZZ-1"] = "X"
-
-    def handle_refused_then_real(msg: Message) -> Send:
-        try_absent(msg)
-        msg["MSH-3"] = "REAL"
+def test_a_write_that_raises_still_shows_on_its_line() -> None:
+    # The live-debug loop shows the value that broke the Handler; recording happens before the
+    # write so a refused write is not hidden from the failing line.
+    def handle_bad_write(msg: Message) -> Send:
+        msg["PID-5"] = "A|B"
         return Send("out", msg)
 
-    traced = trace_dry_run(
-        _registry(route_to_h, {"h": handle_refused_then_real}), ADT_A01, show_phi=True
-    )
-    inv = _handler_invocation(traced)
-    assert [w["path"] for w in _all_writes(inv)] == ["MSH-3"]
-    assert "writes_truncated" not in inv
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_bad_write}), ADT_A01, show_phi=True)
+    assert traced["disposition"] == MessageStatus.ERROR.value
+    writes = _all_writes(_handler_invocation(traced))
+    assert {"path": "PID-5", "value": "A|B"} in writes
+
+
+def test_a_write_after_the_traced_frame_returned_is_not_held(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A wrapper's write after the unwrapped Handler returns has no line left to emit it on, so it
+    # must not be kept (BACKLOG #6824).
+    import functools
+
+    def inner(msg: Message) -> Send:
+        return Send("out", msg)
+
+    @functools.wraps(inner)
+    def wrapper(msg: Message) -> Send:
+        out = inner(msg)
+        msg["MSH-4"] = "LATE"
+        return out
+
+    made = _capture_tracers(monkeypatch)
+    trace_dry_run(_registry(route_to_h, {"h": wrapper}), ADT_A01)
+    rec = next(r for r in made[0].invocations if r.kind == "handler")
+    assert rec.frame is not None
+    assert rec._writes_by_line == {}
+
+
+def _run_threads(*targets) -> None:
+    """Run each target on its own thread; re-raise the first error, and fail on a hung thread."""
+    import threading
+
+    errors: list[BaseException] = []
+
+    def guarded(fn):
+        def run() -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread below
+                errors.append(exc)
+
+        return run
+
+    threads = [threading.Thread(target=guarded(t), daemon=True) for t in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+    assert not any(t.is_alive() for t in threads), "a worker thread hung"
+    if errors:
+        raise errors[0]
 
 
 def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
@@ -947,22 +985,16 @@ def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
     def run_a() -> None:
         with dt._patched_message_writes():
             a_entered.set()
-            b_exited.wait(10)
+            assert b_exited.wait(10)
             seen["a_during"] = Message._write
 
     def run_b() -> None:
-        a_entered.wait(10)
+        assert a_entered.wait(10)
         with dt._patched_message_writes():
             pass
         b_exited.set()
 
-    ta = threading.Thread(target=run_a)
-    tb = threading.Thread(target=run_b)
-    ta.start()
-    tb.start()
-    ta.join(20)
-    tb.join(20)
-    assert b_exited.is_set()
+    _run_threads(run_a, run_b)
     assert seen["a_during"] is dt._recording_write
     assert Message._write is dt._ORIG_MESSAGE_WRITE
     assert dt._patch_holders == 0
@@ -990,18 +1022,13 @@ def test_concurrent_traced_dry_runs_each_record_their_writes() -> None:
         results["a"] = trace_dry_run(reg, ADT_A01, show_phi=True)
 
     def run_b() -> None:
-        a_paused.wait(10)
+        assert a_paused.wait(10)
         results["b"] = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
         b_done.set()
 
-    ta = threading.Thread(target=run_a)
-    tb = threading.Thread(target=run_b)
-    ta.start()
-    tb.start()
-    ta.join(20)
-    tb.join(20)
-    assert b_done.is_set()
+    _run_threads(run_a, run_b)
     assert any(w["path"] == "MSH-3" for w in _all_writes(_handler_invocation(results["b"])))
     a_writes = _all_writes(_handler_invocation(results["a"]))
     assert any(w["path"] == "MSH-3" and w["value"] == "AFTER" for w in a_writes)
     assert Message._write is dt._ORIG_MESSAGE_WRITE
+    assert dt._patch_holders == 0

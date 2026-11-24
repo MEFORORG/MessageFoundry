@@ -53,6 +53,9 @@ site keeps them unchanged).
   #6823):** a Handler's ``lazy_result`` marks any iterable return whose exact type is not
   ``list``/``tuple``/``set``/``frozenset`` (``str``/``bytes``/``bytearray`` aside). It means only that
   the per-invocation ``sends`` were not read; such a body may still carry line events.
+* *Bounded capture.* An invocation keeps at most :data:`_MAX_EVENTS` line events and
+  :data:`_MAX_WRITES` ``msg`` writes. Past the first it carries ``"truncated": true``; past the
+  second, ``"writes_truncated": true``, and later writes on every line are dropped (BACKLOG #6824).
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -359,9 +362,10 @@ class _Recorder:
 
     def record_write(self, path: str, value: object) -> None:
         # A write is kept only where a later `_finalize` will emit it. Past the event cap no line is
-        # finalized, and with no latched frame none ever is, so a write kept then would only be held:
-        # a long mutating loop would grow this recorder without bound (BACKLOG #6824).
-        if self.frame is None:
+        # finalized, and with no latched frame or no open line (the frame has returned) none is, so a
+        # write kept then would only be held: a long mutating loop would grow this recorder without
+        # bound (BACKLOG #6824).
+        if self.frame is None or self._last_line is None:
             return
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
@@ -548,12 +552,11 @@ def _recording_write(
     *,
     as_data: bool,
 ) -> None:
-    _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
-    # Recorded only once the write took, so a refused write neither shows in the trace nor spends
-    # the per-invocation write budget (BACKLOG #6824).
+    # Recorded before the write, so a write that raises still shows on the line that failed.
     rec = _active_recorder.get()
     if rec is not None:
         rec.record_write(path, value)
+    _ORIG_MESSAGE_WRITE(self, path, value, occurrence, repetition, as_data=as_data)
 
 
 # ``Message._write`` is class-global, so concurrent traces (one per thread) share one patch. A
