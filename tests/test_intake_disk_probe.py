@@ -321,10 +321,26 @@ async def test_a_thread_start_failure_is_an_unmeasured_tick(
     await monitor.check_once()
     await monitor.stop()
     gate.hold(DISK_REASON)
-    monkeypatch.setattr(threading.Thread, "start", refuse)
-    await monitor.check_once()  # must not raise
-    monkeypatch.undo()
+    probe.free_mib = HIGH_MIB  # a measurement here would release, so the assertion can differ
+    started = probe.started
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", refuse)
+        await monitor.check_once()  # must not raise
+    assert probe.started == started, "control: no probe ran"
     assert gate.reasons == {DISK_REASON}, "an unmeasured tick leaves the pause as it was"
+
+
+async def test_a_monitor_dropped_without_stop_ends_its_idle_thread(
+    tmp_path: Path, probe: _Probe
+) -> None:
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    await monitor.check_once()
+    thread = probe.threads[0]
+    assert thread.is_alive(), "control: the idle worker is running"
+    del monitor
+    gc.collect()
+    await asyncio.to_thread(thread.join, 10.0)
+    assert not thread.is_alive(), "a dropped monitor left its idle probe thread running"
 
 
 async def test_a_late_high_reading_does_not_release_a_held_pause(
@@ -388,9 +404,7 @@ async def test_a_late_failure_is_not_logged_as_unretrieved(
     assert not [r for r in caplog.records if r.exc_info and r.exc_info[1] is late]
 
 
-async def test_normal_ticks_measure_each_tick_and_leave_no_thread(
-    tmp_path: Path, probe: _Probe
-) -> None:
+async def test_normal_ticks_measure_each_tick(tmp_path: Path, probe: _Probe) -> None:
     gate = IntakeGate()
     monitor = _disk_monitor(tmp_path, gate)
     await monitor.check_once()

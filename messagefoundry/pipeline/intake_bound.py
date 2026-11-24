@@ -56,6 +56,8 @@ import logging
 import queue
 import threading
 import time
+import weakref
+from collections.abc import Callable
 from typing import NamedTuple
 
 from messagefoundry.config.settings import StoreBackend
@@ -209,11 +211,12 @@ class _DiskProbeWorker:
     ``Thread.start`` blocks its caller until the thread runs, which under GIL contention would stall
     the event loop on every tick. ``busy_since`` is read and written on the loop only."""
 
-    __slots__ = ("busy_since", "inbox", "thread")
+    __slots__ = ("busy_since", "close", "inbox", "thread")
 
     def __init__(self) -> None:
         self.inbox: queue.SimpleQueue[_DiskRequest | None] = queue.SimpleQueue()
         self.busy_since: float | None = None
+        self.close: Callable[[], object] | None = None
         self.thread = threading.Thread(
             target=_serve_disk_probes,
             args=(self.inbox,),
@@ -665,13 +668,14 @@ class IntakeBoundMonitor:
     async def _probe_disk(self, path: str) -> tuple[DiskFloorReading | None, BaseException | None]:
         """This tick's disk reading, or ``(None, cause)`` when it has none (BACKLOG #5767).
 
-        A thread blocked on a hung volume cannot be cancelled, so each probe gets a daemon thread of
-        its own and never holds a worker of the default executor that routing and transforms share.
+        A thread blocked on a hung volume cannot be cancelled, so probes run on a dedicated daemon
+        worker and never hold a thread of the default executor that routing and transforms share.
         At most one probe runs on the current worker. A worker stuck past
         :data:`PROBE_STUCK_SECONDS` is abandoned and replaced, so one wedged call does not end
         measuring, and at most :data:`MAX_ABANDONED_DISK_PROBES` abandoned threads may be alive. At
         that cap no probe starts until one of them returns, so calls wedged for good leave the bound
-        unmeasured until a restart. Only the tick that started a probe uses its result."""
+        unmeasured until a restart, which can itself block while the volume is still hung. Only the
+        tick that started a probe uses its result."""
         self._abandoned_probes = [t for t in self._abandoned_probes if t.is_alive()]
         worker = self._probe_worker
         if worker is not None and not worker.thread.is_alive():
@@ -687,7 +691,8 @@ class IntakeBoundMonitor:
                 log.warning(
                     "intake pause: %d disk probes are stuck on the SQLite store's volume, so the "
                     "engine stopped starting new ones. The disk pause state cannot change until "
-                    "one of them returns and a new probe succeeds, or the engine restarts",
+                    "one of them returns and a new probe succeeds. A restart also clears this, but "
+                    "only once the volume answers: a start on a hung volume can block",
                     len(self._abandoned_probes),
                 )
             return None, None
@@ -700,6 +705,10 @@ class IntakeBoundMonitor:
                 worker.thread.start()
             except Exception as exc:  # advisory: an unmeasured tick, never a dead monitor
                 return None, exc
+            # Holds the queue only, so a monitor dropped without stop() still ends its idle thread.
+            closer = weakref.finalize(self, worker.inbox.put, None)
+            closer.atexit = False
+            worker.close = closer
             self._probe_worker = worker
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[_DiskOutcome] = loop.create_future()
@@ -715,7 +724,8 @@ class IntakeBoundMonitor:
         is idle; until then it counts against the cap."""
         worker, self._probe_worker = self._probe_worker, None
         if worker is not None:
-            worker.inbox.put(None)
+            if worker.close is not None:
+                worker.close()  # sends the stop sentinel once and drops the finalizer
             self._abandoned_probes.append(worker.thread)
 
     def _sync_alert(self, reason: str, *, value: int, limit: int) -> None:
