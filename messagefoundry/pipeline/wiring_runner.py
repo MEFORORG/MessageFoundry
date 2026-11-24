@@ -2913,10 +2913,12 @@ class RegistryRunner:
         ``None`` where a listener on SQLite or Postgres would keep a longer value.
 
         Those checks see a summary only after it is built, so its memory bound is taken first, from
-        the raw text of the fields it is built from. It is not built when those fields total over
-        :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, or when their counted escapes could
-        add more than :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields, so an
-        escape in a component the summary does not read can still cost a row its summary."""
+        the raw text of the fields it can be built from for any message type. It is not built when
+        a PID, ORC or OBR line is over :attr:`_INJECT_SUMMARY_MAX_SOURCE_CHARS` characters, when
+        those fields total more, or when their counted escapes could add more than
+        :attr:`_INJECT_SUMMARY_MAX_CHARS`. The measure takes whole fields and counts the order
+        fields on every type, so a value the summary would not read can still cost a row its
+        summary."""
         from messagefoundry.parsing._builtin_hl7 import escape_expansion_estimate
 
         cap = self._INJECT_SUMMARY_MAX_CHARS
@@ -2943,12 +2945,25 @@ class RegistryRunner:
                 # A whole-field read returns the raw text and unescapes nothing, so measuring the
                 # fields summarize() reads costs no expansion. The control id and type are such
                 # reads too, which is why only the summary needs this bound.
-                sources = [
-                    value
-                    for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
-                    if (value := peek.field(path))
-                ]
-                read_summary = sum(map(len, sources)) <= self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                # Any field read splits its whole segment, at a cost set by the segment's field
+                # count, so a long segment is refused from its unsplit line before that read.
+                limit = self._INJECT_SUMMARY_MAX_SOURCE_CHARS
+                unsplit = peek.message["_lazy"]
+                read_summary = all(
+                    len(unsplit.get(index, "")) <= limit
+                    for index, segment in enumerate(peek.message["segments"])
+                    if segment["id"] in ("PID", "ORC", "OBR")
+                )
+                sources = (
+                    [
+                        value
+                        for path in ("MSH-9", "PID-3", "PID-5", "ORC-2", "ORC-3", "OBR-2", "OBR-3")
+                        if (value := peek.field(path))
+                    ]
+                    if read_summary
+                    else []
+                )
+                read_summary = read_summary and sum(map(len, sources)) <= limit
                 if read_summary:
                     # The estimate takes the escape character from its text's first line, so the
                     # probe opens with the message's own MSH encoding characters.

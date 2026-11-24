@@ -1002,6 +1002,17 @@ async def test_inject_bound_reads_the_messages_own_escape_character(
     assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
 
 
+async def test_inject_does_not_split_a_segment_of_very_many_fields(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # A field read splits its whole segment, so this PID must be refused from its unsplit line.
+    body = f"MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID{'|' * 500_000}\r"
+    engine.add_registry(_running_registry(tmp_path))
+    await engine.start()
+    assert await _peak_of_field_read(engine, body) < _INJECT_READ_PEAK_BOUND
+    assert await _inject_fields(engine, body) == ("MSG1", "ADT^A01", None)
+
+
 @pytest.mark.parametrize("filler", ["X", "中", "\U0001f600"], ids=["latin", "cjk", "astral"])
 async def test_inject_at_the_largest_summarized_source_stays_within_the_bound(
     engine: Engine, tmp_path: Path, filler: str
