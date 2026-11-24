@@ -8948,9 +8948,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     * the name is a modelled section's name and nothing else, ``MEFOR_<SECTION>`` with or without
       trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
       modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
-      that name, and the
-      name of a config section is the engine's, so a refusal here does not guess at another tool's
-      variable. Manager decision d20261123T172418598-d8ffd6, option (c), under the owner's
+      that name, and the name of a config section is the engine's, so a refusal here does not
+      guess at another tool's variable. Manager decision d20261123T172418598-d8ffd6, option (c), under the owner's
       delegation of 2026-11-23;
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
@@ -8961,8 +8960,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
 
     At least these names are spared:
 
-    * one whose first part names no modelled section, outside the first case above
-      (``MEFOR_ALLOW_INSECURE_TLS``, the escape honoured only at ``[security].enforcement = warn``; a harness variable; another tool's).
+    * one that none of the three cases above matches because it names no modelled section
+      (``MEFOR_ALLOW_INSECURE_TLS``, the escape honoured only at
+      ``[security].enforcement = warn``; a harness variable; another tool's).
       So a typo in the SECTION part of a name is not refused.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
@@ -9000,7 +9000,8 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
             continue
         section, _, key = rest.partition("_")
         model = models.get(section)
-        if section not in _SECTIONS or section == "security" or not key or model is None:
+        # An empty key cannot reach here: the section-name case above took it.
+        if section not in _SECTIONS or section == "security" or model is None:
             continue
         if key in model.model_fields:
             continue
@@ -9072,10 +9073,11 @@ def _env_can_hold(model: type[BaseModel], key: str) -> bool:
 
 
 def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> list[str]:
-    """One note per ``MEFOR_*`` variable that :func:`_reject_unknown_env_keys` lets through and
-    that LOOKS like a setting nothing will read (vault BACKLOG #2600). Never quotes a value.
+    """One note per ``MEFOR_*`` variable that LOOKS like a setting nothing will read (vault
+    BACKLOG #2600). Never quotes a value. Every such variable but a section's name alone is one
+    :func:`_reject_unknown_env_keys` lets through; that one it refuses too (the first shape below).
 
-    A WARNING and not a refusal, on purpose. A name the refusal passes names no section the
+    For the rest, a WARNING and not a refusal, on purpose. A name the refusal passes names no section the
     environment can set, and the engine cannot list every such name: harnesses, scripts and an
     operator's own tooling use ``MEFOR_*`` names this module has never seen. A wrong guess here
     costs a log line; a wrong refusal would stop the start.
@@ -9083,9 +9085,10 @@ def _unread_env_notes(environ: Mapping[str, str], data: Mapping[str, Any]) -> li
     At least two shapes are noted:
 
     * the name is a modelled section's name alone (:func:`_section_named_alone`), which
-      :func:`_reject_unknown_env_keys` then refuses. It is noted as well, because the note is
-      logged before every refusal in :func:`load_settings`, so a refused file key does not hide
-      it until the next start;
+      :func:`_reject_unknown_env_keys` then refuses. It is noted as well, because
+      :func:`load_settings` logs the notes before its key and variable refusals, so a refused file
+      key does not hide it until the next start. A file that cannot be read or parsed is refused
+      before any note is logged;
     * the name splits as ``MEFOR_<NEAR>_<KEY>`` where ``NEAR`` is no section, is close to one, and
       ``KEY`` is a real setting of that section or the rest of a :data:`_OUT_OF_BAND_ENV` name
       (``MEFOR_STOER_PATH``). ``NEAR`` is compared only with sections of as many ``_``-parts as it

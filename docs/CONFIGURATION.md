@@ -44,8 +44,9 @@
 > **A name that is a section and nothing else is refused too**, such as `MEFOR_UPDATE_CHECK=false`,
 > `MEFOR_STORE` or `MEFOR_STORE_`. No setting has that name. The refusal names the variable, never
 > its value, and says how a setting in that section is spelled, or that the section is set in the
-> file. The same variable is also logged as a WARNING before the load's refusals run, so a refused
-> file key does not hide it until the next start.
+> file. The same variable is also logged as a WARNING before the load refuses an unknown key, so a
+> refused file key does not hide it until the next start. A settings file that cannot be read or
+> parsed is refused before that WARNING.
 >
 > **A variable that names no section is not refused. Some are warned about, and the rest are
 > dropped with no message.** The loader cannot tell a typo in the SECTION part from the `MEFOR_*`

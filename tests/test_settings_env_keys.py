@@ -184,7 +184,7 @@ def test_names_outside_the_section_name_shape_still_load(caplog: pytest.LogCaptu
                 "MEFOR_ALLOW_INSECURE_TLS": "1",  # names no section
                 "MEFOR_TEST_FORCE_AAD_BIND": "1",  # the test suite's own switch
                 "MEFOR_STOER_PATH": "x.db",  # near a section: warned about, not refused
-                "MEFOR_PORT": "tcp://10.0.0.1:8765",  # what a Service named "mefor" injects
+                "MEFOR_PORT": "tcp://10.0.0.1:8765",  # names no section
             },
             default_file=False,
         )
@@ -322,7 +322,8 @@ def test_the_note_is_logged_at_warning_and_the_load_still_succeeds(
         )
     # Neither variable changed anything, as the note says.
     assert str(loaded.store.path) != _SENTINEL
-    assert loaded.auth.lockout_minutes == 15
+    default = type(loaded.auth).model_fields["lockout_minutes"].default
+    assert default != 7 and loaded.auth.lockout_minutes == default
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "MEFOR_STOER_PATH" in text and "MEFOR_AUHT_LOCKOUT_MINUTES" in text
     assert "NOT applied" in text
@@ -794,9 +795,9 @@ _DEPLOY_GLOBS = (
     "scripts/**/*.ps1",
     "scripts/**/*.sh",
 )
-#: A name followed by ``*`` or ``_*`` is a documented family (``MEFOR_EGRESS_ALLOWED_*``), not a name.
-#: A family written with a wildcard or a placeholder (``MEFOR_STORE_*``, ``MEFOR_STORE_<KEY>``).
-_FAMILY = re.compile(r"_?[*<]")
+#: A name followed by ``*``, ``_*`` or ``_<`` is a documented family (``MEFOR_EGRESS_ALLOWED_*``,
+#: ``MEFOR_STORE_<KEY>``), not a name.
+_FAMILY = re.compile(r"_?\*|_<")
 
 
 def _deployment_names() -> dict[str, set[str]]:
