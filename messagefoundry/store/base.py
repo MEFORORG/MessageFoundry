@@ -5563,10 +5563,10 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
-    loop's task type). On a task without it nothing can be checked, so the borrow is cancelled at
-    once, and one WARNING says the check is off. That matches origin/main's acquire_pooled, but not
-    origin/main's warm-up, which put its cancel off one turn: on such a task type a hand-over in
-    flight in the cancel's turn can be lost on either path.
+    loop's task type). On a task without it nothing can be checked, so the cancel is put off one
+    loop turn, as origin/main's warm-up did, and one WARNING says the check is off. A hand-over
+    already queued in the cancel's turn then finishes first; one that takes more than that turn can
+    still be lost on such a task type.
 
     Callers register what returns the borrow's connection (:func:`_park_borrow`, or the warm-up's
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
@@ -5578,9 +5578,9 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
             _warned_no_waiter = True
             log.warning(
                 "this event loop's tasks have no _fut_waiter; abandoned pool borrows are cancelled "
-                "without checking for a hand-over in flight"
+                "one turn later without checking for a hand-over in flight"
             )
-        borrow.cancel()
+        asyncio.get_running_loop().call_soon(borrow.cancel)
         return
     if deferrals < _BORROW_CANCEL_MAX_DEFERRALS and _value_in_flight(borrow):
         asyncio.get_running_loop().call_soon(_cancel_borrow, borrow, deferrals + 1)
@@ -5597,12 +5597,13 @@ def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
     cancelled is not in flight, since no value is on its way. Outside the check, at least: a gather
     with a child done with a value beside a pending child (its cancel discards that value), a shield
     or another combinator, and a future that ignores its cancel; each counts as not in flight. The
-    gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour."""
+    gather check reads ``_children``, a CPython detail the gather tests pin only through behaviour.
+    A nested task without ``_fut_waiter`` cannot be checked and counts as not in flight."""
     if fut.done():
         return not fut.cancelled() and fut.exception() is None
     if isinstance(fut, asyncio.Task):
         waiter: asyncio.Future[Any] | None = getattr(fut, "_fut_waiter", None)
-        return waiter is None or _value_in_flight(waiter)
+        return hasattr(fut, "_fut_waiter") and (waiter is None or _value_in_flight(waiter))
     children: list[asyncio.Future[Any]] | None = getattr(fut, "_children", None)
     if children is not None:
         pending = [child for child in children if not child.done()]
@@ -5642,7 +5643,7 @@ async def acquire_pooled(
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
     per retry. That cancel goes through :func:`_cancel_borrow`, which on CPython puts it off while a
-    value is on its way into the borrow (on a task type it cannot read, it cancels at once).
+    value is on its way into the borrow (on a task type it cannot read, it puts it off one turn).
     Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
     borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
     not check is lost before the borrow ends. The caller's own cancellation takes the same path — it must, or a
