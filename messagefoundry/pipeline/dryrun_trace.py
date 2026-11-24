@@ -54,8 +54,8 @@ site keeps them unchanged).
   ``list``/``tuple``/``set``/``frozenset`` (``str``/``bytes``/``bytearray`` aside). It means only that
   the per-invocation ``sends`` were not read; such a body may still carry line events.
 * *Bounded capture.* An invocation keeps at most :data:`_MAX_EVENTS` line events and
-  :data:`_MAX_WRITES` ``msg`` writes. Past the first it carries ``"truncated": true``; past the
-  second, ``"writes_truncated": true``, and later writes on every line are dropped (BACKLOG #6824).
+  :data:`_MAX_WRITES` ``msg`` writes. Past either it carries ``"truncated": true``; past the second
+  also ``"writes_truncated": true``, and later writes on every line are dropped (BACKLOG #6824).
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -100,9 +100,7 @@ __all__ = ["trace_dry_run"]
 _MAX_EVENTS = 5000
 # Message writes are capped per invocation on their own, because a helper the Handler calls is not
 # line-traced: all its writes land on one Handler line, so the event cap alone never bounds them.
-# A write past the event cap is dropped under ``truncated``, since its line is never emitted; one past
-# this cap is dropped and the record marked ``writes_truncated`` instead, because its lines may all be
-# present and ``truncated`` tells a consumer line coverage is short (BACKLOG #6824).
+# Semantics: :meth:`_Recorder.record_write` (BACKLOG #6824).
 _MAX_WRITES = 5000
 _MAX_VALUE_LEN = 120
 
@@ -361,19 +359,21 @@ class _Recorder:
     # message-write capture (called from the patched Message.set) --------------
 
     def record_write(self, path: str, value: object) -> None:
-        # Past the event cap no line is finalized, and with no latched frame none ever is, so a write
-        # kept then would only be held: a long mutating loop would grow this recorder without bound
-        # (BACKLOG #6824). Other kept writes are bounded by _MAX_WRITES.
-        if self.frame is None:
-            return
+        # Past the event cap no line is finalized, so a write kept then would only be held: a long
+        # mutating loop would grow this recorder without bound (BACKLOG #6824). A write with no
+        # latched frame is keyed to the def line, where a later finalize may still emit it (a
+        # wrapper writing before a one-line target runs), so it is kept, against _MAX_WRITES.
         if len(self.events) >= _MAX_EVENTS:
             self.truncated = True
             return
         if self._write_count >= _MAX_WRITES:
+            # Also `truncated`: the IDE reads only that key, and a capped write list must not look
+            # complete there.
             self.writes_truncated = True
+            self.truncated = True
             return
         self._write_count += 1
-        line = self.frame.f_lineno
+        line = self.frame.f_lineno if self.frame is not None else (self.def_line or 0)
         self._writes_by_line.setdefault(line, []).append(
             {"path": path, "value": _safe_value(value, self.show_phi)}
         )

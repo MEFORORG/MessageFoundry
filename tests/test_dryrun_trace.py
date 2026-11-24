@@ -884,9 +884,8 @@ def test_writes_after_the_event_cap_are_not_retained(monkeypatch: pytest.MonkeyP
 
 def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     # A helper the Handler calls is not line-traced, so all its writes land on one Handler line.
-    # The per-invocation write cap must bound those too, and say so as `writes_truncated`: every
-    # line is still present, so `truncated` (which a consumer reads as short line coverage) stays
-    # off (BACKLOG #6824).
+    # The per-invocation write cap must bound those too, and say so as `writes_truncated` and as
+    # `truncated`, the key the IDE reads, so a capped trace never looks complete (BACKLOG #6824).
     from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
 
     def fill(msg: Message) -> None:
@@ -902,10 +901,26 @@ def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) 
     assert traced["sends"] == [{"outbound": "out"}]
     inv = _handler_invocation(traced)
     assert inv.get("writes_truncated") is True
-    assert "truncated" not in inv
+    assert inv.get("truncated") is True
     rec = next(r for r in made[0].invocations if r.kind == "handler")
     assert _retained_writes(rec) <= _MAX_WRITES
     assert len(_all_writes(inv)) == _MAX_WRITES
+
+
+def test_a_wrapper_write_before_a_one_line_target_is_emitted() -> None:
+    # Before the target frame latches, a write is keyed to the def line; a one-line target's def
+    # line is its body line, so that line's finalize emits it. The write is kept, not dropped.
+    import functools
+
+    def inner(msg: Message) -> Send: return Send("out", msg)  # fmt: skip  # noqa: E704
+
+    @functools.wraps(inner)
+    def wrapper(msg: Message) -> Send:
+        msg["MSH-3"] = "EARLY"
+        return inner(msg)
+
+    traced = trace_dry_run(_registry(route_to_h, {"h": wrapper}), ADT_A01, show_phi=True)
+    assert {"path": "MSH-3", "value": "EARLY"} in _all_writes(_handler_invocation(traced))
 
 
 def test_a_write_that_raises_still_shows_on_its_line() -> None:
