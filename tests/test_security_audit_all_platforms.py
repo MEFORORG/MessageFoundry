@@ -13,6 +13,7 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 from __future__ import annotations
 
 import codecs
+import contextlib
 import io
 import locale
 import os
@@ -1042,6 +1043,90 @@ def test_a_lock_character_stdout_cannot_encode_does_not_raise(
     out.flush()
     assert f"foo==1 ; sys_platform == '{_HAN}'" in raw.getvalue().decode("utf-8")
     assert len(ran) == 2
+
+
+def _stderr_into(monkeypatch: pytest.MonkeyPatch) -> io.BytesIO:
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stderr", io.TextIOWrapper(raw, encoding="utf-8", write_through=True))
+    return raw
+
+
+def test_a_closed_stdout_pipe_exits_2_before_the_audit_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5: a reader that closed the pipe made the summary raise (OSError errno 22 on Windows,
+    BrokenPipeError elsewhere) as a traceback. ``main`` refuses with exit 2 instead, and runs
+    neither pip nor pip-audit, so a run whose output went nowhere is not read as an audit."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    out = io.TextIOWrapper(open(write_end, "wb"), encoding="utf-8")  # noqa: SIM115 -- closed in the finally below
+    monkeypatch.setattr(sys, "stdout", out)
+    err = _stderr_into(monkeypatch)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    try:
+        assert main([str(src)], run=run) == 2
+    finally:
+        with contextlib.suppress(OSError):
+            out.close()
+    assert ran == []
+    text = err.getvalue().decode("utf-8")
+    assert f"::error::{src}: " in text
+    assert "Traceback" not in text
+
+
+def test_a_stdout_that_raises_broken_pipe_and_has_no_fileno_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5: a stream with no descriptor to point at devnull still ends in the exit 2 refusal."""
+
+    class _Gone(io.TextIOBase):
+        def write(self, s: str) -> int:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self) -> None:
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def fileno(self) -> int:
+            raise io.UnsupportedOperation("fileno")
+
+        def close(self) -> None:
+            """Collected without the flush ``IOBase.close`` would raise from."""
+
+    monkeypatch.setattr(sys, "stdout", _Gone())
+    err = _stderr_into(monkeypatch)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert ran == []
+    assert f"::error::{src}: " in err.getvalue().decode("utf-8")
+
+
+def test_a_closed_stdout_pipe_leaves_no_error_at_interpreter_exit(tmp_path: Path) -> None:
+    """R5, as a process: what stayed buffered is flushed again at exit, so without stdout pointed
+    at devnull the exit-time flush raised once more, after ``main`` had returned."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "messagefoundry.security.audit_all_platforms", str(src)],
+            cwd=ROOT,
+            stdout=write_end,
+            stderr=subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+    err = proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 2, err
+    assert f"::error::{src}: " in err
+    assert "Traceback" not in err
+    assert "Exception ignored" not in err
 
 
 def _seen_by(

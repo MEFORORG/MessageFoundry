@@ -129,6 +129,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import functools
 import io
 import locale
@@ -756,6 +757,27 @@ def _distinct_count(requirements: Sequence[str]) -> int:
     return len(set(requirements))
 
 
+def _refuse_closed_stdout(lock: str) -> int:
+    """Exit 2 for a stdout whose reader went away before the summary was written.
+
+    What stayed buffered is flushed again at interpreter exit and would raise there too, after
+    this returned; the Python docs' SIGPIPE note points stdout's descriptor at devnull for that.
+    A stream with no descriptor is left as it is.
+    """
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    with contextlib.suppress(OSError):
+        print(
+            f"::error::{lock}: stdout closed before the summary was written; the audit did not run",
+            file=sys.stderr,
+        )
+    return 2
+
+
 def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | None = None) -> int:
     # The lock's own text reaches stdout, which on a cp1252 console raised a traceback quoting a
     # character it could not encode (vault BACKLOG #3786 R5). UTF-8 keeps every character of an
@@ -880,15 +902,20 @@ def main(argv: Sequence[str] | None = None, run: Callable[[list[str]], int] | No
         return 2
     # A skipped pin is neither counted nor listed as audited.
     stripped = [e for e in stripped if (name := _pin_name(e)) is None or name not in private]
-    print(
-        f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
-        "requirement lines un-gated from a marker the host would have evaluated:"
-    )
-    for entry in stripped:
-        print(f"  {entry}")
-    for _, entry in skipped:
-        print(f"  not audited, named by --skip-private: {entry}")
-    sys.stdout.flush()
+    try:
+        print(
+            f"{lock}: {_distinct_count(read)} pinned requirements audited, {len(stripped)} "
+            "requirement lines un-gated from a marker the host would have evaluated:"
+        )
+        for entry in stripped:
+            print(f"  {entry}")
+        for _, entry in skipped:
+            print(f"  not audited, named by --skip-private: {entry}")
+        sys.stdout.flush()
+    except OSError:
+        # A reader that closed the pipe (BrokenPipeError, or OSError errno 22 on Windows) made this
+        # a traceback (vault BACKLOG #3786 R5). Refused before pip or pip-audit runs.
+        return _refuse_closed_stdout(lock)
     if run is None:
         run = functools.partial(_run, pass_environment=tuple(args.pass_environment))
     pip_check = [*python_module_argv("pip"), "install", "--dry-run", "--ignore-installed"]
