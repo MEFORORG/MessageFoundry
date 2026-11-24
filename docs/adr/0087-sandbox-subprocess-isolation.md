@@ -397,12 +397,13 @@ target, no `pickle` import left to mis-suppress:
   >   `EXITED_AFTER_BOOT`, or as `STDOUT_CLOSED` when only its EOF is found and it is still
   >   running once the EOF grace is spent, and counts toward that bound. One kept from an earlier
   >   dispatch is recorded the same way with `CRASH` in place of `EXITED_AFTER_BOOT`, writes its
-  >   WARNING, and counts, unless the engine read its EOF before the first check ended. Then it is
+  >   WARNING, and counts, unless the engine read its EOF before the first check began the pass
+  >   that kept the worker. Then it is
   >   handled as at the first check: found exited, it is replaced with no cause recorded and is not
   >   counted; found by its EOF, it is reaped with no cause, or recorded as `STDOUT_CLOSED` when it
   >   is still running once the grace is spent, and counts. So a kept worker that died before the
-  >   first check is still recorded as `CRASH` when the engine read its EOF only after that check
-  >   ended, or read none because another holder, such as a grandchild, kept its response pipe
+  >   first check is still recorded as `CRASH` when the engine read its EOF only after that pass
+  >   began, or read none because another holder, such as a grandchild, kept its response pipe
   >   open (`_died_before_first_check` in `messagefoundry/pipeline/sandbox.py`).
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that

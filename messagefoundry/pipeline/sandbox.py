@@ -205,10 +205,12 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     found by :meth:`SandboxSession._live_worker` before a request is written. A worker spawned in
     the dispatch that exits before its request is recorded as :attr:`EXITED_AFTER_BOOT`, because
     a feed whose workers keep doing so is a crash loop, not a peer that happened to die. A worker
-    kept from an earlier dispatch that the check right before the write finds exited, or whose
-    queued EOF it finds, is recorded as :attr:`CRASH`, with its WARNING, unless the worker's
-    response pipe reached EOF before the dispatch's first check ended (vault BACKLOG #3135 step 7;
-    :meth:`SandboxSession._died_before_first_check` says when such a worker is still recorded).
+    kept from an earlier dispatch that the check right before the write finds exited, by the
+    process or by its queued EOF, is recorded as :attr:`CRASH`, with its WARNING, unless the
+    engine read its EOF before the dispatch's first check began its last pass (vault BACKLOG #3135
+    step 7; :meth:`SandboxSession._died_before_first_check` says when such a worker is still
+    recorded). A queued EOF from a worker still running once the grace is spent is a
+    :attr:`STDOUT_CLOSED` kill wherever it is found, as before.
 
     There is no CPU-cap cause: the engine sets no ``RLIMIT_CPU`` (engine PR 2133), and the wall
     cap is the bound. A request the codec cannot encode, or one over the frame cap, is refused before a
@@ -671,7 +673,7 @@ _EOF_EXIT_POLL_SECONDS: Final = 0.02
 _EOF_EXIT_FLOOR_SECONDS: Final = 0.1
 
 #: How many workers a dispatch may replace for exiting, or closing their pipe, before its request
-#: before its call fails. The bound is per dispatch, shared by both of its
+#: is written; one more fails the call. The bound is per dispatch, shared by both of its
 #: :meth:`SandboxSession._live_worker` calls, so the call before the write does not restart it.
 _LIVE_WORKER_EOF_RESPAWNS: Final = 2
 
@@ -1033,11 +1035,11 @@ class SandboxSession:
         self._stray_retried = False
         self._eof_respawns = 0
         self._dispatch_generation = self._generation
-        # When the current dispatch's first _live_worker call handed out its worker, and when the
-        # current worker's frame reader read EOF on its response pipe (empty until it does; a fresh
-        # list per spawn, so a stale reader's stamp lands in a list nothing reads). Together they
-        # tell the second call whether a kept worker it finds dead died before the first call ended
-        # (see _died_before_first_check).
+        # When the current dispatch's first _live_worker call began the pass that handed out its
+        # worker, and when the current worker's frame reader read EOF on its response pipe (empty
+        # until it does; a fresh list per spawn, so a stale reader's stamp lands in a list nothing
+        # reads). Together they tell the second call whether a kept worker it finds dead died
+        # before that pass (see _died_before_first_check).
         self._first_check_at = float("-inf")
         self._eof_at: list[float] = []
         # The [egress] lists whose empty-list refusal this session has logged.
@@ -1466,12 +1468,15 @@ class SandboxSession:
 
         A worker spawned in this dispatch and found exited by this check is recorded as
         :attr:`KillCause.EXITED_AFTER_BOOT`, whether or not its EOF has reached the queue: the
-        check asks the process too, the second call included, and it counts toward the bound. At
-        the second call (``before_write``), a worker kept from an earlier dispatch and found exited,
-        or whose EOF is queued, is taken to have died during this dispatch, so it is recorded as
-        :attr:`KillCause.CRASH` and counted, as it would have been had the request been written to
-        it, unless :meth:`_died_before_first_check` says its pipe reached EOF before the first call
-        ended. Then, as at the first call, it died between dispatches and is handled as the first
+        check asks the process too, the second call included, and it counts toward the bound. One
+        whose EOF is queued and that is still running once the grace is spent is recorded as
+        :attr:`KillCause.STDOUT_CLOSED` instead. At the second call (``before_write``), a worker
+        kept from an earlier dispatch and found exited, or whose EOF is queued, is taken to have
+        died during this dispatch, so it is recorded as :attr:`KillCause.CRASH`, or as
+        :attr:`KillCause.STDOUT_CLOSED` when only its EOF is found and it is still running once the
+        grace is spent, and counted, as it would have been had the request been written to it,
+        unless :meth:`_died_before_first_check` says its pipe reached EOF before the first call
+        began its last pass. Then, as at the first call, it died between dispatches and is handled as the first
         call handles such a worker: an exited one is replaced with no cause and not counted, and a
         queued EOF reaps it with no cause, or as :attr:`KillCause.STDOUT_CLOSED` if it is still
         running once the grace is spent, and is counted. The check cannot see an exit that
@@ -1482,6 +1487,9 @@ class SandboxSession:
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
         while True:
+            # Taken before this pass looks at the worker or the queue, so an EOF stamped before it
+            # was read before the pass began: a death after it can never read as an earlier one.
+            pass_started = time.monotonic()
             if self._proc is None or _has_exited(self._proc):
                 booted = self._generation != self._dispatch_generation
                 crashed = before_write and not self._died_before_first_check()
@@ -1510,22 +1518,24 @@ class SandboxSession:
                 # queued as an EOF, so ask the process itself, without reaping it.
                 if not (fresh and _has_exited(proc)):
                     if not before_write:
-                        self._first_check_at = time.monotonic()
+                        self._first_check_at = pass_started
                     return proc
                 self._kill(proc, KillCause.EXITED_AFTER_BOOT, phase)
             self._count_eof_respawn()
 
     def _died_before_first_check(self) -> bool:
         """Whether the current worker's frame reader read EOF on its response pipe before this
-        dispatch's first :meth:`_live_worker` call handed the worker out, so that a death the second
-        call finds predates the request's encode. False when no EOF has been read yet, or it was
-        read later.
+        dispatch's first :meth:`_live_worker` call began the pass that handed the worker out, so
+        that a death the second call finds predates the request's encode. False when no EOF has
+        been read yet, or it was read later.
 
-        The reader stamps the EOF once its read returns, which is after the pipe closed, so a
-        worker that dies while the request is encoded never reads True, and its death is recorded.
-        A worker that died before the first call ended still reads False, and is recorded as a
-        ``CRASH``, when the reader read its EOF only after that call ended, or read none because
-        another holder kept the pipe open, such as a grandchild that inherited fd 1."""
+        The reader stamps the EOF once its read returns, which is after the pipe closed, and the
+        pass's time is taken before it looks at the worker, so a worker that dies during that pass
+        or while the request is encoded never reads True, and its death is recorded. A worker that
+        died before the pass still reads False, and is recorded as a ``CRASH`` (or
+        ``STDOUT_CLOSED``, as :meth:`_live_worker` says), when the reader read its EOF only after
+        the pass began, for example because the reader thread was not scheduled until then, or read
+        none because another holder kept the pipe open, such as a grandchild that inherited fd 1."""
         return bool(self._eof_at) and self._eof_at[0] < self._first_check_at
 
     def _count_eof_respawn(self) -> None:

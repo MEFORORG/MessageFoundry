@@ -1230,7 +1230,13 @@ def test_a_process_a_handler_spawns_does_not_get_the_request_pipe_on_fd_0(tmp_pa
     while its fd 0 is not the pipe (ADR 0087, the step 8 notes)."""
     (tmp_path / "graph.py").write_text(_FD0_GRAPH, encoding="utf-8")
     registry = load_config(tmp_path)
-    session = _session(str(tmp_path), inbound="IB_F")
+    # Each dispatch starts three interpreters, so the default 15 s wall cap would fail it on the
+    # loaded runner the marker above is for.
+    session = _session(
+        str(tmp_path),
+        inbound="IB_F",
+        policy=SandboxPolicy(mode=SandboxMode.SUBPROCESS, wall_seconds=120.0),
+    )
     try:
         assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
             ("OB_F", "0,0,3")
