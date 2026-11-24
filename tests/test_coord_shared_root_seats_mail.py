@@ -716,6 +716,68 @@ def test_the_record_hook_keeps_the_epoch_fallback_for_an_unreadable_file(
     assert json.loads(recs[0].read_text(encoding="utf-8-sig"))["poolEpoch"] == 1
 
 
+def test_bump_epoch_is_refused_for_a_codex_session(repo: Path, shared: Path) -> None:
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-BumpEpoch",
+        env=_env(shared, KORUS_AGENT="codex", KORUS_SESSION_ID="cx-1"),
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "REFUSED for a Codex session" in proc.stderr
+    assert not list(shared.rglob(".pool-epoch")) and not list(_local(repo).rglob(".pool-epoch"))
+
+
+def test_writer_errors_take_a_bracketed_root_and_the_record_host(
+    repo: Path, tmp_path: Path
+) -> None:
+    # '[1]' is a wildcard to Add-Content -Path, which then writes nothing (BACKLOG #7593). A file where
+    # the .writer-alive directory belongs makes the heartbeat fail, which must stay non-fatal.
+    shared = tmp_path / "sh[1]" / "mefor-coord"
+    seats = shared / "seats"
+    seats.mkdir(parents=True)
+    (seats / ".writer-alive").write_text("not a directory", encoding="utf-8")
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-Record",
+        "-Worktree",
+        top,
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-brk", COMPUTERNAME="ENV-SAYS-OTHER"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    errors = seats / ".writer-errors.txt"
+    assert errors.is_file(), proc.stderr
+    lines = [
+        ln for ln in errors.read_text(encoding="utf-8-sig").splitlines() if "writer-alive" in ln
+    ]
+    assert lines, errors.read_text(encoding="utf-8-sig")
+    host = lines[0].split("\t")[1]
+    assert host != "ENV-SAYS-OTHER" and host, lines[0]
+
+
+def test_the_heartbeat_is_replaced_whole_and_leaves_no_temp(repo: Path, shared: Path) -> None:
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    alive = shared / "seats" / ".writer-alive"
+    for _ in range(2):
+        proc = _ps(
+            COORD / "seat.ps1",
+            repo,
+            "-Record",
+            "-Worktree",
+            top,
+            env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-alive"),
+        )
+        assert proc.returncode == 0, proc.stderr
+        beats = list(alive.iterdir())
+        assert len(beats) == 1 and beats[0].suffix == ".txt", beats
+        assert time.strptime(beats[0].read_text(encoding="utf-8-sig").strip(), "%Y-%m-%dT%H:%M:%SZ")
+        # A read-only heartbeat is replaced, as the records are, not left stale (temp then rename).
+        os.chmod(beats[0], 0o444)
+    assert not (shared / "seats" / ".writer-errors.txt").exists()
+
+
 def test_bump_epoch_waits_on_a_held_mutex_and_never_steals_it(repo: Path, shared: Path) -> None:
     seats = shared / "seats"
     seats.mkdir(parents=True)

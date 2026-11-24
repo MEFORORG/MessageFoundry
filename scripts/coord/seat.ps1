@@ -169,6 +169,14 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true' -and $PSCmdlet.ParameterSetName -notin 'R
     exit 3
 }
 
+# The pool epoch marks a CLAUDE account switch. docs/CODEX.md: "Do not use Claude's account-switch or
+# pool-epoch commands for a Codex account." bridge.py refuses it too; this holds for a direct run
+# (BACKLOG #7594). Nothing is read or written.
+if ($env:KORUS_AGENT -eq 'codex' -and $BumpEpoch) {
+    [Console]::Error.WriteLine('seat.ps1 -BumpEpoch: REFUSED for a Codex session (KORUS_AGENT=codex). The pool epoch marks a Claude account switch; docs/CODEX.md says not to use it for a Codex account. Nothing was read or written.')
+    exit 1
+}
+
 $SCHEMA = 1
 $WRITER = 'seat.ps1/1.0.0'
 
@@ -190,8 +198,10 @@ function Write-WriterError {
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
-        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
-        Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
+        # Get-CoordHost, the name every shared record carries, not the inherited $env:COMPUTERNAME;
+        # -LiteralPath, so a '[' in a shared-root path is not read as a wildcard (BACKLOG #7593).
+        $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), (Get-CoordHost), $Stage, ($Message -replace '\s+', ' ')
+        Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
 
@@ -1289,8 +1299,14 @@ try {
     try {
         $aliveDir = Join-Path $script:SeatsDir '.writer-alive'
         if (-not (Test-Path -LiteralPath $aliveDir)) { New-Item -ItemType Directory -Path $aliveDir -Force | Out-Null }
-        Set-Content -LiteralPath (Join-Path $aliveDir "$boxKey.txt") `
-            -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+        # Temp then rename (BACKLOG #7594): Set-Content in place truncates first, so a reader could
+        # find the heartbeat empty. A failure is still only recorded, never fatal (rule 2).
+        $alive = Join-Path $aliveDir "$boxKey.txt"
+        $aliveTmp = Join-Path $aliveDir (".$boxKey.txt." + [guid]::NewGuid().ToString('n') + '.tmp')
+        try {
+            Set-Content -LiteralPath $aliveTmp -Value ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) -Encoding utf8 -EA Stop
+            Move-CoordFileReplace -Source $aliveTmp -Destination $alive -ReplaceReadOnly
+        } catch { Remove-Item -LiteralPath $aliveTmp -Force -EA SilentlyContinue; throw }
     } catch { Write-WriterError -Stage 'writer-alive' -Message $_.Exception.Message }
 
     if ($BumpEpoch) {
