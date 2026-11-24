@@ -5,11 +5,13 @@
 Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` through
 :func:`messagefoundry.childenv.python_child_argv`, which runs this module the way ``python -m``
 would. It speaks the length-prefixed **MFW2** codec
-(:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — requests are read from a
-private copy of the stdin pipe, since fd 0 is the null device once :func:`_detach_request_pipe`
-has run (vault BACKLOG #3135 step 8) — a closed-tag JSON+segment wire whose
-decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
-direction, in either process.
+(:mod:`messagefoundry.pipeline._sandbox_codec`), a closed-tag JSON+segment wire whose decode path
+cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
+direction, in either process. The engine starts the worker with the request pipe on fd 0 and the
+response pipe on fd 1. Before it reads anything, :func:`_detach_request_pipe` moves the request
+pipe to a private, non-inheritable descriptor and points fd 0 at the null device (vault BACKLOG
+#3135 step 8), so the worker reads its frames from that private copy, never from fd 0 or
+``sys.stdin``, and writes its replies to fd 1.
 
 1. **Bootstrap** — reads one ``boot`` frame ``{snapshot, forbidden, mem_mb, code_sets, broker}``, loads
    the message :class:`~messagefoundry.config.wiring.Registry` from the engine's config snapshot
@@ -103,11 +105,18 @@ def _detach_request_pipe() -> io.BufferedReader:
     request pipe, from which it could read a later request's id and forge that request's answer.
     The pipe moves to a descriptor :func:`os.dup` makes non-inheritable (PEP 446), and fd 0 is
     pointed at the null device, so such a process finds no pipe on fd 0, with its descriptors
-    inherited or not. On Windows :mod:`subprocess` hands a child the process's standard input
-    handle rather than fd 0. ``os.dup2`` repoints that handle only in a console-subsystem
-    interpreter, so the handle is read back and the worker refuses to boot when it does not name
-    the null device. The old pipe handle is closed by the ``dup2``. An :class:`OSError` here is a
-    bootstrap failure, reported as one.
+    inherited or not. On Windows, when a Handler redirects at least one of a child's standard
+    streams, :mod:`subprocess` hands the child this process's standard input handle for any
+    stream it does not redirect, rather than fd 0; with none redirected it passes no standard
+    handles. ``os.dup2`` repoints that handle only in a console-subsystem interpreter, so the
+    handle is read back and the worker refuses to boot when it does not name the null device.
+    The old pipe handle is closed by the ``dup2``.
+
+    A failure here is a bootstrap failure. Once the pipe is duplicated, it raises
+    :class:`_RequestPipeRefused` with a reader on the private copy, which the caller owns: it
+    drains the boot frame from it and closes it, so the parent's boot write completes and the
+    parent reads the refusal's reason. An :class:`OSError` from the ``os.dup`` itself carries no
+    reader.
 
     This closes inheritance across a new program through fd 0 only. Code running in the worker
     can still read the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps
@@ -115,23 +124,53 @@ def _detach_request_pipe() -> io.BufferedReader:
     ``/proc/<pid>/fd`` on Linux and handle duplication on Windows (ADR 0087 AC-10). On Windows,
     when the worker is started through a virtual environment's ``python.exe`` launcher, the
     launcher hands the worker a second, inheritable handle to the request pipe that this does not
-    close, so a process the worker starts with handle inheritance can still read the pipe
-    (measured by review round-4b15e359; unfixed). Called before
-    the boot frame is read, so no byte has been buffered from fd 0 yet."""
+    close, so a process the worker starts with handle inheritance can still read the pipe; that
+    is unfixed, and ADR 0087's step 8 note on AC-10 records it. Called before the boot frame is
+    read, so no byte has been buffered from fd 0 yet."""
     private = os.dup(0)
-    null = os.open(os.devnull, os.O_RDONLY)
     try:
-        os.dup2(null, 0, inheritable=True)
-    finally:
-        os.close(null)
-    if sys.platform == "win32":
-        import _winapi
-        import msvcrt
+        null = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null, 0, inheritable=True)
+        finally:
+            os.close(null)
+        if sys.platform == "win32":
+            import _winapi
+            import msvcrt
 
-        if _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE) != msvcrt.get_osfhandle(0):
+            if _winapi.GetStdHandle(_winapi.STD_INPUT_HANDLE) != msvcrt.get_osfhandle(0):
+                raise OSError("the standard input handle still names the request pipe")
+        return os.fdopen(private, "rb")
+    except OSError as exc:
+        try:
+            reader = os.fdopen(private, "rb")
+        except OSError:
             os.close(private)
-            raise OSError("the standard input handle still names the request pipe")
-    return os.fdopen(private, "rb")
+            raise exc from None
+        raise _RequestPipeRefused(str(exc), reader=reader) from exc
+
+
+def _drain_boot_frame(reader: Any) -> None:
+    """Read and discard the boot frame from a refused detach's private copy, then close it (see
+    :func:`_detach_request_pipe`). A helper rather than inline in :func:`main`, so main's first
+    ``_read_frame_bytes`` call stays the real boot read that the source-order guard in
+    ``tests/test_sandbox_worker_logging.py`` measures."""
+    from messagefoundry.pipeline.sandbox import _read_frame_bytes
+
+    try:
+        with reader:
+            _read_frame_bytes(reader)
+    except OSError as exc:
+        log.error("sandbox worker could not drain its boot frame: %s", type(exc).__name__)
+
+
+class _RequestPipeRefused(OSError):
+    """:func:`_detach_request_pipe` failed once it had duplicated the request pipe. ``reader`` is a
+    reader on that private copy, which the caller drains and closes."""
+
+    def __init__(self, message: str, *, reader: Any) -> None:
+        super().__init__(message)
+        self.reader = reader
 
 
 class _ForbiddenImportFinder:
@@ -604,13 +643,20 @@ def main() -> int:
     try:
         stdin = _detach_request_pipe()
     except OSError as exc:
-        # No boot frame is read. The parent may read this reply in place of the boot reply, but
-        # a boot frame larger than the pipe's buffer fails its write first, and the parent then
-        # records a failed boot write instead of this refusal.
-        try:  # noqa: SIM105
+        # Read the boot frame first, from the private copy the refusal hands back, so the parent's
+        # boot write completes and it reads this reply as the boot reply, naming the reason. With
+        # no copy (the os.dup itself failed) nothing is read, and a boot frame larger than the
+        # pipe's buffer fails the parent's write first: it then records a failed boot write, and
+        # only the line below, relayed at DEBUG, names the refusal.
+        log.error("sandbox worker refused to boot: the request pipe could not be detached")
+        if isinstance(exc, _RequestPipeRefused):
+            _drain_boot_frame(exc.reader)
+        try:
             _write_frame(stdout, codec.encode_bootfail(_error_text(exc)))
-        except (OSError, SandboxError):
-            pass
+        except (OSError, SandboxError) as write_exc:
+            log.error(
+                "sandbox worker could not report its boot refusal: %s", type(write_exc).__name__
+            )
         return 1
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot

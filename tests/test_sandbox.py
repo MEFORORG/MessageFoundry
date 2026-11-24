@@ -1301,6 +1301,78 @@ def test_the_private_request_pipe_is_not_inheritable() -> None:
     assert proc.stderr.decode().splitlines()[-1] == "False,False,hello"
 
 
+# The detach failing after its os.dup: the null device cannot be opened. The refusal must carry a
+# reader on the private copy, so the caller can drain the boot frame and close it, and fd 0 must
+# still be the pipe, since nothing was moved.
+_DETACH_FAIL_PROBE = """
+import os, stat, sys
+from messagefoundry.pipeline import _sandbox_worker
+
+def _no_devnull(*a, **k):
+    raise OSError("no null device")
+
+os.open = _no_devnull
+try:
+    _sandbox_worker._detach_request_pipe()
+except _sandbox_worker._RequestPipeRefused as exc:
+    with exc.reader as reader:
+        line = reader.readline().decode().strip()
+    fd0_is_pipe = stat.S_ISFIFO(os.fstat(0).st_mode)
+    sys.stderr.write(f"{line},{fd0_is_pipe},{reader.closed}")
+"""
+
+
+def test_a_detach_that_fails_after_its_dup_hands_back_the_private_copy() -> None:
+    """Vault BACKLOG #3135 step 8: a detach that fails once the pipe is duplicated does not leak
+    the copy. The refusal hands it back as a reader, which the caller drains and closes."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _DETACH_FAIL_PROBE],
+        input=b"hello\n",
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stderr.decode().splitlines()[-1] == "hello,True,True"
+
+
+def test_a_detach_refusal_drains_the_boot_frame_and_reports_its_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_run_one: Any,  # noqa: F811 - imports the worker without keeping its root handler
+) -> None:
+    """Vault BACKLOG #3135 step 8: a worker that refuses to detach its request pipe reads the boot
+    frame before it replies, so the parent's boot write completes and the parent reads the
+    refusal's reason as a failed boot, rather than recording a failed boot write."""
+    from messagefoundry.config.snapshot import ConfigSnapshot
+    from messagefoundry.pipeline import _sandbox_worker
+
+    stdin, stdout = io.BytesIO(), io.BytesIO()
+    boot = codec.encode_boot(
+        snapshot=ConfigSnapshot(directory=Path("."), files={}),
+        forbidden=(),
+        mem_mb=None,
+        code_sets=None,
+    )
+    sandbox_mod._write_frame(stdin, boot)
+    size = stdin.tell()
+    stdin.seek(0)
+
+    def _refuse() -> io.BufferedReader:
+        raise _sandbox_worker._RequestPipeRefused("the request pipe stays", reader=stdin)
+
+    monkeypatch.setattr(_sandbox_worker, "_detach_request_pipe", _refuse)
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(buffer=stdout))
+    assert _sandbox_worker.main() == 1
+    assert stdin.closed  # drained, then closed
+    assert size > 0
+    stdout.seek(0)
+    reply = sandbox_mod._read_frame_bytes(stdout)
+    assert reply is not None
+    worker_graph, why = codec.decode_boot_reply(reply)
+    assert worker_graph is None
+    assert "the request pipe stays" in why
+
+
 def test_a_worker_booted_in_the_dispatch_that_dies_during_encode_is_recorded(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1261,8 +1261,15 @@ class SandboxSession:
                 sink.put(body)
                 if body is _OVERSIZE:
                     return  # the stream is out of step, so nothing after the header is a frame
-        except OSError:
-            pass
+        except OSError as exc:
+            # Read as the peer being gone, as a clean EOF is. DEBUG, not WARNING: a read error on a
+            # pipe the reap has just broken is the ordinary end of a killed worker. The type name
+            # only, since an OSError's text can name a path.
+            log.debug(
+                "inbound %r: sandbox frame reader stopped on %s, read as EOF",
+                self._inbound,
+                type(exc).__name__,
+            )
         eof_at.append(time.monotonic())
         sink.put(_EOF)
 
