@@ -936,9 +936,9 @@ async def test_a_send_settled_before_the_cut_reached_the_drain_is_read_as_it_end
     amy = SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test")
     gate = _SendGate()
     assert gate.begin()  # its thread began, so a cut cannot skip it
-    notifier._sending = (amy, send, gate, lambda: calls.append(1))
+    pending = (amy, send, gate, lambda: calls.append(1))
     ben = SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test")
-    await notifier._record_cut([ben])
+    await notifier._record_cut([ben], pending, gate.skip())
     assert calls == ([1] if outcome == "sent" else [])
     assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == sorted(
         [("amy", reason) for reason in rows] + [("ben", "abandoned")]
@@ -996,6 +996,7 @@ async def test_a_send_still_waiting_for_a_thread_at_the_cut_never_mails(
     try:
         await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
         await asyncio.sleep(0.05)  # the drain is now waiting on the queued send
+        assert notifier._sending is not None, "the drain never reached the send"
         await _cut_close(notifier)
     finally:
         busy.set()

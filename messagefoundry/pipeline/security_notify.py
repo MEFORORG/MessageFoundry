@@ -858,7 +858,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         only the wait. The writes are not bounded: past the step's cut grace the shutdown stops
         waiting for them, and they go on, beside engine.stop(), until the store closes, which fails
         the rest. The count of queued notices is logged before any of them is written. A second
-        call waits for the first to finish or be cut, and closes nothing itself."""
+        call waits for the first, its record writes included, and closes nothing itself."""
         if self._closing:
             await self._closed.wait()
             return
@@ -879,6 +879,10 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         finally:
             # Taken and logged before any await, so a second cancel cannot leave them untold.
             left = self._take_queued()
+            # Skipped here too, before any await, so a send still waiting for a worker thread cannot
+            # begin once the close is cut, even while the drain unwinds.
+            pending, self._sending = self._sending, None
+            skipped = pending is not None and pending[2].skip()
             try:
                 if drain is not None:
                     # Cut while the sentinel waited on a full queue, the drain still runs; cut while
@@ -892,7 +896,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             finally:
                 # Held and shielded like a failed send's record, so a cut of this close stops only
                 # its wait: the writes go on until the store closes.
-                records = asyncio.ensure_future(self._record_cut(left))
+                records = asyncio.ensure_future(self._record_cut(left, pending, skipped))
                 self._recording.add(records)
                 records.add_done_callback(self._recording.discard)
                 # Each one swallows its own failure, so this only waits.
@@ -915,10 +919,15 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             )
         return left
 
-    async def _record_cut(self, left: list[SecurityEvent]) -> None:
-        """Record the send a cut close stopped waiting for, and each notice it left queued."""
+    async def _record_cut(
+        self,
+        left: list[SecurityEvent],
+        pending: tuple[SecurityEvent, asyncio.Future[bool], _SendGate, Callable[[], None]] | None,
+        skipped: bool,
+    ) -> None:
+        """Record the send a cut close stopped waiting for, and each notice it left queued.
+        ``skipped`` says the close stopped that send before its thread began."""
         records: list[tuple[SecurityEvent, str]] = []
-        pending, self._sending = self._sending, None
         if pending is not None:
             event, send, gate, delivered = pending
             if not send.done() or send.cancelled():
@@ -928,7 +937,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 # unknown. No line for it: a cut that leaves notices queued nearly always has a send
                 # in flight, so a line skipped for a lock notice would say a lock landed (BACKLOG
                 # #1131).
-                records.append((event, "abandoned" if gate.skip() else "interrupted"))
+                records.append((event, "abandoned" if skipped else "interrupted"))
             elif (exc := send.exception()) is not None:
                 # It ended before the cut reached the drain, so its outcome is known.
                 self._log_send_failed(event, exc)
