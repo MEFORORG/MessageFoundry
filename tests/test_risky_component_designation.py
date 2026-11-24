@@ -2007,10 +2007,11 @@ def test_the_survey_checks_can_fail() -> None:
 def test_the_survey_record_field_checks_can_fail() -> None:
     """RED when: a survey check stops seeing a recorded field that is wrong. That covers a date
     that is not ``YYYY-MM-DD`` (the basic form ``YYYYMMDD`` included), a search that drops
-    ``suffixes``, ``cannot_see`` or ``module_rule``, a search figure the answers do not give, a
-    hit whose line numbers are not line numbers, a file named twice among the hits or the adapted
-    modules, an adapted module with no ``words``, a ``display`` that is not text, a second release
-    line of its own that is half recorded, and a page that drops a ``display`` or that line.
+    ``suffixes``, ``cannot_see``, ``module_rule`` or ``run_rule``, a search figure the answers do
+    not give, a hit whose line numbers are not line numbers, a file named twice among the hits or
+    the adapted modules, an adapted module with no ``words``, a ``display`` that is not text, a
+    second release line of its own that is half recorded, and a page that drops a ``display`` or
+    that line.
 
     THE POSITIVE CONTROL FOR THE RECORD FIELDS (vault BACKLOG #3030). Most cases change one field
     of the tracked record, on a not-designated wheel that was fetched and carries nothing. The
@@ -2052,6 +2053,8 @@ def test_the_survey_record_field_checks_can_fail() -> None:
         ({"suffixes": []}, no_search),
         ({"cannot_see": []}, no_search),
         ({"module_rule": " "}, no_search),
+        ({"run_rule": " "}, no_search),
+        ({"run_rule": None}, no_search),
         ({"wheels_searched": stated["wheels_searched"] + 1}, "the search gives wheels_searched"),
         (
             {"wheel_files_searched": stated["wheel_files_searched"] - 1},

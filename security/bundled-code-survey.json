@@ -36,6 +36,7 @@
   },
   "search": {
     "run": "2026-10-05",
+    "run_rule": "`run` is the earliest day the search ran for an answer this record still holds, not the day of every answer. A wheel searched again later by the same rules, as after its pin moved, carries the later day in its own `forms_surveyed`.",
     "directories": [
       "_vendor",
       "vendor",
