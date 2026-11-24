@@ -422,7 +422,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "[pipeline].snapshot_on_send (copy-on-Send, ADR 0104) resolved best-effort from the service "
         "settings (--service-config, else ./messagefoundry.toml if present); when no settings load "
         "it falls back to the setting's own default (ON) — matching the default engine, never a "
-        "silent OFF (#230).",
+        "silent OFF (#230). A MEFOR_* variable that is a settings section's name alone is "
+        "refused instead, naming the variable.",
     )
     dryrun.add_argument("--config", default="samples/config", help="config modules directory")
     _add_anchor_flags(
@@ -461,7 +462,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "best-effort from the settings the posture check reads: this instance's "
         "messagefoundry.toml, or with no file, the MEFOR_* environment when --env or "
         "MEFOR_AI_ENVIRONMENT names the instance. When no settings load, the preview falls back to the "
-        "setting's own default (ON) — matching the default engine, never a silent OFF (#230). "
+        "setting's own default (ON) — matching the default engine, never a silent OFF (#230); a "
+        "MEFOR_* variable that is a settings section's name alone fails the dryrun check instead. "
         "Under --project-root with no --service-config, check reads the project root's "
         "messagefoundry.toml, else the config dir's, while serve with the same flags reads the "
         "one in its own working directory; when they differ, each settings check's line names "
@@ -6510,9 +6512,7 @@ def _snapshot_on_send_setting(service_config: str | None) -> bool:
     try:
         return load_settings(config_path=service_config).pipeline.snapshot_on_send
     except SectionNameEnvError:
-        # Raised for the caller to report: before vault BACKLOG #2600 that variable loaded with a
-        # warning and the preview read the file's flag, so a silent default here would be new.
-        raise
+        raise  # why: SectionNameEnvError's docstring
     except (FileNotFoundError, ValueError, ValidationError, OSError):
         return PipelineSettings().snapshot_on_send
 
@@ -14989,9 +14989,7 @@ def _alert(args: argparse.Namespace) -> int:
                         load_settings(config_path=path).alerts
                     )
                 except SectionNameEnvError:
-                    # Reported by the handler below, not read as "nothing configured": before
-                    # vault BACKLOG #2600 that variable loaded with a warning (as for the next check).
-                    raise
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     configured = (
                         set()
@@ -15011,9 +15009,7 @@ def _alert(args: argparse.Namespace) -> int:
                 try:
                     alerts = load_settings(config_path=path).alerts
                 except SectionNameEnvError:
-                    # Before vault BACKLOG #2600 that variable loaded with a warning and this check
-                    # ran; read as "no settings yet" it would skip the check, so it is reported.
-                    raise
+                    raise  # to the handler below; why: SectionNameEnvError's docstring
                 except (OSError, ValueError):
                     alerts = None  # no settings yet, so no email transport sends the override
                 if (

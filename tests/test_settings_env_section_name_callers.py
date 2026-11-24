@@ -3,11 +3,13 @@
 """Callers that fall back on a settings load error report the section-name refusal instead
 (vault BACKLOG #2600).
 
-Before #2600 a ``MEFOR_<SECTION>`` variable loaded with a warning, so the ``dryrun`` preview and the
-``check`` dry-run leg read the file's ``[pipeline].snapshot_on_send``, and ``alert add`` ran its
-transport and recipient-override checks against the file's ``[alerts]``. Read as an ordinary load
-error, the new refusal sent each of them to its fallback with no message. These tests pin that the
-refusal is reported there, and that any other load error still falls back as before.
+Before the refusal a ``MEFOR_<SECTION>`` variable did not stop the load, so the ``dryrun`` preview
+and the ``check`` dry-run leg read the file's ``[pipeline].snapshot_on_send``, and ``alert add`` ran
+its transport and recipient-override checks against the file's ``[alerts]``. Read as an ordinary
+load error, the refusal sent each of them to its fallback. ``alert add`` was still refused later,
+by its post-write settings check, but its transport check first reported the wrong cause. These
+tests pin that the refusal is reported where it is met, and that any other load error still falls
+back as before.
 
 Synthetic values only."""
 
@@ -72,12 +74,12 @@ def test_dryrun_snapshot_setting_still_falls_back_on_another_load_error(
     assert _snapshot_on_send_setting(str(toml)) is True
 
 
-def test_dryrun_cli_refuses_on_the_section_name_refusal(
-    tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def _feed(tmp_path: Path) -> tuple[Path, Path]:
+    """A one-inbound config and one synthetic message."""
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "IB_TEST.py").write_text(
+        "# SPDX-License-Identifier: AGPL-3.0-or-later\n"
         "from messagefoundry import File, inbound, router\n"
         'inbound("IB_TEST", File(directory="in"), router="r")\n'
         '@router("r")\ndef route(msg):\n    return []\n',
@@ -85,6 +87,13 @@ def test_dryrun_cli_refuses_on_the_section_name_refusal(
     )
     msg = tmp_path / "a.hl7"
     msg.write_text("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1\r", encoding="utf-8")
+    return cfg, msg
+
+
+def test_dryrun_cli_refuses_on_the_section_name_refusal(
+    tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg, msg = _feed(tmp_path)
     toml = _off_toml(tmp_path)
     clean_env.setenv("MEFOR_STORE", "x")
     rc = main(
@@ -115,6 +124,17 @@ def test_check_snapshot_setting_reports_the_section_name_refusal(
         checks._resolve_snapshot_on_send(
             tmp_path, service_config=toml, suppress_search=False, env=None
         )
+
+
+def test_check_dryrun_leg_fails_on_the_section_name_refusal(
+    tmp_path: Path, clean_env: pytest.MonkeyPatch
+) -> None:
+    cfg, msg = _feed(tmp_path)
+    toml = _off_toml(tmp_path)
+    clean_env.setenv("MEFOR_STORE", "x")
+    result = checks._check_dryrun(cfg, msg, service_config=toml)
+    assert result.ok is False and result.required is True and result.skipped is False
+    assert result.detail.startswith("settings did not load:") and "MEFOR_STORE" in result.detail
 
 
 def test_check_snapshot_setting_still_falls_back_on_another_load_error(
@@ -182,6 +202,20 @@ def test_alert_add_transport_check_does_not_read_the_refusal_as_none_configured(
     error = json.loads(out)["error"]
     assert "MEFOR_STORE" in error and "unconfigured transport" not in error
     assert add_rule_calls == []
+
+
+def test_alert_add_end_to_end_writes_nothing_on_the_section_name_refusal(
+    tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Without the add_rule stub: the real path refuses and leaves the file as it was.
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(_ALERTS_EMAIL, encoding="utf-8")
+    clean_env.setenv("MEFOR_STORE", "x")
+    rc, out = _add(
+        svc, {"event_type": "connection_stopped", "recipients": ["a@example.org"]}, capsys
+    )
+    assert rc == 1 and "MEFOR_STORE" in json.loads(out)["error"]
+    assert svc.read_text(encoding="utf-8") == _ALERTS_EMAIL
 
 
 def test_alert_add_recipient_check_still_runs_without_the_variable(

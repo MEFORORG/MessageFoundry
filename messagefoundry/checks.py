@@ -18,7 +18,8 @@ checks). Two checks are **required** (they can block a commit):
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
   ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
-  never a silent OFF (#230).
+  never a silent OFF (#230). The section-name refusal
+  (:class:`~messagefoundry.config.settings.SectionNameEnvError`) fails the leg instead.
 
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
@@ -1932,9 +1933,8 @@ def _resolve_snapshot_on_send(
         # (vault BACKLOG #2355), exactly as the settings legs read it.
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
     except SectionNameEnvError:
-        # Raised for _check_dryrun to fail the leg with: before vault BACKLOG #2600 that variable
-        # loaded with a warning and the preview read the file's flag, so a silent default is new.
-        raise
+        raise  # why: SectionNameEnvError's docstring
+
     except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 
@@ -2034,7 +2034,7 @@ def _check_dryrun(
             config_dir, service_config=service_config, suppress_search=suppress_search, env=env
         )
     except SectionNameEnvError as exc:
-        return CheckResult("dryrun", ok=False, required=True, detail=str(exc))
+        return _settings_refused("dryrun", required=True, exc=exc)
     errors: list[str] = []
     total = 0
     pinned = 0

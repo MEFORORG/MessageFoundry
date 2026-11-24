@@ -8972,8 +8972,14 @@ class SectionNameEnvError(ValueError):
 
     A ``ValueError``, so a caller that reports a load error reports this one too. Its own class so
     a caller that falls back to a default on a load error can tell this refusal apart and report
-    it instead: before #2600 such a variable loaded with a warning, so falling back on it would be
-    a new silent outcome on that caller's path."""
+    it instead. Before this refusal such a variable did not stop the load, so those callers read
+    the settings; falling back on it would be a new outcome on their path that names nothing.
+    At least these report it: ``dryrun``'s and ``check``'s ``[pipeline].snapshot_on_send``
+    resolution, and ``alert add``'s transport and recipient-override checks.
+
+    The class is chosen per refusal, not per variable: a refusal that also names an unknown
+    ``MEFOR_<SECTION>_<KEY>`` is this class when at least one name is a section's name alone, and
+    a plain ``ValueError`` otherwise."""
 
 
 def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]) -> None:
