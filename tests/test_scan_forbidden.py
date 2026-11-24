@@ -29,8 +29,9 @@ import random
 import re
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1917,43 +1918,167 @@ def test_a_long_markup_run_after_a_verdict_clause_scans_in_linear_time(sf, body:
     assert time.perf_counter() - began < 1
 
 
+def _hard_wrapped(lines: int) -> str:
+    """A hard-wrapped paragraph: one unit, one line mark per line, one binding identifier per line."""
+    return "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
+
+
+class _CountingMarks(list[tuple[int, int]]):
+    """A unit's (offset, line) marks that count every mark read, by index or by iteration, so a
+    lookup's cost is read as a number of marks rather than a number of seconds."""
+
+    reads = 0
+
+    def __getitem__(self, index: Any) -> Any:
+        self.reads += 1
+        return super().__getitem__(index)
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        for mark in super().__iter__():
+            self.reads += 1
+            yield mark
+
+
+def _wrapped_marks(lines: int) -> _CountingMarks:
+    """The marks :func:`_hard_wrapped` makes: one per line, each line 22 characters with its break."""
+    return _CountingMarks((22 * i, i + 1) for i in range(lines))
+
+
+def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
+    """The line lookup the hard-wrapped paragraph's test was written against, from before
+    ``_pr_line_at`` bisected: every mark, once per binding identifier."""
+    return max(lineno for start, lineno in marks if start <= offset)
+
+
+def _most_reads_per_lookup(line_at: Callable[[list[tuple[int, int]], int], int], lines: int) -> int:
+    """The most marks ``line_at`` reads for one lookup over a paragraph of ``lines`` lines, over 64
+    offsets spread across it, each answer checked against the line the offset sits on."""
+    marks = _wrapped_marks(lines)
+    most = 0
+    for at in range(0, 22 * lines, 22 * lines // 64 + 1):
+        marks.reads = 0
+        assert line_at(marks, at) == at // 22 + 1, at
+        most = max(most, marks.reads)
+    return most
+
+
+#: The most marks one lookup may read over a paragraph of ``lines`` lines: a bisection reads about
+#: log2 of the marks, and one more for the answer. Read 2026-11-24: 11 at 1000 marks, 14 at 8000.
+def _lookup_bound(lines: int) -> int:
+    return lines.bit_length() + 2
+
+
+@pytest.mark.parametrize("lines", [1000, 8000])
+def test_the_line_lookup_reads_a_logarithmic_number_of_marks(sf, lines: int) -> None:
+    """A hard-wrapped paragraph is one unit with a mark per line, and every binding identifier is
+    reported at its own line, so finding that line must not read every mark once per identifier.
+    A count, not a timing: the same answer on every runner, loaded or not."""
+    reads = _most_reads_per_lookup(sf._pr_line_at, lines)
+    assert reads <= _lookup_bound(lines), f"one lookup read {reads} of {lines} marks"
+
+
+@pytest.mark.parametrize("lines", [1000, 8000])
+def test_the_read_count_catches_the_lookup_it_was_written_against(lines: int) -> None:
+    """Control: the scanning lookup gives the same answers and reads every mark, so the bound above
+    fails it, at about 70 times the bound at 1000 marks and 500 times at 8000."""
+    reads = _most_reads_per_lookup(_line_at_by_scan, lines)
+    assert reads == lines
+    assert reads > _lookup_bound(lines)
+
+
+def test_a_hard_wrapped_paragraph_reports_every_identifier_line_through_the_lookup(
+    sf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan takes one lookup per binding identifier, each through ``_pr_line_at`` and each
+    within :func:`_lookup_bound`, and reports every one of 8000 lines at its own line. That joins
+    the read count above to the scan. The former form of this test timed a 24000-line paragraph
+    against 10 seconds: about 2 to 2.8 s locally, and 10.38 s on a loaded windows-2025 runner,
+    which ejected a pull request from the merge queue."""
+    lines = 8000
+    looked: list[int] = []
+    line_at = sf._pr_line_at
+
+    def counted(marks: list[tuple[int, int]], offset: int) -> int:
+        held = _CountingMarks(marks)
+        found = line_at(held, offset)
+        looked.append(held.reads)
+        return found
+
+    monkeypatch.setattr(sf, "_pr_line_at", counted)
+    hits = sf.scan_pr_body(_hard_wrapped(lines))
+    assert [hit.split(":")[1] for hit in hits] == [str(n) for n in range(1, lines + 1)]
+    assert len(looked) == lines
+    assert max(looked) <= _lookup_bound(lines), f"one lookup read {max(looked)} of {lines} marks"
+
+
+class _CountingBisect:
+    """The scanner's ``bisect`` module with ``bisect_left`` calls counted, for the column lookup."""
+
+    def __init__(self) -> None:
+        self.lefts = 0
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(bisect, name)
+
+    def bisect_left(self, *args: Any, **kwargs: Any) -> int:
+        self.lefts += 1
+        return bisect.bisect_left(*args, **kwargs)
+
+
+def _column_list(n: int, header: str = "ASVS") -> str:
+    """A table whose one data cell holds ``n`` identifiers split by a word."""
+    return f"| {header} | x |\n|---|---|\n| " + " x ".join([_REQ] * n) + " |"
+
+
+def test_the_column_list_takes_one_column_lookup_per_identifier(
+    sf, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A positive floor for the column list timed below, which reports nothing: under a header naming
+    ASVS, each identifier's column is one bisection over the row's pipes, and under any other header
+    there is none. A count of the pipes before each identifier, the quadratic form, takes none and
+    fails here as well as in the timing."""
+    counting = _CountingBisect()
+    monkeypatch.setattr(sf, "bisect", counting)
+    sf.scan_pr_body(_column_list(50, "Status"))
+    plain = counting.lefts
+    counting.lefts = 0
+    sf.scan_pr_body(_column_list(50))
+    assert counting.lefts - plain == 50, (
+        f"{counting.lefts - plain} column lookups for 50 identifiers"
+    )
+
+
 #: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
-#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. Measured
-#: 2026-11-24 on a 32-core Windows box, five to ten attempts per shape: the shipped scanner read
-#: 6.5x to 10.7x on every shape below. Three per-identifier defects, each put back by hand in a copy
-#: of the scanner, read 17x and over on the shape it slows: :func:`_line_at_by_scan` on the
-#: hard-wrapped paragraph, a count of the pipes before each identifier on the column list, and
-#: _PR_MARK_BEFORE searched from the start of the sentence rather than 20 characters back on both
-#: "and" lists. The line sits between them. A step of 4 with a line of 8, the house pair in
-#: ``tests/test_ad_group_dn_only.py``, passed the pipe count at about 7x, as the former 10 second
-#: bound did at about 1.2 s: at these sizes its quadratic term is still smaller than the scan.
+#: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is kept only
+#: for the identifier lists, whose per-identifier searches are inline and a count cannot reach.
+#: Measured 2026-11-24 on a 32-core Windows box, eight attempts per shape, sizes as below: the
+#: shipped scanner read 4.7x to 9.2x. Two per-identifier defects, put back by hand in a copy of the
+#: scanner, read at least 1.5 times the line at their lowest: a count of the pipes before each
+#: identifier on the column list 22.0x to 32.2x, and _PR_MARK_BEFORE searched from the start of the
+#: sentence rather than 20 characters back 26.1x to 30.2x and 25.6x to 31.2x on the two "and" lists.
+#: At 4000 against 32000 identifiers the pipe count read as low as 15.3x, so the column list stays
+#: at 6000.
 _GROWTH_STEP, _GROWTH_LINE = 8, 14.0
 
 
 def _growth_attempts(
-    call: Callable[[str], object], small: str, large: str, line: float, *, rounds: int = 1
+    call: Callable[[str], object], small: str, large: str, line: float
 ) -> list[float]:
     """How much longer ``call`` takes on ``large`` than on ``small``, one reading per attempt, each a
     reading of :func:`_growth_between` with the collector off.
 
-    A RATIO, NOT A NUMBER OF SECONDS. A wall-clock bound fails whenever the runner is slow enough:
-    the hard-wrapped paragraph below took about 1.6 s to 2.8 s locally against a 10 s bound, and
-    10.38 s on a loaded windows-2025 runner, which ejected a pull request from the merge queue. A
-    slow runner slows both sizes alike, so the ratio still tells linear from quadratic.
-
-    A reading at or over ``line`` is taken again, up to three attempts, and stops at the first under
-    it, so the lowest reading is the verdict: one preemption cannot fake a curve. A subject fails
-    only if every attempt reads at or over the line, so that is what a quadratic control must show,
-    read with ``min`` over every attempt. The rule is ``tests/test_ad_group_dn_only.py``'s
-    ``_scaling_ratios``, which takes three rounds per attempt; the scan subjects here take one,
-    since each long sample is already 0.3 s to 1.3 s and a round more doubles a test that has only
-    the retries to absorb load, and the cheap lookup subjects take more."""
+    A ratio, not a number of seconds: a slow runner slows both sizes alike. A reading at or over
+    ``line`` is taken again, up to three attempts, and stops at the first under it, so the lowest
+    reading is the verdict and one preemption cannot fake a curve. The rule is
+    ``tests/test_ad_group_dn_only.py``'s ``_scaling_ratios``, with one round per attempt, not
+    three: a long sample here is up to about 0.8 s, and a round more doubles a test whose only
+    defence against load is the retry."""
     readings: list[float] = []
     for _ in range(3):
         was_enabled = gc.isenabled()
         gc.disable()
         try:
-            readings.append(_growth_between(call, small, large, rounds=rounds))
+            readings.append(_growth_between(call, small, large, rounds=1))
         finally:
             if was_enabled:
                 gc.enable()
@@ -1962,9 +2087,9 @@ def _growth_attempts(
     return readings
 
 
-def _assert_linear(sf, make: Callable[[int], str], n: int) -> None:
-    """``scan_pr_body`` on ``make(_GROWTH_STEP * n)`` against ``make(n)``, under the line."""
-    readings = _growth_attempts(sf.scan_pr_body, make(n), make(_GROWTH_STEP * n), _GROWTH_LINE)
+def _assert_linear(scan: Callable[[str], object], make: Callable[[int], str], n: int) -> None:
+    """``scan`` on ``make(_GROWTH_STEP * n)`` against ``make(n)``, under the line."""
+    readings = _growth_attempts(scan, make(n), make(_GROWTH_STEP * n), _GROWTH_LINE)
     ratio = min(readings)
     assert ratio < _GROWTH_LINE, (
         f"{_GROWTH_STEP}x the body took {ratio:.2f}x the time ({_attempts(readings)})"
@@ -1975,148 +2100,55 @@ def _attempts(readings: list[float]) -> str:
     return "attempts: " + ", ".join(f"{reading:.2f}x" for reading in readings)
 
 
-def _hard_wrapped(lines: int) -> str:
-    """A hard-wrapped paragraph: one unit, one line mark per line, one binding identifier per line."""
-    return "\n".join([f"{_REQ} stays {_PARTIAL}"] * lines)
-
-
-def test_a_hard_wrapped_paragraph_reports_every_identifier_line_in_linear_time(sf) -> None:
-    """A hard-wrapped paragraph is one unit with a line mark per line, and every binding identifier is
-    reported at its own line, so finding that line must not scan every mark once per identifier.
-    1000 lines against 8000: the bisecting lookup read 6.5x to 9.5x, and the lookup this test was
-    written against (:func:`_line_at_by_scan`), put back in the scanner, 17.3x to 26.7x. That
-    control is too slow to run here, about 15 s, so it is not in the suite; the lookup itself has a
-    cheap check and control below, which this test's 14x line does not share."""
-    lines = 1000
-    hits = sf.scan_pr_body(_hard_wrapped(lines))
-    # A positive control: each line's identifier is reported at its own line, so the lookup ran.
-    assert [hit.split(":")[1] for hit in hits] == [str(n) for n in range(1, lines + 1)]
-    _assert_linear(sf, _hard_wrapped, lines)
-
-
-def _line_at_by_scan(marks: list[tuple[int, int]], offset: int) -> int:
-    """The line lookup the test above was written against, from before ``_pr_line_at`` bisected:
-    every mark, once per binding identifier."""
-    return max(lineno for start, lineno in marks if start <= offset)
-
-
-#: The lookup's own timing: 256 lookups over 1000 marks against 256 over 8000, the marks a
-#: hard-wrapped paragraph of that many lines makes. A bisection grows with the log of the marks and
-#: a scan with the marks, so 8 times the marks gives the scan about 8 and the bisection under 2.
-#: Measured 2026-11-24 with five rounds per attempt: ``_pr_line_at`` 0.81x to 2.32x over 150
-#: attempts, :func:`_line_at_by_scan` 4.8x to 10.7x over 60. The line sits between them.
-_LOOKUP_LINE = 3.0
-
-
-def _lookups(line_at: Callable[[list[tuple[int, int]], int], int]) -> Callable[[str], object]:
-    """A subject for :func:`_growth_attempts` that runs ``line_at`` over as many marks as its argument
-    has characters, 256 lookups spread over them, so only the mark count differs between sizes.
-    That many, and five rounds, because one round of 64 let a single stalled short sample read the
-    scanning lookup as low as 1.56x in 300 trials, under the line."""
-    marks = {n: [(22 * i, i + 1) for i in range(n)] for n in (1000, _GROWTH_STEP * 1000)}
-
-    def look(size: str) -> object:
-        held = marks[len(size)]
-        top = held[-1][0]
-        return [line_at(held, at) for at in range(0, top + 1, top // 255)]
-
-    return look
-
-
-def _lookup_growth(line_at: Callable[[list[tuple[int, int]], int], int]) -> list[float]:
-    return _growth_attempts(
-        _lookups(line_at), "x" * 1000, "x" * (_GROWTH_STEP * 1000), _LOOKUP_LINE, rounds=5
-    )
-
-
-def test_the_line_lookup_does_not_grow_with_the_marks(sf) -> None:
-    """The defect site itself, cheap enough to carry its own control: ``_pr_line_at`` over 8 times
-    the marks must take under :data:`_LOOKUP_LINE` times as long. The answers are checked too, so a
-    lookup that skipped the work would not pass."""
-    held = [(22 * i, i + 1) for i in range(1000)]
-    assert [sf._pr_line_at(held, at) for at in (0, 21, 22, 21977, 21978, 99999)] == [
-        1,
-        1,
-        2,
-        999,
-        1000,
-        1000,
-    ]
-    readings = _lookup_growth(sf._pr_line_at)
-    ratio = min(readings)
-    assert ratio < _LOOKUP_LINE, (
-        f"{_GROWTH_STEP}x the marks took {ratio:.2f}x the time ({_attempts(readings)})"
-    )
-
-
-def test_the_line_lookup_check_fails_the_lookup_it_was_written_against() -> None:
-    """Control: the check above must fail the scanning lookup, or its pass proves nothing. It asserts
-    exactly the negation of that test's pass condition: every attempt at or over the line, read with
-    ``min``. The scanning lookup gives the same answers, so only its cost differs."""
-    held = [(22 * i, i + 1) for i in range(1000)]
-    assert [_line_at_by_scan(held, at) for at in (0, 21, 22, 21977, 21978, 99999)] == [
-        1,
-        1,
-        2,
-        999,
-        1000,
-        1000,
-    ]
-    readings = _lookup_growth(_line_at_by_scan)
-    ratio = min(readings)
-    assert ratio >= _LOOKUP_LINE, (
-        f"a scanning lookup scaled by only {ratio:.2f}x ({_attempts(readings)})"
-    )
-
-
 @pytest.mark.parametrize(
-    ("readings", "spent", "verdict"),
-    [((20.0, 3.0, 50.0), 2, 3.0), ((20.0, 15.0, 14.0), 3, 14.0), ((13.9,), 1, 13.9)],
+    ("readings", "spent"),
+    [((20.0, 3.0, 50.0), 2), ((20.0, 14.0, 15.0), 3), ((13.9,), 1)],
     ids=["stops-at-the-first-under", "every-attempt-over", "first-under"],
 )
-def test_the_growth_rule_keeps_its_lowest_attempt(
-    monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], spent: int, verdict: float
+def test_the_growth_rule_stops_at_the_first_attempt_under_the_line(
+    monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], spent: int
 ) -> None:
-    """The rule both checks and their control share: it stops at the first attempt under the line,
-    takes at most three, and its verdict is the lowest. A reading of exactly the line is over it."""
+    """The attempt loop: it stops at the first reading under the line and takes at most three. A
+    reading of exactly the line is over it."""
     pending = iter(readings)
     monkeypatch.setitem(globals(), "_growth_between", lambda *_a, **_k: next(pending))
-    taken = _growth_attempts(len, "a", "aa", 14.0)
-    assert len(taken) == spent
-    assert min(taken) == verdict
+    assert _growth_attempts(len, "a", "aa", 14.0) == list(readings[:spent])
 
 
 @pytest.mark.parametrize(
     ("readings", "failure"),
-    [((20.0, 15.0, 13.9), None), ((20.0, 15.0, 14.0), "took 14.00x the time (attempts: 20.00x")],
+    [
+        ((20.0, 15.0, 13.9), None),
+        ((20.0, 14.0, 15.0), "took 14.00x the time (attempts: 20.00x, 14.00x, 15.00x)"),
+    ],
     ids=["clears-on-the-last", "never-clears"],
 )
 def test_the_linear_check_passes_on_any_attempt_under_the_line(
-    sf, monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], failure: str | None
+    monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], failure: str | None
 ) -> None:
-    """The same rule driven through :func:`_assert_linear`, the assert the scan checks share: it
-    passes once any attempt reads under the line and fails, naming the lowest, when none does."""
+    """The same rule through :func:`_assert_linear`: it passes once any attempt reads under the line,
+    and when none does it fails naming the lowest, which here is not the last."""
     pending = iter(readings)
     monkeypatch.setitem(globals(), "_growth_between", lambda *_a, **_k: next(pending))
     if failure is None:
-        _assert_linear(sf, _hard_wrapped, 2)
+        _assert_linear(len, _hard_wrapped, 2)
     else:
         with pytest.raises(AssertionError, match=re.escape(failure)):
-            _assert_linear(sf, _hard_wrapped, 2)
+            _assert_linear(len, _hard_wrapped, 2)
 
 
 @pytest.mark.parametrize(
     ("make", "n"),
     [
         # Identifiers split by a word, so each one takes the column lookup.
-        (lambda n: "| ASVS | x |\n|---|---|\n| " + " x ".join([_REQ] * n) + " |", 6000),
-        (lambda n: "ASVS " + " and ".join([_REQ] * n) + " cannot pass", 1000),
+        (_column_list, 6000),
+        (lambda n: "ASVS " + " and ".join([_REQ] * n) + " cannot pass", 500),
         # Review round-23e833d96f: an invisible character and a line separator.
         (
             lambda n: (
                 "ASVS " + " and ".join([_REQ] * n) + " cannot pass" + chr(0x200B) + chr(0x2028)
             ),
-            1000,
+            500,
         ),
     ],
     ids=["column-lookup", "and-list", "and-list-invisible"],
@@ -2125,14 +2157,12 @@ def test_a_long_identifier_list_scans_in_linear_time(
     sf, make: Callable[[int], str], n: int
 ) -> None:
     """A row or a sentence holding a long list of identifiers must scan in time linear in the list.
-    The two "and" lists keep the 8000 identifiers they had under the former 10 second bound, where
-    they took about 1.4 s and 2.7 s locally, too close to it for a loaded runner; the column list
-    grows from 16000 to 48000, where a pipe count per identifier read 22x
-    to 32x; at 32000 it read as low as 15.3x, too close to the line. Their controls are the readings :data:`_GROWTH_LINE` records, taken
-    by hand, as a control in the suite would cost tens of seconds. A ratio does not see a constant
-    factor, such as the two whole extra readings the invisible character once added, and the former
-    bound did not see it either at this size."""
-    _assert_linear(sf, make, n)
+    These sat in test_a_long_table_row_scans_in_linear_time under its 10 second bound, where the two
+    "and" lists took about 1.4 s and 2.7 s locally, too close to it for a loaded runner.
+    :data:`_GROWTH_LINE` records the defects each fails. A ratio does not see a constant factor,
+    such as the two whole extra readings the invisible character once added, and the former bound
+    did not see it either at that size."""
+    _assert_linear(sf.scan_pr_body, make, n)
 
 
 def _pr_kinds(sf, body: str) -> set[str]:
