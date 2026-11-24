@@ -46,20 +46,27 @@ import hashlib
 import hmac
 import logging
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.store.crypto import (
     _KEY_ID_LEN,
+    BATCH_MAX_CHARS,
+    BATCH_MAX_ITEMS,
     NO_STORE_ID,
+    BatchCipher,
     Cipher,
     CipherError,
     CipherUnavailableError,
+    b64_chars,
+    batch_chars,
+    cell_aad,
     cipher_blocks_on_io,
     derive_row_seal_key,
+    encrypt_many,
     row_seal_key_id,
 )
 from messagefoundry.store.crypto import (
@@ -577,6 +584,78 @@ async def cipher_call[**P, T](
     if cipher_blocks_on_io(cipher):
         return await _in_transit_pool(call, *args, **kwargs)
     return call(*args, **kwargs)
+
+
+def _batch_cost(plaintext: str, aad: bytes | None) -> int:
+    """What ``TransitCipher.encrypt_many`` counts a value as against :data:`BATCH_MAX_CHARS`."""
+    return b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+
+
+async def seal_chunks(
+    cipher: Cipher,
+    table: str,
+    column: str,
+    rows: Sequence[Any],
+    *,
+    aad_cols: tuple[str, ...],
+    aad_of: Callable[[Any], bytes] | None = None,
+    local_whole_page: bool,
+) -> AsyncIterator[tuple[Sequence[Any], list[str]]]:
+    """Yield ``(chunk, sealed)``: each chunk of ``rows`` with every row's ``v`` encrypted under its
+    cell AAD, in row order. "Seal" here is the at-rest cell encryption (``mfenc:``), not this
+    module's row seal. The three stores' at-open ``_seal_surface`` share it (BACKLOG #6706). Each
+    writes a chunk's rows before the next chunk is encrypted.
+
+    The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
+    :func:`cell_aad` over ``aad_cols``. The cut is chosen per chunk, from one read of the cipher:
+
+    - A :class:`BatchCipher` whose ``batches_now`` is True (False when it has none) is cut at
+      :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64, the cost
+      ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch
+      is one request. A value over the character bound is a chunk of its own. A chunk Transit
+      refuses (at least an HTTP 400, a 413, or a reply without its ``reference`` echo) is sent
+      value by value inside the one call, up to one request per value more, while the seal's
+      transaction waits. A cancelled seal can then leave up to :data:`BATCH_MAX_ITEMS` values
+      running on in the Transit pool.
+      A cipher that stops batching between the cut and the call can still send that chunk's
+      values alone inside the one call.
+    - An in-process cipher, such as AES-GCM, keeps the store's shape from before batching: with
+      ``local_whole_page`` (SQLite) the whole page is one chunk, else one value per chunk.
+    - Any other cipher, a Transit cipher sending values alone included, gets one value per chunk,
+      so each call is followed by its write.
+
+    Only the first case is sized here. The cipher itself may still measure a value:
+    ``TransitCipher.encrypt_many`` sizes every value, alone or not.
+
+    Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as that
+    does."""
+    items = [
+        (
+            r["v"],
+            aad_of(r) if aad_of is not None else cell_aad(table, column, *(r[c] for c in aad_cols)),
+        )
+        for r in rows
+    ]
+    start = 0
+    while start < len(items):
+        # Read once per chunk; a cipher that does not say it batches is not cut as a batch.
+        batching = isinstance(cipher, BatchCipher) and getattr(cipher, "batches_now", False) is True
+        if batching:
+            end, size = start + 1, _batch_cost(*items[start])
+            while end < len(items) and end - start < BATCH_MAX_ITEMS:
+                cost = _batch_cost(*items[end])
+                if size + cost > BATCH_MAX_CHARS:
+                    break
+                size += cost
+                end += 1
+        elif local_whole_page and not cipher_blocks_on_io(cipher):
+            end = len(items)
+        else:
+            end = start + 1
+        if start:
+            await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
+        yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])
+        start = end
 
 
 #: The start check's fixed 32-byte input: a digest of its own label, so it is no row's seal input
