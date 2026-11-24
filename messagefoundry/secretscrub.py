@@ -610,13 +610,12 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # run or at the very start of the value, still prints the quoted value: ``pwd=a_password="v w"``,
 # ``password=x.client_secret="v w"`` and ``token=bearer_token="v w"``. The stop lands on the keyword
 # and the pass cannot resume there. A label of a later family is caught, because it sees the keyword
-# right after the placeholder. And a keyword spelled with a fold character such as U+017F as its FIRST
-# letter is not checked where the run class does not fold, because the walk reads that character as a
-# separator and checks only from the next letter. That is ``_MEFOR_SECRET`` here, the one pattern in
-# this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern but
-# ``_AUTH_SCHEME``: there ``_MEFOR_SECRET`` has no fold, and ``_BEARER``, ``_CREDENTIAL_KV`` and
-# ``_KEY_MATERIAL`` fold their keywords alone. Both copies of ``_AUTH_SCHEME`` fold globally, so their
-# run class folds and the check runs.
+# right after the placeholder. A keyword spelled with a fold character such as U+017F as its FIRST
+# letter was not checked where the run class does not fold, because the walk read that character as
+# a separator and checked only from the next letter. That was ``_MEFOR_SECRET`` here, the one pattern
+# in this module compiled without ``(?i)``, and in ``support/redact.py`` every stopped pattern but
+# ``_AUTH_SCHEME``. Since BACKLOG #3114 step 4 the walk checks in front of every separator outside
+# ASCII too (:data:`_FOLD_BEFORE`), so the check runs there.
 #
 # AND ONE DELIBERATE TRADE, which is the one place a single pass prints text the old class hid. After a
 # hard separator, an underscored run in front of a keyword is read as the later label's prefix, so in
@@ -726,6 +725,33 @@ _GUARDED_QUOTED_VALUE = (
 _GUARDED_BRACED_VALUE = r"\{(?:[^}'\"\r\n]|\}\})*+\}(?!\})"
 #: The same, holding no whitespace at all: the one braced shape the old plain class took whole.
 _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
+
+# A BRACED VALUE HOLDING WHITE SPACE, WITH TEXT GLUED AFTER ITS CLOSER (BACKLOG #2966 steps 1 and 2).
+# The guard above refuses a closer that does not end the value, and the plain class then stopped at the
+# first white space inside the braces, so ``MEFOR_X={pp ww}x rest`` printed " ww}x rest" and
+# ``private_key={pp ww},rest`` printed " ww},rest". ``_MEFOR_SECRET`` and ``_KEY_MATERIAL`` now take
+# such a value, closer and glued text, when the glued text is only lower case ASCII letters and the
+# separators that pattern's plain class runs over (";", "," and "&" for ``_MEFOR_SECRET``, "," for
+# ``_KEY_MATERIAL``), up to a character that class stops at. Anything else falls back to the plain
+# class, as before.
+#
+# WHY SO NARROW. What the old class left printing, from the space in the braces to the end of the
+# glued text, was still read by every later pass, and a pass that starts there and runs past the glued
+# text hid something this run would now take away from it. So the glued text holds no ":" or "=" (a
+# label, a ``://`` a DSN pass reads), no capital and no digit (a name run or a date the PHI pass reads
+# across the next space), no "-" (a ``-----BEGIN`` marker), and no "." or "/". It may not end in a
+# scheme word, as ``;bearer tok``, which ``_AUTH_SCHEME`` reads past the space, and it may not be
+# followed by white space and a ":", "=" or quote, as ``;password = v``, or by a quote at all.
+# The braces must hold white space, because without it the plain class already ran on past the closer,
+# and no ";", "&" or "{": the connection-string member pass reads a ``;pwd=`` member and masks its
+# value up to the next ";", across white space, so taking a ``;pwd=vq1 a}b`` in the braces took away
+# the member that hid what followed the glued text. Measured with synthetic values, by a differential
+# against ``origin/main`` over about 240,000 generated lines through ``scrub_credentials`` and
+# ``support.redact.redact_log_line``: with ";" allowed in the braces, five lines printed a value
+# ``origin/main`` hid on each surface; without it, none did on that corpus. That is a sample, not a
+# proof.
+_SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+[^\S\r\n](?:[^{}'\"\r\n;&]|\}\})*+\}(?!\})"
+_GLUED_END = r"(?<!bearer)(?<!basic)(?<!digest)(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
 
 #: One unit of a value walk: a run of letters and digits, SPLIT AT EVERY CAMELCASE BOUNDARY, a capital
 #: after a lower-case letter or a digit (BACKLOG #5545). The walks below check for a later label in
@@ -892,6 +918,17 @@ _NOT_BEFORE_QUOTED_LABEL = (
     + _MEFOR_QUOTED_LABEL
     + r")"
 )
+#: The same checks, made in front of a character the walk reads as a SEPARATOR when that character is
+#: outside ASCII (BACKLOG #3114 step 4). A keyword spelled with a fold character for its first letter,
+#: such as U+017F for the "s" of ``secret``, is a label to :data:`_LABEL_HEAD` and
+#: :data:`_BRACED_HEAD`, which fold their keywords, but a walk whose run class does not fold read that
+#: letter as a separator and checked only from the next one. So ``MEFOR_X=a;`` and the keyword
+#: spelled that way, then ``={pp ww}``, printed " ww}" where the ASCII spelling prints " xx}". Under a
+#: global ``(?i)`` the run class already takes those letters and the separator class never sees them,
+#: so this changes only ``_MEFOR_SECRET`` here and the patterns without a global fold in
+#: ``support/redact.py``. An ASCII separator is not checked, as before.
+_FOLD_AT = r"(?:(?=[\x00-\x7f])|" + _NOT_AT_QUOTED_LABEL + r")"
+_FOLD_BEFORE = r"(?:(?=[\x00-\x7f])|" + _NOT_BEFORE_QUOTED_LABEL + r")"
 
 
 #: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
@@ -991,26 +1028,26 @@ _KEY_TERMINATORS = r"\s'\";&"  # _KEY_MATERIAL
 _SCHEME_TERMINATORS = r"\s'\",;"  # _AUTH_SCHEME
 _PLAIN_VALUE = (
     rf"['\"]?(?:[^{_PLAIN_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_PLAIN_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_PLAIN_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KV_VALUE = (
     rf"['\"]?(?:[^{_KV_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KV_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_KV_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_KV_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_KEY_VALUE = (
     rf"['\"]?(?:[^{_KEY_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_KEY_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_KEY_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 _PLAIN_SCHEME_VALUE = (
     rf"['\"]?(?:[^{_SCHEME_TERMINATORS}{{]++(?!\{{){_NO_QUOTED_LABEL_AFTER}"
-    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
-    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
+    rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
+    rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
 )
 
@@ -1334,7 +1371,8 @@ _AUTH_SCHEME = re.compile(
 # -- which an unquoted form misses entirely.
 #
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
-# on ``_CREDENTIAL_KV``'s residuals.
+# on ``_CREDENTIAL_KV``'s residuals. A braced value holding white space is also taken with lower case
+# text glued after its closer, within the limits stated on :data:`_SPACED_GUARDED_BRACED`.
 #
 # A BRACED VALUE WITH NO SPACE IN IT TAKES ONE QUOTE AFTER ITS CLOSER, as the old plain class's
 # trailing ``['\"]?`` did. Without it ``password='vq0 MEFOR_X={vq1}' vq2'`` printed " vq2'": the old
@@ -1353,7 +1391,11 @@ _MEFOR_SECRET = re.compile(
     + rf"(?![^{_PLAIN_TERMINATORS}])"
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
+    + rf"(?![^{_PLAIN_TERMINATORS}])|"
+    + _SPACED_GUARDED_BRACED
+    + r"[a-z;,&]++"
     + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + _GLUED_END
     # A quoted value with no space in it and at least one character, closer and all. With the braced
     # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
     # passes see the same text they always did, wherever the old pattern matched this label at all.
@@ -1383,7 +1425,12 @@ _MEFOR_SECRET = re.compile(
 #   closing "}" ENDS the value -- that is, when the next character is one their plain class stops at.
 #   Without that guard, ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc", which the plain class
 #   used to hide. Both forms are the GUARDED ones. A value either refuses falls back to the plain
-#   class, which now carries the stop before a quoted label and is otherwise the old class.
+#   class, which now carries the stop before a quoted label and is otherwise the old class. Since
+#   BACKLOG #2966 steps 1 and 2, a braced value holding white space is also taken with text glued
+#   after its closer when that text is narrow enough (:data:`_SPACED_GUARDED_BRACED`), so
+#   ``MEFOR_X={pp ww}x rest`` and ``private_key={pp ww},rest`` no longer print the braced tail. A
+#   glued text holding a capital, a digit, ":", "=", "-", "." or "/", or a braced value holding ";",
+#   "&" or "{", still falls back to the plain class and prints the tail as before.
 # * ``_BEARER`` takes a quoted value and NOT a braced one. ``session=`` and ``token=`` legitimately
 #   carry a "{"-opening dict or JSON repr in this engine's log text, and taking braces would change
 #   those lines for no credential.
@@ -1471,6 +1518,11 @@ _KEY_MATERIAL = re.compile(
     + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
+    + _SPACED_GUARDED_BRACED
+    + r"(?-i:[a-z,])++"
+    + rf"(?![^{_KEY_TERMINATORS}])"
+    + _GLUED_END
+    + r"|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
     + _CAMEL_PLAIN_KEY_VALUE
