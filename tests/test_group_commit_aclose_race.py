@@ -4,10 +4,11 @@
 
 A committer task cancelled outside ``aclose()`` is only marked closed by its done-callback, and
 asyncio runs a done-callback one loop turn after the task finishes. In that turn ``submit()`` still
-enrols, because ``_closed`` is not yet set. If ``aclose()`` runs in the same turn, its ``await task`` returns without yielding (the task is already done), it
-clears ``_task``, and the done-callback then reads itself as a stale task's and returns early. The
-member enrolled in that turn was never committed and never rejected, so its caller (the ingress ACK
-gate among them) would park on its future forever.
+enrols, because ``_closed`` is not yet set. If ``aclose()`` runs in the same turn, its
+``await task`` raises the task's CancelledError without yielding (the task is already done),
+aclose swallows that stale cancel and clears ``_task``, and the done-callback then reads itself as
+a stale task's and returns early. The member enrolled in that turn was never committed and never
+rejected, so its caller (the ingress ACK gate among them) would park on its future forever.
 
 The test drives the loop turn by turn rather than sleeping: ``asyncio.sleep(0)`` yields exactly one
 turn, and an eagerly started task runs synchronously up to its first suspension, which is how a
@@ -50,10 +51,10 @@ async def test_member_enrolled_in_the_turn_the_committer_stopped_is_refused_by_a
 
         # Same turn: a member enrols (submit runs eagerly up to its await on the future), then the
         # store closes the committer (aclose runs eagerly and, on a done task, never yields).
-        member = asyncio.Task(gc.submit(lambda: _ret(1)), eager_start=True)
+        member = asyncio.create_task(gc.submit(lambda: _ret(1)), eager_start=True)
         assert not member.done()
         assert len(gc._pending) == 1
-        closer = asyncio.Task(gc.aclose(), eager_start=True)
+        closer = asyncio.create_task(gc.aclose(), eager_start=True)
         assert closer.done()
         closer.result()  # aclose itself raised nothing
         assert gc._pending == []  # refused by aclose itself, not left to a later callback
@@ -71,7 +72,8 @@ async def test_member_enrolled_in_the_turn_the_committer_stopped_is_refused_by_a
         with pytest.raises(RuntimeError, match="closed"):
             await gc.submit(lambda: _ret(2))
     finally:
-        # The regression case: release the parked caller (and a closer that yielded) so the run exits.
+        # The regression case: release the parked caller (and a closer that yielded) so the run
+        # can exit.
         leftovers = [t for t in (member, closer) if t is not None and not t.done()]
         for t in leftovers:
             t.cancel()

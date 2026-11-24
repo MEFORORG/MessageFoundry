@@ -637,6 +637,7 @@ class _GroupCommitter:
         if self._task is None or self._task.done():
             # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
             self._closed = False
+            self._reaped = None  # the old task is done; a callback still queued for it reads stale
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
             self._task.add_done_callback(self._on_stopped)
 
@@ -650,9 +651,9 @@ class _GroupCommitter:
 
         :meth:`aclose` also calls it, directly, because asyncio runs a done-callback a loop turn after
         the task ends: a :meth:`submit` can enrol in that turn, and an ``aclose`` in the same turn
-        finds the task done and returns without yielding, so without the direct call this callback
-        would run only after ``aclose`` cleared ``_task``, read the task as stale, and leave that
-        member pending (BACKLOG #5664)."""
+        finds the task done and gets past its ``await`` without yielding. Without the direct call
+        this callback would run only after ``aclose`` cleared ``_task``, read the task as stale, and
+        leave that member pending (BACKLOG #5664)."""
         if task is not self._task or task is self._reaped:
             return  # a stale task (a newer one owns the committer now), or one already handled
         self._reaped = task
@@ -679,11 +680,11 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier rejects its members in _on_stopped, called below if
-                # its done-callback has not run yet; that stale cancel must not abort the store's
-                # close. A cancel of OUR task during the
-                # await still propagates; the baseline keeps a caller that already caught an
-                # earlier cancel of its own from reading as cancelled now.
+                # A committer cancelled earlier rejects its members in _on_stopped, which its
+                # done-callback or the call below runs once; that stale cancel must not abort the
+                # store's close. A cancel of OUR task during the await still propagates, leaving
+                # _task set so the done-callback still rejects; the baseline keeps a caller that
+                # already caught an earlier cancel of its own from reading as cancelled now.
                 if not task.cancelled() or (
                     current is not None and current.cancelling() > baseline
                 ):
@@ -691,7 +692,10 @@ class _GroupCommitter:
             # Before clearing _task, so the member a same-turn submit() enrolled is rejected rather
             # than left to a done-callback that would read the task as stale (see _on_stopped).
             self._on_stopped(task)
-            self._task = None
+            # An overlapping close and start() may have installed a newer task; leave that one.
+            if self._task is task:
+                self._task = None
+                self._reaped = None
 
     async def submit(
         self,
