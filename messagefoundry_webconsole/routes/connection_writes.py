@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -32,6 +32,11 @@ from .._auth import (
 )
 from ._common import CONNECTION_RULE, refuse
 
+if TYPE_CHECKING:
+    # Typing only, so a console on an engine without it still mounts (the seam note on
+    # ENGINE_UI_SEAM says what such a pairing does).
+    from messagefoundry.api.message_scope import DeniedOperation
+
 _log = logging.getLogger(__name__)
 
 #: What a bulk outcome row says for a selection that is not a name this console could have rendered.
@@ -57,7 +62,12 @@ _NOT_A_CONNECTION_NAME = "not applied: not a valid connection name"
 
 
 async def _audit_refused_name(
-    core: Any, engine: Any, identity: Identity, request: Request, operation: str
+    core: Any,
+    engine: Any,
+    identity: Identity,
+    request: Request,
+    name: str,
+    operation: DeniedOperation,
 ) -> None:
     """Audit a channel-scoped actor's bulk selection that failed the connection-name rule.
 
@@ -68,9 +78,11 @@ async def _audit_refused_name(
     malformed name is never in scope, and the refusal is audited here instead.
 
     The row carries no channel (BACKLOG #3031). The name is caller-chosen text that failed the rule,
-    bounded only by the request body, and ``audit_log.channel_id`` would otherwise hold it whole. The
-    actor and the host still identify the attempt, as on the purge confirm page's refusal. The
-    row's ``operation`` says which bulk route refused it (vault BACKLOG #3748 item 7).
+    bounded only by the request body, so it is handed to the engine's helper, which writes no
+    channel for a name that fails the same rule and marks the row ``"malformed_name": true``. The
+    actor and the host still identify the attempt. The row's ``operation`` says which bulk route
+    refused it (vault BACKLOG #3748 item 7), and the marker tells it from the purge confirm page's
+    refusal, which names no channel by design.
 
     A failed write is logged and the batch goes on, as it does for a failed target, so the
     operator still sees which targets were applied."""
@@ -78,7 +90,7 @@ async def _audit_refused_name(
         return
     try:
         await core.audit_channel_denied(
-            engine, identity, None, client_ip(request), operation=operation
+            engine, identity, name, client_ip(request), operation=operation
         )
     except Exception:  # noqa: BLE001 - capture-and-continue; one bad selection never aborts the batch
         _log.exception("could not audit a channel-scoped actor's malformed bulk selection")
@@ -170,7 +182,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # The rule's own sentence is discarded here on purpose -- see _NOT_A_CONNECTION_NAME.
             # A channel-scoped actor's refusal is still audited; _audit_refused_name says why.
             if refuse(CONNECTION_RULE, name) is not None:
-                await _audit_refused_name(core, engine, identity, request, "connection_control")
+                await _audit_refused_name(
+                    core, engine, identity, request, name, "connection_control"
+                )
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:
@@ -332,7 +346,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # value reaching the result table, which the raw append below used to put there.
             # Same shape and the same channel-scope audit as ui_bulk_control above.
             if refuse(CONNECTION_RULE, value) is not None:
-                await _audit_refused_name(core, engine, identity, request, "connection_purge")
+                await _audit_refused_name(
+                    core, engine, identity, request, value, "connection_purge"
+                )
                 outcomes.append((None, _NOT_A_CONNECTION_NAME))
                 continue
             try:

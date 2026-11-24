@@ -2355,9 +2355,10 @@ the same permission set on the same method reds CI until it is listed here.
 > `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
 > the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
 > such a row is told apart from a refusal that names no channel by design (BACKLOG #3031). At
-> least some refusals that name no channel by design, such as a channel-scoped caller's config
-> reload, carry `"operation"` in their detail, naming the operation refused; `DeniedOperation` in
-> the same file lists the values (vault BACKLOG #3748 item 7).
+> least some rows that name no channel carry `"operation"` in their detail, naming the operation
+> refused: a channel-scoped caller's config reload is one, and a web console bulk selection whose
+> name fails the rule is another. `DeniedOperation` in the same file lists the values. Some such
+> rows carry none, at least one from a per-name connection route (vault BACKLOG #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial

@@ -47,9 +47,16 @@ CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
 #: What a refusal that names no channel by design was refusing (vault BACKLOG #3748 item 7). Each
 #: value is the audit action the operation writes when it runs, so a denial row and the row the
-#: operation would have written read alike: a config reload, a reset of every statistic, a purge,
-#: and a start, stop or restart.
-DeniedOperation = Literal["config_reload", "stats_reset", "connection_purge", "connection_control"]
+#: operation would have written read alike: a config reload, its dry run, a reset of every
+#: statistic, a replay of every channel's dead letters, a purge, and a start, stop or restart.
+DeniedOperation = Literal[
+    "config_reload",
+    "config_reload_check",
+    "stats_reset",
+    "dead_letter_replay",
+    "connection_purge",
+    "connection_control",
+]
 _DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
 
 
@@ -97,7 +104,9 @@ async def audit_channel_denied(
     if flag_direction_not_inbound:
         detail["flag_direction_not_inbound"] = True
     if operation is not None:
-        if operation in _DENIED_OPERATIONS:
+        # isinstance first: the console's value arrives untyped, and an unhashable one would
+        # raise in the set test and lose the row.
+        if isinstance(operation, str) and operation in _DENIED_OPERATIONS:
             detail["operation"] = operation
         else:
             _log.warning("a channel denial named an unknown operation; the row omits it")

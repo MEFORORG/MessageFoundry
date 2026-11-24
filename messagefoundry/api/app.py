@@ -7534,7 +7534,15 @@ def create_app(
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
-            await _audit_channel_denied(engine, identity, req.channel_id, client_ip(request))
+            # A replay of every channel names none, so its row names the operation instead (vault
+            # BACKLOG #3748 item 7).
+            await _audit_channel_denied(
+                engine,
+                identity,
+                req.channel_id,
+                client_ip(request),
+                operation="dead_letter_replay" if req.channel_id is None else None,
+            )
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (
             gate is not None
@@ -7820,7 +7828,11 @@ def create_app(
         refusal = _reload_refusal(user)
         if refusal is not None:
             await _audit_channel_denied(
-                engine, user, None, client_ip(request), operation="config_reload"
+                engine,
+                user,
+                None,
+                client_ip(request),
+                operation="config_reload_check" if req.dry_run else "config_reload",
             )
             raise HTTPException(403, refusal)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run

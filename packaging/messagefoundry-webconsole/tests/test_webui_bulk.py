@@ -811,8 +811,8 @@ async def test_console_denials_naming_no_channel_name_their_operation(
     engine: Engine, tmp_path: Path
 ) -> None:
     """Vault BACKLOG #3748 item 7: a scoped actor's console refusals that name no channel each
-    carry the operation refused, so the bulk control, the bulk purge and the purge confirm page's
-    rows are told apart."""
+    carry the operation refused, and the malformed bulk selections carry the marker, so the bulk
+    control, the bulk purge and the purge confirm page's rows are told apart."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
@@ -835,8 +835,17 @@ async def test_console_denials_naming_no_channel_name_their_operation(
         assert "not applied: not a valid connection name" in r.text
     rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
     assert [row["channel_id"] for row in rows] == [None, None, None]
-    ops = sorted(str(json.loads(str(row["detail"])).get("operation")) for row in rows)
-    assert ops == ["connection_control", "connection_purge", "connection_purge"]
+    details = sorted((json.loads(str(row["detail"])) for row in rows), key=str)
+    # The malformed bulk selections are marked, so the bulk purge's is told apart from the confirm
+    # page's refusal, which names no channel by design.
+    assert details == sorted(
+        [
+            {"channel": None, "malformed_name": True, "operation": "connection_control"},
+            {"channel": None, "malformed_name": True, "operation": "connection_purge"},
+            {"channel": None, "operation": "connection_purge"},
+        ],
+        key=str,
+    )
 
 
 async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(

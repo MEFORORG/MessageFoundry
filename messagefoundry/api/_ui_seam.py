@@ -970,9 +970,11 @@ from typing import Any
 #: Vault BACKLOG #3748 item 7: the console passes the keyword ``operation`` to the
 #: ``audit_channel_denied`` callback on its refusals that name no channel. As for BACKLOG #3378
 #: above, the digest does not cover that callback's signature, so it did not move and the handshake
-#: does not catch the skew. A newer console on an older engine raises TypeError on such a refusal;
-#: the console release that carries this raises its ``messagefoundry`` floor instead. ADR 0215's
-#: slice 5 drops the callback from the bundle, and each JSON route then writes its own row.
+#: does not catch the skew. A newer console on an older engine raises TypeError on such a refusal:
+#: the bulk routes catch and log it and write no denial row, and the purge confirm page answers 500
+#: with no row. The console release that carries this raises its ``messagefoundry`` floor instead.
+#: ADR 0215's slice 5 drops the callback from the bundle, and each JSON route then writes its own
+#: row.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
