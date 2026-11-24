@@ -3400,16 +3400,10 @@ def _serve(args: argparse.Namespace) -> int:
     # messagefoundry/serviceenv.py says what the reading covers.
     # Another engine secret reaching the service from outside those lists, such as from the
     # machine-wide environment, is refused under enforce only, and named under warn.
-    from messagefoundry.serviceenv import (
-        service_env_enforced_refusal,
-        service_env_posture,
-        service_env_refusal,
-    )
+    from messagefoundry.serviceenv import service_env_posture, service_env_start_refusal
 
     service_env = service_env_posture()
-    service_env_refused = service_env_refusal(service_env)
-    if service_env_refused is None and enforcing:
-        service_env_refused = service_env_enforced_refusal(service_env)
+    service_env_refused = service_env_start_refusal(service_env, enforcing=enforcing)
     if service_env_refused is not None:
         print(f"error: refusing to start: {service_env_refused}.", file=sys.stderr)
         return 2
@@ -6077,16 +6071,13 @@ def _supervise(args: argparse.Namespace) -> int:
     # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
     # Under enforce, also a secret reaching the service from outside its lists, as in `serve`.
     from messagefoundry.serviceenv import (
-        service_env_enforced_refusal,
         service_env_loosenings,
         service_env_posture,
-        service_env_refusal,
+        service_env_start_refusal,
     )
 
     service_env = service_env_posture()
-    service_env_refused = service_env_refusal(service_env)
-    if service_env_refused is None and enforcing:
-        service_env_refused = service_env_enforced_refusal(service_env)
+    service_env_refused = service_env_start_refusal(service_env, enforcing=enforcing)
     if service_env_refused is not None:
         print(
             f"error: {service_env_refused}. Every engine shard would refuse to start; refusing to "

@@ -528,9 +528,8 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import (
     ServiceEnvironmentRefused,
     ServiceEnvPosture,
-    service_env_enforced_refusal,
     service_env_posture,
-    service_env_refusal,
+    service_env_start_refusal,
 )
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
@@ -4756,14 +4755,11 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 def _refuse_a_secret_in_the_service_environment(caller: str, *, enforcing: bool) -> None:
     """Raise where ``serve`` would refuse to start on its own Windows service environment.
 
-    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, and under
-    ``enforcing`` :func:`service_env_enforced_refusal` too, so an app built here without either
-    of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
-    ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
-    posture = service_env_posture()
-    refused = service_env_refusal(posture)
-    if refused is None and enforcing:
-        refused = service_env_enforced_refusal(posture)
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_start_refusal`, so an app
+    built here without either of them refuses on the same finding (vault BACKLOG #2595, #8212
+    item 1). ``service_env_posture`` says what the reading covers, and when it cannot read the
+    lists."""
+    refused = service_env_start_refusal(service_env_posture(), enforcing=enforcing)
     if refused is not None:
         raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
 
@@ -4809,6 +4805,9 @@ def create_app(
     phi_read_hop_secure: bool = True,
     log_dir: str | None = None,
     configured_log_level: str | None = None,
+    # The dial for the service-environment check only, where it differs from
+    # ``security_settings.enforcement``, as ``create_managed_app`` takes it (vault BACKLOG #2595).
+    security_enforcement: SecurityEnforcement | None = None,
 ) -> FastAPI:
     # Vault BACKLOG #3673, defect 3: an application that builds the API without the command line
     # gets the remote-debugging hook here, rather than late or never. It goes in after the API's
@@ -4819,7 +4818,7 @@ def create_app(
     install_remote_debug_guard()
     _refuse_a_secret_in_the_service_environment(
         "create_app",
-        enforcing=(security_settings or SecuritySettings()).enforcement
+        enforcing=(security_enforcement or (security_settings or SecuritySettings()).enforcement)
         is SecurityEnforcement.ENFORCE,
     )
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
@@ -14112,6 +14111,7 @@ def create_managed_app(
         store_settings=resolved,
         ai_settings=ai_settings,
         security_settings=security_settings,
+        security_enforcement=security_enforcement,
         expose_docs=expose_docs,
         allow_no_auth=allow_no_auth,
         audit_all_authz=audit_all_authz,

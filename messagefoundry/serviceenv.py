@@ -1163,6 +1163,16 @@ def _kept_empty(variable: _Variable) -> bool:
     )
 
 
+def _sensitive_value(name: str, value: str) -> bool:
+    """Whether ``value``, read for ``name`` from this process's environment, holds a secret: it
+    is not blank, and for a name that takes either a key or its path, it is not a path, as
+    :func:`_names` judges the same name in the lists (:func:`_path_form`). One line, since an
+    environment value is one string."""
+    if not value.strip():
+        return False
+    return not (name in _INLINE_PEM_NAMES and _path_form(value))
+
+
 def _path_form(value: str) -> bool:
     """Whether the value of a name that takes either a key or its path (:data:`_INLINE_PEM_NAMES`)
     is a path, which is no secret: it holds no PEM armour, and its own line, the text after the
@@ -1237,7 +1247,9 @@ def read_service_env_posture(
         probe = _WindowsProbe()
     environ = os.environ if environ is None else environ
     keys = tuple(name for name in KEY_CLASS_NAMES if environ.get(name, "").strip())
-    others = tuple(name for name in DIRECTORY_CLASS_NAMES if environ.get(name, "").strip())
+    others = tuple(
+        name for name in DIRECTORY_CLASS_NAMES if _sensitive_value(name, environ.get(name, ""))
+    )
     service: str | None = None
     try:
         ancestors = iter(probe.ancestor_images())
@@ -1386,7 +1398,7 @@ def _where(posture: ServiceEnvPosture) -> str:
 
 
 class ServiceEnvironmentRefused(Exception):  # noqa: N818 - a refusal, not an error condition
-    """An API app factory refused to build on :func:`service_env_refusal`'s finding.
+    """An API app factory refused to build on :func:`service_env_start_refusal`'s finding.
 
     Not a ``RuntimeError``, so a handler written for another build failure, such as the absent
     web console ``create_app(serve_ui=True)`` reports, does not catch this refusal with it."""
@@ -1422,9 +1434,21 @@ def service_env_enforced_refusal(posture: ServiceEnvPosture) -> str | None:
     if found is None:
         return None
     return (
-        f'{found}. [security].enforcement = "warn" starts the engine with this named as '
-        "secret_from_outside_service_lists"
+        f'{found}. Under [security].enforcement = "warn" the engine starts and names this as '
+        "secret_from_outside_service_lists, but that setting relaxes other refusals as well, so "
+        "move the secret instead"
     )
+
+
+def service_env_start_refusal(posture: ServiceEnvPosture, *, enforcing: bool) -> str | None:
+    """The one refusal ``serve``, ``supervise`` and the API app factories apply, or None:
+    :func:`service_env_refusal`, and where ``enforcing`` (``[security].enforcement =
+    "enforce"``) :func:`service_env_enforced_refusal` too, both in one message where both
+    apply, so one start names every finding."""
+    found = [service_env_refusal(posture)]
+    if enforcing:
+        found.append(service_env_enforced_refusal(posture))
+    return ". ".join(f for f in found if f is not None) or None
 
 
 def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
@@ -1441,8 +1465,10 @@ def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
         "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment and passes to "
         "every local user's processes. Put each in the secrets directory "
         f"{_DIRECTORY_VARIABLE} names, as one restricted file per setting named as its variable, "
-        "and remove it from where it is set. "
-        'See docs/CONFIGURATION.md, "The secrets directory"'
+        "and remove it from where it is set. Where no secrets directory exists yet, or the "
+        f'service\'s lists name none, the bullet "The other secrets: a secrets directory" under '
+        'docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created and '
+        'named for the service. See docs/CONFIGURATION.md, "The secrets directory"'
     )
 
 
@@ -1702,6 +1728,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         + (spare if keep_one else "")
         + '. See docs/SERVICE.md, "Start / stop / status"'
     )
+    if posture.status is ServiceEnvStatus.UNOBSERVABLE:
+        # The lists were not read, so the value may have come from elsewhere instead, and a
+        # removal from the lists alone would leave it refused at every start.
+        steps.append(
+            "The engine could not read the service's lists, so a refused variable may come from "
+            "the machine-wide environment instead, which Windows keeps in the registry key "
+            "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment: where it "
+            "is set there, remove it there too"
+        )
     if posture.value_runs_on:
         # Removing the name alone would leave the value, which then refuses nothing.
         steps.append(

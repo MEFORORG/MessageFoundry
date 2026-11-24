@@ -1,6 +1,7 @@
-- **An engine secret that reaches the Windows service from outside its own environment lists now
-  refuses the start under `[security].enforcement = "enforce"`, and is named as
-  `secret_from_outside_service_lists` under `"warn"`.** This applies where the engine finds its
+- **An engine secret other than a store key that reaches the Windows service from outside its
+  own environment lists now refuses the start under `[security].enforcement = "enforce"`, and is
+  named as `secret_from_outside_service_lists` under `"warn"`.** A store key from there is still
+  named as `store_key_in_service_environment` and not refused. This applies where the engine finds its
   service and reads its lists, and the secret, such as `MEFOR_STORE_PASSWORD`, is in the
   engine's environment but not in those lists, so it came from somewhere else, such as the
   machine-wide environment. `serve`, `supervise`, `create_app` and `create_managed_app` apply it.

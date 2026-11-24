@@ -29,6 +29,7 @@ from messagefoundry.serviceenv import (
     service_env_enforced_refusal,
     service_env_loosenings,
     service_env_refusal,
+    service_env_start_refusal,
 )
 from tests.test_service_env_secrets import (
     _SAMPLES_CONFIG,
@@ -42,6 +43,15 @@ from tests.test_service_env_secrets import (
 
 _PASSWORD_VALUE = "synthetic-store-password-value"
 _TOKEN_VALUE = "synthetic-vault-token-value"
+#: Split so the gitleaks private-key rule reads no PEM key marker in this file.
+_PEM_VALUE = "-----BEGIN " + "PRIVATE KEY-----synthetic"
+
+
+def _value(name: str) -> str:
+    """A synthetic value that is a secret for ``name``: the OIDC signing key takes a path too,
+    which is no secret, so it gets inline PEM armour."""
+    return _PEM_VALUE if name == "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY" else _PASSWORD_VALUE
+
 
 #: A known service whose lists set nothing secret, with a store password in the engine's own
 #: environment, so it came from outside the lists.
@@ -61,11 +71,12 @@ def _names(posture: ServiceEnvPosture) -> list[str]:
 
 
 def test_the_reading_keeps_each_secret_name_in_the_environment_and_no_value() -> None:
-    environ = dict.fromkeys(DIRECTORY_CLASS_NAMES, _PASSWORD_VALUE)
+    environ = {name: _value(name) for name in DIRECTORY_CLASS_NAMES}
     posture = _service([], **environ)
     assert posture.others_in_environment == DIRECTORY_CLASS_NAMES
     assert posture.others_from_elsewhere == DIRECTORY_CLASS_NAMES
     assert _PASSWORD_VALUE not in repr(posture)
+    assert _PEM_VALUE not in repr(posture)
 
 
 def test_a_blank_secret_in_the_environment_is_not_read_as_set() -> None:
@@ -93,13 +104,13 @@ def test_a_secret_the_lists_set_is_not_from_elsewhere() -> None:
 def test_an_unreadable_list_refuses_another_secret_in_the_environment(name: str) -> None:
     """Before this change only a store key was read here, so the secret was neither refused nor
     named."""
-    posture = _unreadable(**{name: _PASSWORD_VALUE})
+    posture = _unreadable(**{name: _value(name)})
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert f"{name} reaches this engine through its environment" in refusal
     assert "could not be read (the registry key of service 'MessageFoundry'" in refusal
     assert refusal.endswith('[security].enforcement = "warn" does not change this refusal')
-    assert _PASSWORD_VALUE not in refusal
+    assert _PASSWORD_VALUE not in refusal and _PEM_VALUE not in refusal
     assert "secret_in_service_environment" in _names(posture)
 
 
@@ -151,14 +162,16 @@ def test_a_shell_is_not_refused() -> None:
 @pytest.mark.parametrize("name", DIRECTORY_CLASS_NAMES)
 def test_a_secret_from_outside_the_lists_is_refused_under_enforce_and_named(name: str) -> None:
     """Before this change it was neither refused nor named."""
-    posture = _service(["MEFOR_AI_ENVIRONMENT=prod"], **{name: _PASSWORD_VALUE})
+    posture = _service(["MEFOR_AI_ENVIRONMENT=prod"], **{name: _value(name)})
     assert service_env_refusal(posture) is None
     refusal = service_env_enforced_refusal(posture)
     assert refusal is not None
     assert refusal.startswith(f"{name} reaches the Windows service 'MessageFoundry'")
     assert "machine-wide environment" in refusal
-    assert refusal.endswith("named as secret_from_outside_service_lists")
-    assert _PASSWORD_VALUE not in refusal
+    assert "names this as secret_from_outside_service_lists" in refusal
+    assert refusal.endswith("so move the secret instead")
+    assert "The other secrets: a secrets directory" in refusal
+    assert _PASSWORD_VALUE not in refusal and _PEM_VALUE not in refusal
     entries = dict(service_env_loosenings(posture))
     assert name in entries["secret_from_outside_service_lists"]
     assert "secret_in_service_environment" not in entries
@@ -275,3 +288,76 @@ def test_an_embedded_app_refuses_under_enforce_and_builds_under_warn(
     assert str(raised.value) == f"{factory}: refusing to start: {refusal}"
     (tmp_path / "warn").mkdir()
     _build(factory, tmp_path / "warn", SecurityEnforcement.WARN)
+
+
+# --- repair round 1 (code review round-862b5a4ac8) ---------------------------------------------------
+
+_KEY_PATH = "C:/keys/oidc.pem"
+
+
+def test_an_oidc_signing_key_path_in_the_lists_and_the_environment_is_not_a_secret() -> None:
+    """NSSM puts a listed value in the engine's environment too. A key path is no secret in the
+    lists (``_path_form``), so the environment reading judges it the same way, and the engine
+    neither says the lists do not set it nor refuses."""
+    posture = _service(
+        [f"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY={_KEY_PATH}"],
+        MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=_KEY_PATH,
+    )
+    assert posture.others_in_environment == ()
+    assert service_env_start_refusal(posture, enforcing=True) is None
+    assert "secret_from_outside_service_lists" not in _names(posture)
+
+
+def test_an_oidc_signing_key_path_with_unreadable_lists_is_not_refused() -> None:
+    posture = _unreadable(MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=_KEY_PATH)
+    assert service_env_start_refusal(posture, enforcing=True) is None
+
+
+def test_an_inline_oidc_signing_key_from_elsewhere_is_still_refused() -> None:
+    posture = _service([], MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=_PEM_VALUE)
+    assert posture.others_from_elsewhere == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",)
+
+
+def test_one_start_names_a_listed_secret_and_one_from_elsewhere_together() -> None:
+    posture = _service(
+        [f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"],
+        MEFOR_STORE_PASSWORD=_PASSWORD_VALUE,
+        MEFOR_AI_API_KEY=_TOKEN_VALUE,
+    )
+    refusal = service_env_start_refusal(posture, enforcing=True)
+    assert refusal is not None
+    assert "MEFOR_STORE_PASSWORD (in Parameters" in refusal
+    assert "MEFOR_AI_API_KEY reaches the Windows service" in refusal
+    assert service_env_start_refusal(posture, enforcing=False) == service_env_refusal(posture)
+
+
+def test_an_unreadable_list_says_to_remove_it_from_the_machine_wide_environment_too() -> None:
+    refusal = service_env_refusal(_unreadable(MEFOR_STORE_PASSWORD=_PASSWORD_VALUE))
+    assert refusal is not None
+    assert "may come from the machine-wide environment instead" in refusal
+
+
+def test_create_managed_app_honours_an_explicit_warn_dial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``create_managed_app`` passes its dial on to ``create_app``, which runs the check again, so
+    an explicit ``security_enforcement`` wins over ``security_settings`` there too."""
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.settings import EgressSettings
+
+    monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: _ELSEWHERE)
+    create_managed_app(
+        db_path=tmp_path / "embedded.db",
+        egress_settings=EgressSettings(deny_by_default=False),
+        allow_no_auth=True,
+        security_settings=SecuritySettings(enforcement=SecurityEnforcement.ENFORCE),
+        security_enforcement=SecurityEnforcement.WARN,
+    )
+    with pytest.raises(ServiceEnvironmentRefused, match="^create_managed_app: "):
+        create_managed_app(
+            db_path=tmp_path / "embedded2.db",
+            egress_settings=EgressSettings(deny_by_default=False),
+            allow_no_auth=True,
+            security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+            security_enforcement=SecurityEnforcement.ENFORCE,
+        )
