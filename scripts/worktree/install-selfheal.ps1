@@ -7,8 +7,9 @@
 
 .DESCRIPTION
     Idempotent. MERGES (never clobbers) a SessionStart hook that runs the shared worktree-selfheal.ps1;
-    existing hooks and top-level keys are preserved. Backs up settings.json, validates the written JSON,
-    and rolls back on any failure.
+    existing hooks and top-level keys are preserved. Validates the new JSON before writing, backs up
+    settings.json, and replaces it in one move from a temp file beside it, so it is never written in place.
+    It does not create the allowlist; install-gate.ps1 owns that.
 
     Run once per config dir a session can use. On this box (a subscription-swap setup) that is:
       ~/.claude                (the Desktop app; CLAUDE_CONFIG_DIR unset)
@@ -46,22 +47,32 @@ if ($env:CLAUDECODE -eq '1') {
 $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
 if (-not $HookPath) { $HookPath = Join-Path $homeDir '.claude-hooks/worktree-selfheal.ps1' }
 
+# The path goes into a double-quoted shell command below. A `$` or backtick there would be expanded by
+# whichever shell runs the hook, and a double quote would end the argument, so the wired command would
+# name a different file. Refuse rather than escape on a guess about which shell that is.
+if ($HookPath -match '[$`"]') {
+    throw "Refusing a HookPath containing a dollar sign, backtick or double quote: $HookPath"
+}
+
 if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config dir not found: $ConfigDir" }
 $settingsPath = Join-Path $ConfigDir 'settings.json'
 
-# --- Ensure the shared, account-agnostic hook script + allowlist exist (idempotent) ---------------
+# --- Ensure the shared, account-agnostic hook script exists (idempotent) --------------------------
 # One script copy, referenced by every config dir's wiring, so an account swap can't drop it.
 $sharedDir = Split-Path -Parent $HookPath
 New-Item -ItemType Directory -Force -Path $sharedDir | Out-Null
 $canonical = Join-Path $PSScriptRoot 'worktree-selfheal.ps1'
 if (Test-Path -LiteralPath $canonical) { Copy-Item -LiteralPath $canonical -Destination $HookPath -Force }
 elseif (-not (Test-Path -LiteralPath $HookPath)) { throw "worktree-selfheal.ps1 not found beside this installer or at $HookPath." }
-$reposFile = Join-Path $sharedDir 'worktree-gate.repos.txt'
-if (-not (Test-Path -LiteralPath $reposFile)) {
-    # Seed from the worktree gate's existing allowlist if present; else a commented template.
-    $gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
-    if (Test-Path -LiteralPath $gateRepos) { Copy-Item -LiteralPath $gateRepos -Destination $reposFile -Force }
-    else { Set-Content -LiteralPath $reposFile -Encoding utf8 -Value '# Primaries guarded by the SessionStart backstop. One absolute path per line. Delete to disable.' }
+
+# The allowlist is NOT created here. The backstop reads the gate's ~/.claude/hooks/worktree-gate.repos.txt
+# first and ~/.claude-hooks/worktree-gate.repos.txt only as a legacy fallback (worktree-selfheal.ps1). A
+# copy seeded into the legacy place would outlive `install-gate.ps1 -Uninstall` and keep the backstop
+# running `git checkout` on the primary after the gate's allowlist was gone. install-gate.ps1 owns the one
+# allowlist. An existing legacy file is left as it is.
+$gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
+if (-not (Test-Path -LiteralPath $gateRepos)) {
+    Write-Host "[$ConfigDir] note: $gateRepos is absent, so the backstop guards nothing until install-gate.ps1 writes it."
 }
 
 $raw = if (Test-Path -LiteralPath $settingsPath) { Get-Content -LiteralPath $settingsPath -Raw } else { '{}' }
@@ -82,7 +93,8 @@ if (($cfg.hooks.PSObject.Properties.Name -contains 'SessionStart') -and $cfg.hoo
 # Idempotency: bail if any SessionStart hook already runs our script.
 foreach ($g in $groups) {
     foreach ($h in @($g.hooks)) {
-        if ("$($h.command)" -match 'worktree-selfheal') {
+        # An exec-form hook names the script in args rather than command; it is the same wiring.
+        if ("$($h.command) $(@($h.args) -join ' ')" -match 'worktree-selfheal') {
             Write-Host "[$ConfigDir] already wired -- no change."
             return
         }
@@ -93,7 +105,7 @@ foreach ($g in $groups) {
 $entry = [pscustomobject]@{
     hooks = @([pscustomobject]@{
             type          = 'command'
-            command       = "pwsh -NoProfile -File `"$HookPath`""
+            command       = "pwsh -NoProfile -NonInteractive -File `"$HookPath`""
             timeout       = 30
             statusMessage = 'Worktree self-heal'
         })
@@ -101,18 +113,23 @@ $entry = [pscustomobject]@{
 $groups = @($groups) + $entry
 $cfg.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue $groups -Force
 
-# Backup -> write -> validate -> roll back on failure.
+# Validate -> backup -> write a temp file beside the live one -> one replace. Other sessions read
+# settings.json at any moment, so it is never written in place: a reader sees the old file or the new
+# one, never a truncated one. Invalid JSON leaves the live file untouched and exits non-zero.
+$json = $cfg | ConvertTo-Json -Depth 40
+try {
+    $null = $json | ConvertFrom-Json
+} catch {
+    throw "[$ConfigDir] produced invalid JSON; settings.json left untouched. $_"
+}
 if (Test-Path -LiteralPath $settingsPath) {
     Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
 }
-$json = $cfg | ConvertTo-Json -Depth 40
-Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
+$tmp = Join-Path $ConfigDir ("settings.json.tmp-selfheal-{0}" -f [guid]::NewGuid().ToString('N'))
 try {
-    $null = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
-    Write-Host "[$ConfigDir] wired + valid JSON."
-} catch {
-    if (Test-Path -LiteralPath "$settingsPath.bak-selfheal") {
-        Copy-Item -LiteralPath "$settingsPath.bak-selfheal" -Destination $settingsPath -Force
-    }
-    throw "[$ConfigDir] produced invalid JSON; rolled back. $_"
+    [IO.File]::WriteAllText($tmp, $json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmp -Destination $settingsPath -Force
+} finally {
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
 }
+Write-Host "[$ConfigDir] wired + valid JSON."

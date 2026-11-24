@@ -20,6 +20,7 @@ session's own worktree.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -296,3 +297,142 @@ def test_the_default_hook_path_resolves_without_USERPROFILE(tmp_path: Path) -> N
     assert (fake_home / ".claude-hooks" / "worktree-selfheal.ps1").is_file(), (
         "the hook should have been copied under the resolved home"
     )
+
+
+# ------------------------------------------- the settings write, the wiring check, the seeded copy
+#
+# BACKLOG #7612 and #7613. Every run below points USERPROFILE and HOME at a temporary home and passes
+# -HookPath and -ConfigDir under tmp, so nothing reads or writes the real ~/.claude.
+
+
+def run_installer(
+    home: Path, cfg: Path, hook_path: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    hp = hook_path if hook_path is not None else home / ".claude-hooks" / "worktree-selfheal.ps1"
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALLER),
+            "-ConfigDir",
+            str(cfg),
+            "-HookPath",
+            str(hp),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Path:
+    c = tmp_path / "cfg"
+    c.mkdir()
+    return c
+
+
+def _session_start(cfg: Path) -> list[dict[str, object]]:
+    data = json.loads((cfg / "settings.json").read_text(encoding="utf-8-sig"))
+    groups: list[dict[str, object]] = data["hooks"]["SessionStart"]
+    return groups
+
+
+def test_an_exec_form_hook_counts_as_already_wired(home: Path, cfg: Path) -> None:
+    """A hook naming the script in ``args`` rather than ``command`` is the same wiring. Checking only
+    ``command`` appended a second group, so every session would run the backstop twice."""
+    original = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "pwsh",
+                            "args": ["-NoProfile", "-File", "C:/x/worktree-selfheal.ps1"],
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+    (cfg / "settings.json").write_text(json.dumps(original), encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert "already wired" in r.stdout
+    assert len(_session_start(cfg)) == 1, "an exec-form hook was wired a second time"
+
+
+def test_a_successful_install_preserves_keys_and_leaves_no_temp_file(home: Path, cfg: Path) -> None:
+    (cfg / "settings.json").write_text(json.dumps({"model": "x", "hooks": {}}), encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    data = json.loads((cfg / "settings.json").read_text(encoding="utf-8-sig"))
+    assert data["model"] == "x"
+    hooks = _session_start(cfg)[0]["hooks"]
+    assert isinstance(hooks, list)
+    assert "-NonInteractive" in str(hooks[0]["command"]), "the hook's pwsh could prompt on stdin"
+    leftovers = sorted(p.name for p in cfg.iterdir() if p.name != "settings.json")
+    assert leftovers == ["settings.json.bak-selfheal"], f"stray files: {leftovers}"
+
+
+def test_the_live_settings_file_is_never_written_in_place() -> None:
+    """A concurrent session reading settings.json must see the old file or the new one, never a
+    truncated one. So the new text is parsed BEFORE anything is written, written to a temp file in the
+    same directory, and moved over the live file in one replace. No direct Set-Content onto it."""
+    src = INSTALLER.read_text(encoding="utf-8")
+    assert "Set-Content -LiteralPath $settingsPath" not in src, (
+        "live settings.json written in place"
+    )
+    parse_at = src.index("$null = $json | ConvertFrom-Json")
+    write_at = src.index("[IO.File]::WriteAllText($tmp")
+    move_at = src.index("Move-Item -LiteralPath $tmp -Destination $settingsPath -Force")
+    assert parse_at < write_at < move_at
+
+
+@pytest.mark.parametrize("bad", ["a$b", "a`b", 'a"b'])
+def test_a_hook_path_the_shell_would_rewrite_is_refused(
+    home: Path, cfg: Path, tmp_path: Path, bad: str
+) -> None:
+    """The path is embedded in a double-quoted shell command. A ``$`` or backtick there would be
+    expanded by the shell that runs the hook, and a quote would end the argument, so the wired command
+    would name a different file. Refused before anything is written, rather than escaped on a guess
+    about which shell runs it."""
+    if os.name == "nt" and '"' in bad:
+        pytest.skip("a Windows path cannot contain a double quote")
+    hp = tmp_path / bad / "worktree-selfheal.ps1"
+    r = run_installer(home, cfg, hook_path=hp)
+    assert r.returncode != 0, "a HookPath the shell would rewrite was wired"
+    assert "HookPath" in (r.stderr + r.stdout)
+    assert not (cfg / "settings.json").exists()
+    assert not hp.parent.exists(), "it must refuse before creating the hook directory"
+
+
+def test_the_installer_does_not_create_the_legacy_allowlist(home: Path, cfg: Path) -> None:
+    """BACKLOG #7613. The backstop reads the gate's allowlist first and the legacy one only as a
+    fallback. A copy seeded into ~/.claude-hooks would outlive ``install-gate.ps1 -Uninstall`` and keep
+    the backstop armed after the gate's allowlist is gone, so the installer must not create one."""
+    (home / ".claude" / "hooks" / "worktree-gate.repos.txt").write_text("C:/P\n", encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert not (home / ".claude-hooks" / "worktree-gate.repos.txt").exists(), "legacy copy seeded"
+
+
+def test_with_no_allowlist_the_installer_writes_no_template(home: Path, cfg: Path) -> None:
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert not (home / ".claude-hooks" / "worktree-gate.repos.txt").exists(), "template seeded"
+    assert "install-gate.ps1" in r.stdout, "the operator is not told the backstop is off"
+
+
+def test_an_existing_legacy_allowlist_is_left_alone(home: Path, cfg: Path) -> None:
+    legacy = home / ".claude-hooks" / "worktree-gate.repos.txt"
+    legacy.write_text("C:/Kept\n", encoding="utf-8")
+    r = run_installer(home, cfg)
+    assert r.returncode == 0, r.stderr
+    assert legacy.read_text(encoding="utf-8") == "C:/Kept\n"
