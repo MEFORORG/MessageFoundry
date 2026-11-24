@@ -3399,10 +3399,14 @@ jobs:
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
           fi
-          # The container image smoke runs on PRs that touch the image, the per-profile locks, packaging,
-          # this workflow, an engine module on the image's start path, or a rig file its steps run.
-          # ci/locks/release-tools.lock is in because the image's builder stage installs from it
-          # (BACKLOG #1193), so a bump to it can break the image build.
+          # The container image smoke runs on PRs that touch the image (docker/, which holds the
+          # per-profile locks), pyproject.toml or requirements.lock, this workflow, an engine module on
+          # the image's start path, or a rig file its steps run. It does NOT run on a PR that touches
+          # only packaging/. ci/locks/release-tools.lock is in because the image's builder stage
+          # installs from it (BACKLOG #1193), so a bump to it can break the image build. README.md,
+          # LICENSE and NOTICE are in because the builder stage COPYs them beside pyproject.toml and
+          # the engine build reads them, so a rename or a removal fails the image build (BACKLOG
+          # #5472). tests/test_ci_docker_gate.py reads the root files the Dockerfile COPYs.
           #
           # THE START-PATH ARM (vault BACKLOG #3455). The image's ENTRYPOINT is `python -m
           # messagefoundry` (docker/Dockerfile), and this job is the only one that starts `serve` the
@@ -3434,7 +3438,7 @@ jobs:
           # not in ci-gate's needs (see the note above ci-gate). The merge_group and push arms are
           # unchanged (#1830). tests/test_ci_docker_gate.py pins this alternation, and the measured
           # run rate is in that file's docstring.
-          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(docker/|\.dockerignore|ci/locks/release-tools\.lock|pyproject\.toml|requirements\.lock|(README\.md|LICENSE|NOTICE)$|messagefoundry/(__init__|__main__|serviceenv|terminal_text|api/(__init__|app|models|tls)|auth/(trust_anchors|anchor_path|passwords)|pki|config/(anchor|retention_classification|settings|tls_policy|wiring)|transports/egress|logging_setup|startupcode|remotedebug)\.py$|harness/load/rigadmin\.py$|scripts/ci/make_syslog_ca_crl\.py$|tests/_phi_gate_provisions\.py$|\.github/workflows/ci\.yml)'; then
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
@@ -3452,7 +3456,14 @@ jobs:
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|\.github/workflows/(ci|release)\.yml)'; then
+          # ci/locks/release-tools.lock is listed because the build installs its backend from it,
+          # so a lock-only bump changes the hatchling that builds (BACKLOG #5472). README.md,
+          # CHANGELOG.md, LICENSE and NOTICE are the root files the engine build reads by name: the
+          # sdist's `only-include`, `readme` and `license-files` in pyproject.toml, so a rename or a
+          # removal of one breaks the build or drops a licence file from it. They rarely change, so
+          # listing them costs little. tests/test_ci_packaging_gate.py reads those inputs out of
+          # pyproject.toml and this job, and fails if one stops tripping this arm.
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE)$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -3519,7 +3530,15 @@ jobs:
           # (BACKLOG #5641): tests/test_new_dependency_check.py, a manifest entry, sweeps every
           # packaging pyproject and a hatch.toml beside any swept one, so an edit to one of those
           # alone must still run this tier.
-          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.pre-commit-config\.yaml|constraints\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
+          # `.gitleaks.toml`, `.semgrep/`, `.codex/`, `requirements.lock` and the `ci/`, `docker/`
+          # and `security/` lock folders are that shape again (BACKLOG #5472): a manifest entry reads
+          # each from the repository, and none matched an arm here. tests/test_ci_tooling_gate.py
+          # names the reader of each. `uv.lock` stays out: no manifest entry reads it by name, and
+          # that file pins the choice. NOTICE, `.agents/` and the rest of `packaging/` stay out for
+          # the same reason. NOT CLOSED HERE: a listed test that
+          # scans every tracked file, such as tests/test_defaulted_credential_lint.py, reads paths no
+          # arm names, so a PR that touches only those still meets it first on push-to-main.
+          if echo "$changed" | grep -qE '^(scripts/|\.github/|docs/|\.claude/|CLAUDE\.md|LICENSE|ide/|ci/npm-tools/|ci/python-version|(ci|docker|security)/locks/|pyproject\.toml|hatch\.toml|packaging/[^/]+/(pyproject|hatch)\.toml|\.gitignore|\.gitattributes|\.gitleaks\.toml|\.semgrep/|\.codex/|\.pre-commit-config\.yaml|constraints\.lock|requirements\.lock|tests/(conftest\.py|_tooling_manifest\.py|tooling_manifest\.txt|test_tooling_partition\.py))' \
             || echo "$changed" | grep -qxFf <(grep -vE '^[[:space:]]*(#|$)' tests/tooling_manifest.txt); then
             echo "tooling=true" >> "$GITHUB_OUTPUT"
           else
