@@ -231,7 +231,8 @@ def _static_authorization(settings: Mapping[str, Any]) -> list[str]:
     reader does not take the connector type. Whether it reads resolved or unresolved settings
     depends on its caller. Read on unresolved settings, a Basic pair whose ``env()`` halves both
     resolve empty counts as set here; that hop builds and sends the bearer if one is set, otherwise
-    nothing, and this listing still names Basic. One half resolving empty refuses the build."""
+    any ``Authorization`` entry in its static ``headers``, otherwise no ``Authorization`` header,
+    and this listing still names Basic. One half resolving empty refuses the build."""
     if settings.get("basic_user") and settings.get("basic_password"):
         return ["HTTP Basic"]
     if settings.get("bearer_token"):

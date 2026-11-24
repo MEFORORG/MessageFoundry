@@ -1,5 +1,5 @@
-- **One credential owns the `Authorization` header on a SOAP, REST or FHIR outbound.** A SOAP outbound
-  now refuses at construction a `bearer_token` beside a Basic pair, as REST and DICOMweb already
+- **A detached-JWS signing header named `Authorization` no longer replaces the credential on a SOAP, REST or FHIR outbound, and a SOAP outbound refuses a `bearer_token` beside a Basic pair.**
+  A SOAP outbound now refuses at construction a `bearer_token` beside a Basic pair, as REST and DICOMweb already
   did; it used to send Basic and drop the token without a word. A SOAP, REST or FHIR outbound
   refuses a detached-JWS signing header named `Authorization`, in any spelling, beside a
   configured or minted credential for that header, at least HTTP Basic, a `bearer_token`, an
