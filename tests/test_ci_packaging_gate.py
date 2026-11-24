@@ -53,8 +53,9 @@ def _root_files_the_engine_build_reads() -> set[str]:
     """The repo-ROOT files the engine build reads by name, from pyproject.toml.
 
     The sdist's ``only-include``, the ``readme`` and the ``license-files``. A directory (the
-    package) and a nested path are left out: the packaged trees are not this arm's by design, as
-    the comment above it in ci.yml says.
+    package) is left out: the packaged trees are not this arm's by design, as the comment above
+    it in ci.yml says. A nested path is left out of the sdist/readme roots, but a nested
+    ``license-files`` entry (the vendored defusedxml LICENSE) is included.
     """
     project = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))["project"]
     sdist = hatch_build(_PYPROJECT)["targets"]["sdist"]

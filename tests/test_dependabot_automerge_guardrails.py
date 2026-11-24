@@ -23,10 +23,13 @@ document does not yet make — do not read them as claims about its text:
 All three must be wired into the ``Enable auto-merge`` step's ``if`` so a held/un-advisoried/fresh PR
 does NOT auto-merge, while an eligible patch still does (``gh pr merge --auto`` preserved).
 
-WARNING: #2 and #4 cannot change a merge decision as the workflow ships, and these tests do not pretend
-otherwise: ``age_ok=true`` and ``advisory_ok=true`` are reachable only for uv/pip, ``eligible=true`` only for
-github-actions, and the merge ``if`` requires all of them on the security track — disjoint sets. It is tested as a FORWARD guard, so that populating a Python
-allow row later is a one-line change to a control that already works, not a control to be written
+WARNING: #4 cannot change a merge decision as the workflow ships, and #2 can only HOLD one, never confirm it,
+and these tests do not pretend otherwise: ``age_ok=true`` and ``advisory_ok=true`` are reachable only for
+uv/pip, ``eligible=true`` only for github-actions, and the merge ``if`` requires all of them on the security
+track -- disjoint sets. #2's step does hold a PR the allow-set would pass (an ungrouped or unknown-group PR is
+reported as ``security_track=true`` with ``advisory_ok=false``). The confirming halves are tested as FORWARD
+guards, so that populating a Python allow row later is a one-line change to a control that already works, not
+a control to be written
 under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins the conjunction that makes this
 true, so the day someone widens it, a test has to be edited deliberately.
 """
@@ -347,7 +350,7 @@ def test_release_age_is_gated_on_the_allow_set() -> None:
     this step makes an UNAUTHENTICATED outbound GET from a job holding ``contents: write``, so making
     it for a PR that was going to be held anyway is gratuitous. The honesty reason, which is why the
     assertion lives here rather than in a comment: this ``if`` is half of the conjunction that makes
-    guardrail #4 INERT today (``age_ok=true`` needs uv/pip, ``eligible=true`` needs github-actions).
+    guardrail #4 INERT (and #2 unable to confirm) today (``age_ok=true`` needs uv/pip, ``eligible=true`` needs github-actions).
     Pinning it means widening #4 into a live control has to edit a test, not slip through as prose.
     """
     age = _step("age")
