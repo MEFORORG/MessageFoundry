@@ -39,7 +39,18 @@ from starlette.requests import HTTPConnection
 from starlette.routing import BaseRoute
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from messagefoundry.api.auth_models import STEP_UP_VIA_HEADER, STEP_UP_VIA_IDP, CredentialReply
+from messagefoundry.api.auth_models import (
+    MUST_CHANGE_NEXT_ENROL_FACTOR,
+    MUST_CHANGE_NEXT_HEADER,
+    MUST_CHANGE_NEXT_ROTATE,
+    MUST_CHANGE_NEXT_VERIFY_FACTOR,
+    STEP_UP_REASON_HEADER,
+    STEP_UP_REASON_NEW_ADDRESS,
+    STEP_UP_REASON_REVERIFY,
+    STEP_UP_VIA_HEADER,
+    STEP_UP_VIA_IDP,
+    CredentialReply,
+)
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
     parse_trusted_proxies,
@@ -594,6 +605,38 @@ def _password_change_required(deadline: float | None, *, suffix: str = "") -> st
             " ask an administrator to reset it"
         )
     return f"password change required; the temporary password stops working at {when}" + suffix
+
+
+async def _password_change_next(auth: AuthService, token: str | None, *, enrol_first: bool) -> str:
+    """The step a must-change session takes next, for its refusal's :data:`MUST_CHANGE_NEXT_HEADER`.
+
+    ADR 0215 section 2. In the web console's ``must_change_target`` order: a factor the session
+    owes first, since ``POST /me/password`` refuses it until then (BACKLOG #1954); then enrolment,
+    when the account must enrol before it rotates (ADR 0197 Amendment A); otherwise the password
+    change. Asked on the refusal path only, so an admitted request pays nothing for it. The header
+    only names where to go; the gate has already refused, and each destination route keeps its own
+    checks.
+
+    A store fault on the factor read keeps the 403 rather than turning it into a 500, as
+    :func:`_step_up_refusal` does for its wording read, and names the password change, the
+    destination the web console picks for a state it cannot read."""
+    try:
+        owes_factor = await auth.password_change_owes_factor(token)
+    except AUDIT_WRITE_DEFECTS:
+        raise
+    except store_call_errors() as exc:
+        log.warning(
+            "a must-change refusal could not read whether the session owes a factor (%s); it"
+            " names the password change",
+            type(exc).__name__,
+            exc_info=True,
+        )
+        owes_factor = False
+    if owes_factor:
+        return MUST_CHANGE_NEXT_VERIFY_FACTOR
+    if enrol_first:
+        return MUST_CHANGE_NEXT_ENROL_FACTOR
+    return MUST_CHANGE_NEXT_ROTATE
 
 
 # --- Answering before the request body is read (vault BACKLOG #2739) ---------------------------------
@@ -1364,6 +1407,11 @@ async def _admit(
                     await pending_credential_deadline_for(auth, identity.user_id),
                     suffix=_ENROL_FIRST_SUFFIX if enrol_first else "",
                 ),
+                headers={
+                    MUST_CHANGE_NEXT_HEADER: await _password_change_next(
+                        auth, bearer_token(request), enrol_first=enrol_first
+                    )
+                },
             )
     # ASVS 6.3.3 — MFA is an ACCESS gate, not only a step-up gate. Ordering is load-bearing in
     # BOTH directions. must_change stays FIRST: a fresh account (a new user) is
@@ -1571,15 +1619,23 @@ _IDP_STEP_UP_DETAIL = (
 
 
 async def _step_up_refusal(
-    auth: AuthService, token: str | None, action: str | None = None
+    auth: AuthService, token: str | None, action: str | None = None, *, new_address: bool = False
 ) -> _GateRefusal:
     """The 403 every JSON step-up gate raises, for the session that holds ``token``.
 
     One place for the step-up raise sites (BACKLOG #2158), at least the four ``require_step_up*``
     and ``require_reauth_only*`` factories and :func:`refuse_from_new_address`. It reads the
     session only on the refusal path, so a request that passes pays nothing for it. ``action`` adds
-    ``X-Step-Up-Action`` for the per-action gates (ADR 0077)."""
-    headers = {"X-Step-Up-Required": "1"}
+    ``X-Step-Up-Action`` for the per-action gates (ADR 0077). ``new_address`` names the cause in
+    :data:`STEP_UP_REASON_HEADER` (ADR 0215 section 2): the caller passes True when the session was
+    last verified from another host, and the header then reads :data:`STEP_UP_REASON_NEW_ADDRESS`,
+    otherwise :data:`STEP_UP_REASON_REVERIFY`. The refusal is the same either way."""
+    headers = {
+        "X-Step-Up-Required": "1",
+        STEP_UP_REASON_HEADER: (
+            STEP_UP_REASON_NEW_ADDRESS if new_address else STEP_UP_REASON_REVERIFY
+        ),
+    }
     if action is not None:
         headers["X-Step-Up-Action"] = action
     try:
@@ -1646,7 +1702,7 @@ async def refuse_from_new_address(request: Request) -> None:
         return
     token = bearer_token(request)
     if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
-        raise await _step_up_refusal(auth, token)
+        raise await _step_up_refusal(auth, token, new_address=True)
 
 
 def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Identity]]:
@@ -2073,7 +2129,7 @@ def require_step_up(*permissions: Permission) -> Callable[[Request], Awaitable[I
                     token, client_ip(request), path=request.url.path
                 )
                 if new_ip or not await auth.has_recent_step_up(token):
-                    raise await _step_up_refusal(auth, token)
+                    raise await _step_up_refusal(auth, token, new_address=new_ip)
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)
@@ -2104,17 +2160,21 @@ def require_reauth_only(*permissions: Permission) -> Callable[[Request], Awaitab
                     token, client_ip(request), path=request.url.path
                 )
                 if new_ip or not await auth.has_recent_step_up(token):
-                    raise await _step_up_refusal(auth, token)
+                    raise await _step_up_refusal(auth, token, new_address=new_ip)
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)
 
 
-async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
+async def _action_step_up_ok(
+    auth: AuthService, token: str | None, action: str, *, spend: bool = True
+) -> bool:
     """The step-up decision for a per-action route (ADR 0077): when action-binding is enforced
     (default), a fresh **single-use grant BOUND to** ``action`` (consumed here); when the org opted
     out (``[auth].require_action_step_up = false``), the legacy session-window recency. Split out so
     ``require_step_up_action`` and ``require_reauth_only_action`` share one place for the fallback.
+    ``spend=False`` asks only that the grant is held and leaves it unspent, for
+    :func:`step_up_status` (ADR 0215 section 2); it then authorizes nothing.
 
     The factor-binding refusal below sits ABOVE that fork, so no knob reaches it (ASVS 6.3.3; the
     bypass it closes is the ADR 0077 amendment of 2026-09-14)."""
@@ -2125,7 +2185,9 @@ async def _action_step_up_ok(auth: AuthService, token: str | None, action: str) 
     if await auth.factor_binding_is_blocked(token, action):
         return False
     if auth.action_step_up_required:
-        return await auth.has_action_step_up(token, action)
+        if spend:
+            return await auth.has_action_step_up(token, action)
+        return await auth.holds_action_step_up(token, action)
     return await auth.has_recent_step_up(token)
 
 
@@ -2188,9 +2250,9 @@ def require_step_up_action(
                     # _action_step_up_ok runs above its fork; it pops nothing, so it can run here as
                     # well as at the spend.
                     if new_ip or await auth.factor_binding_is_blocked(token, action):
-                        raise await _step_up_refusal(auth, token, action)
+                        raise await _step_up_refusal(auth, token, action, new_address=new_ip)
                 elif new_ip or not await _action_step_up_ok(auth, token, action):
-                    raise await _step_up_refusal(auth, token, action)
+                    raise await _step_up_refusal(auth, token, action, new_address=new_ip)
             if proof_in_route:
                 # For the refusal row the route body's spend may owe (_record_route_refusal).
                 setattr(
@@ -2235,6 +2297,37 @@ async def step_up_window_live(request: Request) -> bool:
     if auth is None:
         return True
     return await auth.has_recent_step_up(bearer_token(request))
+
+
+@dataclass(frozen=True, slots=True)
+class StepUpStatus:
+    """What :func:`step_up_status` read: the session window and, when asked, one action's proof."""
+
+    window_live: bool
+    action_proof_live: bool | None
+
+
+async def step_up_status(request: Request, action: str | None) -> StepUpStatus:
+    """Whether the caller's step-up is fresh, read without spending anything (ADR 0215 section 2).
+
+    ``window_live`` is :func:`step_up_window_live`. With ``action`` it also answers whether the
+    action's own gate would accept the caller's proof: the factor-binding refusal, then a held
+    single-use grant bound to ``action`` while action binding is on, otherwise the session window,
+    the decision :func:`_action_step_up_ok` makes, with the grant left unspent. It does not ask the
+    new-address question, because that question writes an audit row and a notice; an action from
+    a host the session has not verified from is still refused by its own gate. So a True here
+    is a hint for a page that would lose an operator's input to a re-authentication, never an
+    authorization: the action's gate decides. With no auth service attached every answer is True,
+    as the gates then check nothing."""
+    auth = get_auth(request)
+    if auth is None:
+        return StepUpStatus(window_live=True, action_proof_live=None if action is None else True)
+    token = bearer_token(request)
+    window_live = await auth.has_recent_step_up(token)
+    if action is None:
+        return StepUpStatus(window_live=window_live, action_proof_live=None)
+    proof_live = await _action_step_up_ok(auth, token, action, spend=False)
+    return StepUpStatus(window_live=window_live, action_proof_live=proof_live)
 
 
 async def refuse_unless_step_up_window_live(request: Request) -> None:
@@ -2287,7 +2380,7 @@ def require_reauth_only_action(
                 if await auth.factor_binding_is_blocked(token, action):
                     raise await _mfa_refusal(request, auth, identity)
                 if new_ip or not await _action_step_up_ok(auth, token, action):
-                    raise await _step_up_refusal(auth, token, action)
+                    raise await _step_up_refusal(auth, token, action, new_address=new_ip)
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)

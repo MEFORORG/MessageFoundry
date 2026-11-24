@@ -717,9 +717,7 @@ _E = "get_engine"
 #: on an error today is read on the following GET. :func:`_write_authority_problems` checks it.
 _UI_ROUTES: dict[str, Ui] = {
     "GET /ui/users": _J("GET /users", f"{_AS} admin.list_users"),
-    "GET /ui/users/new": _J(
-        "GET /roles;ADD GET /auth/check/users:manage", f"{_AS} admin.list_roles"
-    ),
+    "GET /ui/users/new": _J("GET /roles;GET /auth/check/users:manage", f"{_AS} admin.list_roles"),
     "GET /ui/users/{user_id}": _J(
         "ADD GET /users/{user_id};GET /roles;GET /users/{user_id}/federated-identity",
         f"{_AS} admin.checked_user admin.federated_identity_view admin.list_roles "
@@ -795,9 +793,9 @@ _UI_ROUTES: dict[str, Ui] = {
         "admin.user_summary_scoped admin.checked_user",
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
-    "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
+    "GET /ui/roles/new": Ui("check", "GET /auth/check/users:manage", ""),
     "GET /ui/roles/{role_id}/edit": _J(
-        "GET /roles/custom;ADD GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
+        "GET /roles/custom;GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
     ),
     "POST /ui/roles/custom": _J("POST /roles/custom", f"{_AS} admin.create_custom_role"),
     "POST /ui/roles/custom/{role_id}/update": _J(
@@ -940,7 +938,7 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /messages/{message_id}/replay", f"core.replay_message {_E}"
     ),
     "GET /ui/messages/{message_id}/resend-confirm": Ui(
-        "check", "ADD GET /auth/check/messages:resend", ""
+        "check", "GET /auth/check/messages:resend", ""
     ),
     "GET /ui/messages/{message_id}/resend-done": _J(
         "ADD GET /messages/{message_id}/prior-resend", f"core.prior_resend {_E}"
@@ -950,8 +948,7 @@ _UI_ROUTES: dict[str, Ui] = {
         f"{_AS} core.prior_resend core.resend_message {_E}",
     ),
     "GET /ui/messages/{message_id}/edit": _J(
-        "GET /messages/{message_id};GET /messages/{message_id}/raw;"
-        "ADD GET /auth/check/messages:edit",
+        "GET /messages/{message_id};GET /messages/{message_id}/raw;GET /auth/check/messages:edit",
         f"core.get_message core.get_message_body {_E}",
     ),
     # Its gate names messages:view_raw beside messages:edit (BACKLOG #324), because it reads the
@@ -976,7 +973,7 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "POST /ui/csp-report": Ui("public", "", ""),
     "GET /ui/uploaded-logs": _J("GET /uploads", f"core.list_uploaded_files {_E}"),
-    "GET /ui/uploaded-logs/upload-form": Ui("check", "ADD GET /auth/check/files:upload", ""),
+    "GET /ui/uploaded-logs/upload-form": Ui("check", "GET /auth/check/files:upload", ""),
     "POST /ui/uploaded-logs/upload": _J("POST /uploads", f"core.upload_file {_E}"),
     "GET /ui/uploaded-logs/file/{file_id}": _J(
         "GET /uploads/{file_id}/messages", f"core.browse_uploaded_file {_E}"
@@ -988,10 +985,10 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /uploads/{file_id}/resend", f"core.resend_uploaded_message {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/resend-confirm": _J(
-        "GET /uploads;ADD GET /auth/check/messages:edit", f"core.list_uploaded_files {_E}"
+        "GET /uploads;GET /auth/check/messages:edit", f"core.list_uploaded_files {_E}"
     ),
     "GET /ui/uploaded-logs/file/{file_id}/delete-confirm": _J(
-        "GET /uploads;ADD GET /auth/check/files:delete", f"core.list_uploaded_files {_E}"
+        "GET /uploads;GET /auth/check/files:delete", f"core.list_uploaded_files {_E}"
     ),
     "POST /ui/uploaded-logs/file/{file_id}/delete": _J(
         "DELETE /uploads/{file_id}", f"core.delete_uploaded_file {_E}"
@@ -1028,11 +1025,11 @@ _UI_ROUTES: dict[str, Ui] = {
         "GET /cluster/nodes;GET /cluster/status", f"core.cluster_nodes core.cluster_status {_E}"
     ),
     "GET /ui/cluster/stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        "GET /cluster/nodes;GET /cluster/status;GET /auth/check/cluster:control",
         f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "GET /ui/cluster/force-stepdown-confirm": _J(
-        "GET /cluster/nodes;GET /cluster/status;ADD GET /auth/check/cluster:control",
+        "GET /cluster/nodes;GET /cluster/status;GET /auth/check/cluster:control",
         f"core.cluster_nodes core.cluster_status {_E}",
     ),
     "POST /ui/cluster/stepdown": _J("POST /cluster/stepdown", f"core.cluster_stepdown {_E}"),
@@ -1075,7 +1072,7 @@ _UI_ROUTES: dict[str, Ui] = {
         "POST /connections/{name}/flag", f"core.audit_channel_denied core.set_connection_flag {_E}"
     ),
     "GET /ui/connections/purge-confirm": _J(
-        "ADD GET /connections/quiesced;ADD GET /auth/check/messages:purge",
+        "ADD GET /connections/quiesced;GET /auth/check/messages:purge",
         f"core.audit_channel_denied {_E} engine.registry_runner",
     ),
     "POST /ui/connections/purge-bulk": _J(

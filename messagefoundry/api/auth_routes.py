@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_ACTION_MAX,
     STEP_UP_VIA_HEADER,
     STEP_UP_VIA_IDP,
     AdGroupMap,
@@ -70,6 +71,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    StepUpStatusReply,
     UserCreatedResponse,
     UserCreateRequest,
     UserListEntry,
@@ -106,6 +108,7 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
     spend_step_up_action,
+    step_up_status,
 )
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
@@ -836,6 +839,51 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.get("/auth/me", response_model=CurrentUser)
     async def me(identity: Identity = Depends(require())) -> CurrentUser:
         return _current_user(identity)
+
+    # ADR 0215 section 2: gate-only routes. A web console page that shows no engine data of its own
+    # asks one of these before it renders, so the JSON gate authorizes the page as it authorizes a
+    # bearer client. Each is a real static gate, require(p) for one permission, registered in a
+    # loop over Permission so the route walk and the route map read it; the permission never comes
+    # from the request. Unlike GET /auth/me, these are NOT exempt from must-change confinement or
+    # the factor gate, and a named permission writes its grant row as any other require(p) route.
+    # A caller learns nothing it cannot read from its own GET /auth/me.
+    @app.get("/auth/check", response_model=SimpleMessage)
+    async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
+        return SimpleMessage(detail="authorized")
+
+    def _add_permission_check(permission: Permission) -> None:
+        async def auth_check_permission(
+            _: Identity = Depends(require(permission)),
+        ) -> SimpleMessage:
+            return SimpleMessage(detail="authorized")
+
+        app.add_api_route(
+            f"/auth/check/{permission.value}",
+            auth_check_permission,
+            methods=["GET"],
+            response_model=SimpleMessage,
+            name=f"auth_check_{permission.name.lower()}",
+        )
+
+    for check_permission in Permission:
+        _add_permission_check(check_permission)
+
+    @app.get("/me/step-up", response_model=StepUpStatusReply)
+    async def my_step_up_status(
+        request: Request,
+        action: Annotated[str | None, Query(max_length=STEP_UP_ACTION_MAX)] = None,
+        _: Identity = Depends(require()),
+    ) -> StepUpStatusReply:
+        """Whether the caller's step-up window is live and, with ``action``, whether that action's
+        gate would accept its proof, read WITHOUT spending it (ADR 0215 section 2). A hint for a
+        page that would lose input to a re-authentication; the action's own gate decides, and it
+        also asks the new-address question, which this read does not."""
+        result = await step_up_status(request, action)
+        return StepUpStatusReply(
+            window_live=result.window_live,
+            action=action,
+            action_proof_live=result.action_proof_live,
+        )
 
     @app.post("/me/password", response_model=SimpleMessage)
     async def change_password(

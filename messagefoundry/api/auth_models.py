@@ -43,6 +43,8 @@ _MFA_CODE_MAX = 64
 _CONFIRM_CODE_MAX = 16
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
+#: A step-up action id: ``ReauthRequest.purpose`` and the ``action`` ``GET /me/step-up`` reads.
+STEP_UP_ACTION_MAX = 64
 
 #: The response header an ``oidc`` session's step-up refusal carries, set to
 #: :data:`STEP_UP_VIA_IDP`, so a client can branch on a header rather than parse the detail
@@ -50,6 +52,25 @@ _TOKEN_MAX = 256
 #: FastAPI-free ``apiclient`` share one spelling (vault BACKLOG #3145 item 6).
 STEP_UP_VIA_HEADER = "X-Step-Up-Via"
 STEP_UP_VIA_IDP = "idp"
+
+#: The response header every JSON step-up refusal carries, naming why the gate asked (ADR 0215
+#: section 2): :data:`STEP_UP_REASON_NEW_ADDRESS` when the session was last verified from another
+#: host, :data:`STEP_UP_REASON_REVERIFY` for any other cause, at least a lapsed window, a missing
+#: or spent action proof, or a factor-binding refusal. Both are cleared by a step-up; the reason
+#: only lets a client choose where to resume. It decides nothing.
+STEP_UP_REASON_HEADER = "X-Step-Up-Reason"
+STEP_UP_REASON_NEW_ADDRESS = "new-address"
+STEP_UP_REASON_REVERIFY = "reverify"
+
+#: The response header a must-change session's 403 carries, naming the step the session takes next
+#: (ADR 0215 section 2): :data:`MUST_CHANGE_NEXT_VERIFY_FACTOR` while it owes a factor it has
+#: enrolled, :data:`MUST_CHANGE_NEXT_ENROL_FACTOR` while its account must enrol a factor before it
+#: rotates (ADR 0197 Amendment A), otherwise :data:`MUST_CHANGE_NEXT_ROTATE`. The detail
+#: string is unchanged, so a client that matches it still does.
+MUST_CHANGE_NEXT_HEADER = "X-Password-Change-Next"
+MUST_CHANGE_NEXT_VERIFY_FACTOR = "verify-factor"
+MUST_CHANGE_NEXT_ENROL_FACTOR = "enrol-factor"
+MUST_CHANGE_NEXT_ROTATE = "change-password"
 
 
 class CredentialReply(BaseModel):
@@ -497,7 +518,7 @@ class ReauthRequest(RequestModel):
     # 403 handed back in `X-Step-Up-Action`), minting a single-use per-action grant instead of only
     # refreshing the session window. Bounded length — it is an opaque action tag, never reflected;
     # an unknown tag simply fails closed (nothing consumes it, so the action re-prompts).
-    purpose: str | None = Field(default=None, max_length=64)
+    purpose: str | None = Field(default=None, max_length=STEP_UP_ACTION_MAX)
 
 
 class UserCreatedResponse(UserSummary, CredentialReply):
@@ -775,6 +796,17 @@ class AuditList(BaseModel):
 
 class SimpleMessage(BaseModel):
     detail: str
+
+
+class StepUpStatusReply(BaseModel):
+    """``GET /me/step-up`` (ADR 0215 section 2): whether the caller's step-up is fresh, read
+    without spending it. ``action_proof_live`` is ``None`` when no ``action`` was asked. Neither
+    field authorizes anything: the action's own gate decides, and it also asks whether the request
+    comes from a host the session has not verified from, which this read does not."""
+
+    window_live: bool
+    action: str | None = None
+    action_proof_live: bool | None = None
 
 
 class SessionInfo(BaseModel):
