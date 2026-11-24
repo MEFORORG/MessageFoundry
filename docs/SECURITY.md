@@ -6746,7 +6746,8 @@ the email channel sends:
   administrator" rather than "If this was you". That covers at least the
   directory rename, the directory's email change, a role change applied by the session reconciler
   or by a directory sign-in's re-sync, and the reconciler's `account_disabled` when it read the
-  account disabled (vault BACKLOG #3121). The role notice says the roles were changed to match the
+  account disabled (vault BACKLOG #3121). An administrator's role change or account disable closes
+  the same way, since both routes refuse a self-target (BACKLOG #6034). The role notice says the roles were changed to match the
   directory's groups, not that the console played no part: those groups map to roles through the
   group-to-role map an administrator edits. Like the disable notice, it says the sessions already
   open on the account were ended, which both of its senders do first.

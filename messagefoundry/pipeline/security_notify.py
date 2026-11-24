@@ -287,6 +287,12 @@ _SECOND_STEP_FACTOR = {
 }
 
 
+def _count(value: object) -> int | None:
+    """``value`` when it is an ``int`` and not a ``bool``, else ``None``. ``bool`` subclasses
+    ``int``, so a bare ``isinstance`` check would print ``True`` as a count (BACKLOG #6034)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None]:
     """The ACCOUNT_LOCKED notice's own description, detail lines and closing (ADR 0197).
 
@@ -295,9 +301,9 @@ def _lock_lines(event: SecurityEvent) -> tuple[str | None, list[str], str | None
     land on that counter too, and unconditional advice would tell an owner who mistyped their
     password to replace a working authenticator."""
     lock = event.detail.get("lock")
-    cycle = event.detail.get("cycle")
+    cycle = _count(event.detail.get("cycle"))
     lines: list[str] = []
-    if isinstance(cycle, int):
+    if cycle is not None:
         lines.append(f"Lock number: {cycle} since the last successful sign-in")
     if lock == "sign_in":
         description = "Your account's sign-in was locked after repeated failed sign-in attempts."
@@ -389,20 +395,21 @@ def _build_body(event: SecurityEvent) -> str:
     lock_description, lock_lines, lock_closing = (
         _lock_lines(event) if event.event_type == ACCOUNT_LOCKED else (None, [], None)
     )
+    # Every opening prints the name through ``_shown``: a directory supplies it on a directory
+    # notice (BACKLOG #2291), and nothing here shapes it on any other.
+    account = _shown(event.username, "a username")
     if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
         # BACKLOG #2007: sent to the ISSUER, so nothing changed on the recipient's own account.
-        opening = f"A reminder for you as a MessageFoundry administrator ({event.username})."
+        opening = f"A reminder for you as a MessageFoundry administrator ({account})."
     elif event.event_type == ENROLMENT_CODE_SPENT:
         # ADR 0207 A5: also to the ISSUER, but about something that has happened, not a reminder.
-        opening = f"A notice for you as a MessageFoundry administrator ({event.username})."
+        opening = f"A notice for you as a MessageFoundry administrator ({account})."
     elif event.event_type == TEMPORARY_CREDENTIAL_EXPIRING:
-        opening = f"A reminder about your MessageFoundry account ({event.username})."
+        opening = f"A reminder about your MessageFoundry account ({account})."
     else:
-        # Through ``_shown``: on a directory rename this is the directory's new name (BACKLOG #2291).
-        account = _shown(event.username, "a username")
         opening = f"A security-relevant change occurred on your MessageFoundry account ({account})."
     lines = [opening, "", lock_description or description]
-    failed = event.detail.get("failed_attempts")
+    failed = _count(event.detail.get("failed_attempts"))
     if event.event_type in (ACCOUNT_LOCKED, LOGIN_AFTER_FAILURES) and failed:
         lines.append(f"Failed attempts: {failed}")
     lines += lock_lines
@@ -418,7 +425,11 @@ def _build_body(event: SecurityEvent) -> str:
         # notice and the reminder (#2007) go to the holder; the issuer's reminder names the holder.
         # `expires_at` is the instant the login gate refuses on, read off the stored stamp.
         stamp = event.detail.get("expires_at")
-        expires = deadline_utc(stamp) if isinstance(stamp, (int, float)) else None
+        expires = (
+            deadline_utc(stamp)
+            if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            else None
+        )
         if event.event_type == TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER:
             lines += _holder_lines(event)
             if expires is not None:
@@ -515,8 +526,8 @@ def _build_body(event: SecurityEvent) -> str:
     if event.event_type == FEDERATED_IDENTITY_BOUND:
         # vault BACKLOG #2609: the bind ended the holder's sessions. The count lets a holder who
         # was signed in on several devices see that all of them went.
-        ended = event.detail.get("sessions_revoked")
-        if isinstance(ended, int) and not isinstance(ended, bool):
+        ended = _count(event.detail.get("sessions_revoked"))
+        if ended is not None:
             lines.append(f"Sessions ended: {ended}")
     if event.event_type == MFA_ENABLED and event.detail.get("issued_credential"):
         # ADR 0197 Amendment A: this account still held the password it was issued. An
@@ -539,8 +550,8 @@ def _build_body(event: SecurityEvent) -> str:
             "your MessageFoundry administrator."
         )
     if event.event_type == RECOVERY_CODE_USED:
-        remaining = event.detail.get("remaining")
-        if isinstance(remaining, int):
+        remaining = _count(event.detail.get("remaining"))
+        if remaining is not None:
             lines.append(f"Recovery codes remaining: {remaining}")
             if remaining == 0:
                 lines.append(
@@ -605,6 +616,8 @@ def _build_body(event: SecurityEvent) -> str:
         or event.event_type
         in (
             ACCOUNT_CREATED,
+            ROLES_CHANGED,
+            ACCOUNT_DISABLED,
             USERNAME_CHANGED,
             FEDERATED_IDENTITY_BOUND,
             FEDERATED_IDENTITY_UNBOUND,
@@ -616,7 +629,10 @@ def _build_body(event: SecurityEvent) -> str:
         # change or disable the directory drove (vault BACKLOG #3121). Nor to a federated link or
         # unlink:
         # both routes refuse an administrator changing their own account's binding. Nor to the
-        # engine ending sessions on a directory answer (vault BACKLOG #2140).
+        # engine ending sessions on a directory answer (vault BACKLOG #2140). Nor to an
+        # administrator's role change or disable, whose description says an administrator did it:
+        # ``PUT /users/{id}/roles`` and the disable in ``PATCH /users/{id}`` both refuse a
+        # self-target (BACKLOG #6034).
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

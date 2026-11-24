@@ -19,6 +19,7 @@ from messagefoundry.auth.notifications import (
     ACCOUNT_LOCKED,
     DIRECTORY_SESSIONS_ENDED,
     EMAIL_CHANGED,
+    ENROLMENT_CODE_SPENT,
     MFA_CREDENTIAL_REMOVED,
     MFA_DISABLED,
     NEW_ADDRESS_REVERIFY,
@@ -277,9 +278,6 @@ _ADMIN_TEXT = {
     ROLES_CHANGED: "Your account's roles were changed by an administrator.",
     ACCOUNT_DISABLED: "Your account was disabled by an administrator.",
 }
-_IF_THIS_WAS_YOU = (
-    "If this was you, no action is needed. If not, contact your MessageFoundry administrator."
-)
 
 
 @pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
@@ -308,16 +306,18 @@ def test_a_directory_role_or_disable_notice_names_the_directory_and_no_administr
 
 
 @pytest.mark.parametrize("kind", [ROLES_CHANGED, ACCOUNT_DISABLED])
-def test_an_administrator_role_or_disable_notice_keeps_its_wording(kind: str) -> None:
-    """vault BACKLOG #3121, closing item 2: the notice an administrator's own act sends keeps its
-    text. Kept by the row's instruction, not judged correct: "if this was you" on an administrator's
-    act is the shape BACKLOG #1141 fixed for the reset notice, and vault #3072 item 10 names."""
+def test_an_administrator_role_or_disable_notice_does_not_say_if_this_was_you(kind: str) -> None:
+    """BACKLOG #6034 item 1 (S08-57), its closing half only. An administrator made this change,
+    and both ``PUT /users/{id}/roles`` and the disable in ``PATCH /users/{id}`` refuse a
+    self-target, so "if this was you, no action is needed" cannot apply: the shape BACKLOG #1141
+    fixed for the reset notice. vault BACKLOG #3121 kept the old closing by its row's instruction, not as correct."""
     body = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
     lines = body.splitlines()
     assert _ADMIN_TEXT[kind] in lines
     assert _DIRECTORY_TEXT[kind] not in lines
     assert "directory" not in body.lower()
-    assert body.endswith(_IF_THIS_WAS_YOU)
+    assert "if this was you" not in body.lower()
+    assert body.endswith(_DIRECTORY_CLOSING)
 
 
 def test_the_sign_in_role_re_sync_notice_says_where_the_sign_in_came_from() -> None:
@@ -729,3 +729,67 @@ def test_a_second_step_lock_notice_is_conditional_and_names_the_factor_that_was_
         assert "If this was not you" in body and replace in body
         assert body.index("If these attempts were your own") < body.index(replace)
         assert "If this was you, no action is needed" not in body
+
+
+# --- BACKLOG #6034: the reminder and issuer openings print the username through ``_shown`` ---------
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [TEMPORARY_CREDENTIAL_EXPIRING, TEMPORARY_CREDENTIAL_EXPIRING_FOR_ISSUER, ENROLMENT_CODE_SPENT],
+)
+def test_a_reminder_or_issuer_opening_does_not_print_a_name_with_a_line_break(kind: str) -> None:
+    """BACKLOG #6034 (S08-56). These three openings interpolated ``event.username`` raw, so a name
+    carrying a line break wrote its own lines, here a false closing, into the notice. A clean name
+    is the control: it still prints whole."""
+    body = _build_body(SecurityEvent(kind, username=_FORGED, email="j@example.org"))
+    lines = body.splitlines()
+    # The unfixed opening wrote the forged line as "If this was you, no action is needed.).", so
+    # the check is a prefix over every line after the opening, not an equality.
+    assert not any(line.startswith("If this was you") for line in lines[1:])
+    assert "(a username that cannot be shown safely here)." in lines[0]
+    clean = _build_body(SecurityEvent(kind, username="jdoe", email="j@example.org"))
+    assert "(jdoe)." in clean.splitlines()[0]
+
+
+def test_a_boolean_detail_is_not_read_as_a_count_or_a_timestamp() -> None:
+    """BACKLOG #6034 item 1 (S08-77). ``bool`` subclasses ``int``, so a ``True`` rendered as
+    "Lock number: True", a 1970 deadline, or "Recovery codes remaining: False". No sender passes a
+    bool today; the renderer refuses one as ``FEDERATED_IDENTITY_BOUND`` already does."""
+    locked = _build_body(
+        SecurityEvent(
+            ACCOUNT_LOCKED,
+            username="bob",
+            email="bob@x",
+            detail={"lock": "sign_in", "cycle": True, "failed_attempts": True},
+        )
+    )
+    assert "Lock number" not in locked
+    assert "Failed attempts" not in locked
+    counted = _build_body(
+        SecurityEvent(
+            ACCOUNT_LOCKED,
+            username="bob",
+            email="bob@x",
+            detail={"lock": "sign_in", "cycle": 2, "failed_attempts": 5},
+        )
+    )
+    # The control: a real count still prints.
+    assert "Failed attempts: 5" in counted.splitlines()
+    reminder = _build_body(
+        SecurityEvent(
+            TEMPORARY_CREDENTIAL_EXPIRING,
+            username="bob",
+            email="bob@x",
+            detail={"expires_at": True},
+        )
+    )
+    assert "1970" not in reminder
+    assert "stops working" not in reminder
+    used = _build_body(
+        SecurityEvent(
+            RECOVERY_CODE_USED, username="bob", email="bob@x", detail={"remaining": False}
+        )
+    )
+    assert "Recovery codes remaining" not in used
+    assert "last recovery code" not in used
