@@ -288,21 +288,28 @@ function ConvertTo-Stamp($Value) {
 
 # The INSTANT a `claimed` stamp names, for arithmetic (BACKLOG #5871). Never `[datetime]::Parse` the
 # coerced value: PowerShell turns the [datetime] back into an invariant "MM/dd/yyyy" string and Parse
-# reads it under the CURRENT culture, so a day-first host (en-GB, de-DE) failed every listing line on
-# day 13 onward and swapped day and month before it. A [datetime] from ConvertFrom-Json already holds
-# the instant (Kind Local or Utc); a string is read only as round-trip ISO 8601, keeping its offset.
+# reads it under the CURRENT culture, so on a day-first host (en-GB, de-DE) a row whose stamp fell on a
+# local day of 13 or later failed, and an earlier one swapped day and month. A [datetime] from
+# ConvertFrom-Json already holds the instant; one with no offset (Kind Unspecified) is read as this
+# host's local time, as before. A stamp ConvertFrom-Json left as a string is parsed under the
+# INVARIANT culture, never the current one, keeping any offset it names.
 function ConvertTo-ClaimedInstant($Value) {
     if ($Value -is [datetimeoffset]) { return $Value }
     if ($Value -is [datetime]) { return [datetimeoffset]::new($Value) }
-    return [datetimeoffset]::ParseExact([string]$Value, 'o', [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None)
+    return [datetimeoffset]::Parse([string]$Value, [cultureinfo]::InvariantCulture)
+}
+
+# Whether a claim record is THIS worktree's: the same path, written on THIS machine. The same path on
+# ANOTHER machine is another tree: two PCs sharing a root can each have a D:\Code\... checkout.
+function Test-ClaimIsMine($Claim) {
+    $held = ($Claim.worktree -replace '\\', '/').TrimEnd('/')
+    $me = ($holder -replace '\\', '/').TrimEnd('/')
+    return (($held -ieq $me) -and (Test-CoordRecordIsHere $Claim))
 }
 
 function Get-Mine([string]$Path) {
     $c = Read-CoordText $Path | ConvertFrom-Json
-    $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-    $me = ($holder -replace '\\', '/').TrimEnd('/')
-    # The same path on ANOTHER machine is another tree: two PCs can each have a D:\Code\... checkout.
-    [pscustomobject]@{ Claim = $c; IsMine = (($held -ieq $me) -and (Test-CoordRecordIsHere $c)) }
+    [pscustomobject]@{ Claim = $c; IsMine = (Test-ClaimIsMine $c) }
 }
 
 # ONE record, appended exclusively, retried. FileMode::Append + FileShare::Read excludes a second
@@ -824,7 +831,6 @@ function Get-LandedEvidenceSet($Holders, [switch]$WithStatus) {
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
-    $me = ($holder -replace '\\', '/').TrimEnd('/')
     Write-Host ""
     Write-Host "Active work claims ($($files.Count)):"
     $rows = foreach ($f in $files) {
@@ -840,8 +846,8 @@ function Show-List {
             continue
         }
         $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
-        # The same rule as Get-Mine: the same path on ANOTHER machine is another tree (BACKLOG #5871).
-        $mine = if (($held -ieq $me) -and (Test-CoordRecordIsHere $c)) { "  <-- THIS worktree" } else { "" }
+        # Get-Mine's rule, so another PC's claim at the same path is not marked as ours (BACKLOG #5871).
+        $mine = if (Test-ClaimIsMine $c) { "  <-- THIS worktree" } else { "" }
         # LIVENESS, not age. This used to print "[STALE ~Nh -- release it if that session is gone]" once
         # a claim was 12h old, which measures how long the WORK has run and says nothing about whether
         # anyone is still doing it. Measured 2026-07-31: a claim reported STALE ~21h whose holder had
@@ -850,8 +856,9 @@ function Show-List {
         # to prevent, arrived at by following the tool's own recommendation. A long claim is the normal
         # shape of long work; report what the HOLDER is doing and let the operator decide.
         $age = ""
+        # Its own try: an unreadable stamp costs only the age, never the liveness verdict (BACKLOG #5871).
+        $hrs = try { [int]([datetimeoffset]::UtcNow - (ConvertTo-ClaimedInstant $c.claimed)).TotalHours } catch { '?' }
         try {
-            $hrs = [int]([datetimeoffset]::UtcNow - (ConvertTo-ClaimedInstant $c.claimed)).TotalHours
             # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
             # same way. They used to disagree: this one probed, the other two did not probe at all.
             $live = Get-HolderLiveness $held $c

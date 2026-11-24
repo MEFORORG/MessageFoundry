@@ -37,7 +37,8 @@ pytestmark = pytest.mark.skipif(
     reason="claim.ps1 needs pwsh on Windows",
 )
 
-#: A non-UTC offset that is not this host's, so a reading that dropped the offset would be hours off.
+#: A non-UTC offset, so the stamp's own date and this host's local date can differ. ConvertFrom-Json
+#: moves a stamp into local time before claim.ps1 sees it, so the misread is of the LOCAL date.
 _OFFSET = timezone(timedelta(hours=9, minutes=30))
 
 
@@ -63,8 +64,15 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _env() -> dict[str, str]:
-    # Never let an inherited root point a test run at shared state.
-    return {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    # Never let an inherited root, or a global/system `mefor.claimsRoot`, point a run at shared state.
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    return env
+
+
+def _ps_quote(text: str) -> str:
+    return "'" + text.replace("'", "''") + "'"
 
 
 def _claim(repo: Path, *args: str, culture: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -72,19 +80,30 @@ def _claim(repo: Path, *args: str, culture: str | None = None) -> subprocess.Com
     if culture is None:
         cmd = ["pwsh", "-NoProfile", "-NonInteractive", "-File", script, *args]
     else:
-        # The culture is set in the same runspace the script then runs in, as a day-first host's is.
-        # Bare, not quoted: a quoted '-List' binds as a positional value, not as the switch.
-        quoted = " ".join(args)
+        # The culture is set in the same runspace the script then runs in, as a day-first host's is,
+        # and echoed first so a test can see it took. A switch stays bare: a quoted '-List' binds as a
+        # positional value, not as the switch.
+        rest = " ".join(a if a.startswith("-") else _ps_quote(a) for a in args)
         cmd = [
             "pwsh",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            f"[cultureinfo]::CurrentCulture = '{culture}'; & '{script}' {quoted}; exit $LASTEXITCODE",
+            f"[cultureinfo]::CurrentCulture = {_ps_quote(culture)}; "
+            f"Write-Host ('CULTURE=' + [cultureinfo]::CurrentCulture.Name); "
+            f"& {_ps_quote(script)} {rest}; exit $LASTEXITCODE",
         ]
     return subprocess.run(
         cmd, cwd=str(repo), capture_output=True, text=True, timeout=TIMEOUT, check=False, env=_env()
     )
+
+
+def _list_under(repo: Path, culture: str) -> str:
+    proc = _claim(repo, "-List", culture=culture)
+    assert proc.returncode == 0, proc.stderr
+    # Positive control: without it a culture that silently failed to apply would pass on the old code.
+    assert f"CULTURE={culture}" in proc.stdout, proc.stdout
+    return proc.stdout
 
 
 def _the_record(repo: Path) -> Path:
@@ -123,10 +142,9 @@ def test_list_reads_the_held_age_on_any_culture_and_offset(repo: Path, culture: 
     assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
     stamp, hours = _stamp_hours_ago(day_past_12=True)
     _rewrite(_the_record(repo), claimed=stamp)
-    proc = _claim(repo, "-List", culture=culture)
-    assert proc.returncode == 0, proc.stderr
-    assert "liveness check FAILED" not in proc.stdout
-    assert f"[held {hours}h;" in proc.stdout, proc.stdout
+    out = _list_under(repo, culture)
+    assert "liveness check FAILED" not in out
+    assert f"[held {hours}h;" in out, out
 
 
 def test_a_day_first_culture_still_reads_a_day_12_or_earlier_stamp_unswapped(repo: Path) -> None:
@@ -134,8 +152,29 @@ def test_a_day_first_culture_still_reads_a_day_12_or_earlier_stamp_unswapped(rep
     stamp, hours = _stamp_hours_ago(day_past_12=False)
     assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
     _rewrite(_the_record(repo), claimed=stamp)
-    out = _claim(repo, "-List", culture="en-GB").stdout
+    out = _list_under(repo, "en-GB")
     assert f"[held {hours}h;" in out, out
+
+
+def test_a_stamp_left_as_a_string_is_read_invariantly_with_its_offset(repo: Path) -> None:
+    """ConvertFrom-Json does not coerce this shape, so it reaches the helper's string branch."""
+    hours = 30
+    while (datetime.now(UTC) - timedelta(hours=hours)).astimezone().day <= 12:
+        hours += 24
+    when = (datetime.now(UTC) - timedelta(hours=hours)).astimezone(_OFFSET)
+    stamp = when.strftime("%Y-%m-%d %H:%M:%S") + " +09:30"
+    assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
+    _rewrite(_the_record(repo), claimed=stamp)
+    out = _list_under(repo, "de-DE")
+    assert f"[held {hours}h;" in out, out
+
+
+def test_an_unreadable_stamp_costs_the_age_not_the_liveness_verdict(repo: Path) -> None:
+    assert _claim(repo, "-Take", "k", "-Note", "n").returncode == 0
+    _rewrite(_the_record(repo), claimed="not a date")
+    out = _claim(repo, "-List").stdout
+    assert "liveness check FAILED" not in out, out
+    assert "[held ?h;" in out, out
 
 
 def test_this_worktree_marker_needs_the_record_to_be_from_this_machine(repo: Path) -> None:
