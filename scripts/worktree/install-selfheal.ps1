@@ -8,7 +8,9 @@
 .DESCRIPTION
     Idempotent. MERGES (never clobbers) a SessionStart hook that runs the shared worktree-selfheal.ps1;
     existing hooks and top-level keys are preserved. Parses the new JSON before writing settings.json,
-    backs it up, writes it in place, reads it back, and restores the backup on failure. The shared hook
+    backs it up, writes it in place, and reads it back. On a failed write or read-back it restores the
+    backup this run made; if settings.json did not exist at the start, it removes any file the failed
+    write left, and never restores a .bak-selfheal from an earlier run. The shared hook
     script is copied earlier, before that parse. It does not create the allowlist; install-gate.ps1 owns that.
 
     Run once per config dir a session can use. On this box (a subscription-swap setup) that is:
@@ -154,10 +156,11 @@ try {
             $outcome = "restored from $backupPath"
         } else {
             if (Test-Path -LiteralPath $settingsPath) { Remove-Item -LiteralPath $settingsPath -Force }
-            $outcome = 'there was no settings.json before this run, so the written file was removed'
+            $outcome = 'there was no settings.json before this run, so any file the failed write left was removed'
         }
     } catch {
-        throw "[$ConfigDir] the write or its read-back failed ($writeError), and the rollback failed too ($_). settings.json may be damaged; this run's backup, if any, is $backupPath."
+        $backupNote = if ($madeBackup) { "this run's backup is $backupPath" } else { "this run made no backup; any existing $backupPath is from an earlier run and was not used" }
+        throw "[$ConfigDir] the write or its read-back failed ($writeError), and the rollback failed too ($_). settings.json may be damaged; $backupNote."
     }
     throw "[$ConfigDir] the write or its read-back failed; $outcome. $writeError"
 }
