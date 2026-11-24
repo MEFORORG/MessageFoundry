@@ -23,9 +23,9 @@ document does not yet make — do not read them as claims about its text:
 All three must be wired into the ``Enable auto-merge`` step's ``if`` so a held/un-advisoried/fresh PR
 does NOT auto-merge, while an eligible patch still does (``gh pr merge --auto`` preserved).
 
-WARNING: #4 cannot change a merge decision as the workflow ships, and these tests do not pretend otherwise:
-``age_ok=true`` is reachable only for uv/pip, ``eligible=true`` only for github-actions, and the merge
-``if`` requires both — disjoint sets. It is tested as a FORWARD guard, so that populating a Python
+WARNING: #2 and #4 cannot change a merge decision as the workflow ships, and these tests do not pretend
+otherwise: ``age_ok=true`` and ``advisory_ok=true`` are reachable only for uv/pip, ``eligible=true`` only for
+github-actions, and the merge ``if`` requires all of them on the security track — disjoint sets. It is tested as a FORWARD guard, so that populating a Python
 allow row later is a one-line change to a control that already works, not a control to be written
 under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins the conjunction that makes this
 true, so the day someone widens it, a test has to be edited deliberately.
@@ -37,6 +37,7 @@ import copy
 import datetime as dt
 import functools
 import itertools
+import json
 import os
 import re
 import shutil
@@ -887,6 +888,9 @@ def test_ci_executing_ecosystem_is_aged_at_least_five_days() -> None:
         ("github_actions", "evil/actions/checkout", "false"),
         # An empty name list cannot confirm eligibility.
         ("github_actions", "", "false"),
+        # Nor can an empty member, which only a nameless dependency produces (BACKLOG #5474).
+        ("github_actions", "actions/checkout, ", "false"),
+        ("github_actions", "actions/checkout,,actions/setup-python", "false"),
         # uv/npm allow rows ship empty, so every bump on them holds.
         ("uv", "certifi", "false"),
         ("uv", "cryptography", "false"),
@@ -1019,6 +1023,7 @@ def test_the_advisory_guard_fails_closed_when_the_api_errors(
         "ghsa",
         {
             "DEP_GROUP": "pip-security",
+            "DEP_ECOSYSTEM": "uv",
             "DEPS_JSON": '[{"dependencyName":"requests","prevVersion":"2.19.0"}]',
             "GH_TOKEN": "stub",
         },
@@ -1609,3 +1614,290 @@ def test_merge_step_passes_only_a_head_moved_refusal(
         [bash, "-e", script.as_posix()], capture_output=True, text=True, timeout=120, env=env
     )
     assert proc.returncode == rc, f"{label}: rc={proc.returncode}\n{proc.stdout}{proc.stderr}"
+
+
+# --------------------------------------------------------------------------------------------------
+# BACKLOG #5474: the track is READ, never inferred, and a dependency with no usable name DENIES
+# --------------------------------------------------------------------------------------------------
+
+#: The ghsa step's version-track case arm, the one place that names the version-update groups.
+_VERSION_ARM = re.compile(r"^\s*([A-Za-z0-9_|-]+)\)\s*track=version\s*;;", re.MULTILINE)
+
+
+def _version_groups_in_workflow() -> set[str]:
+    body = str(_step("ghsa")["run"])
+    found = _VERSION_ARM.findall(body)
+    # Counted on the raw text too, so at least a second `track=version` assignment, or a second
+    # emission of the version track's output, cannot sit beside the literal arm unread.
+    assert len(found) == 1 and body.count("track=version") == 1, (
+        f"expected exactly one version-track assignment in the ghsa step, got {found}"
+    )
+    assert body.count("security_track=false") == 1, "a second route to the version track"
+    return set(found[0].split("|"))
+
+
+def test_the_version_track_is_exactly_dependabots_version_update_groups() -> None:
+    """The ghsa step's allow-list of version groups is dependabot.yml's, no more and no fewer.
+
+    A group missing here holds its PRs (fail closed, but a silent loss of auto-merge); a group here
+    that dependabot.yml applies to security updates would skip #2 and #4, which is the defect."""
+    version: set[str] = set()
+    security: set[str] = set()
+    for update in _load_dependabot()["updates"]:
+        for name, group in (update.get("groups") or {}).items():
+            applies = group.get("applies-to", "version-updates")
+            assert applies in {"version-updates", "security-updates"}, (name, applies)
+            (security if applies == "security-updates" else version).add(name)
+    assert version and security, "dependabot.yml declares no groups; this would pass on nothing"
+    assert not (version & security), version & security
+    assert _version_groups_in_workflow() == version
+    # Not required for safety (an unnamed group already reads as the security track), but it keeps
+    # the `*security*` arm, and the warning the unknown arm prints, describing real groups.
+    assert all("security" in name for name in security), security
+
+
+def _stub_dir(
+    tmp_path: Path,
+    rows: list[tuple[str | None, str | None]],
+    count: str = "1",
+    published: str = "",
+    jq: bool = True,
+) -> Path:
+    """``gh``, ``curl`` and (unless ``jq=False``) ``jq`` stubs in ONE directory.
+
+    The jq stub answers by the filter it is handed: the upload-time filter prints ``published``,
+    and any other (the per-dependency ``@tsv``) prints ``rows`` the way real jq's ``@tsv`` does,
+    with null and the empty string both as an empty field. That keeps these rows runnable where jq
+    is absent (the maintainer's box); ``test_the_real_jq_feeds_a_nameless_row_to_the_deny``
+    repeats the decisive rows through the real binary wherever it exists.
+    """
+    stub_dir = tmp_path / "stubs5474"
+    stub_dir.mkdir()
+    data = tmp_path / "stubs5474.data"
+    data.mkdir()
+    tsv = "".join(f"{name or ''}\t{ver or ''}\n" for name, ver in rows)
+    (data / "rows.tsv").write_text(tsv, encoding="utf-8", newline="\n")
+    (data / "published").write_text(f"{published}\n", encoding="utf-8", newline="\n")
+    scripts = {
+        "gh": f"#!/usr/bin/env bash\necho '{count}'\n",
+        "curl": "#!/usr/bin/env bash\necho '{}'\n",
+    }
+    if jq:
+        scripts["jq"] = (
+            "#!/usr/bin/env bash\n"
+            "cat > /dev/null\n"
+            'case "$*" in\n'
+            f"  *upload_time*) cat '{(data / 'published').as_posix()}' ;;\n"
+            f"  *) cat '{(data / 'rows.tsv').as_posix()}' ;;\n"
+            "esac\n"
+        )
+    for tool, body in scripts.items():
+        stub = stub_dir / tool
+        stub.write_text(body, encoding="utf-8", newline="\n")
+        stub.chmod(0o755)
+    return stub_dir
+
+
+def _deps_json(rows: list[tuple[str | None, str | None]], version_key: str) -> str:
+    return json.dumps([{"dependencyName": name, version_key: ver} for name, ver in rows])
+
+
+def _arms(security_track: str, advisory_ok: str, age_ok: str) -> bool:
+    """Would the merge ``if`` arm an otherwise in-scope PR on these guard outputs?"""
+    context = {
+        "steps.allowset.outputs.eligible": "true",
+        "steps.authors.outputs.sole_author": "true",
+        "steps.ghsa.outputs.security_track": security_track,
+        "steps.ghsa.outputs.advisory_ok": advisory_ok,
+        "steps.age.outputs.age_ok": age_ok,
+        "steps.meta.outputs.update-type": "version-update:semver-patch",
+        "steps.meta.outputs.dependency-type": "direct:production",
+    }
+    verdict = _evaluate_expression(str(_merge_step().get("if", "")), context)
+    assert verdict == _merge_policy(context), context
+    return verdict
+
+
+@pytest.mark.parametrize(
+    ("group", "security_track", "advisory_ok", "arms"),
+    [
+        # Every version-update group is still the version track, and still arms.
+        ("python-deps", "false", "false", True),
+        ("python-deps-major", "false", "false", True),
+        ("actions-deps", "false", "false", True),
+        ("ide-deps", "false", "false", True),
+        ("ci-npm-tools", "false", "false", True),
+        # THE REGRESSION ROWS. Before the fix each read as the version track (security_track=false),
+        # so the merge `if` armed it without asking #2 or #4. An ungrouped PR carries an EMPTY group.
+        ("", "true", "false", False),
+        ("some-new-group", "true", "false", False),
+        ("Python-Deps", "true", "false", False),
+        # The discriminating PASS: a security group with a confirmed advisory still arms.
+        ("python-security", "true", "true", True),
+    ],
+)
+def test_the_ghsa_step_reads_the_track_from_a_named_group(
+    group: str, security_track: str, advisory_ok: str, arms: bool, tmp_path: Path
+) -> None:
+    rows: list[tuple[str | None, str | None]] = [("requests", "2.19.0")]
+    run = _run_step_body(
+        "ghsa",
+        {
+            "DEP_GROUP": group,
+            "DEP_ECOSYSTEM": "uv",
+            "DEPS_JSON": _deps_json(rows, "prevVersion"),
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_stub_dir(tmp_path, rows),
+    )
+    assert run.rc == 0, f"the ghsa body aborted (rc={run.rc}){_diagnostic(run)}"
+    got = (run.outputs.get("security_track"), run.outputs.get("advisory_ok"))
+    assert got == (security_track, advisory_ok), f"group={group!r} -> {got}{_diagnostic(run)}"
+    # Fed to the shipped merge `if` with age_ok at its most permissive, so only ghsa's verdict
+    # decides whether this PR would be armed.
+    assert _arms(got[0] or "", got[1] or "", "true") is arms, f"group={group!r}"
+
+
+@pytest.mark.parametrize(
+    ("label", "rows", "expected"),
+    [
+        # The discriminating PASSES, so a step that denies everything fails here.
+        ("one named dependency", [("requests", "2.19.0")], "true"),
+        ("an upper-case name is lowered", [("Requests", "2.19.0")], "true"),
+        # THE REGRESSION ROWS: each confirmed (advisory_ok=true) before the fix.
+        ("no name and no version, as `[{}]`", [(None, None)], "false"),
+        ("an empty name and version", [("", "")], "false"),
+        ("a whitespace-only name", [(" ", "2.19.0")], "false"),
+        ("a nameless row after a named one", [("requests", "2.19.0"), (None, None)], "false"),
+        # The row's unadjudicated item: `affects` is a comma-separated list, so a comma adds an
+        # unversioned package of the PR's choosing.
+        ("a comma in the name", [("requests,django", "2.19.0")], "false"),
+        ("a comma in the previous version", [("requests", "2.19.0,django")], "false"),
+        ("an @ in the name", [("requests@1.0,django", "2.19.0")], "false"),
+        ("an action, not a pip name", [("actions/checkout", "v4")], "false"),
+        # Already denied before the fix, kept as the neighbouring controls. The second is shifted
+        # by `read` into raw=version, prev='', so the prevVersion guard denies it.
+        ("a name with no previous version", [("requests", None)], "false"),
+        ("a nameless row with a version", [(None, "2.19.0")], "false"),
+    ],
+)
+def test_the_advisory_gate_denies_a_nameless_or_malformed_dependency(
+    label: str, rows: list[tuple[str | None, str | None]], expected: str, tmp_path: Path
+) -> None:
+    run = _run_step_body(
+        "ghsa",
+        {
+            "DEP_GROUP": "python-security",
+            "DEP_ECOSYSTEM": "uv",
+            "DEPS_JSON": _deps_json(rows, "prevVersion"),
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_stub_dir(tmp_path, rows),
+    )
+    assert run.rc == 0, f"the ghsa body aborted (rc={run.rc}){_diagnostic(run)}"
+    assert run.outputs.get("security_track") == "true", _diagnostic(run)
+    assert run.outputs.get("advisory_ok") == expected, (
+        f"{label} -> advisory_ok={run.outputs.get('advisory_ok')!r}, expected {expected!r}"
+        f"{_diagnostic(run)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "rows", "expected"),
+    [
+        ("one named dependency", [("requests", "2.32.3")], "true"),
+        # THE REGRESSION ROWS: each aged (age_ok=true) before the fix.
+        ("no name and no version, as `[{}]`", [(None, None)], "false"),
+        ("a whitespace-only name", [(" ", "2.32.3")], "false"),
+        ("a nameless row after a named one", [("requests", "2.32.3"), (None, None)], "false"),
+        ("an interior space, once rewritten to another name", [("py yaml", "6.0")], "false"),
+        # Already denied before the fix (shifted by `read`), kept as a control.
+        ("a nameless row with a version", [(None, "2.32.3")], "false"),
+    ],
+)
+def test_the_release_age_gate_denies_a_nameless_dependency(
+    label: str, rows: list[tuple[str | None, str | None]], expected: str, tmp_path: Path
+) -> None:
+    # Computed here, not in the parametrize list, so the test ids stay stable under xdist.
+    aged = _iso(24 * 30)
+    run = _run_step_body(
+        "age",
+        {
+            "SECURITY_TRACK": "true",
+            "DEP_ECOSYSTEM": "uv",
+            "DEPS_JSON": _deps_json(rows, "newVersion"),
+        },
+        tmp_path,
+        path_prepend=_stub_dir(tmp_path, rows, published=aged),
+    )
+    assert run.rc == 0, f"the age body aborted (rc={run.rc}){_diagnostic(run)}"
+    assert run.outputs.get("age_ok") == expected, (
+        f"{label} -> age_ok={run.outputs.get('age_ok')!r}, expected {expected!r}{_diagnostic(run)}"
+    )
+
+
+@pytest.mark.skipif(
+    shutil.which("jq") is None,  # bash via require_bash (BACKLOG #1216)
+    reason="needs bash + jq, the same runner matrix as the release-age rows above",
+)
+@pytest.mark.parametrize(
+    ("deps_json", "expected"),
+    [
+        ('[{"dependencyName":"requests","prevVersion":"2.19.0"}]', "true"),
+        ("[{}]", "false"),
+        ('[{"dependencyName":"","prevVersion":""}]', "false"),
+        ('[{"prevVersion":"2.19.0"}]', "false"),
+        ('[{"dependencyName":"requests","prevVersion":"2.19.0"},{}]', "false"),
+    ],
+)
+def test_the_real_jq_feeds_a_nameless_row_to_the_deny(
+    deps_json: str, expected: str, tmp_path: Path
+) -> None:
+    """The stubbed rows above, through the REAL jq filter: what `[{}]` becomes is jq's to decide."""
+    run = _run_step_body(
+        "ghsa",
+        {
+            "DEP_GROUP": "python-security",
+            "DEP_ECOSYSTEM": "uv",
+            "DEPS_JSON": deps_json,
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_stub_dir(tmp_path, [], jq=False),
+    )
+    assert run.rc == 0, f"the ghsa body aborted (rc={run.rc}){_diagnostic(run)}"
+    assert run.outputs.get("advisory_ok") == expected, f"{deps_json} {_diagnostic(run)}"
+
+
+@pytest.mark.parametrize(
+    ("ecosystem", "expected"),
+    [
+        # The discriminating PASSES: both spellings of the Python ecosystem still ask.
+        ("uv", "true"),
+        ("pip", "true"),
+        # Asked about a PyPI package of the same name before the fix, and confirmed by its advisory.
+        ("npm_and_yarn", "false"),
+        ("github_actions", "false"),
+        ("", "false"),
+    ],
+)
+def test_the_advisory_gate_asks_only_about_a_pip_ecosystem(
+    ecosystem: str, expected: str, tmp_path: Path
+) -> None:
+    rows: list[tuple[str | None, str | None]] = [("lodash", "4.17.20")]
+    run = _run_step_body(
+        "ghsa",
+        {
+            "DEP_GROUP": "ide-security",
+            "DEP_ECOSYSTEM": ecosystem,
+            "DEPS_JSON": _deps_json(rows, "prevVersion"),
+            "GH_TOKEN": "stub",
+        },
+        tmp_path,
+        path_prepend=_stub_dir(tmp_path, rows),
+    )
+    assert run.rc == 0, f"the ghsa body aborted (rc={run.rc}){_diagnostic(run)}"
+    assert run.outputs.get("security_track") == "true", _diagnostic(run)
+    assert run.outputs.get("advisory_ok") == expected, f"{ecosystem!r} {_diagnostic(run)}"
