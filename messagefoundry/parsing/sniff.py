@@ -91,7 +91,8 @@ def _sniff_head(raw: bytes, past_noise: re.Pattern[bytes] = _PAST_LEADING_WS) ->
 
 
 #: The str-domain twin of :data:`_LEADING_WS`, plus U+FEFF (what a UTF-8/UTF-16 BOM decodes to). Derived
-#: from the byte set rather than retyped, so the tolerated leading noise has ONE definition.
+#: from the byte set rather than retyped. The two skip patterns below restate both sets as regex
+#: literals, and tests/test_sniff_head_copy.py holds each literal equal to its set.
 _LEADING_WS_STR = _LEADING_WS.decode("ascii") + "\ufeff"
 
 #: Characters of a decoded body that :func:`text_sniff_head` encodes. The longest text magic is three
@@ -103,7 +104,7 @@ _TEXT_SNIFF_HEAD_CHARS = 8
 #: large decoded body with leading noise is not copied whole (BACKLOG #5520, filing review
 #: finding 3). A literal for the same reason as :data:`_PAST_LEADING_WS`, and pinned to
 #: :data:`_LEADING_WS_STR` by the same test file.
-_PAST_LEADING_WS_STR = re.compile(r"[^ \t\r\n\x0b\x0c﻿]")
+_PAST_LEADING_WS_STR = re.compile(r"[^ \t\r\n\x0b\x0c\ufeff]")
 
 
 def text_sniff_head(text: str) -> bytes:

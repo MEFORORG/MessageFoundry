@@ -115,12 +115,13 @@ def test_the_content_sniffs_read_the_same_head(
 
 
 def test_the_written_out_noise_classes_match_the_noise_sets() -> None:
-    """The two skip patterns are literals so the static regex scan can read them; each must match
-    exactly what its noise set does not hold, so the literal cannot drift from the set."""
+    """_PAST_LEADING_WS and _PAST_LEADING_WS_STR are literals so the static regex scan can read
+    them; each must match exactly what its noise set does not hold, checked over every byte and
+    every code point, so the literal cannot drift from the set."""
     for byte in range(256):
         one = bytes([byte])
         assert (sniff._PAST_LEADING_WS.fullmatch(one) is None) == (one in sniff._LEADING_WS), byte
-    for code in [*range(0x3100), 0xFEFF, 0x10FFFF]:
+    for code in range(0x110000):
         char = chr(code)
         skipped = sniff._PAST_LEADING_WS_STR.fullmatch(char) is None
         assert skipped == (char in sniff._LEADING_WS_STR), code
