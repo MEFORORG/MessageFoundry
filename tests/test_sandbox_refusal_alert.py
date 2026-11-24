@@ -362,6 +362,55 @@ async def test_a_refusal_straddling_a_same_registry_reload_alerts_once(
         await store.close()
 
 
+async def test_a_refusal_overtaken_by_a_graph_change_alerts_when_the_graph_returns(
+    edited_config: Path, tmp_path: Path
+) -> None:
+    """A refusal overtaken only by a graph change, with the session kept (a swap of the registry
+    with no reload), discards that session (BACKLOG #6830). Kept, its refusal cache would hold the
+    overtaken refusal, so once an equal graph was served again the message's rerun would be
+    refused from that cache, as not first, and dead-lettered with no alert ever raised."""
+    registry = _loaded_then_sent_edited(edited_config)
+    sink = _Recorder()
+    runner: RegistryRunner | None = None
+
+    def call(*args: Any, sandbox: SandboxSession | None = None, **kwargs: Any) -> Any:
+        try:
+            return transform_one(*args, sandbox=sandbox, **kwargs)
+        except SandboxWorkerRefused:
+            assert runner is not None
+            runner.registry = Registry(code_digest="1" * 64)  # an unequal graph, session kept
+            raise
+
+    store = await MessageStore.open(tmp_path / "graph_change.db")
+    try:
+        runner = _runner(registry, store, edited_config, cast(Any, sink))
+        try:
+            session = runner._sandbox_for("IB_PARITY")
+            assert session is not None
+            with pytest.raises(SandboxSessionClosed):
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY", call, registry, "h_0", RAW, run_context=RunContext()
+                )
+            assert sink.refused == []
+            assert session._closed and "IB_PARITY" not in runner._sandbox_sessions
+            runner.registry = copy.copy(registry)  # an equal graph is served again
+            with pytest.raises(SandboxWorkerRefused) as refused:
+                await runner._off_loop_sandboxed(
+                    "IB_PARITY",
+                    transform_one,
+                    runner.registry,
+                    "h_0",
+                    RAW,
+                    run_context=RunContext(),
+                )
+            assert refused.value.first
+            assert sink.refused == [("IB_PARITY", True)]
+        finally:
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
 async def test_a_refusal_straddling_a_reload_under_stop_re_pends_and_alerts_on_its_rerun(
     edited_config: Path, tmp_path: Path
 ) -> None:

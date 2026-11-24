@@ -7515,31 +7515,27 @@ class RegistryRunner:
         session, or when the graph its worker was compared with is not equal to the one served now.
         Neither the alert nor the dead-letter belongs to it: what overtook it may have cleared the
         cause, and if not, the message's next run compares again and alerts once. That run is on a
-        fresh session when the session was discarded, and on the same one, whose cache then misses,
-        when only the graph changed. The graph is compared by value, as the session's refusal
-        cache is, so a swap of ``self.registry`` to an equal graph does not overtake a refusal.
-        Checked on the loop with no await before the caller's alert, so a reload cannot discard
-        the session between this check and that alert."""
+        fresh session: a session still serving when only the graph changed is discarded here, since
+        its refusal cache holds the overtaken refusal, and an equal graph served again later would
+        be refused from that cache with no alert. The graph is compared by value, as the session's
+        refusal cache is, so a swap of ``self.registry`` to an equal graph does not overtake a
+        refusal. Checked on the loop with no await before the caller's alert, so a reload cannot
+        discard the session between this check and that alert."""
         session = self._sandbox_for(name)
         try:
             return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
         except SandboxWorkerRefused as exc:
-            if session is not None and (
-                self._sandbox_sessions.get(name) is not session or self._overtaken(exc.graph)
-            ):
-                raise SandboxSessionClosed(
-                    f"inbound {name!r}: a reload overtook its sandbox worker's refusal"
-                ) from exc
-            raise
-
-    def _overtaken(self, compared: GraphShape | None) -> bool:
-        """Whether a refusal against ``compared`` is against a graph unequal to the one served.
-        The identity test first: the served shape is cached per registry, so it is the same object
-        for every refusal on an unchanged graph, and the comparison by value is then skipped."""
-        if compared is None:
-            return False
-        served = self._engine_graph_shape()
-        return compared is not served and compared != served
+            if session is None:
+                raise
+            serving = self._sandbox_sessions.get(name) is session
+            if serving and (exc.graph is None or exc.graph == self._engine_graph_shape()):
+                raise
+            if serving:
+                del self._sandbox_sessions[name]
+                await asyncio.to_thread(session.close)
+            raise SandboxSessionClosed(
+                f"inbound {name!r}: a reload overtook its sandbox worker's refusal"
+            ) from exc
 
     async def stop(
         self,
