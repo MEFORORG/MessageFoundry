@@ -533,11 +533,10 @@ for any permission whose grant is audited on its own routes. That covers the PHI
 grants get a row govern every other route. docs/SECURITY.md (Gate-only check routes) states the
 check-route rule.
 
-Provenance. This amendment rests on a class B decision logged by the #2603 Manager on 2026-11-24
-with `scripts/coord/decision.ps1`, id `d20261124T092116115-d8b2a5`, gate `REVIEW`, predicate
-`review`: *"round-5d8e21a7 findings 1-4 weaken or mislabel a control on new routes"*. The record
-holds no separate question field. Its recommendation reads: *"Before the slice 2a PR: audited-permission
-check routes write the grant's decision row; must-change header and detail share one target;
-factor-binding refusal gets its own step-up reason; /me/step-up is audited, paced and new-address
-checked. Each is the strictly safer option. Decided under the owner's instruction of 2026-11-23."*
-The owner's instruction of 2026-11-23 is cited by that record and is not quoted in it.
+Provenance. This amendment rests on a Lander ruling recorded with `scripts/coord/decision.ps1` as
+decision `d20261124T135809520-03bdbe`, decided by the Lander under the owner's delegation of
+2026-11-24. The Lander put the amendment's provenance to the owner in its owner table on engine
+PR 3248, and the owner answered *"/driver for all"* in the Lander's chat; an adversarial review
+subagent affirmed the decision. The ruling accepts this amendment: grant rows are added for audited
+check routes and none are removed, so access is unchanged. CORRECTED 2026-11-24: this paragraph
+first cited class B decision `d20261124T092116115-d8b2a5`, whose record is pending and unreviewed.
