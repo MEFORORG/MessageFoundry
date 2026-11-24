@@ -2787,8 +2787,11 @@ allowed link-local address.
 The IPv6 check reads each value as written and also folded to compatibility form (NFKC), and
 refuses when either reading holds an address it counts as routable. So at least a routable
 address the check reads, written with fullwidth digits or colons or with a circled digit, is
-refused, such as `4000<U+FF1A>a1<U+FF1A><U+FF1A>5`; a fullwidth form of a miss listed above
-still passes, such as `1.2.4000<U+FF1A><U+FF1A>5`. A folded reading that is an allowed address adds no hit, so
+refused, such as `4000<U+FF1A>a1<U+FF1A><U+FF1A>5`. Some fullwidth forms of a miss listed
+above still pass, such as `1.2.4000<U+FF1A><U+FF1A>5`. A fullwidth full stop is not a character
+the check reads a run from, so as written it ends the run: `1.2<U+FF0E>4000::5` is refused,
+because as written it holds `4000::5`; written with fullwidth colons too, as
+`1.2<U+FF0E>4000<U+FF1A><U+FF1A>5`, it passes. A folded reading that is an allowed address adds no hit, so
 `fe80<U+FF1A><U+FF1A>1` and `::<U+2460>` pass: they fold to `fe80::1` and `::1`, and neither
 holds a routable address as written. The written reading still counts on its own:
 `<U+FF46>e80::1` folds to the allowed `fe80::1` and is refused, because as written it holds
