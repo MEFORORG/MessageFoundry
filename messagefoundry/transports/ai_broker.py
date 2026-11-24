@@ -112,6 +112,10 @@ _DEFAULT_TIMEOUT = 60.0
 #: that the context consults no CRL. PHI-free.
 _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 
+#: The label a refusal raised while the anchored opener's context is built or asserted names, so
+#: it does not name the HTTP-family destinations (BACKLOG #5527 item 9). PHI-free.
+_AI_OPENER_CELL = "[ai] engine AI broker"
+
 #: The cell for any other reason, written through the guard's ``stated_cell``, which drops
 #: "verified" on a context that does not verify the peer. It does not say "no revocation check",
 #: as REST's and remotefile's cells do not on a relaxed hop (vault BACKLOG #4912).
@@ -122,7 +126,7 @@ _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 #: foresaw when the owner ruling of 2026-10-27 built the attestation pair alone. It is offered only
 #: to a broker that was handed a ``[tls]`` policy, on a context whose only reason for no CRL
 #: credit is that it consults none: on a build with none, such as a direct
-#: ``create_app`` whose embedder set no ``app.state.tls_settings``, setting it would change
+#: ``create_app`` whose embedder passed no ``tls_settings``, setting it would change
 #: nothing. No connection's attestation is offered either:
 #: the endpoint is not a connection. Naming either would be a remedy the operator cannot perform.
 _AI_CRL_LEVER = (
@@ -225,7 +229,7 @@ def _endpoint_opener(
         held = _anchored_opener
         if held is not None and held[0] == anchor:
             return held[1]
-        opener = _no_redirect_opener(trust_anchor=anchor)
+        opener = _no_redirect_opener(trust_anchor=anchor, connector=_AI_OPENER_CELL)
         _anchored_opener = (anchor, opener)
         return opener
 

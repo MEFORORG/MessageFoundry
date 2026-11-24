@@ -513,6 +513,7 @@ def http_family_trust_anchor(
 def _no_redirect_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
+    connector: str = _HTTP_FAMILY_CELL,
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
@@ -529,12 +530,30 @@ def _no_redirect_opener(
     narrows nothing — the default — leaves the opener handler-for-handler what it was (apart from the
     strict reply class every opener gets, BACKLOG #2052), which is why a
     connection needs one of these openers only when it carries an extra handler OR an anchor that
-    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`."""
+    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`.
+    :func:`_verifying_opener` makes that choice.
+
+    ``connector`` is the hop label a refusal raised while the context is built or asserted names;
+    a hop outside the HTTP-family destinations passes its own (BACKLOG #5527 item 9)."""
     return build_strict_opener(
         _NoRedirectHandler,
-        build_anchored_https_handler(anchor=trust_anchor, connector=_HTTP_FAMILY_CELL),
+        build_anchored_https_handler(anchor=trust_anchor, connector=connector),
         *extra_handlers,
     )
+
+
+def _verifying_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+    trust_anchor: TrustAnchor,
+    connector: str = _HTTP_FAMILY_CELL,
+) -> urllib.request.OpenerDirector:
+    """The verifying, no-redirect opener for a hop with ``extra_handlers`` and ``trust_anchor``:
+    rest.py's shared opener when there is no handler and the anchor narrows nothing, otherwise one
+    of the hop's own from :func:`_no_redirect_opener` (BACKLOG #5527 item 10). The one place the
+    hops that adopt it make that choice, so they cannot drift onto different tests of it."""
+    if extra_handlers or trust_anchor.narrows:
+        return _no_redirect_opener(*extra_handlers, trust_anchor=trust_anchor, connector=connector)
+    return _shared_no_redirect_opener()
 
 
 # Shared opener that verifies TLS and never follows redirects, reused by every connection that needs

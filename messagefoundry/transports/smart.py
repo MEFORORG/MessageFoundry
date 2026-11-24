@@ -81,7 +81,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     auth_challenge_refused,
     digest_proxy_meets_the_token_connect,
     ech_readdressed_request,
@@ -455,13 +455,11 @@ class _TokenEndpointProvider(abc.ABC):
         self._opener: urllib.request.OpenerDirector
         if ech_sidecar is not None:
             self._opener = _no_redirect_opener(urllib.request.ProxyHandler({}))
-        elif token_proxy is not None or trust_anchor.narrows:
-            self._opener = _no_redirect_opener(
+        else:
+            self._opener = _verifying_opener(
                 *(token_proxy.opener_handlers() if token_proxy is not None else ()),
                 trust_anchor=trust_anchor,
             )
-        else:
-            self._opener = _shared_no_redirect_opener()
         # #1498, #2112 (ADR 0173 §4.3): the revocation twin of the cleartext refusal, and the same
         # one-statement call its HTTP-family siblings make. The token hop VERIFIES the authorization
         # server's certificate but stdlib ssl performs no OCSP/CRL, so a revoked-but-unexpired
