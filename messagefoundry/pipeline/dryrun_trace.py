@@ -367,8 +367,10 @@ class _Recorder:
             self.truncated = True
             return
         if self._write_count >= _MAX_WRITES:
-            # Also `truncated`: the IDE reads only that key, and a capped write list must not look
-            # complete there.
+            # Also `truncated`, so the record never reads as complete. The IDE reads only that key,
+            # and only in its test bench, which shows its event-cap message (coverage may
+            # under-report) even when only writes were capped. Its inline write views read neither
+            # flag.
             self.writes_truncated = True
             self.truncated = True
             return
