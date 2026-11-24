@@ -357,9 +357,7 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   and reason, released and aborted, the send and receive lines for C-STORE and C-ECHO with their status, and the
   library's fixed protocol error lines stay, at least those for a malformed PDU or association field. Lost, at least: the C-FIND, C-GET and C-MOVE progress lines and
   identifier dumps, which this engine does not serve; the text of a library exception that matches no template,
-  including an operating system's socket error text; every note and group member of an exception; and any line
-  a library upgrade adds,
-  until it is pinned.
+  including an operating system's socket error text; and every note and group member of an exception.
 
   Where the engine quotes such an exception, in its own C-STORE line or a delivery error, it keeps the class
   and reads `[message withheld]` with the file, line and function that raised it. pynetdicom's own
@@ -402,8 +400,7 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   a dataset dump's loop variable, is in the census only by that variable's name. The pin tests in
   `tests/test_dicom_peer_value_logs.py` fail when either library's version changes in the environment they
   run in. They do not reach a site's own install: the `[dicom]` extra pins pynetdicom exactly but lets pydicom
-  resolve to any release from 3.0.2 below 3.1. On another release a changed line is withheld rather than leaked,
-  so the cost there is a lost line. Known limits, at least: a flagged UID that spells a name in pydicom's UID
+  resolve to any release from 3.0.2 below 3.1. Known limits, at least: a flagged UID that spells a name in pydicom's UID
   dictionary is kept by a dump field, the `No presentation context for` line and the `No supported service
   class` line. The SCP reads each association
   request and command set once before pynetdicom does. What that read writes on the named loggers is

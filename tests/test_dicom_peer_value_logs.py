@@ -552,8 +552,8 @@ def test_the_line_shapes_the_filter_reads_are_still_pynetdicoms_and_pydicoms() -
 
 
 def test_the_filter_was_read_against_these_library_versions() -> None:
-    """The shapes are a list read from these two releases. A new release can add a line of a shape
-    the list lacks, which would pass whole, so a version change fails here until it is read."""
+    """The shapes are a list read from these two releases, so a version change fails here until it
+    is read."""
     import pydicom
     import pynetdicom
 
