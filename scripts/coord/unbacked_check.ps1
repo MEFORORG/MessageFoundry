@@ -641,15 +641,17 @@ foreach ($p in $Path) {
     # the NO-REMOTE and UNVERIFIABLE lines do not leave out a detached checkout's work (BACKLOG #6489
     # item 1). The detached share is the distinct commits no at-risk branch already counts: a HEAD
     # detached on a branch's history would otherwise count that history twice. If that count cannot
-    # be read, each detached HEAD's own count is added instead -- too high, never too low.
+    # be read, each detached HEAD's own count is added instead -- too high, never too low -- and the
+    # failure is a failed scan like any other. Every id goes on stdin, so the command line does not
+    # grow with the worktree count, and no blank line is written: rev-list --stdin stops reading there.
     $detachedSum = $detachedUnresolved
     if ($detachedOids.Count -gt 0) {
-        $tipText = $excludeText
-        if ($atRiskOids.Count -gt 0) { $tipText += (($atRiskOids | ForEach-Object { "^$_" }) -join "`n") + "`n" }
-        $res = Invoke-RevList -Repo $p -RevArgs (@('--count') + $detachedOids) -NotArgs $notArgs -ExcludeText $tipText
+        $stdinLines = @($excludeText -split "`n" | Where-Object { $_ }) + @($atRiskOids | ForEach-Object { "^$_" }) + @($detachedOids)
+        $res = Invoke-RevList -Repo $p -RevArgs @('--count') -NotArgs $notArgs -ExcludeText (($stdinLines -join "`n") + "`n")
         if ($res.Ok -and $res.Lines) {
             $detachedSum += [int]$res.Lines[0]
         } else {
+            $scanFailed += '(detached commit count)'
             $detachedSum = [int](($detached | Measure-Object -Property Commits -Sum).Sum)
         }
     }
