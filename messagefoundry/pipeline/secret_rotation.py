@@ -569,19 +569,23 @@ def secrets_from_settings_and_stamps(
 class PendingRotationWrites:
     """What :func:`reconcile_rotation_meta` would have written, held back by ``defer_writes`` so a
     start that fails or is refused writes nothing (BACKLOG #5615). ``stamps`` are finished rows,
-    already sealed. ``record`` is the ``(key_id, day)`` to open the rotation record for."""
+    already sealed. ``record`` is the ``(key_id, day)`` to open the rotation record for. ``seen`` is
+    the DEK stamp and rotation record the compute read, so the save can tell they have not moved."""
 
     stamps: list[tuple[str, str, str, str]] = field(default_factory=list)
     record: tuple[str, str] | None = None
+    seen: tuple[SecretRotationMetaRow | None, SecretRotationMetaRow | None] = (None, None)
 
 
 async def persist_rotation_meta(
     meta_store: SecretRotationMetaStore, pending: PendingRotationWrites
-) -> None:
-    """Save what a deferred reconcile computed, never re-sealing. The record goes first and through
-    :func:`open_rotation_record`, so it keeps a record another writer opened meanwhile. The graph
-    came up since the compute, so the record is read again: a DEK stamp is dropped if a run opened
-    a record for that key in between, as the in-place path's adjacent reads would have seen."""
+) -> bool:
+    """Save what a deferred reconcile computed, never re-sealing. Returns ``False``, having written
+    nothing, when the DEK stamp or the rotation record moved since the compute: a ``rotate-key`` run
+    got in during bring-up, so what was computed is stale and the caller reconciles again."""
+    current = await meta_store.get_secret_rotation_meta()
+    if (current.get(_DEK_CLASS_ID), current.get(ROTATION_RECORD_ID)) != pending.seen:
+        return False
     if pending.record is not None:
         key_id, day = pending.record
         try:
@@ -589,27 +593,16 @@ async def persist_rotation_meta(
         except Exception:
             log.warning(_RECORD_NOT_WRITTEN)
             raise
-        record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-        hold = _rotation_hold(record, dek_fingerprint(key_id))
-        if hold is None and _record_open(record):
-            hold = _HELD_FOR_ANOTHER_RECORD
-        elif hold is not None and opened:
-            hold = _OPENED_AT_START
-        if hold is not None:
-            log.warning(hold)
+        if opened:
+            log.warning(_OPENED_AT_START)  # only now is it true that a record was opened
     for class_id, fingerprint, tracked_since, last_rotated in pending.stamps:
-        if class_id == _DEK_CLASS_ID:
-            record = (await meta_store.get_secret_rotation_meta()).get(ROTATION_RECORD_ID)
-            hold = _rotation_hold(record, fingerprint)
-            if hold is not None:
-                log.warning(hold)
-                continue
         await meta_store.upsert_secret_rotation_meta(
             class_id,
             fingerprint=fingerprint,
             tracked_since=tracked_since,
             last_rotated=last_rotated,
         )
+    return True
 
 
 async def reconcile_rotation_meta(
@@ -677,6 +670,8 @@ async def reconcile_rotation_meta(
     ts = time.time() if now is None else now
     today = datetime.datetime.fromtimestamp(ts, tz=_UTC).date()
     stored = await meta_store.get_secret_rotation_meta()
+    if defer_writes is not None:
+        defer_writes.seen = (stored.get(_DEK_CLASS_ID), stored.get(ROTATION_RECORD_ID))
     stamps: dict[str, SecretStamp] = {}
 
     async def _record(

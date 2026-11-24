@@ -315,13 +315,17 @@ async def test_a_failed_save_refuses_and_the_next_start_detects_the_change(
     assert (await site.rows())[_AD].last_rotated != _LONG_AGO
 
 
-async def test_a_record_opened_during_bring_up_stops_the_deferred_stamp(tmp_path: Path) -> None:
-    """A run that opened a record for this key after the compute must not read as complete."""
+@pytest.mark.parametrize("same_key", [True, False], ids=["this-key", "another-key"])
+async def test_a_record_opened_during_bring_up_stops_the_deferred_save(
+    tmp_path: Path, same_key: bool
+) -> None:
+    """A run that got in after the compute makes it stale, so the save writes nothing."""
     site = _Site(tmp_path)
     store = await site.open()
     try:
         key_id = store.cipher_info().active_key_id
-        assert key_id is not None
+        other = cipher_info(make_cipher(generate_key())).active_key_id
+        assert key_id is not None and other is not None
         pending = sr.PendingRotationWrites()
         await reconcile_rotation_meta(
             store,
@@ -331,13 +335,40 @@ async def test_a_record_opened_during_bring_up_stops_the_deferred_stamp(tmp_path
             defer_writes=pending,
         )
         assert [row[0] for row in pending.stamps] == [sr._DEK_CLASS_ID], "premise: a DEK stamp"
-        await sr.open_rotation_record(store, key_id, "2026-01-01")
-        await sr.persist_rotation_meta(store, pending)
+        opened_for = key_id if same_key else other
+        await sr.open_rotation_record(store, opened_for, "2026-01-01")
+        assert await sr.persist_rotation_meta(store, pending) is False
         rows = await store.get_secret_rotation_meta()
         assert sr._DEK_CLASS_ID not in rows
-        assert rows[sr.ROTATION_RECORD_ID].fingerprint == sr.dek_fingerprint(key_id)
+        assert rows[sr.ROTATION_RECORD_ID].fingerprint == sr.dek_fingerprint(opened_for)
     finally:
         await store.close()
+
+
+async def test_a_run_during_bring_up_refuses_from_the_stored_date(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The computed stamp said today. The stored date is what the refusal must read."""
+    site = _Site(tmp_path)
+    store = await site.open()
+    key_id = store.cipher_info().active_key_id
+    assert key_id is not None
+    await store.upsert_secret_rotation_meta(
+        sr._DEK_CLASS_ID,
+        fingerprint=sr.dek_fingerprint("0" * len(key_id)),
+        tracked_since=_LONG_AGO,
+        last_rotated=_LONG_AGO,
+    )
+    await store.close()
+    real_start = RegistryRunner.start
+
+    async def rotate_during_bring_up(self: RegistryRunner, **kwargs: Any) -> None:
+        await real_start(self, **kwargs)
+        await sr.open_rotation_record(self.store, key_id, "2026-01-01")  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RegistryRunner, "start", rotate_during_bring_up)
+    with pytest.raises(StoreKeyRotationOverdueError):
+        await site.start(SecretRotationSettings())
 
 
 # --- the store key: a failed or refused start leaves no rotation record ------------------------

@@ -2633,6 +2633,10 @@ class Engine:
         (BACKLOG #5615)."""
         if self._secret_rotation_settings is None:
             return
+        if defer_writes is not None:
+            # An earlier failed start on this Engine saved nothing, so its stamps must not stand in
+            # for this reconcile if it fails: empty is what reads as an undetermined age.
+            self._secret_rotation_stamps = {}
         # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
         # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
         # Vault/OIDC secret is fingerprinted with a keyed MAC sealed as a store-cipher cell
@@ -2695,7 +2699,7 @@ class Engine:
         if not isinstance(self.store, SecretRotationMetaStore):
             return
         try:
-            await persist_rotation_meta(self.store, pending)
+            saved = await persist_rotation_meta(self.store, pending)
         except Exception as exc:
             log.error(
                 "secret-rotation stamps were not saved (%s); their age is undetermined",
@@ -2703,6 +2707,13 @@ class Engine:
             )
             self._secret_rotation_stamps = {}
             await self._enforce_rotation_expiry()
+            return
+        if not saved:
+            # A rotate-key run moved the stamp or the record during bring-up. Decide again, in
+            # place, from what the store says now, so the refusals read its dates.
+            log.warning("secret rotation: the rotation state changed during start; reconciling")
+            self._secret_rotation_stamps = {}
+            await self._reconcile_rotation_and_refuse()
 
     async def _enforce_rotation_expiry(self) -> None:
         """Run both expiry refusals against the current stamps."""
