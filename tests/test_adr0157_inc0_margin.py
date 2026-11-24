@@ -629,7 +629,12 @@ async def test_the_sqlserver_twin_stamps_the_baseline_from_the_same_instant() ->
 
     class _Store:
         async def _fetchone_clamped(
-            self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+            self,
+            sql: str,
+            params: tuple[object, ...],
+            *,
+            timeout_clamp: float,
+            share_deadline: bool = False,
         ) -> dict[str, object]:
             mono.t = 20.0  # the response returns 20 s after the claim was issued
             return {"owner": "A", "leader_epoch": 1}
