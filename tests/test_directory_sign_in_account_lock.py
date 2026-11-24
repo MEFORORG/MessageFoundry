@@ -309,18 +309,8 @@ async def test_the_store_refuses_an_ineligible_row_only_when_asked(
     else:
         await engine.store.record_login_failure(user_id, failed_attempts=5, locked_until=now + 600)
 
-    async def mint(eligible: bool) -> bool:
-        return await engine.store.create_session(
-            token_hash=hash_token(uuid.uuid4().hex),
-            user_id=user_id,
-            expires_at=now + 3600,
-            seed_reauth=False,
-            auth_mechanism="kerberos",
-            require_sign_in_eligible=eligible,
-        )
-
-    assert await mint(True) is False
-    assert await mint(False) is True
+    assert await _mint(engine, user_id, eligible=True) is False
+    assert await _mint(engine, user_id, eligible=False) is True
 
 
 async def _mint(engine: Engine, user_id: str, *, eligible: bool) -> bool:
@@ -369,17 +359,37 @@ async def test_a_disable_committed_by_another_connection_is_refused_at_the_inser
     assert (await _sign_in(service, _principal())).ok
     user_id = await _user_id(engine)
     before = await _live_sessions(engine, user_id)
-    other = sqlite3.connect(tmp_path / "directory_sign_in_lock.db", isolation_level=None, timeout=5)
+    db: Any = engine.store._db  # type: ignore[attr-defined]
+    traced: list[str] = []
+    other = sqlite3.connect(
+        tmp_path / "directory_sign_in_lock.db",
+        isolation_level=None,
+        timeout=5,
+        check_same_thread=False,
+    )
     try:
-        other.execute("BEGIN IMMEDIATE")
-        other.execute("UPDATE users SET disabled=1 WHERE id=?", (user_id,))
+        # Off the event loop: a blocked BEGIN here must not stop an aiosqlite COMMIT it waits on.
+        await asyncio.to_thread(other.execute, "BEGIN IMMEDIATE")
+        await asyncio.to_thread(other.execute, "UPDATE users SET disabled=1 WHERE id=?", (user_id,))
+        await db.set_trace_callback(traced.append)
         mint = asyncio.ensure_future(_mint(engine, user_id, eligible=True))
-        await asyncio.sleep(0.3)
+        # The control: the mint has issued its BEGIN before the other connection commits, so a
+        # pass is not a mint that simply started after the commit.
+        for _ in range(500):
+            if any(s.startswith("BEGIN") for s in traced):
+                break
+            await asyncio.sleep(0.01)
+        assert any(s.startswith("BEGIN") for s in traced)
+        await asyncio.sleep(0.2)
         assert not mint.done()  # waiting on the other connection's write lock
-        other.execute("COMMIT")
+        await asyncio.to_thread(other.execute, "COMMIT")
     finally:
         other.close()
-    assert await mint is False
+    try:
+        assert await mint is False
+    finally:
+        off: Any = None  # sqlite3 clears the trace on None; aiosqlite's stub types only a callable
+        await db.set_trace_callback(off)
     assert await _live_sessions(engine, user_id) <= before
 
 

@@ -2715,20 +2715,6 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     The slugs are literals from a closed set, never directory- or IdP-supplied text, because they are
     stored on the audit row and read by the browser layer.
     """
-    state = _directory_sign_in_state_refusal(user, now)
-    if state is not None:
-        return state
-    # Last, so a disabled or locked row keeps the reason an operator already acts on.
-    if not federated and _holds_federated_binding(user):
-        return FEDERATED_SIGN_IN_REQUIRED
-    return None
-
-
-def _directory_sign_in_state_refusal(user: UserRecord, now: float) -> str | None:
-    """The disabled and lock half of :func:`_directory_login_refusal`, with no binding check.
-
-    BACKLOG #5653: the reason a directory session insert refused under ``require_sign_in_eligible``
-    is named from these states alone, since the binding there is the insert's own guard."""
     if user.disabled:
         return "disabled"
     # ADR 0197 AC-5: EITHER lock refuses a directory sign-in. The sign-in lock is read first, so a
@@ -2737,6 +2723,9 @@ def _directory_sign_in_state_refusal(user: UserRecord, now: float) -> str | None
         return DIRECTORY_LOCKED
     if user.second_step_locked_until is not None and now < user.second_step_locked_until:
         return DIRECTORY_LOCKED
+    # Last, so a disabled or locked row keeps the reason an operator already acts on.
+    if not federated and _holds_federated_binding(user):
+        return FEDERATED_SIGN_IN_REQUIRED
     return None
 
 
@@ -8915,9 +8904,12 @@ class AuthService:
                     )
                     again = None
                 if again is not None:
-                    # The disabled and lock states only: a binding change keeps the reason chosen
-                    # below.
-                    now_ineligible = _directory_sign_in_state_refusal(again, time.time())
+                    # ``federated=True`` here is NOT a claim that this sign-in is federated (on the
+                    # Windows SSO leg it is not). It is passed only because that value skips
+                    # ``_directory_login_refusal``'s one binding check, its last, so the result
+                    # names the disabled and lock states alone; a binding change keeps the reason
+                    # chosen below, and the insert's own guard already judged the binding.
+                    now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif now_ineligible is not None:

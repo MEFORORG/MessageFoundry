@@ -22053,13 +22053,15 @@ class MessageStore:
         now = time.time() if now is None else now
         # _writer_txn, not a short writer: the account's row is read first in the same transaction
         # (BACKLOG #2592 for its session epoch, which the seal covers; BACKLOG #1474 for the guarded
-        # path's binding check; BACKLOG #5653 for the eligibility check). The lock alone is what
-        # makes the read and the INSERT atomic against clear_user_federated_subject, a disable, a
-        # lockout and every whole-account revoke, which take the same lock.
-        # That lock is this process's only. Under ``require_sign_in_eligible`` the transaction is
-        # BEGIN IMMEDIATE, so SQLite's write lock is held before the read and a disable or lockout
-        # committed by another engine shard on the same store cannot land between the read and the
-        # INSERT (BACKLOG #5653, as BACKLOG #3078 F5 does for the first-administrator grant).
+        # path's binding check; BACKLOG #5653 for the eligibility check). Within this process the
+        # asyncio lock is what makes the read and the INSERT atomic against
+        # clear_user_federated_subject, a disable, a lockout and every whole-account revoke, which
+        # take the same lock. Another engine shard on the same file takes only SQLite's own write
+        # lock. Under ``require_sign_in_eligible`` the transaction is BEGIN IMMEDIATE, so that lock
+        # is held before the read: a disable or lockout another shard commits first is read and
+        # refused. Under the deferred BEGIN the same write fails the INSERT as ``database is
+        # locked`` instead, an error rather than a refusal (BACKLOG #5653; BACKLOG #3078 F5 is the
+        # first-administrator grant's same choice).
         # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
         async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
             cur = await self._db.execute(
