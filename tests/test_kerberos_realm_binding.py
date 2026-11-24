@@ -3,13 +3,14 @@
 """BACKLOG #4846: a Kerberos ticket resolves only to the account it proves.
 
 ``kerberos_principal`` checks a ticket's realm against ``[auth].kerberos_realm`` and drops it
-(BACKLOG #2610). The directory lookup that followed was the password path's name lookup, so:
+(BACKLOG #2610). The directory lookup that followed was the password path's name lookup, so
+in the shipped code:
 
-* under a forest-wide base or the global catalog, ``alice@CORP.EXAMPLE`` resolved to the CHILD
-  domain's ``alice`` when the root held none, and was refused as ambiguous when both held one;
+* under a forest-wide base or the global catalog, ``alice@CORP.EXAMPLE`` would resolve to the
+  CHILD domain's ``alice`` when the root held none, and be refused as ambiguous when both did;
 * a single entry holding only the UPN ``alice@<ad_domain>``, under another ``sAMAccountName``,
-  answered a ticket for ``alice``;
-* a machine's ticket (``WS01$``) or a trust account's (``CHILD$``) looked up like a person's.
+  would answer a ticket for ``alice``;
+* a machine's ticket (``WS01$``) or a trust account's (``CHILD$``) was looked up like a person's.
 
 Pinned here, each with a control showing the name-keyed lookup the other callers keep still
 answers the old way, so the difference is the Kerberos lookup and not the doubles.
@@ -172,8 +173,12 @@ def test_the_name_lookup_the_other_callers_keep_still_refuses_the_pair() -> None
     assert found.answer is DirectoryAnswer.AMBIGUOUS
 
 
-def test_a_dropped_entry_is_logged_by_label_and_count(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"):
+def test_a_dropped_entry_is_logged_at_debug_by_label_and_count(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """DEBUG, not WARNING: under the global catalog a name held in several domains drops entries
+    on every sign-in, which is routine rather than a fault to clear."""
+    with caplog.at_level("DEBUG", logger="messagefoundry.auth.ldap"):
         _kerberos(_Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice")
     messages = [
         r.getMessage()
@@ -181,6 +186,7 @@ def test_a_dropped_entry_is_logged_by_label_and_count(caplog: pytest.LogCaptureF
         if r.name == "messagefoundry.auth.ldap" and r.getMessage().startswith("Kerberos lookup")
     ]
     assert len(messages) == 1 and "kept 1 of 2" in messages[0]
+    assert all(r.levelname == "DEBUG" for r in caplog.records if "Kerberos lookup" in r.message)
     assert "alice" not in messages[0].lower()
     assert "child" not in messages[0].lower()
 
@@ -225,6 +231,28 @@ def _no_session() -> _NoSession:
 def test_a_dollar_name_is_not_found_without_a_session(name: str) -> None:
     probe = _no_session().probe_principal(name, kerberos_realm=_REALM)
     assert probe.answer is DirectoryAnswer.NOT_FOUND and probe.principal is None
+
+
+@pytest.mark.parametrize("name", ["WS01$", "CHILD$"])
+def test_the_kerberos_lookup_itself_never_searches_a_dollar_name(name: str) -> None:
+    """Where the filter is built, too, so a caller that skips ``probe_principal`` is covered: a
+    trust account is a person-category user the filter alone would return."""
+    conn = _Conn([_Entry(name, "CN=CHILD$,CN=Users,DC=corp,DC=example")])
+    assert _kerberos(conn, name).answer is DirectoryAnswer.NOT_FOUND and conn.filters == []
+
+
+def test_the_kerberos_lookup_itself_refuses_an_empty_realm() -> None:
+    conn = _Conn([_ROOT_ALICE])
+    with pytest.raises(LdapError, match="kerberos_realm must be"):
+        _kerberos(conn, "alice", "")
+    assert conn.filters == []
+
+
+def test_an_in_realm_entry_whose_dn_the_parser_refuses_is_dropped() -> None:
+    """Fails closed: an unescaped quote is a shape the shared DN parser refuses."""
+    quoted = _Entry("alice", 'CN=Alice "Al" Root,OU=Staff,DC=corp,DC=example')
+    assert ldap_mod._dn_realm(str(quoted.entry_dn)) is None
+    assert _kerberos(_Conn([quoted]), "alice").answer is DirectoryAnswer.NOT_FOUND
 
 
 def test_the_name_lookup_the_other_callers_keep_still_searches_a_dollar_name() -> None:

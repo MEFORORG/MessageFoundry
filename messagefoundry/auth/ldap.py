@@ -646,6 +646,16 @@ def _account_state(entry: Any) -> DirectoryAnswer:
     return DirectoryAnswer.UNDETERMINED
 
 
+def _holds_name(entry: Any, name: str) -> bool:
+    """Whether ``entry``'s own ``sAMAccountName`` is ``name``, which must be lower-case already.
+
+    One rule for the ambiguity check and the Kerberos narrowing (BACKLOG #4846). Compared with
+    ``lower()``, not ``casefold()``, so a German sharp s does not equal "ss". An entry with no
+    readable name holds none.
+    """
+    return (_attr(entry, "sAMAccountName") or "").lower() == name
+
+
 def _multi(entry: Any, name: str) -> list[str]:
     if name not in entry:
         return []
@@ -845,9 +855,10 @@ def _dn_realm(dn: str) -> str | None:
     BACKLOG #4846. ``CN=alice,OU=Staff,DC=child,DC=corp,DC=example`` gives
     ``child.corp.example``. Only the trailing run of single-valued ``dc`` RDNs counts, so a ``DC=``
     higher up the DN, or one inside a multi-valued RDN, adds nothing. The type may be spelled as
-    its OID, which ends no run early. The value is canonical (:func:`_canonical_value`), so ASCII
-    letters are lower-case and any other character is a ``\\xx`` escape that no realm, which is
-    printable ASCII (``check_kerberos_realm``), can equal.
+    its OID, which ends no run early. The value is canonical (:func:`_canonical_value`): ASCII
+    letters are lower-case, other printable ASCII stays literal apart from the RFC 4514 specials,
+    which are backslash-escaped, and every non-ASCII character is a ``\\xx`` escape. A realm is
+    printable ASCII with no ``\\`` (``check_kerberos_realm``), so an escaped label equals none.
 
     ``None`` when ``dn`` does not parse, ends in no ``DC=`` RDN, or has a label in that run that
     holds a ``.``, escaped or not: ``DC=corp.example`` is one label, not the two Active Directory
@@ -2089,7 +2100,7 @@ class LdapAuthenticator:
             # None, which must never match a caller that holds no id.
             label = safe_name(fallback_username)
             name = fallback_username.lower()
-            holders = [x for x in entries if (_attr(x, "sAMAccountName") or "").lower() == name]
+            holders = [x for x in entries if _holds_name(x, name)]
             chosen = (
                 tie_break_object_id is not None
                 and len(holders) == 1
@@ -2151,35 +2162,33 @@ class LdapAuthenticator:
         A ticket proves its holder has the ``sAMAccountName`` ``name`` in the domain ``realm``
         names. An entry is kept only when both hold for it:
 
-        - its own ``sAMAccountName`` is ``name``, compared with ``lower()`` as the ambiguity check
-          does. The Kerberos filter asks for nothing else, so this only re-reads what the directory
-          answered; an entry with no readable name is not shown to be the holder;
-        - the ``DC=`` suffix of its DN is the realm's domain (:func:`_dn_realm`), up to ASCII case,
-          as the ticket's realm was compared (:func:`_account_in_realm`). Under a forest-wide base
-          or the global catalog, ``alice`` in a child domain is another account than ``alice`` in
-          the realm, and the ticket names only the second.
+        - its own ``sAMAccountName`` is ``name`` (:func:`_holds_name`, the ambiguity check's
+          rule). The Kerberos filter asks for nothing else, so this only re-reads what the
+          directory answered;
+        - the whole trailing run of ``DC=`` RDNs in its DN equals the realm's domain
+          (:func:`_dn_realm`), up to ASCII case, as the ticket's realm was compared
+          (:func:`_account_in_realm`). Under a forest-wide base or the global catalog, ``alice`` in
+          a child domain is another account than ``alice`` in the realm, and the ticket names only
+          the second.
 
         This binds the realm to the entry on Active Directory, where a domain's realm is its DNS
-        name and its naming context is that name's ``DC=`` RDNs. A directory whose DNs do not follow
-        that, so that its users' DNs do not end in the realm's ``DC=`` RDNs, matches no entry, which
-        fails closed.
-        A dropped entry is logged once per name, with a label for it and the counts only.
+        name and its naming context is that name's ``DC=`` RDNs. An entry whose DN does not end in
+        exactly those RDNs matches nothing, which fails closed. So does one whose DN this engine's
+        parser refuses (:func:`canonical_group_dn` lists those shapes), such as a name with an
+        unescaped ``"``.
+
+        A dropped entry is logged at DEBUG, with a label for the name and the counts only. Under the
+        global catalog a name held in several domains drops entries on every sign-in, which is not
+        a fault an operator can clear.
         """
         domain = realm.lower()
         held = name.lower()
-        kept = [
-            x
-            for x in entries
-            if (_attr(x, "sAMAccountName") or "").lower() == held
-            and _dn_realm(str(x.entry_dn)) == domain
-        ]
+        kept = [x for x in entries if _holds_name(x, held) and _dn_realm(str(x.entry_dn)) == domain]
         if len(kept) < len(entries):
-            label = safe_name(name)
-            _warn_once(
-                f"kerberos-outside-realm:{label}",
-                "Kerberos lookup for %s kept %d of %d directory entries; the rest are outside "
-                "[auth].kerberos_realm's domain or do not hold the name (logged once per name)",
-                label,
+            logger.debug(
+                "Kerberos lookup for %s kept %d of %d directory entries; the rest do not hold the "
+                "name, are outside [auth].kerberos_realm's domain, or have a DN the engine cannot read",
+                safe_name(name),
                 len(kept),
                 len(entries),
             )
@@ -2210,17 +2219,21 @@ class LdapAuthenticator:
         nothing wider:
 
         - the filter has no ``userPrincipalName`` arm. With one, a single entry holding the UPN
-          ``alice@<ad_domain>`` under another name answered the ticket alone, so a renamed account
-          that kept its old UPN signed in for whoever was later given the old name;
+          ``alice@<ad_domain>`` under another name would answer the ticket alone, so a renamed
+          account that kept its old UPN would sign in for whoever was later given the old name;
         - the filter asks for ``objectCategory=person`` and ``objectClass=user``. A computer object
           is a ``user`` by class but not a person by category, so a machine's ticket
           (``WS01$@REALM``) finds nothing, and neither does a managed service account's or a
           contact's;
         - only entries in the realm's domain, holding the name, are read (:meth:`_kerberos_holders`).
 
-        A name ending in ``$`` is refused before this, by :meth:`probe_principal`.
+        A name ending in ``$`` is NOT_FOUND without a search, and a malformed realm raises
+        (:func:`_kerberos_lookup_realm`).
         """
         if kerberos_realm is not None:
+            kerberos_realm = _kerberos_lookup_realm(username, kerberos_realm)
+            if kerberos_realm is None:
+                return _Lookup(DirectoryAnswer.NOT_FOUND)
             search_filter = (
                 "(&(objectCategory=person)(objectClass=user)"
                 f"(sAMAccountName={_escape_filter(username)}))"
@@ -2480,18 +2493,9 @@ class LdapAuthenticator:
             raise ValueError("pass object_id or tie_break_object_id, not both")
         if object_id is not None and kerberos_realm is not None:
             raise ValueError("pass object_id or kerberos_realm, not both")
-        if kerberos_realm is not None:
-            # Before the session opens, since neither needs the directory (BACKLOG #4846). The
-            # realm is checked again, as _configured_kerberos_realm does: an empty or malformed one
-            # is a configuration fault, never a reason to drop the binding.
-            try:
-                kerberos_realm = check_kerberos_realm(kerberos_realm)
-            except ValueError as exc:
-                raise LdapError(str(exc)) from exc
-            if username.endswith("$"):
-                # A machine account's name, and an interdomain trust account's, which is a
-                # person-category user that the filter alone would find. No person needs the $.
-                return DirectoryProbe(DirectoryAnswer.NOT_FOUND)
+        # Before the session opens, since neither check needs the directory (BACKLOG #4846).
+        if kerberos_realm is not None and _kerberos_lookup_realm(username, kerberos_realm) is None:
+            return DirectoryProbe(DirectoryAnswer.NOT_FOUND)
         try:
             with self._service_session() as svc:
                 found = (
@@ -2742,10 +2746,29 @@ def _configured_kerberos_realm(settings: AuthSettings) -> str:
     """
     if not settings.kerberos_realm:
         raise LdapError("kerberos_realm is not set; Windows SSO accepts no ticket without it")
+    return _checked_kerberos_realm(settings.kerberos_realm)
+
+
+def _checked_kerberos_realm(realm: str) -> str:
+    """``realm`` through ``check_kerberos_realm``, its refusal raised as a configuration fault."""
     try:
-        return check_kerberos_realm(settings.kerberos_realm)
+        return check_kerberos_realm(realm)
     except ValueError as exc:
         raise LdapError(str(exc)) from exc
+
+
+def _kerberos_lookup_realm(username: str, realm: str) -> str | None:
+    """The checked ``realm`` a Kerberos lookup of ``username`` binds to, or ``None`` for no lookup.
+
+    BACKLOG #4846. ``None`` for a name ending in ``$``: a machine account's, or an interdomain trust
+    account's, which is a person-category ``user`` that the Kerberos filter alone would find. No
+    person's name needs the ``$``. A malformed or empty realm raises :class:`LdapError`, a
+    configuration fault, never a reason to drop the binding. Both
+    :meth:`LdapAuthenticator.probe_principal`, before its session opens, and
+    :meth:`LdapAuthenticator._lookup_by_name`, where the filter is built, ask it.
+    """
+    checked = _checked_kerberos_realm(realm)
+    return None if username.endswith("$") else checked
 
 
 def _account_in_realm(principal: str, realm: str) -> str:
