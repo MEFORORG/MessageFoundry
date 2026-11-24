@@ -3772,31 +3772,69 @@ def test_a_marker_written_under_any_culture_is_iso_utc_text(
     # The reader, in the default culture, must take a mark made NOW as live now, not PENDING.
     assert read(state)[0] == UNAVAILABLE
 
-    # A date with no offset is UTC midnight, the same instant the refusal text equates it with.
-    later = avail_in_culture(
-        culture,
-        "-Mark",
-        "-ConfigDir",
-        str(root),
-        "-Reason",
-        "cancelled",
-        "-EffectiveFrom",
-        "2099-01-01",
-    )
-    assert later.returncode == 0, later.stdout + later.stderr
-    doc = json.loads(marker.read_text(encoding="utf-8-sig"))
-    assert doc["effective_from"] == "2099-01-01T00:00:00Z"
-    assert _ISO_UTC.match(doc["marked_at"]), doc["marked_at"]
+    # The same culture reads it back: -Status formatted the stamps with the current calendar too,
+    # and under ar-SA a year past 2077 threw.
+    status = avail_in_culture(culture, "-Status", "-ConfigDir", str(root))
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert re.search(rf"marked {year}-\d\d-\d\dT\d\d:\d\d:\d\dZ", status.stdout), status.stdout
+
+    # The documented ISO forms parse under every culture; the date-only one was refused under ar-SA.
+    for given, written in (
+        ("2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+        ("2099-01-01", None),
+    ):
+        later = avail_in_culture(
+            culture,
+            "-Mark",
+            "-ConfigDir",
+            str(root),
+            "-Reason",
+            "cancelled",
+            "-EffectiveFrom",
+            given,
+        )
+        assert later.returncode == 0, later.stdout + later.stderr
+        doc = json.loads(marker.read_text(encoding="utf-8-sig"))
+        assert _ISO_UTC.match(doc["effective_from"]), doc["effective_from"]
+        assert doc["effective_from"][:4] in ("2098", "2099"), doc["effective_from"]
+        if written is not None:
+            assert doc["effective_from"] == written
+        status = avail_in_culture(culture, "-Status", "-ConfigDir", str(root))
+        assert status.returncode == 0, status.stdout + status.stderr
+        assert "effective from 209" in status.stdout, status.stdout
 
 
+@pytest.mark.parametrize("given", ["Jan 5", "01/10/2026", "10/1/2026 3pm", "", "next Tuesday"])
+def test_an_effective_from_that_is_not_iso_is_refused(tmp_path: Path, given: str) -> None:
+    """BACKLOG #7557 review. A lenient parse read 'Jan 5' as a date already past and '01/10/2026' by
+    US order, marking a live account dead now; an explicit '' was read as omitted, so as "now"."""
+    root = tmp_path / ".claude-account-9"
+    root.mkdir()
+    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "x", "-EffectiveFrom", given)
+    assert out.returncode == 1, out.stdout
+    assert "REFUSED" in out.stdout
+    assert not (root / "mefor-usage" / "unavailable.json").exists()
+
+
+@pytest.mark.skipif(
+    os.name != "nt", reason="a read-only target blocks an overwrite only on Windows"
+)
 def test_a_failed_marker_write_leaves_no_temp_file_behind(tmp_path: Path) -> None:
     """BACKLOG #7557. A throw from the rename left ``unavailable.json.<pid>.tmp`` beside the marker.
-    A directory at the marker path makes the write fail, whichever line refuses it."""
+    A read-only marker makes the overwriting File.Move throw, after the temp file is written."""
     root = tmp_path / ".claude-account-9"
-    (root / "mefor-usage" / "unavailable.json").mkdir(parents=True)
-    out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    state = root / "mefor-usage"
+    state.mkdir(parents=True)
+    marker = state / "unavailable.json"
+    marker.write_text('{"unavailable": false}', encoding="utf-8")
+    marker.chmod(stat.S_IREAD)
+    try:
+        out = avail("-Mark", "-ConfigDir", str(root), "-Reason", "cancelled")
+    finally:
+        marker.chmod(stat.S_IREAD | stat.S_IWRITE)
     assert out.returncode != 0, out.stdout
-    assert not list((root / "mefor-usage").glob("*.tmp"))
+    assert json.loads(marker.read_text(encoding="utf-8")) == {"unavailable": False}
+    assert not list(state.glob("*.tmp"))
 
 
 def test_a_root_whose_name_holds_wildcard_characters_is_marked_literally(tmp_path: Path) -> None:

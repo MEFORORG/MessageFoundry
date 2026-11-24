@@ -107,9 +107,9 @@ function Show-One([string]$Root) {
     }
 }
 
-function Assert-ConfigRoot {
-    if (-not (Test-Path -LiteralPath $ConfigDir -PathType Container)) {
-        Write-Host "REFUSED -- no such config root: $ConfigDir" -ForegroundColor Red
+function Assert-ConfigRoot([string]$Root) {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        Write-Host "REFUSED -- no such config root: $Root" -ForegroundColor Red
         Write-Host "  This script will not create one, and reads nothing from one. Check the path." -ForegroundColor DarkGray
         exit 1
     }
@@ -137,7 +137,7 @@ switch ($PSCmdlet.ParameterSetName) {
         # -Force builds every missing ancestor, so a typo'd -ConfigDir would have this command
         # MANUFACTURE a config root nothing can launch from and then declare it cancelled -- a wholly
         # fictional account, recorded as fact, with nothing anywhere reporting a problem.
-        Assert-ConfigRoot
+        Assert-ConfigRoot $ConfigDir
         $sd = Get-UsageStateDir $ConfigDir
         $path = Join-Path $sd $script:UsageUnavailableMarker
         Assert-MarkerNotDirectory $path
@@ -146,15 +146,23 @@ switch ($PSCmdlet.ParameterSetName) {
         # th-TH the current culture's Thai Buddhist calendar wrote marked_at in year 2569, so an account
         # marked dead NOW read PENDING for 543 years; under fi-FI the time separator became '.'; under
         # ar-SA the Um Al Qura calendar refused '2026-10-01' outright. ConvertTo-UtcDateTime parses with
-        # the current culture, so -EffectiveFrom is parsed here instead. A date with no offset is UTC,
-        # as every timestamp this codebase writes is, which makes 2026-10-01 and 2026-10-01T00:00:00Z
-        # the same instant, as the refusal text below says they are.
+        # the current culture, so -EffectiveFrom is parsed here instead, and ONLY as ISO-8601: a lenient
+        # parse took 'Jan 5' as a date already past and an en-GB '01/10/2026' as 10 January, marking a
+        # live account dead now. A form with no offset keeps its old meaning, the operator's LOCAL time.
         $inv = [cultureinfo]::InvariantCulture
         $iso = "yyyy-MM-dd'T'HH:mm:ss'Z'"
         $eff = $null
-        if ($EffectiveFrom) {
+        # BOUND, NOT TRUTHY: an explicit -EffectiveFrom '' (a wrapper passing an unset variable) must be
+        # refused, not read as omitted and so as "now".
+        if ($PSBoundParameters.ContainsKey('EffectiveFrom')) {
             $parsed = [System.DateTimeOffset]::MinValue
-            if ([System.DateTimeOffset]::TryParse($EffectiveFrom, $inv, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
+            $forms = [string[]]@(
+                'yyyy-MM-dd',
+                "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd'T'HH:mmK",
+                "yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm:ssK",
+                "yyyy-MM-dd'T'HH:mm:ss.FFFFFFF", "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK"
+            )
+            if ([System.DateTimeOffset]::TryParseExact([string]$EffectiveFrom, $forms, $inv, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)) {
                 $eff = $parsed.UtcDateTime
             }
             if ($null -eq $eff) {
@@ -214,7 +222,7 @@ switch ($PSCmdlet.ParameterSetName) {
     'Clear' {
         # A typo'd root carries no marker, so without this a clear of a fictional account reported
         # NOTHING TO CLEAR and exit 0, and the real marker stayed in force. BACKLOG #7558.
-        Assert-ConfigRoot
+        Assert-ConfigRoot $ConfigDir
         $sd = Get-UsageStateDir $ConfigDir
         $path = Join-Path $sd $script:UsageUnavailableMarker
         # A directory at the marker path is not "no marker": the reader takes it as MALFORMED and the
@@ -260,7 +268,7 @@ switch ($PSCmdlet.ParameterSetName) {
         else {
             # A typo'd root has no marker and so read AVAILABLE, an all-clear for an account that
             # does not exist. BACKLOG #7558.
-            Assert-ConfigRoot
+            Assert-ConfigRoot $ConfigDir
             Show-One $ConfigDir
         }
         Write-Host ""
