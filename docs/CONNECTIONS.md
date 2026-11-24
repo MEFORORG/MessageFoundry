@@ -3130,11 +3130,13 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
   queue (ADR 0095), because the credential at fault is one the engine cannot see, at least a
   `UsernameToken` a Handler writes into its own envelope or a client certificate. A 2xx ends that
   run unless its body is a WS-Security fault, and so does a `401` that is not a WS-Security fault;
-  a 5xx, a `407`, any other status or no answer leaves it open. A `401` whose fault code element
-  (SOAP 1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`) names `MessageExpired` dead-letters
-  on every connection; where the Fault has no such element, `MessageExpired` anywhere from the
-  Fault on counts (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py` module
-  docstring points here.
+  a 5xx, a `407`, any other status or no answer leaves it open. A `401` carrying `MessageExpired`
+  dead-letters on every connection. The WS-Security code search looks after the first Body start
+  tag when a Fault follows it, else at the whole reply. Where it also finds `FailedAuthentication`
+  or `InvalidSecurityToken` and the Fault's first child is a code element with a close tag (SOAP
+  1.1 `faultcode`, or SOAP 1.2 `Code` with its `Subcode`), `MessageExpired` counts only in that
+  element; otherwise it counts anywhere that search looks (BACKLOG #5798). This bullet is where the rule is stated; the `soap.py`
+  module docstring points here.
 
 ```python
 from messagefoundry import outbound, Soap, env
@@ -5280,7 +5282,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with an OAuth2 bearer, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** is not relayed (`capture_error_responses`). Outside a 2xx body, the fault code decides: a Receiver/Server fault is retried, and any other fault dead-letters, whatever the HTTP status, except an HTTP `401` on a connection with a bearer token provider, which drops the bearer and retries within the WS-Security limits the SOAP section's WS-\* mode notes give. A dead-lettered delivery gets a fixed-JSON `502`. A retried one ends in a reply, a `502` or the `reply_on_timeout` answer (see [the listener section](#http-web-service-listener--http-inbound-only-adr-0023)). A SOAP fault in a 2xx body is captured as a rejection instead, and comes back as a `502` that carries the partner's body |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |

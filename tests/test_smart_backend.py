@@ -687,14 +687,28 @@ def test_audit_token_url_must_be_egress_listed(rsa_pem: str) -> None:
 # --- BACKLOG #5800 added item 1: the SMART provider's grant checks run at construction ------------
 
 
-def test_smart_refuses_an_unencodable_scope_at_construction(rsa_pem: str) -> None:
-    """The form body is URL-encoded as strict UTF-8 at each mint. Mutation: drop the surrogate
-    check in ``__init__``. Red: the provider builds, and the first mint raises UnicodeEncodeError
-    out of send or test_connection."""
+@pytest.mark.parametrize(
+    ("setting", "over"),
+    [
+        ("smart_scope", {"scope": "system/Patient.rs\ud800"}),
+        ("smart_private_key", {"private_key": "-----BEGIN PRIVATE KEY-----\udc80"}),
+        ("smart_private_key_password", {"private_key_password": "pw-synthetic-\udc80"}),
+    ],
+    ids=["scope", "private-key", "key-password"],
+)
+def test_smart_refuses_an_unencodable_grant_value_at_construction(
+    rsa_pem: str, setting: str, over: dict[str, str]
+) -> None:
+    """The scope is URL-encoded as strict UTF-8 at each mint, and the key and its password as the
+    signer loads them. Mutation: drop the surrogate check in ``__init__``. Red: "scope" builds,
+    and the first mint raises UnicodeEncodeError out of send or test_connection; the key cases
+    raise one at construction whose ``object`` is the whole key or password (review round
+    2c51ab65)."""
     with pytest.raises(
-        SmartAuthError, match="smart_scope holds a character UTF-8 cannot encode"
+        SmartAuthError, match=f"{setting} holds a character UTF-8 cannot encode"
     ) as ei:
-        _provider(rsa_pem, scope="system/Patient.rs\ud800")
+        _provider(rsa_pem, **over)
+    assert "synthetic" not in str(ei.value)
     # Raised outside any handler, so no exception holding the value rides the chain.
     assert ei.value.__cause__ is None and ei.value.__context__ is None
 

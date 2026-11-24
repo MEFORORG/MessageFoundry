@@ -487,10 +487,19 @@ def _searched_code(body: str, start: int, end: int) -> str:
     return ""
 
 
+# BACKLOG #5798 added item 3: the faultcode close tag outside markup, as _CODE_END_OUTSIDE_MARKUP_RE
+# finds the Code's, and the two WS-Security codes that name a credential rather than the Timestamp.
+_FAULTCODE_END_OUTSIDE_MARKUP_RE = re.compile(
+    r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?faultcode\s*>)"
+)
+_WSSE_CREDENTIAL_RE = re.compile(r"FailedAuthentication|InvalidSecurityToken", re.IGNORECASE)
+
+
 def _code_element_span(body: str, fault: re.Match[str]) -> tuple[int, int] | None:
-    """Where the code element :func:`_first_child_code` reads starts and where its close tag
-    starts, or ``None`` when the Fault's first child is no ``faultcode`` or ``Code`` with a close
-    tag. For a SOAP 1.2 ``Code`` the span holds its ``Subcode``, where WS-Security puts its code."""
+    """Where the Fault's first child starts and where its close tag starts, when that child is a
+    ``faultcode`` or a ``Code`` with a close tag outside markup, else ``None``: the element
+    :func:`_first_child_code` reads. For a SOAP 1.2 ``Code`` the span holds its ``Subcode``, where
+    WS-Security puts its code. A self-closing element has no span."""
     gt = _start_tag_gt(body, fault.end() - 1, len(body))
     if gt < 0:
         return None
@@ -499,34 +508,34 @@ def _code_element_span(body: str, fault: re.Match[str]) -> tuple[int, int] | Non
     child = _first_child(body, gt + 1, end)
     if child < 0:
         return None
-    if _FAULTCODE_RE.match(body, child, end) is not None:
-        close = _FAULTCODE_END_RE.search(body, child, end)
-    elif (code := _CODE_RE.match(body, child, end)) is not None:
-        code_gt = _start_tag_gt(body, code.end(), end)
-        close = (
-            None
-            if code_gt < 0
-            else _search_outside_markup(_CODE_END_OUTSIDE_MARKUP_RE, body, code_gt + 1, end)
-        )
+    if (element := _FAULTCODE_RE.match(body, child, end)) is not None:
+        close_re = _FAULTCODE_END_OUTSIDE_MARKUP_RE
+    elif (element := _CODE_RE.match(body, child, end)) is not None:
+        close_re = _CODE_END_OUTSIDE_MARKUP_RE
     else:
         return None
+    element_gt = _start_tag_gt(body, element.end(), end)
+    close = None if element_gt < 0 else _search_outside_markup(close_re, body, element_gt + 1, end)
     return None if close is None else (child, close.start())
 
 
 def _names_expired_timestamp(body: str) -> bool:
-    """Whether ``body`` holds a Fault whose code element names ``MessageExpired``.
+    """Whether ``body``'s Fault reads as ``MessageExpired`` for the bearer retry in ``_post``.
 
-    BACKLOG #5798 added item 3: the search once ran from the Fault start to the reply's end, so a
-    ``MessageExpired`` in a faultstring, a Detail or after the Fault kept a FailedAuthentication
-    fault from its bearer retry. It now reads the code element :func:`_code_element_span` finds.
-    Where there is none, it searches from the Fault start, as before, which errs toward permanent."""
+    ``MessageExpired`` is searched for as :func:`_classify_soap` searches for a WS-Security code,
+    from where :func:`_find_fault` starts, unless both of these hold: the Fault's code element
+    (:func:`_code_element_span`) is found, and a ``FailedAuthentication`` or
+    ``InvalidSecurityToken`` is in that searched range. Then only the code element decides.
+    BACKLOG #5798 added item 3: the range search alone let a ``MessageExpired`` in a faultstring,
+    a Detail or after the Fault keep such a fault from its bearer retry. A reply whose only
+    WS-Security code is ``MessageExpired`` still reads as it did, wherever that code sits."""
     fault, start = _find_fault(body)
     if fault is None:
         return False
     span = _code_element_span(body, fault)
-    if span is None:
-        return _WSSE_EXPIRED_RE.search(body, start) is not None
-    return _WSSE_EXPIRED_RE.search(body, *span) is not None
+    if span is not None and _WSSE_CREDENTIAL_RE.search(body, start) is not None:
+        return _WSSE_EXPIRED_RE.search(body, *span) is not None
+    return _WSSE_EXPIRED_RE.search(body, start) is not None
 
 
 def _classify_soap(status: int, body: str) -> DeliveryError | None:

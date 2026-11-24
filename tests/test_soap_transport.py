@@ -494,9 +494,10 @@ async def _ws_security_401_then(dest: SoapDestination, kind: str) -> None:
 
 @pytest.mark.parametrize("kind", ["2xx", "2xx-read-fails", "2xx-sender-fault", "plain-401"])
 async def test_control_a_2xx_or_a_plain_401_between_ends_the_ws_security_401_run(kind: str) -> None:
-    """Only a 2xx or a 401 that is not a WS-Security fault ends the run, so the next WS-Security
-    401 gets its retry again. Mutations: move the 2xx reset after the body read (red:
-    "2xx-read-fails"), or drop the reset on a plain 401 (red: "plain-401")."""
+    """A 2xx that is not a WS-Security fault, a 2xx whose read fails, or a 401 that is not a
+    WS-Security fault ends the run, so the next WS-Security 401 gets its retry again. Mutations:
+    move the 2xx reset after the body read (red: "2xx-read-fails"), drop the reset on a plain 401
+    (red: "plain-401"), or keep the run on any 2xx fault (red: "2xx-sender-fault")."""
     dest, _ = _oauth2_dest()
     await _ws_security_401_then(dest, kind)
     with pytest.raises(DeliveryError) as ei:
@@ -618,6 +619,14 @@ _EXPIRED_IN_THE_CODE = {
         b"<soap:Reason><soap:Text>expired</soap:Text></soap:Reason></soap:Fault>"
     ),
     "no-code-element": (b"<soap:Fault><faultstring>wsse:MessageExpired</faultstring></soap:Fault>"),
+    "client-code-expired-elsewhere": (
+        b"<soap:Fault><faultcode>soap:Client</faultcode>"
+        b"<faultstring>wsse:MessageExpired</faultstring></soap:Fault>"
+    ),
+    "comment-in-the-faultcode": (
+        b"<soap:Fault><faultcode><!-- </faultcode> -->wsse:MessageExpired</faultcode>"
+        b"<faultstring>FailedAuthentication</faultstring></soap:Fault>"
+    ),
 }
 
 
@@ -628,7 +637,11 @@ async def test_control_message_expired_in_the_code_or_with_no_code_stays_permane
     body: bytes,
 ) -> None:
     """A SOAP 1.2 Subcode is inside the Code element, so it decides. A Fault with no code
-    element keeps the earlier search, which errs toward permanent."""
+    element, or a reply whose only WS-Security code is MessageExpired, keeps the earlier search,
+    as on main ("client-code-expired-elsewhere", review round 2c51ab65; mutation: read only the
+    code element whenever it is found, red: a bearer retry, then a lane stop). A faultcode close
+    tag inside a comment does not end the element (mutation: a plain close-tag search, red: a
+    bearer retry)."""
     dest, _ = _oauth2_dest()
     dest._opener = _Opener(exc=_http_error(401, body))  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as ei:

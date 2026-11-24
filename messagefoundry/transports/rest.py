@@ -443,9 +443,10 @@ def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = Fa
     """Call a bearer provider's ``access_token`` for ``label``'s hop (BACKLOG #5795, #5797).
 
     The provider raises ``DeliveryError`` for a failed mint, but a token request it cannot build or
-    encode raises a plain ``ValueError``: at least an over-length token URL or proxy credential
-    (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That is the
-    connection's fault, the same for every queued row, so for a delivery it becomes a permanent
+    encode raises a plain ``ValueError``: at least a header value ``http.client`` refuses. (The
+    SMART and OAuth2 client-credentials providers refuse an over-length token URL or proxy
+    credential when they are built, BACKLOG #5800, so this arm is not their length control.) That
+    is the connection's fault, the same for every queued row, so for a delivery it becomes a permanent
     configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
     the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead: a
     REST or FHIR test-connection probe raises only that type.
