@@ -69,7 +69,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
 from types import CodeType, FrameType
-from typing import Any
+from typing import Any, cast
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.fhir_lookup import FhirLookupError
@@ -157,10 +157,9 @@ def _safe_snapshot(frame: FrameType) -> dict[str, Any]:
 def _sends_from(result: object) -> list[str]:
     """Outbound names in a Handler's raw return (``Send``/``SetState``/an iterable/``None``) — mirrors
     the ``Send`` half of :func:`messagefoundry.pipeline.dryrun._partition`, name-only (no payload = no
-    PHI). It shares that function's materialization rule so the trace does not drift from what actually
-    delivers now that any non-``str`` iterable fans out (BACKLOG #341).
+    PHI). It reports a subset of what that function delivers, never a substitute (ADR 0072 gate 1b).
 
-    **One deliberate divergence: a one-shot iterator is never consumed.** A generator Handler is
+    **It never walks a return it cannot prove re-iterable.** A generator Handler is
     reported as no sends rather than drained here, because this hook is a *pure observer* — exhausting
     the generator would leave ``_partition`` nothing to partition, so the traced run would deliver 0
     where the untraced run delivers N. Under-reporting is the only safe option; it is symmetric with
@@ -169,15 +168,15 @@ def _sends_from(result: object) -> list[str]:
     no sends was exact rather than a degradation. The caller marks the invocation ``lazy_result`` so
     the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1).
 
-    **"Not an Iterator" is not "safe to walk"** (BACKLOG #6823), the same defect the Router half hit
-    under BACKLOG #1694: an object whose ``__iter__`` hands back a stored generator is single-pass yet
-    no ``Iterator``, and walking it here left ``_partition`` an empty iterable, so a delivering run
-    traced as FILTERED. Only the re-iterable containers in :data:`_ROUTED_CONTAINERS` are walked; any
-    other iterable is reported as no sends and declared by :func:`_handler_return_is_untraceable`."""
+    "Not an ``Iterator``" is not "safe to walk" either (BACKLOG #6823): see
+    :data:`_ROUTED_CONTAINERS`. Only those exact builtin types are walked, since a subclass may
+    override ``__iter__``; any other iterable is reported as no sends and declared by
+    :func:`_handler_return_is_untraceable`. A re-iterable shape outside that set, such as a
+    ``deque``, therefore under-reports too."""
     if result is None:
         return []
-    if isinstance(result, _ROUTED_CONTAINERS):
-        items: Iterable[object] = result
+    if type(result) in _ROUTED_CONTAINERS:
+        items: Iterable[object] = cast("Iterable[object]", result)
     elif _handler_return_is_untraceable(result):
         return []
     else:
@@ -185,14 +184,21 @@ def _sends_from(result: object) -> list[str]:
     return [it.to for it in items if isinstance(it, Send)]
 
 
+#: What ``handler_result_items`` treats as a single value although it is ``Iterable``. Kept in step
+#: with that function's carve-out, which ``_partition`` applies.
+_HANDLER_SINGLE_VALUES = (str, bytes, bytearray)
+
+
 def _handler_return_is_untraceable(result: object) -> bool:
     """True when :func:`_sends_from` declines to walk this Handler return, so the record is incomplete.
 
-    Drives ``lazy_result`` for the Handler half. It names exactly the shapes ``_partition``
-    materializes as a container (any ``Iterable`` but ``str``/``bytes``/``bytearray``) that are not
-    known to be re-iterable: a generator, and a custom single-pass iterable."""
-    return isinstance(result, Iterable) and not isinstance(
-        result, (str, bytes, bytearray, *_ROUTED_CONTAINERS)
+    Drives ``lazy_result`` for the Handler half: an ``Iterable`` that ``_partition`` materializes as
+    a container and whose exact type is not in :data:`_ROUTED_CONTAINERS`. At least a generator, a
+    custom single-pass iterable and a builtin-container subclass are such returns."""
+    return (
+        isinstance(result, Iterable)
+        and not isinstance(result, _HANDLER_SINGLE_VALUES)
+        and type(result) not in _ROUTED_CONTAINERS
     )
 
 
@@ -353,8 +359,10 @@ class _Recorder:
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
             # The Handler half walks the same allowlist, so its declaration widens the same way
-            # (BACKLOG #6823): a single-pass custom iterable is untraced, not "sent nothing".
-            self.lazy_result = self.lazy_result or _handler_return_is_untraceable(result)
+            # (BACKLOG #6823): a single-pass custom iterable is untraced, not "sent nothing". The
+            # predicate also covers a generator, and replaces the Iterator test so the flag and
+            # `_sends_from` cannot disagree on an Iterator that subclasses a builtin container.
+            self.lazy_result = _handler_return_is_untraceable(result)
             self.sends = _sends_from(result)
         # An "accepts" predicate (ADR 0084) returns a bool — it has neither routed_to nor sends, and its
         # verdict is reported at message level (`accepts_declined`). Named explicitly so it isn't quietly

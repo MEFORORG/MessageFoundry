@@ -308,8 +308,9 @@ def test_gate_1a_a_generator_handler_traces_byte_identically_at_message_level() 
     non-``str`` iterable, and materialising a generator CONSUMES it. Mirroring that rule literally
     would leave the real ``_partition`` an exhausted iterator, so the *traced* run would deliver 0
     where the untraced run delivers 2: a tracer that changes the disposition, which is the one thing
-    ADR 0072 forbids. The two-line ``isinstance(result, Iterator)`` guard in ``_sends_from`` is what
-    prevents it, and before this test nothing covered it — deleting the guard left the whole tracer
+    ADR 0072 forbids. ``_sends_from``'s refusal to walk a return it cannot prove re-iterable (an
+    ``isinstance(result, Iterator)`` guard until BACKLOG #6823) is what prevents it, and before this
+    test nothing covered it — deleting the guard left the whole tracer
     suite green while turning a traced generator Handler into an accept-and-drop.
 
     The untraced side is asserted non-empty first, so this cannot pass by both runs delivering nothing
@@ -370,6 +371,52 @@ def test_gate_1a_a_single_pass_iterable_handler_traces_byte_identically() -> Non
     the invocation is declared with ``lazy_result``, as for a generator Handler."""
     plain = dry_run(_two_out_registry(handle_single_pass), ADT_A01)
     traced = trace_dry_run(_two_out_registry(handle_single_pass), ADT_A01)
+
+    assert [d.to for d in plain.deliveries] == ["out", "out2"]
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
+    assert traced["disposition"] == plain.disposition.value
+    inv = _handler_invocation(traced)
+    assert inv["sends"] == []
+    assert inv["lazy_result"] is True
+
+
+class _GenList(list[Send]):
+    """A ``list`` subclass whose ``__iter__`` is single-pass: ``isinstance(x, list)`` is True."""
+
+    def __init__(self, *items: Send) -> None:
+        super().__init__(items)
+        self._gen = (i for i in items)
+
+    def __iter__(self) -> Iterator[Send]:
+        return self._gen
+
+
+class _IterList(list[Send]):
+    """A ``list`` subclass that is also its own one-shot ``Iterator``."""
+
+    def __init__(self, *items: Send) -> None:
+        super().__init__(items)
+        self._pos = 0
+
+    def __iter__(self) -> _IterList:
+        return self
+
+    def __next__(self) -> Send:
+        if self._pos >= len(self):
+            raise StopIteration
+        self._pos += 1
+        return list.__getitem__(self, self._pos - 1)
+
+
+@pytest.mark.parametrize("cls", [_GenList, _IterList])
+def test_gate_1a_a_single_pass_container_subclass_handler_is_not_drained(cls: type) -> None:
+    """The allowlist is tested on the EXACT type: a builtin-container subclass may be single-pass."""
+
+    def handle(msg: Message) -> object:
+        return cls(Send("out", msg), Send("out2", msg))
+
+    plain = dry_run(_two_out_registry(handle), ADT_A01)
+    traced = trace_dry_run(_two_out_registry(handle), ADT_A01)
 
     assert [d.to for d in plain.deliveries] == ["out", "out2"]
     assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
