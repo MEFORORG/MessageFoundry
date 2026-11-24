@@ -369,7 +369,9 @@ def test_an_exec_form_hook_counts_as_already_wired(home: Path, cfg: Path) -> Non
     assert len(_session_start(cfg)) == 1, "an exec-form hook was wired a second time"
 
 
-def test_a_successful_install_preserves_keys_and_leaves_no_temp_file(home: Path, cfg: Path) -> None:
+def test_a_successful_install_preserves_keys_and_leaves_no_stray_file(
+    home: Path, cfg: Path
+) -> None:
     (cfg / "settings.json").write_text(json.dumps({"model": "x", "hooks": {}}), encoding="utf-8")
     r = run_installer(home, cfg)
     assert r.returncode == 0, r.stderr
@@ -419,6 +421,39 @@ def test_an_invalid_result_leaves_settings_json_byte_identical(home: Path, cfg: 
     assert not marker.exists(), "settings.json was written before the new text was validated"
     assert settings.read_bytes() == original, "settings.json changed"
     assert not (cfg / "settings.json.bak-selfheal").exists()
+
+
+def test_a_failed_read_back_restores_the_backup(home: Path, cfg: Path) -> None:
+    """origin/main read the written file back and restored the backup if that failed; this keeps it.
+    The shim passes the pre-write parse of the new text and fails the second one, the read-back."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    shim = (
+        "$global:n = 0; function ConvertFrom-Json { param([Parameter(ValueFromPipeline)]$InputObject) "
+        "process { if (\"$InputObject\" -match 'worktree-selfheal') { $global:n++; "
+        "if ($global:n -ge 2) { throw 'injected read-back failure' } } "
+        "$InputObject | Microsoft.PowerShell.Utility\\ConvertFrom-Json } }"
+    )
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    r = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{shim}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+    assert r.returncode != 0, "a failed read-back was reported as success"
+    assert "injected read-back failure" in (r.stderr + r.stdout), "the shim never fired"
+    assert settings.read_bytes() == original, "the backup was not restored"
 
 
 @pytest.mark.parametrize("bad", ["a$b", "a`b", 'a"b'])
@@ -479,8 +514,8 @@ def test_the_note_reads_the_home_legacy_file_not_the_hook_dir(
 
 
 def test_a_tilde_config_dir_still_installs(home: Path, tmp_path: Path) -> None:
-    """The temp file is written through .NET, which does not resolve PowerShell's ``~``. The old
-    in-place Set-Content did, so a ``~``-relative ConfigDir must keep working."""
+    """A ``~``-relative ConfigDir worked on origin/main and must keep working. An intermediate version
+    of this branch broke it by writing through .NET, which does not resolve PowerShell's ``~``."""
     (home / "cfg").mkdir()
     env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
     env.pop("CLAUDECODE", None)

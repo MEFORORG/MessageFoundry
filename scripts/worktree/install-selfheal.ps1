@@ -7,8 +7,9 @@
 
 .DESCRIPTION
     Idempotent. MERGES (never clobbers) a SessionStart hook that runs the shared worktree-selfheal.ps1;
-    existing hooks and top-level keys are preserved. Parses the new JSON before writing anything, backs
-    up settings.json, then writes it in place. It does not create the allowlist; install-gate.ps1 owns that.
+    existing hooks and top-level keys are preserved. Parses the new JSON before writing settings.json,
+    backs it up, writes it in place, reads it back, and restores the backup on failure. The shared hook
+    script is copied earlier, before that parse. It does not create the allowlist; install-gate.ps1 owns that.
 
     Run once per config dir a session can use. On this box (a subscription-swap setup) that is:
       ~/.claude                (the Desktop app; CLAUDE_CONFIG_DIR unset)
@@ -120,8 +121,7 @@ $entry = [pscustomobject]@{
 $groups = @($groups) + $entry
 $cfg.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue $groups -Force
 
-# Validate -> backup -> write a temp file beside the live one -> one replace. Other sessions read
-# Validate -> backup -> write. The text is parsed BEFORE settings.json is touched, so a failed parse
+# Validate -> backup -> write -> read back, rolling back from the backup on failure. The text is parsed BEFORE settings.json is touched, so a failed parse
 # leaves the live file byte-identical and exits non-zero. What the parse catches: text ConvertTo-Json
 # emitted that ConvertFrom-Json cannot read back. What it does not: anything ConvertTo-Json emits as
 # valid JSON, including objects nested past -Depth 40, which it turns into strings with only a warning.
@@ -136,5 +136,13 @@ try {
 if (Test-Path -LiteralPath $settingsPath) {
     Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
 }
-Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
-Write-Host "[$ConfigDir] wired + valid JSON."
+try {
+    Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
+    $null = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
+    Write-Host "[$ConfigDir] wired + valid JSON."
+} catch {
+    if (Test-Path -LiteralPath "$settingsPath.bak-selfheal") {
+        Copy-Item -LiteralPath "$settingsPath.bak-selfheal" -Destination $settingsPath -Force
+    }
+    throw "[$ConfigDir] the write or its read-back failed; restored from $settingsPath.bak-selfheal where one existed. $_"
+}
