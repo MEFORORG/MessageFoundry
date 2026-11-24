@@ -2720,7 +2720,9 @@ class _Reading:
         other decorator may make that binding anything, so where one is outermost on either side
         this tells nothing, and :meth:`pair` decides (BACKLOG #5590). Outside a class, where
         `method` is false, a ``staticmethod`` is called as the function under it is, so it is
-        read as none."""
+        read as none. A def with no shape decorator is read as none even where Python itself wraps
+        it, as ``type()`` makes an undecorated ``__new__`` a staticmethod, so two defs this tells
+        apart can bind the same thing."""
         if m not in self.outer or s not in self.outer:
             return None
         mo, so = self.outer[m], self.outer[s]
@@ -3230,69 +3232,28 @@ def _signature_clause(
     )
 
 
-#: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
-_OUTER_BINDS: Final = {
-    "builtins.property": (
-        "a property, which is not callable, and which, read through an instance, calls its getter "
-        "on each read, where it has one"
-    ),
-    "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
-    "builtins.classmethod": (
-        "a classmethod, which a call through a class passes the class first, and which outside "
-        "a class is not callable"
-    ),
-    "functools.cache": (
-        "a cache wrapper whose call results are cached (over something not callable, the "
-        "decoration raises TypeError)"
-    ),
-    "functools.lru_cache": (
-        "a cache wrapper that caches call results up to its maxsize, and none at a maxsize of 0 "
-        "or less (over something not callable, the decoration raises TypeError, except that a "
-        "bare lru_cache over None or an int returns a decorator)"
-    ),
-    "functools.cached_property": (
-        "a cached_property, which is not callable, and which, read through an instance with a "
-        "__dict__, stores its function's result there on a read that finds none, later reads "
-        "returning what is stored"
-    ),
-    "contextlib.contextmanager": (
-        "a function whose call passes its arguments to what it wraps and returns a context "
-        "manager over the result, raising where that call raises"
-    ),
-    "contextlib.asynccontextmanager": (
-        "a function whose call passes its arguments to what it wraps and returns an async "
-        "context manager over the result, raising where that call raises"
-    ),
-    "typing.overload": "an overload stub, which raises NotImplementedError when called",
-    "typing_extensions.overload": "an overload stub, which raises NotImplementedError when called",
-}
-
-
 class _OuterClause(str):
-    """A refusal clause from :func:`_outer_clause`. It carries its own `tail`, what the change
-    does, because the tail :func:`_screen_mutation` gives a signature clause is not true of it."""
+    """A refusal clause from :func:`_outer_clause`. It carries its own `tail`, because the tail
+    :func:`_screen_mutation` gives a signature clause is not true of it."""
 
     tail: str
 
 
 def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) -> _OuterClause:
+    """The refusal for two defs whose outermost shape decorators differ. It names the two
+    decorators compared and nothing about what either binds the name to: this screen does not read
+    that, and the two can bind the same thing, as where one side writes the ``staticmethod``
+    Python's ``type()`` already puts around an undecorated ``__new__``."""
     mine, live = (f"shape decorator {o}" if o else "no shape decorator" for o in outer)
     clause = _OuterClause(
         f"redefines {qual}() with {mine} as its outermost decorator, passthrough decorators "
-        f"aside, where {path} has {live} (as this screen resolves them), so, as this screen reads "
-        "them, the two bind the name to different shapes"
+        f"aside, where {path} has {live} (as this screen resolves them)"
     )
-    binds = [
-        _OUTER_BINDS.get(o, f"what {o} returns") if o else "the function the def itself makes"
-        for o in outer
-    ]
     clause.tail = (
-        f"With the decorators as this screen resolves them, and where each definition runs and no "
-        f"decorator raises, this definition, applied, binds the name to {binds[0]}, and the "
-        f"{path} definition it was compared with binds it to {binds[1]}. So the "
-        "observable may go red for that change and not for the reintroduction. Copy the live "
-        "decorators; the mutation lives in a different repository from the symbol it shadows, so "
-        "nothing else keeps the two in step"
+        "For this definition the screen compared only those two outermost shape decorators, and "
+        "refused because it reads them as different. It does not read what either definition "
+        "binds the name to when it runs, so the two may bind the same thing. Copy the live decorators; the mutation lives in a different "
+        "repository from the symbol it shadows, so nothing else keeps the two in step"
     )
     return clause
 

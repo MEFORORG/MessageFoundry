@@ -3274,29 +3274,61 @@ def test_prove_absences_screen_outer_rule_reads_a_module_level_staticmethod_as_n
     assert "builtins.staticmethod" in problem
 
 
-def test_prove_absences_screen_outer_refusal_says_what_the_change_does(tmp_path: Path) -> None:
-    """A dropped cache beside an unnamed decorator leaves every call working, so the refusal says
-    the results stop being cached, and not the signature refusal's text."""
+def test_prove_absences_screen_outer_refusal_names_only_the_decorators_compared(
+    tmp_path: Path,
+) -> None:
+    """A dropped cache beside an unnamed decorator is refused with a text naming the two outermost
+    shape decorators compared and nothing about what either binds the name to, and not the
+    signature refusal's text."""
     plain = _decorated((), method=False)
     cached = _OUTER_HEAD + _decorated(("functools.cache", "w"), method=False)
     (problem,) = _screen(plain, cached, tmp_path)
     assert "where a value was expected" not in problem
-    assert "the function the def itself makes" in problem
-    assert problem.index("binds the name to the function the def itself makes") < (
-        problem.index("binds it to a cache wrapper whose call results are cached")
-    )
-    # A property swapped for a cached_property: the text names what differs.
+    assert "with no shape decorator as its outermost decorator" in problem
+    assert "has shape decorator functools.cache" in problem
+    assert "compared only those two outermost shape decorators" in problem
+    assert "binds the name to a" not in problem
+    assert "the function the def itself makes" not in problem
+    # A property swapped for a cached_property: each side's decorator is named on its own side.
     prop = _OUTER_HEAD + _decorated(("property", "w"), method=True)
     (swapped,) = _screen(_decorated(("functools.cached_property",), method=True), prop, tmp_path)
-    # Each text is attributed to its own side: the mutation's first, then the live one's.
-    assert swapped.index(
-        "binds the name to a cached_property, which is not callable, and which"
-    ) < (swapped.index("binds it to a property, which is not callable, and which"))
+    assert swapped.index("shape decorator functools.cached_property as its outermost") < (
+        swapped.index("has shape decorator builtins.property")
+    )
+    assert "which is not callable" not in swapped
     # Control: a signature refusal keeps its own text.
     bare = _OUTER_HEAD + plain
     (renamed,) = _screen("def f(b):\n    return 1\n", bare, tmp_path)
     assert "where a value was expected" in renamed
     assert "code that inspects the name can see it" in renamed
+
+
+def test_prove_absences_screen_outer_refusal_on_new_claims_no_binding(tmp_path: Path) -> None:
+    """Python's ``type()`` makes an undecorated ``__new__`` a staticmethod, so a mutation dropping
+    the decorator binds what the live one does. The screen still refuses it (it reads the
+    undecorated side as none), but the refusal must not say the two bind different things."""
+    live = (
+        "class C:\n    @staticmethod\n    def __new__(cls):\n        return object.__new__(cls)\n"
+    )
+    mutation = "class C:\n    def __new__(cls):\n        return object.__new__(cls)\n"
+    # The premise: both bind a staticmethod.
+
+    class Decorated:
+        @staticmethod
+        def __new__(cls: type[Decorated]) -> Decorated:
+            return object.__new__(cls)
+
+    class Plain:
+        def __new__(cls) -> Plain:
+            return object.__new__(cls)
+
+    assert isinstance(Decorated.__dict__["__new__"], staticmethod)
+    assert isinstance(Plain.__dict__["__new__"], staticmethod)
+    (problem,) = _screen(mutation, live, tmp_path)
+    assert "has shape decorator builtins.staticmethod" in problem
+    assert "the function the def itself makes" not in problem
+    assert "bind the name to different shapes" not in problem
+    assert "may bind the same thing" in problem
 
 
 def test_signature_fields_name_every_signature_value() -> None:
