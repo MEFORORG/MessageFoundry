@@ -34,6 +34,8 @@ nobody can see fail is not a guard.
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import re
 import subprocess
 import sys
@@ -1443,3 +1445,108 @@ def test_json_output_carries_the_floor_flag(mod: ModuleType, tmp_path: Path) -> 
     fuzzy = mod.to_json(mod.price_script(script), script, "<t>")
     assert fuzzy["exact"] is False
     assert [u["kind"] for u in fuzzy["unpriced"]] == ["dynamic-width"]
+
+
+# BACKLOG #7600: `_loop_head` read every `while` as a loop (a `do`'s tail included), missed the
+# head of `for await (...)`, and ended a brace-less body at the first `;` anywhere. Each shape
+# below priced EXACT and wrong before the fix.
+@pytest.mark.parametrize(
+    "source",
+    [
+        # the first `;` sat inside the `if` block: the agent priced once, outside the loop
+        "for (const x of rows) if (x) { y(); await agent('a') }\n",
+        # `for await` had no head, so its body ended at the block's inner `;`
+        "for await (const x of rows) { const r = 1; await agent('a') }\n",
+        # the `else` branch after the `;` was priced once, outside the loop
+        "for (const x of rows) if (x) y(); else await agent('a');\n",
+    ],
+)
+def test_a_loop_body_is_not_cut_short_into_an_exact_count(mod: ModuleType, source: str) -> None:
+    cost = mod.price_script(source)
+    assert not cost.exact, f"priced {cost.agents} EXACT for a loop of unknown length"
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+    assert cost.unknowns[0].per_unit == 1
+
+
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # `for await` over a literal is a fan of known width like `for`
+        ("for await (const x of [1, 2, 3]) { const r = 1; await agent('a') }\n", 3),
+        # ASI ends the brace-less body at the line break: was 4 EXACT, the next line in the loop
+        ("for (const x of [1, 2])\n  await agent('a')\nawait agent('b')\n", 3),
+        ("for (const x of [1, 2]) for (const y of [1, 2, 3]) await agent('a');\n", 6),
+        # a `do`'s `while (...)` is its tail, not a loop swallowing the next statement
+        ("let i = 0\ndo { i++ } while (i < 3)\nawait agent('b')\n", 1),
+        ("do { i++ } while (i < 3)\nfor (const x of [1, 2]) await agent('b')\n", 2),
+        ("do i++; while (i < 3)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_loop_shape_prices_exactly(mod: ModuleType, source: str, agents: int) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
+
+
+def test_a_do_while_tail_is_not_a_second_loop(mod: ModuleType) -> None:
+    cost = mod.price_script("do {\n  await agent('a')\n} while (more())\nawait agent('b')\n")
+    assert [(u.kind, u.form) for u in cost.unknowns] == [("loop", "do loop, repetitions unknown")]
+    assert cost.agents == 1, "the agent after the loop runs once and belongs in the floor"
+
+
+def test_a_compound_brace_less_body_is_never_a_known_width(mod: ModuleType) -> None:
+    """Where ASI cannot place the end, the widest reading is taken and the width is not trusted."""
+    cost = mod.price_script(
+        "for (const x of [1, 2])\n  if (c)\n    await agent('a')\nawait agent('b')\n"
+    )
+    assert not cost.exact
+    assert [u.kind for u in cost.unknowns] == ["loop"]
+
+
+# BACKLOG #7601: `--stdin` decoded in the locale encoding while a path decoded UTF-8, and an
+# undecodable file escaped as a UnicodeDecodeError traceback.
+_UTF8_SCRIPT = "const q = rows.map(agent) // Á\n".encode()
+
+
+def _stdin(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
+    # The Windows default: a cp1252 text layer over the bytes, as a stock console gives.
+    wrapper = io.TextIOWrapper(io.BytesIO(data), encoding="cp1252", errors="surrogateescape")
+    monkeypatch.setattr(sys, "stdin", wrapper)
+
+
+def test_stdin_and_a_path_read_the_same_text(
+    mod: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "u8.js"
+    path.write_bytes(_UTF8_SCRIPT)
+    assert mod.main([str(path), "--json"]) == 0
+    from_path = json.loads(capsys.readouterr().out)
+    _stdin(monkeypatch, _UTF8_SCRIPT)
+    assert mod.main(["--stdin", "--json"]) == 0
+    from_stdin = json.loads(capsys.readouterr().out)
+    assert from_stdin["unpriced"] == from_path["unpriced"]
+    assert "Á" in from_stdin["unpriced"][0]["form"]
+
+
+@pytest.mark.parametrize("route", ["path", "stdin"])
+def test_undecodable_input_is_reported_not_raised(
+    mod: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    route: str,
+) -> None:
+    bad = b"\xff\xfeawait agent('a')\n"
+    if route == "path":
+        path = tmp_path / "bad.js"
+        path.write_bytes(bad)
+        argv = [str(path)]
+    else:
+        _stdin(monkeypatch, bad)
+        argv = ["--stdin"]
+    assert mod.main(argv) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "cannot read" in captured.err and "utf-8" in captured.err
