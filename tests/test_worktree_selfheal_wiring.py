@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -454,6 +455,71 @@ def test_a_failed_read_back_restores_the_backup(home: Path, cfg: Path) -> None:
     assert r.returncode != 0, "a failed read-back was reported as success"
     assert "injected read-back failure" in (r.stderr + r.stdout), "the shim never fired"
     assert settings.read_bytes() == original, "the backup was not restored"
+
+
+# Writes a truncated settings.json, then throws: an interrupted Set-Content. Other paths pass through.
+_FAILING_SET_CONTENT = (
+    "function Set-Content { param($LiteralPath, $Value, $Encoding) "
+    "if ($LiteralPath -like '*settings.json') { "
+    "Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value '{\"trunc' "
+    "-Encoding utf8; throw 'injected write failure' } "
+    "Microsoft.PowerShell.Management\\Set-Content -LiteralPath $LiteralPath -Value $Value "
+    "-Encoding $Encoding }"
+)
+
+
+def run_installer_with_prelude(
+    home: Path, cfg: Path, prelude: str
+) -> subprocess.CompletedProcess[str]:
+    hp = home / ".claude-hooks" / "worktree-selfheal.ps1"
+    env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+    env.pop("CLAUDECODE", None)
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f"{prelude}; & '{INSTALLER}' -ConfigDir '{cfg}' -HookPath '{hp}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env=env,
+    )
+
+
+def _fired(r: subprocess.CompletedProcess[str]) -> bool:
+    """pwsh wraps a long error across lines behind a ``|`` gutter and colours it, so compare with
+    ANSI escapes, gutters and all whitespace removed."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", r.stderr + r.stdout).replace("|", "")
+    return "injectedwritefailure" in "".join(text.split())
+
+
+def test_a_failed_write_restores_this_runs_backup(home: Path, cfg: Path) -> None:
+    """A throw from Set-Content itself, after it truncated the file, restores the backup this run
+    made."""
+    settings = cfg / "settings.json"
+    original = b'{\r\n  "model": "keep-me",\r\n  "hooks": {}\r\n}\r\n'
+    settings.write_bytes(original)
+    r = run_installer_with_prelude(home, cfg, _FAILING_SET_CONTENT)
+    assert r.returncode != 0, "a failed write was reported as success"
+    assert _fired(r), "the shim never fired"
+    assert settings.read_bytes() == original, "this run's backup was not restored"
+
+
+def test_a_failed_write_never_restores_a_stale_backup(home: Path, cfg: Path) -> None:
+    """No settings.json at the start, and a .bak-selfheal from an earlier run. A failed write must
+    not bring that stale content back as settings.json, must not leave the truncated file, and must
+    leave the stale backup as it was."""
+    stale = b'{"model": "stale-from-an-earlier-run"}\n'
+    backup = cfg / "settings.json.bak-selfheal"
+    backup.write_bytes(stale)
+    r = run_installer_with_prelude(home, cfg, _FAILING_SET_CONTENT)
+    assert r.returncode != 0, "a failed write was reported as success"
+    assert _fired(r), "the shim never fired"
+    assert not (cfg / "settings.json").exists(), "a stale backup or a truncated write was left"
+    assert backup.read_bytes() == stale, "the stale backup was changed"
 
 
 @pytest.mark.parametrize("bad", ["a$b", "a`b", 'a"b'])

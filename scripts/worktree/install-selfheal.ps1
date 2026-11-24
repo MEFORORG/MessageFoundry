@@ -121,8 +121,8 @@ $entry = [pscustomobject]@{
 $groups = @($groups) + $entry
 $cfg.hooks | Add-Member -NotePropertyName 'SessionStart' -NotePropertyValue $groups -Force
 
-# Validate -> backup -> write -> read back, rolling back from the backup on failure. The text is parsed BEFORE settings.json is touched, so a failed parse
-# leaves the live file byte-identical and exits non-zero. What the parse catches: text ConvertTo-Json
+# Validate -> backup -> write -> read back, rolling back on failure. The text is parsed BEFORE
+# settings.json is touched, so a failed parse leaves the live file byte-identical and exits non-zero. What the parse catches: text ConvertTo-Json
 # emitted that ConvertFrom-Json cannot read back. What it does not: anything ConvertTo-Json emits as
 # valid JSON, including objects nested past -Depth 40, which it turns into strings with only a warning.
 # The write is in place, as before, so it goes through a symlinked or hard-linked settings.json and
@@ -133,16 +133,31 @@ try {
 } catch {
     throw "[$ConfigDir] produced invalid JSON; settings.json left untouched. $_"
 }
+# Roll back only to a backup THIS run made. A .bak-selfheal left by an earlier run is never restored:
+# with no settings.json at the start there is nothing to go back to, so the failed write is removed and
+# the stale backup is left as it is.
+$backupPath = "$settingsPath.bak-selfheal"
+$madeBackup = $false
 if (Test-Path -LiteralPath $settingsPath) {
-    Copy-Item -LiteralPath $settingsPath -Destination "$settingsPath.bak-selfheal" -Force
+    Copy-Item -LiteralPath $settingsPath -Destination $backupPath -Force
+    $madeBackup = $true
 }
 try {
     Set-Content -LiteralPath $settingsPath -Value $json -Encoding utf8
     $null = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json
     Write-Host "[$ConfigDir] wired + valid JSON."
 } catch {
-    if (Test-Path -LiteralPath "$settingsPath.bak-selfheal") {
-        Copy-Item -LiteralPath "$settingsPath.bak-selfheal" -Destination $settingsPath -Force
+    $writeError = $_
+    try {
+        if ($madeBackup) {
+            Copy-Item -LiteralPath $backupPath -Destination $settingsPath -Force
+            $outcome = "restored from $backupPath"
+        } else {
+            if (Test-Path -LiteralPath $settingsPath) { Remove-Item -LiteralPath $settingsPath -Force }
+            $outcome = 'there was no settings.json before this run, so the written file was removed'
+        }
+    } catch {
+        throw "[$ConfigDir] the write or its read-back failed ($writeError), and the rollback failed too ($_). settings.json may be damaged; this run's backup, if any, is $backupPath."
     }
-    throw "[$ConfigDir] the write or its read-back failed; restored from $settingsPath.bak-selfheal where one existed. $_"
+    throw "[$ConfigDir] the write or its read-back failed; $outcome. $writeError"
 }
