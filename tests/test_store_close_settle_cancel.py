@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5720: a cancel landing in a store close's AES-GCM settle skipped every close step after
-it, so the PostgreSQL pool was left open. SQL Server and SQLite are unchanged here: a forced
-release there leaves things open or can hang a later close.
+"""BACKLOG #5720: a cancel landing in a store close's AES-GCM settle skipped the pool's close, so
+the PostgreSQL pool was left open. SQL Server and SQLite are unchanged here: on SQL Server a forced
+executor shutdown could break a borrower's release and a sync pool close would block the loop, and
+on SQLite a forced stop() can hang a later close().
 
 The settle is a database write on a keyed store, so a cancel can land there; each test stands a
 settle that blocks in for it. No real PostgreSQL or SQL Server is involved. Synthetic data only.

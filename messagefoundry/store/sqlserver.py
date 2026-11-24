@@ -4449,7 +4449,7 @@ class SqlServerStore:
             # Don't leak the pool if first-open initialization fails (M-6), a cancel included
             # (BACKLOG #5720). The reserved block is forfeited, not settled: see the same except in
             # PostgresStore.open (postgres.py), which states what a forfeit costs. The executor is
-            # released in a finally, same as close() above: wait_closed() cannot complete while the
+            # released in a finally, same as close() below: wait_closed() cannot complete while the
             # pool is wedged, so releasing the executor only on the success path would leak its
             # threads in exactly the case this except exists for.
             async def _release() -> None:
