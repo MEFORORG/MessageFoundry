@@ -1356,7 +1356,12 @@ class _FakeSqlLeaseStore:
         return self._db.release(owner)  # the store's _execute returns the driver's row count
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         return await self._execute(sql, params)  # the release; the clamp is not modelled here
 

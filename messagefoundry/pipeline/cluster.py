@@ -660,11 +660,12 @@ class StepdownOutcome(NamedTuple):
 
 def rows_affected(status: object) -> int:
     """The row count a release write reported, for BOTH coordinators: an ``int`` from
-    ``SqlServerStore._execute``, or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when there is none
-    to read, the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown count reads as
-    RELEASED: that keeps the stepdown's claim pause armed, which is the safe direction, at the cost of
-    a ``200`` that could over-report a drain. Both drivers report a count for a direct ``UPDATE``, so
-    this is a guard, not a path. Only a node that may own the row sends the write at all."""
+    ``SqlServerStore._execute_clamped``, which counts the release's ``OUTPUT`` rows rather than
+    ``cursor.rowcount`` (BACKLOG #6795), or asyncpg's command tag (``"UPDATE 1"``). ``-1`` when
+    there is none to read, the DB-API spelling of "unknown". Callers test ``!= 0``, so an unknown
+    count reads as RELEASED: that keeps the stepdown's claim pause armed, which is the safe
+    direction, at the cost of a ``200`` that could over-report a drain. Only a node that may own
+    the row sends the write at all."""
     if isinstance(status, int):
         return status
     if isinstance(status, str):

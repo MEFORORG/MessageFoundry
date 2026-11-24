@@ -6707,7 +6707,12 @@ class SqlServerStore:
         return await self._write_rows(sql, params)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         """:meth:`_execute` bounded by ``timeout_clamp`` exactly as :meth:`_fetchone_clamped` bounds
         a read, whose docstring says what that leaves unbounded, the COMMIT included, and what a
@@ -6716,14 +6721,24 @@ class SqlServerStore:
         heartbeat runs in the maintenance loop's side pass, which a statement at
         ``[store].command_timeout`` would hold that long (BACKLOG #6472, #5710), and a stepdown's
         release under ``_leadership_lock``, where it would delay the renew; ``stop()`` passes its
-        own bound instead of the renew clamp."""
-        return await self._write_rows(sql, params, timeout_clamp)
+        own bound instead of the renew clamp.
+
+        ``count_output`` returns the number of rows the statement's ``OUTPUT`` clause returned
+        instead of ``cursor.rowcount``, which a session-wide ``SET NOCOUNT ON`` turns into ``-1``
+        even for a zero-match UPDATE (BACKLOG #6795, as #2283 does for :meth:`_execute_output`).
+        The lease release passes it, because it reads whether its owner-scoped UPDATE matched."""
+        return await self._write_rows(sql, params, timeout_clamp, count_output=count_output)
 
     async def _write_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        count_output: bool = False,
     ) -> int:
         """The body of :meth:`_execute` and :meth:`_execute_clamped`; :meth:`_clamp_bounds` says
-        what ``timeout_clamp`` sets.
+        what ``timeout_clamp`` sets, and :meth:`_execute_clamped` what ``count_output`` does.
 
         A failure of the pool release alone, after the write committed, is logged and the row count
         returned, as ``cluster._call_within`` does on Postgres: reporting that write as failed would
@@ -6739,10 +6754,14 @@ class SqlServerStore:
                         self._cursor(conn) as cur,
                     ):
                         await cur.execute(sql, params)
-                        # getattr: some test cursors model no row count, and -1 is the DB-API
-                        # 'unknown'.
-                        count = getattr(cur, "rowcount", -1)
-                        rows = count if isinstance(count, int) else -1
+                        if count_output:
+                            # Drained before the commit; _cursor frees the handle OUTPUT leaves.
+                            rows = len(await cur.fetchall())
+                        else:
+                            # getattr: some test cursors model no row count, and -1 is the DB-API
+                            # 'unknown'.
+                            count = getattr(cur, "rowcount", -1)
+                            rows = count if isinstance(count, int) else -1
                         await self._commit(conn)
                 except Exception:
                     # A rollback that fails would otherwise recycle a connection still holding the

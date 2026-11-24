@@ -176,7 +176,12 @@ class _SqlStore:
         return await self.writes.run(sql, owner)
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         return await self._execute(sql, params)  # the release; the clamp is not modelled here
 

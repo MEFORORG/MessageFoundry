@@ -1324,3 +1324,51 @@ async def test_the_driver_ends_a_slow_claim_at_the_clamp() -> None:
         assert await store._fetchone("SELECT 1 AS x") == {"x": 1}
     finally:
         await store.close()
+
+
+# --- BACKLOG #6795: the release reads its match from OUTPUT, not the row count ----------------
+
+
+class _NoCountCursor(_Cursor):
+    """A cursor on a connection where ``SET NOCOUNT ON`` outlived the batch that set it: the driver
+    reports ``-1`` for every statement, a zero-match UPDATE included, and only the OUTPUT rowset
+    says what changed."""
+
+    rowcount = -1
+
+    async def fetchall(self) -> list[tuple[object, ...]]:
+        return list(self._conn.output)  # type: ignore[attr-defined]
+
+
+class _NoCountConn(_Conn):
+    def __init__(self, output: list[tuple[object, ...]]) -> None:
+        super().__init__()
+        self.output = output
+        self.columns = ("owner",)
+
+    async def cursor(self) -> _Cursor:
+        return _NoCountCursor(self)
+
+
+@pytest.mark.parametrize(("output", "released"), [([], False), ([("A",)], True)])
+async def test_the_release_reads_its_match_from_output_not_the_row_count(
+    output: list[tuple[object, ...]], released: bool
+) -> None:
+    """Red before #6795: the release read ``cursor.rowcount``, and ``rows_affected`` reads ``-1``
+    as released, so a release whose row named another node reported a drain."""
+    conn = _NoCountConn(output)
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    coord._is_leader = True
+    result = await coord._release_leadership(force_write=True)
+    assert (result[0], result[2], result[3]) == (True, True, released)
+
+
+async def test_a_stepdown_whose_row_names_another_node_reports_no_drain() -> None:
+    """The stepdown outcome the API returns: with nothing released it is not a drain, and the pause
+    this call armed is undone, as it is on Postgres, whose count is never ``-1`` (BACKLOG #1508)."""
+    conn = _NoCountConn([])
+    coord = SqlServerCoordinator(_store(conn), "A", lease_renew_timeout_seconds=3.25)
+    coord._last_renew_ok = 0.0  # may own the row, so the release is sent
+    outcome = await coord.step_down_leadership(sibling_acquire_delay_seconds=0.0)
+    assert outcome.lease_released is False and not outcome.drained
+    assert coord._no_claim_until == 0.0
