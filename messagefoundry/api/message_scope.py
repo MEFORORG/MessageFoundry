@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 from fastapi import HTTPException, Request
 
@@ -45,6 +45,13 @@ _log = logging.getLogger(__name__)
 #: console's flag route answer with one text (BACKLOG #3378).
 CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
+#: What a refusal that names no channel by design was refusing (vault BACKLOG #3748 item 7). Each
+#: value is the audit action the operation writes when it runs, so a denial row and the row the
+#: operation would have written read alike: a config reload, a reset of every statistic, a purge,
+#: and a start, stop or restart.
+DeniedOperation = Literal["config_reload", "stats_reset", "connection_purge", "connection_control"]
+_DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
+
 
 async def audit_channel_denied(
     engine: Engine,
@@ -53,6 +60,7 @@ async def audit_channel_denied(
     client: str | None = None,
     *,
     flag_direction_not_inbound: bool = False,
+    operation: DeniedOperation | None = None,
 ) -> None:
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
 
@@ -73,13 +81,26 @@ async def audit_channel_denied(
     ``inbound``, which a scoped caller may flag only (BACKLOG #3378). The detail then carries
     ``"flag_direction_not_inbound": true``. Such a row can name an inbound inside the actor's own
     scope, and without the marker it would read like a request asked of the wrong engine shard. The
-    direction itself is not recorded, since the console's form carries it as caller text."""
+    direction itself is not recorded, since the console's form carries it as caller text.
+
+    ``operation`` names what a refusal that names no channel was refusing (vault BACKLOG #3748 item
+    7). The detail then carries ``"operation"`` with one of the :data:`DeniedOperation` values, so
+    two such rows from one actor are told apart. A value outside them is left out of the row and
+    logged, rather than refusing the audit: the console hands this helper its keyword through an
+    untyped seam callback. At least these rows carry none: a refusal that names a channel; a name
+    that fails the connection-name rule from a caller that passes no operation, such as the
+    per-name connection routes; and an out-of-scope message whose integrity tag names no channel."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
         detail = {"channel": None, "malformed_name": True}
     if flag_direction_not_inbound:
         detail["flag_direction_not_inbound"] = True
+    if operation is not None:
+        if operation in _DENIED_OPERATIONS:
+            detail["operation"] = operation
+        else:
+            _log.warning("a channel denial named an unknown operation; the row omits it")
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,

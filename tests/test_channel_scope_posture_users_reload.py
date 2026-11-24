@@ -20,6 +20,7 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -643,3 +644,63 @@ async def test_the_engine_refusal_audits_no_malformed_name(
     assert all("A" * 64 not in str(r["detail"]) for r in rows)
     marked = [json.loads(str(r["detail"])).get("malformed_name", False) for r in rows]
     assert sorted(marked) == [False, True, True]
+
+
+# --- vault BACKLOG #3748 item 7: a denial that names no channel names its operation ---------------
+
+
+async def _denial_details(engine: Engine, actor: str) -> list[dict[str, object]]:
+    rows = await engine.store.list_audit(limit=200, actor=actor, action="auth.channel_denied")
+    return [json.loads(str(r["detail"])) for r in rows]
+
+
+async def test_a_refused_reload_and_reset_all_name_their_operation(engine: Engine) -> None:
+    """A channel-scoped caller's refused reload and refused reset of every statistic each write a
+    denial row naming no channel. Each now names the operation, so the two are told apart. The
+    control: a reset refused for one named target names its channel and carries no operation."""
+    service = await _service(engine)
+    await _user(service, "scoped-dep", [Role.DEPLOYMENT.value], ["IB_T_ADT"])
+    await _user(service, "scoped-op", [Role.OPERATOR.value], ["IB_T_ADT"])
+    async with _client(engine, service) as c:
+        r = await c.post(
+            "/config/reload", json={"dry_run": True}, headers=await _login(c, "scoped-dep")
+        )
+        assert r.status_code == 403, r.text
+        op = await _login(c, "scoped-op")
+        r = await c.post("/statistics/reset", json={"all": True}, headers=op)
+        assert r.status_code == 403, r.text
+        r = await c.post(
+            "/statistics/reset",
+            json={"targets": [{"role": "source", "channel_id": "IB_OTHER"}]},
+            headers=op,
+        )
+        assert r.status_code == 403, r.text
+    assert await _denial_details(engine, "scoped-dep") == [
+        {"channel": None, "operation": "config_reload"}
+    ]
+    assert sorted(await _denial_details(engine, "scoped-op"), key=str) == sorted(
+        [{"channel": None, "operation": "stats_reset"}, {"channel": "IB_OTHER"}], key=str
+    )
+
+
+async def test_an_unknown_denied_operation_is_left_out_and_the_row_is_still_written(
+    engine: Engine,
+) -> None:
+    """The console hands ``operation`` through an untyped seam callback, so a value outside
+    ``DeniedOperation`` is left out of the row rather than refusing the audit."""
+    from messagefoundry.api.message_scope import audit_channel_denied
+
+    actor = "unknown-op-caller"
+    scoped = Identity.build(
+        user_id="unknown-op-caller-id",
+        username=actor,
+        auth_provider=AuthProvider.LOCAL,
+        roles=[Role.OPERATOR],
+        allowed_channels=frozenset({MINE}),
+    )
+    bogus: Any = "drop_table"
+    await audit_channel_denied(engine, scoped, None, None, operation=bogus)
+    await audit_channel_denied(engine, scoped, None, None, operation="connection_purge")
+    assert sorted(await _denial_details(engine, actor), key=str) == sorted(
+        [{"channel": None}, {"channel": None, "operation": "connection_purge"}], key=str
+    )

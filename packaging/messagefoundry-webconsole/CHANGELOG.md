@@ -144,6 +144,13 @@ this line.**
   the page, and the one re-auth then mints its grant. The bulk purge confirm page also keeps its
   destination and scope selection across the re-auth, up to the 512-character cap on `next`.
   (vault BACKLOG #3241, added item 2 and step 1)
+- **A console channel denial that names no channel says which operation it refused.** The bulk
+  start, stop and restart, the bulk purge and its confirm page write their `auth.channel_denied`
+  row with `"operation"` in its detail (`connection_control` or `connection_purge`), so two such
+  rows from one actor are told apart. Needs an engine whose `audit_channel_denied` takes
+  `operation`, which no published engine does yet. As for BACKLOG #3378 below, the release that
+  carries this raises the `messagefoundry` floor to the engine release that adds it: the seam
+  digest does not cover that callback's signature. (vault BACKLOG #3748 item 7)
 - **A channel-scoped caller's bad flag direction gets the audited 403.** `POST
   /ui/connections/{name}/flag` answered 404 for a direction other than `inbound` or `outbound`
   before the engine handler's scope check, so on a first deployment such a caller's probe there

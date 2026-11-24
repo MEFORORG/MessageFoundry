@@ -967,6 +967,13 @@ from typing import Any
 #: ``0cb66e183386b7c8`` to ``10cd6745cb708c1a``, and over the merge with BACKLOG #5646 above, from
 #: ``7c3240bbbaf0605a`` to ``a888b8fed812bbe6``.
 #:
+#: Vault BACKLOG #3748 item 7: the console passes the keyword ``operation`` to the
+#: ``audit_channel_denied`` callback on its refusals that name no channel. As for BACKLOG #3378
+#: above, the digest does not cover that callback's signature, so it did not move and the handshake
+#: does not catch the skew. A newer console on an older engine raises TypeError on such a refusal;
+#: the console release that carries this raises its ``messagefoundry`` floor instead. ADR 0215's
+#: slice 5 drops the callback from the bundle, and each JSON route then writes its own row.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

@@ -7,6 +7,7 @@ bulk connection controls (bulk-control, reset-many and bulk purge)."""
 from __future__ import annotations
 
 import base64
+import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -804,6 +805,38 @@ async def test_bulk_routes_audit_a_scoped_malformed_name_without_writing_it(
     rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
     assert [(row["actor"], row["channel_id"]) for row in rows] == [("op", None)]
     assert all("xxxxx" not in str(dict(row)) for row in rows)
+
+
+async def test_console_denials_naming_no_channel_name_their_operation(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Vault BACKLOG #3748 item 7: a scoped actor's console refusals that name no channel each
+    carry the operation refused, so the bulk control, the bulk purge and the purge confirm page's
+    rows are told apart."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(await _uid(service, "op"), ["in1"], actor="admin")
+    await _start_two_out(engine, tmp_path)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await _post_pairs(
+            c,
+            "/ui/connections/bulk-control",
+            [("action", "stop"), ("sel", _rowkey("source", "bad name"))],
+        )
+        assert r.status_code == 200, r.text
+        await _mint_action(c, "/ui/connections/purge-confirm")
+        r = await c.get("/ui/connections/purge-confirm", params={"scope": "all", "dest": "out1"})
+        assert r.status_code == 403, r.text
+        r = await _post_pairs(
+            c, "/ui/connections/purge-bulk", [("scope", "all"), ("dest", "bad name")]
+        )
+        assert r.status_code == 200, r.text
+        assert "not applied: not a valid connection name" in r.text
+    rows = await engine.store.list_audit(limit=100, action="auth.channel_denied")
+    assert [row["channel_id"] for row in rows] == [None, None, None]
+    ops = sorted(str(json.loads(str(row["detail"])).get("operation")) for row in rows)
+    assert ops == ["connection_control", "connection_purge", "connection_purge"]
 
 
 async def test_a_failed_malformed_name_audit_does_not_abort_the_batch(
