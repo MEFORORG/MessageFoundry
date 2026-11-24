@@ -74,7 +74,8 @@ def _assert_sealed(
 
 
 #: (page size, row-built AAD, Transit requests). One request per cell before the batch path: 200.
-#: A page of 200 is two batches of 128; four pages of 50 are one batch each.
+#: One page of 500 holds all 200 rows, cut 128 + 72 into two batches; four pages of 50 are one
+#: batch each.
 _CASES = [(500, None, 2), (50, _tag, 4)]
 
 
@@ -268,8 +269,8 @@ async def _chunks(
 
 
 async def test_a_page_is_one_cipher_call_per_batch_bound() -> None:
-    """One call carries at most ``BATCH_MAX_ITEMS`` values, so while the cipher batches a cancelled
-    seal leaves at most one request's values running on in the Transit pool."""
+    """One cipher call carries at most ``BATCH_MAX_ITEMS`` values: a page of 200 is two calls, 128
+    then 72. This checks call sizes only; it neither reaches the Transit pool nor cancels a seal."""
     cipher = _CountingBatchCipher()
     rows = _pending(_legacy_rows(), _ROWS)
     chunks = await _chunks(cipher, rows)
@@ -350,8 +351,8 @@ async def test_a_single_value_cipher_writes_each_value_before_the_next_call(back
 
 
 async def test_an_aes_gcm_page_makes_no_sizing_copy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only a batch cipher is cut by size, so no unwiped UTF-8 copy of an AES-GCM plaintext is
-    made to measure it."""
+    """Under AES-GCM the page is cut whole and none of the three ``row_seal`` sizing helpers is
+    called. This watches those three names only, not an encode added anywhere else."""
     sized: list[object] = []
 
     def counted(*args: Any) -> int:
