@@ -176,8 +176,11 @@ async def test_concurrent_merges_on_every_cluster_table_do_not_deadlock(store) -
     run MERGE ... WITH (HOLDLOCK) at once on ``cluster_config``, ``nodes`` or ``leader_lease``.
     Each MERGE seeks its primary key and, by SQL Server's documented locking, reads the target
     under update range locks, which conflict with each other, so racers should queue rather than
-    convert. This races each table's insert case and its matched case on ONE key, five rounds, and
-    any 1205 escapes from gather. It is evidence, not proof: nothing here shows two statements
+    convert. Any 1205 escapes from gather. It races, with eight racers each: the empty-table seed
+    of the one ``cluster_config`` row once, then five rounds of bumps of that row; one insert each
+    of eight DISTINCT ``node_id`` keys once, then five rounds of one shared ``node_id`` registered
+    by every racer; and five rounds of take-over of one existing expired ``leader_lease`` row,
+    whose first insert is not raced. It is evidence, not proof: nothing here shows two statements
     overlapped, and no arm makes a deadlock happen on purpose. The store itself treats a 1205 on a
     one-key HOLDLOCK burst as possible and retries it (``_retry_idempotent_merge``), so a 1205 here
     is a measurement for #6793, not a flake to re-run."""
@@ -218,6 +221,14 @@ async def test_the_release_reports_its_match_under_nocount_on(
     await a._register()
     await b._register()
     assert await a._claim_or_renew_lease() is True
+    # Positive control: NOCOUNT reached the statement, so the driver's own count of this
+    # zero-match UPDATE is -1, the value the release no longer reads.
+    zero_match = await store._execute_clamped(
+        "UPDATE leader_lease SET owner = owner WHERE lease_key = ? AND owner = ?",
+        (b._lease_key, b.node_id),
+        timeout_clamp=5.0,
+    )
+    assert zero_match == -1, "NOCOUNT did not reach the statement; this test proves nothing"
     _, _, wrote, released = await b._release_leadership(force_write=True)
     assert (wrote, released) == (True, False), "the row names A, so B's release matched nothing"
     a._is_leader = True
