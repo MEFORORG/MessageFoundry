@@ -396,8 +396,8 @@ roster alias of the Lander.
 > and throws, so the gate fails closed to REVIEW. The later rungs stay 10 and 5 minutes, so the
 > Steward's minutes default is (60, 10, 5), though the gate reads only HOLD: the lowest weekly level
 > and the longest lead time in the triple, so an out-of-order hand edit cannot lift the rung, and the
-> rung's source says so. A NaN slot reads as the default before that choice, so a NaN cannot lift it
-> either (BACKLOG #5178).
+> rung's source says so. A NaN slot reads as watch.py's default for that slot before that choice, so a
+> NaN cannot lift it either (BACKLOG #5178).
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
 > `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its
@@ -547,7 +547,8 @@ roster alias of the Lander.
 >   earlier reset. The same-reset case is what this amendment closes.
 >   **Narrowed 2026-11-24 (BACKLOG #5178):** a reading at or below the published one, on another reset,
 >   now counts as a new window only from a session of this root that has just called the API, whether or
->   not the published reset has passed. An unpinned session counts as this root's, so an unpinned session
+>   not the published reset has passed, where both windows carry a readable reset; against a published
+>   window with no readable reset, an idle lower reading is still taken, as before. An unpinned session counts as this root's, so an unpinned session
 >   of another root that publishes here still passes. From a published 80, two idle sessions' 80, 5, 80, 5
 >   now leaves one history row, and
 >   an idle session's frozen 5 no longer replaces a published 100. A higher reading on a later reset, or

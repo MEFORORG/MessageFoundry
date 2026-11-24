@@ -513,28 +513,31 @@ def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
 
 
 @pytest.mark.parametrize(
-    "weekly",
+    ("weekly", "pct", "expected"),
     [
-        [float("nan"), 94, 97],
-        [93, float("nan"), 97],
-        [93, 96, float("nan")],
-        [97, float("nan"), 94],
+        pytest.param([float("nan"), 94, 97], 92.0, HALT, id="nan-hold-reads-as-90"),
+        pytest.param([93, float("nan"), 97], 95.0, HALT, id="nan-middle"),
+        pytest.param([93, 96, float("nan")], 95.0, HALT, id="nan-last"),
+        pytest.param([93, 96, float("nan")], 92.0, NO_REVIEW, id="nan-last-leaves-hold-at-93"),
+        pytest.param([97, float("nan"), 91], 92.0, HALT, id="nan-and-out-of-order"),
     ],
-    ids=["nan-first", "nan-middle", "nan-last", "nan-and-out-of-order"],
 )
-def test_a_nan_weekly_level_never_lifts_the_rung(sb: Sandbox, weekly: list[float]) -> None:
+def test_a_nan_weekly_level_never_lifts_the_rung(
+    sb: Sandbox, weekly: list[float], pct: float, expected: int
+) -> None:
     """BACKLOG #5178. ConvertFrom-Json reads a bare NaN as a number, and the lowest-number rule made a
-    NaN in any slot the rung, which no level reaches. A NaN slot now reads as the default 90."""
+    NaN in any slot the rung, which no level reaches. A NaN slot now reads as watch.py's default for
+    that slot, (90, 94, 97), so a NaN HOLD is 90 and a NaN in a later slot leaves HOLD as written."""
     seed_vault(sb, calibrated("manager"))
-    write_fake_usage(_usage_path(sb), usage(92.0))
-    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [93, 96, 98]}}), encoding="utf-8")
-    assert gate(sb)[0] == NO_REVIEW, "control: 92 is below an in-order rung of 93"
+    write_fake_usage(_usage_path(sb), usage(pct))
     _thresholds(sb).write_text(json.dumps({"levels": {"weekly": weekly}}), encoding="utf-8")
     assert "NaN" in _thresholds(sb).read_text(encoding="utf-8"), "control: the file holds a NaN"
     code, doc = gate(sb)
-    assert code == HALT and "levels.weekly holds NaN" in why(doc), why(doc)
-    if weekly[0] == 97:
-        assert "levels.weekly out of order" in why(doc), "both faults are named: " + why(doc)
+    assert code == expected, why(doc)
+    if expected == HALT:
+        assert "levels.weekly holds NaN" in why(doc), why(doc)
+        disordered = weekly[0] == 97
+        assert ("levels.weekly out of order" in why(doc)) == disordered, why(doc)
 
 
 def test_a_nan_minutes_slot_never_shortens_the_lead_time(sb: Sandbox) -> None:

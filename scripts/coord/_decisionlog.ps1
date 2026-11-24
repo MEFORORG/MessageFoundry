@@ -915,13 +915,14 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       source then says the triple was out of order, and a typo such as 9.5 halts early, not late.
 
       A NaN CANNOT LIFT THE RUNG EITHER. ConvertFrom-Json reads a bare NaN as a number, and no
-      comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes the default instead
-      and the strictest number still holds, so a NaN can only pull the rung toward the default, never
-      past it. Throwing would answer UNKNOWN, which is a REVIEW where the triple's other numbers can
-      halt. Other out-of-range values pass as written, and a slip in any slot can move the rung: a
-      level of 0 or below, or an infinite lead time, halts early. A triple whose every level is above
-      100, or whose every lead time is 0 or below, turns that clause off, as the same value in the
-      first slot did before this rule.
+      comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes watch.py's default for
+      that slot instead, (90, 94, 97) and (60, 10, 5), and the strictest number still holds, so a
+      NaN in a later slot leaves HOLD where the file put it, and a NaN HOLD reads as the default.
+      Throwing would answer UNKNOWN, which is a REVIEW where the triple's other numbers can halt.
+      Other out-of-range values pass as written, and a slip in any slot can move the rung: a level of
+      0 or below, or an infinite lead time, halts early. A triple whose every level is above 100, or
+      whose every lead time is below 0, turns that clause off, as the same value in the first slot
+      did before this rule. A lead time of 0 still hits on a run-out already projected as past.
     #>
     $holdAt = 90.0
     $holdMin = 60.0
@@ -930,19 +931,23 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
     if (-not [System.IO.File]::Exists($ThresholdsFile)) { return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source } }
     $doc = [System.IO.File]::ReadAllText($ThresholdsFile) | ConvertFrom-Json -ErrorAction Stop
     if ($doc -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile is not a JSON object" }
-    # The triple's HOLD: Minimum for levels, Maximum for minutes, a NaN slot read as $Default first.
-    function Get-Hold($Raw, [string]$What, [double]$Default, [string]$Pick) {
+    # The triple's HOLD: Minimum for levels, Maximum for minutes, a NaN slot read as that slot's
+    # entry in $Defaults first. The order note reads only the numbers the file wrote.
+    function Get-Hold($Raw, [string]$What, [double[]]$Defaults, [string]$Pick) {
         $vals = @($Raw)
         if ($Raw -isnot [array] -or $vals.Count -ne 3 -or @($vals | Where-Object { $_ -isnot [int] -and $_ -isnot [long] -and $_ -isnot [double] -and $_ -isnot [decimal] }).Count) {
             throw "$ThresholdsFile $What is not three numbers"
         }
-        $t = @($vals | ForEach-Object { [double]$_ })
-        $nanCount = @($t | Where-Object { [double]::IsNaN($_) }).Count
-        $t = @($t | ForEach-Object { if ([double]::IsNaN($_)) { $Default } else { $_ } })
+        $written = @($vals | ForEach-Object { [double]$_ })
+        $t = @(0..2 | ForEach-Object { if ([double]::IsNaN($written[$_])) { $Defaults[$_] } else { $written[$_] } })
         $hold = ($t | Measure-Object -Minimum:($Pick -eq 'Minimum') -Maximum:($Pick -eq 'Maximum')).$Pick
+        $finite = @($written | Where-Object { -not [double]::IsNaN($_) })
         $notes = @()
-        if ($nanCount) { $notes += "$What holds NaN, read as the default" }
-        if ($hold -ne $t[0]) { $notes += "$What out of order" }
+        if ($finite.Count -lt 3) { $notes += "$What holds NaN, read as the default for that slot" }
+        if ($finite.Count -and -not [double]::IsNaN($written[0]) -and
+            ($finite | Measure-Object -Minimum:($Pick -eq 'Minimum') -Maximum:($Pick -eq 'Maximum')).$Pick -ne $written[0]) {
+            $notes += "$What out of order"
+        }
         return [pscustomobject]@{ Hold = $hold; Notes = $notes }
     }
     $levels = Get-DecisionJsonValue $doc 'levels'
@@ -950,7 +955,7 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
         if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
         foreach ($p in $levels.PSObject.Properties) {
             if ($p.Name -cne 'weekly') { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
-            $h = Get-Hold $p.Value 'levels.weekly' $holdAt 'Minimum'
+            $h = Get-Hold $p.Value 'levels.weekly' @($holdAt, 94.0, 97.0) 'Minimum'
             $holdAt = $h.Hold
             $source = $ThresholdsFile
             $notes += $h.Notes
@@ -958,7 +963,7 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
     if ($null -ne $minutes) {
-        $h = Get-Hold $minutes 'minutes' $holdMin 'Maximum'
+        $h = Get-Hold $minutes 'minutes' @($holdMin, 10.0, 5.0) 'Maximum'
         $holdMin = $h.Hold
         $source = $ThresholdsFile
         $notes += $h.Notes

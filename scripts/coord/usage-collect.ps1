@@ -371,7 +371,10 @@ try {
     # readable reset that is not an earlier, passed one (refused above, higher or not) is taken from
     # anyone, before or after the published reset, because refusing it weakens a stop: while
     # that reset is ahead the lower published number could clear the gate, and past it the gone window
-    # reads UNKNOWN, so the gate would answer REVIEW where the higher number halts it. Past
+    # reads UNKNOWN, so the gate would answer REVIEW where the higher number halts it. That reason
+    # does not hold for a session pinned to another root: its reading is taken too, stamped with its
+    # own root, so the reader refuses the window and the next reading meets no floor. That gap
+    # predates BACKLOG #5178 and is still open. Past
     # the published reset, a lower or equal idle reading is still refused, because its frozen number
     # for the new window could read OK on a pool since spent; keeping the gone window costs a REVIEW.
     # A first fire is never live, so such a reading waits for a live session of this root.
