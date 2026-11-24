@@ -255,6 +255,9 @@ _REPORT_INTERVAL_S = 3600.0
 _REPORTED_MAX = 4096
 #: How much of an upload id a tag-failure alert names, as ``store/cell_tag.py`` names a row.
 _TAG_REF_LEN = 12
+#: How much of a stored value the tag-failure checks read: more than any marker this build writes
+#: (version, algorithm, key id and v4 salt), so a multi-MiB body is not copied to read its key id.
+_TAG_MARKER_HEAD_CHARS = 256
 
 
 class _OncePerInterval:
@@ -2011,9 +2014,8 @@ class UploadStore:
         ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
-        ``cell_tag`` names a row: the id is random and carries no PHI. For a sidecar, the WARNING
-        the scan logs beside it names the whole id; a body's refusal by :meth:`read_bytes` logs no
-        line of its own."""
+        ``cell_tag`` names a row: the id is random and carries no PHI. The WARNING the scan, or
+        :meth:`read_bytes` for a body, logs beside it names the whole id."""
         cipher = self._cipher
         report = getattr(cipher, "report_tag_failure", None)
         # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
@@ -2024,10 +2026,11 @@ class UploadStore:
             return
         if not isinstance(exc, UnauthenticatedCipherError) or gave_no_verdict(exc):
             return
-        if not cipher.is_encrypted(stored):
+        head = stored[:_TAG_MARKER_HEAD_CHARS]
+        if not cipher.is_encrypted(head):
             return
         holds = getattr(cipher, "holds_key_for", None)
-        held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
+        held = holds(head) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
         if not (held and _tag_reported.first(f"{part} {fid}")):
             return
         report(
@@ -3160,11 +3163,17 @@ class UploadStore:
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherUnavailableError as exc:
+                stored = ""
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
-                # A body under a held key whose tag fails is reported as a sidecar is
-                # (BACKLOG #5552 item 6 (a)).
+                # Logged with the whole id, as the scan logs a sidecar's, and a body under a held
+                # key whose tag fails is reported as a sidecar is (BACKLOG #5552 item 6 (a)). The
+                # cipher's message carries no decrypted value.
+                _log.warning("uploaded-file body %s: cipher declined it: %s", file_id, exc)
                 self._report_tag_failure(file_id, stored, exc, part="body")
+                # This frame's copy is let go; _decrypt_blob's frame on the cause's traceback
+                # still holds the stored text, as it did before this report.
+                stored = ""
                 raise UploadUnreadableError(str(exc)) from exc
             except OSError as exc:
                 # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error

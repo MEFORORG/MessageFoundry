@@ -1910,9 +1910,36 @@ async def test_a_body_under_a_key_not_held_is_not_reported(tmp_path: Path) -> No
     )
     foreign = (tmp_path / "other" / "uploads" / f"{elsewhere.file_id}.blob").read_text("utf-8")
     (tmp_path / "uploads" / f"{mine.file_id}.blob").write_text(foreign, encoding="utf-8")
-    with pytest.raises(UploadUnreadableError):
+    with pytest.raises(UploadUnreadableError) as caught:
         await store.read_bytes(mine.file_id)
+    # The cipher arm, not a damaged or access refusal, so the key-not-held branch is what ran.
+    assert type(caught.value) is UploadUnreadableError
+    assert isinstance(caught.value.__cause__, CipherError)
     assert reports == []
+
+
+async def test_a_sidecar_and_a_body_report_of_one_upload_are_reported_apart(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5552 item 6 (a): the memo is keyed per part, so one upload's sidecar report does
+    not mute a tag failure of its body for the interval."""
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    for suffix in (".meta", ".blob"):
+        (root / f"{b.file_id}{suffix}").write_text(
+            (root / f"{a.file_id}{suffix}").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    from messagefoundry.uploads import UploadUnreadableError
+
+    with pytest.raises(UploadUnreadableError):
+        await store.read_bytes(b.file_id)
+    parts = sorted(reason.split()[2] for _, reason in reports)
+    assert parts == ["body", "sidecar"], reports
 
 
 async def test_the_listing_scan_lstats_each_sidecar_once_before_its_open(
