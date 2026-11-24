@@ -100,8 +100,9 @@ def _detach_request_pipe() -> Any:
     request pipe, from which it could read a later request's id and forge that request's answer.
     The pipe moves to a descriptor :func:`os.dup` makes non-inheritable (PEP 446), and fd 0 is
     pointed at the null device, so such a process finds no pipe on fd 0, with its descriptors
-    inherited or not. On Windows ``os.dup2`` on fd 0 also repoints the process's standard input
-    handle, which is what :mod:`subprocess` hands a child there; the old pipe handle is closed.
+    inherited or not. On Windows :mod:`subprocess` hands a child the process's standard input
+    handle rather than fd 0, so that handle is set to the null device too: ``os.dup2`` sets it only
+    in a console-subsystem interpreter. The old pipe handle is closed by the ``dup2``.
 
     This closes inheritance across a new program only. Code running in the worker can still read
     the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps it, and a
@@ -114,6 +115,13 @@ def _detach_request_pipe() -> Any:
         os.dup2(null, 0, inheritable=True)
     finally:
         os.close(null)
+    if sys.platform == "win32":
+        import ctypes
+        import msvcrt
+
+        std_input_handle = -10  # STD_INPUT_HANDLE
+        if not ctypes.windll.kernel32.SetStdHandle(std_input_handle, msvcrt.get_osfhandle(0)):
+            raise OSError("could not point the standard input handle at the null device")
     return os.fdopen(private, "rb")
 
 

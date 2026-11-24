@@ -1206,7 +1206,11 @@ def h_fd0(msg):
     every_fd = subprocess.run(
         [sys.executable, "-c", probe], timeout=30, close_fds=False
     ).returncode
-    return Send("OB_F", f"{inherited},{every_fd}")
+    # The negative control: the probe must see a pipe it is handed.
+    piped = subprocess.run(
+        [sys.executable, "-c", probe], timeout=30, stdin=subprocess.PIPE
+    ).returncode
+    return Send("OB_F", f"{inherited},{every_fd},{piped}")
 """
 
 
@@ -1215,20 +1219,64 @@ def test_a_process_a_handler_spawns_cannot_read_the_request_pipe(tmp_path: Path)
 
     The worker moves the pipe to a private, non-inheritable descriptor before it reads the boot
     frame, and points fd 0 at the null device, so a process a Handler spawns, with its descriptors
-    inherited or not, finds no pipe on fd 0. Exit status 3 means the grandchild's fd 0 was a pipe."""
+    inherited or not, finds no pipe on fd 0. Exit status 3 means the grandchild's fd 0 was a pipe;
+    the third probe is handed one, to show the probe can see it."""
     (tmp_path / "graph.py").write_text(_FD0_GRAPH, encoding="utf-8")
     registry = load_config(tmp_path)
     session = _session(str(tmp_path), inbound="IB_F")
     try:
         assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
-            ("OB_F", "0,0")
+            ("OB_F", "0,0,3")
         ]
         # The worker still reads its requests: a second message is answered by the same worker.
         proc = session._proc
         assert _deliveries(registry, "h_fd0", sandbox=session, run_context=RunContext()) == [
-            ("OB_F", "0,0")
+            ("OB_F", "0,0,3")
         ]
         assert session._proc is proc
+    finally:
+        session.close()
+
+
+def test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs() -> None:
+    """Vault BACKLOG #3135 step 8: the detach must come before the boot frame is read, since the
+    boot frame's reply path runs ``load_snapshot()``, the earliest admin code, which can start a
+    process of its own. The Handler-time test above cannot see a detach moved below that point."""
+    import inspect
+
+    from messagefoundry.pipeline import _sandbox_worker
+
+    source = inspect.getsource(_sandbox_worker.main)
+    detach = source.index("_detach_request_pipe()")
+    assert detach < source.index("_read_frame_bytes(stdin)")
+    assert detach < source.index("load_snapshot(")
+
+
+def test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write(
+    graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Vault BACKLOG #3135 step 7: the second check also finds a worker that exited while the
+    request was encoded, and the request goes to a fresh worker rather than a dead pipe."""
+    registry, config_dir = graph
+    expected = _deliveries(registry, "h_ok")
+    session = _session(config_dir)
+    try:
+        _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext())
+        doomed = session._proc
+        assert doomed is not None
+        generation = session._generation
+        real_encode = codec.encode_request
+
+        def _encode(**kw: Any) -> bytes:
+            doomed.kill()
+            _wait_exited(doomed)
+            return real_encode(**kw)
+
+        monkeypatch.setattr(codec, "encode_request", _encode)
+        assert _deliveries(registry, "h_ok", sandbox=session, run_context=RunContext()) == expected
+        assert session._proc is not doomed
+        assert session._generation == generation + 1
+        assert KillCause.REQUEST_WRITE not in session.kill_counts
     finally:
         session.close()
 

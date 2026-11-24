@@ -389,19 +389,17 @@ target, no `pickle` import left to mis-suppress:
   >
   >   *Amended 2026-11-24 (vault BACKLOG #3135 step 7):* `dispatch` now also makes the check before
   >   a request a second time, after the request is encoded and right before it is written. A frame
-  >   found there is handled as at `_live_worker`'s check: the worker is dropped and the message is
-  >   retried on a fresh worker, sharing the one retry each dispatch gets, so a second stray frame
-  >   fails the call. A queued EOF found there sends the request to a fresh worker.
+  >   found there is handled as at `_live_worker`'s check, since it is a second `_live_worker`
+  >   call: the worker is dropped and the message is retried on a fresh worker, sharing the one
+  >   retry each dispatch gets, so a second stray frame fails the call. A worker found exited
+  >   there, or whose EOF is queued, is replaced before the write, within the same per-dispatch
+  >   respawn bound.
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
   >   arrives after that call's check before its request is not read by that call.
   > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
   >   next call's check before its request finds it, and that message is retried. One that arrives
-  >   after that check, and ahead of that call's answer, is read in its place.
-  >   *Amended 2026-11-24 (vault BACKLOG #3135 step 7):* "that check" is now the second check
-  >   before a request, the one right before the write. A frame that arrives while the request is
-  >   encoded is found there and the message is retried, so the window this bullet describes
-  >   narrows to the time between that check and the end of the call's answer. It is not closed. It is rejected as an
+  >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
   >   invalid frame, and the call fails as an internal error, which the `[delivery] internal_error`
   >   policy then handles, unless it is a well-formed answer to that very request, which is taken as
   >   the answer, or, at `mode=isolated`, a well-formed lookup for that request carrying the next
@@ -421,6 +419,13 @@ target, no `pickle` import left to mis-suppress:
   >   confined from another). One that arrives after that call's answer meets that call's own check
   >   after its answer, or carries on to the next call. A frame still queued when its worker is
   >   respawned is discarded unexamined, since a respawn starts a fresh queue and new pipes.
+  >
+  >   *Amended 2026-11-24 (vault BACKLOG #3135 step 7):* in this bullet, the check before a
+  >   request that a frame arrives after is now the second one, made right before the write. A
+  >   frame the reader has queued while the request was encoded is found there and handled as at
+  >   the first check. So the window this bullet describes narrows by the time the request takes
+  >   to encode, to frames queued after that second check and ahead of the call's answer. It is
+  >   not closed.
   > - **A length header over the frame cap.** How the engine handles one is new since vault BACKLOG
   >   #3135, not a carried-over rule; the worker's own reader still treats one as a dead peer.
   >   Before vault BACKLOG #3135 the engine read such a header as a dead peer: at least, in the
@@ -471,7 +476,10 @@ target, no `pickle` import left to mis-suppress:
   >   so a process a Handler starts with `subprocess`, with its descriptors inherited or not, finds
   >   no pipe on fd 0. At least these still reach the pipe: a POSIX `fork` with no `exec` keeps
   >   every descriptor, the private one included, which is code from the worker's own image; code
-  >   running in the worker; and the `/proc` and Windows routes listed below.
+  >   running in the worker; and the `/proc` and Windows routes listed below. Where this ADR names
+  >   `/proc/<pid>/fd/0` as the request pipe, the pipe is now at the private descriptor's
+  >   `/proc/<pid>/fd/<n>` instead, and fd 0 is the null device; the route is otherwise as
+  >   described. Where it speaks of reading fd 0, read the private descriptor.
   >
   > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
   > least these are not accepted by either owner record, and each is to be added as a step on vault
@@ -496,7 +504,9 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`,
   `tests/test_sandbox.py::test_a_stray_frame_queued_after_the_check_is_found_before_the_request_is_written`,
   `tests/test_sandbox.py::test_the_second_check_shares_the_one_retry_a_dispatch_gets`,
-  `tests/test_sandbox.py::test_a_process_a_handler_spawns_cannot_read_the_request_pipe`
+  `tests/test_sandbox.py::test_a_process_a_handler_spawns_cannot_read_the_request_pipe`,
+  `tests/test_sandbox.py::test_the_request_pipe_leaves_fd_0_before_any_admin_code_runs`,
+  `tests/test_sandbox.py::test_a_worker_that_dies_while_its_request_is_encoded_is_replaced_before_the_write`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (under the default `[delivery] internal_error` it previously
   dead-lettered every message), and SHALL preserve `_partition` parity for **every** return shape —
@@ -732,7 +742,9 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   inherits the request pipe on fd 0: the worker moves the pipe to a non-inheritable descriptor and
   points fd 0 at the null device before it reads the boot frame. It still inherits fd 1, and the
   rest of this bullet about writing frames stands. A child made by a POSIX `fork` with no `exec`
-  still holds the private descriptor, and the `/proc` and Windows routes above are unchanged.
+  still holds the private descriptor. The `/proc` route above now reaches the request pipe at the
+  private descriptor's `/proc/<pid>/fd/<n>` rather than `/proc/<pid>/fd/0`, which is the null
+  device; `/proc/<pid>/fd/1` is unchanged, and so is the Windows route.
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects
