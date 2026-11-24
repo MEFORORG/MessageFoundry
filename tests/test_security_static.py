@@ -826,12 +826,12 @@ _UNSCANNABLE_RE_PATTERNS = {
     #
     # The text read is the engine's own checked-in DDL: ``declared_schema`` is called from
     # ``postgres.py`` and ``sqlserver.py`` over their ``_SCHEMA`` (and Postgres's migration index
-    # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier; the one
-    # quantified group, ``(?:UTE)?``, holds only literals. Each pattern is an alternation of
-    # literals, ``@`` and the name, joined by single ``\s*`` or ``\s+`` runs, plus that optional
-    # ``(?:UTE)?`` and an operator class ``[-+*/|&^%]``, optional in one branch and required in the
-    # other. No ``\s`` run is followed by a token that can match whitespace, so there is one way to
-    # split any prefix.
+    # DDL), and from nowhere else at this pin's writing. The shapes have no nested quantifier. Each
+    # pattern is an alternation of literals, ``@`` and the name, joined by single ``\s*`` or
+    # ``\s+`` runs. The runs pattern (the first) also holds the optional ``(?:UTE)?``, a group of
+    # literals only. The changes pattern (the second) also holds the operator class
+    # ``[-+*/|&^%]``, optional in one branch and required in the other. No ``\s`` run is followed
+    # by a token that can match whitespace, so there is one way to split any prefix.
     "messagefoundry/store/server_schema_verify.py": (
         "f'\\\\b(?:EXEC(?:UTE)?\\\\s*\\\\(\\\\s*@{var}\\\\s*\\\\)|sp_executesql\\\\s+@{var}\\\\b)'",
         "f'\\\\b(?:SET|SELECT)\\\\s+@{var}\\\\s*[-+*/|&^%]?=|@{var}\\\\s*[-+*/|&^%]='",
