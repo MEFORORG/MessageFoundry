@@ -1027,7 +1027,8 @@ def _read_fault_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [
         r.getMessage()
         for r in caplog.records
-        if r.levelno == logging.WARNING and "reading an object before it was sent" in r.getMessage()
+        if r.levelno == logging.WARNING
+        and "data set SOP Instance UID is not compared" in r.getMessage()
     ]
 
 
@@ -1124,8 +1125,8 @@ async def test_dicomweb_a_memory_error_in_the_read_escapes_before_the_post(
 
 
 async def test_dicomweb_a_parse_failure_in_the_read_still_sends() -> None:
-    # Negative control for the refusal above: an object the codec cannot parse is no data set UID,
-    # and the object is still sent.
+    # An object the codec cannot parse (a DicomError) is no data set UID, and the object is still
+    # sent; unlike a fault the codec does not wrap, it writes no WARNING.
     pytest.importorskip("pydicom")
     from messagefoundry.parsing.dicom.errors import DicomError
 

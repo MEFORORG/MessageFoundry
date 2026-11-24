@@ -524,9 +524,10 @@ def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
         return
     _write_held(held)
     logger.warning(
-        "DICOMweb: the [dicom] extra (pydicom) raised %s reading an object before it was sent, so "
-        "its data set SOP Instance UID is not compared and a 202 is compared with the File Meta "
-        "SOP Instance UID alone; this is written once per process, and the extra may be broken",
+        "DICOMweb: reading an object's data set with the [dicom] extra (pydicom) raised %s before "
+        "it was sent, so its data set SOP Instance UID is not compared: a 202 is compared with the "
+        "File Meta SOP Instance UID alone, or, for an object with none, confirmed by any UID it "
+        "names; this is written once per process, and the extra may be broken",
         fault,
     )
 
@@ -592,8 +593,9 @@ def _read_sent_uids(obj: bytes) -> _SentUids:
     """Both comparable UIDs of the object sent: the File Meta one by hand
     (:func:`_sent_instance_uid`) and the data set one with the codec
     (:func:`_data_set_instance_uid`). Called before the POST, as the SCU parses before it
-    associates (BACKLOG #5914). Only a :class:`MemoryError` from that read is raised; any other
-    fault reads as no data set UID, and the object is still sent."""
+    associates (BACKLOG #5914). A :class:`MemoryError` from the codec's read is raised; any other
+    fault there reads as no data set UID, and the object is still sent. A fault in finding the
+    extra (:func:`_dicom_extra_installed`) other than a :class:`ValueError` is not caught."""
     meta, cause = _sent_instance_uid(obj)
     data_set, read_fault = _data_set_instance_uid(obj)
     return _SentUids(meta, cause, data_set, read_fault)
@@ -636,7 +638,9 @@ def _stowrs_refusal(body: str, status: int, sent: _SentUids) -> tuple[str, str] 
       ReferencedSOPSequence (``00081199``) item that names its File Meta Media Storage SOP Instance
       UID or its data set SOP Instance UID. An empty 202 is one. When ``sent`` has neither UID
       there is nothing to compare, so a 202 not refused above is one whatever its reply names,
-      with a reason naming why (BACKLOG #5914, decisions of 2026-11-23).
+      with a reason naming why (BACKLOG #5914, decisions of 2026-11-23), except where the data
+      set read raised a fault (``read_fault``): then an item naming any UID confirms it, as on
+      origin/main (Manager decision of 2026-11-24).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
     the ReferencedSOPSequence rule and is not compared with ``sent`` (BACKLOG #5914 ruling), so a 200
@@ -676,7 +680,7 @@ def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] 
     here parses the object. With neither UID to compare, the reason names why the File Meta has
     none (BACKLOG #5914). The exception is an object with no File Meta UID whose data set read
     raised a fault the codec does not wrap (``read_fault``): nothing can be compared, so a 202 is
-    confirmed as before BACKLOG #5914, by an item that names any UID."""
+    confirmed as origin/main confirms it, by an item that names any UID."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     if any(uid in named for uid in (sent.meta, sent.data_set)):
         return None
@@ -687,7 +691,8 @@ def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] 
             "unconfirmed-202",
             f"no SOP Instance UID of the instance sent to compare: {sent.cause}, and no data set SOP "
             "Instance UID (0008,0018) read; a replay of the same object cannot confirm it on a "
-            f"202 unless the [dicom] extra then reads its data set UID; {_NOT_SENT}",
+            f"202 unless the [dicom] extra then reads its data set UID, or reading it raises; "
+            f"{_NOT_SENT}",
         )
     return "unconfirmed-202", f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}"
 

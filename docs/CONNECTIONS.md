@@ -4007,7 +4007,9 @@ adds only the `multipart/related; type="application/dicom"` framing + `applicati
 handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
 the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
 adds the data set's UID to that comparison. An installed extra that does not load, or whose
-read of an object raises, adds nothing, with a WARNING; *Status classification* below says how. So
+read of an object raises, adds no data set UID, with a WARNING; where its read raises on an object
+with no File Meta UID, a 202 is confirmed by any UID it names. *Status classification* below says
+how. So
 on a host running DICOMweb, fix or remove a broken `pydicom`, then restart the engine.
 
 | Setting | Default | Meaning |
@@ -4041,7 +4043,8 @@ most 64 characters) that equals a SOP Instance UID of the object sent: the **Med
 Instance UID** (`0002,0003`) in its File Meta group, or the **SOP Instance UID** (`0008,0018`) of
 its data set, an empty 202 included (code `unconfirmed-202`). A 202 that none of the rules above
 refuses is also `unconfirmed-202`, whatever its reply names, when the object sent has neither UID
-to compare, and its reason names why the File Meta has none. At least these leave no File Meta
+to compare, and its reason names why the File Meta has none, except where the data set read raised
+a fault, as below. At least these leave no File Meta
 UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
 `(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
 the end of the object, a value that is not ASCII or is not in the UID grammar once its NUL or
@@ -4069,8 +4072,9 @@ leave, is taken as no extra too. After fixing or removing `pydicom`, restart the
 the read of the object itself, such as a `TypeError` from a `pydicom` whose private readers changed,
 or a warning the filters turn into an error, also reads as no data set UID: the object is sent, and
 one WARNING per process names the exception class only, never its text. Where the object also has
-no File Meta UID, nothing can be compared, so a 202 is confirmed as before BACKLOG #5914, by a
-ReferencedSOPSequence item that names any UID. A `MemoryError` is not caught there. The data set UID is read
+no File Meta UID, nothing can be compared, so a 202 is confirmed as on origin/main, by a
+ReferencedSOPSequence item that names any UID; on a host without the extra the same 202 is
+`unconfirmed-202`. A `MemoryError` is not caught there. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
 object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
 object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
