@@ -54,7 +54,6 @@ from messagefoundry.config.settings import (
     ApprovalsSettings,
     AuthSettings,
     EgressSettings,
-    SecurityEnforcement,
     SecuritySettings,
     ServiceStatusSettings,
     StoreSettings,
@@ -174,7 +173,6 @@ _NON_BOOL_VALUES: dict[str, tuple[Any, ...]] = {
     "trusted_proxies": (("10.0.0.1",),),
     "log_dir": ("synthetic-log-dir",),
     "configured_log_level": ("INFO",),
-    "security_enforcement": (SecurityEnforcement.WARN,),
 }
 _NON_BOOL_BUILT_BY_FIXTURE = frozenset({"engine", "auth"})
 

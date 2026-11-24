@@ -30,13 +30,16 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
 * **A store key that reaches a Windows service through its environment is named** (key-custody
   slice S2a), wherever it came from, since the machine-wide environment is readable by every
   local user too.
-* **Another engine secret that reaches a known service from outside the lists it read refuses
-  the start under ``[security].enforcement = "enforce"``**, and is named as
-  ``secret_from_outside_service_lists`` under ``"warn"``. The machine-wide environment is one
-  such place. The owner's 2026-10-01 ruling refuses a secret in the environment under
-  ``enforce``, and always only in the service's own NSSM environment, so
-  :func:`service_env_enforced_refusal` carries this one and the caller applies the setting
-  (vault BACKLOG #2595, slice B's other half).
+* **Another engine secret that reaches a known service from outside the lists it read is named
+  as ``secret_from_outside_service_lists``, and one the machine-wide environment sets refuses the
+  start under ``[security].enforcement = "enforce"``** (vault BACKLOG #2595, slice B's other
+  half). The owner's 2026-10-01 ruling refuses key-class names and a Windows service's NSSM
+  environment always, and other secrets in the environment under ``enforce``; this refusal is
+  that second half for the machine-wide environment, so :func:`service_env_enforced_refusal`
+  carries it and the caller applies the setting. The engine refuses only a name it finds set in
+  that environment's registry key: a secret a service-start wrapper exports into the engine's
+  own environment, which ``docs/SERVICE.md`` describes, is named and not refused. A store key
+  from outside the lists stays named and not refused, as the bullet above says.
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
 grandchild when a virtual environment's ``python.exe`` starts the base interpreter, or further
@@ -167,6 +170,11 @@ class ServiceEnvPosture:
     #: wherever they came from. Each comes from that constant, never from the registry. Empty
     #: when ``status`` is ``NOT_A_SERVICE`` (vault BACKLOG #2595, slice B's other half).
     others_in_environment: tuple[str, ...] = ()
+    #: The names in ``others_in_environment`` that the machine-wide environment sets, read from
+    #: its registry key (:data:`MACHINE_ENVIRONMENT_KEY`). Each comes from that constant list,
+    #: never from the registry. Empty unless ``status`` is ``OBSERVED``, or when that key could
+    #: not be read.
+    others_machine_wide: tuple[str, ...] = ()
     #: Why the reading failed (``UNOBSERVABLE``).
     detail: str = ""
     #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry sets empty or blank, so the
@@ -1203,7 +1211,7 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
         if not ((value and not value.isspace()) or _kept_empty(variable)):
             continue
-        if name in _INLINE_PEM_NAMES and _path_form(value):
+        if name in _INLINE_PEM_NAMES and not _sensitive_value(name, value):
             continue
         names.setdefault(name, (variable.where, variable.line))
     return tuple((name, where, line) for name, (where, line) in names.items())
@@ -1234,17 +1242,63 @@ def _value_entry_shapes(
     return tuple(empty), tuple(unplain)
 
 
+#: The registry key, under ``HKEY_LOCAL_MACHINE``, that holds the machine-wide environment. Windows
+#: passes it to every local user's processes.
+MACHINE_ENVIRONMENT_KEY = "SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+
+
+def _machine_wide_names(names: Sequence[str]) -> list[str]:
+    """Which of ``names`` the host's machine-wide environment sets, read by name from
+    :data:`MACHINE_ENVIRONMENT_KEY`. Raises ``OSError`` where the key cannot be read. Names only:
+    a value is read by ``QueryValueEx`` and dropped at once."""
+    if sys.platform != "win32":
+        raise OSError("the Windows registry is not available on this platform")
+    import winreg
+
+    found: list[str] = []
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, MACHINE_ENVIRONMENT_KEY) as key:
+        for name in names:
+            try:
+                winreg.QueryValueEx(key, name)
+            except FileNotFoundError:
+                continue
+            found.append(name)
+    return found
+
+
+def _located_machine_wide(
+    machine_wide: Callable[[Sequence[str]], Iterable[str]] | None, names: tuple[str, ...]
+) -> tuple[str, ...]:
+    """The ``names`` ``machine_wide`` says the machine-wide environment sets, in their own order.
+    None located where there is no reader, no name to ask about, or the read fails: the refusal
+    acts only on a name it found there, and the loosening still names the rest."""
+    if machine_wide is None or not names:
+        return ()
+    try:
+        located = {name.upper() for name in machine_wide(names)}
+    except OSError as exc:
+        _log.warning("the machine-wide environment could not be read: %s", exc)
+        return ()
+    return tuple(name for name in names if name in located)
+
+
 def read_service_env_posture(
-    *, probe: ServiceProbe | None = None, environ: Mapping[str, str] | None = None
+    *,
+    probe: ServiceProbe | None = None,
+    environ: Mapping[str, str] | None = None,
+    machine_wide: Callable[[Sequence[str]], Iterable[str]] | None = None,
 ) -> ServiceEnvPosture:
     """Read the engine's own service environment now. Never raises for a host it cannot read.
 
     ``probe`` and ``environ`` default to the host and to this process's environment. Off Windows,
-    with no probe given, the engine is not a service."""
+    with no probe given, the engine is not a service. ``machine_wide`` answers which of the names
+    it is given the machine-wide environment sets, raising ``OSError`` where it cannot tell; it
+    defaults to the host's registry where no probe is given, and to none set where one is."""
     if probe is None:
         if sys.platform != "win32":
             return ServiceEnvPosture(ServiceEnvStatus.NOT_A_SERVICE)
         probe = _WindowsProbe()
+        machine_wide = _machine_wide_names if machine_wide is None else machine_wide
     environ = os.environ if environ is None else environ
     keys = tuple(name for name in KEY_CLASS_NAMES if environ.get(name, "").strip())
     others = tuple(
@@ -1276,6 +1330,8 @@ def read_service_env_posture(
         )
     variables = _variables(entries)
     found = _names(variables)
+    listed_names = {name for name, _where, _line in found}
+    machine = _located_machine_wide(machine_wide, tuple(n for n in others if n not in listed_names))
     empty, unplain = _value_entry_shapes(variables)
     # Every registry string as written, never the variables read from them, so a line absorbed
     # into a broken name or an uncounted twin is still judged.
@@ -1288,6 +1344,7 @@ def read_service_env_posture(
         source_lines=tuple((name, line) for name, _where, line in found if line is not None),
         keys_in_environment=keys,
         others_in_environment=others,
+        others_machine_wide=machine,
         empty_value_names=empty,
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
@@ -1423,14 +1480,9 @@ def service_env_refusal(posture: ServiceEnvPosture) -> str | None:
 
 def service_env_enforced_refusal(posture: ServiceEnvPosture) -> str | None:
     """Why ``serve``, ``supervise`` or an API app factory must not start under
-    ``[security].enforcement = "enforce"``, or None. The caller applies the setting.
-
-    An engine secret other than a store key that reaches a known service from outside the lists
-    it read, such as from the machine-wide environment, is refused under ``enforce`` and named as
-    ``secret_from_outside_service_lists`` under ``warn``: the owner's 2026-10-01 ruling refuses a
-    secret in the environment under ``enforce``, and always only in a Windows service's own NSSM
-    environment (vault BACKLOG #2595, slice B's other half)."""
-    found = _elsewhere_finding(posture)
+    ``[security].enforcement = "enforce"``, or None; the caller applies the setting. The module
+    docstring says what it refuses and the ruling it rests on."""
+    found = _machine_wide_finding(posture)
     if found is None:
         return None
     return (
@@ -1451,24 +1503,54 @@ def service_env_start_refusal(posture: ServiceEnvPosture, *, enforcing: bool) ->
     return ". ".join(f for f in found if f is not None) or None
 
 
-def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
+#: Where the remedies say a secrets directory is created and named for the service.
+_CREATE_POINTER = (
+    'the bullet "The other secrets: a secrets directory" under docs/SERVICE.md, "Protect the '
+    'store encryption key at rest", says how'
+)
+_MOVE = (
+    f"Put each in the secrets directory {_DIRECTORY_VARIABLE} names, as one restricted file per "
+    "setting named as its variable, and remove it from where it is set. Where no secrets "
+    f"directory exists yet, or the service's lists name none, {_CREATE_POINTER} it is created and "
+    'named for the service. See docs/CONFIGURATION.md, "The secrets directory"'
+)
+
+
+def _machine_wide_finding(posture: ServiceEnvPosture) -> str | None:
     """What :func:`service_env_enforced_refusal` refuses on and the remedy, without its
     enforcement note. Names only, each from :data:`DIRECTORY_CLASS_NAMES`."""
+    located = [n for n in posture.others_from_elsewhere if n in posture.others_machine_wide]
+    if not located:
+        return None
+    return (
+        f"{', '.join(located)} is set in the machine-wide environment, which Windows keeps in the "
+        f"registry key HKLM\\{MACHINE_ENVIRONMENT_KEY} and passes to every local user's "
+        f"processes, and so reaches the Windows service {posture.service_name or '<unknown>'!r}. "
+        + _MOVE
+    )
+
+
+def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
+    """What the ``secret_from_outside_service_lists`` entry names: every engine secret in this
+    process's environment that the engine did not read in the service's lists, wherever it
+    came from. Names only."""
     elsewhere = posture.others_from_elsewhere
     if not elsewhere:
         return None
-    name = posture.service_name or "<unknown>"
+    machine = [n for n in elsewhere if n in posture.others_machine_wide]
+    where = (
+        f"; {', '.join(machine)} is set in the machine-wide environment, which "
+        "`serve`, `supervise` and the API app factories refuse under "
+        '[security].enforcement = "enforce"'
+        if machine
+        else ""
+    )
     return (
-        f"{', '.join(elsewhere)} reaches the Windows service {name!r} through its environment, "
-        "and the service's own environment lists do not set it, so it came from somewhere else, "
-        "such as the machine-wide environment, which Windows keeps in the registry key "
-        "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment and passes to "
-        "every local user's processes. Put each in the secrets directory "
-        f"{_DIRECTORY_VARIABLE} names, as one restricted file per setting named as its variable, "
-        "and remove it from where it is set. Where no secrets directory exists yet, or the "
-        f'service\'s lists name none, the bullet "The other secrets: a secrets directory" under '
-        'docs/SERVICE.md, "Protect the store encryption key at rest", says how it is created and '
-        'named for the service. See docs/CONFIGURATION.md, "The secrets directory"'
+        f"{', '.join(elsewhere)} reaches the Windows service "
+        f"{posture.service_name or '<unknown>'!r} through its environment, and the engine did not "
+        "read it in the service's own lists, so it came from somewhere else, such as the "
+        f"machine-wide environment or a service-start wrapper{where}. Any process that can read "
+        f"the place it came from can read it. {_MOVE}"
     )
 
 
@@ -1613,11 +1695,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         if (_DIRECTORY_VARIABLE not in posture.listed or doubt) and (
             moving_others or moving_values
         ):
-            create = (
-                'Where no secrets directory exists yet, the bullet "The other secrets: a secrets '
-                'directory" under docs/SERVICE.md, "Protect the store encryption key at rest", '
-                "says how it is created"
-            )
+            create = f"Where no secrets directory exists yet, {_CREATE_POINTER} it is created"
             if doubt and posture.directory_in_refused and posture.installer_reads_extra:
                 create += (
                     ". Where a string the first step leaves as it is lies in AppEnvironmentExtra "
@@ -1734,8 +1812,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         steps.append(
             "The engine could not read the service's lists, so a refused variable may come from "
             "the machine-wide environment instead, which Windows keeps in the registry key "
-            "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment: where it "
-            "is set there, remove it there too"
+            f"HKLM\\{MACHINE_ENVIRONMENT_KEY}: where it is set there, remove it there too"
         )
     if posture.value_runs_on:
         # Removing the name alone would leave the value, which then refuses nothing.
@@ -1851,9 +1928,11 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
     """The ``(name, plain-language risk)`` entries for ``posture``. One place for the wording, so
     ``security_loosenings()`` and the ``supervise`` start-up lines cannot say different things.
 
-    A caller that refuses on :func:`service_env_refusal` checks it first, as ``serve``,
+    A caller that refuses on :func:`service_env_start_refusal` checks it first, as ``serve``,
     ``supervise``, ``create_app`` and ``create_managed_app`` do, so
-    ``secret_in_service_environment`` reaches only a caller that does not."""
+    ``secret_in_service_environment`` reaches only a caller that does not. Under ``warn`` they
+    read ``secret_from_outside_service_lists`` here, including a machine-wide secret they refuse
+    under ``enforce``."""
     out: list[tuple[str, str]] = []
     if posture.status is ServiceEnvStatus.UNOBSERVABLE:
         out.append(
@@ -1885,8 +1964,7 @@ def service_env_loosenings(posture: ServiceEnvPosture) -> list[tuple[str, str]]:
         out.append(
             (
                 "secret_from_outside_service_lists",
-                "`serve`, `supervise` and the API app factories refuse to start on this under "
-                f'[security].enforcement = "enforce": {elsewhere}',
+                elsewhere,
             )
         )
     # What `serve`, `supervise` and the API app factories refuse, named for a caller that reads

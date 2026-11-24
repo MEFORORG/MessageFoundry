@@ -2685,12 +2685,15 @@ count is above `0` (vault BACKLOG #2613).
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
 - **`secret_from_outside_service_lists`: another engine secret reaches the service from outside
   its lists.** An engine secret other than a store key is in the engine's own environment, the
-  engine read its service's lists, and they do not set it, so it came from somewhere else, such
-  as the machine-wide environment. Under `[security].enforcement = "enforce"`, `serve`,
-  `supervise` and both API app factories refuse to start on it; under `"warn"` the engine starts
-  and names it here. The owner's 2026-10-01 ruling refuses a secret in the environment under
-  `enforce`, and always only in a Windows service's NSSM environment. Move it to the secrets
-  directory and remove it from where it is set (vault BACKLOG #2595).
+  engine read its service's lists, and it did not read the secret there, so it came from
+  somewhere else, such as the machine-wide environment or a service-start wrapper. Where the
+  machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
+  factories refuse to start on it under `[security].enforcement = "enforce"`, and under `"warn"`
+  the engine starts and names it here. One the engine does not find there, such as a wrapper's,
+  is named here and not refused. A store key from outside the lists is named as
+  `store_key_in_service_environment` and not refused. The rule each follows is stated once, in
+  the `messagefoundry/serviceenv.py` module docstring. Move it to the secrets directory and
+  remove it from where it is set (vault BACKLOG #2595).
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   a variable named by a `[secrets].provider = "env"` reference, whose name only your config
   knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable that

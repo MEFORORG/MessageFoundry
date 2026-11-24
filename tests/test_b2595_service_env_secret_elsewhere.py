@@ -3,17 +3,17 @@
 """An engine secret reaching a Windows service from outside the lists it read (vault BACKLOG
 #2595, slice B's other half).
 
-The owner's 2026-10-01 ruling refuses a secret in the environment under ``enforce``, and always
-only in the service's own NSSM environment. So a secret other than a store key that reaches a
-known service from somewhere else, such as the machine-wide environment, refuses ``serve``,
-``supervise`` and the API app factories under ``enforce`` and is named under ``warn``. Where the
-service is known and its lists could not be read, such a secret most likely came from them, and
-refuses whatever the setting, as a store key there already did. Synthetic values only.
+A secret other than a store key that reaches a known service from outside its lists is named;
+one the machine-wide environment sets refuses ``serve``, ``supervise`` and the API app
+factories under ``enforce``. Where the service is known and its lists could not be read, such a
+secret refuses whatever the setting, as a store key there already did. The rule is stated once,
+in ``messagefoundry/serviceenv.py``'s module docstring. Synthetic values only.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pytest
@@ -53,9 +53,19 @@ def _value(name: str) -> str:
     return _PEM_VALUE if name == "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY" else _PASSWORD_VALUE
 
 
-#: A known service whose lists set nothing secret, with a store password in the engine's own
-#: environment, so it came from outside the lists.
-_ELSEWHERE = _service(["MEFOR_AI_ENVIRONMENT=prod"], MEFOR_STORE_PASSWORD=_PASSWORD_VALUE)
+def _machine(entries: list[str], machine: tuple[str, ...], **environ: str) -> ServiceEnvPosture:
+    """A known service whose machine-wide environment sets ``machine``."""
+    probe = _Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, entries=entries)
+    return read_service_env_posture(
+        probe=probe, environ=environ, machine_wide=lambda names: [n for n in names if n in machine]
+    )
+
+
+#: A known service whose lists set nothing secret, with a store password the machine-wide
+#: environment sets.
+_ELSEWHERE = _machine(
+    ["MEFOR_AI_ENVIRONMENT=prod"], ("MEFOR_STORE_PASSWORD",), MEFOR_STORE_PASSWORD=_PASSWORD_VALUE
+)
 
 
 def _unreadable(**environ: str) -> ServiceEnvPosture:
@@ -160,14 +170,15 @@ def test_a_shell_is_not_refused() -> None:
 
 
 @pytest.mark.parametrize("name", DIRECTORY_CLASS_NAMES)
-def test_a_secret_from_outside_the_lists_is_refused_under_enforce_and_named(name: str) -> None:
+def test_a_machine_wide_secret_is_refused_under_enforce_and_named(name: str) -> None:
     """Before this change it was neither refused nor named."""
-    posture = _service(["MEFOR_AI_ENVIRONMENT=prod"], **{name: _value(name)})
+    posture = _machine(["MEFOR_AI_ENVIRONMENT=prod"], (name,), **{name: _value(name)})
     assert service_env_refusal(posture) is None
     refusal = service_env_enforced_refusal(posture)
     assert refusal is not None
-    assert refusal.startswith(f"{name} reaches the Windows service 'MessageFoundry'")
-    assert "machine-wide environment" in refusal
+    assert refusal.startswith(f"{name} is set in the machine-wide environment")
+    assert "Session Manager\\Environment" in refusal
+    assert "reaches the Windows service 'MessageFoundry'" in refusal
     assert "names this as secret_from_outside_service_lists" in refusal
     assert refusal.endswith("so move the secret instead")
     assert "The other secrets: a secrets directory" in refusal
@@ -223,7 +234,7 @@ def test_serve_refuses_a_secret_from_outside_the_lists_under_enforce(
     rc = _serve(tmp_path, monkeypatch, _ELSEWHERE, warn=False, service_config=settings_file)
     err = capsys.readouterr().err
     assert rc == 2
-    assert "refusing to start: MEFOR_STORE_PASSWORD reaches the Windows service" in err
+    assert "refusing to start: MEFOR_STORE_PASSWORD is set in the machine-wide environment" in err
     assert _PASSWORD_VALUE not in err
     assert not read
     assert not any(tmp_path.iterdir()), sorted(p.name for p in tmp_path.iterdir())
@@ -256,7 +267,7 @@ def test_supervise_refuses_a_secret_from_outside_the_lists_under_enforce(
     )
     err = capsys.readouterr().err
     assert rc == 2 and not spawned
-    assert "MEFOR_STORE_PASSWORD reaches the Windows service 'MessageFoundry'" in err
+    assert "MEFOR_STORE_PASSWORD is set in the machine-wide environment" in err
     assert "refusing to start the fleet" in err
     assert not read
 
@@ -319,15 +330,16 @@ def test_an_inline_oidc_signing_key_from_elsewhere_is_still_refused() -> None:
 
 
 def test_one_start_names_a_listed_secret_and_one_from_elsewhere_together() -> None:
-    posture = _service(
+    posture = _machine(
         [f"MEFOR_STORE_PASSWORD={_PASSWORD_VALUE}"],
+        ("MEFOR_AI_API_KEY",),
         MEFOR_STORE_PASSWORD=_PASSWORD_VALUE,
         MEFOR_AI_API_KEY=_TOKEN_VALUE,
     )
     refusal = service_env_start_refusal(posture, enforcing=True)
     assert refusal is not None
     assert "MEFOR_STORE_PASSWORD (in Parameters" in refusal
-    assert "MEFOR_AI_API_KEY reaches the Windows service" in refusal
+    assert "MEFOR_AI_API_KEY is set in the machine-wide environment" in refusal
     assert service_env_start_refusal(posture, enforcing=False) == service_env_refusal(posture)
 
 
@@ -337,27 +349,94 @@ def test_an_unreadable_list_says_to_remove_it_from_the_machine_wide_environment_
     assert "may come from the machine-wide environment instead" in refusal
 
 
-def test_create_managed_app_honours_an_explicit_warn_dial(
+def test_the_factories_read_the_dial_from_security_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``create_managed_app`` passes its dial on to ``create_app``, which runs the check again, so
-    an explicit ``security_enforcement`` wins over ``security_settings`` there too."""
+    """The check reads ``security_settings.enforcement``, as every other check in ``create_app``
+    does, so ``create_managed_app``'s separate ``security_enforcement`` does not change it, and the
+    refusal names the factory the caller called."""
     from messagefoundry.api.app import create_managed_app
     from messagefoundry.config.settings import EgressSettings
 
     monkeypatch.setattr("messagefoundry.api.app.service_env_posture", lambda: _ELSEWHERE)
-    create_managed_app(
-        db_path=tmp_path / "embedded.db",
-        egress_settings=EgressSettings(deny_by_default=False),
-        allow_no_auth=True,
-        security_settings=SecuritySettings(enforcement=SecurityEnforcement.ENFORCE),
-        security_enforcement=SecurityEnforcement.WARN,
-    )
     with pytest.raises(ServiceEnvironmentRefused, match="^create_managed_app: "):
         create_managed_app(
-            db_path=tmp_path / "embedded2.db",
+            db_path=tmp_path / "embedded.db",
             egress_settings=EgressSettings(deny_by_default=False),
             allow_no_auth=True,
-            security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
-            security_enforcement=SecurityEnforcement.ENFORCE,
+            security_settings=SecuritySettings(enforcement=SecurityEnforcement.ENFORCE),
+            security_enforcement=SecurityEnforcement.WARN,
         )
+    create_managed_app(
+        db_path=tmp_path / "embedded2.db",
+        egress_settings=EgressSettings(deny_by_default=False),
+        allow_no_auth=True,
+        security_settings=SecuritySettings(enforcement=SecurityEnforcement.WARN),
+        security_enforcement=SecurityEnforcement.ENFORCE,
+    )
+
+
+# --- repair round 2 (code review round-5914e38328) ---------------------------------------------------
+
+
+def test_a_secret_the_machine_wide_environment_does_not_set_is_named_and_not_refused() -> None:
+    """A service-start wrapper may export a secret into the engine's own environment
+    (docs/SERVICE.md). The engine does not find it in the machine-wide environment's registry
+    key, so it names it and does not refuse."""
+    posture = _machine(["MEFOR_AI_ENVIRONMENT=prod"], (), MEFOR_STORE_PASSWORD=_PASSWORD_VALUE)
+    assert posture.others_from_elsewhere == ("MEFOR_STORE_PASSWORD",)
+    assert posture.others_machine_wide == ()
+    assert service_env_start_refusal(posture, enforcing=True) is None
+    entries = dict(service_env_loosenings(posture))
+    risk = entries["secret_from_outside_service_lists"]
+    assert "MEFOR_STORE_PASSWORD reaches the Windows service" in risk
+    assert "is set in the machine-wide environment" not in risk
+
+
+def test_a_machine_wide_read_that_fails_refuses_nothing_and_still_names() -> None:
+    def failing(names: object) -> list[str]:
+        raise PermissionError("access denied")
+
+    probe = _Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, entries=[])
+    posture = read_service_env_posture(
+        probe=probe, environ={"MEFOR_AI_API_KEY": _TOKEN_VALUE}, machine_wide=failing
+    )
+    assert posture.others_machine_wide == ()
+    assert service_env_start_refusal(posture, enforcing=True) is None
+    assert "secret_from_outside_service_lists" in _names(posture)
+
+
+def test_a_machine_wide_store_key_stays_named_and_not_refused() -> None:
+    """The carve-out the changelog states: a store key from outside the lists keeps its
+    ``store_key_in_service_environment`` entry and is not refused, even under enforce."""
+    posture = _machine([], ("MEFOR_STORE_ENCRYPTION_KEY",), MEFOR_STORE_ENCRYPTION_KEY="x" * 44)
+    assert service_env_start_refusal(posture, enforcing=True) is None
+    assert _names(posture) == ["store_key_in_service_environment"]
+
+
+def test_an_unreadable_list_gives_one_finding_under_enforce() -> None:
+    posture = _unreadable(MEFOR_STORE_PASSWORD=_PASSWORD_VALUE)
+    assert service_env_start_refusal(posture, enforcing=True) == service_env_refusal(posture)
+
+
+def test_supervise_names_a_machine_wide_secret_under_warn_and_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_file: str,  # noqa: F811
+) -> None:
+    # A store key, so the later at-rest gate does not refuse the keyless fleet first.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    rc, spawned = _supervise(
+        tmp_path, monkeypatch, _ELSEWHERE, warn=True, service_config=settings_file
+    )
+    assert rc == 0 and spawned, capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="reads this host's registry")
+def test_the_host_reader_finds_a_name_the_machine_wide_environment_sets() -> None:
+    """Path is set machine-wide on every Windows install; the second name is not."""
+    from messagefoundry.serviceenv import _machine_wide_names
+
+    found = _machine_wide_names(["PATH", "MEFOR_SYNTHETIC_NEVER_SET_2595"])
+    assert found == ["PATH"]

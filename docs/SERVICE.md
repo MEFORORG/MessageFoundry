@@ -376,8 +376,10 @@ the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentE
 may hold a value `serve` or `supervise` refused, as the next paragraph says.
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
-settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
-or retired store key found in their own environment, never another secret setting. Use the DPAPI
+settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse a store key,
+a retired store key or another engine secret setting found in their own environment. Under
+`[security].enforcement = "enforce"` they also refuse an engine secret setting other than a store
+key that the machine-wide environment sets (vault BACKLOG #2595). Use the DPAPI
 key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
@@ -761,8 +763,8 @@ NSSM environment.
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
-  service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
-  list, and not if it could not (the previous bullet links where that is stated).
+  service's NSSM list, where `serve` and `supervise` refuse it, whether or not the engine could
+  read that list (the previous bullet links where that is stated).
   A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
   active environment's value file if it is not a secret and is the same for every instance (the
   previous bullet's link says when and why).

@@ -229,12 +229,14 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   read, is neither refused nor named, since only a store key's names are read there (vault
   BACKLOG #2595). **UPDATED 2026-11-24: that other half is now built for these names (vault
   BACKLOG #2595).** Where the engine reads its service's lists and such a secret is in its own
-  environment but not in them, `serve`, `supervise` and both API app factories refuse under
-  `enforce` and name it as `secret_from_outside_service_lists` under `warn`, as the owner's
-  2026-10-01 ruling has it for a secret outside a service's NSSM environment. Where the service
-  is known and its lists could not be read, such a secret refuses under every setting, as a
-  store key there already did. A `MEFOR_VALUE_*` variable from outside the lists is still
-  neither refused nor named, and an engine that does not find its service reads none of this.
+  environment but not in them, it is named as `secret_from_outside_service_lists`, and where
+  the machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
+  factories refuse under `enforce`. Where the service is known and its lists could not be read,
+  such a secret refuses under every setting, as a store key there already did. Not refused, at
+  least: such a secret from elsewhere, such as a service-start wrapper, which is named; a store
+  key from outside the lists, which is named; and a `MEFOR_VALUE_*` variable from outside the
+  lists, which is neither refused nor named. An engine that does not find its service reads none
+  of this. `messagefoundry/serviceenv.py`'s module docstring states the rule.
 - **2026-11-05, slice D built.** `[store].key_provider` no longer accepts the four external names
   ADR 0019 declared and nobody built, `aws_kms`, `azure_kv`, `gcp_kms` and `pkcs11`; each is now
   refused as an unknown name. Question 12 of the maintainer-internal decisions index answered yes

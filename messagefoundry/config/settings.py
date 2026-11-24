@@ -10864,8 +10864,9 @@ def security_loosenings(
     ``create_managed_app``, which never reach this registry then; a caller that reads it with no
     refusal of its own gets what they refuse as ``secret_in_service_environment``, where the
     engine finds its service. Another engine secret that reaches the service from outside those
-    lists refuses them under ``enforce`` only, and is named here as
-    ``secret_from_outside_service_lists``. ``None`` has the meaning it has for ``remote_debug``.
+    lists is named here as ``secret_from_outside_service_lists``; one the machine-wide
+    environment sets refuses them under ``enforce``. ``None`` has the meaning it has for
+    ``remote_debug``.
 
     The sequence parameters are the CONNECTION-scoped deviations, each a list of connection NAMES:
     ``cleartext_hops`` declares ``cleartext_accepted`` (ADR 0153), ``expiry_relaxed_hops`` declares
