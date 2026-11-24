@@ -429,13 +429,32 @@ def test_unknown_kid_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
     assert exc.value.reason == "unknown_kid"
 
 
+def test_multi_aud_without_azp_rejected(rsa_key: rsa.RSAPrivateKey) -> None:
+    jws = _mint(rsa_key, "k1", _good_claims(aud=["mefor-console", "another"]))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_azp"
+
+
+def test_multi_aud_with_matching_azp_accepted(rsa_key: rsa.RSAPrivateKey) -> None:
+    jws = _mint(rsa_key, "k1", _good_claims(aud=["mefor-console", "another"], azp="mefor-console"))
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
 # --- claims: azp is checked whenever present, and a malformed aud array is refused (BACKLOG #5339) --
 #
-# OpenID Connect Core 1.0, ID Token Validation, item 5: if an azp claim is present, the client must
-# verify that its client_id is the claim value, whatever the audience count. RFC 7519 section 4.1.3:
-# an array aud is an array of case-sensitive strings, so a non-string or empty element is malformed.
+# OpenID Connect Core 1.0, ID Token Validation, item 5 (a SHOULD, and narrowed by errata set 2): a
+# present azp is our client_id. The engine takes the stricter reading and refuses any other azp,
+# whatever the audience count. RFC 7519 section 4.1.3: aud is a string or an array of strings, so a
+# non-string or empty element is malformed.
 
 _ABSENT = object()
+
+
+def _aud_azp_claims(aud: Any, azp: Any) -> dict[str, Any]:
+    """``_good_claims`` with this aud, and this azp unless it is ``_ABSENT``."""
+    return _good_claims(aud=aud) if azp is _ABSENT else _good_claims(aud=aud, azp=azp)
 
 
 @pytest.mark.parametrize(
@@ -449,14 +468,12 @@ _ABSENT = object()
         ("mefor-console", ["mefor-console"]),
         (["mefor-console"], "another-client"),
         (["mefor-console", "another"], "another"),
-        (["mefor-console", "another"], _ABSENT),
     ],
 )
 def test_an_azp_that_is_not_our_client_is_refused(
     rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
 ) -> None:
-    over = {"aud": aud} if azp is _ABSENT else {"aud": aud, "azp": azp}
-    jws = _mint(rsa_key, "k1", _good_claims(**over))
+    jws = _mint(rsa_key, "k1", _aud_azp_claims(aud, azp))
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert exc.value.reason == "claim_azp"
@@ -468,7 +485,6 @@ def test_an_azp_that_is_not_our_client_is_refused(
     [
         ("mefor-console", "mefor-console"),
         (["mefor-console"], "mefor-console"),
-        (["mefor-console", "another"], "mefor-console"),
         ("mefor-console", _ABSENT),
         (["mefor-console"], _ABSENT),
         (["mefor-console", "mefor-console"], _ABSENT),
@@ -477,8 +493,7 @@ def test_an_azp_that_is_not_our_client_is_refused(
 def test_a_matching_or_absent_azp_is_accepted(
     rsa_key: rsa.RSAPrivateKey, aud: Any, azp: Any
 ) -> None:
-    over = {"aud": aud} if azp is _ABSENT else {"aud": aud, "azp": azp}
-    jws = _mint(rsa_key, "k1", _good_claims(**over))
+    jws = _mint(rsa_key, "k1", _aud_azp_claims(aud, azp))
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"
 
@@ -493,14 +508,16 @@ def test_a_matching_or_absent_azp_is_accepted(
         ["mefor-console", 1.5],
         ["mefor-console", ["x"]],
         ["mefor-console", {"a": 1}],
+        "",
     ],
 )
-def test_a_malformed_aud_array_is_refused_even_when_it_names_our_client(
+def test_a_malformed_aud_is_refused_even_when_it_names_our_client(
     rsa_key: rsa.RSAPrivateKey, aud: Any
 ) -> None:
     """Each array carries our client_id and a matching azp, so only the malformed element can refuse
-    it. Before BACKLOG #5339 the scalar cases were accepted; the unhashable ones (a nested list, a
-    dict) raised TypeError from ``set()`` and are refused by the same element check now."""
+    it. Before BACKLOG #5339 the scalar-element cases were accepted; the unhashable ones (a nested
+    list, a dict) raised TypeError from ``set()`` and are refused by the same element check now. The
+    empty-string aud is refused under the same rule rather than by the membership check."""
     jws = _mint(rsa_key, "k1", _good_claims(aud=aud, azp="mefor-console"))
     with pytest.raises(oidc.ClaimsError) as exc:
         oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
@@ -508,7 +525,11 @@ def test_a_malformed_aud_array_is_refused_even_when_it_names_our_client(
     assert exc.value.reason in oidc.REASONS
 
 
-# --- claims: two malformed-IdP shapes reject as audited ClaimsErrors, not 500s (BACKLOG #1016) -----
+# --- claims: a malformed nonce rejects as an audited ClaimsError, not a 500 (BACKLOG #1016) ---------
+#
+# The malformed-aud half of #1016 is test_a_malformed_aud_is_refused_even_when_it_names_our_client
+# above; its negative control is test_a_matching_or_absent_azp_is_accepted, whose list-aud rows pass
+# the element check.
 
 
 def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey) -> None:
@@ -526,9 +547,9 @@ def test_a_non_ascii_nonce_is_a_mismatch_not_a_crash(rsa_key: rsa.RSAPrivateKey)
 def test_the_malformed_shape_guards_do_not_over_reject_a_valid_token(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
-    """Negative control (guard-the-guard): the two malformed-shape guards must not reject an ordinary
-    valid token — an ASCII nonce equal to the policy nonce and a plain str aud validate byte-
-    identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
+    """Negative control (guard-the-guard): the nonce-encoding guard and the aud shape check must not
+    reject an ordinary valid token — an ASCII nonce equal to the policy nonce and a plain str aud
+    validate byte-identically. The existing ``{"nonce": "wrong"}`` rung already proves an ASCII wrong-nonce still
     routes to ``nonce_mismatch``, so the encoding guard does not swallow real mismatches."""
     jws = _mint(rsa_key, "k1", _good_claims())
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
