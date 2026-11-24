@@ -647,18 +647,27 @@ class _GroupCommitter:
         if task is not self._task:
             return  # a stale task; a newer one owns the committer now
         self._closed = True
-        stranded, self._pending = self._pending, []
+        stranded = self._take_pending()
         if task.cancelled() or task.exception() is not None:
             log.warning(
                 "store group committer stopped outside close; rejecting %d pending member(s)",
                 len(stranded),
             )
+        self._reject_stranded(stranded, "group committer stopped")
+
+    def _take_pending(self) -> list[_Member]:
+        stranded, self._pending = self._pending, []
+        return stranded
+
+    @staticmethod
+    def _reject_stranded(stranded: list[_Member], reason: str) -> None:
         for member in stranded:
             if not member.future.done():
-                member.future.set_exception(RuntimeError("group committer stopped"))
+                member.future.set_exception(RuntimeError(reason))
 
     async def aclose(self) -> None:
-        """Stop the committer, flushing any enrolled members first so nothing is stranded."""
+        """Stop the committer, flushing the members it can still reach first. A member left pending
+        once the committer task is gone is rejected with a ``RuntimeError``, not left to park."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
@@ -677,6 +686,11 @@ class _GroupCommitter:
                 ):
                     raise
             self._task = None
+        # The committer is gone, so nothing will run what is still pending. A member can be here
+        # when the task ended outside close and a submit() enrolled in the turn before its
+        # _on_stopped ran: awaiting an already-done task does not yield, so that callback runs after
+        # _task is cleared above and returns early as a stale task's (BACKLOG #5664). Refuse it.
+        self._reject_stranded(self._take_pending(), "group committer closed")
 
     async def submit(
         self,
