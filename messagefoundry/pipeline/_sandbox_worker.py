@@ -142,9 +142,9 @@ def _rlimit_data_counts_mmap() -> bool:
         return False
     if uname.sysname != "Linux":
         return False  # another kernel's numbering says nothing about Linux 4.7 semantics
-    # Bounded digit runs, so int() never meets a string too long to convert; a longer run reads
+    # Bounded ASCII digit runs, so int() never meets a string too long to convert; a longer run reads
     # as unparseable rather than as its first nine digits.
-    match = re.match(r"(\d{1,9})\.(\d{1,9})(?!\d)", uname.release)
+    match = re.match(r"([0-9]{1,9})\.([0-9]{1,9})(?![0-9])", uname.release)
     if match is None:
         return False
     return (int(match[1]), int(match[2])) >= (4, 7)

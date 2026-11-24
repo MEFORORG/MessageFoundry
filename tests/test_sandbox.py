@@ -677,6 +677,8 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("4.10", True),
         ("4.14.0-1-generic", True),
         ("10.0", True),
+        # Positive control for the off-Linux test below: its release passes here.
+        ("14.0-RELEASE", True),
         ("6.1.0-13-amd64", True),
         # A two-component release whose minor carries a suffix (BACKLOG #6811).
         ("6.12-rc4", True),
@@ -691,6 +693,7 @@ def test_on_github_actions_linux_both_thread_tests_run(
         ("6", False),
         ("6-rc1", False),
         ("4." + "9" * 5000, False),
+        ("\uff14.\uff17", False),  # fullwidth digits: a kernel release is ASCII
         ("", False),
     ],
 )
