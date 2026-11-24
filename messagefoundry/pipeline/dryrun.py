@@ -611,37 +611,6 @@ def transform_one(
 #: in this process; the path too, so another config's set of the same name still logs. A test resets it.
 _skipped_reference_sets_logged: set[tuple[str, str]] = set()
 
-#: Each FILE-backed reference set the preview has loaded, by path: the file's stat signature at the
-#: load and the table as the store encodes it (BACKLOG #6820). ``check`` previews every fixture on
-#: every inbound, and each preview re-read and re-parsed every file; an unchanged file is now read
-#: once. Stat is taken before the read, so a file edited during it is read again on the next
-#: preview. Values are kept encoded and decoded per preview, so a Handler that edits a container
-#: value changes its own preview only. Bounded, oldest out first. A test resets it.
-_reference_file_cache: dict[str, tuple[tuple[int, int, int], dict[str, str]]] = {}
-_REFERENCE_FILE_CACHE_MAX = 64
-
-
-def _encoded_reference_file(path: str) -> dict[str, str]:
-    """The set at ``path``, each value as the store encodes it, from the cache while the file's
-    stat signature is unchanged. Raises as :func:`load_code_set` and
-    :func:`encode_reference_value` do; neither outcome is cached."""
-    try:
-        st = os.stat(path)
-    except OSError:
-        signature = None  # the load below raises the loader's own refusal
-    else:
-        signature = (st.st_mtime_ns, st.st_size, st.st_ino)
-        cached = _reference_file_cache.get(path)
-        if cached is not None and cached[0] == signature:
-            return cached[1]
-    encoded = {k: encode_reference_value(v) for k, v in load_code_set(path).items()}
-    if signature is not None:
-        _reference_file_cache.pop(path, None)  # re-inserted last, so eviction takes the oldest
-        _reference_file_cache[path] = (signature, encoded)
-        while len(_reference_file_cache) > _REFERENCE_FILE_CACHE_MAX:
-            _reference_file_cache.pop(next(iter(_reference_file_cache)), None)
-    return encoded
-
 
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     """Best-effort preview of reference snapshots for a dry-run (ADR 0006): load each FILE-backed
@@ -652,7 +621,11 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
     engine's sealed reference cache returns (BACKLOG #1174): a TOML date is an ISO string in both. A
     set the store would refuse to encode is omitted, as the live sync would refuse to commit it. So is
     a set whose file did not load (vault BACKLOG #3340); both log a warning naming it, the second once
-    per set per process."""
+    per set per process.
+
+    Every call reads every file again. A caller previewing many messages against one graph, as
+    ``check`` does, builds the view once and passes it to :func:`dry_run` as ``reference_view``
+    (BACKLOG #6820)."""
     view: dict[str, Mapping[str, Any]] = {}
     for spec in registry.references.values():
         if spec.source.kind != "file":
@@ -661,14 +634,16 @@ def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
         if not isinstance(path, str):  # an env() ref — unresolved in a pure dry-run
             continue
         try:
-            view[spec.name] = {k: json.loads(v) for k, v in _encoded_reference_file(path).items()}
+            view[spec.name] = {
+                k: json.loads(encode_reference_value(v)) for k, v in load_code_set(path).items()
+            }
         except CodeSetError:
             # A missing, malformed or unreadable file. Say so, or a later read of the set reports it
             # missing with nothing to say why. The set name only, never the loader's text: that can
             # quote a KEY (a duplicate one), which may be PHI for a patient-keyed set, and `check`
             # writes this line into a CI log. No cause either: a guess from the path (missing versus
-            # malformed) misnames a permission or a directory. Once per set per process, since
-            # `check` reloads the view for every fixture on every inbound.
+            # malformed) misnames a permission or a directory. Once per set per process, since a
+            # caller that passes no view reloads it for every message it previews.
             if (spec.name, path) not in _skipped_reference_sets_logged:
                 _skipped_reference_sets_logged.add((spec.name, path))
                 log.warning("dry-run: reference set %r skipped, its file did not load", spec.name)
@@ -752,6 +727,7 @@ def route_message(
     tracer: TraceHook | None = None,
     sandbox: SandboxSession | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -779,6 +755,12 @@ def route_message(
     value here (falling back to the Settings-model default, ON, when none load — #230 P4); a
     programmatic caller or the Test Bench should likewise pass ``settings.pipeline.snapshot_on_send``
     where the site has set it.
+
+    ``reference_view`` is the reference sets the preview reads, as
+    :func:`_dry_run_reference_view` builds them. ``None``, the default, builds them from the graph
+    on this call, reading every file-backed set again. A caller previewing many messages against
+    one graph builds it once and passes it, so each file is read once (BACKLOG #6820); the
+    previews then share its values, as the live engine's messages share its sealed cache.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -793,7 +775,7 @@ def route_message(
     # view from the graph's FILE-backed declarations (literal paths) so a reference(...) read resolves
     # during `check`/Test Bench. DB-backed or env()-path sets can't be reached in a pure dry-run and are
     # simply absent (a read of one then raises, surfaced as that message's preview error).
-    sim_reference = _dry_run_reference_view(registry)
+    sim_reference = _dry_run_reference_view(registry) if reference_view is None else reference_view
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
     meta_ops: list[MetaOpPreview] = []
@@ -989,6 +971,7 @@ def _dry_run_raw(
     *,
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> DryRunResult:
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage.
 
@@ -1019,6 +1002,7 @@ def _dry_run_raw(
             ingest_time=time.time(),
             tracer=tracer,
             snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(
@@ -1129,6 +1113,7 @@ def dry_run(
     inbound: str | None = None,
     tracer: TraceHook | None = None,
     snapshot_on_send: bool = True,
+    reference_view: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> DryRunResult:
     """Decode → guard → parse → (strict-validate) → route one message; return disposition + payloads.
 
@@ -1156,6 +1141,9 @@ def dry_run(
     ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
     default is ``True``, as the engine's is (BACKLOG #5794); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
 
+    ``reference_view`` is threaded to :func:`route_message` too; ``check`` builds it once per
+    graph and passes it for every fixture (BACKLOG #6820).
+
     **THIS FUNCTION TAKES NO ``sandbox`` ARGUMENT AND ALWAYS RUNS ROUTERS/HANDLERS IN-PROCESS.** It is
     therefore blind to ``[sandbox].mode``. That matches ``serve`` on the shipped default (``off``),
     and diverges from it at ``[sandbox].mode=subprocess``: ``messagefoundry check`` and
@@ -1173,7 +1161,14 @@ def dry_run(
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:
-        return _dry_run_raw(registry, ic, raw, tracer=tracer, snapshot_on_send=snapshot_on_send)
+        return _dry_run_raw(
+            registry,
+            ic,
+            raw,
+            tracer=tracer,
+            snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
+        )
 
     try:
         text = decode_ingress(raw, ic)
@@ -1188,20 +1183,18 @@ def dry_run(
     # The peek's field reads and the marker check sit inside the guard with the parse, under the
     # listener's PEEK_READ_FAULTS, so a parser fault in one is an ERROR naming its type alone, as the
     # listener records it, rather than an exception out of the preview (BACKLOG #6821, #1594).
-    parse_error: str | None = None
     try:
         peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
         mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
         # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
         marker_refused = doc_ref_marker_refusal(peek, text)
     except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
-        parse_error = f"parse error: {exc}"
-    except PEEK_READ_FAULTS as exc:
-        parse_error = f"parse error: peek read failed ({type(exc).__name__})"
-    if parse_error is not None:
         return DryRunResult(
-            inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=parse_error
+            inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=f"parse error: {exc}"
         )
+    except PEEK_READ_FAULTS as exc:
+        fault = f"parse error: peek read failed ({type(exc).__name__})"
+        return DryRunResult(inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=fault)
 
     if marker_refused is not None:
         return DryRunResult(
@@ -1240,6 +1233,7 @@ def dry_run(
             ingest_time=time.time(),
             tracer=tracer,
             snapshot_on_send=snapshot_on_send,
+            reference_view=reference_view,
         )
     except Exception as exc:  # a router/handler script raised
         return DryRunResult(

@@ -31,7 +31,7 @@ from messagefoundry.config.wiring import (
     Send,
     env,
 )
-from messagefoundry.parsing.message import Message, RawMessage
+from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
@@ -1214,23 +1214,16 @@ async def test_a_concurrent_resync_between_decision_and_delete_is_not_destroyed(
         await store.close()
 
 
-# --- BACKLOG #6820: the preview reads a reference file once while it is unchanged ----------------
+# --- BACKLOG #6820: check reads each reference file once per run, not once per fixture -----------
 
 _REF_RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
 
-def test_dryrun_reads_an_unchanged_reference_file_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`check` calls the preview once per fixture per inbound, and each call used to re-read and
-    re-parse every file-backed reference set (BACKLOG #6820). An unchanged file is now read once;
-    an edited one is read again, so the preview still shows the file as it stands."""
-    import os
-
+def _counting_loader(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Count the dry run's reference-file loads; the list grows by one path per load."""
     from messagefoundry.config.code_sets import load_code_set as real
     from messagefoundry.pipeline import dryrun
 
-    monkeypatch.setattr(dryrun, "_reference_file_cache", {})
     loads: list[str] = []
 
     def counting(path: str) -> Any:
@@ -1238,42 +1231,60 @@ def test_dryrun_reads_an_unchanged_reference_file_once(
         return real(path)
 
     monkeypatch.setattr(dryrun, "load_code_set", counting)
+    return loads
+
+
+def test_route_message_reads_a_passed_reference_view(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that passes ``reference_view`` previews against it, and no file is read; with
+    none passed, each call builds the view and reads the file again (BACKLOG #6820)."""
+    loads = _counting_loader(monkeypatch)
     csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
     reg = _ref_graph(csv)
     reg.handlers["h"] = lambda m: [Send("OB_REF", reference("provider_npi")["MED1"])]
+    ic = reg.inbound["IB_REF"]
 
-    first = [route_message(reg, reg.inbound["IB_REF"], _REF_RAW) for _ in range(3)]
-    assert [o.deliveries[0].payload for o in first] == ["9991"] * 3
-    assert len(loads) == 1
+    view = {"provider_npi": {"MED1": "PASSED"}}
+    passed = [route_message(reg, ic, _REF_RAW, reference_view=view) for _ in range(2)]
+    assert [o.deliveries[0].payload for o in passed] == ["PASSED", "PASSED"]
+    assert loads == []
 
-    _csv(csv, "code,npi\nMED1,9992222\n")
-    stat = csv.stat()
-    os.utime(csv, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
-    again = route_message(reg, reg.inbound["IB_REF"], _REF_RAW)
-    assert again.deliveries[0].payload == "9992222"
-    assert len(loads) == 2
+    built = [route_message(reg, ic, _REF_RAW) for _ in range(2)]
+    assert [o.deliveries[0].payload for o in built] == ["9991", "9991"]
+    assert loads == [str(csv), str(csv)]
 
 
-def test_dryrun_reference_containers_are_fresh_per_preview(
+def test_check_reads_each_reference_file_once_per_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A cached set hands each preview its own copy of a container value, so a Handler that edits
-    one in a fixture does not change what the next fixture reads (BACKLOG #6820)."""
-    from messagefoundry.pipeline import dryrun
+    """`check` previews every fixture on every inbound, and each preview used to re-read and
+    re-parse every file-backed reference set (BACKLOG #6820). It now builds the view once per run:
+    three fixtures read the file once, and each still reads the set."""
+    from messagefoundry import checks
 
-    monkeypatch.setattr(dryrun, "_reference_file_cache", {})
-    toml = tmp_path / "npi.toml"
-    toml.write_text('MED1 = ["9991"]\n', encoding="utf-8")
-    reg = _ref_graph(toml)
-    seen: list[list[str]] = []
+    loads = _counting_loader(monkeypatch)
+    csv = _csv(tmp_path / "npi.csv", "code,npi\nMED1,9991\n")
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "from messagefoundry import Reference, FileRef, reference\n"
+        f"Reference('provider_npi', source=FileRef(path={str(csv)!r}))\n"
+        "inbound('IB_REF', File(directory='in'), router='r')\n"
+        "outbound('OB_REF', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m): return Send('OB_REF', reference('provider_npi')['MED1'])\n",
+        encoding="utf-8",
+    )
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    for n in range(3):
+        (msgs / f"m{n}.hl7").write_text(_REF_RAW, encoding="utf-8")
 
-    def handle(m: Message | RawMessage) -> list[Send]:
-        value = reference("provider_npi")["MED1"]
-        seen.append(list(value))
-        value.append("EDITED")
-        return [Send("OB_REF", m)]
-
-    reg.handlers["h"] = handle
-    for _ in range(2):
-        route_message(reg, reg.inbound["IB_REF"], _REF_RAW)
-    assert seen == [["9991"], ["9991"]]
+    result = checks._check_dryrun(cfg, msgs)
+    assert result.ok, result.detail
+    assert "3/3" in result.detail or "3 run" in result.detail, result.detail
+    assert loads == [str(csv)]

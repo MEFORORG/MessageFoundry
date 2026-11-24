@@ -1943,7 +1943,12 @@ def _check_dryrun(
 ) -> CheckResult:
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
+    from messagefoundry.pipeline.dryrun import (
+        _dry_run_reference_view,
+        dry_run,
+        fixture_cap,
+        read_message_sets,
+    )
     from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
@@ -2026,6 +2031,10 @@ def _check_dryrun(
     asserted = (
         0  # runs checked against a declared .expect disposition (executable acceptance criteria)
     )
+    # Built once for the whole run, so each file-backed reference set is read once rather than once
+    # per fixture per inbound (BACKLOG #6820). Every fixture then reads the same snapshot, as every
+    # message reads the live engine's sealed cache.
+    reference_view = _dry_run_reference_view(reg)
     for label, path, raw, target in message_sets:
         try:
             expected = _expected_disposition(path, cap=cap)
@@ -2037,7 +2046,13 @@ def _check_dryrun(
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=ic_name,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             # A Router/Handler's own `raise` can quote field values, so its text goes through
             # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
             # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in
