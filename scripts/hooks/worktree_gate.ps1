@@ -1234,15 +1234,16 @@ function Test-TrueSeparatorIn([string]$Text) {
 # and 4.6 s at origin/main in that round's run on that day's load, when a failure that was not kept
 # was asked again on every ask in both passes; the rewritten pass now asks it once per pass
 # (Invoke-GitRead's note). With the cache as it now
-# stands, one run of the seven TIMED shapes in tests/test_worktree_gate_added_command_readings.py on a
-# loaded Windows box on 2026-11-24, against the BASELINE commit 1983d8eb79a and against cf790ecc157
-# before the cache: 10.0 s (10.0 s, 51.5 s) for that existing-non-repository shape; 4.2 s (11.6 s,
-# 49.4 s) for nine lines whose `-C` paths name no directory, which review round 2c9e3d7a9b had timed
-# at 44.1 s; 2.1 s (1.0 s, 11.4 s) and 6.1 s (1.8 s, 17.8 s) for the two one-line nine-hoist shapes,
-# whose `-C` paths name no directory; and 2.7 s to 3.0 s (3.7 s to 12.3 s, 51.6 s to 60.0 s) for the
-# other three. The one-line shapes stay slower than BASELINE: each hoist asks git about a `-C` no
-# earlier pass named, and every hoist costs a pass of the rules over the text before its cut. These
-# are single runs on one box, not bounds.
+# stands, keeping no failure for the run (Lander hold of 2026-11-24), one run of the seven TIMED shapes
+# in tests/test_worktree_gate_added_command_readings.py on a heavily loaded Windows box on 2026-11-24,
+# against the BASELINE commit 1983d8eb79a and against cf790ecc157 before the cache: 30.3 s (21.9 s,
+# 97.8 s) for that existing-non-repository shape; 24.5 s (17.5 s, 62.2 s) for nine lines whose `-C`
+# paths name no directory, which review round 2c9e3d7a9b had timed at 44.1 s; 11.9 s (2.1 s, 16.7 s)
+# and 14.4 s (5.2 s, 21.9 s) for the two one-line nine-hoist shapes, whose `-C` paths name no
+# directory; and 2.7 s to 6.5 s (2.3 s to 18.4 s, 53.1 s to 85.1 s) for the other three. The first two
+# passed the 20 s proof wait in that run, and BASELINE passed it on the first. The shapes whose `-C`
+# fails stay slower than BASELINE: each such failure is asked again, and every hoist costs a pass of
+# the rules over the text before its cut. These are single runs on one box, not bounds.
 # A run past the shell entry's 20 s proof wait makes the entry start its own gate run, so the wait
 # and that run share the 60 s timeout, and past it a slow run blocks the command rather than letting
 # it through (install-gate.ps1 installs `onFailure = block`).
@@ -3289,9 +3290,7 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
 # rule for a failed answer is in the function's note. The hook runs before the tool call, so nothing
 # it judges has run yet; another process could still change the repository during the run. A kept
-# answer hides such a change from later asks, which uncached calls would have seen: a kept success,
-# and a failure kept on a missing plain path that becomes reachable during the run, for example a
-# mapped drive that reconnects (review round 62fa86c0fa).
+# success hides such a change from later asks, which uncached calls would have seen.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 # The rewritten pass's own failures, replayed only in that pass; Invoke-GitRead's note says why.
 $gitReadRewrittenFailures = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3312,12 +3311,8 @@ function Invoke-GitRead([object[]]$GitArgs) {
     }
     $key = $keyArgs -join [char]0
     # WHAT IS KEPT. A success, an exit code of 0 with at least one output line (which may be blank),
-    # is kept for the run. A failure is kept only where the first `-C` is a PLAIN absolute path -- a
-    # drive letter and a separator on Windows, a `/` elsewhere, with no `.` or `..` segment -- and .NET
-    # finds no directory there: for that shape .NET and git read the path alike, git cannot answer, and
-    # the command that might create it has not run. A device spelling (`\\?\X:\..\C:\<dir>`,
-    # `\\?\C:/<dir>`) is excluded because .NET reports it missing while git enters it, so keeping its
-    # failure allowed a hijack origin/main refused (review round a9c38332ff). Any other failure, or an
+    # is kept for the run. A failure is never kept for the run: in the given pass it is asked again on
+    # every ask, as origin/main asks it. A failure, or an
     # answer with no line, is asked again on every ask in the given pass, as with no cache and as
     # origin/main asked it, so one spawn that failed under load does not stand for a later ask there
     # that could read the answer and deny. In the rewritten pass a failure is asked on that pass's
@@ -3343,15 +3338,6 @@ function Invoke-GitRead([object[]]$GitArgs) {
     $out = @(& git @GitArgs 2>$null)
     $code = $LASTEXITCODE
     $keep = $code -eq 0 -and $out.Count -gt 0
-    if (-not $keep -and $code -ne 0) {
-        $c = [Array]::IndexOf($GitArgs, '-C')
-        if ($c -ge 0 -and $c + 1 -lt $GitArgs.Count) {
-            $dir = $GitArgs[$c + 1]
-            $plainAbs = $(if ($IsWindows) { '\A[A-Za-z]:[\\/](?![\\/])' } else { '\A/(?!/)' })
-            $keep = $dir -match $plainAbs -and $dir -notmatch '(?:^|[\\/])\.{1,2}(?:[\\/]|\z)' -and
-                -not [System.IO.Directory]::Exists($dir)
-        }
-    }
     if ($keep) { $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
     elseif ($script:gitReadPass -eq 'rewritten') { $gitReadRewrittenFailures[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
     $global:LASTEXITCODE = $code

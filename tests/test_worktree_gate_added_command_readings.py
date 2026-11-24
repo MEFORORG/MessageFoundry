@@ -440,7 +440,7 @@ def test_a_failed_answer_on_a_device_spelling_is_asked_again(
     """.NET reports these spellings of the worktree missing while git enters them (review round a9c38332ff).
 
     A failure was kept wherever .NET found no directory, so one failed `worktree list` ask let the
-    hijack through that origin/main refused on its second ask. Only a plain absolute path is kept now.
+    hijack through that origin/main refused on its second ask. No failure is kept for the run now.
     """
     state = _install_stub_git(tmp_path, monkeypatch, 1, "worktree list")
     win = str(rig.wt).replace("/", "\\")
@@ -491,13 +491,15 @@ def test_a_failed_absolute_common_dir_is_asked_again(
     assert asks > 1, f"the stub was asked {asks} times, so no second ask was measured"
 
 
-def test_a_failure_on_a_missing_plain_path_is_asked_once(
+def test_a_failure_on_a_missing_plain_path_is_asked_again(
     rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A `-C` that is a plain absolute path naming no directory keeps its failure for the run.
+    """A failure on a `-C` that is a plain absolute path naming no directory is not kept for the run.
 
-    Without that, each hoist re-asked the failing questions of the lines before it: 44.1 s for nine
-    lines (review round 2c9e3d7a9b). Git's trace2 log counts the asks per argument list.
+    .NET's Directory.Exists also reads false on a transient SMB or network error, a sharing violation
+    or access denied, so keeping that failure let one transient failure on a mapped drive stand for
+    the run where origin/main asks again (Lander hold of 2026-11-24). Git's trace2 log counts the asks
+    per argument list.
     """
     trace = tmp_path / "trace2.log"
     lines = [f"echo line{i} $(git -C {{o}}/m{i} checkout -q y{i})" for i in range(9)]
@@ -517,7 +519,7 @@ def test_a_failure_on_a_missing_plain_path_is_asked_once(
     missing = Counter(a for a in starts if re.search(r"[\\/]m\d", a))
     assert len(missing) >= 9, f"{len(missing)} missing-directory questions: the lines were not read"
     repeated = {argv: n for argv, n in missing.items() if n > 1}
-    assert not repeated, f"a kept failure was asked again: {repeated}"
+    assert repeated, f"no failure on a missing directory was asked again: {dict(missing)}"
 
 
 _FILLER = "abcdefghij " * 2700
