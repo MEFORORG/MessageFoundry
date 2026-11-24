@@ -200,8 +200,9 @@ class ServiceEnvPosture:
     #: as part of that variable. Where it does, the doubt step then
     #: leaves as it is each string that holds a refused variable or that one's value runs on
     #: into, and each string whose take-out, alone or beside the others, would change how the
-    #: reader reads a refused variable, so no value goes before the step that moves it. The
-    #: remedy alone reads this.
+    #: reader reads a refused variable, so no value goes before the step that moves it, as far
+    #: as that check sees a change: it misses at least one that only changes how many identical
+    #: readings there are. The remedy alone reads this.
     directory_in_refused: bool = False
     #: Whether any AppEnvironmentExtra string is one install-service.ps1 reads as setting
     #: ``MEFOR_SECRETS_DIRECTORY`` (:func:`_installer_reads`), so the doubt step may leave such a
@@ -1048,7 +1049,11 @@ def _take_out_changes_refused(
     the step leaves as it is each string that holds a refused variable or that one's value runs
     on into (the Lander's hold on PR 3142, comment 7116005396, F3), and each string whose
     take-out, alone or beside the others, would change such a reading (the Lander's hold on PR
-    3142, comment 7119680463, item 3). The remedy alone reads this."""
+    3142, comment 7119680463, item 3). It compares the readings as sets, so it does not see a
+    take-out that only changes how many identical readings there are, such as one that stops a
+    reading which a twin with the same registry value, name and value still makes; the step
+    then leaves no string for that (the Lander's hold on PR 3142, comment 7122889682, item 2).
+    The remedy alone reads this."""
     return _refused_readings(variables) != _refused_readings(_variables(_taken_out(entries)))
 
 
@@ -1506,8 +1511,10 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         # below a refused name written alone or set to nothing only a refused line ends it,
         # erring past the reader's fail-closed rule (_ends_blank_class); every other line of a
         # string whose first non-blank line names a refused variable is part of it, as the
-        # whole-string reading holds them, and the reader skips leading blank lines (the
-        # Lander's hold on PR 3142, comment 7122889682, item 1); and below any other line of one
+        # whole-string reading holds them where that line sets the name, and the reader skips
+        # leading blank lines (the Lander's hold on PR 3142, comment 7122889682, item 1); where
+        # that line is a name written alone, the rule errs past the reader, which may end the
+        # value at a line below it; and below any other line of one
         # the doubt step's rule ends it. It also takes, until none is left, the strings whose
         # refused variables removing the others would read differently (the Lander's hold on PR
         # 3142, comment 7119680463, items 1 and 3; code review rounds 1 and 2 on that repair).

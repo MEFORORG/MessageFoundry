@@ -713,9 +713,11 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         {"MEFOR_VALUE_A": "SEKRITa", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
         False,
     ),
-    # The Lander's hold on PR 3142, comment 7122889682, item 1: a blank first line, then a
-    # refused name. The reader skips the blank line, so every line below the name is part of
-    # its value, SEKz43=Q a line of the private key's among them, and none is added back.
+    # The Lander's hold on PR 3142, comment 7122889682, item 1, as the Lander reproduced it: a
+    # blank first line, then a name the refusal is about. The reader skips the blank line, so
+    # every line below the name is part of its value, SEKz43=Q a line of the private key's
+    # among them, and none is added back. This value reads as a path, so the refusal does not
+    # list the key; the next case's does.
     "blank-first-line-above-a-refused-name": (
         [
             (
@@ -727,6 +729,24 @@ _CASES: dict[str, tuple[list[tuple[str, str]], frozenset[str], dict[str, str], b
         ],
         frozenset({"mefor_secrets_directory=SEKRITpw"}),
         {"MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY": "SEKoidc42", "MEFOR_STORE_PASSWORD": "SEKRITpw"},
+        False,
+    ),
+    # The same shape with a key the refusal lists, a PEM-style header leading its value.
+    "blank-first-line-above-a-listed-private-key": (
+        [
+            (
+                _EXTRA,
+                "\nMefor_Auth_Oidc_Client_Private_Key=-----BEGIN SYNTHETIC TEST KEY-----\nSEKz43=Q\n"
+                "MEFOR_STORE_PASSWORD=",
+            ),
+            (_EXTRA, "mefor_secrets_directory=SEKRITpw"),
+            (_APP, " MEFOR_SECRETS_DIRECTORY=C:\\e"),
+        ],
+        frozenset({"mefor_secrets_directory=SEKRITpw"}),
+        {
+            "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY": "-----BEGIN SYNTHETIC TEST KEY-----",
+            "MEFOR_STORE_PASSWORD": "SEKRITpw",
+        },
         False,
     ),
     # The same hold, item 2: the same shape adds back no ordinary line the reader held as part
@@ -825,6 +845,10 @@ _READ_OUT = {
     "empty-key-rejoins-an-ordinary-line": {"MEFOR_VALUE_B"},
     "ordinary-line-in-a-string-led-by-a-refused-name": {"MEFOR_VALUE_A", "MEFOR_STORE_PASSWORD"},
     "blank-first-line-above-a-refused-name": {
+        "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
+        "MEFOR_STORE_PASSWORD",
+    },
+    "blank-first-line-above-a-listed-private-key": {
         "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY",
         "MEFOR_STORE_PASSWORD",
     },
