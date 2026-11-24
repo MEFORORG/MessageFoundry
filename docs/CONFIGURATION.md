@@ -41,20 +41,35 @@
 > `MEFOR_SECRET_ROTATION_WARN_DAYS=0` used to change nothing and say nothing. The four sections
 > are listed under [Mechanism](#mechanism). Set them in the file.
 >
+> **A name that is a section and nothing else is refused too**, such as `MEFOR_UPDATE_CHECK=false`,
+> `MEFOR_STORE` or `MEFOR_STORE_`. No setting has that name. The refusal names the variable, never
+> its value, and says how a setting in that section is spelled, or that the section is set in the
+> file. The same variable is also logged as a WARNING before the load refuses an unknown key, so a
+> refused file key does not hide it until the next start. A settings file that cannot be read or
+> parsed is refused before that WARNING.
+>
 > **A variable that names no section is not refused. Some are warned about, and the rest are
 > dropped with no message.** The loader cannot tell a typo in the SECTION part from the `MEFOR_*`
 > variables that belong to no section, such as `MEFOR_ALLOW_INSECURE_TLS`, or from a name another
-> tool owns. So it logs a WARNING, naming the variable and never its value, for at least these two
-> shapes, and the load goes on without the setting:
+> tool owns. So it logs a WARNING, naming the variable and never its value, for at least this
+> shape, and the load goes on without the setting:
 >
-> - a name that is a section and nothing else, such as `MEFOR_UPDATE_CHECK=false` or `MEFOR_STORE`;
-> - a name whose first part is close to a section and whose remainder is a real setting of that
->   section, such as `MEFOR_STOER_PATH`. The warning offers the name you probably meant. For a setting one string cannot fill, such
->   as a list of tables or a dict, it names the `[section].key` to set in the file instead.
+> - a name whose first part is close to a section and whose remainder is a real setting of the
+>   closest such section, such as `MEFOR_STOER_PATH`, or the rest of a documented variable read
+>   outside the settings model, such as `MEFOR_STOER_VAULT_ADDR`. The warning offers the name you
+>   probably meant. For a setting one string cannot fill, such as a list of tables or a dict, it
+>   names the `[section].key` to set in the file instead.
 >
-> At least these are still dropped with no message: a name close to no section, and a name with a
-> typo in both parts (`MEFOR_STOER_PATHH`). Nothing checks a key in the CLI layer of
+> At least these are still dropped with no message: a name close to no section, a name with a
+> typo in both parts (`MEFOR_STOER_PATHH`), and a name whose remainder is a setting of a section
+> other than the closest one (`MEFOR_SECURE_REQUIRE_MFA`, where `secure` is closest to
+> `[secrets]`). Nothing checks a key in the CLI layer of
 > `load_settings` either; the `messagefoundry` command builds that layer from its own flags.
+>
+> **A typo that makes the leading parts of a name another real section is read as that section.**
+> `MEFOR_SECRETS_ROTATION_WARN_DAYS`, typed for `MEFOR_SECRET_ROTATION_WARN_DAYS`, is refused as an
+> unknown `[secrets]` key, and the refusal does not point toward `[secret_rotation]`.
+> `MEFOR_AI_HOST`, typed for `MEFOR_API_HOST`, is refused as an unknown `[ai]` key.
 >
 > **A secret reference names a variable of your choosing, and that variable is spared.** Under
 > `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name
