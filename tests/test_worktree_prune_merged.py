@@ -2959,54 +2959,64 @@ def test_a_gone_entry_stays_in_the_ledger_while_a_claim_may_name_it(
     assert settled["_exit"] == 0
 
 
-@pytest.mark.parametrize("case", ["another-pc", "this-machine-gone", "this-machine-back"])
-def test_the_held_entry_notice_names_the_host_and_forces_only_what_claim_list_would(
-    fx: Fixture, sleeper: int, tmp_path: Path, case: str
+@pytest.mark.parametrize(
+    ("host", "shown"),
+    [("OTHER-PC", "OTHER-PC"), (None, "<no host>"), (42, "<unreadable host>")],
+)
+def test_the_held_entry_notice_names_the_host_and_prints_no_release_command(
+    fx: Fixture, sleeper: int, host: object, shown: str
 ) -> None:
     """Red on 2d4ef04485: the notice printed one `claim.ps1 -Release '<key>' -Force` recipe for every
     held entry and no host, so it told the operator to force-release another PC's claim from here.
-    Each claim now shows its host. Another PC's gets no -Force recipe. This machine's keeps it only
-    where `claim.ps1 -List` would read the holder as gone; a holder path that is back gets pointed
-    at -List instead. The path comes back between the ledger read and the notice through the git
-    shim, which is the only way a test can reach that case."""
+    Whether a claim can be released is claim.ps1's call, so the notice now prints no release command
+    for any claim; it names the key, the file and the host, and points at claim.ps1 -List. The text
+    and the receipt write the host the same way, a missing or non-string one included."""
     live_record(fx, sleeper, fx.primary)
     tree = fx.sibling("deleted")
     _write_orphan_ledger(fx, tree)
     claim = write_claim(fx, "deleted-work", tree)
-    if case == "another-pc":
+    if host is not None:
         rec = json.loads(claim.read_bytes())
-        rec["host"] = "OTHER-PC"
+        rec["host"] = host
         claim.write_bytes(json.dumps(rec).encode("utf-8"))
 
-    if case == "this-machine-back":
-        shim = _git_shim(
-            tmp_path,
-            f"    New-Item -ItemType Directory -Force -Path '{tree}' | Out-Null",
-        )
-        proc = run_text(fx, "-Apply", "-IdleHours", "0", path_prepend=shim)
-    else:
-        proc = run_text(fx)
+    proc = run_text(fx)
+    receipt = run(fx)
 
     assert claim.exists(), "the notice released a claim"
     text = proc.stdout
     start = text.find("ledger entr(ies) kept for a tree read as gone")
     assert start >= 0, text
     notice = text[start:]
+    assert "-Release" not in notice, notice
+    assert "-Force" not in notice, notice
     claim_lines = [ln for ln in notice.splitlines() if "claim 'deleted-work'" in ln]
     assert len(claim_lines) == 1, notice
     line = claim_lines[0]
-    if case == "another-pc":
-        assert "OTHER-PC" in line, line
-        assert "-Release" not in notice, notice
-        assert "from OTHER-PC" in line, line
-    elif case == "this-machine-gone":
-        assert "this machine" in line, line
-        assert "claim.ps1 -Release 'deleted-work' -Force" in line, line
-    else:
-        assert tree.exists(), "CONTROL: the shim put the holder path back"
-        assert "this machine" in line, line
-        assert "-Release" not in line, line
-        assert "claim.ps1 -List" in line, line
+    assert claim.name in line, line
+    assert f"host {shown}:" in line, line
+    assert "claim.ps1 -List" in line, line
+    assert "leaves the ledger on the next -Apply once no claim names its tree" in notice, notice
+    assert "could not be read in full stays" not in notice, notice
+    held = receipt["ledger"]["heldForClaims"]
+    assert [c["host"] for h in held for c in h["claims"]] == [shown], held
+
+
+def test_the_held_entry_footer_for_an_unreadable_registry_does_not_promise_it_clears(
+    fx: Fixture, sleeper: int
+) -> None:
+    """An entry held because a claim file could not be read was never named by a claim, so the
+    footer must not say it clears once no claim names its tree; it says what holds it instead."""
+    live_record(fx, sleeper, fx.primary)
+    _write_orphan_ledger(fx, fx.sibling("deleted"))
+    (_claims_dir(fx) / "corrupt.json").write_bytes(b"{not json at all")
+    notice = run_text(fx).stdout
+    start = notice.find("ledger entr(ies) kept for a tree read as gone")
+    assert start >= 0, notice
+    notice = notice[start:]
+    assert "could not be read in full stays" in notice, notice
+    assert "An entry a claim names" not in notice, notice
+    assert "-Release" not in notice, notice
 
 
 def test_a_gone_entry_with_no_claim_still_clears_on_apply(fx: Fixture, sleeper: int) -> None:
