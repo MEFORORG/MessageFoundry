@@ -2663,13 +2663,6 @@ class StageDispatcher:
         st = self._states.get(key)
         return st is not None and st.phase is _LanePhase.STOPPED
 
-    def mid_episode(self, key: str) -> bool:
-        """Whether ``key`` is CLAIMING or PROCESSING: an episode is running that can still end in a
-        STOP, so a STOP site may have recorded a hold for a lane not yet STOPPED. False for an
-        unknown lane."""
-        st = self._states.get(key)
-        return st is not None and st.phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING)
-
     def stopped_holding_rows(self, key: str) -> bool:
         """Whether ``key`` is STOPPED by an episode that ended with claimed rows still in flight,
         whose re-pend did not land (BACKLOG #5704). Whether a re-arm would claim past them is
