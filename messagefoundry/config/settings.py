@@ -7759,15 +7759,14 @@ class DrSettings(_Section):
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
     # backup destination — no new egress). With seed_dir also empty, a passive box (enabled, with
     # activate = false) is refused at load: no activation could ever name a seed (BACKLOG #5965 item
-    # 1). A box latched with activate = true loads with neither set, since the latch reads no seed,
-    # but once POST /dr/release hands it back it cannot re-activate through POST /dr/activate until
-    # a seed is configured. Whitespace-only is refused too.
+    # 1). A box latched with activate = true loads with neither set; what that means after POST
+    # /dr/release is stated once, in the [dr] enabled row of docs/CONFIGURATION.md. Whitespace-only
+    # is refused too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
     # which is operator configuration and is not confined. Must be absolute. A URL is
-    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load,
-    # and a box latched with activate = true loads but cannot re-activate after POST /dr/release;
+    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load;
     # see seed_archive above (BACKLOG #5965). Whitespace-only is refused too.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small

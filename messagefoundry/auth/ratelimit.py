@@ -202,9 +202,10 @@ class SlidingWindowRateLimiter:
         if self._per_key and len(bucket) >= self._per_key:
             # Room opens when the oldest hit ages out. ``allow`` never grows a bucket past a
             # positive budget, and a negative budget admits one hit and then refuses, so the
-            # oldest hit is always the one holding the count at the budget. No setting can now
-            # hand this class a negative count: the load refuses one for the sign-in and PHI-read
-            # keys (BACKLOG #5318), which also feed the ceremony and audit-row limiters, and for
-            # the admin-write count (BACKLOG #3293).
+            # oldest hit is always the one holding the count at the budget. No [auth] setting can
+            # now hand this class a negative count: the load refuses one for the sign-in keys,
+            # which also feed the ceremony and audit-row limiters, and for the PHI-read keys
+            # (BACKLOG #5318), and for the admin-write count (BACKLOG #3293). The intake-auth
+            # budgets are refused separately, when their connection is built.
             wait = max(wait, bucket[0] - (now - self._window))
         return max(wait, 0.0)
