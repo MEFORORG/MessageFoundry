@@ -406,15 +406,29 @@ def test_after_a_real_reset_an_idle_lower_reading_keeps_the_gone_window(tmp_path
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
     assert read(tmp_path)[0] == UNKNOWN
 
-    # A higher number than the gone window's is no better evidence: an idle session's frozen 95 for
-    # the new window is refused too.
-    _session_fire(tmp_path, {**new, "used_percentage": 95.0}, "other", 1000)
+    # An equal number is refused too: it is no rise, so it is no evidence of a new window.
+    _session_fire(tmp_path, {**new, "used_percentage": 91.0}, "other", 1000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(91.0)
+    assert len(history(tmp_path)) == 1
 
     # CONTROL. A live session's reading of the new window replaces the gone one.
     _session_fire(tmp_path, new, "idle", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(2.0)
     assert read(tmp_path)[0] == OK
+
+
+def test_after_a_real_reset_an_idle_higher_reading_replaces_the_gone_window(tmp_path: Path) -> None:
+    """BACKLOG #5178, past the published reset. Only a lower or equal idle reading is refused there. A
+    higher one replaces the gone window from any session, as on main: a gone 50 and an idle session's
+    99 for the new window publish 99, which reads at the ceiling, so the gate halts rather than
+    answering REVIEW on the gone window."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 50.0, "resets_at": now - 300}, "live", 1000)
+    assert read(tmp_path)[0] == UNKNOWN, "control: the gone window reads UNKNOWN"
+    _session_fire(tmp_path, {"used_percentage": 99.0, "resets_at": now + 500000}, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(99.0)
+    assert [r["seven_day"] for r in history(tmp_path)] == [50.0, 99.0]
+    assert read(tmp_path)[0] == CRITICAL
 
 
 def test_a_live_session_of_another_root_cannot_lower_this_roots_window(tmp_path: Path) -> None:

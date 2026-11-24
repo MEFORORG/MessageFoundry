@@ -341,7 +341,8 @@ try {
     # THE RULE NEEDS A PUBLISHED WINDOW TO COMPARE WITH. At least these gone readings are published and
     # reach the history: one on an empty directory, one over a window stamped with another root or with
     # no reset, one higher than the published window for the same gone reset, and one with a later reset
-    # than the published window from a live session of this root. Nothing here reads the clock against a lone reading. The reader reports
+    # than the published window that is higher than it or comes from a live session of this root.
+    # Nothing here reads the clock against a lone reading. The reader reports
     # any window past its reset as UNKNOWN with no percentage, so its level is not graded. Its history
     # row can still be read: with no current reset, usage.ps1's rate cannot filter its rows by reset,
     # so it refuses the rate only where those rows change reset or fall.
@@ -365,11 +366,12 @@ try {
     # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
     # frozen number replaced the published one on every fire. So it needs a session that has just
     # called the API and is stamped with this root, as a confirmation must be. A higher reading is
-    # taken from anyone while the published reset is ahead, because refusing it could clear a stop.
-    # Once the published reset has passed, any reading on another reset needs a live session: the gone
-    # window reads UNKNOWN, so keeping it costs a REVIEW, while an idle session's frozen number for the
-    # new window could read OK, whatever last week's level was. A first fire is never live, so the gone
-    # window stands until a live session of this root reports the new one.
+    # taken from anyone, before or after the published reset, because refusing it weakens a stop: while
+    # that reset is ahead the lower published number could clear the gate, and past it the gone window
+    # reads UNKNOWN, so the gate would answer REVIEW where the higher number halts it. Past
+    # the published reset, a lower or equal idle reading is still refused, because its frozen number
+    # for the new window could read OK on a pool since spent; keeping the gone window costs a REVIEW.
+    # A first fire is never live, so such a reading waits for a live session of this root.
     #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
@@ -393,8 +395,7 @@ try {
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
             $live = $calledApi -and $stampOwn
             ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not $live)) -or
-            ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch) -or
-            ($seenEpoch -ne $publishedEpoch -and $publishedEpoch -le $nowEpoch -and -not $live)
+            ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
         $confirmed = $calledApi -and $stampOwn -and
