@@ -2364,9 +2364,13 @@ the same permission set on the same method reds CI until it is listed here.
 > by a reload. `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
 > `tests/test_multishard_smoke.py` runs the wrong-engine cause on `GET /connections/{name}/metadata`
 > only, against two plain `serve` processes
-> over one store, each with its own graph and API port. It is not run under `serve --shard`, whose
-> engine shards split one config, so on engine shards that cause is read from the code (BACKLOG
-> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> over one store, each with its own graph and API port.
+> `tests/test_engine_shard_wrong_shard_403.py` runs it on engine shards: two engines of one config,
+> each on the graph `filter_registry_for_shard` gives it as `serve --shard` does, over one store,
+> answering in process. It pins the metadata 403 and its denial row on both engine shards, and the
+> flag route writing the flag for a sibling engine shard's inbound, as the flag paragraph below says.
+> It does not run `serve --shard` subprocesses, which refuse SQLite with more than one engine shard
+> (BACKLOG #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
 > direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
