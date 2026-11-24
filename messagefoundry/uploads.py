@@ -301,6 +301,12 @@ def _not_a_plain_file(path: Path) -> str | None:
         info = path.lstat()
     except OSError:
         return None
+    return _plain_refusal(info)
+
+
+def _plain_refusal(info: os.stat_result) -> str | None:
+    """Why the file an ``lstat`` result describes must not be read, as :func:`_not_a_plain_file`
+    words it, or ``None`` when it is a regular file."""
     if _names_a_link(info):
         return "it is a link and was not followed"
     if not _is_regular(info):
@@ -383,6 +389,16 @@ class _NotPlainError(OSError):
     ``OSError``, so each reader treats it as it treats a file it could not read."""
 
 
+class _RefusedBeforeOpen(_NotPlainError):
+    """A :class:`_NotPlainError` raised by :func:`_open_plain`'s own ``lstat``, before any open:
+    ``reason`` is :func:`_plain_refusal`'s. The listing scan reads it rather than making that
+    ``lstat`` itself (BACKLOG #5552 item 8)."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path.name} is not a plain file")
+        self.reason = reason
+
+
 def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     """The regular file ``path`` open for reading, without following a link, and its ``fstat``
     (BACKLOG #5387 added item 1). The caller closes it.
@@ -419,8 +435,9 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         unreached = codec_safe_str(exc)
     if unreached is not None:
         raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
-    if _names_a_link(before) or not _is_regular(before):
-        raise _NotPlainError(f"{path.name} is not a plain file")
+    refused = _plain_refusal(before)
+    if refused is not None:
+        raise _RefusedBeforeOpen(path, refused)
     met: tuple[_Recheck, str] | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
@@ -1906,17 +1923,20 @@ class UploadStore:
         for fid, entry in self._iter_sidecars():
             if sink is not None:
                 bodies.add(f"{fid}{_BLOB_SUFFIX}")
-            refused = _not_a_plain_file(entry)
-            if refused is not None:
-                if self._link_logged.first(f"scan {fid} {refused}"):
-                    _log.warning("uploaded-file sidecar %s: %s, so it was not read", fid, refused)
-                continue
             classify = False
             broken = False
             stored = ""
             try:
                 stored = _read_sidecar(entry)
                 out.append(self._decrypt_meta(stored, fid))
+            except _RefusedBeforeOpen as exc:
+                # The open's own lstat refused it, so the scan makes none of its own under
+                # _quota_lock (BACKLOG #5552 item 8).
+                if self._link_logged.first(f"scan {fid} {exc.reason}"):
+                    _log.warning(
+                        "uploaded-file sidecar %s: %s, so it was not read", fid, exc.reason
+                    )
+                continue
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
                     # Its own line, so an outage never reads as the refusal logged below. Logged
@@ -1975,10 +1995,13 @@ class UploadStore:
                 self._body_checks.pop(name, None)
         return out
 
-    def _report_tag_failure(self, fid: str, stored: str, exc: CipherError) -> None:
-        """Raise the cipher's tag-failure alert for sidecar ``fid`` when ``exc`` is its AEAD tag
-        failing under a key the cipher holds, once per upload per :data:`_REPORT_INTERVAL_S`
-        and only while its hook is armed (BACKLOG #5553). The tests are ``store/cell_tag.py``'s
+    def _report_tag_failure(
+        self, fid: str, stored: str, exc: CipherError, part: str = "sidecar"
+    ) -> None:
+        """Raise the cipher's tag-failure alert for upload ``fid``'s ``part``, its sidecar or its
+        body, when ``exc`` is that part's AEAD tag failing under a key the cipher holds, once per
+        part per upload per :data:`_REPORT_INTERVAL_S` and only while its hook is armed (BACKLOG
+        #5553; the body by :meth:`read_bytes`, BACKLOG #5552 item 6 (a)). The tests are ``store/cell_tag.py``'s
         ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
@@ -1998,11 +2021,11 @@ class UploadStore:
             return
         holds = getattr(cipher, "holds_key_for", None)
         held = holds(stored) if callable(holds) else getattr(cipher, "names_no_keys", False) is True
-        if not (held and _tag_reported.first(fid)):
+        if not (held and _tag_reported.first(f"{part} {fid}")):
             return
         report(
             "uploaded_file",
-            f"an uploaded-file sidecar failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
+            f"an uploaded-file {part} failed its integrity tag (upload {fid[:_TAG_REF_LEN]})",
         )
 
     def _unsealable_sync(self, fid: str, sidecar: Path) -> _UnsealableUpload | None:
@@ -3119,10 +3142,12 @@ class UploadStore:
             _refuse_unplain(file_id, "body", blob_path)
             kind: _ReadRefusal = "damaged"
             unreached: str | None = None
+            stored = ""
             try:
                 # No size cap: a sound body stored under a larger max_upload_bytes is still
                 # served, as the reseal pass keeps it too.
-                return self._decrypt_blob(_read_plain_text(blob_path), file_id)
+                stored = _read_plain_text(blob_path)
+                return self._decrypt_blob(stored, file_id)
             except _UnreachableError as exc:
                 unreached = codec_safe_str(exc)
             except FileNotFoundError as exc:
@@ -3130,6 +3155,9 @@ class UploadStore:
             except CipherUnavailableError as exc:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
+                # A body under a held key whose tag fails is reported as a sidecar is
+                # (BACKLOG #5552 item 6 (a)).
+                self._report_tag_failure(file_id, stored, exc, part="body")
                 raise UploadUnreadableError(str(exc)) from exc
             except OSError as exc:
                 # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error
