@@ -212,13 +212,11 @@ class KillCause(str, enum.Enum):  # noqa: UP042
     #: The worker answered that it ran out of memory and exits, so it is reaped (vault BACKLOG #3133).
     MEMORY_CAP = "memory_cap"
     #: The worker loaded a graph that differs from the engine's. No WARNING here: the runner logs
-    #: and raises the ``sandbox_worker_refused`` alert for a refusal from the session still serving
-    #: the inbound, against a graph equal to the one it serves. A refusal from a session a reload
-    #: has discarded, or against an unequal graph, gets neither: the runner re-runs its message on a
-    #: fresh session, whose refusal does (BACKLOG #6830). This record does not outlast it: the
-    #: reload discards this session. That kill then writes no line of its own,
-    #: though its reap can (see :func:`_reap_process_tree`); only the refused dispatch's own error
-    #: reaches the runner's internal-error policy.
+    #: and raises the ``sandbox_worker_refused`` alert for this refusal, unless it finds the refusal
+    #: overtaken (``RegistryRunner._sandboxed_dispatch`` says when, BACKLOG #6830), in which case it
+    #: does neither and runs the message again. That kill writes no line of its own, though its
+    #: reap can (see :meth:`SandboxSession._reap`); only the refused dispatch's own error, when it
+    #: is not overtaken, reaches the runner's internal-error policy.
     GRAPH_MISMATCH = "graph_mismatch"
     #: The boot frame could not be written to the new worker.
     BOOT_WRITE = "boot_write"

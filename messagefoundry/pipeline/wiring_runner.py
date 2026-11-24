@@ -7466,12 +7466,12 @@ class RegistryRunner:
         #2724, owner ruling 2026-10-16: alert, keep dead-letter). Only the refusal that compared the
         graphs raises it; the session's cached refusals for later messages do not.
 
-        **A refusal that a reload overtook is a close, not a refusal** (BACKLOG #6830): one from a
-        session a reload or a rollback has since discarded, or compared with a graph unequal to the
-        one now served. :meth:`_sandboxed_dispatch` raises it as :class:`SandboxSessionClosed`, so it
-        is retried or re-pended exactly as above, raises no alert and is not dead-lettered. The
-        message's next run compares on a session that is serving, and that refusal, if the cause
-        still stands, is the one that alerts, whether or not any further message arrives."""
+        **An overtaken refusal is a close, not a refusal** (BACKLOG #6830):
+        :meth:`_sandboxed_dispatch` says which refusals are overtaken, and raises each as
+        :class:`SandboxSessionClosed`, so it is retried or re-pended exactly as above, raises no
+        alert and is not dead-lettered. The message's next run compares again, and that refusal,
+        if the cause still stands, is the one that alerts, whether or not any further message
+        arrives."""
         try:
             try:
                 return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
@@ -7479,7 +7479,8 @@ class RegistryRunner:
                 if self._stop.is_set() or self.registry is not registry:
                     raise
                 log.info(
-                    "inbound %r: its sandbox worker was recycled mid-dispatch; retrying",
+                    "inbound %r: its sandbox worker was recycled mid-dispatch, or a reload "
+                    "overtook its refusal; retrying",
                     name,
                 )
                 return await self._sandboxed_dispatch(name, fn, registry, *args, **kwargs)
@@ -7508,12 +7509,14 @@ class RegistryRunner:
     ) -> T:
         """One dispatch of :meth:`_off_loop_sandboxed`, on the session resolved for it now.
 
-        A :class:`SandboxWorkerRefused` a reload overtook is raised as :class:`SandboxSessionClosed`
-        (BACKLOG #6830): the session that raised it is no longer the one serving ``name``, because
-        a reload or a rollback discarded it, or the graph its worker was compared with is not equal
-        to the one served now. Neither the alert nor the dead-letter belongs to it: the reload may
-        have cleared the cause, and if not, the message's next run, on a session that is serving,
-        compares again and alerts once. The graph is compared by value, as the session's refusal
+        An overtaken :class:`SandboxWorkerRefused` is raised as :class:`SandboxSessionClosed`
+        (BACKLOG #6830). It is overtaken when the session that raised it is no longer the one
+        serving ``name``, which at least a reload, a rollback and a stop cause by discarding every
+        session, or when the graph its worker was compared with is not equal to the one served now.
+        Neither the alert nor the dead-letter belongs to it: what overtook it may have cleared the
+        cause, and if not, the message's next run compares again and alerts once. That run is on a
+        fresh session when the session was discarded, and on the same one, whose cache then misses,
+        when only the graph changed. The graph is compared by value, as the session's refusal
         cache is, so a swap of ``self.registry`` to an equal graph does not overtake a refusal.
         Checked on the loop with no await before the caller's alert, so a reload cannot discard
         the session between this check and that alert."""
@@ -7522,13 +7525,21 @@ class RegistryRunner:
             return await asyncio.to_thread(fn, registry, *args, sandbox=session, **kwargs)
         except SandboxWorkerRefused as exc:
             if session is not None and (
-                self._sandbox_sessions.get(name) is not session
-                or (exc.graph is not None and exc.graph != self._engine_graph_shape())
+                self._sandbox_sessions.get(name) is not session or self._overtaken(exc.graph)
             ):
                 raise SandboxSessionClosed(
                     f"inbound {name!r}: a reload overtook its sandbox worker's refusal"
                 ) from exc
             raise
+
+    def _overtaken(self, compared: GraphShape | None) -> bool:
+        """Whether a refusal against ``compared`` is against a graph unequal to the one served.
+        The identity test first: the served shape is cached per registry, so it is the same object
+        for every refusal on an unchanged graph, and the comparison by value is then skipped."""
+        if compared is None:
+            return False
+        served = self._engine_graph_shape()
+        return compared is not served and compared != served
 
     async def stop(
         self,
