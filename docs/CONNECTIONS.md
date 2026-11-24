@@ -290,9 +290,9 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 > the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
 > are delivered is unaffected. **Use an ordered container whenever order matters.**
 >
-> The execution tracer behind `dryrun --trace` (and the Test Bench that reads it) reads a Handler's
-> per-invocation sends only when the Handler returns an exact `list`, `tuple`, `set` or `frozenset`.
-> Any other iterable return (other than `str`/`bytes`/`bytearray`), such as a generator, a `deque`, a
+> The execution tracer behind `dryrun --trace` (and the Test Bench that reads it) reports a
+> Handler's per-invocation sends for a single returned value, such as a bare `return Send(...)`, and
+> for an exact `list`, `tuple`, `set` or `frozenset`. Any other iterable return (other than `str`/`bytes`/`bytearray`), such as a generator, a `deque`, a
 > custom iterable or a subclass of one of those four, may be single-pass, so the tracer does not walk
 > it: that invocation's record reports no sends and is marked `"lazy_result": true`, so the omission
 > is declared rather than read as a handler that did nothing (BACKLOG #6823). The run's message-level

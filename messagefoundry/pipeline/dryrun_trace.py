@@ -49,7 +49,10 @@ site keeps them unchanged).
   The invocation therefore carries ``"lazy_result": true``: message-level ``sends``/``handlers`` stay
   byte-identical to the untraced run, and the consumer can say *"this body was not traced"* instead of
   rendering an apparently inert handler beside ``trace_ok: true`` (ADR 0072 §6 gate 1; the honest-
-  degradation rule of ADR 0089 §4).
+  degradation rule of ADR 0089 §4). **Handler half, wider (ADR 0072 amendment 2026-11-24, BACKLOG
+  #6823):** a Handler's ``lazy_result`` marks any iterable return whose exact type is not
+  ``list``/``tuple``/``set``/``frozenset`` (``str``/``bytes``/``bytearray`` aside). It means only that
+  the per-invocation ``sends`` were not read; such a body may still carry line events.
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -286,8 +289,9 @@ class _Recorder:
         self.sends: list[str] = []
         self.routed_to: list[str] = []
         self.truncated = False
-        # The invocation returned a one-shot iterator (a generator Router/Handler): its body has not
-        # run yet, so this record has no line events and its sends/routed_to are not measurable here.
+        # The return was not walked, so this record's sends/routed_to are not measurable here. For a
+        # generator the body has not run yet either, so there are no line events; a Handler's other
+        # unwalked iterables (BACKLOG #6823) may still have them. See `record_return`.
         self.lazy_result = False
         # trace state
         self.frame: FrameType | None = None
