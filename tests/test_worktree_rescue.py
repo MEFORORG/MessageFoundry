@@ -15,6 +15,7 @@ real checkout is never in reach: a guard that failed open here would stash the r
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -228,7 +229,10 @@ def test_a_push_that_creates_no_entry_is_refused_and_touches_nothing(tmp_path: P
 
     proc = _rescue(repo, "empty")
     assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "git stash push created no entry although status reported" in proc.stderr + proc.stdout
+    out = _flat(proc.stderr + proc.stdout)
+    assert "git stash push created no entry although status reported" in out
+    # Positive control for the popped-entry test below: git saved nothing, so the stack is untouched.
+    assert "The stash stack was not touched" in out
     assert not (tmp_path / "repo-empty").exists()
     assert _stash_entries(repo) == [(foreign, "On main: foreign earlier")]
     assert (nested / "x.txt").read_text(encoding="utf-8") == "edited inside the nested repository\n"
@@ -304,4 +308,94 @@ def test_changes_stash_cannot_carry_are_reported_as_left_behind(tmp_path: Path) 
     assert "nested" in out
     assert "The primary checkout is clean again" not in out
     assert (tmp_path / "repo-partial" / "work.txt").read_text(encoding="utf-8") == "rescued work\n"
+    assert _stash_entries(repo) == []
+
+
+# --- Messages that must stay true when another session moves the stack --------------------------------
+#
+# A ``git.cmd`` placed first on the script's PATH stands in for another session: it forwards every call to
+# the real git and, when asked, refuses the rescue's ``stash drop`` or pops the rescue's entry straight
+# after its push. Only the pwsh child sees it; ``_git`` above still runs the real git.
+
+_GIT_WRAPPER = r"""@echo off
+setlocal
+if /I "%~3 %~4"=="stash drop" if defined RESCUE_TEST_FAIL_DROP exit /b 1
+"{git}" %*
+set rc=%ERRORLEVEL%
+if /I "%~3 %~4"=="stash push" if defined RESCUE_TEST_POP_AFTER_PUSH "{git}" -C %2 stash pop -q >nul 2>&1
+exit /b %rc%
+"""
+
+
+def _flat(text: str) -> str:
+    """Console output without pwsh's colour codes or its wrapped-error gutter, one space per run."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    text = re.sub(r"\n\s*\|", " ", text)
+    return " ".join(text.split())
+
+
+def _wrapped_env(tmp_path: Path, **flags: str) -> dict[str, str]:
+    real = shutil.which("git")
+    assert real, "git must be on PATH"
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(_GIT_WRAPPER.replace("{git}", real), encoding="ascii")
+    env = {"PATH": f"{shim}{os.pathsep}{_ENV.get('PATH', '')}"}
+    env.update(flags)
+    return env
+
+
+def test_a_failed_own_drop_is_reported_with_a_drop_command_that_works(tmp_path: Path) -> None:
+    """The success output must not leave the rescue's entry on the shared stack unmentioned."""
+    repo = tmp_path / "repo"
+    _seed(repo)
+    _commit_all(repo)
+    foreign = _push_foreign(repo)
+    _make_work(repo)
+
+    proc = _rescue(repo, "nodrop", extra_env=_wrapped_env(tmp_path, RESCUE_TEST_FAIL_DROP="1"))
+    out = _flat(proc.stdout + proc.stderr)
+    assert proc.returncode == 0, out
+    assert (tmp_path / "repo-nodrop" / "work.txt").read_text(encoding="utf-8") == "rescued work\n"
+    entries = _stash_entries(repo)
+    assert len(entries) == 2 and entries[1][0] == foreign, entries
+    own = entries[0][0]
+    assert f"Stash commit {own} is still on the shared stash list" in out, out
+    assert "stays on the stash list as a spare copy" in out, out
+    # The printed command re-finds the position by SHA and drops only that entry.
+    found = re.search(r'\$n = @\(git .*?stash drop "stash@\{\$n\}" \}', out)
+    assert found, out
+    command = found.group(0)
+    assert own in command, command
+    with single_spawn():
+        ran = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", command],
+            cwd=repo,
+            env=_ENV,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=50,
+            check=False,
+        )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert _stash_entries(repo) == [(foreign, "On main: foreign earlier")]
+
+
+def test_an_entry_popped_before_the_read_back_is_not_called_untouched(tmp_path: Path) -> None:
+    """The push made an entry and a peer popped it: the stack WAS touched, and the message must say so."""
+    repo = tmp_path / "repo"
+    _seed(repo)
+    _commit_all(repo)
+    _make_work(repo)
+
+    proc = _rescue(repo, "popped", extra_env=_wrapped_env(tmp_path, RESCUE_TEST_POP_AFTER_PUSH="1"))
+    out = _flat(proc.stdout + proc.stderr)
+    assert proc.returncode != 0, out
+    assert "The stash stack was not touched" not in out, out
+    assert "reported saving the work" in out, out
+    assert "refs/worktree-rescue/" in out, out
+    assert not (tmp_path / "repo-popped").exists()
+    # The stand-in peer popped into the primary itself, so the work is back where it started.
+    assert (repo / "work.txt").read_text(encoding="utf-8") == "rescued work\n"
     assert _stash_entries(repo) == []

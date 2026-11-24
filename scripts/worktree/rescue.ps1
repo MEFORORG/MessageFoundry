@@ -16,7 +16,7 @@
     THE STASH STACK IS CLONE-WIDE: every worktree and every session on this clone pushes and pops the same
     one, so "the top entry" is not "my entry" (BACKLOG #5957). The push carries a unique tag, the entry's
     commit id is read back by that tag straight away, anchored under a private ref
-    (refs/worktree-rescue/<id>), and taken off the shared stack at once; the apply names the id, never a
+    (refs/worktree-rescue/<guid>, this run's own GUID, not the stash SHA), and taken off the shared stack at once; the apply names the id, never a
     bare pop. The one step that cannot name the id is that drop: git stash drop takes a POSITION, so the
     position is re-found by id and checked just before the drop, and any other session's entry a shifted
     position dropped anyway is stored back. A push that created no entry is refused before anything else
@@ -128,6 +128,32 @@ function Get-StashEntries {
     }
 }
 
+# Whether a stash commit is on the clone-wide list right now: $true, $false, or $null when the list cannot
+# be read. Every message below that says where this run's entry is reads it here, at the moment it speaks.
+function Test-StashListed([string]$Id) {
+    try { return (@(Get-StashEntries | Where-Object Sha -eq $Id).Count -gt 0) } catch { return $null }
+}
+
+# The command an operator pastes to drop a listed entry. git stash drop takes a POSITION, so the command
+# re-finds it by SHA at the moment it runs, and drops nothing when the SHA is no longer listed.
+function Get-DropBySha([string]$Id) {
+    "`$n = @(git -C `"$RepoRoot`" stash list --format=%H).IndexOf('$Id'); if (`$n -ge 0) { git -C `"$RepoRoot`" stash drop `"stash@{`$n}`" }"
+}
+
+# Say where this run's entry is after a drop that did not remove it. A shifted position means some other
+# session moved the list, which may be a pop of THIS entry, so read the list again instead of assuming.
+function Write-OwnEntryState([string]$Id, [string]$Anchor, [string]$Why) {
+    $listed = Test-StashListed $Id
+    if ($listed -eq $true) {
+        Write-Warning "$Why. Stash commit $Id stays on the stash list as a spare copy (it is also held under $Anchor)."
+    } elseif ($listed -eq $false) {
+        Write-Warning ("$Why. Stash commit $Id is no longer on the stash list: another session took it off, most " +
+            "likely by a bare pop that ALSO applied this work into that session's tree. It is still held under $Anchor.")
+    } else {
+        Write-Warning "$Why. The stash list could not be read again, so stash commit $Id may or may not still be listed; it is held under $Anchor."
+    }
+}
+
 # Take this run's entry off the shared stack, by id. git stash drop takes a POSITION, which another
 # session's push or drop can shift at any moment, so: re-find the position by id, confirm it still holds
 # that id, run the drop under the C locale so its "Dropped ... (<id>)" line parses, and store back, under
@@ -143,7 +169,7 @@ function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
             return
         }
         if ((& git -C $RepoRoot rev-parse "stash@{$at}") -ne $Id) {
-            Write-Warning "The stash list moved under this run; stash commit $Id stays listed as a spare copy (it is also held under $Anchor)."
+            Write-OwnEntryState -Id $Id -Anchor $Anchor -Why "The stash list moved under this run, so the drop was not attempted"
             return
         }
         $savedLcAll = $env:LC_ALL
@@ -152,7 +178,7 @@ function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
         finally { $env:LC_ALL = $savedLcAll }
         $dropped = if ($dropOut -match '\(([0-9a-f]{40,64})\)') { $Matches[1] } else { $null }
         if ($dropRc -ne 0) {
-            Write-Warning "Could not drop stash commit $Id (exit $dropRc); it stays listed as a spare copy."
+            Write-OwnEntryState -Id $Id -Anchor $Anchor -Why "Could not drop stash commit $Id (exit $dropRc)"
         } elseif (-not $dropped) {
             Write-Warning "Could not read which entry the drop removed ($dropOut). Check git stash list against: $(@($listed | ForEach-Object { "$($_.Sha) $($_.Subject)" }) -join '; ')"
         } elseif ($dropped -ne $Id) {
@@ -162,9 +188,10 @@ function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
             if (-not $subject) { $subject = "restored by rescue.ps1 after a shifted drop" }
             & git -C $RepoRoot stash store -m $subject $dropped
             if ($LASTEXITCODE -eq 0) {
-                Write-Warning "The stash list moved during the drop; another session's entry $dropped was dropped and has been stored back (at the top). Stash commit $Id stays listed as a spare copy."
+                Write-OwnEntryState -Id $Id -Anchor $Anchor -Why "The stash list moved during the drop; another session's entry $dropped was dropped and has been stored back (at the top)"
             } else {
                 Write-Warning "The stash list moved during the drop and another session's entry was dropped; storing it back FAILED. Restore it with: git -C `"$RepoRoot`" stash store -m `"$subject`" $dropped"
+                Write-OwnEntryState -Id $Id -Anchor $Anchor -Why "This run's own entry was not the one dropped"
             }
         }
     } catch {
@@ -178,8 +205,13 @@ function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
 $guid      = [guid]::NewGuid().ToString('N')
 $stashMsg  = "rescue -> $Name [$guid]"
 $anchorRef = "refs/worktree-rescue/$guid"
-& git -C $RepoRoot stash push --include-untracked -m $stashMsg
-$pushRc = $LASTEXITCODE
+# Under the C locale, so the no-entry branch below can read git's "No local changes to save" and tell a
+# push that created nothing from one whose entry another session popped. Echoed, so the caller still sees it.
+$savedLcAll = $env:LC_ALL
+$env:LC_ALL = 'C'
+try { $pushOut = @(& git -C $RepoRoot stash push --include-untracked -m $stashMsg); $pushRc = $LASTEXITCODE }
+finally { $env:LC_ALL = $savedLcAll }
+$pushOut | ForEach-Object { Write-Host $_ }
 try {
     $stashSha = @(Get-StashEntries | Where-Object { $_.Subject.EndsWith(": $stashMsg", [StringComparison]::Ordinal) } | ForEach-Object Sha) | Select-Object -First 1
 } catch {
@@ -191,15 +223,26 @@ if (-not $stashSha) {
         # The changes are gone from the primary but no entry carries this run's tag. Either a concurrent
         # push (a second rescue, say) took them first, or this run's entry was popped before the read-back.
         throw ("The primary is now clean, but no stash entry carries this run's tag ($stashMsg). Another " +
-            "session either stashed these changes first (look in: git -C `"$RepoRoot`" stash list) or popped " +
-            "this run's entry before it could be read, which applied it into that session's tree. Nothing more was moved.")
+            "session either stashed these changes first (look in: git -C `"$RepoRoot`" stash list, and, since " +
+            "a concurrent rescue run anchors its entry there and drops it from that list, in: git -C " +
+            "`"$RepoRoot`" for-each-ref refs/worktree-rescue/) or popped this run's entry before it could be " +
+            "read, which applied it into that session's tree. Nothing more was moved.")
     }
-    if ($pushRc -ne 0) { throw "git stash push failed (exit $pushRc) and created no entry -- nothing was moved." }
+    if ($pushRc -ne 0) { throw "git stash push failed (exit $pushRc) and no entry carrying this run's tag ($stashMsg) is listed; the primary still shows changes. Check git -C `"$RepoRoot`" stash list before retrying." }
     # Exit 0 with no entry is real: git stash prints "No local changes to save" for a change it cannot
     # carry, such as edited content inside a nested repository that status still reports.
-    throw ("git stash push created no entry although status reported $($dirty.Count) change(s) -- nothing " +
-        "was moved. git stash cannot carry these changes (for example, edits inside a nested repository); " +
-        "commit or move them by hand. The stash stack was not touched.")
+    if (@($pushOut | Where-Object { $_ -match '^No local changes to save' }).Count -gt 0) {
+        throw ("git stash push created no entry although status reported $($dirty.Count) change(s) -- nothing " +
+            "was moved. git stash cannot carry these changes (for example, edits inside a nested repository); " +
+            "commit or move them by hand. The stash stack was not touched.")
+    }
+    # Otherwise the push did record an entry, and the primary is dirty again with no tagged entry listed:
+    # another session popped it before the read-back, which applied it into whatever tree that session runs in.
+    throw ("git stash push reported saving the work, but no stash entry carries this run's tag ($stashMsg) " +
+        "and the primary still shows $($now.Count) change(s). Another session most likely popped this run's " +
+        "entry before it could be read, which applied it into that session's tree (the primary itself, if it " +
+        "runs there). This run moved nothing further; check the primary, git -C `"$RepoRoot`" stash list, and " +
+        "git -C `"$RepoRoot`" for-each-ref refs/worktree-rescue/ before retrying.")
 }
 
 # ANCHOR, then leave the shared stack at once. Held under a private ref, the work cannot be popped by
@@ -246,6 +289,15 @@ try {
     Write-Host ""
     Write-Host "Rescued into $Target (branch '$Name', off $($sha.Substring(0,7)))." -ForegroundColor Green
     if ($left.Count -eq 0) { Write-Host "The primary checkout is clean again." }
+    # A drop that failed or found the list shifted leaves this run's entry listed; say so, now, by reading it.
+    $stillListed = Test-StashListed $stashSha
+    if ($stillListed -eq $true) {
+        Write-Warning ("Stash commit $stashSha is still on the shared stash list, a spare copy of the work now in " +
+            "$Target. Drop it by its position, re-found by SHA when the command runs:")
+        Write-Warning "    $(Get-DropBySha $stashSha)"
+    } elseif ($null -eq $stillListed) {
+        Write-Warning "Could not re-read the stash list; stash commit $stashSha may still be listed. To drop it if so: $(Get-DropBySha $stashSha)"
+    }
     Write-Host "Continue there:"
     Write-Host "  cd `"$Target`""
     if (-not $NoInstall) { Write-Host "  .\.venv\Scripts\Activate.ps1" }
@@ -256,6 +308,10 @@ finally {
         Write-Warning "    git -C `"$RepoRoot`" stash apply --index $stashSha    # put it back (by id, never a bare pop)"
         Write-Warning "    git -C `"$RepoRoot`" update-ref -d $anchorRef          # then release the anchor"
         Write-Warning "If the primary still holds part of the work (a failed push), move that aside before the apply."
+        if ((Test-StashListed $stashSha) -ne $false) {
+            Write-Warning "It may also still be on the shared stash list; once it is restored, drop that entry, re-found by SHA:"
+            Write-Warning "    $(Get-DropBySha $stashSha)"
+        }
         Write-Warning "Nothing was discarded. Resolve the failure above, then retry or apply it by hand."
     }
 }
