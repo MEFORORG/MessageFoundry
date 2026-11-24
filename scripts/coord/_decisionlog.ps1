@@ -945,7 +945,8 @@ function Get-DecisionCostRung {
       numbers). RATE GOVERNS (korus roles/COMMON.md, The three usage states; the record is
       roles/retired/STEWARD.md 9.6a, owner-ratified 2026-08-14): with a burn rate, the rung is hit
       when the window is projected to run out within HoldMin minutes and before it resets, whatever
-      the level. Only with no rate is the level the backstop. A rate of zero or below counts as no
+      the level. Only with no rate, or a rate usage.ps1 refused on a fresh reading (rate_refused,
+      BACKLOG #5494), is the level the backstop. A rate of zero or below counts as no
       rate, because usage inside one reset period does not fall, and such a rate must not lift
       the backstop. In the Steward's watch.py the rate helper likewise returns nothing unless the rate
       is positive. Its _burn projects again since the owner lifted its suppression on 2026-11-02, from

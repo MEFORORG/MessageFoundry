@@ -1522,6 +1522,7 @@ def test_one_tick_is_a_rate_however_close_the_rows(
         pytest.param((0.5, 85.0), (0.02, 86.0), id="seconds-apart"),
         pytest.param((0.2, 85.0), (0.1, 86.0), id="one-rounding-step"),
         pytest.param((0.1, 85.0), (0.1, 86.0), id="no-span"),
+        pytest.param((0.5, 86.0), (0.1, 86.0), id="flat"),
     ],
 )
 def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
@@ -1542,6 +1543,17 @@ def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
     assert d["seven_day"]["reason"].startswith("86% used"), d
 
 
+def test_two_ticks_under_the_minimum_are_a_fast_burn_at_their_lower_bound(tmp_path: Path) -> None:
+    """84 to 86 in 0.6 minutes: whatever the rounding, at least one whole tick in at most a minute,
+    so at least 60 percent an hour. Refusing it turned a stop into a review."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(0.8, 84.0), (0.5, 85.0), (0.2, 86.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL, d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(60.0, abs=0.5), d
+
+
 def test_a_span_under_the_minimum_at_the_ceiling_stays_critical(tmp_path: Path) -> None:
     """The refusal grades nothing below the ceiling band."""
     epoch = int(time.time()) + 280000
@@ -1558,23 +1570,34 @@ def _drop_reset(state: Path) -> None:
     (state / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
 
-def test_a_history_row_far_ahead_of_now_refuses_the_rate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("ahead_pct", [86.0, 88.0], ids=["level-reached", "higher-level"])
+def test_a_history_row_far_ahead_of_now_is_left_out_of_the_span(
+    tmp_path: Path, ahead_pct: float
+) -> None:
     """BACKLOG #5494. 80 to 86 over 18 minutes runs out in about 42 minutes, before the reset in two
     hours. A row dated ten hours ahead stretched the span to 620 minutes, so the rate read 0.6 percent an
-    hour and the window graded WARN, not projected to run out. Past the clock-skew tolerance a row is
-    refused, the rate with it, and the window reads UNKNOWN."""
+    hour and the window graded WARN, not projected to run out. Past the clock-skew tolerance the row's
+    date is set aside and reported, and its level kept, since usage does not fall inside a window."""
     epoch = int(time.time()) + 7200
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
-    write_history(tmp_path, [(20.0, 80.0), (2.0, 86.0), (-600.0, 86.0)], epoch)
+    write_history(tmp_path, [(20.0, 80.0), (2.0, 86.0), (-600.0, ahead_pct)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+    want = (ahead_pct - 80.0) / (18.0 / 60.0)
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(want, abs=1), d
+    assert "FUTURE" in d["seven_day"]["reason"].upper(), d
+
+
+def test_a_row_far_ahead_beside_one_other_refuses_the_rate(tmp_path: Path) -> None:
+    """With its date set aside, one row is left, and one row is no rate. The far row still shows a move,
+    so the rate is refused rather than left to the level."""
+    epoch = int(time.time()) + 7200
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [(2.0, 80.0), (-600.0, 86.0)], epoch)
     code, d = read(tmp_path)
     assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
     assert d["seven_day"]["rate_pct_per_hr"] is None, d
     assert "FUTURE" in d["seven_day"]["rate_refused"].upper(), d
-    assert "FUTURE" in d["seven_day"]["reason"].upper(), d
-    # The control: the same rows with nothing ahead project the run-out.
-    write_history(tmp_path, [(20.0, 80.0), (2.0, 86.0)], epoch)
-    code, d = read(tmp_path)
-    assert code == CRITICAL and d["seven_day"]["rate_refused"] is None, d
 
 
 @pytest.mark.parametrize(
@@ -1638,6 +1661,25 @@ def test_a_refused_rate_on_a_wired_root_blames_no_wiring(fake_home: Path) -> Non
     publish(state, seven=86.0, age_min=48, seven_epoch=epoch)
     _, _, stale = reader(pin=pin, home=fake_home)
     assert "cannot tell them apart" in stale, stale
+
+
+def test_a_foreign_last_row_does_not_suppress_this_roots_row(tmp_path: Path) -> None:
+    """The collector writes a row only when the number moves from the last row. A last row of another
+    root's at the same number is not this root's, so it must not hide this root's observation."""
+    epoch = int(time.time()) + 280000
+    row = {"at": _minutes_ago(5), "seven_day": 86.0, "seven_reset": epoch}
+    row["config_root_env"] = str(tmp_path / "other-root")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "history.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    collect(
+        tmp_path,
+        {
+            "session_id": "A",
+            "rate_limits": {"seven_day": {"used_percentage": 86.0, "resets_at": epoch}},
+        },
+    )
+    rows = history(tmp_path)
+    assert len(rows) == 2 and rows[-1]["config_root_env"] == "unset", rows
 
 
 def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) -> None:

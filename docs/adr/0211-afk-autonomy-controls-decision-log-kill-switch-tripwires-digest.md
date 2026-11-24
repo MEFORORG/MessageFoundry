@@ -407,15 +407,17 @@ roster alias of the Lander.
 > Either can stop work on a pool that has room, and a false stop is the safe direction. The highest
 > percentage is taken as the level reached, so a low row cannot turn the rate negative.
 >
-> **Amended 2026-11-23 (BACKLOG #5494): the rate refuses history it cannot trust.** A span under one
-> minute is mostly the rounding of the ages, a row dated more than 5 minutes after now stretches the
-> span toward a rate of zero, and with no reset on the reading, rows that change reset or fall may be
-> two windows. Each refuses the rate rather than give a number, a refusal is not "no rate", and a fresh
-> reading with a refused rate reads UNKNOWN in `usage.ps1`. The gate then answers REVIEW below the 90
-> percent rung and hits at it, so a tick seconds apart below the rung now reviews rather than halts.
-> Rows stamped with another config root are skipped. Where this note and the paragraph above differ,
-> this note wins.
->
+> **Amended 2026-11-23 (BACKLOG #5494): the rate refuses history it cannot trust.** At least these
+> refuse it: rows spanning under one minute that climbed one tick or less, which is mostly rounding;
+> rows across a reset when the reading carries none; too few rows once those dated more than 5 minutes
+> after now are set aside; and a history that cannot be read. A row set aside for its date keeps its
+> level but not its date, which would stretch the span toward a rate of zero. Two or more ticks under a
+> minute are taken at their lower bound, one tick less over one minute. A refusal is not "no rate": a
+> fresh reading with a refused rate reads UNKNOWN in `usage.ps1` below its ceiling, and the gate then
+> answers REVIEW below its weekly HOLD level and hits at it, as with no rate. So a single tick seconds
+> apart below that level now reviews rather than halts. Rows stamped with another config root are
+> skipped. Where this note and the paragraph above differ, this note wins.
+
 > **The highest reading in a reset period binds.** An idle session keeps reporting its cached
 > percentage, so no one session's reading is the truth; each is a valid floor. Against a published
 > window of this root's, the collector therefore refuses a reading with the same reset that is not
