@@ -98,6 +98,19 @@ function Invoke-DecisionGh {
     param([string[]]$GhArgs, [string]$InputJson = '')
     $ErrorActionPreference = 'Continue'
     $tmp = $null
+    # Both are process-wide, and a caller dot-sources this file, so each is put back in the finally
+    # (BACKLOG #7555). $null restores an unset variable by removing it.
+    $savedPrompt = $env:GH_PROMPT_DISABLED
+    $savedEncoding = $null
+    $switched = $false
+    # PowerShell wraps a setter's exception (SetValueInvocationException), so the console-handle
+    # IOException is looked for along the inner chain. Local, because afk-kill.ps1 runs this
+    # function's body alone in another runspace.
+    $isConsoleIO = {
+        param([Exception]$Exception)
+        for ($e = $Exception; $null -ne $e; $e = $e.InnerException) { if ($e -is [System.IO.IOException]) { return $true } }
+        return $false
+    }
     try {
         if ($InputJson) {
             $tmp = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "mefor-decision-$PID-$([guid]::NewGuid().ToString('N')).json")
@@ -106,8 +119,21 @@ function Invoke-DecisionGh {
         }
         # A script must never wait on an auth prompt.
         $env:GH_PROMPT_DISABLED = '1'
-        # gh writes UTF-8; the console's code page would mangle a non-ASCII field.
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host with no
+        # console handle refuses the setter with an IOException; gh still runs, and the refusal is
+        # reported unless the page was UTF-8 already.
+        try {
+            $savedEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $switched = $true
+        } catch {
+            if (-not (& $isConsoleIO $_.Exception)) { throw }
+            if (-not $savedEncoding -or $savedEncoding.CodePage -ne 65001) {
+                $why = $_.Exception.Message
+                try { [Console]::Error.WriteLine("_decisionlog.ps1: WARNING -- gh's output could not be set to decode as UTF-8 ($why), so a non-ASCII field may come back mangled.") }
+                catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
+            }
+        }
         $all = & gh @GhArgs 2>&1
         $code = $LASTEXITCODE
         $out = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
@@ -116,6 +142,10 @@ function Invoke-DecisionGh {
     } catch [System.Management.Automation.CommandNotFoundException] {
         return [pscustomobject]@{ Code = 127; Out = ''; Err = 'gh is not on PATH' }
     } finally {
+        if ($switched) {
+            try { [Console]::OutputEncoding = $savedEncoding } catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
+        }
+        $env:GH_PROMPT_DISABLED = $savedPrompt
         if ($tmp) { try { [System.IO.File]::Delete($tmp) } catch { $null = $_ } }
     }
 }
