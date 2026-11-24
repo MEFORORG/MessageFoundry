@@ -2351,15 +2351,17 @@ the same permission set on the same method reds CI until it is listed here.
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
 > A name that fails the connection-name rule is never in a scope, and its denial row carries no
 > channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
-> console checks the rule before it calls in, and then hands on an empty name rather than the
-> caller's text. `audit_channel_denied` in `messagefoundry/api/message_scope.py`, which writes
-> every `auth.channel_denied` row the API and the console seam record, checks the rule again. Its detail then carries `"malformed_name": true`, so
+> console checks the rule before it calls in. `audit_channel_denied` in
+> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks the name it is given against the rule too; for its own refusal
+> of a bulk selection the console gives it an empty name, never the caller's text. Such a row's
+> detail carries `"malformed_name": true`, so
 > such a row is told apart from a refusal that names no channel by design (BACKLOG #3031). At
 > least some rows that name no channel carry `"operation"` in their detail, naming the operation
 > refused: a channel-scoped caller's config reload is one, and a web console bulk selection whose
 > name fails the rule is another. `DeniedOperation` in the same file lists the values. Some such
-> rows carry none, at least a refused message read whose integrity tag names no channel (vault
-> BACKLOG #3748 item 7).
+> rows carry none, at least one for a malformed name a core handler such as `dual_role_control`
+> refuses (vault BACKLOG #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial

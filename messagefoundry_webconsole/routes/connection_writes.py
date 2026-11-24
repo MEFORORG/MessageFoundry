@@ -82,13 +82,13 @@ async def _audit_refused_name(
     malformed name is never in scope, and the refusal is audited here instead.
 
     The row carries no channel (BACKLOG #3031). The name is caller-chosen text that failed the rule,
-    bounded only by the request body, so it never leaves the console: the helper is handed
-    :data:`_REFUSED_NAME`, an empty name the same rule refuses, and the engine's helper writes no
-    channel for it and marks the row ``"malformed_name": true``. So two checks stand between the
-    caller's text and ``audit_log.channel_id``: this console's rule, and the caller's text never
-    being passed on. The actor and the host still identify the attempt. The row's ``operation`` says which bulk route
-    refused it (vault BACKLOG #3748 item 7), and the marker tells it from the purge confirm page's
-    refusal, which names no channel by design.
+    bounded only by the request body, so this audit call does not pass it on: the helper is handed
+    :data:`_REFUSED_NAME`, an empty name the engine's rule refuses, so it writes no channel and
+    marks the row ``"malformed_name": true``. The engine helper's own rule check is still the
+    bound for every other caller, this console's control routes included, and is not redundant
+    here. The actor and the host still identify the attempt. The row's ``operation`` says which
+    bulk route refused it (vault BACKLOG #3748 item 7), and the marker tells it from the purge
+    confirm page's refusal, which names no channel by design.
 
     A failed write is logged and the batch goes on, as it does for a failed target, so the
     operator still sees which targets were applied."""

@@ -97,8 +97,8 @@ async def audit_channel_denied(
     is written only on a row that names no channel, so a row naming a channel never carries one. A
     value outside them is left out of the row and logged, whether or not the row names a channel,
     rather than refusing the audit: the console hands this helper its keyword through an untyped
-    seam callback. At least one row names no channel and carries no operation: a refused message
-    read whose integrity tag names no channel (:func:`read_scoped_message`)."""
+    seam callback. At least one row names no channel and carries no operation: a malformed name a
+    core handler refuses, such as ``dual_role_control``, which passes none."""
     detail: dict[str, object] = {"channel": channel}
     if channel is not None and not is_connection_name(channel):
         channel = None
