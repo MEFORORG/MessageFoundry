@@ -1691,7 +1691,8 @@ def session_reseal_params(new: SessionRecord, old: SessionRecord) -> tuple[objec
         new.global_epoch,
         new.seal,
         old.token_hash,
-        old.seal,
+        # The seal cell as read, so a BLOB cell still matches (SessionRecord.from_mapping).
+        getattr(old, "_seal_cell", old.seal),
     )
 
 
@@ -1714,29 +1715,34 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
     )
 
 
-def _keyless_seal(fields: tuple[tuple[str, object], ...]) -> str:
-    """The seal a store with no sealer writes over ``fields``: empty. A float in ``fields`` that is
-    a NaN or an infinity raises ``ValueError``, for the reason :meth:`RowSealer.seal` refuses one
-    (BACKLOG #6717)."""
-    if any(isinstance(v, float) and not math.isfinite(v) for _, v in fields):
-        raise ValueError("a row write refuses a float that is not finite")
-    return ""
+def _refuse_new_non_finite(
+    sealer: object, fields: Iterable[tuple[str, object]], prior: Iterable[tuple[str, object]] = ()
+) -> None:
+    """On a store with no sealer, raise ``ValueError`` for a NaN or an infinity in ``fields`` that
+    ``prior``, the row as it was read, does not already hold under that name (BACKLOG #6717). A
+    keyed store's sealer refuses one, for the reason :meth:`RowSealer.seal` gives; a keyless
+    SQLite store would write it unchecked. A value carried forward from the stored row is written
+    as before, so only a new value is refused."""
+    if sealer is not None:
+        return
+    held = {n: v for n, v in prior if isinstance(v, float) and not math.isfinite(v)}
+    for name, value in fields:
+        if isinstance(value, float) and not math.isfinite(value):
+            was = held.get(name)
+            if was is None or not (was == value or (math.isnan(was) and math.isnan(value))):
+                raise ValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
     """``record`` with its seal set: the sealer's seal over its sealed fields, or empty on a store
     with no sealer (BACKLOG #2592)."""
-    fields = record.seal_fields()
-    seal = _keyless_seal(fields) if sealer is None else sealer.seal(SESSION_KIND, fields)
+    seal = "" if sealer is None else sealer.seal(SESSION_KIND, record.seal_fields())
     return replace(record, seal=seal)
 
 
 async def seal_session_async(sealer: AnyRowSealer | None, record: SessionRecord) -> SessionRecord:
     """:func:`seal_session`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    fields = record.seal_fields()
-    seal = (
-        _keyless_seal(fields) if sealer is None else await sealer.seal_async(SESSION_KIND, fields)
-    )
+    seal = "" if sealer is None else await sealer.seal_async(SESSION_KIND, record.seal_fields())
     return replace(record, seal=seal)
 
 
@@ -3656,7 +3662,13 @@ class SessionRecord:
     def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
-        return decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        record = decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
+        if isinstance(d["seal"], bytes):
+            # ``seal`` reads the BLOB as text, and fails a seal check as malformed, as the raw
+            # cell did; the compare-and-set binds the cell itself (:func:`session_reseal_params`),
+            # so the write still matches the row it read (BACKLOG #6718).
+            object.__setattr__(record, "_seal_cell", d["seal"])
+        return record
 
     @classmethod
     def _decode(cls, d: Mapping[str, Any]) -> SessionRecord:
@@ -3675,7 +3687,6 @@ class SessionRecord:
             # Hard subscripts: every reader is a SELECT *, so a mapping without them is a defect.
             user_epoch=int(d["user_epoch"]),
             global_epoch=int(d["global_epoch"]),
-            # Text, as RoleRow and ApprovalRow read their seal (BACKLOG #6718).
             seal=str(d["seal"] or ""),
         )
 
@@ -4163,15 +4174,13 @@ def _factor_unproven(
 def seal_user(sealer: RowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """``record`` with its seal set: the sealer's seal over it under the active key, or empty on a
     store with no sealer (BACKLOG #2592)."""
-    fields = record.seal_fields()
-    seal = _keyless_seal(fields) if sealer is None else sealer.seal(USER_KIND, fields)
+    seal = "" if sealer is None else sealer.seal(USER_KIND, record.seal_fields())
     return record.changed(authz_seal=seal)
 
 
 async def seal_user_async(sealer: AnyRowSealer | None, record: UserAuthzRecord) -> UserAuthzRecord:
     """:func:`seal_user`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    fields = record.seal_fields()
-    seal = _keyless_seal(fields) if sealer is None else await sealer.seal_async(USER_KIND, fields)
+    seal = "" if sealer is None else await sealer.seal_async(USER_KIND, record.seal_fields())
     return record.changed(authz_seal=seal)
 
 
@@ -6281,9 +6290,8 @@ def new_approval_row(
 
 def seal_approval(sealer: RowSealer | None, row: ApprovalRow) -> ApprovalRow:
     """``row`` with its seal set under the active key, or empty with no sealer (BACKLOG #2592)."""
-    fields = row.seal_fields()
     return replace(
-        row, seal=_keyless_seal(fields) if sealer is None else sealer.seal(APPROVAL_KIND, fields)
+        row, seal="" if sealer is None else sealer.seal(APPROVAL_KIND, row.seal_fields())
     )
 
 
@@ -6300,10 +6308,7 @@ def approval_seal_ok(sealer: RowSealer | None, row: ApprovalRow) -> bool:
 
 async def seal_approval_async(sealer: AnyRowSealer | None, row: ApprovalRow) -> ApprovalRow:
     """:func:`seal_approval`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    fields = row.seal_fields()
-    seal = (
-        _keyless_seal(fields) if sealer is None else await sealer.seal_async(APPROVAL_KIND, fields)
-    )
+    seal = "" if sealer is None else await sealer.seal_async(APPROVAL_KIND, row.seal_fields())
     return replace(row, seal=seal)
 
 
@@ -6422,10 +6427,12 @@ def approval_tombstone(
     Sealed under :data:`~messagefoundry.store.row_seal.APPROVAL_TOMBSTONE_KIND` over
     :func:`approval_tombstone_fields`, so it never verifies as the row's approval seal: the row
     keeps failing :func:`approval_seal_ok`, and nothing can turn it back into a request that holds."""
-    fields = approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at)
     if sealer is None:
-        return _keyless_seal(fields)
-    return sealer.seal(APPROVAL_TOMBSTONE_KIND, fields)
+        return ""
+    return sealer.seal(
+        APPROVAL_TOMBSTONE_KIND,
+        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
+    )
 
 
 def held_approval_tombstone(sealer: RowSealer | None, found: ByName) -> tuple[str, float] | None:
@@ -6478,10 +6485,12 @@ async def approval_tombstone_async(
     sealer: AnyRowSealer | None, approval_id: str, *, approver: str, decided_at: float
 ) -> str:
     """:func:`approval_tombstone`, awaitable, for either sealer (ADR 0217 slice 1b)."""
-    fields = approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at)
     if sealer is None:
-        return _keyless_seal(fields)
-    return await sealer.seal_async(APPROVAL_TOMBSTONE_KIND, fields)
+        return ""
+    return await sealer.seal_async(
+        APPROVAL_TOMBSTONE_KIND,
+        approval_tombstone_fields(approval_id, approver=approver, decided_at=decided_at),
+    )
 
 
 async def held_approval_tombstone_async(
@@ -19776,6 +19785,9 @@ class MessageStore:
         ``current`` that fails its seal, writing nothing, and the UPDATE lands only while the row
         is still in ``current``'s status and carries its seal."""
         sealer = self._row_sealer
+        _refuse_new_non_finite(
+            sealer, new.seal_fields(), () if current is None else current.seal_fields()
+        )
         if current is not None:
             cur = await self._db.execute(
                 _SQLITE_APPROVAL_UPDATE,
@@ -20440,6 +20452,7 @@ class MessageStore:
         )
         # Sealed before the writer lock: the seal depends on the record alone, and under a Transit
         # sealer it is a Vault round trip that ingress would otherwise wait behind.
+        _refuse_new_non_finite(self._row_sealer, record.seal_fields())
         sealed = await seal_user_async(self._row_sealer, record)
         async with _writer_guard(self._db, self._lock):
             # BACKLOG #2592: the whole row, sealed, in one INSERT.
@@ -20498,6 +20511,7 @@ class MessageStore:
             return None
         if changed.roles != current.roles:
             raise ValueError("a presealed user write may not change the account's role rows")
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
         return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
 
     async def _write_user(
@@ -20546,6 +20560,7 @@ class MessageStore:
                 changed = existing_roles_only(
                     current, changed, [str(r["id"]) for r in await cur.fetchall()]
                 )
+            _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
             updated = await seal_user_async(self._row_sealer, changed)
         cur = await self._db.execute(_USER_RESEAL, user_reseal_params(updated, current))
         if cur.rowcount != 1:
@@ -22189,22 +22204,21 @@ class MessageStore:
                 # A deleted account is refused, guarded or not (BACKLOG #2733), not left to the
                 # INSERT's foreign-key error. The locked read refuses one deleted after this read.
                 return False
-            record = await seal_session_async(
-                self._row_sealer,
-                new_session_record(
-                    token_hash=token_hash,
-                    user_id=user_id,
-                    now=time.time() if now is None else now,
-                    expires_at=expires_at,
-                    client=client,
-                    seed_reauth=seed_reauth,
-                    auth_mechanism=auth_mechanism,
-                    idp_auth_time=idp_auth_time,
-                    mfa_verified=mfa_verified,
-                    user_epoch=epochs[0],
-                    global_epoch=epochs[1],
-                ),
+            minted = new_session_record(
+                token_hash=token_hash,
+                user_id=user_id,
+                now=time.time() if now is None else now,
+                expires_at=expires_at,
+                client=client,
+                seed_reauth=seed_reauth,
+                auth_mechanism=auth_mechanism,
+                idp_auth_time=idp_auth_time,
+                mfa_verified=mfa_verified,
+                user_epoch=epochs[0],
+                global_epoch=epochs[1],
             )
+            _refuse_new_non_finite(self._row_sealer, minted.seal_fields())
+            record = await seal_session_async(self._row_sealer, minted)
             try:
                 inserted = await self._insert_sealed_session(
                     record,
@@ -22362,7 +22376,9 @@ class MessageStore:
         if current.revoked_at is not None:
             return None
         await session_writer_seal_check(self._row_sealer, current)
-        updated = await seal_session_async(self._row_sealer, change(current))
+        changed = change(current)
+        _refuse_new_non_finite(self._row_sealer, changed.seal_fields(), current.seal_fields())
+        updated = await seal_session_async(self._row_sealer, changed)
         cur = await self._db.execute(_SESSION_RESEAL, session_reseal_params(updated, current))
         return updated if cur.rowcount == 1 else None
 

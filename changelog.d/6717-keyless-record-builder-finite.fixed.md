@@ -1,6 +1,7 @@
-- **On a store with no row-seal key, the session, user and approval record builders and the
-  approval tombstone now raise `ValueError` for a NaN or an infinity in the fields they seal under
-  a key, as the local row sealer does.** They wrote an empty seal without checking, so a NaN
-  reached SQLite, which stores it as NULL. Writes that do not go through these builders, such as
-  the revoke statements that set `revoked_at`, and columns a seal leaves out, such as a session's
-  `last_used_at`, are not checked. (`BACKLOG #6717`)
+- **A SQLite store with no row-seal key now refuses a new NaN or infinity in the fields a session,
+  user or approval seal covers, where a keyed store's sealer refuses one.** It wrote the value
+  unchecked, and SQLite stores a NaN as NULL. The check runs where the SQLite store mints a session
+  or account, writes an approval, or rewrites a session or account record, and raises `ValueError`.
+  A non-finite value already in the stored row is carried forward as before. The revoke statements
+  that set `revoked_at`, columns a seal leaves out such as a session's `last_used_at`, and the
+  Postgres and SQL Server stores are not checked. (`BACKLOG #6717`)

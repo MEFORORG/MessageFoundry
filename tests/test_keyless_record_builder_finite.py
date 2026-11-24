@@ -1,134 +1,140 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A keyless store's session, user and approval record builders refuse a float that is not finite
-(BACKLOG #6717 item 9).
+"""A keyless SQLite store refuses a NEW NaN or infinity in a sealed field (BACKLOG #6717 item 9).
 
-With a sealer, :meth:`RowSealer.seal` refuses a NaN or an infinity, because SQLite stores a NaN as
-``NULL``. With no sealer the builders wrote an empty seal and let the value through, so a keyless
-store wrote the NaN and read back ``None`` without a word. Each builder now refuses it there too.
+A keyed store's sealer refuses one; a keyless store wrote it, and SQLite stores a NaN as ``NULL``.
+The refusal covers only a value the write brings in: a non-finite value already in the stored row,
+put there outside the store, is carried forward as before, so a sign-in on such a row still works.
+Synthetic accounts only.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import fields, replace
+import sqlite3
+import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.store.store import (
-    SessionRecord,
-    UserAuthzRecord,
-    UserRow,
-    approval_tombstone,
-    approval_tombstone_async,
-    new_approval_row,
-    seal_approval,
-    seal_approval_async,
-    seal_session,
-    seal_session_async,
-    seal_user,
-    seal_user_async,
-)
+from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token, mint_token
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.store import MessageStore
+from tests._admin_account import ADMIN_PASSWORD, ADMIN_USERNAME, create_admin
 
 _NON_FINITE = [math.nan, math.inf, -math.inf]
 
 
-def _session(**changes: Any) -> SessionRecord:
-    base = SessionRecord(
-        token_hash="t" * 64,
-        user_id="u-6717",
-        created_at=1.0,
-        expires_at=3.0,
-        last_used_at=2.0,
-        revoked_at=None,
-        client="198.51.100.7",
+def _raw(path: Path, sql: str, params: tuple[Any, ...]) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _user(store: MessageStore, user_id: str) -> None:
+    await store.create_user(
+        user_id=user_id,
+        username=user_id,
+        auth_provider="local",
+        password_generated=False,
+        audits=(),
     )
-    return replace(base, **changes)
 
 
-def _approval(**changes: Any) -> Any:
-    row = new_approval_row(
-        approval_id="a-6717",
-        operation="op",
-        params="{}",
-        requester="r",
-        requester_user_id="u-6717",
-        requested_at=1.0,
-        expires_at=None,
+async def _session(store: MessageStore, user_id: str) -> str:
+    token_hash = hash_token(mint_token())
+    assert await store.create_session(
+        token_hash=token_hash, user_id=user_id, expires_at=time.time() + 3600
     )
-    return replace(row, **changes)
-
-
-def _sample(annotation: object) -> Any:
-    text = str(annotation)
-    if "bool" in text:
-        return False
-    if "int" in text:
-        return 0
-    if "float" in text:
-        return 0.0
-    return "x"
-
-
-def _user(**changes: Any) -> UserAuthzRecord:
-    row = UserRow(**{f.name: _sample(f.type) for f in fields(UserRow)})
-    return UserAuthzRecord(row=replace(row, **changes))
+    return token_hash
 
 
 @pytest.mark.parametrize("value", _NON_FINITE)
-def test_seal_session_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        seal_session(None, _session(reauth_at=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-async def test_seal_session_async_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        await seal_session_async(None, _session(idp_auth_time=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-def test_seal_approval_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        seal_approval(None, _approval(expires_at=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-async def test_seal_approval_async_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        await seal_approval_async(None, _approval(requested_at=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-def test_seal_user_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        seal_user(None, _user(created_at=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-async def test_seal_user_async_refuses_a_non_finite_float_with_no_sealer(value: float) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        await seal_user_async(None, _user(created_at=value))
-
-
-@pytest.mark.parametrize("value", _NON_FINITE)
-async def test_approval_tombstone_refuses_a_non_finite_decision_time_with_no_sealer(
-    value: float,
+async def test_a_new_session_with_a_non_finite_expiry_is_refused(
+    tmp_path: Path, value: float
 ) -> None:
-    with pytest.raises(ValueError, match="not finite"):
-        approval_tombstone(None, "a-6717", approver="ap", decided_at=value)
-    with pytest.raises(ValueError, match="not finite"):
-        await approval_tombstone_async(None, "a-6717", approver="ap", decided_at=value)
+    store = await MessageStore.open(tmp_path / "k.db")
+    try:
+        await _user(store, "u-6717")
+        with pytest.raises(ValueError, match="not finite"):
+            await store.create_session(
+                token_hash=hash_token(mint_token()), user_id="u-6717", expires_at=value
+            )
+        assert await store.list_sessions("u-6717") == []
+    finally:
+        await store.close()
 
 
-async def test_a_finite_record_still_takes_an_empty_seal_with_no_sealer() -> None:
-    """The control: a finite row is unchanged, so the refusal is the only new behaviour."""
-    assert seal_session(None, _session(seal="old")).seal == ""
-    assert (await seal_session_async(None, _session(seal="old"))).seal == ""
-    assert seal_approval(None, _approval(seal="old")).seal == ""
-    assert (await seal_approval_async(None, _approval(seal="old"))).seal == ""
-    assert seal_user(None, _user(authz_seal="old")).row.authz_seal == ""
-    assert (await seal_user_async(None, _user(authz_seal="old"))).row.authz_seal == ""
-    assert approval_tombstone(None, "a-6717", approver="ap", decided_at=1.0) == ""
-    assert await approval_tombstone_async(None, "a-6717", approver="ap", decided_at=1.0) == ""
+@pytest.mark.parametrize("value", _NON_FINITE)
+async def test_a_session_write_bringing_a_non_finite_value_is_refused(
+    tmp_path: Path, value: float
+) -> None:
+    store = await MessageStore.open(tmp_path / "k.db")
+    try:
+        await _user(store, "u-6717")
+        token_hash = await _session(store, "u-6717")
+        before = await store.get_session(token_hash)
+        with pytest.raises(ValueError, match="not finite"):
+            await store.mark_session_reauthed(token_hash, now=value)
+        assert await store.get_session(token_hash) == before
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("value", _NON_FINITE)
+async def test_a_user_write_bringing_a_non_finite_value_is_refused(
+    tmp_path: Path, value: float
+) -> None:
+    store = await MessageStore.open(tmp_path / "k.db")
+    try:
+        await _user(store, "u-6717")
+        with pytest.raises(ValueError, match="not finite"):
+            await store.record_login_failure("u-6717", failed_attempts=1, locked_until=value)
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("value", _NON_FINITE)
+async def test_a_new_approval_with_a_non_finite_expiry_is_refused(
+    tmp_path: Path, value: float
+) -> None:
+    store = await MessageStore.open(tmp_path / "k.db")
+    try:
+        with pytest.raises(ValueError, match="not finite"):
+            await store.create_pending_approval(
+                approval_id="a-6717",
+                operation="op",
+                params="{}",
+                requester="r",
+                requester_user_id="u-6717",
+                requested_at=1.0,
+                expires_at=value,
+            )
+    finally:
+        await store.close()
+
+
+async def test_a_stored_infinity_is_carried_forward_and_sign_in_still_works(
+    tmp_path: Path,
+) -> None:
+    """As on main: an infinity already in the account row, written outside the store, does not
+    stop a sign-in or a failed one on a keyless store; the row keeps the value."""
+    path = tmp_path / "k.db"
+    store = await MessageStore.open(path)
+    try:
+        service = AuthService(store, AuthSettings())
+        admin = await create_admin(service)
+        _raw(path, "UPDATE users SET created_at=? WHERE id=?", (math.inf, admin.user_id))
+        bad = await service.login(ADMIN_USERNAME, "not-the-password")
+        assert not bad.ok
+        good = await service.login(ADMIN_USERNAME, ADMIN_PASSWORD)
+        assert good.ok
+        user = await store.get_user(admin.user_id)
+        assert user is not None and user.created_at == math.inf
+    finally:
+        await store.close()
