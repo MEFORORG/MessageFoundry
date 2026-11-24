@@ -52,7 +52,7 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
-from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES, PEEK_READ_FAULTS
 from messagefoundry.parsing.split import _BOM, _BOM_BYTES, one_message_bytes
 from messagefoundry.parsing.validate import warm_validation
 from messagefoundry.pipeline._sandbox_codec import build_payload
@@ -1185,17 +1185,25 @@ def dry_run(
             error=exc.reason,
         )
 
+    # The peek's field reads and the marker check sit inside the guard with the parse, under the
+    # listener's PEEK_READ_FAULTS, so a parser fault in one is an ERROR naming its type alone, as the
+    # listener records it, rather than an exception out of the preview (BACKLOG #6821, #1594).
+    parse_error: str | None = None
     try:
         peek = Peek.parse(text, max_bytes=peek_max_bytes(ic))
-    except HL7PeekError as exc:
+        mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
+        # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
+        marker_refused = doc_ref_marker_refusal(peek, text)
+    except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
+        parse_error = f"parse error: {exc}"
+    except PEEK_READ_FAULTS as exc:
+        parse_error = f"parse error: peek read failed ({type(exc).__name__})"
+    if parse_error is not None:
         return DryRunResult(
-            inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=f"parse error: {exc}"
+            inbound=ic.name, disposition=MessageStatus.ERROR, raw=text, error=parse_error
         )
 
-    mt, cid, summ = peek.message_type, peek.control_id, (summarize(peek) or None)
-
-    # The listener's marker refusal, at the same point after the parse (BACKLOG #5099).
-    if (marker_refused := doc_ref_marker_refusal(peek, text)) is not None:
+    if marker_refused is not None:
         return DryRunResult(
             inbound=ic.name,
             disposition=MessageStatus.ERROR,
