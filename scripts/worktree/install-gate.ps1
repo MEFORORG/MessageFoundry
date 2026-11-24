@@ -53,6 +53,15 @@
     gate against the same ref, so a stale install run from a stale tree no longer reads IN SYNC. The
     script never fetches: the ref is as fresh as this checkout's last fetch.
 
+    THE INSTALLED GATE MUST MATCH ITS OWN RECEIPT BEFORE IT IS OVERWRITTEN (BACKLOG #1247). Every
+    install leaves worktree_gate.ps1.receipt.json beside the gate, carrying the hash it installed. A
+    later install REFUSES when the installed gate's content differs from that hash, when the receipt
+    cannot be read or records no hash, or when a gate is installed with no receipt at all: each means
+    something other than this installer may have written the machine-global gate, and overwriting it
+    would erase the only evidence. Nothing on the box changes on a refusal. Find out who wrote it, then
+    pass -OverwriteUnexplained; the new receipt records the hash that was overwritten. A box with no
+    installed gate installs as before.
+
     Run from a PLAIN TERMINAL, not from inside Claude Code -- a session that can install its own gate can
     uninstall it. The script refuses when $env:CLAUDECODE is set.
 
@@ -64,6 +73,7 @@
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall -Repo C:\Users\me\Code\Probe  # stop governing ONE
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -AllowStaleSource   # deliberately install a gate not on origin/main
+    pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -OverwriteUnexplained   # replace a gate that does not match its receipt
 #>
 [CmdletBinding()]
 param(
@@ -102,7 +112,11 @@ param(
     # Install this checkout's gate even though it differs from -UpstreamRef's, or -UpstreamRef cannot
     # be read. For a deliberate offline install, a rollback to an older gate, or a test of an unmerged
     # gate change. Nothing else.
-    [switch]$AllowStaleSource
+    [switch]$AllowStaleSource,
+    # Overwrite an installed gate whose content does not match its own receipt, whose receipt cannot
+    # be read, or which has no receipt (BACKLOG #1247). Only after finding out who wrote it: the new
+    # receipt records the overwritten hash, and the .bak keeps its bytes.
+    [switch]$OverwriteUnexplained
 )
 
 $ErrorActionPreference = "Stop"
@@ -273,6 +287,49 @@ function Get-GateHash([string]$Path) {
         (($sha.ComputeHash($folded) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
     } finally {
         $sha.Dispose()
+    }
+}
+
+# WHY AN INSTALLED GATE MAY NOT BE OVERWRITTEN, OR $null WHEN IT MAY (BACKLOG #1247). The receipt each
+# install leaves records the hash it wrote, so an installed gate that no longer matches it was written
+# by something other than this installer, and overwriting it erases the only evidence of that write.
+#
+# NO RECEIPT AT ALL ALSO REFUSES, while no GATE at all installs. The receipt is NOT protected by gate
+# rule 1a (see the receipt write below), so treating a missing receipt as "nothing to check" would let
+# anyone silence this check by deleting one unprotected file. A refusal on a missing receipt costs a
+# box that still carries a pre-receipt install one deliberate -OverwriteUnexplained; it is the
+# stricter reading, and the receipt is still a convenience record, never attestation.
+function Get-UnexplainedGate([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $installedSha = Get-GateHash $Path
+    $receiptPath = "$Path.receipt.json"
+    $recordedSha = $null
+    $problem = $null
+    if (-not (Test-Path -LiteralPath $receiptPath)) {
+        $problem = "it has no receipt at $receiptPath, so nothing records that this installer wrote it"
+    } else {
+        try {
+            $raw = Get-Content -LiteralPath $receiptPath -Raw -ErrorAction Stop
+            $parsed = if ($raw) { $raw | ConvertFrom-Json -ErrorAction Stop } else { $null }
+            $field = if ($null -ne $parsed) { $parsed.PSObject.Properties['gateSha256'] } else { $null }
+            if ($field -and $field.Value -is [string] -and $field.Value -match '\A[0-9A-Fa-f]{64}\z') {
+                $recordedSha = $field.Value.ToUpperInvariant()
+            } else {
+                $problem = "its receipt at $receiptPath records no gate hash"
+            }
+        } catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException], [System.ArgumentException] {
+            $problem = "its receipt at $receiptPath cannot be read: $($_.Exception.Message)"
+        }
+        if (-not $problem -and $recordedSha -ne $installedSha) {
+            $problem = "its content does not match the hash its own receipt at $receiptPath records"
+        }
+    }
+    if (-not $problem) { return $null }
+    [pscustomobject]@{
+        Path         = $Path
+        InstalledSha = $installedSha
+        ReceiptSha   = $recordedSha
+        Problem      = $problem
     }
 }
 
@@ -1098,6 +1155,24 @@ if ($dispatchRefusal) {
 
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
 
+# REFUSE TO OVERWRITE A GATE THAT DOES NOT MATCH ITS OWN RECEIPT (BACKLOG #1247), before the allowlist
+# write, so a refusal leaves the box as it was. An unexplained write to this machine-global file was
+# once overwritten in silence, and the .bak was the only evidence left afterwards.
+$unexplained = Get-UnexplainedGate $GateDst
+if ($unexplained) {
+    $why = @(
+        "Refusing to overwrite the installed gate at $($unexplained.Path): $($unexplained.Problem)."
+        "  installed gate sha256 : $($unexplained.InstalledSha)"
+        "  receipt records       : $(if ($unexplained.ReceiptSha) { $unexplained.ReceiptSha } else { '(no hash)' })"
+        "Something other than this installer may have written it. Nothing on this box has been changed."
+        "Find out who wrote it first: compare it with scripts\hooks\worktree_gate.ps1 and keep a copy if you need one."
+        "Then re-run with -OverwriteUnexplained. The new receipt records the overwritten hash, and the .bak keeps its bytes."
+    ) -join [Environment]::NewLine
+    if (-not $OverwriteUnexplained) { throw $why }
+    Write-Host "WARNING: overwriting an installed gate that does not match its receipt, because -OverwriteUnexplained was given." -ForegroundColor Yellow
+    Write-Host "         $($unexplained.Problem). Installed sha256 $($unexplained.InstalledSha) is recorded in the new receipt." -ForegroundColor Yellow
+}
+
 # READ AND MERGE BEFORE ANYTHING ON THIS BOX CHANGES. An allowlist this run cannot read must stop the
 # install while the machine is still exactly as it was -- reading after the gate copy below would leave a
 # refreshed gate sitting behind a refusal.
@@ -1124,6 +1199,7 @@ $bak = Write-GovernedRoots -Path $ReposFile -Lines $result.Lines
 # same file.
 $GateSrc = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
 $gateBak = $null
+$replacedSha = Get-GateHash $GateDst
 if (Test-Path -LiteralPath $GateDst) {
     $gateBak = "$GateDst.bak"
     Copy-Item -LiteralPath $GateDst -Destination $gateBak -Force
@@ -1170,6 +1246,12 @@ $receipt = [ordered]@{
     upstreamGateSha256 = $upstream.Sha
     dispatchSha256     = (Get-GateHash $DispatchDst)
     allowStaleSource   = [bool]$AllowStaleSource
+    # BACKLOG #1247: the hash this install replaced, and, when it did not match its own receipt, what
+    # -OverwriteUnexplained overrode.
+    replacedSha256       = $replacedSha
+    overwroteUnexplained = $(if ($unexplained -and $OverwriteUnexplained) {
+        [ordered]@{ installedSha256 = $unexplained.InstalledSha; receiptSha256 = $unexplained.ReceiptSha; problem = $unexplained.Problem }
+    } else { $null })
     note           ='Convenience record written by install-gate.ps1. NOT protected by the gate and NOT attestation.'
 } | ConvertTo-Json -Depth 4
 Set-Content -LiteralPath "$GateDst.receipt.json" -Value $receipt -Encoding utf8
