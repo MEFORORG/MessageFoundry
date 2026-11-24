@@ -1021,6 +1021,9 @@ class SandboxSession:
         # What is left of the current dispatch's EOF grace (see _EOF_EXIT_GRACE_SECONDS); each
         # dispatch refills it.
         self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
+        # Whether the current dispatch has spent its one retry on a stray frame found before its
+        # request (see _live_worker); each dispatch resets it.
+        self._stray_retried = False
         # The [egress] lists whose empty-list refusal this session has logged.
         self._lookup_refusals_logged: set[str] = set()
         # Per (kind, connection), the completion event of the runner call running on it, removed by
@@ -1433,7 +1436,8 @@ class SandboxSession:
         A leftover FRAME kills the worker, and this message, which never reached it, is retried
         once on a fresh worker (owner ruling 2026-11-09, vault BACKLOG #3135 step 4). Every fresh
         worker is checked the same way, the one spawned after a leftover EOF included, and a second
-        stray frame raises, so the retry happens at most once per dispatch. The spawns are bounded
+        stray frame raises, so the retry happens at most once per dispatch, the check
+        :meth:`dispatch` makes again before its write included (vault BACKLOG #3135 step 7). The spawns are bounded
         too: a worker that keeps exiting, or closing its pipe, before its request fails the call.
         ADR 0187 *Amendment B* lists at least the cases in which such a message's call fails.
 
@@ -1445,7 +1449,6 @@ class SandboxSession:
 
         Liveness is read with :func:`_has_exited`, which leaves a dead worker unreaped so the
         respawn's reap takes the ordinary group kill (see :func:`_has_exited`)."""
-        stray_seen = False
         eof_respawns = 0
         while True:
             fresh = self._proc is None or _has_exited(self._proc)
@@ -1453,9 +1456,9 @@ class SandboxSession:
                 self._spawn(phase)
             exited = KillCause.EXITED_AFTER_BOOT if fresh else None
             if self._drop_unsolicited(self._proc, "before", phase, exited=exited):
-                if stray_seen:
+                if self._stray_retried:
                     raise _unsolicited_error("before")
-                stray_seen = True
+                self._stray_retried = True
                 continue
             proc = self._proc
             if proc is not None:
@@ -1802,6 +1805,7 @@ class SandboxSession:
             # pre-stage its answer.
             request_id = secrets.token_hex(16)
             self._eof_grace_left = _EOF_EXIT_GRACE_SECONDS
+            self._stray_retried = False
             # Resolved FIRST, so a session with a cached graph refusal refuses at once rather than
             # encode each message (a reference view can be large) only to refuse it.
             proc = self._live_worker(phase)
@@ -1824,6 +1828,20 @@ class SandboxSession:
                     raise SandboxError(f"sandbox frame too large: {len(request)} bytes")
             except (OSError, SandboxError) as exc:
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
+            # The check again, right before the write (vault BACKLOG #3135 step 7): a frame queued
+            # while the request was encoded would otherwise be read in this call's answer slot and
+            # fail a message that never reached the worker. Found here, it is the same case as at
+            # _live_worker's check and shares its one retry. This narrows the AC-10 window to the
+            # time between this check and the write; it does not close it. A queued EOF found here
+            # reaps the worker, so the request goes to a fresh one rather than a dead pipe.
+            if self._drop_unsolicited(proc, "before", phase):
+                if self._stray_retried:
+                    raise _unsolicited_error("before")
+                self._stray_retried = True
+                proc = self._live_worker(phase)
+            elif proc is not self._proc:
+                proc = self._live_worker(phase)
+            assert proc.stdin is not None
             try:
                 _write_frame(proc.stdin, request)
             except (OSError, SandboxError) as exc:

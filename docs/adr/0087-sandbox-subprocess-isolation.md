@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** At least two statements were false of the code: the grandchild residual, which said nothing a grandchild writes can be taken as an answer, and the Decision bullet *"A frame answers a request, or the worker dies"*. Each correction sits beside its text, and the residual says what a grandchild can do. AC-10's 2026-11-09 amendment gains dated additions, at least those its *Added 2026-11-10* note names. **Owner acceptances (2026-11-10).** Two cases are accepted by the owner (records d20261110T144543956-d8f55a and d20261110T165507353-b70f7b), each only in its record's scope as the owner's scope rulings cited with it widen it; AC-10's 2026-11-09 amendment, *Owner acceptances*, cites the records and those rulings. **Corrected (2026-11-11).** At least the *Isolation denial routing* Decision bullet was false under `[delivery] internal_error = "stop"`: it said a `SandboxError` is one *"which the router/transform worker routes to `ERROR`/dead-letter **post-ACK**"*, under every policy, where `stop` halts the inbound's routing or transform instead. The correction sits beside it. At least the Context's reliability constraint, the `db_lookup`/`fhir_lookup` bullet, AC-11, AC-14 and the Handler-exception residual now name the policy too.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched. **Amended (2026-09-05)** — a 74 GiB extrapolation added under the per-worker footprint on 2026-09-04 is **retracted in place**; the measured per-child figures stand, and the surviving constraint is restated as the ADR 0052 AC-2 conflict it always was. No decision, boundary or acceptance criterion of this ADR changes. **Corrected (2026-10-01)** — the "DEK-in-worker" residual said there is no key in the worker to strip. That was false wherever the key arrives by environment variable, because the worker inherited the engine's environment. The correction sits beside that bullet; the worker now gets an allowlisted environment (vault BACKLOG #2587), which is not an isolation boundary by itself. **Amended (2026-10-07).** The owner ruled to drop the worker's POSIX `RLIMIT_CPU` backstop, so CPU time is bounded only per call, by the wall cap, and `[sandbox].cpu_seconds` is gone (vault BACKLOG #3133 part 1). The Decision bullet that named the backstop is edited, the reasons are under "POSIX CPU limit dropped" below, and what the limit used to bound is a new residual. `RLIMIT_AS` is unchanged. **Amended (2026-10-11).** The owner ruled that `[sandbox].mem_mb` stays and changes meaning (vault BACKLOG #3133 part 2). On Linux it is now headroom above the loaded graph, enforced with `RLIMIT_DATA`, so address space a thread only reserves does not count. A call that runs out of memory is reported as the memory cap, and its worker is recycled. The reasons are under "Memory cap is headroom above the loaded graph" below; the Decision bullet that named `RLIMIT_AS` is edited. **Amended (2026-11-09).** The owner ruled that a frame found waiting before a request no longer fails that call: the worker is still dropped, and the message is retried once on a fresh worker (vault BACKLOG #3135 step 4). A length header over the frame cap is now read by the engine as a frame rather than a dead peer; AC-10's amendment says what that changes. AC-10 and the residual on a compromised worker denying its own feed carry the amendment beside them, and every kill now records a cause, as ADR 0187 *Amendment B* says. **Corrected (2026-11-10).** At least two statements were false of the code: the grandchild residual, which said nothing a grandchild writes can be taken as an answer, and the Decision bullet *"A frame answers a request, or the worker dies"*. Each correction sits beside its text, and the residual says what a grandchild can do. AC-10's 2026-11-09 amendment gains dated additions, at least those its *Added 2026-11-10* note names. **Owner acceptances (2026-11-10).** Two cases are accepted by the owner (records d20261110T144543956-d8f55a and d20261110T165507353-b70f7b), each only in its record's scope as the owner's scope rulings cited with it widen it; AC-10's 2026-11-09 amendment, *Owner acceptances*, cites the records and those rulings. **Corrected (2026-11-11).** At least the *Isolation denial routing* Decision bullet was false under `[delivery] internal_error = "stop"`: it said a `SandboxError` is one *"which the router/transform worker routes to `ERROR`/dead-letter **post-ACK**"*, under every policy, where `stop` halts the inbound's routing or transform instead. The correction sits beside it. At least the Context's reliability constraint, the `db_lookup`/`fhir_lookup` bullet, AC-11, AC-14 and the Handler-exception residual now name the policy too. **Amended (2026-11-24).** Two fixes on vault BACKLOG #3135 (steps 7 and 8) change what AC-10's 2026-11-09 amendment and the grandchild residual describe: the check for a frame waiting before a request runs again right before the request is written, and the worker moves its request pipe off fd 0 before it reads the boot frame. Each note sits beside the text it changes; no accepted text is rewritten.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -386,12 +386,22 @@ target, no `pickle` import left to mis-suppress:
   >   request is encoded. `_reject_unsolicited` checks once, right after the call's answer is read.
   >   A frame left **after** an answer still fails the call closed when it is queued by the time
   >   that second check runs.
+  >
+  >   *Amended 2026-11-24 (vault BACKLOG #3135 step 7):* `dispatch` now also makes the check before
+  >   a request a second time, after the request is encoded and right before it is written. A frame
+  >   found there is handled as at `_live_worker`'s check: the worker is dropped and the message is
+  >   retried on a fresh worker, sharing the one retry each dispatch gets, so a second stray frame
+  >   fails the call. A queued EOF found there sends the request to a fresh worker.
   > - **A call refused at encode reads nothing after its check.** A request the engine cannot
   >   encode, or one over the frame cap, fails only its message and keeps its worker. A frame that
   >   arrives after that call's check before its request is not read by that call.
   > - **A frame that arrives later meets at least these outcomes.** On a worker still kept, the
   >   next call's check before its request finds it, and that message is retried. One that arrives
-  >   after that check, and ahead of that call's answer, is read in its place. It is rejected as an
+  >   after that check, and ahead of that call's answer, is read in its place.
+  >   *Amended 2026-11-24 (vault BACKLOG #3135 step 7):* "that check" is now the second check
+  >   before a request, the one right before the write. A frame that arrives while the request is
+  >   encoded is found there and the message is retried, so the window this bullet describes
+  >   narrows to the time between that check and the end of the call's answer. It is not closed. It is rejected as an
   >   invalid frame, and the call fails as an internal error, which the `[delivery] internal_error`
   >   policy then handles, unless it is a well-formed answer to that very request, which is taken as
   >   the answer, or, at `mode=isolated`, a well-formed lookup for that request carrying the next
@@ -437,6 +447,12 @@ target, no `pickle` import left to mis-suppress:
   >   `[delivery] internal_error` policy, the owner answered *"Yes, any policy"*, so the case is
   >   accepted under every such policy, where the call fails and that policy handles it,
   >   `internal_error=stop` included.
+  >
+  >   *Note 2026-11-24 (vault BACKLOG #3135 step 7), not the owner's words:* a fix narrowed this
+  >   window; the AC-10 amendment's second check, above, says how. A frame that arrives between that
+  >   check and the call's answer is still read in the answer slot. The acceptance ran until a fix
+  >   narrows or closes the window, so whether it still covers the window that remains is for the
+  >   owner to rule, and this note does not record it as accepted.
   > - **Record d20261110T165507353-b70f7b:** a grandchild that inherits the worker's request pipe
   >   (fd 0) can read a later request's id and forge an answer that the engine accepts as that
   >   message's result. This falls under this ADR's no-confinement residual, until a fix closes
@@ -447,6 +463,15 @@ target, no `pickle` import left to mis-suppress:
   >   fail answers too, the owner answered *"Yes, all answer kinds"*, so it covers a forged answer
   >   of every kind, `ok`, `denied`, `error` and `memory`, including the false `MEMORY_CAP` kill
   >   cause a forged `memory` answer records.
+  >
+  >   *Note 2026-11-24 (vault BACKLOG #3135 step 8), not the owner's words:* the inheritance path
+  >   this record names is closed for a process that runs a new program. The worker moves its
+  >   request pipe to a non-inheritable descriptor and points fd 0 at the null device before it
+  >   reads the boot frame (`_detach_request_pipe` in `messagefoundry/pipeline/_sandbox_worker.py`),
+  >   so a process a Handler starts with `subprocess`, with its descriptors inherited or not, finds
+  >   no pipe on fd 0. At least these still reach the pipe: a POSIX `fork` with no `exec` keeps
+  >   every descriptor, the private one included, which is code from the worker's own image; code
+  >   running in the worker; and the `/proc` and Windows routes listed below.
   >
   > *The Manager's 2026-11-10 reading of the code and the two records, not the owner's words:* at
   > least these are not accepted by either owner record, and each is to be added as a step on vault
@@ -468,7 +493,10 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox.py::test_a_frame_staged_between_dispatches_can_never_answer_the_next_one`,
   `tests/test_sandbox.py::test_a_dead_peer_is_not_treated_as_a_forged_frame`,
   `tests/test_sandbox.py::test_request_ids_are_unpredictable_and_never_reused`,
-  `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`
+  `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`,
+  `tests/test_sandbox.py::test_a_stray_frame_queued_after_the_check_is_found_before_the_request_is_written`,
+  `tests/test_sandbox.py::test_the_second_check_shares_the_one_retry_a_dispatch_gets`,
+  `tests/test_sandbox.py::test_a_process_a_handler_spawns_cannot_read_the_request_pipe`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (under the default `[delivery] internal_error` it previously
   dead-lettered every message), and SHALL preserve `_partition` parity for **every** return shape —
@@ -700,6 +728,11 @@ it is the constraint any proposal to make `subprocess` a *default* has to clear 
   own feed: a kill-and-respawn fails calls on that inbound, which the `[delivery] internal_error`
   policy then handles. (Since 2026-11-09 a frame staged before a request costs that message a retry on a
   fresh worker, and in the cases AC-10's amendment points to, a failed call too.)
+  *Amended 2026-11-24 (vault BACKLOG #3135 step 8):* a grandchild that runs a new program no longer
+  inherits the request pipe on fd 0: the worker moves the pipe to a non-inheritable descriptor and
+  points fd 0 at the null device before it reads the boot frame. It still inherits fd 1, and the
+  rest of this bullet about writing frames stands. A child made by a POSIX `fork` with no `exec`
+  still holds the private descriptor, and the `/proc` and Windows routes above are unchanged.
 - **One Handler is not confined from another inside a worker.** All of an inbound's Routers/Handlers
   share one child and one `Registry`, so admin code can rebind a sibling in-process. This seam does
   not change that — `mode=off` shares an address space too — and any claim that the pipe protects

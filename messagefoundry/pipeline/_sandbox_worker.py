@@ -92,6 +92,31 @@ def _redirect_stdout_to_stderr() -> None:
     sys.stdout = sys.stderr
 
 
+def _detach_request_pipe() -> Any:
+    """Move the request pipe off fd 0 and return a reader on the private copy (vault BACKLOG #3135
+    step 8).
+
+    A process a Handler spawns inherits fd 0 unless it is told otherwise, and with it the worker's
+    request pipe, from which it could read a later request's id and forge that request's answer.
+    The pipe moves to a descriptor :func:`os.dup` makes non-inheritable (PEP 446), and fd 0 is
+    pointed at the null device, so such a process finds no pipe on fd 0, with its descriptors
+    inherited or not. On Windows ``os.dup2`` on fd 0 also repoints the process's standard input
+    handle, which is what :mod:`subprocess` hands a child there; the old pipe handle is closed.
+
+    This closes inheritance across a new program only. Code running in the worker can still read
+    the private descriptor, a child made by a POSIX ``fork`` with no ``exec`` keeps it, and a
+    same-UID process can still reach the pipe by other routes, at least ``/proc/<pid>/fd`` on Linux
+    and handle duplication on Windows (ADR 0087 AC-10). Called before
+    the boot frame is read, so no byte has been buffered from fd 0 yet."""
+    private = os.dup(0)
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, 0, inheritable=True)
+    finally:
+        os.close(null)
+    return os.fdopen(private, "rb")
+
+
 class _ForbiddenImportFinder:
     """A ``sys.meta_path`` finder that fails a forbidden import loudly.
 
@@ -558,7 +583,7 @@ def main() -> int:
     from messagefoundry.pipeline._sandbox_codec import SandboxError
     from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame, graph_shape
 
-    stdin = sys.stdin.buffer
+    stdin = _detach_request_pipe()
     stdout = sys.stdout.buffer
     # Sequenced deliberately: AFTER the frame writer captures its raw handle (at module scope the
     # capture above would resolve to fd 2 and send every frame to the wrong pipe) and BEFORE the boot
