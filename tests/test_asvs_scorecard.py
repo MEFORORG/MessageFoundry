@@ -3168,9 +3168,9 @@ def test_prove_absences_screen_outer_rule_reads_only_a_shape_that_is_fixed_and_l
 ) -> None:
     """The rule tells nothing where the outermost shape decorator may call an implementation
     registered on it in place of what it wraps (``singledispatch``), where a decorator is called
-    that is not used that way, where ``functools.wraps`` is left uncalled, or where the target's def is not the live binding; each
-    of these is accepted, as without the rule. A ``typing_extensions`` passthrough is passed over
-    like the ``typing`` one."""
+    that is not used that way, where ``functools.wraps`` is left uncalled, or where the target's
+    def is not the live binding; each of these is accepted, as without the rule. A
+    ``typing_extensions`` passthrough is passed over like the ``typing`` one."""
     head = "import functools\nimport typing_extensions\n\ndef g(): ...\n\nw = WRAP\n\n"
     plain = _decorated((), method=False)
     for live in (

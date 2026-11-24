@@ -3229,8 +3229,8 @@ def _signature_clause(
 #: What a name is bound to with each shape decorator outermost, for :func:`_outer_clause`.
 _OUTER_BINDS: Final = {
     "builtins.property": (
-        "a property, which is not callable, and which, read through an instance, runs its getter "
-        "on each read, or raises AttributeError where it has none"
+        "a property, which is not callable, and which, read through an instance, calls its getter "
+        "on each read, where it has one"
     ),
     "builtins.staticmethod": "a staticmethod, whose callers pass every parameter",
     "builtins.classmethod": (
@@ -3283,8 +3283,8 @@ def _outer_clause(qual: str, path: str, outer: tuple[str | None, str | None]) ->
         for o in outer
     ]
     clause.tail = (
-        f"Applied, where no decorator raises, this definition binds the name to {binds[0]}, and "
-        f"the {path} definition it was compared with binds it to {binds[1]}. So the "
+        f"Applied, this definition binds the name to {binds[0]}. The {path} definition it was "
+        f"compared with binds it to {binds[1]}. Each holds where no decorator raises. So the "
         "observable may go red for that change and not for the reintroduction. Copy the live "
         "decorators; the mutation lives in a different repository from the symbol it shadows, so "
         "nothing else keeps the two in step"
