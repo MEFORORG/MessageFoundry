@@ -5580,8 +5580,10 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     ``abandoned`` list) before calling this, so an exception raised here does not skip it."""
     if borrow.done():
         return
-    # The attribute gate covers a borrow from a task factory whose task type does not subclass
-    # asyncio.Task, which _value_in_flight would otherwise read as parked.
+    # The attribute gate covers a borrow from a task factory whose task type neither subclasses
+    # asyncio.Task nor exposes _fut_waiter, which _value_in_flight would otherwise read as parked. A
+    # type that exposes it without subclassing asyncio.Task still reads parked, and is cancelled at
+    # once on either path.
     state: _Flight = _value_in_flight(borrow) if hasattr(borrow, "_fut_waiter") else "unknown"
     if state == "unknown":
         global _warned_no_waiter
@@ -5671,8 +5673,9 @@ async def acquire_pooled(
     A bare ``asyncio.wait_for(pool.acquire(), timeout)`` cancels the borrow at the instant the timer
     fires, which races the pool's own mark-in-use step; ``shield`` moves the cancellation out of that
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
-    per retry. That cancel goes through :func:`_cancel_borrow`, which on CPython puts it off while a
-    value is on its way into the borrow (on a task type it cannot read, it cancels at once).
+    per retry. That cancel goes through :func:`_cancel_borrow`, which on CPython's own task type puts
+    it off while a value is on its way into the borrow (on a task type it cannot read, or one that is
+    not an ``asyncio.Task``, it cancels at once).
     Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
     borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
     not check is lost before the borrow ends. The caller's own cancellation takes the same path — it must, or a
@@ -5730,7 +5733,8 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     discard the connection there, because a pending cancel is thrown in instead of the resolved value.
     So the cancel path hands the borrow to the cleanup and cancels it through :func:`_cancel_borrow`,
     which puts the cancel off while a value is on its way into the borrow (on a task type it
-    cannot read, one turn unchecked). The cleanup releases each abandoned
+    cannot read, one turn unchecked; on a type that exposes ``_fut_waiter`` without being an
+    ``asyncio.Task``, not at all). The cleanup releases each abandoned
     borrow's connection as soon as that borrow lands, under the same deadline as the other releases,
     so a borrow that lands is not kept waiting on a sibling still stuck; it attaches
     :func:`_salvage_late_borrow` to any borrow still pending at the deadline, and a borrow is returned
