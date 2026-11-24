@@ -18,10 +18,9 @@ checks). Two checks are **required** (they can block a commit):
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
   ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
-  never a silent OFF (#230). When the leg reaches the preview, a settings source resolves and
-  nothing else refuses the settings first, the section-name refusal
-  (:class:`~messagefoundry.config.settings.SectionNameEnvError`) fails the leg instead; with no
-  source resolved nothing is loaded, so nothing is refused.
+  never a silent OFF (#230). The section-name refusal
+  (:class:`~messagefoundry.config.settings.SectionNameEnvError`, whose docstring says when) can
+  fail the leg instead.
 
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`

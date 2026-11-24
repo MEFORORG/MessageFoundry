@@ -60,8 +60,7 @@ def _off_toml(tmp_path: Path) -> Path:
 def test_dryrun_snapshot_setting_reports_the_section_name_refusal(
     tmp_path: Path, clean_env: pytest.MonkeyPatch, name: str
 ) -> None:
-    # The trailing-underscore forms were a plain ValueError on main before this change, so the
-    # helper fell back on them; they are reported now too.
+    # Every form here was a plain ValueError before this change, so the helper fell back on it.
     toml = _off_toml(tmp_path)
     clean_env.setenv(name, "x")
     with pytest.raises(SectionNameEnvError, match=name):
@@ -210,7 +209,8 @@ def test_alert_add_transport_check_does_not_read_the_refusal_as_none_configured(
 def test_alert_add_end_to_end_writes_nothing_on_the_section_name_refusal(
     tmp_path: Path, clean_env: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Without the add_rule stub: the real path refuses and leaves the file as it was.
+    # Control, without the add_rule stub: the real path refuses and leaves the file as it was. It
+    # held before this change too, through the post-write settings check.
     svc = tmp_path / "messagefoundry.toml"
     svc.write_text(_ALERTS_EMAIL, encoding="utf-8")
     clean_env.setenv("MEFOR_STORE", "x")
