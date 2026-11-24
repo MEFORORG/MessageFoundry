@@ -9287,18 +9287,20 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     written, and ``icacls /grant:r`` kept each of them:
 
     - every deny, placed first;
-    - the explicit OWNER RIGHTS entries, decided as a set: every one is carried, unless each is a
-      plain allow (``A``) holding both READ_CONTROL and WRITE_DAC, in which case the allows are all
-      dropped.
+    - the explicit OWNER RIGHTS entries, decided as a set: they are all dropped only when no deny
+      is carried and each is a plain allow (``A``) with no flags holding both READ_CONTROL and
+      WRITE_DAC; otherwise every one is carried.
 
     Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
-    owner beyond the list, so the entries are decided together. Where one narrows the owner, a
-    deny, an allow lacking either right, or an object allow (``OA``; one that carries an
-    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights,
-    measured), dropping any of them could hand the owner those implicit rights back or take away a
-    right ``icacls /grant:r`` left it, so the owner keeps what that rewrite left. Where none
-    narrows, dropping them all leaves the owner its implicit READ_CONTROL and WRITE_DAC, no more
-    than any one of them granted. A null DACL carries nothing.
+    owner beyond the list, and those implicit rights are granted before any deny is read, so the
+    entries are decided together and against the carried denies. When they are carried, they stay
+    as that rewrite left them. When they are dropped, the owner gets its implicit READ_CONTROL and
+    WRITE_DAC, which each dropped entry already granted, and no deny was there to withhold them.
+    An object allow (``OA``) is always carried: one carrying an ObjectType GUID grants the owner
+    nothing on a file yet still turns off the implicit rights (measured), and one without a GUID
+    applies like a plain allow. Either way the owner can end with less than ``icacls /grant:r``
+    left it, since the one list drops every other principal's allow, an allow for the owner's own
+    account or groups included: a narrowing, not a loosening. A null DACL carries nothing.
 
     Where the current list cannot be read or parsed, or the write fails other than by access
     denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
@@ -9430,18 +9432,21 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
         return None
     denies: list[str] = []
     owner_rights: list[str] = []
-    narrowing = False
+    all_full = True
     for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
-        if "ID" in _sddl_flag_set(flags):
+        flag_set = _sddl_flag_set(flags)
+        if "ID" in flag_set:
             continue
-        is_owner_rights = ace_sid in _OWNER_RIGHTS
         if kind in _SDDL_DENY_TYPES:
             denies.append(f"({text})")
-            narrowing = narrowing or is_owner_rights
-        elif is_owner_rights:
+        elif ace_sid in _OWNER_RIGHTS:
             owner_rights.append(f"({text})")
-            narrowing = narrowing or kind != "A" or not _grants_owner_implicit_rights(rights)
-    return denies, owner_rights if narrowing else []
+            all_full = all_full and (
+                kind == "A" and not flag_set and _grants_owner_implicit_rights(rights)
+            )
+    # A carried deny can bind the owner only while an OWNER RIGHTS entry stays: the implicit
+    # rights an owner regains with none left are granted before any deny is read.
+    return denies, ([] if all_full and not denies else owner_rights)
 
 
 def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:

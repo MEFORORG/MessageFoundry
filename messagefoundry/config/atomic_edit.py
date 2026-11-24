@@ -15,8 +15,9 @@ On Windows those modes do not restrict the file, so the candidate is given a pro
 granting the editing account, and the live file's owner when that is another account, before its
 first byte is written. An own-account replaced file is then given the editing account's list
 alone; a foreign-owned one gets the list the next paragraph describes. ``_restrict_to_editor``
-writes that one whole list. When that write fails, ``store._secure_file``, which can grant only
-the editing account, is the fallback for a file no other account owns. On Windows, a file another
+writes that one whole list. When that write fails, ``store._secure_file``, which writes the
+editing account's entry and the entries its docstring says it carries over, is the fallback for a file
+no other account owns. On Windows, a file another
 account owns takes its kept icacls rewrite instead, which removes inherited entries and keeps the
 explicit ones, the owner's entry among them where the candidate's write took. The
 caller's ``validate`` runs against that candidate. Only a candidate that

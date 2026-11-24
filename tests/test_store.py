@@ -325,30 +325,41 @@ def test_secure_file_carries_explicit_denies_first_and_every_owner_rights_entry_
 
 @_windows_only
 @pytest.mark.parametrize(
-    ("owner_rights", "carried"),
+    ("current", "carried"),
     [
         # A full entry beside a narrowing one: the owner kept FA under `icacls /grant:r`. RED before
         # the set rule: FA was dropped and WD carried, so the owner was left WD alone.
-        pytest.param("(A;;FA;;;OW)(A;;WD;;;OW)", "(A;;FA;;;OW)(A;;WD;;;OW)", id="full-and-wd"),
+        pytest.param("(A;;FA;;;OW)(A;;WD;;;OW)", "", id="full-and-wd"),
         # An OWNER RIGHTS deny is an OWNER RIGHTS entry too, so the full allow beside it stays.
         # RED before: the deny was carried and the allow dropped, leaving the owner nothing.
-        pytest.param("(D;;FW;;;OW)(A;;FA;;;OW)", "(A;;FA;;;OW)", id="deny-and-full"),
-        # Every entry holds READ_CONTROL and WRITE_DAC: all are dropped together, and the owner is
-        # left its implicit READ_CONTROL and WRITE_DAC, no more than any of them granted.
-        pytest.param("(A;;FA;;;OW)(A;;0x1f01ff;;;OW)", "", id="all-full-dropped"),
+        pytest.param("(D;;FW;;;OW)(A;;FA;;;OW)", "(D;;FW;;;OW)", id="ow-deny-and-full"),
+        # Any carried deny keeps the set: with no OWNER RIGHTS entry left, the owner's implicit
+        # READ_CONTROL and WRITE_DAC are granted before the deny is read, so it would bind no more.
+        pytest.param("(D;;WD;;;WD)(A;;FA;;;OW)", "(D;;WD;;;WD)", id="other-deny-and-full"),
+        # A flagged entry (inherit-only here grants nothing on the file) is not a full one.
+        pytest.param("(A;OICIIO;FA;;;OW)", "", id="inherit-only-full"),
+        # An object allow is always carried, with or without an ObjectType GUID.
+        pytest.param("(A;;FA;;;OW)(OA;;FA;;;OW)", "", id="guidless-object-allow"),
+        # Every entry is a plain, flag-free allow holding READ_CONTROL and WRITE_DAC and no deny is
+        # carried: all are dropped, and the owner is left its implicit READ_CONTROL and WRITE_DAC.
+        pytest.param("(A;;FA;;;OW)(A;;0x1f01ff;;;OW)(A;;KA;;;OW)(A;;GA;;;OW)", None, id="all-full"),
     ],
 )
 def test_secure_file_decides_the_owner_rights_entries_as_a_set(
-    monkeypatch: pytest.MonkeyPatch, owner_rights: str, carried: str
+    monkeypatch: pytest.MonkeyPatch, current: str, carried: str | None
 ) -> None:
+    # ``carried`` holds the carried denies, written first; the OWNER RIGHTS allows of ``current``
+    # follow this account's entry unless it is None, when they are all dropped.
+    import re
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
 
-    captured = _capture_dacl_writes(monkeypatch, current=f"O:BAD:PAI(A;;FA;;;WD){owner_rights}")
+    captured = _capture_dacl_writes(monkeypatch, current=f"O:BAD:PAI(A;;FA;;;WD){current}")
     store_mod._secure_file(Path("store.db"))
-    denies = "(D;;FW;;;OW)" if "(D;" in owner_rights else ""
-    assert captured == [("store.db", f"D:P{denies}(A;;FA;;;{_TOKEN_SID}){carried}", True)]
+    allows = "" if carried is None else "".join(re.findall(r"\((?!D;)[^()]*\)", current))
+    expected = f"D:P{carried or ''}(A;;FA;;;{_TOKEN_SID}){allows}"
+    assert captured == [("store.db", expected, True)]
 
 
 @_windows_only

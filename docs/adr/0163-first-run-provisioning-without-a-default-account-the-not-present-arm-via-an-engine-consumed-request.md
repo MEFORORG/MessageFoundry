@@ -277,12 +277,9 @@ see its *What it widens* and *Left open*.
   same DACL (measured); on the copy fallback it does not. **AMENDED 2026-11-23:** built where the
   write succeeds: for these callers `_secure_file` now writes one protected DACL whole, granting the
   account the process runs as, and removes inherited entries and explicit allows for other
-  principals. It carries over explicit entries the icacls rewrite kept: every deny, and the explicit
-  OWNER RIGHTS entries, decided as a set, so all of them are carried unless each is a plain allow
-  holding both READ_CONTROL and WRITE_DAC. A carried OWNER RIGHTS allow is an explicit allow for the
-  file's owner. The set is decided together because any OWNER RIGHTS entry turns off the READ_CONTROL
-  and WRITE_DAC Windows otherwise gives an owner. An OWNER RIGHTS object allow (`OA`) carrying an
-  ObjectType GUID grants the owner nothing on a file; one without a GUID applies like a plain allow.
+  principals. It carries over explicit entries the icacls rewrite kept: every deny, and in most cases
+  the explicit OWNER RIGHTS entries, as a set. A carried OWNER RIGHTS allow is an explicit allow for
+  the file's owner.
   On some failures it runs the icacls rewrite instead, which keeps every explicit entry, other
   principals' allows included. The `_secure_file` docstring, *What the one list carries over*, is
   the statement of the rule and of those failures; this list follows it.
