@@ -7972,7 +7972,8 @@ source of record is `SecurityEventNotifier._record_undelivered` in
 `admin-reset-totp` record it the same way (BACKLOG #5634). `provision-admin` writes it into the
 store it holds open, so a takeover notice whose `auth.first_administrator_provisioned` row reads
 `holder_notice: dispatched` and whose send failed gets its own undelivered row too, except in at
-least these cases: that write fails, or the run is interrupted mid-send. The command's own result
+least these cases: that write fails, or an interrupt ends the run before it lands. An interrupt
+mid-send can instead leave a `reason: interrupted` row (BACKLOG #6832). The command's own result
 says so as well: `holder_notice_send_failed` in `--json`, and a WARNING line in text. Both say
 the notifier requested to record the notice as undelivered, that is, its send raised, so delivery is
 unconfirmed; a send can raise after the relay has queued the mail. That row can

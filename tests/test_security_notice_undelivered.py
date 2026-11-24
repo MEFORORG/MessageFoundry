@@ -810,6 +810,64 @@ async def test_a_close_timeout_cuts_the_drain_and_records_before_returning(
         release.set()
 
 
+async def test_a_cut_of_the_close_while_it_records_stops_only_its_wait(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, final review round. The teardown cuts the step while the close is still
+    writing its rows; the cut stops the wait, and every row is still written."""
+    started, release = _blocking_send(monkeypatch)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    class _GatedAudit:
+        async def record_view(
+            self, message_id: str, *, actor: str | None = None, now: float | None = None
+        ) -> None:
+            raise AssertionError("the notifier never records a view")
+
+        async def record_audit(
+            self,
+            action: str,
+            *,
+            actor: str | None = None,
+            channel_id: str | None = None,
+            detail: str | None = None,
+            client: str | None = None,
+            now: float | None = None,
+        ) -> None:
+            entered.set()
+            await gate.wait()
+            await store.record_audit(action, actor=actor, detail=detail)
+
+    notifier = SecurityEventNotifier(
+        host="smtp.example.org",
+        port=25,
+        sender="mf@example.org",
+        audit=cast(AuditStore, _GatedAudit()),
+    )
+    notifier.start()
+    for name in ("amy", "ben", "cat"):
+        await notifier.notify(
+            SecurityEvent(PASSWORD_CHANGED, username=name, email=f"{name}@x.test")
+        )
+    try:
+        assert await asyncio.to_thread(started.wait, 5.0)
+        closing = asyncio.create_task(notifier.aclose(0.05))
+        await asyncio.wait_for(entered.wait(), 5.0)
+        closing.cancel()  # the step's own cut, mid-record
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+    finally:
+        gate.set()
+        release.set()
+    await asyncio.wait_for(asyncio.gather(*notifier._recording), 5.0)
+    assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == [
+        ("amy", "interrupted"),
+        ("ben", "abandoned"),
+        ("cat", "abandoned"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("outcome", "rows"),
     [("sent", []), ("raised", ["send_failed"]), ("cancelled", ["interrupted"])],

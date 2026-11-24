@@ -19,7 +19,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from messagefoundry.auth.audit_visibility import LOCK_NOTICE_UNDELIVERED_ACTION
 from messagefoundry.auth.notifications import (
@@ -712,7 +712,7 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._audit = audit
         # The records still being written, at least the queue-full ones and a failed send's, held so
         # the loop keeps them alive and so aclose() can wait for them.
-        self._recording: set[asyncio.Future[bool]] = set()
+        self._recording: set[asyncio.Future[Any]] = set()
         # The send the drain is waiting on, with what it needs to record or count it, so a cut
         # close can record it (BACKLOG #6832). None between sends.
         self._sending: tuple[SecurityEvent, asyncio.Future[bool], Callable[[], None]] | None = None
@@ -827,13 +827,17 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         count of queued notices is logged before any of them is written."""
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         drain = self._task
+        deadline = asyncio.timeout(timeout)
+        cut = True
         try:
-            async with asyncio.timeout(timeout):
+            async with deadline:
                 await super().aclose()
+            cut = False
         except TimeoutError:
-            log.warning(
-                "%s did not drain within %.2fs; cutting its queue", type(self).__name__, timeout
-            )
+            # No line of its own: what was cut is logged below, without the lock notices a bare
+            # "cut" line would hint at (BACKLOG #1131).
+            if not deadline.expired():
+                raise
         finally:
             # Taken and logged before any await, so a second cancel cannot leave them untold.
             left = self._take_queued()
@@ -844,14 +848,17 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                     drain.cancel()
                     self._task = None
                     await asyncio.gather(drain, return_exceptions=True)
-                    if not drain.cancelled() and (error := drain.exception()) is not None:
+                    # Uncut, the base close has already raised the drain's failure to the caller.
+                    if cut and not drain.cancelled() and (error := drain.exception()) is not None:
                         log.error("%s drain loop failed", type(self).__name__, exc_info=error)
             finally:
-                try:
-                    await self._record_cut(left)
-                finally:
-                    # Each one swallows its own failure, so this only waits.
-                    await asyncio.gather(*self._recording, return_exceptions=True)
+                # Held and shielded like a failed send's record, so a cut of this close stops only
+                # its wait: the writes go on until the store closes.
+                records = asyncio.ensure_future(self._record_cut(left))
+                self._recording.add(records)
+                records.add_done_callback(self._recording.discard)
+                # Each one swallows its own failure, so this only waits.
+                await asyncio.shield(asyncio.gather(*self._recording, return_exceptions=True))
 
     def _take_queued(self) -> list[SecurityEvent]:
         """Empty the queue, stop sentinel included, and log how many notices it held. At least a
