@@ -176,23 +176,26 @@ def test_unknown_provider_name_fails_closed() -> None:
 _BROKEN_IMPORT_TEXT = "DLL load failed: C:/synthetic/site-packages/_sdk.pyd marker zz0451"
 
 
-@pytest.mark.parametrize(
-    "make_error",
-    [
-        pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
-        pytest.param(
-            lambda: ImportError(f"cannot import name 'Client' ({_BROKEN_IMPORT_TEXT})"),
-            id="missing-symbol",
-        ),
-        pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
-        pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
-    ],
-)
+#: Errors a present-but-broken import can raise, each built fresh per raise.
+_BROKEN_IMPORTS = [
+    pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
+    pytest.param(
+        lambda: ImportError(f"cannot import name 'Client' ({_BROKEN_IMPORT_TEXT})"),
+        id="missing-symbol",
+    ),
+    pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
+    pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
+    pytest.param(lambda: SyntaxError(_BROKEN_IMPORT_TEXT), id="syntax-error"),
+    pytest.param(lambda: ValueError(_BROKEN_IMPORT_TEXT), id="value-error"),
+]
+
+
+@pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
 def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text(
     monkeypatch: pytest.MonkeyPatch, make_error: Any
 ) -> None:
     # Vault BACKLOG #6709 item 1: an SDK that is installed but broken raises a plain ImportError (or
-    # an OSError or AttributeError from the module's top-level code), not ModuleNotFoundError. The
+    # another error from the module's top-level code), not ModuleNotFoundError. The
     # dispatch must refuse with SecretProviderError, naming the extra and the error's type, and
     # must not repeat the error's text, in its own text or through a chain.
     raised: list[BaseException] = []
@@ -213,14 +216,7 @@ def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 
-@pytest.mark.parametrize(
-    "make_error",
-    [
-        pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
-        pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
-        pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
-    ],
-)
+@pytest.mark.parametrize("make_error", _BROKEN_IMPORTS)
 def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
     monkeypatch: pytest.MonkeyPatch, make_error: Any
 ) -> None:
@@ -229,6 +225,7 @@ def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
     import builtins
 
     real_import = builtins.__import__
+    type_name = type(make_error()).__name__
 
     def _import(name: str, *args: Any, **kwargs: Any) -> Any:
         if name == "hvac":
@@ -237,9 +234,13 @@ def test_vault_lazy_hvac_import_that_breaks_fails_closed_with_a_fixed_text(
 
     monkeypatch.setattr(builtins, "__import__", _import)
     provider = secretprovider_vault.build_provider(SecretsSettings())
-    with pytest.raises(SecretProviderError, match=r"install 'messagefoundry\[vault\]'") as caught:
+    with pytest.raises(SecretProviderError) as caught:
         provider.resolve("mefor/ad")
-    assert "synthetic" not in str(caught.value) and "0451" not in str(caught.value)
+    text = str(caught.value)
+    # A broken hvac is told apart from a missing one: it names the class and says reinstall.
+    assert f"hvac is installed but did not import ({type_name})" in text
+    assert "reinstall 'messagefoundry[vault]'" in text
+    assert "synthetic" not in text and "0451" not in text and "Client" not in text
     assert caught.value.__cause__ is None and caught.value.__context__ is None
 
 

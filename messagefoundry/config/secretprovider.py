@@ -126,10 +126,11 @@ def _load_external_provider(
     The seam: a per-provider module ``messagefoundry/config/secretprovider_<name>.py`` exposes
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
     dispatch imports it by name with **no edit here**. A missing provider module, a missing backend
-    SDK, or a provider module that is present but fails to import with an ``ImportError``,
-    ``OSError`` or ``AttributeError`` **fails closed** with :class:`SecretProviderError`; the last
-    two name the extra. The base install pulls **zero** external SDK. A provider that imports its
-    SDK lazily wraps that import itself (``secretprovider_vault._import_hvac``).
+    SDK, or a provider module that is present but whose import raises an ``Exception``, **fails
+    closed** with :class:`SecretProviderError`; the last two name the extra. The base install pulls
+    **zero** external SDK. A provider that imports its SDK lazily, as ``vault`` does, refuses a
+    failed SDK import itself, at its first read rather than here
+    (``secretprovider_vault._import_hvac``).
 
     ``posture`` is handed to every external provider, because each one dials a network hop that a
     posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as
@@ -149,13 +150,13 @@ def _load_external_provider(
             f"[secrets].provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra ('messagefoundry[{extra}]')."
         ) from exc
-    except (ImportError, OSError, AttributeError) as exc:
+    except Exception as exc:
         # Present but broken: a C extension that fails to load, a name the SDK no longer has, or
-        # an OSError or AttributeError from the module's top-level code (vault BACKLOG #6709).
-        # The text names the provider and the error's type only: an import error's own text can
-        # carry a filesystem path, and this text reaches operator output. The refusal is raised
-        # outside this handler with no chain, so a rendered traceback does not carry that text
-        # either.
+        # any other error from the module's top-level code, such as an OSError, an AttributeError
+        # or a SyntaxError in a truncated file (vault BACKLOG #6709). The text names the provider
+        # and the error's class only: an import error's own text can carry a filesystem path or a
+        # source line, and this text reaches operator output. The refusal is raised outside this
+        # handler with no chain, so a rendered traceback does not carry the error's text either.
         failed = type(exc).__name__
     else:
         provider: SecretProvider = module.build_provider(settings, posture=posture)

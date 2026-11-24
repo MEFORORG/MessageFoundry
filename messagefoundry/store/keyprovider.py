@@ -303,17 +303,17 @@ def _load_external_provider(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
         ) from exc
-    except (ImportError, OSError, AttributeError) as exc:
+    except Exception as exc:
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
-        # module itself no longer has. Importing runs the module's top-level code, which can also
-        # fail with an OSError (a native library) or an AttributeError (vault BACKLOG #6709 item
-        # 3). Other classes pass through as they did, so a ValueError or a hop refusal raised at
-        # import keeps the refusal store.base picks for its class. resolve_active_key and
-        # resolve_decrypt_keys replace what reaches them with a fresh fixed-text refusal chosen by
-        # its class, so there these three classes read as a key-provider refusal; this keeps this
-        # seam's own contract, KeyProviderError, for a provider module whose import fails. An
-        # error raised later, inside build_provider or a provider's lazy SDK import, is the
-        # provider's to wrap (vault BACKLOG #6709).
+        # module itself no longer has. Importing runs the module's top-level code, which can fail
+        # with any class (an OSError from a native library, an AttributeError, a SyntaxError in a
+        # truncated file), so this takes any Exception (vault BACKLOG #6709 item 3). Left raw, a
+        # ValueError would reach store.base, which reads a ValueError as a refused key and tells
+        # the operator to generate a new one; a failed import is never a bad key. The error is
+        # chained, not swallowed. This seam's own text does not reach an operator through
+        # resolve_active_key or resolve_decrypt_keys, which replace any error with a fixed text of
+        # their own. An error raised later, inside build_provider or a provider's lazy SDK import,
+        # is not caught here.
         raise KeyProviderError(
             f"[store].key_provider={name!r} could not load its provider module or backend (an "
             f"import failed: {type(exc).__name__}, chained below) — reinstall MessageFoundry "

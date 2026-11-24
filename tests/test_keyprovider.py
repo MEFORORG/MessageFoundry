@@ -259,16 +259,21 @@ def test_an_external_provider_whose_backend_import_breaks_fails_closed(
     assert len(raised) == 2 and raised[0] is not raised[1]
 
 
-def test_an_import_time_value_error_keeps_its_own_class(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Vault BACKLOG #6709 item 3 widens the seam to OSError and AttributeError only, so a
-    # ValueError raised at import still reaches store.base as a ValueError, which picks its own
-    # refusal for that class.
+def test_an_import_time_value_error_is_not_read_as_a_refused_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Vault BACKLOG #6709 item 3: store.base reads a raw ValueError as a refused key and tells the
+    # operator to generate a new one. A provider module whose import raises one is a broken
+    # install, so the seam refuses it as a KeyProviderError like any other failed import.
     def _import(_name: str) -> ModuleType:
         raise ValueError("synthetic")
 
     monkeypatch.setattr("messagefoundry.store.keyprovider.importlib.import_module", _import)
-    with pytest.raises(ValueError, match="synthetic"):
+    with pytest.raises(KeyProviderError, match="could not load its provider module or backend"):
         resolve_key_provider(StoreSettings(key_provider="vault"))
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "gen-key" not in str(caught.value)
 
 
 @pytest.mark.parametrize(
