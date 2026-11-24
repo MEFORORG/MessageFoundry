@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #6687: a DR copy loop reads a ``None`` read as "no data yet", not as end of stream.
+"""BACKLOG #6687: a DR copy loop refuses a ``None`` read rather than reading it as end of stream.
 
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
 ``if not buf: break`` ends the copy short there. Three copy loops in ``pipeline/dr_backup.py`` now
-share :func:`dr_backup._read_chunks`, and these tests drive each of the three. Reads in that module
-this branch does not change include at least ``_extract_member``, the plaintext branch of
-``_restore_blocking``, the ``shutil.copyfileobj`` in ``_place_restored_store`` and ``_sha256_file``.
-The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
+share :func:`dr_backup._read_chunks`, which reads through the codec's ``_read_once`` and so refuses
+a ``None`` read with the codec's ``BackupCodecError``, as the keyed branch does. These tests drive
+each of the three. Reads in that module this branch does not change include at least
+``_extract_member``, the plaintext branch of ``_restore_blocking``, the ``shutil.copyfileobj`` in
+``_place_restored_store`` and ``_sha256_file``. The sources are synthetic: a store with one made-up
+row, and a tar of made-up config bytes."""
 
 from __future__ import annotations
 
@@ -15,7 +17,6 @@ import builtins
 import hashlib
 import io
 import tarfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -23,10 +24,12 @@ import pytest
 
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup as dr
-from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner
 from messagefoundry.store import MessageStore
+from messagefoundry.store.backup_codec import BackupCodecError
 
-_CHUNK = dr._COPY_CHUNK_BYTES
+# The 1 MiB literal is the pre-fix loops' read size, so the module still imports on that code.
+_CHUNK: int = getattr(dr, "_COPY_CHUNK_BYTES", 1024 * 1024)
 
 
 class _Scripted:
@@ -74,71 +77,19 @@ class _Stalling:
 # --- the shared loop itself -------------------------------------------------------------------
 
 
-class _FakeClock:
-    """Stands in for ``dr_backup``'s own ``time`` module: ``sleep`` records the wait and moves a
-    fake ``monotonic`` on by it, so no test here sleeps or races a real clock. Every other
-    attribute is the real ``time`` module's."""
-
-    def __init__(self) -> None:
-        self.now = 0.0
-        self.waits: list[float] = []
-
-    def monotonic(self) -> float:
-        return self.now
-
-    def sleep(self, seconds: float) -> None:
-        self.waits.append(seconds)
-        self.now += seconds
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(time, name)
-
-
-@pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
-    fake = _FakeClock()
-    monkeypatch.setattr(dr, "time", fake)
-    return fake
-
-
-def test_a_none_read_is_waited_out_not_read_as_end_of_stream(clock: _FakeClock) -> None:
-    src = _Scripted([None, b"ab", None, None, b"cd", b""])
-    assert list(dr._read_chunks(src)) == [b"ab", b"cd"]
-    assert src.reads == 6
-    # Each None read sleeps the documented wait, rather than spinning on the source.
-    assert clock.waits == [dr._NO_DATA_YET_WAIT_SECONDS] * 3
-
-
-def test_a_source_that_only_answers_none_is_refused_at_the_limit(clock: _FakeClock) -> None:
-    wait, limit = dr._NO_DATA_YET_WAIT_SECONDS, dr._NO_DATA_YET_LIMIT_SECONDS
-    # Enough None reads to reach the limit and several more; _Scripted raises AssertionError on a
-    # read past its script, which pytest.raises(TimeoutError) would not catch.
-    stall = round(limit / wait) + 5
-    src = _Scripted([b"ab"] + [None] * stall)
-    chunks = dr._read_chunks(src)
+def test_a_none_read_is_refused_not_read_as_end_of_stream() -> None:
+    src = _Scripted([b"ab", None, b"cd", b""])
+    chunks = dr._read_chunks(src, "test copy")
     assert next(chunks) == b"ab"
-    with pytest.raises(TimeoutError, match="no data ready"):
+    with pytest.raises(BackupCodecError, match="no data ready reading the test copy"):
         next(chunks)
-    assert limit <= clock.now < limit + 2 * wait
-
-
-def test_a_byte_arriving_restarts_the_no_data_limit(clock: _FakeClock) -> None:
-    # Each stall is shorter than the limit, and together they are longer than it, so the copy
-    # finishes only if a byte arriving starts the limit again.
-    wait, limit = dr._NO_DATA_YET_WAIT_SECONDS, dr._NO_DATA_YET_LIMIT_SECONDS
-    per_stall = round(limit / wait) // 2
-    script: list[bytes | None] = []
-    for _ in range(4):
-        script += [None] * per_stall + [b"x"]
-    src = _Scripted([*script, b""])
-    assert b"".join(dr._read_chunks(src)) == b"xxxx"
-    assert clock.now > limit
+    assert src.reads == 2
 
 
 def test_an_empty_read_ends_the_stream_and_nothing_reads_past_it() -> None:
     # _Scripted raises on a read past its script, so a loop that kept reading would fail here.
-    src = _Scripted([b"ab", b""])
-    assert list(dr._read_chunks(src)) == [b"ab"]
+    src = _Scripted([b"ab", b"cd", b""])
+    assert list(dr._read_chunks(src, "test copy")) == [b"ab", b"cd"]
 
 
 def test_the_scripted_source_refuses_a_read_past_its_end() -> None:
@@ -177,12 +128,15 @@ async def _store_with_a_row(path: Path) -> MessageStore:
     return store
 
 
-@pytest.mark.parametrize("site", ["build", "verify"])
-async def test_a_plaintext_backup_copies_through_a_none_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str
+@pytest.mark.parametrize(
+    ("site", "what"), [("build", "plaintext tar"), ("verify", "plaintext archive")]
+)
+async def test_a_plaintext_backup_refuses_a_none_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, site: str, what: str
 ) -> None:
     """The no-key build copies the staged tar to the archive, and verify copies the archive back to
-    a tar. A ``None`` at either used to end the copy at zero bytes, so verify could not PASS."""
+    a tar. A ``None`` at either used to end the copy at zero bytes, so the run failed later on an
+    empty tar; it now fails at the read, naming the copy."""
     dest = (tmp_path / "backups").resolve()
     wrapped: list[_Stalling] = []
     real_open = builtins.open
@@ -211,18 +165,17 @@ async def test_a_plaintext_backup_copies_through_a_none_read(
             store_settings=StoreSettings(path=str(db), encryption_key=None),
             config_dir=None,
         )
-        result = await runner.run_once(now=1.0)
+        with pytest.raises(BackupError, match=f"no data ready reading the {what}"):
+            await runner.run_once(now=1.0)
     finally:
         await store.close()
     assert sum(w.stalls for w in wrapped) > 0, "no copy-sized read went through the wrapper"
-    assert result is not None and result.encrypted is False
-    assert result.verify is not None and result.verify.status == "PASS"
 
 
-def test_a_config_member_is_restored_whole_through_a_none_read(
+def test_a_config_restore_refuses_a_none_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    payload = b"synthetic = true\n" * 200_000  # over 3 MiB, so the copy takes several reads
+    payload = b"synthetic = true\n" * 1000
     tar_path = tmp_path / "archive.tar"
     with tarfile.open(tar_path, "w:") as tar:
         info = tarfile.TarInfo("config/settings.toml")
@@ -242,11 +195,23 @@ def test_a_config_member_is_restored_whole_through_a_none_read(
 
     monkeypatch.setattr(tarfile.TarFile, "extractfile", _extractfile)
     dest = tmp_path / "restored-config"
+    written: list[Path] = []
+    # The restore's own wrapper turns the codec's refusal into a named BackupError.
+    with pytest.raises(BackupError, match="no data ready reading the config member"):
+        dr._restore_config_members(tar_path, dest, written=written)
+    assert sum(w.stalls for w in wrapped) > 0
+
+
+def test_a_config_member_still_restores_whole_from_a_blocking_reader(tmp_path: Path) -> None:
+    payload = b"synthetic = true\n" * 200_000  # over 3 MiB, so the copy takes several reads
+    tar_path = tmp_path / "archive.tar"
+    with tarfile.open(tar_path, "w:") as tar:
+        info = tarfile.TarInfo("config/settings.toml")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    dest = tmp_path / "restored-config"
     assert dr._extract_config_members(tar_path, dest) == 1
-    assert sum(w.stalls for w in wrapped) > 1
-    assert hashlib.sha256((dest / "settings.toml").read_bytes()).digest() == (
-        hashlib.sha256(payload).digest()
-    )
+    assert (dest / "settings.toml").read_bytes() == payload
 
 
 # --- _HashingReader (added item 10, met by engine PR 3033; pinned here) -------------------------

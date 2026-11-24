@@ -74,6 +74,7 @@ from messagefoundry.store.backup_codec import (
     FORMAT_VERSION,
     BackupCodecError,
     BackupKeyMismatch,
+    _read_once,
     archive_key_id,
     decrypt_stream,
     encrypt_stream,
@@ -208,9 +209,10 @@ _MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
 #: which the decrypt has already written to that same temp dir in full. So the member cap is reached
 #: only after the disk it protects is spent. This moves the bound to the first write — on the restore
 #: path, both limbs of it. :func:`_verify_archive_blocking`'s own plaintext limb is still uncounted,
-#: though since BACKLOG #1174 it too stages beside a SQLite store. Its copy is no larger than the
-#: archive file it reads, and giving it this bound means adding an escape arm to that function's
-#: ordered ``except`` block, which is a wider change than the one this constant documents.
+#: though since BACKLOG #1174 it too stages beside a SQLite store. That limb has no byte cap of its
+#: own: what it copies is whatever the archive path yields, which a device or a growing file does
+#: not bound. Giving it this bound means adding an escape arm to that function's ordered ``except``
+#: block, which is a wider change than the one this constant documents.
 #:
 #: **Why twice the member cap, and why a multiple rather than a literal.** A conforming archive is one
 #: ``store.db`` — admitted up to :data:`_MAX_RESTORE_MEMBER_BYTES`, above which the verify FAILs at the
@@ -458,39 +460,20 @@ class _ChunkSource(Protocol):
 
 #: The read size of :func:`_read_chunks`, the 1 MiB the copy loops it replaced read.
 _COPY_CHUNK_BYTES = 1024 * 1024
-#: How long :func:`_read_chunks` sleeps after a ``None`` read before it reads again (BACKLOG #6687).
-_NO_DATA_YET_WAIT_SECONDS = 0.01
-#: How long :func:`_read_chunks` keeps reading ``None`` with no byte arriving before it refuses.
-_NO_DATA_YET_LIMIT_SECONDS = 30.0
 
 
-def _read_chunks(src: _ChunkSource) -> Iterator[bytes]:
+def _read_chunks(src: _ChunkSource, what: str) -> Iterator[bytes]:
     """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
     empty read, which is the end of the stream.
 
-    A ``None`` read is not the end of the stream: a non-blocking source answers ``None`` when it has
-    no data ready YET. Stopping there, as a bare ``if not buf: break`` loop does, would finish a copy
-    short and report it as complete. So the loop sleeps :data:`_NO_DATA_YET_WAIT_SECONDS` and reads
-    again. A run of ``None`` reads with no byte between them that lasts
-    :data:`_NO_DATA_YET_LIMIT_SECONDS` raises :class:`TimeoutError`, an ``OSError``. Any read that
-    returns bytes starts that limit again, so it bounds one stall, not the whole copy: a source that
-    sends a byte inside each limit is read for as long as it keeps doing so. A blocking source does
-    not answer ``None``, so for one this yields the same reads the old loops wrote (BACKLOG #6687)."""
-    stalled_since: float | None = None
+    Each read goes through the codec's own ``_read_once``, so a no-key copy refuses what a keyed
+    one refuses, with the same :class:`BackupCodecError`. That includes a ``None`` read, from a
+    non-blocking source with no data ready: a bare ``if not buf: break`` loop reads it as the end of
+    the stream and finishes the copy short (BACKLOG #6687). ``what`` names the copy in the refusal.
+    A blocking binary file answers each read with at most ``n`` bytes and never ``None``, so for
+    one this yields the same reads the old loops wrote."""
     while True:
-        buf = src.read(_COPY_CHUNK_BYTES)
-        if buf is None:
-            now = time.monotonic()
-            if stalled_since is None:
-                stalled_since = now
-            elif now - stalled_since >= _NO_DATA_YET_LIMIT_SECONDS:
-                raise TimeoutError(
-                    "the source stream had no data ready for "
-                    f"{_NO_DATA_YET_LIMIT_SECONDS:g} seconds (non-blocking source)"
-                )
-            time.sleep(_NO_DATA_YET_WAIT_SECONDS)
-            continue
-        stalled_since = None
+        buf = _read_once(cast(BinaryIO, src), _COPY_CHUNK_BYTES, what)
         if not buf:
             return
         yield buf
@@ -1331,7 +1314,7 @@ class BackupRunner:
             else:
                 # No key + allow_unencrypted: write the plaintext tar verbatim. It can hold PHI: no
                 # instance is synthetic since BACKLOG #1279 (ADR 0186).
-                for buf in _read_chunks(src):
+                for buf in _read_chunks(src, "plaintext tar"):
                     dst.write(buf)
             dst.flush()
             os.fsync(dst.fileno())
@@ -4456,7 +4439,7 @@ def _verify_in_staging(
             # teardown discards the partial tar on the way out.
             decrypt_stream(src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES)
         else:
-            for buf in _read_chunks(src):
+            for buf in _read_chunks(src, "plaintext archive"):
                 dst.write(buf)
     manifest = _read_manifest_from_tar(tar_path)
     if manifest.get("config_only"):
@@ -6979,13 +6962,14 @@ def _restore_config_members(
 ) -> int:
     """:func:`_extract_config_members`, with an ``OSError``, ``ValueError`` or ``tarfile.TarError``
     it does not word itself made a refusal (vault BACKLOG #5233). At least these are covered: a
-    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. Any other
-    exception type still escapes as it did. Unguarded, each left the restore as a CLI
+    ``PermissionError`` from a ``mkdir``, a full volume, and a member that ends early. A
+    :class:`BackupCodecError` from :func:`_read_chunks`, such as a ``None`` read, is made one too
+    (BACKLOG #6687). Any other exception type still escapes as it did. Unguarded, each left the restore as a CLI
     traceback, on the config-only route and the store route alike. The caller's ``finally`` still
     rolls back what ``written`` records."""
     try:
         return _extract_config_members(tar_path, config_dest, written=written)
-    except (OSError, ValueError, tarfile.TarError) as exc:
+    except (OSError, ValueError, tarfile.TarError, BackupCodecError) as exc:
         raise BackupError(
             "restore", f"could not restore the config bundle into {config_dest}: {safe_exc(exc)}"
         ) from exc
@@ -7161,7 +7145,7 @@ def _extract_config_members(
                 # secrets (connections.toml), and securing it after the stream would leave the write
                 # under the directory's inherited ACL on Windows for as long as the write takes.
                 _secure_file(out)
-                for buf in _read_chunks(src):
+                for buf in _read_chunks(src, "config member"):
                     # Counting the streamed bytes IS the cap enforcement here (a lying header declares a
                     # small size and streams an unbounded one), so this loop cannot become copyfileobj.
                     streamed += len(buf)
