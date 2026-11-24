@@ -5,7 +5,9 @@
 classification (transient retry vs permanent dead-letter), response capture, and the egress arm.
 
 The opener is faked so nothing hits the network — and because the destination treats the object as
-**opaque bytes** (no pydicom parse), these tests need **no** ``[dicom]`` extra and run on every CI leg."""
+**opaque bytes** (no pydicom parse; it reads only the Part-10 File Meta group, by hand), these tests
+need **no** ``[dicom]`` extra and run on every CI leg. The one test that checks that reader against
+pydicom's own writer skips without it."""
 
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import http.client
 import io
 import json
 import logging
+import struct
 import urllib.error
 import urllib.request
 
@@ -32,8 +35,44 @@ from messagefoundry.transports.rest import HttpAuthError
 from tests._malformed_reply import MALFORMED_REPLIES, RefusedAndMalformed
 
 BASE = "https://pacs.example.org/dicom-web"
-# An opaque "DICOM object" — the destination never parses it, so any bytes exercise the carriage + framing.
-OBJECT = b"\x00" * 128 + b"DICM" + b"synthetic-part10-bytes"
+
+
+def _meta_element(element: int, vr: bytes, value: bytes) -> bytes:
+    """One File Meta element, Explicit VR Little Endian (PS3.10 section 7.1): OB takes the long form."""
+    head = struct.pack("<HH", 0x0002, element) + vr
+    if vr == b"OB":
+        return head + b"\0\0" + struct.pack("<I", len(value)) + value
+    return head + struct.pack("<H", len(value)) + value
+
+
+def _ui(uid: str) -> bytes:
+    raw = uid.encode("ascii")
+    return raw + b"\0" if len(raw) % 2 else raw  # PS3.5: a UI value pads to even length with NUL
+
+
+def _part10(uid: str | None, *, vr: bytes = b"UI", value: bytes | None = None) -> bytes:
+    """A synthetic Part-10 object whose File Meta (0002,0003) is ``uid``, or absent when ``None``.
+    ``vr`` and ``value`` override that element's VR and raw value bytes. The data set is opaque."""
+    elements = [
+        _meta_element(0x0001, b"OB", b"\0\1"),
+        _meta_element(0x0002, b"UI", _ui("1.2.840.10008.5.1.4.1.1.88.11")),
+    ]
+    if uid is not None:
+        elements.append(_meta_element(0x0003, vr, _ui(uid) if value is None else value))
+    elements.append(_meta_element(0x0010, b"UI", _ui("1.2.840.10008.1.2.1")))
+    meta = b"".join(elements)
+    group_length = struct.pack("<HH", 0x0002, 0x0000) + b"UL" + struct.pack("<HI", 4, len(meta))
+    return b"\x00" * 128 + b"DICM" + group_length + meta + b"synthetic-dataset-bytes"
+
+
+def _carried(obj: bytes) -> str:
+    return RawMessage.from_bytes(obj, "dicom").encode()
+
+
+# The instance STORED_OK confirms (BACKLOG #5914: a 202 is compared with the File Meta UID).
+SENT_UID = "1.2.3.4.5"
+# A synthetic Part-10 object; the destination reads only its File Meta group, never the data set.
+OBJECT = _part10(SENT_UID)
 PAYLOAD = RawMessage.from_bytes(
     OBJECT, "dicom"
 ).encode()  # the mfb64:v1: carriage a Handler hands over
@@ -42,7 +81,7 @@ PAYLOAD = RawMessage.from_bytes(
 STORED_OK = json.dumps(
     {
         "00081190": {"vr": "UR", "Value": [f"{BASE}/studies/1.2.3"]},
-        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}]},
+        "00081199": {"vr": "SQ", "Value": [{"00081155": {"vr": "UI", "Value": [SENT_UID]}}]},
     }
 )
 # A dicom+json body carrying a non-empty FailedSOPSequence (00081198) → an instance was rejected.
@@ -593,7 +632,7 @@ async def test_dicomweb_202_confirms_by_a_uid_at_the_grammar_boundary(uid: str) 
     body = _uid_body({"vr": "UI", "Value": [uid]})
     dest = _dest()
     dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
-    assert await dest.send(PAYLOAD) is None
+    assert await dest.send(_carried(_part10(uid.rstrip("\0 ")))) is None
 
 
 async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance() -> None:
@@ -601,7 +640,7 @@ async def test_dicomweb_202_confirms_when_one_item_of_several_names_an_instance(
         {
             "00081199": {
                 "vr": "SQ",
-                "Value": [{}, {"00081155": {"vr": "UI", "Value": ["1.2.3.4.5"]}}],
+                "Value": [{}, {"00081155": {"vr": "UI", "Value": [SENT_UID]}}],
             }
         }
     )
@@ -621,6 +660,122 @@ async def test_dicomweb_202_with_a_referenced_sop_delivers() -> None:
     assert isinstance(resp, DeliveryResponse)
     assert resp.outcome == "accepted"
     assert resp.detail == "HTTP 202"
+
+
+# --- BACKLOG #5914 step 1: a 202 is compared with the File Meta UID (0002,0003) of the instance sent ---
+
+# A UID other than SENT_UID, and two that differ from it only at an edge a prefix or suffix test would miss.
+_OTHER_UIDS = [
+    pytest.param("1.2.3.4.6", id="other"),
+    pytest.param("1.2.3", id="prefix-of-sent"),
+    pytest.param("1.2.3.4.55", id="sent-is-prefix"),
+]
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("other", _OTHER_UIDS)
+async def test_dicomweb_202_naming_another_instance_is_unconfirmed(
+    other: str, capture: bool
+) -> None:
+    # The decision of 2026-11-23: a 202 whose ReferencedSOPSequence names a well-formed UID that is
+    # not the instance sent confirms nothing.
+    dest = _dest(capture_response=capture)
+    body = _uid_body({"vr": "UI", "Value": [other]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.permanent is True
+    assert exc.value.code == "unconfirmed-202"
+    assert "before a replay" in str(exc.value)
+    # Content-free: neither UID reaches the refusal text.
+    assert other not in str(exc.value) and SENT_UID not in str(exc.value)
+
+
+async def test_dicomweb_202_confirms_when_a_later_item_names_the_instance_sent() -> None:
+    items = [
+        {"00081155": {"vr": "UI", "Value": ["1.2.3.4.6"]}},
+        {"00081155": {"vr": "UI", "Value": [SENT_UID]}},
+    ]
+    body = json.dumps({"00081199": {"vr": "SQ", "Value": items}})
+    dest = _dest()
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
+_TRUNCATED = OBJECT[: OBJECT.index(_ui(SENT_UID)) + 3]  # cut inside the (0002,0003) value
+# Objects with no File Meta group at all; the 200 test below uses these too.
+_NO_FILE_META = [
+    pytest.param(b"\x00" * 128 + b"DICM" + b"synthetic-part10-bytes", id="no-file-meta"),
+    pytest.param(b"synthetic-bytes-with-no-preamble", id="no-preamble"),
+]
+_NO_COMPARABLE_UID = [
+    *_NO_FILE_META,
+    pytest.param(b"\x00" * 128 + b"DICX" + OBJECT[132:], id="no-dicm-magic"),
+    pytest.param(_part10(None), id="no-0002-0003"),
+    pytest.param(_part10(SENT_UID, vr=b"LO"), id="wrong-vr"),
+    pytest.param(_part10(SENT_UID, value=b""), id="empty-value"),
+    pytest.param(_part10(SENT_UID, value=b"N/A\0"), id="not-a-uid"),
+    pytest.param(_part10(SENT_UID, value=b"1.2.3.4.5\xff"), id="non-ascii"),
+    pytest.param(_part10(SENT_UID, value=b"1." * 32 + b"12"), id="over-64"),
+    pytest.param(_TRUNCATED, id="truncated"),
+]
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("obj", _NO_COMPARABLE_UID)
+async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
+    obj: bytes, capture: bool
+) -> None:
+    # The decision of 2026-11-23: with no File Meta UID to compare, the 202 confirms nothing, even
+    # when the reply names a well-formed instance -- here, the one SENT_UID names.
+    dest = _dest(capture_response=capture)
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.permanent is True
+    assert exc.value.code == "unconfirmed-202"
+    assert SENT_UID not in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [pytest.param(OBJECT, id="other-uid"), *_NO_FILE_META],
+)
+async def test_dicomweb_200_is_not_compared_with_the_instance_sent(obj: bytes) -> None:
+    # The decision covers the 202 only; a 200 keeps its ruling and is not held to the comparison.
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=200)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
+
+
+async def test_dicomweb_file_meta_reader_agrees_with_pydicoms_writer() -> None:
+    # A control on the synthetic builder above: a Part-10 object written by pydicom itself, with an
+    # odd-length UID that its writer pads, confirms a 202 that names the UID and no other.
+    pydicom = pytest.importorskip("pydicom")
+    from pydicom.dataset import FileMetaDataset
+    from pydicom.uid import UID, ExplicitVRLittleEndian
+
+    uid = "1.2.826.0.1.3680043.8.498.12345"  # odd length: the writer pads it with a NUL
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    meta.MediaStorageSOPInstanceUID = UID(uid)
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = pydicom.Dataset()
+    ds.file_meta = meta
+    ds.SOPInstanceUID = uid
+    ds.PatientName = "Synthetic^Test"
+    buf = io.BytesIO()
+    pydicom.dcmwrite(buf, ds, enforce_file_format=True)
+    written = buf.getvalue()
+    assert len(uid) % 2 == 1 and uid.encode() + b"\0" in written  # control: the pad is on the wire
+    dest = _dest()
+    dest._opener = _FakeOpener(body=_uid_body({"vr": "UI", "Value": [uid]}).encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(written)) is None
+    dest._opener = _FakeOpener(body=STORED_OK.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(written))
+    assert exc.value.code == "unconfirmed-202"
 
 
 @pytest.mark.parametrize("status", [200, 202])

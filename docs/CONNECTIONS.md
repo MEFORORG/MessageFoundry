@@ -4031,11 +4031,18 @@ well-formed FailedSOPSequence with an item); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
-most 64 characters), an empty 202 included (code
-`unconfirmed-202`). A ReferencedSOPSequence that is not an object, has a `Value` that
+most 64 characters) that equals the **Media Storage SOP Instance UID** (`0002,0003`) in the File
+Meta group of the object sent, an empty 202 included (code `unconfirmed-202`). A 202 is refused the
+same way, whatever its reply names, when the object sent has no such UID to compare: no `DICM`
+magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group before the first element
+outside group `0002`, a `(0002,0003)` whose VR is not `UI`, or a value that runs past the end of the
+object, is not ASCII, or is not in the UID grammar once its padding is dropped (BACKLOG #5914,
+decision of 2026-11-23). The File Meta group is read as Explicit VR Little Endian, as PS3.10
+requires, without `pydicom`. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
-required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
+required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200
+dataset that confirms nothing, or names another instance, and is not
 refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
 whitespace after any leading BOMs) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.

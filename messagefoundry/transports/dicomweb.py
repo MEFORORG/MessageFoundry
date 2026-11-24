@@ -11,6 +11,8 @@ PHI-bearing POST to an unintended host; ASVS 15.3.2), the cleartext-credential r
 length limits. The fail-closed ``[egress].allowed_http`` host gate is enforced by ``build_destination`` (it folds
 DICOMWEB into the REST/SOAP/FHIR arm — see transports.egress ``_allowlist_for`` / ``check_egress_allowed``).
 It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works without the DIMSE stack.
+The one read of the object is its File Meta Media Storage SOP Instance UID, by hand, which a 202 is
+compared with (:func:`_sent_instance_uid`; BACKLOG #5914).
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -40,6 +42,7 @@ import base64
 import http.client
 import logging
 import secrets
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -109,10 +112,17 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
-# ReferencedSOPSequence: the instances the server stored. A 202 must name at least one (#5914);
-# see _names_an_instance.
+# ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914);
+# see _named_instance and _sent_instance_uid.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
+# PS3.10 section 7.1: a 128-byte preamble, then "DICM", then the File Meta group in Explicit VR
+# Little Endian. These VRs take the long form: two reserved bytes, then a 4-byte length (PS3.5
+# section 7.1.2).
+_PART10_PREAMBLE = 128
+_LONG_FORM_VRS = frozenset(
+    {b"OB", b"OD", b"OF", b"OL", b"OV", b"OW", b"SQ", b"SV", b"UC", b"UN", b"UR", b"UT", b"UV"}
+)
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
 # malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
@@ -343,26 +353,69 @@ def _failed_sop_state(datasets: list[dict[str, Any]]) -> tuple[bool, bool]:
     return proven, malformed
 
 
-def _names_an_instance(item: Any) -> bool:
-    """True when a ReferencedSOPSequence item is a dataset whose ReferencedSOPInstanceUID element
-    has ``vr`` ``UI``, passes :func:`_element_values`, and holds exactly one value (the attribute's
-    VM is 1): a string that passes :func:`_is_uid` once trailing NUL or space padding, which a
-    binary-to-JSON converter can leave, is dropped. Anything else confirms nothing (BACKLOG #5914):
-    no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one entry.
-    The UID is tested, never logged or returned (PHI-safe)."""
+def _sent_instance_uid(obj: bytes) -> str | None:
+    """The Media Storage SOP Instance UID (``0002,0003``) in the File Meta group of the Part-10
+    object sent, or ``None`` when there is none to compare (BACKLOG #5914).
+
+    Read by hand, so the destination still needs no ``pydicom``: after the 128-byte preamble and
+    ``DICM``, the File Meta elements are always Explicit VR Little Endian (PS3.10 section 7.1). The
+    walk stops at the first element outside group ``0002``. ``None`` for no ``DICM`` magic, no
+    ``(0002,0003)``, one whose VR is not ``UI``, an element that runs past the end of the object,
+    or a value that is not ASCII or does not pass :func:`_is_uid` once its trailing NUL or space
+    padding is dropped. The UID is never logged (PHI-safe)."""
+    if obj[_PART10_PREAMBLE : _PART10_PREAMBLE + 4] != b"DICM":
+        return None
+    pos, size = _PART10_PREAMBLE + 4, len(obj)
+    while pos + 8 <= size:
+        group, element = struct.unpack_from("<HH", obj, pos)
+        if group != 0x0002:
+            return None
+        vr = obj[pos + 4 : pos + 6]
+        if vr in _LONG_FORM_VRS:
+            if pos + 12 > size:
+                return None
+            (length,) = struct.unpack_from("<I", obj, pos + 8)
+            start = pos + 12
+        else:
+            (length,) = struct.unpack_from("<H", obj, pos + 6)
+            start = pos + 8
+        end = start + length  # an undefined length (0xFFFFFFFF) runs past the end, so is refused
+        if end > size:
+            return None
+        if element == 0x0003:
+            if vr != b"UI":
+                return None
+            try:
+                uid = obj[start:end].decode("ascii").rstrip("\0 ")
+            except UnicodeDecodeError:
+                return None
+            return uid if _is_uid(uid) else None
+        pos = end
+    return None
+
+
+def _named_instance(item: Any) -> str | None:
+    """The instance a ReferencedSOPSequence item names, or ``None`` when it names none.
+
+    It names one when it is a dataset whose ReferencedSOPInstanceUID element has ``vr`` ``UI``,
+    passes :func:`_element_values`, and holds exactly one value (the attribute's VM is 1): a string
+    that passes :func:`_is_uid` once trailing NUL or space padding, which a binary-to-JSON converter
+    can leave, is dropped; that unpadded string is returned. Anything else names nothing (BACKLOG
+    #5914): no Value, an empty or null one, a blank, non-string or non-UID entry, or more than one
+    entry. The UID is compared, never logged (PHI-safe)."""
     if not isinstance(item, dict):
-        return False
+        return None
     element = item.get(_REFERENCED_SOP_INSTANCE_UID)
     if not isinstance(element, dict) or element.get("vr") != "UI":
-        return False
+        return None
     value = _element_values(element)
-    if value is None or len(value) != 1:
-        return False
-    uid = value[0]
-    return isinstance(uid, str) and _is_uid(uid.rstrip("\0 "))
+    if value is None or len(value) != 1 or not isinstance(value[0], str):
+        return None
+    uid = value[0].rstrip("\0 ")
+    return uid if _is_uid(uid) else None
 
 
-def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
+def _stowrs_refusal(body: str, status: int, sent_uid: str | None) -> tuple[str, str] | None:
     """The refusal for a 2xx STOW-RS reply, or ``None`` when it is a delivery. Not every reply
     that fails to confirm the store is refused (see the last paragraph). Every code is permanent: a
     re-send would get the same reply.
@@ -376,17 +429,23 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
       proves no rejection (BACKLOG #5914).
     - ``failed-sop``: a well-formed FailedSOPSequence (``00081198``) with an item, in any of the
       datasets, a proven rejection.
-    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
-      no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
-      ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
+    - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply does
+      not name the instance sent: no ReferencedSOPSequence (``00081199``) item whose
+      ReferencedSOPInstanceUID (``00081155``; :func:`_named_instance`) equals ``sent_uid``, the
+      Media Storage SOP Instance UID of the object sent (:func:`_sent_instance_uid`). An empty 202
+      is one, and so is any 202 when ``sent_uid`` is ``None``, since there is no UID to compare
+      (BACKLOG #5914, decision of 2026-11-23).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
-    the ReferencedSOPSequence rule (BACKLOG #5914 ruling), so a 200 dataset that confirms nothing
-    and is not refused above, ``{}`` included, is delivered. docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states
-    the rule in full.
+    the ReferencedSOPSequence rule or compared with ``sent_uid`` (BACKLOG #5914 ruling), so a 200
+    dataset that confirms nothing and is not refused above, ``{}`` included, is delivered.
+    docs/CONNECTIONS.md *DICOMweb*, *Status classification*, states the rule in full.
 
-    Returned as ``(code, reason)``; both are fixed strings that name no reply content."""
-    unconfirmed = ("unconfirmed-202", f"no ReferencedSOPSequence confirming the store; {_NOT_SENT}")
+    Returned as ``(code, reason)``; both are fixed strings that name no reply content and no UID."""
+    unconfirmed = (
+        "unconfirmed-202",
+        f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}",
+    )
     if _reply_is_empty(body):
         return unconfirmed if status == 202 else None
     # A refused parse is (None, hint), and None is not a dataset, so the hint need not be read.
@@ -408,8 +467,14 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
             f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
         )
     if status == 202:
+        if sent_uid is None:
+            return (
+                "unconfirmed-202",
+                "no Media Storage SOP Instance UID (0002,0003) in the instance sent to compare "
+                f"with the reply; {_NOT_SENT}",
+            )
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
-        if not any(_names_an_instance(i) for i in referenced):
+        if not any(_named_instance(i) == sent_uid for i in referenced):
             return unconfirmed
     return None
 
@@ -772,7 +837,10 @@ class DicomWebDestination(DestinationConnector):
         # here, and with no handler active no decode error -- which holds the whole body -- rides
         # the refusal's __context__. The code leads the text, so a cut stored error keeps it; the
         # text names no reply content.
-        refused = _stowrs_refusal(body, status)
+        # Only a 202 is compared with the instance sent, so its File Meta is read only then.
+        refused = _stowrs_refusal(
+            body, status, _sent_instance_uid(dicom_bytes) if status == 202 else None
+        )
         if refused is not None:
             code, reason = refused
             raise NegativeAckError(
