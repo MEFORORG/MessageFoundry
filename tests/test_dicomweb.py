@@ -718,21 +718,57 @@ _NO_FILE_META = [
     pytest.param(b"\x00" * 128 + b"DICM" + b"synthetic-part10-bytes", id="no-file-meta"),
     pytest.param(b"synthetic-bytes-with-no-preamble", id="no-preamble"),
 ]
+# The cause each no-comparable-UID refusal names (BACKLOG #5914, round 3 review finding 4).
+_NO_MAGIC = "no Part-10 preamble and DICM magic"
+_NO_0003 = "no (0002,0003) in the File Meta group"
+_WRONG_VR = "a (0002,0003) whose VR is not UI"
+_NOT_A_UID = "a (0002,0003) value that is not a UID"
+_OVERRUN = "a File Meta element that runs past the end of the object or of the File Meta group"
+_TOO_LONG = "a File Meta group longer than the reader reads"
+_FILE_META_CAP = 64 * 1024  # the reader's fixed cap on the File Meta group, in bytes
+
+
+def _with_group_length(obj: bytes, group_length: int) -> bytes:
+    """``obj`` with its (0002,0000) File Meta Group Length value replaced."""
+    return obj[:140] + struct.pack("<I", group_length) + obj[144:]
+
+
+def _long_zero_length_run(count: int) -> bytes:
+    """OBJECT with ``count`` zero-length (0002,0004) UI elements before (0002,0003), and a group
+    length that covers them all, so only a fixed cap stops a walk short of (0002,0003)."""
+    at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
+    run = (struct.pack("<HH", 0x0002, 0x0004) + b"UI" + struct.pack("<H", 0)) * count
+    obj = OBJECT[:at] + run + OBJECT[at:]
+    return _with_group_length(obj, obj.index(b"synthetic-dataset-bytes") - 144)
+
+
+# A group length that ends where (0002,0003) starts leaves it outside the File Meta group.
+_BEFORE_0003 = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003)) - 144
 _NO_COMPARABLE_UID = [
-    *_NO_FILE_META,
-    pytest.param(b"\x00" * 128 + b"DICX" + OBJECT[132:], id="no-dicm-magic"),
-    pytest.param(_part10(None), id="no-0002-0003"),
-    pytest.param(_part10(SENT_UID, vr=b"LO"), id="wrong-vr"),
-    pytest.param(_part10(SENT_UID, value=b""), id="empty-value"),
-    pytest.param(_part10(SENT_UID, value=b"N/A\0"), id="not-a-uid"),
-    pytest.param(_part10(SENT_UID, value=b"1.2.3.4.5\xff"), id="non-ascii"),
-    pytest.param(_part10(SENT_UID, value=b"1." * 32 + b"12"), id="over-64"),
-    pytest.param(_TRUNCATED, id="truncated"),
+    pytest.param(*_NO_FILE_META[0].values, _NO_0003, id="no-file-meta"),
+    pytest.param(*_NO_FILE_META[1].values, _NO_MAGIC, id="no-preamble"),
+    pytest.param(b"\x00" * 128 + b"DICX" + OBJECT[132:], _NO_MAGIC, id="no-dicm-magic"),
+    pytest.param(_part10(None), _NO_0003, id="no-0002-0003"),
+    pytest.param(_part10(SENT_UID, vr=b"LO"), _WRONG_VR, id="wrong-vr"),
+    pytest.param(_part10(SENT_UID, value=b""), _NOT_A_UID, id="empty-value"),
+    pytest.param(_part10(SENT_UID, value=b"N/A\0"), _NOT_A_UID, id="not-a-uid"),
+    pytest.param(_part10(SENT_UID, value=b"1.2.3.4.5\xff"), _NOT_A_UID, id="non-ascii"),
+    pytest.param(_part10(SENT_UID, value=b"1." * 32 + b"12"), _NOT_A_UID, id="over-64"),
+    pytest.param(_TRUNCATED, _OVERRUN, id="truncated"),
     # An earlier File Meta element whose declared length runs past the end of the object.
     pytest.param(
         OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:8] + struct.pack("<I", 1 << 20),
+        _OVERRUN,
         id="earlier-element-overruns",
     ),
+    # A long-form header cut between its 8th and 12th byte.
+    pytest.param(
+        OBJECT[:144] + _meta_element(0x0001, b"OB", b"\0\1")[:10], _OVERRUN, id="cut-header"
+    ),
+    # Bounded by the (0002,0000) group length: a (0002,0003) after the group's end is not read.
+    pytest.param(_with_group_length(OBJECT, _BEFORE_0003), _NO_0003, id="past-group-length"),
+    # Bounded by a fixed cap: a long run of zero-length group-2 elements is not walked.
+    pytest.param(_long_zero_length_run(_FILE_META_CAP // 8 + 1), _TOO_LONG, id="past-the-cap"),
 ]
 
 
@@ -766,22 +802,87 @@ async def test_dicomweb_file_meta_reader_takes_any_vr_it_does_not_know_as_long_f
         pytest.param("", id="empty-reply"),
     ],
 )
-@pytest.mark.parametrize("obj", _NO_COMPARABLE_UID)
+@pytest.mark.parametrize(("obj", "cause"), _NO_COMPARABLE_UID)
 async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
-    obj: bytes, body: str, capture: bool
+    obj: bytes, cause: str, body: str, capture: bool
 ) -> None:
-    # The decision of 2026-11-23: with no File Meta UID to compare, the 202 confirms nothing,
-    # whether the reply names a well-formed instance -- the one SENT_UID names -- or none.
+    # The decision of 2026-11-23: with no File Meta UID to compare, and no data set SOP Instance
+    # UID read (these synthetic data sets carry none), the 202 confirms nothing, whether the reply
+    # names a well-formed instance -- the one SENT_UID names -- or none.
     dest = _dest(capture_response=capture)
     dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(_carried(obj))
     assert exc.value.permanent is True
     assert exc.value.code == "unconfirmed-202"
-    # Its own reason, carrying the replay advice, and naming no UID.
-    assert "(0002,0003)" in str(exc.value)
-    assert "before a replay" in str(exc.value)
-    assert SENT_UID not in str(exc.value)
+    # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
+    text = str(exc.value)
+    assert cause in text
+    assert "replaying the same object cannot confirm it on a 202" in text
+    assert "refused again" not in text
+    assert "before a replay" in text
+    assert SENT_UID not in text
+
+
+def _pydicom_part10(meta_uid: str, dataset_uid: str) -> bytes:
+    """A Part-10 object written by pydicom whose File Meta (0002,0003) is ``meta_uid`` and whose
+    data set SOP Instance UID (0008,0018) is ``dataset_uid``: a stale File Meta when they differ,
+    as a re-UID written without the File Meta being rewritten leaves it."""
+    pydicom = pytest.importorskip("pydicom")
+    from pydicom.dataset import FileMetaDataset
+    from pydicom.uid import UID, ExplicitVRLittleEndian
+
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    meta.MediaStorageSOPInstanceUID = UID(meta_uid)
+    meta.TransferSyntaxUID = ExplicitVRLittleEndian
+    ds = pydicom.Dataset()
+    ds.file_meta = meta
+    ds.preamble = b"\0" * 128
+    ds.SOPClassUID = UID("1.2.840.10008.5.1.4.1.1.88.11")
+    ds.SOPInstanceUID = UID(dataset_uid)
+    buf = io.BytesIO()
+    pydicom.dcmwrite(buf, ds, enforce_file_format=False)
+    return buf.getvalue()
+
+
+_DATASET_UID = "1.2.826.0.1.3680043.8.498.77"
+
+
+@pytest.mark.parametrize("capture", [False, True])
+async def test_dicomweb_202_naming_the_data_set_uid_of_a_stale_file_meta_delivers(
+    capture: bool,
+) -> None:
+    # Manager decision of 2026-11-23 on this branch: a 202 also confirms when it names the data
+    # set's SOP Instance UID (0008,0018), which a server builds its reply from.
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    assert _ui(SENT_UID) in obj and _DATASET_UID.encode() in obj  # control: the two UIDs differ
+    dest = _dest(capture_response=capture)
+    body = _uid_body({"vr": "UI", "Value": [_DATASET_UID]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    resp = await dest.send(_carried(obj))
+    assert (resp is None) if not capture else isinstance(resp, DeliveryResponse)
+
+
+async def test_dicomweb_202_naming_neither_uid_of_a_stale_file_meta_is_unconfirmed() -> None:
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": ["1.2.3.4.6"]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(_carried(obj))
+    assert exc.value.code == "unconfirmed-202"
+    assert _DATASET_UID not in str(exc.value) and SENT_UID not in str(exc.value)
+
+
+async def test_dicomweb_202_naming_the_data_set_uid_confirms_with_no_file_meta_uid() -> None:
+    # The File Meta (0002,0003) is not a UID, but the data set's (0008,0018) is read and named.
+    obj = _pydicom_part10(SENT_UID, _DATASET_UID)
+    obj = obj.replace(_ui(SENT_UID), b"N/A\0" + b"\0" * (len(_ui(SENT_UID)) - 4), 1)
+    dest = _dest()
+    body = _uid_body({"vr": "UI", "Value": [_DATASET_UID]})
+    dest._opener = _FakeOpener(body=body.encode(), status=202)  # type: ignore[assignment]
+    assert await dest.send(_carried(obj)) is None
 
 
 @pytest.mark.parametrize(

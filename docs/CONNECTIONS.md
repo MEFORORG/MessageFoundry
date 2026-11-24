@@ -4003,8 +4003,9 @@ The modern HTTP imaging lane — a **STOW-RS** `POST {base}/studies` (or `{base}
 **sibling of the REST destination**: it reuses the hardened HTTP plumbing (no-redirect TLS-verifying opener,
 cleartext-credential refusal, the retry/dead-letter classification, the `[egress].allowed_http` gate) and
 adds only the `multipart/related; type="application/dicom"` framing + `application/dicom+json` response
-handling. It needs **no `[dicom]` extra**: the object rides as bytes, and the one part of it read is
-the File Meta Media Storage SOP Instance UID, by hand, which a 202 is compared with (below).
+handling. It needs **no `[dicom]` extra**: the object rides as bytes. A 202 reply is compared with
+the object's SOP Instance UIDs, as *Status classification* below says; the extra, when installed,
+adds the data set's UID to that comparison.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -4033,18 +4034,22 @@ well-formed FailedSOPSequence with an item); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
-most 64 characters) that equals the **Media Storage SOP Instance UID** (`0002,0003`) in the File
-Meta group of the object sent, an empty 202 included (code `unconfirmed-202`). A 202 that none of
-the rules above refuses is also `unconfirmed-202`, whatever its reply names, when the object sent
-has no such UID to compare. At least these leave none: no `DICM` magic after the 128-byte preamble,
-no `(0002,0003)` in the File Meta group before the first element outside group `0002`, a
+most 64 characters) that equals a SOP Instance UID of the object sent: the **Media Storage SOP
+Instance UID** (`0002,0003`) in its File Meta group, or the **SOP Instance UID** (`0008,0018`) of
+its data set, an empty 202 included (code `unconfirmed-202`). A 202 that none of the rules above
+refuses is also `unconfirmed-202`, whatever its reply names, when the object sent has neither UID
+to compare, and its reason names why the File Meta has none. At least these leave no File Meta
+UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
 `(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
-the end of the object, and a value that is not ASCII or is not in the UID grammar once its padding
-is dropped (BACKLOG #5914, decision of 2026-11-23). The File Meta group is read as Explicit VR
-Little Endian, as PS3.10 requires, without `pydicom`. The compared UID is the File Meta one, not
-the data set's SOP Instance UID (`0008,0018`), which a server builds its reply from: an object whose
-data set was given a new SOP Instance UID without its File Meta being rewritten, or a server that
-assigns a new UID on a 202, is dead-lettered on every 202 although the server may hold it. A ReferencedSOPSequence that is not an object, has a `Value` that
+the end of the object or of the group its `(0002,0000)` Group Length declares, a value that is not
+ASCII or is not in the UID grammar once its padding is dropped, and a File Meta group longer than
+64 KiB, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
+read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`. The data set UID is read
+with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
+object the codec cannot parse, only the File Meta UID is compared. So an object whose data set was
+given a new SOP Instance UID without its File Meta being rewritten is confirmed by a 202 naming
+either UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
+dead-lettered on every 202 although the server may hold it. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
 required to carry a ReferencedSOPSequence, and is not compared with the object sent, so a 200
