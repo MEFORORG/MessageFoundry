@@ -916,8 +916,11 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
 
       A NaN CANNOT LIFT THE RUNG EITHER. ConvertFrom-Json reads a bare NaN as a number, and no
       comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes watch.py's default for
-      that slot instead, (90, 94, 97) and (60, 10, 5), and the strictest number still holds, so a
-      NaN in a later slot leaves HOLD where the file put it, and a NaN HOLD reads as the default.
+      that slot instead, (90, 94, 97) and (60, 10, 5), and only then is the strictest number picked
+      across all three slots. So a NaN in ANY slot, a later one included, can move HOLD: the slot's
+      default can be the strictest number, and then it is HOLD. Weekly [96, NaN, 98] gives HOLD 94,
+      not 96, and minutes [5, NaN, 2] gives 10, not 5. The move only ever goes stricter than the
+      numbers the file wrote, so this fails closed.
       Throwing would answer UNKNOWN, which is a REVIEW where the triple's other numbers can halt.
       Other out-of-range values pass as written, and a slip in any slot can move the rung: a level of
       0 or below, or an infinite lead time, halts early. A triple whose every level is above 100, or

@@ -397,7 +397,9 @@ roster alias of the Lander.
 > Steward's minutes default is (60, 10, 5), though the gate reads only HOLD: the lowest weekly level
 > and the longest lead time in the triple, so an out-of-order hand edit cannot lift the rung, and the
 > rung's source says so. A NaN slot reads as watch.py's default for that slot before that choice, so a
-> NaN cannot lift it either (BACKLOG #5178).
+> NaN cannot lift it either (BACKLOG #5178). A NaN in a later slot is not inert: that slot's default
+> can be the strictest number and so become HOLD, as weekly (96, NaN, 98) holds at 94 and minutes
+> (5, NaN, 2) at 10. The move is only ever stricter than the numbers the file wrote.
 >
 > **A slow burn often has no rate, and that is the safe side.** Weekly usage moves in whole percents,
 > `usage-collect.ps1` writes a history row only on a change, and `usage.ps1` needs two rows inside its

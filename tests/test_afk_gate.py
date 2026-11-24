@@ -520,6 +520,8 @@ def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
         pytest.param([93, 96, float("nan")], 95.0, HALT, id="nan-last"),
         pytest.param([93, 96, float("nan")], 92.0, NO_REVIEW, id="nan-last-leaves-hold-at-93"),
         pytest.param([97, float("nan"), 91], 92.0, HALT, id="nan-and-out-of-order"),
+        pytest.param([96, float("nan"), 98], 95.0, HALT, id="nan-middle-default-94-becomes-hold"),
+        pytest.param([96, float("nan"), 98], 93.0, NO_REVIEW, id="nan-middle-hold-94-control"),
     ],
 )
 def test_a_nan_weekly_level_never_lifts_the_rung(
@@ -527,7 +529,9 @@ def test_a_nan_weekly_level_never_lifts_the_rung(
 ) -> None:
     """BACKLOG #5178. ConvertFrom-Json reads a bare NaN as a number, and the lowest-number rule made a
     NaN in any slot the rung, which no level reaches. A NaN slot now reads as watch.py's default for
-    that slot, (90, 94, 97), so a NaN HOLD is 90 and a NaN in a later slot leaves HOLD as written."""
+    that slot, (90, 94, 97), before the lowest number is picked. So a NaN in any slot can move HOLD
+    to that slot's default when the default is the lowest: [96, NaN, 98] holds at 94, not 96. The
+    move only goes lower than the levels the file wrote, so it fails closed."""
     seed_vault(sb, calibrated("manager"))
     write_fake_usage(_usage_path(sb), usage(pct))
     _thresholds(sb).write_text(json.dumps({"levels": {"weekly": weekly}}), encoding="utf-8")
@@ -553,6 +557,24 @@ def test_a_nan_minutes_slot_never_shortens_the_lead_time(sb: Sandbox) -> None:
     code, doc = gate(sb)
     assert code == REVIEW and "does not reach the rung" in why(doc), "control: " + why(doc)
     _thresholds(sb).write_text(json.dumps({"minutes": [float("nan"), 30, 10]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == HALT and "minutes holds NaN" in why(doc), why(doc)
+
+
+def test_a_nan_later_minutes_slot_can_move_hold_to_its_default(sb: Sandbox) -> None:
+    """BACKLOG #5178: a NaN in a later slot is not inert. [5, NaN, 2] reads as (5, 10, 2), so the
+    largest, 10, is HOLD rather than the 5 the file put first; a run-out 8 minutes away hits it."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(
+            50.0, state="CRITICAL", rate_pct_per_hr=50.0, minutes_to_empty=8, minutes_to_reset=90
+        ),
+    )
+    _thresholds(sb).write_text(json.dumps({"minutes": [5, 4, 2]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "does not reach the rung" in why(doc), "control: " + why(doc)
+    _thresholds(sb).write_text(json.dumps({"minutes": [5, float("nan"), 2]}), encoding="utf-8")
     code, doc = gate(sb)
     assert code == HALT and "minutes holds NaN" in why(doc), why(doc)
 
