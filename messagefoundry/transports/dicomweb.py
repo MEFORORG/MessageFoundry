@@ -524,9 +524,8 @@ def _data_set_instance_uid(obj: bytes, base_url: str) -> str | None:
     DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
     materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`),
     or ``None`` when none is read: the optional ``[dicom]`` extra is absent or does not load, the
-    object does not
-    parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), or it carries no UID in the
-    grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
+    object does not parse (a :class:`~messagefoundry.parsing.dicom.errors.DicomError`), or it
+    carries no UID in the grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
     whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914).
 
     Run before the POST. The extra is loaded first, apart from the object, as the SCU loads it

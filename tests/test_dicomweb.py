@@ -1065,9 +1065,9 @@ async def test_dicomweb_a_broken_dicom_extra_compares_the_file_meta_uid_alone(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A pydicom missing a reader the deflate guard replays does not load, so it is taken as absent
-    # (BACKLOG #5914, Manager decision of 2026-11-24: delivery matches origin/main). The object is
-    # sent; a 202 naming the File Meta UID confirms it, and one naming only the data set UID does
-    # not, exactly as with no extra installed.
+    # (BACKLOG #5914, Manager decision of 2026-11-24): no lane stop and no refusal before the POST.
+    # The object is sent; a 202 naming the File Meta UID confirms it, and one naming only the data
+    # set UID does not, as on this branch with no extra installed (origin/main confirms any UID).
     pytest.importorskip("pydicom")
     from pydicom import filereader
 
