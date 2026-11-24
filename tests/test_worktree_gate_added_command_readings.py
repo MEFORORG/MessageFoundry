@@ -491,15 +491,16 @@ def test_a_failed_absolute_common_dir_is_asked_again(
     assert asks > 1, f"the stub was asked {asks} times, so no second ask was measured"
 
 
-def test_a_failure_on_a_missing_plain_path_is_asked_again(
+def test_a_failure_on_a_missing_directory_is_asked_again(
     rig: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failure on a `-C` that is a plain absolute path naming no directory is not kept for the run.
+    """A failed git question about a `-C` that names no directory is asked again in the given pass.
 
-    .NET's Directory.Exists also reads false on a transient SMB or network error, a sharing violation
-    or access denied, so keeping that failure let one transient failure on a mapped drive stand for
-    the run where origin/main asks again (Lander hold of 2026-11-24). Git's trace2 log counts the asks
-    per argument list.
+    The hook kept such a failure for the run where .NET's Directory.Exists read false, which it also
+    reads on an unreachable network path, so one transient failure on a mapped drive stood for the
+    run where origin/main asks again (Lander hold of 2026-11-24). Git's trace2 log counts the asks
+    per argument list. The ninth line's question is asked only in the given pass, because the
+    eight-hoist budget never carries that line, so its count alone shows the given pass asking again.
     """
     trace = tmp_path / "trace2.log"
     lines = [f"echo line{i} $(git -C {{o}}/m{i} checkout -q y{i})" for i in range(9)]
@@ -518,8 +519,9 @@ def test_a_failure_on_a_missing_plain_path_is_asked_again(
     ]
     missing = Counter(a for a in starts if re.search(r"[\\/]m\d", a))
     assert len(missing) >= 9, f"{len(missing)} missing-directory questions: the lines were not read"
-    repeated = {argv: n for argv, n in missing.items() if n > 1}
-    assert repeated, f"no failure on a missing directory was asked again: {dict(missing)}"
+    ninth = {argv: n for argv, n in missing.items() if re.search(r"[\\/]m8\b", argv)}
+    assert ninth, f"the ninth line's question was not asked: {dict(missing)}"
+    assert any(n > 1 for n in ninth.values()), f"the given pass did not ask again: {ninth}"
 
 
 _FILLER = "abcdefghij " * 2700

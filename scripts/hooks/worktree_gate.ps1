@@ -1234,16 +1234,17 @@ function Test-TrueSeparatorIn([string]$Text) {
 # and 4.6 s at origin/main in that round's run on that day's load, when a failure that was not kept
 # was asked again on every ask in both passes; the rewritten pass now asks it once per pass
 # (Invoke-GitRead's note). With the cache as it now
-# stands, keeping no failure for the run (Lander hold of 2026-11-24), one run of the seven TIMED shapes
+# stands, keeping no failure in Invoke-GitRead's given pass (Lander hold of 2026-11-24), one run of the seven TIMED shapes
 # in tests/test_worktree_gate_added_command_readings.py on a heavily loaded Windows box on 2026-11-24,
 # against the BASELINE commit 1983d8eb79a and against cf790ecc157 before the cache: 30.3 s (21.9 s,
 # 97.8 s) for that existing-non-repository shape; 24.5 s (17.5 s, 62.2 s) for nine lines whose `-C`
 # paths name no directory, which review round 2c9e3d7a9b had timed at 44.1 s; 11.9 s (2.1 s, 16.7 s)
 # and 14.4 s (5.2 s, 21.9 s) for the two one-line nine-hoist shapes, whose `-C` paths name no
 # directory; and 2.7 s to 6.5 s (2.3 s to 18.4 s, 53.1 s to 85.1 s) for the other three. The first two
-# passed the 20 s proof wait in that run, and BASELINE passed it on the first. The shapes whose `-C`
-# fails stay slower than BASELINE: each such failure is asked again, and every hoist costs a pass of
-# the rules over the text before its cut. These are single runs on one box, not bounds.
+# ran past the 20 s proof wait in that run, and BASELINE ran past it on the first. The shapes whose
+# `-C` fails stay slower than BASELINE: the rewritten pass asks again a question the given pass
+# already asked, a hoist asks about a `-C` no BASELINE pass named, and every hoist costs a pass of the
+# rules over the text before its cut. These are single runs on one box, not bounds.
 # A run past the shell entry's 20 s proof wait makes the entry start its own gate run, so the wait
 # and that run share the 60 s timeout, and past it a slow run blocks the command rather than letting
 # it through (install-gate.ps1 installs `onFailure = block`).
@@ -3290,7 +3291,8 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # which it puts back in $LASTEXITCODE, so a caller reads what the git call would have given it. The
 # rule for a failed answer is in the function's note. The hook runs before the tool call, so nothing
 # it judges has run yet; another process could still change the repository during the run. A kept
-# success hides such a change from later asks, which uncached calls would have seen.
+# answer hides such a change from later asks, which uncached calls would have seen: a kept success,
+# and a failure replayed in the rewritten pass, for example a mapped drive that reconnects mid-run.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 # The rewritten pass's own failures, replayed only in that pass; Invoke-GitRead's note says why.
 $gitReadRewrittenFailures = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
@@ -3311,12 +3313,13 @@ function Invoke-GitRead([object[]]$GitArgs) {
     }
     $key = $keyArgs -join [char]0
     # WHAT IS KEPT. A success, an exit code of 0 with at least one output line (which may be blank),
-    # is kept for the run. A failure is never kept for the run: in the given pass it is asked again on
-    # every ask, as origin/main asks it. A failure, or an
-    # answer with no line, is asked again on every ask in the given pass, as with no cache and as
-    # origin/main asked it, so one spawn that failed under load does not stand for a later ask there
+    # is kept for the run. This function keeps no failure in the given pass: a failure, or an answer
+    # with no line, is asked again on every ask there, as with no cache and as origin/main asked it
+    # (Lander hold of 2026-11-24; a .NET directory check that once kept some failures also reads false
+    # on an unreachable network path), so one spawn that failed under load does not stand for a later ask there
     # that could read the answer and deny. In the rewritten pass a failure is asked on that pass's
-    # first ask of the question and replayed for the rest of the pass, because each hoist carries the
+    # first ask of the question and replayed for the rest of that pass, which runs to the end of the
+    # hook, because each hoist carries the
     # lines before it and asking on every ask there cost too much (the COST note has the times;
     # Manager decision of 2026-11-24 under the owner's instruction of 2026-11-23). So a question the
     # given pass asked gets one more ask, and a question only the rewritten pass asks gets ONE ask in
@@ -3616,8 +3619,8 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
 # kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
 # Neither re-ask runs in the call that made the first ask, and each goes through Invoke-GitRead, so
-# it reaches git only where that function neither kept the failure nor, in the rewritten pass,
-# already asked the question in that pass; its note says when. The comparable forms are built in the
+# it reaches git except where, in the rewritten pass, that function already asked the question in
+# that pass; its note says when. The comparable forms are built in the
 # path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Read-AbsoluteCommonDir([string]$CandRaw) {
