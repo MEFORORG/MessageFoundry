@@ -11160,12 +11160,13 @@ class AuthService:
     async def _report_unkeyed_bindings(
         self, unkeyed: Sequence[UserRecord], *, still_unkeyed: set[str]
     ) -> None:
-        """Log and audit each bound id-less row a pass skipped (BACKLOG #2027), once per process
-        while the row stays one. ``still_unkeyed`` is every such row, signed in or not; a mark is
-        dropped only when its row stops being one (unbound, disabled or removed). So it is not once
-        per account per process in at least two cases. A row disabled and then re-enabled is
-        reported again once it holds a session. A row is marked only once its audit row is
-        written, so a refused write leaves it unmarked, and a later pass logs it and tries the audit again.
+        """Log and audit each bound id-less row a pass skipped (BACKLOG #2027).
+
+        A row is marked once its audit row is written, and a marked row is not reported again in
+        this process. ``still_unkeyed`` is every such row, signed in or not; a mark is dropped only
+        when its row stops being one (unbound, locally disabled or removed). A row whose audit
+        write was refused stays unmarked, so a later pass that still finds it signed in logs it
+        and tries the audit again.
 
         **Its own audit action, ``auth.ad_reconcile_binding_unkeyed``, not the outage row.**
         ``auth.ad_reconcile_skipped`` means the directory was unreachable and the accounts are fine.
