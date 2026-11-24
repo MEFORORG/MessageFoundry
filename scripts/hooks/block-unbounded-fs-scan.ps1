@@ -723,8 +723,12 @@ function Hide-PowerShellSpans([string]$Text) {
 #   - a case pattern's `)`, and a `((` glued to a keyword;
 #   - a `$'...'` inside arithmetic. Bash drops its `$` and decodes its escapes before the expansion,
 #     so a substitution in it runs, including one spelled with escapes such as `\x24(`;
-#   - a `'` inside a `${...}` within double quotes, which bash reads as a literal character, so a
-#     site after it runs;
+#   - a `'` in the word of a `${x:-...}`, `${x:+...}` or `${x:=...}` within double quotes, or of the
+#     colon-less `-`, `+` and `=` forms. Bash reads that `'` as a literal character, so a site after
+#     it runs. Measured on bash 5.3: after `#`, `%`, `/`, `^`, `,` and `?`, bash honours the quote;
+#   - a heredoc terminator line that matches only after `.Trim()`, and a quoted delimiter with
+#     space around it. In either case the pass and bash can disagree on which lines are body, and a
+#     walk can go undenied (found by a Lander probe on 2026-11-23);
 #   - a heredoc delimiter it captures only part of, such as `<<END-X`. The pass then reads the body as
 #     running past the real terminator, so a site on a later line is skipped;
 #   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs.
