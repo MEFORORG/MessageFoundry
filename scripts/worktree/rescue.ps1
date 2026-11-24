@@ -16,8 +16,10 @@
     THE STASH STACK IS CLONE-WIDE: every worktree and every session on this clone pushes and pops the same
     one, so "the top entry" is not "my entry" (BACKLOG #5957). The push carries a unique tag, the entry's
     commit id is read back by that tag straight away, anchored under a private ref
-    (refs/worktree-rescue/<id>), and taken off the shared stack at once; everything after that names the
-    id -- never stash@{0}, never a bare pop. A push that created no entry is refused before anything else
+    (refs/worktree-rescue/<id>), and taken off the shared stack at once; the apply names the id, never a
+    bare pop. The one step that cannot name the id is that drop: git stash drop takes a POSITION, so the
+    position is re-found by id and checked just before the drop, and any other session's entry a shifted
+    position dropped anyway is stored back. A push that created no entry is refused before anything else
     runs, since the only entry a later step could find would be someone else's.
 
     The anchor is the safety net: if a later step fails, the work is still held under that ref and this
@@ -46,7 +48,9 @@ if (-not $Name) { throw "rescue.ps1 needs -Name <slug> for the new worktree. Not
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
-# $GIT_REDIRECT_NAMES and Get-GitConfigCarriers, the lists remove.ps1 refuses, so the two cannot drift.
+# $GIT_REDIRECT_NAMES and Get-GitConfigCarriers come from worktree-gates.ps1. remove.ps1 calls the same
+# Get-GitConfigCarriers, but keeps its OWN literal copy of the redirect names (and of the two object-store
+# names below), so those lists can drift apart; keep them in step by hand.
 . "$PSScriptRoot\worktree-gates.ps1"
 
 # An inherited GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR or GIT_INDEX_FILE points every `git -C $RepoRoot`
@@ -153,7 +157,9 @@ function Remove-OwnStashEntry([string]$Id, [string]$Anchor) {
             Write-Warning "Could not read which entry the drop removed ($dropOut). Check git stash list against: $(@($listed | ForEach-Object { "$($_.Sha) $($_.Subject)" }) -join '; ')"
         } elseif ($dropped -ne $Id) {
             $subject = @($listed | Where-Object Sha -eq $dropped | ForEach-Object Subject | Select-Object -First 1)
-            $subject = if ($subject) { $subject[0] } else { "restored by rescue.ps1 after a shifted drop" }
+            # An entry pushed after the read above is not in $listed, so read its real subject from the commit.
+            $subject = if ($subject) { $subject[0] } else { "$(& git -C $RepoRoot log -1 --format=%s $dropped)".Trim() }
+            if (-not $subject) { $subject = "restored by rescue.ps1 after a shifted drop" }
             & git -C $RepoRoot stash store -m $subject $dropped
             if ($LASTEXITCODE -eq 0) {
                 Write-Warning "The stash list moved during the drop; another session's entry $dropped was dropped and has been stored back (at the top). Stash commit $Id stays listed as a spare copy."
