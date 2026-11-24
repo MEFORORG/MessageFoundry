@@ -613,6 +613,7 @@ def _build_body(event: SecurityEvent) -> str:
         moved_by_admin
         or set_by_admin
         or from_directory
+        or (event.event_type == MFA_DISABLED and event.detail.get("reset") is True)
         or event.event_type
         in (
             ACCOUNT_CREATED,
@@ -632,7 +633,8 @@ def _build_body(event: SecurityEvent) -> str:
         # engine ending sessions on a directory answer (vault BACKLOG #2140). Nor to an
         # administrator's role change or disable, whose description says an administrator did it:
         # ``PUT /users/{id}/roles`` and the disable in ``PATCH /users/{id}`` both refuse a
-        # self-target (BACKLOG #6034).
+        # self-target (BACKLOG #6034). Nor to an administrator's MFA reset, whose route refuses one
+        # too.
         closing = "If you did not expect this change, contact your MessageFoundry administrator."
     else:
         closing = "If this was you, no action is needed. If not, contact your MessageFoundry administrator."

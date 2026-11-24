@@ -793,3 +793,15 @@ def test_a_boolean_detail_is_not_read_as_a_count_or_a_timestamp() -> None:
     )
     assert "Recovery codes remaining" not in used
     assert "last recovery code" not in used
+
+
+def test_an_administrator_mfa_reset_notice_does_not_say_if_this_was_you() -> None:
+    """BACKLOG #6034. ``admin_reset_mfa`` sends MFA_DISABLED with ``reset``, and its route refuses a
+    self-target, so "if this was you" cannot apply. A holder's own MFA_DISABLED is the control."""
+    reset = _build_body(
+        SecurityEvent(MFA_DISABLED, username="jdoe", email="j@example.org", detail={"reset": True})
+    )
+    assert "if this was you" not in reset.lower()
+    assert reset.endswith(_DIRECTORY_CLOSING)
+    own = _build_body(SecurityEvent(MFA_DISABLED, username="jdoe", email="j@example.org"))
+    assert "If this was you, no action is needed." in own
