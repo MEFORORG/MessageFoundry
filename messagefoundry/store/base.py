@@ -5562,11 +5562,14 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
     it handed over: :func:`acquire_pooled`'s done-callback, or the warm-up cleanup in
     :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
-    This reads ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the loop's
-    task type). Where the borrow, or a task it waits on, has no such attribute, the check reads
-    unknown and one WARNING says the check is off. Each caller then keeps what it did before
-    BACKLOG #5686, on the turn the check first reads unknown: with ``defer_unknown`` (the warm-up)
-    the cancel is put off one loop turn with ``call_soon(borrow.cancel)``, and without it
+    This reads ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the default
+    asyncio task type only). Where the borrow, or a task it waits on directly or through a
+    gather, is an ``asyncio.Task`` with no such attribute, the check reads unknown and one WARNING
+    per process says the check is off; a task that is not an ``asyncio.Task``, or one reached
+    through another combinator such as a shield, reads parked with no WARNING. On unknown, each
+    caller keeps what it did before BACKLOG #5686, on the turn the check first reads unknown: with
+    ``defer_unknown`` (the warm-up) the cancel is put off one loop turn with
+    ``call_soon(borrow.cancel)``, and without it
     (:func:`acquire_pooled`) the borrow is cancelled at once. Each can then lose a hand-over, at
     least: the deferred cancel one resolved after the cancel is scheduled, or one the driver takes
     more than a step to finish; the immediate cancel one whose borrow wake-up is already scheduled.
@@ -5610,9 +5613,11 @@ def _value_in_flight(fut: asyncio.Future[Any]) -> _Flight:
     (it refuses the cancel) or has a pending child in flight. A task whose awaited future failed or
     was cancelled is parked, since no value is on its way. A gather with no pending child in flight
     and a pending child that reads unknown reads unknown. Outside the check, at least: a gather with
-    a child done with a value beside a pending child (its cancel discards that value), a shield or
-    another combinator, and a future that ignores its cancel; each reads parked. The gather check
-    reads ``_children``, a CPython detail the gather tests pin only through behaviour."""
+    a child done with a value beside a pending child (its cancel discards that value; it reads as
+    its pending children do), a shield or another combinator, a task that is not an
+    ``asyncio.Task``, and a future that ignores its cancel; all but the gather read parked. The
+    gather check reads ``_children``, a CPython detail the gather tests pin only through
+    behaviour."""
     if fut.done():
         return "parked" if fut.cancelled() or fut.exception() is not None else "in_flight"
     if isinstance(fut, asyncio.Task):
