@@ -10,9 +10,9 @@ a DICOMweb service via STOW-RS.
 PHI-bearing POST to an unintended host; ASVS 15.3.2), the cleartext-credential refusal, and the outbound
 length limits. The fail-closed ``[egress].allowed_http`` host gate is enforced by ``build_destination`` (it folds
 DICOMWEB into the REST/SOAP/FHIR arm — see transports.egress ``_allowlist_for`` / ``check_egress_allowed``).
-It needs **no** ``pydicom``: the object rides as opaque bytes, so DICOMweb works without the DIMSE stack.
-The one read of the object is its File Meta Media Storage SOP Instance UID, by hand, which a 202 is
-compared with (:func:`_sent_instance_uid`; BACKLOG #5914).
+It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works without the DIMSE stack. A
+202 reply is compared with the object's File Meta Media Storage SOP Instance UID, read by hand
+(:func:`_sent_instance_uid`; BACKLOG #5914).
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -121,12 +121,12 @@ _REFERENCED_SOP_INSTANCE_UID = "00081155"
 # VR, an unknown one included, takes the long form: two reserved bytes, then a 4-byte length, as
 # PS3.5 tells a reader to assume for a VR it does not know.
 _PART10_PREAMBLE = 128
-_SHORT_FORM_VRS = frozenset(
-    {
-        *(b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FL", b"FD", b"IS", b"LO"),
-        *(b"LT", b"PN", b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US"),
-    }
-)
+# fmt: off
+_SHORT_FORM_VRS = frozenset({
+    b"AE", b"AS", b"AT", b"CS", b"DA", b"DS", b"DT", b"FL", b"FD", b"IS", b"LO",
+    b"LT", b"PN", b"SH", b"SL", b"SS", b"ST", b"TM", b"UI", b"UL", b"US",
+})
+# fmt: on
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
 # malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
@@ -446,8 +446,17 @@ def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | No
         "unconfirmed-202",
         f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}",
     )
+    # An object with no UID to compare is named as the cause on any 202 the rules before the
+    # comparison do not refuse, an empty one included; a replay of the same bytes is refused again.
+    no_uid = (
+        "unconfirmed-202",
+        "no Media Storage SOP Instance UID (0002,0003) in the instance sent to compare with the "
+        f"reply, so a replay of the same object is refused again; {_NOT_SENT}",
+    )
     if _reply_is_empty(body):
-        return unconfirmed if status == 202 else None
+        if status != 202:
+            return None
+        return no_uid if _sent_instance_uid(sent) is None else unconfirmed
     # A refused parse is (None, hint), and None is not a dataset, so the hint need not be read.
     obj, _ = json_loads_or_refusal(body.lstrip(_BOM), object_pairs_hook=refuse_repeated_keys)
     if isinstance(obj, dict):
@@ -469,11 +478,7 @@ def _stowrs_refusal(body: str, status: int, sent: bytes) -> tuple[str, str] | No
     if status == 202:
         sent_uid = _sent_instance_uid(sent)
         if sent_uid is None:
-            return (
-                "unconfirmed-202",
-                "no Media Storage SOP Instance UID (0002,0003) in the instance sent to compare "
-                f"with the reply; {_NOT_SENT}",
-            )
+            return no_uid
         referenced = _sequence_items(datasets, _REFERENCED_SOP_SEQUENCE) or []
         if not any(_names_sent_instance(i, sent_uid) for i in referenced):
             return unconfirmed

@@ -4,8 +4,8 @@
 ``multipart/related; type="application/dicom"`` framing, the dicom+json FailedSOPSequence / HTTP-status
 classification (transient retry vs permanent dead-letter), response capture, and the egress arm.
 
-The opener is faked so nothing hits the network — and because the destination treats the object as
-**opaque bytes** (no pydicom parse; it reads only the Part-10 File Meta group, by hand), these tests
+The opener is faked so nothing hits the network — and because the destination parses no data set (it
+reads the Part-10 File Meta group by hand, on a 202), these tests
 need **no** ``[dicom]`` extra and run on every CI leg. The one test that checks that reader against
 pydicom's own writer skips without it."""
 
@@ -532,8 +532,9 @@ def _uid_body(uid: object) -> str:
 
 
 # ReferencedSOPSequence bodies that name no stored instance, so confirm no 202 store (BACKLOG #5914):
-# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element. Each
-# shape case carries SENT_UID, so only the shape check, not the comparison, can refuse it.
+# first by a malformed ReferencedSOPInstanceUID element, then by a malformed sequence element. The
+# element-shape cases from two-values on carry SENT_UID, so the comparison alone cannot refuse them;
+# the blank and grammar cases are refused by the comparison, since SENT_UID passes the grammar.
 _UNCONFIRMING_BODIES = [
     pytest.param(_uid_body(uid), id=f"uid-{name}")
     for name, uid in [
@@ -762,6 +763,7 @@ async def test_dicomweb_file_meta_reader_takes_any_vr_it_does_not_know_as_long_f
     [
         pytest.param(STORED_OK, id="reply-names-an-instance"),
         pytest.param(json.dumps({"00081199": {"vr": "SQ", "Value": [{}]}}), id="reply-names-none"),
+        pytest.param("", id="empty-reply"),
     ],
 )
 @pytest.mark.parametrize("obj", _NO_COMPARABLE_UID)

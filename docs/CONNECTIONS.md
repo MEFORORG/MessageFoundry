@@ -3797,7 +3797,7 @@ ADR 0023), JWKS hosting, `.well-known` discovery, and Bulk Data `$export`.
 A **DICOM** connector (`ConnectorType.DIMSE`) is both an **inbound C-STORE SCP** listener and an
 **outbound C-STORE SCU** sender over DIMSE/`pynetdicom` ([ADR 0025](adr/0025-dicom-codec-store-connectors.md));
 `DICOMweb(...)` (`ConnectorType.DICOMWEB`) is the modern HTTP imaging lane — an **outbound STOW-RS** store/send
-destination. All three carry the object **opaquely** — pair an inbound `DICOM(...)` with `content_type="dicom"`
+destination. All three carry the object **opaquely**, though a DICOMweb 202 reads its File Meta UID (see *DICOMweb*) — pair an inbound `DICOM(...)` with `content_type="dicom"`
 so each received object routes as a `RawMessage` ([ADR 0004](adr/0004-payload-agnostic-ingress.md)); a
 Router/Handler parses it on demand via `messagefoundry.parsing.dicom` (a cheap `DicomPeek` for routing,
 `DicomDataset` + SR→HL7 helpers for transform), and a forwarding Handler re-emits the carried bytes to a SCU
