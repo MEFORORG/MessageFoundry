@@ -28,10 +28,12 @@ and these tests do not pretend otherwise: ``age_ok=true`` and ``advisory_ok=true
 uv/pip, ``eligible=true`` only for github-actions, and the merge ``if`` requires all of them on the security
 track -- disjoint sets. #2's step does hold a PR the allow-set would pass (an ungrouped or unknown-group PR is
 reported as ``security_track=true`` with ``advisory_ok=false``). The confirming halves are tested as FORWARD
-guards, so that populating a Python allow row later is a one-line change to a control that already works, not
-a control to be written
-under pressure. ``test_release_age_is_gated_on_the_allow_set`` pins only that the age step is
-skipped for a PR the allow-set holds; it pins nothing about #2.
+guards, so that they are a control that already works, not one to be written under pressure. A populated
+Python allow row is necessary for them to confirm, not sufficient: at least a uv PR whose lock Dependabot
+resyncs carries a second commit, which the sole-author check holds, and npm needs its own allow row as well as
+an ecosystem-aware #2 query and a publish-date source for #4. ``test_release_age_is_gated_on_the_allow_set``
+checks only that the age step's ``if`` contains the allow-set conjunct as a substring, so an ``if`` that also
+ORs in a loosening such as ``|| always()`` would pass it; it pins nothing about #2 or #4.
 """
 
 from __future__ import annotations
@@ -346,13 +348,13 @@ def test_release_age_step_is_security_track_only_and_fails_closed() -> None:
 def test_release_age_is_gated_on_the_allow_set() -> None:
     """The age step must not run for a PR the allow-set already holds.
 
-    Two distinct reasons, and the weaker one is the one usually noticed. The privacy/egress reason:
-    this step makes an UNAUTHENTICATED outbound GET from a job holding ``contents: write``, so making
-    it for a PR that was going to be held anyway is gratuitous. The honesty reason, which is why the
-    assertion lives here rather than in a comment: this ``if`` is half of the conjunction that makes
-    guardrail #4 INERT today (``age_ok=true`` needs uv/pip, ``eligible=true`` needs github-actions).
-    Pinning it means widening #4 into a live control has to edit a test, not slip through as prose.
-    It pins nothing about #2.
+    The reason is privacy/egress: this step makes an UNAUTHENTICATED outbound GET from a job holding
+    ``contents: write``, so making it for a PR that was going to be held anyway is gratuitous. The
+    assertion is a substring check of the step's ``if``, so an ``if`` that also ORs in a loosening
+    such as ``|| always()`` would still pass it. It pins nothing about #4: what keeps #4 from
+    confirming today is the merge ``if``'s ``eligible`` and ``age_ok`` conjuncts (``age_ok=true``
+    needs uv/pip, ``eligible=true`` needs github-actions), and populating a uv allow row would widen
+    #4 while this test still passes. It pins nothing about #2 either.
     """
     age = _step("age")
     cond = str(age.get("if", ""))
