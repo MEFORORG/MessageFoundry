@@ -5,8 +5,9 @@
 `ci.yml`'s `changes` job decides whether `packaging-build` runs on a pull request. That job is the
 only one outside a release tag that builds every distribution, and `ci-gate` reads a skipped need
 as a pass, so a file the build reads that no arm names merges green unbuilt. Before #5472 the arm
-missed `ci/locks/release-tools.lock`, which the job installs its build backend from, and the root
-files the engine build reads by name: README.md, CHANGELOG.md, LICENSE and NOTICE.
+missed `ci/locks/release-tools.lock`, which the job installs its `build` frontend from, and the
+files the engine build reads by name: README.md, CHANGELOG.md, LICENSE, NOTICE and the vendored
+defusedxml LICENSE.
 
 Both sides are READ, never copied: the regex out of `ci.yml`, and the inputs out of the job's own
 `-r` installs and the root `pyproject.toml`, so a new lock or a new shipped root file is met here.
@@ -57,8 +58,9 @@ def _root_files_the_engine_build_reads() -> set[str]:
     doc = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
     project = doc["project"]
     sdist = doc["tool"]["hatch"]["build"]["targets"]["sdist"]
-    names = {*sdist["only-include"], project["readme"], *project["license-files"]}
-    return {name for name in names if "/" not in name and (_ROOT / name).is_file()}
+    roots = {*sdist["only-include"], project["readme"]}
+    named = {name for name in roots if "/" not in name} | set(project["license-files"])
+    return {name for name in named if (_ROOT / name).is_file()}
 
 
 def test_every_lock_the_job_installs_trips_the_gate() -> None:
@@ -107,8 +109,21 @@ def test_the_existing_arms_still_trip_the_gate(path: str) -> None:
         ("COMMERCIAL-LICENSE.md", "SHAPE: matches only if `LICENSE` loses its `^`"),
         ("LICENSE.md", "SHAPE: matches only if `LICENSE` loses its `$`"),
         ("NOTICE.txt", "SHAPE: matches only if `NOTICE` loses its `$`"),
+        ("hatch.toml.bak", "SHAPE: matches only if `hatch` loses its `$`"),
+        (".gitignore-template", "SHAPE: matches only if `gitignore` loses its `$`"),
         ("docs/README.md", "SHAPE: matches only if `README` loses its `^`"),
     ],
 )
 def test_the_gate_refuses(path: str, why: str) -> None:
     assert not gate([path]), f"the packaging arm admits {path}: {why}"
+
+
+def test_the_changes_diff_lists_both_sides_of_a_rename() -> None:
+    """With rename detection on, ``git diff --name-only`` lists only a rename's NEW path, so
+    ``git mv LICENSE LICENSE.md`` would trip no ``LICENSE$`` arm. Every arm reads this one list."""
+    doc = jobs_of("ci.yml")["changes"]["steps"]
+    run = next(str(step["run"]) for step in doc if step.get("id") == "f")
+    lines = [line.strip() for line in run.splitlines() if line.strip().startswith("changed=")]
+    assert lines, "the changes step no longer assigns `changed`"
+    missing = [line for line in lines if "--no-renames" not in line]
+    assert not missing, f"the changes diff detects renames again: {missing}"

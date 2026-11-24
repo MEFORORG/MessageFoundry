@@ -18,7 +18,8 @@ docker arm in ``ci.yml``'s ``changes`` job. This file pins that arm. The invaria
 
 THE RUN RATE, measured 2026-11-05 over the 544 first-parent commits on engine ``main``
 (``4b006afc69``) since 2026-10-04, each read with ``git diff-tree --name-only -r``: the arms that
-predate #3455 fired on 67, the arm as it stands fires on 278, and the old arms plus
+predate #3455 fired on 67, the arm as it stood then fires on 278 (before BACKLOG #5472 added
+README.md, LICENSE and NOTICE), and the old arms plus
 ``^messagefoundry/`` would fire on 413. These count squash commits on ``main``, not pull-request
 runs, and a pull request pushed more than once runs the job more than once.
 

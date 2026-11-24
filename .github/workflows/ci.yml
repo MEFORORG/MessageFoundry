@@ -3464,11 +3464,12 @@ jobs:
           # [build-system], which is listed already. README.md, CHANGELOG.md, LICENSE and NOTICE are
           # the root files the engine build reads by name: the sdist's `only-include`, `readme` and
           # `license-files` in pyproject.toml, so a rename or a removal of one breaks the build or
-          # drops a licence file from it. hatch.toml merges over pyproject's [tool.hatch], and
+          # drops a licence file from it; so does the vendored defusedxml LICENSE, the third
+          # license-files entry. hatch.toml merges over pyproject's [tool.hatch], and
           # hatchling applies .gitignore as build exclusions. They rarely change, so listing them
           # costs little. tests/test_ci_packaging_gate.py reads the pyproject inputs and the job's
           # locks, and fails if one stops tripping this arm.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore)$|\.github/workflows/(ci|release)\.yml)'; then
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore)$|messagefoundry/_vendor/defusedxml/LICENSE$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -3524,9 +3525,10 @@ jobs:
           # this job now fires on essentially every dependency PR. The hole if it is dropped is concrete
           # rather than theoretical: `uv lock --upgrade-package ruff` edits the lockfiles and does NOT
           # edit pyproject.toml, so a lock-only ruff bump past the cap changes exactly what that test
-          # asserts while matching no other arm here. This lock is listed rather than its siblings
-          # because it is the file the test READS -- uv.lock and requirements.lock move with it in one
-          # re-export, but a uv.lock edit that was never exported has not changed the guard's subject.
+          # asserts while matching no other arm here. This lock is listed rather than uv.lock
+          # because it is the file the test READS -- uv.lock moves with it in one re-export, but a
+          # uv.lock edit that was never exported has not changed the guard's subject.
+          # requirements.lock is listed too, since BACKLOG #5472, for its own reader (below).
           # `ci/npm-tools/` is the same shape again (vault BACKLOG #2793): a Dependabot bump there
           # touches only that lock, and the manifest tests that read it would otherwise run nowhere.
           # `ci/python-version` is that shape once more: a patch bump edits only the pin, and
@@ -5898,13 +5900,18 @@ jobs:
           # non-zero exit does not stop a pwsh step unless $PSNativeCommandUseErrorActionPreference
           # is on, so the exit is read explicitly. send_mllp.py exits 0 on a NAK, so the ACK's
           # MSA-1 is read too. The count is then taken only for this listener, IB_Test_ADT, and only
-          # at PROCESSED, or, on the legs that cannot deliver, at ROUTED with the delivery pending.
+          # at PROCESSED, or, on the legs that cannot deliver, at ROUTED. ROUTED says only that the
+          # router selected a handler: the read cannot tell a pending delivery from a pending
+          # transform, so on those legs this proves the message got past the router, no further.
           # Anything else fails. The sample graph archives to a relative ./out/adt, and the
           # service's working folder is the administrator-only install root: the same graph's
           # relative inbound folders are refused there at start on the virtual-account legs, so
           # their delivery may still be retrying when the step reads. The localsystem leg can write
           # there and must reach PROCESSED. Reads go routed, then processed, after the processed
           # wait, so a message that moves forward between two reads is still counted.
+          # The loop reads rigadmin's exit 1 as "not yet", so a native non-zero exit must not
+          # throw here whatever the runner's pwsh defaults to.
+          $PSNativeCommandUseErrorActionPreference = $false
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
           $ack = @(& python samples\send_mllp.py samples\messages\adt_a01.hl7)
           $sent = $LASTEXITCODE
@@ -5920,9 +5927,13 @@ jobs:
             $rc = $LASTEXITCODE
             if ($rc -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
             if ($rc -eq 0) { $found = $read[0]; break }
-            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc reading $base&status=$($read[0]) with no count: the API refused the read, its own line above says how" }
+            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc reading $base&status=$($read[0]) with no count: the API refused the read or answered without an integer total, its own line above says which" }
           }
-          if (-not $found) { throw "the message from IB_Test_ADT did not reach $(($reads | ForEach-Object { $_[0] } | Select-Object -Unique) -join ' or ') ($env:SMOKE_ACCOUNT leg)" }
+          if (-not $found) {
+            # Name the real disposition: this job runs where nobody can rerun it by hand.
+            & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert $base
+            throw "the message from IB_Test_ADT did not reach $(($reads | ForEach-Object { $_[0] } | Select-Object -Unique) -join ' or ') ($env:SMOKE_ACCOUNT leg); the listing above shows its status"
+          }
           "IB_Test_ADT messages $found = $count"
 
       # vault BACKLOG #2701, #2700: install-service.ps1 registers the engine as the Python

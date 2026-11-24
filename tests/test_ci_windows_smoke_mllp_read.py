@@ -82,11 +82,15 @@ def _run(
     scenario_file = tmp_path / "scenario.json"
     scenario_file.write_text(json.dumps(scenario), encoding="utf-8")
     script = tmp_path / "step.ps1"
+    # The try/catch only prints the thrown message whole: pwsh's own error view word-wraps it
+    # at the host width, which would split the phrases the tests look for.
     script.write_text(
         "$ErrorActionPreference = 'stop'\n"
         + _STUB
+        + "try {\n"
         + body
-        + "\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n",
+        + "\n} catch { [Console]::Out.WriteLine('THROWN: ' + $_.Exception.Message); exit 1 }\n"
+        + "if ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }\n",
         encoding="utf-8",
     )
     assert _PWSH is not None
@@ -186,7 +190,12 @@ def test_the_step_fails_when_the_rig_cannot_sign_in(tmp_path: Path) -> None:
     assert "could not sign in" in proc.stdout + proc.stderr
 
 
-def test_the_read_is_scoped_to_the_listener_and_reads_no_bare_total() -> None:
+def test_every_counted_read_is_scoped_to_the_listener() -> None:
+    """The stub ignores the query, so the scoping is pinned on the text: every read that takes a
+    count goes through ``$base``, and ``$base`` names the one listener the send reaches."""
     body = _new_body()
-    assert "channel_id=IB_Test_ADT" in body
-    assert "--timeout 10 /messages" not in body, "the step reads /messages unfiltered again"
+    assert '$base = "/messages?channel_id=IB_Test_ADT"' in body
+    counted = [line for line in body.splitlines() if "rigadmin get" in line and "--field" in line]
+    assert counted, "the step takes no counted read"
+    unscoped = [line.strip() for line in counted if '"$base&status=' not in line]
+    assert not unscoped, f"a counted read does not go through $base: {unscoped}"

@@ -55,7 +55,7 @@ def _gate_regex() -> str:
     # `tooling=true` is emitted THREE times: the workflow_dispatch and push early-exits, and the
     # pull_request path arm. Only the last is a path decision, which is why the shared reader
     # anchors on the LAST emission; anchoring on the first found no preceding `grep -qE` at all.
-    return changes_arm_pattern("tooling", "gitignore")
+    return changes_arm_pattern("tooling", "tooling_manifest")
 
 
 def gate(changed: list[str]) -> bool:
@@ -128,7 +128,7 @@ _CASES = [
     # `\.pre-commit-config\.yaml` gets no equivalent probe: under the `^` anchor an unescaped one
     # matches any single leading character, so every candidate is a path nobody would ever add, and a
     # row nobody believes gets deleted the first time it is inconvenient.
-    (["uv.lock"], False, "sibling locks are unlisted: constraints.lock is what the test READS"),
+    (["uv.lock"], False, "no listed test reads uv.lock by name; constraints.lock is what it READS"),
     (["constraints_lock"], False, "not a path: reds only if `constraints\\.lock` loses its escape"),
     # BACKLOG #5472: each file below is read from the repository by a manifest entry, and before
     # that row none matched an arm, so a PR editing only one met the test that reads it on no leg.
