@@ -420,19 +420,26 @@ the next action — and no test asserts on deny-text content.
 
 ### G8 — Two allowlists, two installers, no sync
 
-The gate reads `~/.claude/hooks/worktree-gate.repos.txt`; the selfheal backstop reads
-`~/.claude-hooks/worktree-gate.repos.txt`. `install-gate.ps1` rewrites its own unconditionally;
-`install-selfheal.ps1` seeded the other only if absent. Since BACKLOG #7613 it creates no allowlist,
-and the backstop reads the gate's file first and the legacy one only as a fallback, so a copy an
-earlier run seeded is still read once the gate's file is gone. Adding a governed repo via one installer never
-reaches the other, and `install-gate.ps1 -Uninstall` leaves the backstop armed and still willing to
-`git checkout` the primary — so the "verified byte-for-byte clean uninstall" claim is true of the gate and
-false of the estate. They agree today by luck.
+As found, the gate read `~/.claude/hooks/worktree-gate.repos.txt` and the selfheal backstop read
+`~/.claude-hooks/worktree-gate.repos.txt`. `install-gate.ps1` rewrote its own unconditionally;
+`install-selfheal.ps1` seeded the other only if absent. Nothing synced the two, so adding a governed
+repo through the gate installer never reached the backstop, and `install-gate.ps1 -Uninstall` left the
+backstop armed and still willing to `git checkout` the primary.
 
-Related: `install-selfheal.ps1` lacks the `CLAUDECODE` refusal its sibling has, and its source is
-`$PSScriptRoot` — the calling session's own worktree copy, which that session may freely edit. The
-**higher-privilege** component (it runs `git checkout` on the primary unattended) is the **less
-protected** one. `~/.claude-account-2.lock` has the three gate matchers and no selfheal hook at all.
+Since BACKLOG #7613, `install-selfheal.ps1` creates no allowlist. The backstop reads the gate's file
+first and the legacy one only as a fallback, so a repo `install-gate.ps1` adds reaches it. A legacy
+copy an earlier run seeded is still read once the gate's file is gone: `install-gate.ps1 -Uninstall`
+deletes the gate's file, and where that copy remains the backstop stays armed on the roots it lists,
+so the "verified byte-for-byte clean uninstall" claim is still true of the gate and not of the estate.
+Neither installer deletes the legacy file; `install-selfheal.ps1` prints a note naming it when it exists
+and the gate's file is absent. A backstop copy installed before that change reads only the legacy file until
+`install-selfheal.ps1` runs again.
+
+Related: `install-selfheal.ps1` now carries the `CLAUDECODE` refusal its sibling has, but its source is
+still `$PSScriptRoot`, the calling session's own worktree copy, which that session may freely edit. The
+**higher-privilege** component (it runs `git checkout` on the primary unattended) installs from the
+**less protected** source. `~/.claude-account-2.lock` had the three gate matchers and no selfheal hook
+at all when this was found.
 
 ### G9 — Coverage is enumerated, so every hole is silent
 
