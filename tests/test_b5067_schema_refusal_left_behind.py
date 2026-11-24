@@ -1375,9 +1375,11 @@ def test_provision_admin_keyless_refusal_at_the_write_keys_the_pre_check_from_th
     pre-check's open as the earlier one. Each open resolves the key itself, so a keyless write
     open does not show the pre-check's open was keyless: under keyed settings it may have bound
     the salt and written the genesis record, and the text names both, once. Under keyless
-    settings it names neither (Manager decision on the w10-provision-twin review, finding 3).
+    settings it names neither (Manager decision on the w10-provision-twin review, finding 3), nor
+    for a keyless-chain refusal, which shows the audit log is empty.
 
-    Mutation: take the pre-check open's keyedness from the refused class alone."""
+    Mutation: take the pre-check open's keyedness from the refused class alone, or override it
+    for a keyless-chain refusal too."""
     from messagefoundry.__main__ import _KeylessProvisionRefused
     from messagefoundry.store.base import KeylessAuditChainRefused
     from messagefoundry.store.crypto import StoreKeylessError
@@ -1390,7 +1392,10 @@ def test_provision_admin_keyless_refusal_at_the_write_keys_the_pre_check_from_th
     _refused_at_the_write_after_the_pre_check(monkeypatch, exc, keyed=keyed)
     out = _run(_provision(_settings(shell, "sqlserver", "auto")), capsys)
     assert _PRE_CHECK_OPEN in out, out
-    assert out.count(_SALT) == int(keyed) and out.count(_GENESIS) == int(keyed), out
+    # A keyless-chain refusal fires only on an empty audit log, which a keyed open that returned
+    # would have left with its genesis record, so the pre-check's open was keyless.
+    named = keyed and refusal != "keyless-chain"
+    assert out.count(_SALT) == int(named) and out.count(_GENESIS) == int(named), out
     assert _UNUSED_ENTRY in out, out
 
 
@@ -1552,7 +1557,7 @@ def test_provision_admin_cipher_refusal_after_the_write_open_returned_says_it_ma
     write's own open is known to have returned, so it may also have written, never "may or may
     not have reached its own writing steps".
 
-    Mutation: let the class's wording win over ``this_open_returned`` again."""
+    Mutation: let the class's wording win over ``this_open_may_have_written`` again."""
     from messagefoundry.store.crypto import CipherError
 
     _existing_sqlite_store(shell)

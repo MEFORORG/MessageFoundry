@@ -10231,7 +10231,7 @@ def _two_opens_left_behind(
 
     The earlier open's sentence takes keyedness and the genesis record from the refused class
     where it says (:func:`_refused_open_keying`), since both opens ran under the same settings,
-    and from ``keyed`` otherwise. That open ran the one-time steps, so they are named once, for
+    and from ``keyed`` otherwise, unless ``settings_keying_counts`` says otherwise. That open ran the one-time steps, so they are named once, for
     it, and ``this_open`` is described with none of them, and with no claim about this command's
     rows. ``this_open_may_have_written`` says the caller knows ``this_open`` reached its own
     writing steps before the refusal, whether or not it returned: then it may also have written,
@@ -10240,9 +10240,17 @@ def _two_opens_left_behind(
 
     ``settings_keying_counts`` says each open resolves the key itself, so the two can differ: a
     keyless refusal at ``this_open`` then does not show that the earlier open was keyless, and
-    keyed settings still name the salt record and the genesis record for it."""
+    keyed settings describe it as a keyed open, which may bind a salt and write the genesis
+    record. Not for a keyless-chain refusal (``KeylessAuditChainRefused``): it fires only on an
+    empty audit log, and a keyed open that returned over an empty chain writes its genesis
+    record, so the earlier open was keyless."""
+    from messagefoundry.store.base import KeylessAuditChainRefused
+
     keying = _refused_open_keying(exc)
-    if keying is None or (settings_keying_counts and keyed and not keying.keyed):
+    empty_chain = any(isinstance(e, KeylessAuditChainRefused) for e in (exc, exc.__cause__))
+    if keying is None or (
+        settings_keying_counts and keyed and not keying.keyed and not empty_chain
+    ):
         earlier_keyed, earlier_genesis = keyed, None
     else:
         earlier_keyed, earlier_genesis = keying.keyed, keying.genesis
@@ -10409,8 +10417,8 @@ def _provision_left_behind(
     ``after_the_pre_check`` says the refusal came at, or after, the write's open, once the
     pre-check's open over an existing store had returned. The command then ran two opens, and the
     text names each (:func:`_two_opens_left_behind`, follow-up from PR 3162's review). Each open
-    resolves the key itself, so keyed settings name the salt record and the genesis record for the
-    pre-check's open even after a keyless refusal at the write's."""
+    resolves the key itself, so keyed settings describe the pre-check's open as a keyed open even
+    after a keyless refusal at the write's, other than a keyless-chain refusal."""
     if opened:
         return _provision_opened_left_behind(
             exc, store, keyed=keyed, after_the_pre_check=after_the_pre_check
@@ -11415,8 +11423,9 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # #1905, #1916: could not start -- exit 2 whichever of the three checks caught it: the
         # two keyless ones, or the audit row's check. Each is raised before the write, so the
         # shown key's entry has no seed (#5067). Each follows a full open, which may have changed
-        # the database, so the text says so (#5067). Each follows a keyless open whatever this
-        # passes, `_UnauditableWrite` included (`_refused_open_keying`). Over an existing store
+        # the database, so the text says so (#5067). Each follows a keyless write open,
+        # `_UnauditableWrite` included (`_refused_open_keying`); over an existing store the
+        # pre-check's open is keyed as `keyed` says, other than for a keyless-chain refusal. Over an existing store
         # the pre-check's open came first, and the text names both (#5067).
         left = _provision_opened_left_behind(
             exc,
