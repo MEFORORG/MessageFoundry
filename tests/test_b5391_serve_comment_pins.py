@@ -1,54 +1,86 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5391 item 1, S19-73 and S19-74: comments in ``_serve`` that stated false things.
+"""BACKLOG #5391 item 1, S19-73 and S19-74: two comments in ``_serve`` that stated false things.
 
-Engine PR 3019 corrected both; this file pins them. Each pin reads the comments of the one
-``def _serve`` in ``messagefoundry/__main__.py``, from the file, lower-cased with runs of
-whitespace and comment markers collapsed, so a revert that reflows a line is still caught.
-Each also asserts an anchor it must find first, so a refactor that moves the comments out of
-``_serve`` fails here rather than leaving the pins reading nothing.
+Each pin reads one comment block of the one ``def _serve`` in ``messagefoundry/__main__.py``,
+from the file, lower-cased with comment markers and runs of whitespace collapsed, so a revert
+that reflows a line is still caught; the control below shows that. Each block is found by an
+anchor, so a pin whose comment moved fails rather than reading nothing. A pin bans the false
+wording it names, and a reworded revert can pass it.
 
-* S19-73: the comment above ``_serve``'s ``install_remote_debug_guard()`` call said the hook was
-  not first in the process and that the window before it stays open; the module-level call
-  (vault BACKLOG #2742) closes it, and ``tests/test_remote_debug_guard.py`` pins that order. A
-  later wording said the call covers a caller that reached ``_serve`` some other way; every
-  route imports the module first, and the call's job is the retry ``install_remote_debug_guard``
-  documents. The finding's second half, function-local re-imports of ``sys`` and ``Path``, was
-  already gone before PR 3019, so that pin guards a return only; its control shows it can fail.
-* S19-74: a comment justified the posture-B gate's loopback arm by upgrade breakage on working
-  deployments, a cost ``CLAUDE.md`` section 0 makes vacuous.
+* S19-73, the block above ``_serve``'s ``install_remote_debug_guard()`` call. Before engine PR
+  3019 it said this module's imports and argument parsing come before the hook; the
+  module-level call (vault BACKLOG #2742) runs ahead of both. PR 3019's wording said the call
+  covers a caller that reached ``_serve`` some other way; every route imports the module first.
+  The block now points at the guard's own docs instead. The finding's other half, function-local
+  re-imports of ``sys`` and ``Path``, was already gone before PR 3019, so that pin guards a
+  return only; its control shows it can fail.
+* S19-74, the posture-B gate's loopback-arm paragraph. Before PR 3019 it justified the arm by
+  upgrade breakage on working deployments, a cost ``CLAUDE.md`` section 0 makes vacuous.
 """
 
 from __future__ import annotations
 
 import ast
 import functools
+import importlib.util
 import io
 import re
 import tokenize
 from pathlib import Path
 
-import messagefoundry.__main__ as cli
-from tests._ast_sites import named_func, parse_source
+from tests._ast_sites import call_sites, named_func, parse_source
 
 
-@functools.cache
-def _serve_node_and_source() -> tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]:
-    source = Path(cli.__file__).read_text(encoding="utf-8")
-    return named_func(parse_source(source), "_serve"), source
-
-
-@functools.cache
-def _serve_comments() -> str:
-    """Every comment inside ``def _serve``, joined, lower-cased, whitespace collapsed."""
-    node, source = _serve_node_and_source()
-    end = node.end_lineno or node.lineno
-    texts = [
-        tok.string.lstrip("#")
+def _comment_lines(source: str, first: int, last: int) -> dict[int, str]:
+    """The comment text on each line from ``first`` to ``last``, marker stripped."""
+    return {
+        tok.start[0]: tok.string.lstrip("#")
         for tok in tokenize.generate_tokens(io.StringIO(source).readline)
-        if tok.type == tokenize.COMMENT and node.lineno <= tok.start[0] <= end
-    ]
-    return re.sub(r"\s+", " ", " ".join(texts)).lower()
+        if tok.type == tokenize.COMMENT and first <= tok.start[0] <= last
+    }
+
+
+def _block(comments: dict[int, str], line: int) -> str:
+    """The run of comment lines around ``line``, joined, lower-cased, whitespace collapsed."""
+    first = last = line
+    while first - 1 in comments:
+        first -= 1
+    while last + 1 in comments:
+        last += 1
+    text = " ".join(comments[n] for n in range(first, last + 1))
+    return re.sub(r"\s+", " ", text).lower().strip()
+
+
+def _block_above_call(source: str, func: str, callee: str) -> str:
+    node = named_func(parse_source(source), func)
+    comments = _comment_lines(source, node.lineno, node.end_lineno or node.lineno)
+    call_line = call_sites(node, callee)[0].lineno
+    assert call_line - 1 in comments, f"no comment directly above {callee}() in {func}"
+    return _block(comments, call_line - 1)
+
+
+def _block_holding(source: str, func: str, anchor: str) -> str:
+    node = named_func(parse_source(source), func)
+    comments = _comment_lines(source, node.lineno, node.end_lineno or node.lineno)
+    hits = [n for n, text in comments.items() if anchor in text.lower()]
+    assert len(hits) == 1, f"{anchor!r} is on {len(hits)} comment lines of {func}; re-anchor"
+    return _block(comments, hits[0])
+
+
+@functools.cache
+def _main_source() -> str:
+    spec = importlib.util.find_spec("messagefoundry.__main__")
+    assert spec is not None and spec.origin is not None
+    return Path(spec.origin).read_text(encoding="utf-8")
+
+
+def _guard_block() -> str:
+    return _block_above_call(_main_source(), "_serve", "install_remote_debug_guard")
+
+
+def _loopback_arm_block() -> str:
+    return _block_holding(_main_source(), "_serve", "loopback arm warns rather than refuses")
 
 
 def _reimports(func: ast.AST) -> list[str]:
@@ -63,18 +95,15 @@ def _reimports(func: ast.AST) -> list[str]:
     ]
 
 
-def test_s19_73_the_guard_comment_names_neither_an_open_window_nor_another_caller() -> None:
-    comments = _serve_comments()
-    # The anchor: the guard comment is still in _serve. Re-anchor this test if it moves.
-    assert "vault backlog #2700: first in this function" in comments
-    assert "window stays open" not in comments
-    assert "not first in the process" not in comments
-    assert "some other way" not in comments
+def test_s19_73_the_guard_comment_states_neither_false_order() -> None:
+    block = _guard_block()
+    assert block.startswith("vault backlog #2700: first in this function"), block
+    assert "argument parsing come before it" not in block, block
+    assert "some other way" not in block, block
 
 
 def test_s19_73_serve_does_not_re_import_sys_or_path() -> None:
-    node, _source = _serve_node_and_source()
-    assert _reimports(node) == []
+    assert _reimports(named_func(parse_source(_main_source()), "_serve")) == []
 
 
 def test_s19_73_control_the_re_import_check_flags_both_names() -> None:
@@ -84,9 +113,23 @@ def test_s19_73_control_the_re_import_check_flags_both_names() -> None:
     assert _reimports(func) == ["sys", "Path"]
 
 
-def test_s19_74_no_serve_comment_cites_upgrade_breakage_on_working_deployments() -> None:
-    comments = _serve_comments()
-    # The anchor: the posture-B gate's loopback-arm comment is still in _serve.
-    assert "the loopback arm warns rather than refuses (owner decision)" in comments
-    assert "deployments on upgrade" not in comments
-    assert "working deployments" not in comments
+def test_s19_74_the_loopback_arm_paragraph_cites_no_upgrade_breakage() -> None:
+    block = _loopback_arm_block()
+    assert "upgrade" not in block, block
+
+
+def test_control_a_reflowed_phrase_in_the_block_is_still_found() -> None:
+    source = (
+        "def f():\n"
+        "    x = 1\n"
+        "    # Vault BACKLOG #2700: first in this function. A caller that reached it some\n"
+        "    #   other WAY.\n"
+        "    g()\n"
+        "    # The loopback arm WARNS rather than refuses: refusing would break it on\n"
+        "    # UPGRADE.\n"
+        "    return x\n"
+    )
+    guard = _block_above_call(source, "f", "g")
+    assert guard.startswith("vault backlog #2700: first in this function")
+    assert "some other way" in guard
+    assert "upgrade" in _block_holding(source, "f", "loopback arm warns rather than refuses")
