@@ -71,7 +71,6 @@ self-test) or, with ``--strict``, when any term could not be priced.
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import re
 import sys
@@ -986,11 +985,10 @@ def _skip_space(text: str, i: int) -> int:
     return i
 
 
-def _expr_end(ctx: _Ctx, i: int, stops: str = ";,", asi: bool = True) -> int:
+def _expr_end(ctx: _Ctx, i: int, stops: str = ";,") -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues, a line break held in a
-    block comment included. A statement passes ``stops=";"``: a top-level ``,`` does not end one.
-    ``asi=False`` reads no line break as an end, for a statement whose end a line cannot show."""
+    block comment included. A statement passes ``stops=";"``: a top-level ``,`` does not end one."""
     masked, raw = ctx.masked, ctx.code
     depth = 0
     for j in range(i, len(masked)):
@@ -1003,7 +1001,7 @@ def _expr_end(ctx: _Ctx, i: int, stops: str = ";,", asi: bool = True) -> int:
             depth -= 1
         elif depth == 0 and c in stops:
             return j
-        elif asi and depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
+        elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             last = i + len(raw[i:j].rstrip()) - 1
             if nxt is None or not _continues(ctx.ends.get(last, _VALUE), raw, nxt.start()):
@@ -1210,15 +1208,17 @@ class _LoopSpan(NamedTuple):
     body_end: int
     resume: int  # where the scan goes on: past the body, and past a `do`'s `while (...)` tail
     settled: bool
-    tail: tuple[int, int] | None = None  # a `do`'s condition, which runs every iteration too
+    cond: tuple[int, int] | None = None  # a `do`'s condition, which runs every iteration too
 
 
-# A brace-less body opening with one of these is a statement whose end ASI cannot be read from
-# its first line: `if (c)` then a line break then the branch, or an `else` after the `;`.
-_COMPOUND_RE = re.compile(r"(?:if|else|switch|try|with)(?![\w$])|[A-Za-z_$][\w$]*\s*:(?!:)")
+# The statements a brace-less body can open with whose end is not the end of a line: each is read
+# through its parts. A label prefixes another statement.
+_COMPOUND_RE = re.compile(r"(if|switch|try|with)(?![\w$])|[A-Za-z_$][\w$]*\s*:(?!:)")
 _AWAIT_RE = _word_re("await")
 _LOOP_RE = _word_re(*_LOOPS)
 _ELSE_RE = re.compile(r"\s*else(?![\w$])")
+_CATCH_RE = re.compile(r"\s*catch(?![\w$])")
+_FINALLY_RE = re.compile(r"\s*finally(?![\w$])")
 _WHILE_RE = re.compile(r"\s*;?\s*while\s*(?=\()")
 
 
@@ -1245,45 +1245,79 @@ def _loop_head(ctx: _Ctx, after_kw: int, keyword: str) -> _LoopSpan:
         if head:
             subject = (head.end(), close)
         i = _skip_space(ctx.code, close + 1)
-    body_start, body_end, resume, settled = _loop_body(ctx, i)
+    if i < n and masked[i] == "{":
+        body_start = i + 1
+        resume, settled = _statement_end(ctx, i)
+        body_end = resume - 1 if settled else resume
+    else:
+        body_start = i
+        body_end, settled = _statement_end(ctx, i)
+        resume = body_end
     cond: tuple[int, int] | None = None
     if keyword == "do":
         tail = _WHILE_RE.match(masked, resume)
-        close = _match_bracket(masked, tail.end()) if tail else -1
-        if close == -1:
+        close = -1 if tail is None else _match_bracket(masked, tail.end())
+        if tail is None or close == -1:
             settled = False
         else:
-            cond = (tail.end() + 1, close) if tail else None
+            cond = (tail.end() + 1, close)
             resume = close + 1
     return _LoopSpan(subject, body_start, body_end, resume, settled, cond)
 
 
-def _loop_body(ctx: _Ctx, i: int) -> tuple[int, int, int, bool]:
-    """(start, end, resume, settled) of the loop body at ``i``.
+def _statement_end(ctx: _Ctx, i: int) -> tuple[int, bool]:
+    """Where the statement at ``i`` ends, and whether that end was read rather than guessed.
 
-    A brace-less body ends where its statement does: a top-level ``;``, the enclosing block's
-    closer, or a line break ASI ends it at. Not at the first ``;`` anywhere -- one inside a nested
-    block cut the body short and priced the rest once, exact, outside the loop. Where the
-    statement is compound, its end is not read from the line, so the widest reading is taken and
-    the body is marked unsettled: over-reaching costs a floor label, under-reaching an exact
-    under-count.
+    A block ends past its ``}``; a simple statement at a top-level ``;`` (returned, so the caller
+    can look past it), the enclosing closer, or a line break ASI ends it at -- never at the first
+    ``;`` anywhere, which cut a body inside a nested block short and priced the rest once, exact,
+    outside the loop. ``if``/``else``, ``try``/``catch``/``finally``, ``switch``, ``with``, a
+    label and a nested loop are read through their parts. Only unbalanced source is a guess.
     """
     masked = ctx.masked
     n = len(masked)
-    if i < n and masked[i] == "{":
+    i = _skip_space(ctx.code, i)
+    if i >= n:
+        return n, False
+    if masked[i] == "{":
         close = _match_bracket(masked, i)
-        return (i, n, n, False) if close == -1 else (i + 1, close, close + 1, True)
+        return (n, False) if close == -1 else (close + 1, True)
     loop = _LOOP_RE.match(masked, i)
     if loop:
-        inner = _loop_head(ctx, loop.end(), loop.group(0))
-        return i, inner.resume, inner.resume, inner.settled
-    if not _COMPOUND_RE.match(masked, i):
-        end = _expr_end(ctx, i, ";")
-        return i, end, end, True
-    end = _expr_end(ctx, i, ";", asi=False)
-    while end < n and masked[end] == ";" and _ELSE_RE.match(masked, end + 1):
-        end = _expr_end(ctx, end + 1, ";", asi=False)
-    return i, end, end, False
+        span = _loop_head(ctx, loop.end(), loop.group(0))
+        return span.resume, span.settled
+    head = _COMPOUND_RE.match(masked, i)
+    if head is None:
+        return _expr_end(ctx, i, ";"), True
+    keyword = head.group(1)
+    if keyword is None:  # a label
+        return _statement_end(ctx, head.end())
+    j = _skip_space(ctx.code, head.end())
+    if keyword == "try":
+        end, settled = _statement_end(ctx, j)
+        for clause in (_CATCH_RE, _FINALLY_RE):
+            found = clause.match(masked, end)
+            if found is None:
+                continue
+            k = _skip_space(ctx.code, found.end())
+            if masked[k : k + 1] == "(":
+                close = _match_bracket(masked, k)
+                if close == -1:
+                    return n, False
+                k = close + 1
+            end, ok = _statement_end(ctx, k)
+            settled = settled and ok
+        return end, settled
+    close = _match_bracket(masked, j) if masked[j : j + 1] == "(" else -1
+    if close == -1:
+        return n, False
+    end, settled = _statement_end(ctx, close + 1)
+    if keyword == "if":
+        found = _ELSE_RE.match(masked, end + 1 if masked[end : end + 1] == ";" else end)
+        if found is not None:
+            end, ok = _statement_end(ctx, found.end())
+            settled = settled and ok
+    return end, settled
 
 
 def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
@@ -1463,17 +1497,17 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
     in the unpriced list, which trains a reader to skim the list that matters most.
     """
     keyword = m.group("loop")
-    subject, body_start, body_end, _, settled, cond = _loop_head(ctx, m.end(), keyword)
-    inner = _price(ctx, body_start, body_end)
-    if cond is not None:
-        inner = inner + _price(ctx, cond[0], cond[1])
+    span = _loop_head(ctx, m.end(), keyword)
+    inner = _price(ctx, span.body_start, span.body_end)
+    if span.cond is not None:
+        inner = inner + _price(ctx, span.cond[0], span.cond[1])
     if not inner.agents and not inner.unknowns:
         return Cost()
 
     line = ctx.line_of(m.start())
     # A body whose extent is a guess may hold code that runs once, so its count is no width.
-    if subject is not None and settled:
-        width, why = _width_of(ctx, subject[0], subject[1])
+    if span.subject is not None and span.settled:
+        width, why = _width_of(ctx, span.subject[0], span.subject[1])
         if width is not None:
             return _fan_cost(line, width, why, inner, f"{keyword}...of")
 
@@ -1484,7 +1518,7 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
                 line=line,
                 form=(
                     f"{keyword} loop, repetitions unknown"
-                    if settled
+                    if span.settled
                     else f"{keyword} loop, body extent not read, so no width is trusted"
                 ),
                 per_unit=inner.agents,
@@ -1655,6 +1689,9 @@ def workflow_name(source: str) -> str | None:
 
 def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
+    # U+FEFF is whitespace to JavaScript, anywhere, but a token to the lexer: a BOM'd copy of a
+    # file priced differently. Same length, so every offset holds.
+    source = source.replace("﻿", " ")
     notes = _MaskNotes()
     masked = _mask(source, notes)
     chars = list(source)
@@ -1871,24 +1908,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if not args.stdin:
             data = Path(args.script).read_bytes()
+        elif sys.stdin is None:  # pythonw, or a service with no console
+            raise OSError("there is no standard input")
         elif hasattr(sys.stdin, "buffer"):
             data = sys.stdin.buffer.read()
         else:  # a text stream an embedding caller set: its text is already decoded
             data = sys.stdin.read().encode("utf-8")
-        source = data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
-    except (OSError, UnicodeError, AttributeError) as exc:  # AttributeError: no stdin at all
+        source = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, UnicodeError) as exc:
         print(f"cannot read {label}: {exc}", file=sys.stderr)
         return 1
-    # A snippet of UTF-8 source can hold a character the console encoding (cp1252) cannot print;
-    # escape it rather than end the report in a traceback.
-    if isinstance(sys.stdout, io.TextIOWrapper):
-        sys.stdout.reconfigure(errors="backslashreplace")
 
     cost = price_script(source)
     if args.json:
-        print(json.dumps(to_json(cost, source, label), indent=2))
+        report = json.dumps(to_json(cost, source, label), indent=2)
     else:
-        print(render(cost, source, label))
+        report = render(cost, source, label)
+    # A snippet of UTF-8 source can hold a character the console encoding (cp1252) cannot print:
+    # escape it, for this report only, rather than end the report in a traceback.
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(report.encode(encoding, "backslashreplace").decode(encoding))
 
     return 1 if args.strict and cost.unknowns else 0
 

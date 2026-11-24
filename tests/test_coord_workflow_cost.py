@@ -1493,18 +1493,39 @@ def test_a_do_while_tail_is_not_a_second_loop(mod: ModuleType) -> None:
     assert cost.agents == 1, "the agent after the loop runs once and belongs in the floor"
 
 
-def test_a_compound_brace_less_body_is_never_a_known_width(mod: ModuleType) -> None:
-    """Where ASI cannot place the end, the widest reading is taken and the width is not trusted."""
-    cost = mod.price_script(
-        "for (const x of [1, 2])\n  if (c)\n    await agent('a')\nawait agent('b')\n"
-    )
-    assert not cost.exact
-    assert [u.kind for u in cost.unknowns] == ["loop"]
+@pytest.mark.parametrize(
+    ("source", "agents"),
+    [
+        # `if (c)`, a line break, then the branch: the next line after it runs once
+        ("for (const x of [1, 2])\n  if (c)\n    await agent('a')\nawait agent('b')\n", 3),
+        ("for (const r of [1, 2]) if (r) a(); else await agent('a');\nawait agent('b')\n", 3),
+        (
+            "for (const r of [1, 2, 3]) switch (r) { case 1: await agent('a'); break }\n"
+            "await agent('b')\nawait agent('c')\n",
+            5,
+        ),
+        ("for (const r of [1, 2]) try { await agent('a') } catch (e) {}\nawait agent('b')\n", 3),
+        (
+            "for (const x of [1, 2]) inner: for (const y of [1, 2, 3]) await agent('a')\n"
+            "await agent('b')\n",
+            7,
+        ),
+        # a `do` whose body is compound still ends at its own `while (...)`
+        ("do if (x) { a() } while (c)\nawait agent('b')\n", 1),
+        ("do try { a() } catch (e) {} while (c)\nawait agent('b')\n", 1),
+    ],
+)
+def test_a_compound_brace_less_body_is_read_to_its_end(
+    mod: ModuleType, source: str, agents: int
+) -> None:
+    """Each was a guess to the end of the file in round 1 of the fix; now each is read through."""
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, True), cost.unknowns
 
 
 # BACKLOG #7601: `--stdin` decoded in the locale encoding while a path decoded UTF-8, and an
 # undecodable file escaped as a UnicodeDecodeError traceback.
-_UTF8_SCRIPT = "const q = rows.map(agent) // Á\n".encode()
+_UTF8_SCRIPT = "const q = rows.map(agent) // \u00c1\n".encode()
 
 
 def _stdin(monkeypatch: pytest.MonkeyPatch, data: bytes) -> None:
@@ -1527,7 +1548,7 @@ def test_stdin_and_a_path_read_the_same_text(
     assert mod.main(["--stdin", "--json"]) == 0
     from_stdin = json.loads(capsys.readouterr().out)
     assert from_stdin["unpriced"] == from_path["unpriced"]
-    assert "Á" in from_stdin["unpriced"][0]["form"]
+    assert "\u00c1" in from_stdin["unpriced"][0]["form"]
 
 
 @pytest.mark.parametrize("route", ["path", "stdin"])
@@ -1576,7 +1597,7 @@ def test_a_do_while_condition_is_priced_per_iteration(mod: ModuleType) -> None:
 
 
 def test_an_unsettled_body_says_why_it_has_no_width(mod: ModuleType) -> None:
-    cost = mod.price_script("for (const x of [1, 2]) if (x) await agent('a')\n")
+    cost = mod.price_script("for (const x of [1, 2]) if (x) { await agent('a')\n")
     assert [u.form for u in cost.unknowns] == [
         "for loop, body extent not read, so no width is trusted"
     ]
@@ -1614,10 +1635,20 @@ def test_a_snippet_the_console_cannot_encode_is_escaped(
     mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "arrow.js"
-    path.write_bytes("const q = rows.map(agent) // → report\n".encode())
+    path.write_bytes("const q = rows.map(agent) // \u2192 report\n".encode())
     sink = io.BytesIO()
     console = io.TextIOWrapper(sink, encoding="cp1252")
     monkeypatch.setattr(sys, "stdout", console)
     assert mod.main([str(path)]) == 0
     console.flush()
     assert b"\\u2192" in sink.getvalue()
+
+
+def test_a_byte_order_mark_anywhere_is_whitespace(mod: ModuleType) -> None:
+    body = (
+        "function review(r) { return agent(r) }\nconst ROWS = [1, 2, 3]\n"
+        "await parallel(ROWS.map(r => () => review(r)))\n"
+    )
+    for source in ("\ufeff" + body, "await agent('a')\n\ufeff" + body):
+        cost = mod.price_script(source)
+        assert cost.exact and cost.agents == 3 + source.count("agent('a')")
