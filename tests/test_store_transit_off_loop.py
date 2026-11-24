@@ -427,3 +427,68 @@ async def test_the_open_refuses_a_transit_handover_tag_that_does_not_verify() ->
     await store_module.settle_audit_ranges(host, {}, "k-unheld", None, transit_id)  # type: ignore[arg-type]
     assert not host._audit_ranges_trusted
     assert host._audit_range_keys == ["k-unheld", transit_id]
+
+
+class _HmacThreadsTransit(_RecordingTransit):
+    """Records the thread of each ``generate_hmac`` alone: at the open the genesis check is a
+    ``verify_signed_data``, and a range row's handover-tag check is a ``generate_hmac``."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.hmac_threads: list[int] = []
+
+    def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+        self.hmac_threads.append(threading.get_ident())
+        return super().generate_hmac(**kw)
+
+
+async def test_a_real_open_checks_a_planted_transit_handover_tag_off_the_loop(
+    tmp_path: Path,
+) -> None:
+    """The store open itself, over a range row planted to close the Transit range (no roll writes
+    one), makes its handover-tag ``generate_hmac`` off the loop."""
+    import sqlite3
+
+    from messagefoundry.store.crypto import audit_key_id
+
+    transit = _HmacThreadsTransit()
+    cipher = TransitCipher(_FakeClient(transit), _KEY)
+    db = tmp_path / "t.db"
+    store = await MessageStore.open(db, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    try:
+        await store.record_audit("probe", actor="tester", detail="synthetic")
+    finally:
+        await store.close()
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute("SELECT * FROM audit_log ORDER BY seq")]
+        transit_id = store_module.AUDIT_TRANSIT_KEY_ID
+        closes = store_module.audit_range_closing(rows, key_id=transit_id, from_seq=1, prev_hash="")
+        local_id = audit_key_id(b"\x03" * 32)
+        detail = store_module.audit_epoch_detail(local_id, closes, (None, cipher.audit_mac_fn()))
+        con.execute(
+            "INSERT INTO audit_log (seq, ts, actor, action, detail, row_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                len(rows) + 1,
+                time.time(),
+                "tester",
+                store_module.AUDIT_KEY_EPOCH_ACTION,
+                detail,
+                "0" * 64,
+            ),
+        )
+        con.commit()
+    finally:
+        con.close()
+    transit.hmac_threads.clear()
+    store = await MessageStore.open(db, cipher=cipher, audit_mac_fn=cipher.audit_mac_fn())
+    try:
+        # The tag verified, so the open accepted the range the planted row opens.
+        assert store._audit_range_keys == [transit_id, local_id]
+        assert store._audit_ranges_trusted
+    finally:
+        await store.close()
+    assert transit.hmac_threads, "the open made no generate_hmac, so this test measured nothing"
+    assert threading.get_ident() not in transit.hmac_threads

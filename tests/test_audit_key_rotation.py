@@ -828,12 +828,11 @@ async def test_the_roll_refuses_when_the_head_moves_after_it_sealed(tmp_path: Pa
 async def test_the_roll_makes_its_handover_tag_through_cipher_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #3929: the roll makes the outgoing key's handover tag through ``cipher_call``, the
-    helper every audit MAC goes through, so a provider that blocks on I/O would run off the loop.
+    """BACKLOG #3929: the roll makes the outgoing key's handover tag through ``cipher_call``, as the
+    open makes its handover-tag check, so a provider that blocks on I/O would run off the loop.
 
-    The roll reaches that tag only under an in-heap key today: a store holding the Transit MAC has
-    the Transit key active, and the roll never closes a range under the active key. So this pins
-    the route only. It cannot tell which MAC provider the call is keyed on, since both are ``None``
+    The roll reaches that tag only under an in-heap key today (docs/CONNECTIONS.md, the Vault
+    Transit bulk-cipher row, says why). So this pins the route only. It cannot tell which MAC provider the call is keyed on, since both are ``None``
     here, and under an in-heap key ``cipher_call`` runs the call inline."""
     path = tmp_path / "r.db"
     a, b = generate_key(), generate_key()
