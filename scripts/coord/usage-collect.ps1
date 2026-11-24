@@ -448,11 +448,14 @@ try {
         $histPath = Join-Path $StateDir "history.jsonl"
         $prev = $null
         try { $prev = (Get-Content -LiteralPath $histPath -Tail 1 -ErrorAction SilentlyContinue | ConvertFrom-Json) } catch { }
-        # A last row stamped with another root is no row of this root's, so it does not suppress one. An
-        # unstamped or unset row counts as ours, as the reader's test does, so a flat repeat still adds
-        # nothing: a timed row would read as a measured rate of zero.
+        # A last row stamped with another root than the row this fire would write is no row of the same
+        # observer's, so it does not suppress one. Compared with the stamp written, never with the
+        # directory's root: a collector pinned to another root writes that root's stamp, so against the
+        # directory it read its own last row as foreign and appended on every fire. An unstamped or unset
+        # row counts as ours, as the reader's test does, so a flat repeat still adds nothing: a timed row
+        # would read as a measured rate of zero.
         $prevEnv = [string]$prev.config_root_env
-        $prevForeign = $prevEnv -and $prevEnv -ne "unset" -and $prevEnv -ine $ownRoot
+        $prevForeign = $prevEnv -and $prevEnv -ne "unset" -and $prevEnv -ine $stampEnv
         if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch -or $prevForeign) {
             # STAMPED WITH THE ROOT THAT OBSERVED IT, as the window is, so usage.ps1's rate can skip a row
             # another root's collector wrote here when it was wired to publish into this directory.

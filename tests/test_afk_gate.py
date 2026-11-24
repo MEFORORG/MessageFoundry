@@ -850,14 +850,16 @@ def test_a_burn_dated_after_now_with_no_reset_halts_and_names_the_clock(
     ("rows", "minutes_to_reset"),
     [
         pytest.param([(85, 55), (70, 80)], 60, id="span-ends-at-the-newest-row"),
+        pytest.param([(0.5, 79), (0.02, 80)], 240, id="one-tick-seconds-apart"),
         pytest.param([(1.5, 79), (0.1, 80)], 240, id="one-tick-just-over-the-minimum-span"),
     ],
 )
 def test_a_real_burn_halts_however_the_rows_lie(
     sb: Sandbox, tmp_path: Path, rows: list[tuple[float, int]], minutes_to_reset: int
 ) -> None:
-    """Both of these are main's HALT. A span run to now, and a minimum span that fell back to the level,
-    each read them as clear."""
+    """Each of these is main's HALT. A span run to now, and a minimum span that fell back to the level,
+    each read them as clear; a refused rate that reviewed instead of halting read the second as a
+    review (BACKLOG #5494)."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
@@ -873,15 +875,23 @@ def test_a_real_burn_halts_however_the_rows_lie(
 
 
 @pytest.mark.parametrize(
-    ("pct", "expected"),
-    [pytest.param(80, REVIEW, id="below-the-rung"), pytest.param(92, HALT, id="at-the-rung")],
+    ("pct", "expected", "want"),
+    [
+        pytest.param(80, HALT, "Projected to run out", id="below-the-rung"),
+        pytest.param(92, HALT, "Projected to run out", id="at-the-rung"),
+        # 1 tick in 0.8 min is 75 percent an hour on main's rate: from 10 percent that runs out in about
+        # 72 minutes, before the reset but past the rung's 60, so main cleared it. Refused, it reviews.
+        pytest.param(
+            10, REVIEW, "refused the burn rate on this reading", id="run-out-past-holdmin"
+        ),
+    ],
 )
-def test_a_tick_seconds_apart_never_reads_clear(
-    sb: Sandbox, tmp_path: Path, pct: int, expected: int
+def test_a_tick_seconds_apart_halts_as_on_main(
+    sb: Sandbox, tmp_path: Path, pct: int, expected: int, want: str
 ) -> None:
-    """BACKLOG #5494. A span under the minimum is mostly the rounding of the ages, so usage.ps1 refuses
-    the rate and reads the window UNKNOWN. Below the rung the gate reviews: it must not fall back to the
-    level, where 80 percent reads clear. At the rung the level still hits, as it does with no rate."""
+    """BACKLOG #5494. usage.ps1 refuses a rate from a span under the minimum, but main's rate over the
+    same rows still projects, so a run-out inside the rung halts as it did on main. Reviewing it instead
+    loosened the gate. Short of the rung, the refusal reviews rather than clears."""
     root = tmp_path / "config-root"
     root.mkdir()
     state = root / "mefor-usage"
@@ -889,11 +899,34 @@ def test_a_tick_seconds_apart_never_reads_clear(
     _wire(sb, root, tmp_path, env)
     resets = int(ago().timestamp()) + 240 * 60
     assert _fire(sb, state, {"used_percentage": pct, "resets_at": resets}, env).returncode == 0
-    _set_rows(state, [(ago(minutes=0.5), pct - 1), (ago(minutes=0.02), pct)], resets)
+    older = 0.9 if expected == REVIEW else 0.5
+    newer = 0.1 if expected == REVIEW else 0.02
+    _set_rows(state, [(ago(minutes=older), pct - 1), (ago(minutes=newer), pct)], resets)
     seed_vault(sb, calibrated("manager"))
     code, doc = _real_gate(sb, env)
-    want = "refused the burn rate" if expected == HALT else "no trustworthy burn rate"
     assert code == expected and want in why(doc), why(doc)
+
+
+def test_a_uniform_backward_clock_step_past_the_tolerance_halts_as_on_main(
+    sb: Sandbox, tmp_path: Path
+) -> None:
+    """BACKLOG #5494. 40 to 70 in 15 minutes, every row and the reading dated 10 and 25 minutes ahead by
+    a backward clock step. The span, a difference, is unchanged, and main halted on it. usage.ps1 sets
+    rows past its 5-minute tolerance aside and refuses the rate; main's rate over them still projects."""
+    root = tmp_path / "config-root"
+    root.mkdir()
+    state = root / "mefor-usage"
+    env = {"CLAUDE_CONFIG_DIR": str(root)}
+    _wire(sb, root, tmp_path, env)
+    resets = int(ago().timestamp()) + 14400
+    assert _fire(sb, state, {"used_percentage": 70, "resets_at": resets}, env).returncode == 0
+    published = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    published["seven_day"]["captured_at"] = ago(minutes=-25).isoformat().replace("+00:00", "Z")
+    (state / "latest.json").write_text(json.dumps(published), encoding="utf-8")
+    _set_rows(state, [(ago(minutes=-10), 40), (ago(minutes=-25), 70)], resets)
+    seed_vault(sb, calibrated("manager"))
+    code, doc = _real_gate(sb, env)
+    assert code == HALT and "Projected to run out" in why(doc), why(doc)
 
 
 def test_a_burn_row_dated_after_now_beside_a_fresh_reading_halts(

@@ -1043,8 +1043,17 @@ function Get-DecisionCostRung {
     # (BACKLOG #5494). The refusal means the rows show a move nothing could measure, so it cannot clear;
     # but at the rung it must still hit, as with no rate. usage.ps1 sets rate_refused on a fresh reading
     # only, so this does not grade a stale number.
-    if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused') -and [double]$pct -ge $lv.HoldAt) {
-        return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldAt)% with no rate, from $($lv.Source). usage.ps1 refused the burn rate, so the level is the backstop, and it is reached")
+    # With no reset, usage.ps1 keeps main's unguarded run-out on such a window, and the rung hits on it
+    # inside HoldMin as main's rate did, since a missing reset must not loosen the rung.
+    if ($weekState -eq 'UNKNOWN' -and $null -ne $pct -and (Get-DecisionJsonValue $week 'rate_refused')) {
+        $uRate = Get-DecisionJsonValue $week 'rate_pct_per_hr'
+        $uEmpty = Get-DecisionJsonValue $week 'minutes_to_empty'
+        if ($null -ne $uRate -and [double]$uRate -gt 0 -and $null -ne $uEmpty -and [double]$uEmpty -le $lv.HoldMin -and ($null -eq $toReset -or [double]$uEmpty -lt [double]$toReset)) {
+            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldMin) min to cutoff, from $($lv.Source). usage.ps1 refused the burn rate, but the history's unguarded rate projects a run-out in about $uEmpty min")
+        }
+        if ([double]$pct -ge $lv.HoldAt) {
+            return (New-DecisionRung 'HIT' "weekly at $pct%; rung $($lv.HoldAt)% with no rate, from $($lv.Source). usage.ps1 refused the burn rate, so the level is the backstop, and it is reached")
+        }
     }
     if ($null -eq $week -or $null -eq $pct -or $weekState -notin @('OK', 'WARN', 'CRITICAL')) {
         $why = [string](Get-DecisionJsonValue $week 'reason')
@@ -1069,6 +1078,18 @@ function Get-DecisionCostRung {
         New-DecisionRung 'HIT' "$at. No burn rate, so the level is the backstop, and it is reached"
     } else {
         New-DecisionRung 'OK' "$at. No burn rate; below the level backstop"
+    }
+    # A RATE usage.ps1 REFUSED CAN HIT AND CANNOT CLEAR (BACKLOG #5494). Its window reads CRITICAL only on
+    # main's unguarded rate, so a run-out inside HoldMin hits as on main; short of that the level backs it
+    # as with no rate, and below the level the answer is REVIEW, never OK.
+    $refused = [string](Get-DecisionJsonValue $week 'rate_refused')
+    if ($refused -and $rung.State -ne 'HIT') {
+        if ($pct -ge $lv.HoldAt) {
+            $rung = New-DecisionRung 'HIT' "$at. usage.ps1 refused the burn rate, so the level is the backstop, and it is reached"
+        }
+        else {
+            return (New-DecisionRung 'UNKNOWN' "$($rung.Reason); but usage.ps1 refused the burn rate on this reading: $refused")
+        }
     }
     # A HIT stands whatever the overall state: halting on a reading that may be another root's
     # costs a deferral, while dropping it to UNKNOWN would let a session at the ceiling act.

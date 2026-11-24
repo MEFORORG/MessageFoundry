@@ -1519,8 +1519,6 @@ def test_one_tick_is_a_rate_however_close_the_rows(
 @pytest.mark.parametrize(
     ("older", "newer"),
     [
-        pytest.param((0.5, 85.0), (0.02, 86.0), id="seconds-apart"),
-        pytest.param((0.2, 85.0), (0.1, 86.0), id="one-rounding-step"),
         pytest.param((0.1, 85.0), (0.1, 86.0), id="no-span"),
         pytest.param((0.5, 86.0), (0.1, 86.0), id="flat"),
     ],
@@ -1529,9 +1527,9 @@ def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
     tmp_path: Path, older: tuple[float, float], newer: tuple[float, float]
 ) -> None:
     """BACKLOG #5494. An age is rounded to a tenth of a minute, so a span of a step or two is mostly
-    rounding, and the rate divided by it spiked to hundreds of percent an hour. Refusing it must not fall
-    back to the level, which reads 86 percent as clear below the gate's rung: the rows show a move, so
-    the window is UNKNOWN."""
+    rounding. Where main's own rate over the rows projects nothing, as here with no span or no climb, the
+    refusal must not fall back to the level, which reads 86 percent as clear below the gate's rung: the
+    window is UNKNOWN."""
     epoch = int(time.time()) + 280000
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
     write_history(tmp_path, [older, newer], epoch)
@@ -1543,15 +1541,51 @@ def test_a_span_under_the_minimum_is_no_rate_and_reads_unknown(
     assert d["seven_day"]["reason"].startswith("86% used"), d
 
 
-def test_two_ticks_under_the_minimum_are_a_fast_burn_at_their_lower_bound(tmp_path: Path) -> None:
-    """84 to 86 in 0.6 minutes: whatever the rounding, at least one whole tick in at most a minute,
-    so at least 60 percent an hour. Refusing it turned a stop into a review."""
+@pytest.mark.parametrize(
+    ("older", "newer", "rate"),
+    [
+        pytest.param((0.5, 85.0), (0.02, 86.0), 125.0, id="seconds-apart"),
+        pytest.param((0.2, 85.0), (0.1, 86.0), 600.0, id="one-rounding-step"),
+    ],
+)
+def test_one_tick_under_the_minimum_keeps_mains_run_out(
+    tmp_path: Path, older: tuple[float, float], newer: tuple[float, float], rate: float
+) -> None:
+    """BACKLOG #5494. The guarded rate refuses one tick under a minute, but main read it as a fast burn
+    and graded it CRITICAL, which the gate halts on. A refusal that reads UNKNOWN turned that stop into a
+    review, so main's rate still projects, and the refusal stays named for the gate."""
+    epoch = int(time.time()) + 280000
+    publish(tmp_path, seven=86.0, seven_epoch=epoch)
+    write_history(tmp_path, [older, newer], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(rate, rel=0.2), d
+    assert "minimum" in d["seven_day"]["rate_refused"], d
+    assert "unguarded rate" in d["seven_day"]["reason"], d
+
+
+def test_two_ticks_under_the_minimum_are_never_calmer_than_main(tmp_path: Path) -> None:
+    """84 to 86 in 0.6 minutes. Its lower bound, one tick over a minute, is 60 percent an hour, but main
+    read 200, and a calmer rate than main's can clear a stop main made (BACKLOG #5494)."""
     epoch = int(time.time()) + 14400
     publish(tmp_path, seven=86.0, seven_epoch=epoch)
     write_history(tmp_path, [(0.8, 84.0), (0.5, 85.0), (0.2, 86.0)], epoch)
     code, d = read(tmp_path)
     assert code == CRITICAL, d
-    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(60.0, abs=0.5), d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(200.0, rel=0.1), d
+
+
+def test_a_uniform_clock_step_past_the_tolerance_keeps_mains_rate(tmp_path: Path) -> None:
+    """BACKLOG #5494. 40 to 70 over 15 minutes, both rows dated more than 5 minutes ahead by one
+    backward clock step. Set aside for their dates, they leave no rows and the rate is refused; main's
+    rate over their raw ages, whose difference the step leaves alone, still grades the run-out."""
+    epoch = int(time.time()) + 14400
+    publish(tmp_path, seven=70.0, seven_epoch=epoch)
+    write_history(tmp_path, [(-10.0, 40.0), (-25.0, 70.0)], epoch)
+    code, d = read(tmp_path)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(120.0, abs=2), d
+    assert "FUTURE" in d["seven_day"]["rate_refused"].upper(), d
 
 
 def test_a_span_under_the_minimum_at_the_ceiling_stays_critical(tmp_path: Path) -> None:
@@ -1631,8 +1665,10 @@ def test_with_no_reset_time_rows_across_a_reset_give_no_rate(
     )
     code, d = read(tmp_path)
     assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
-    assert d["seven_day"]["rate_pct_per_hr"] is None, d
     assert "reset" in d["seven_day"]["rate_refused"], d
+    # With no reset, main's unguarded rate stays on the window, so the gate still halts on a run-out
+    # inside its rung as main did; here it runs out past the rung, so it reviews.
+    assert d["seven_day"]["rate_pct_per_hr"] > 0, d
 
 
 def test_with_no_reset_time_rows_of_one_window_still_give_a_rate(tmp_path: Path) -> None:
@@ -1653,7 +1689,8 @@ def test_a_refused_rate_on_a_wired_root_blames_no_wiring(fake_home: Path) -> Non
     state = pin / "mefor-usage"
     epoch = int(time.time()) + 280000
     publish(state, seven=86.0, seven_epoch=epoch)
-    write_history(state, [(0.5, 85.0), (0.1, 86.0)], epoch)
+    # Flat, so main's rate projects nothing and the refusal reads UNKNOWN.
+    write_history(state, [(0.5, 86.0), (0.1, 86.0)], epoch)
     _, _, refused = reader(pin=pin, home=fake_home)
     assert "no trustworthy burn rate" in refused and "cannot tell them apart" not in refused, (
         refused
@@ -1697,6 +1734,84 @@ def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) ->
     code, d = read(state)
     assert code == CRITICAL, d
     assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(20.0, abs=1), d
+
+
+def _foreign_rows(state: Path, root: Path, count: int, pct: float, epoch: int) -> None:
+    """Append ``count`` rows stamped with another root, each well inside the rate window."""
+    other = str(root.parent / "other-root")
+    with (state / "history.jsonl").open("a", encoding="utf-8") as f:
+        for i in range(count):
+            row = {"at": _minutes_ago(1.0 - i / (count + 1)), "seven_day": pct}
+            f.write(json.dumps({**row, "seven_reset": epoch, "config_root_env": other}) + "\n")
+
+
+def test_four_hundred_foreign_rows_do_not_hide_this_roots_burn(tmp_path: Path) -> None:
+    """BACKLOG #5494. 40 to 84 in 25 minutes is this root's run-out. 450 flat rows of another root's,
+    written after it, filled the 400-line read; skipped, they left no rate, and 84 percent read on the
+    level alone, clear below the gate's rung. The read widens past them to this root's rows."""
+    root = tmp_path / "root"
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 280000
+    publish(state, seven=84.0, seven_epoch=epoch)
+    _stamp(state, root)
+    write_history(state, [(27.0, 40.0), (2.0, 84.0)], epoch)
+    _foreign_rows(state, root, 450, 10.0, epoch)
+    code, d = read(state)
+    assert code == CRITICAL and d["seven_day"]["state"] == "CRITICAL", d
+    assert d["seven_day"]["rate_pct_per_hr"] == pytest.approx(105.6, abs=2), d
+
+
+def test_foreign_rows_past_the_read_bound_refuse_the_rate(tmp_path: Path) -> None:
+    """Past the widest read, foreign rows still fill it and this root's rows are not reached. That is no
+    measurement, so it is refused rather than read as no rate, which would let the level clear it."""
+    root = tmp_path / "root"
+    state = root / "mefor-usage"
+    epoch = int(time.time()) + 280000
+    publish(state, seven=84.0, seven_epoch=epoch)
+    _stamp(state, root)
+    write_history(state, [(27.0, 40.0), (2.0, 84.0)], epoch)
+    _foreign_rows(state, root, 6500, 10.0, epoch)
+    code, d = read(state)
+    assert code == UNKNOWN and d["seven_day"]["state"] == "UNKNOWN", d
+    assert "another root" in d["seven_day"]["rate_refused"], d
+    assert d["seven_day"]["rate_pct_per_hr"] is None, d
+
+
+def test_a_collector_pinned_to_another_root_appends_once_for_one_reading(tmp_path: Path) -> None:
+    """BACKLOG #5494. A collector pinned to another root stamps its rows with that root. Comparing its
+    last row with the directory's root read its own row as foreign, so every fire with an unchanged
+    reading appended another, a flat series the rate reads as a measured zero."""
+    state = tmp_path / "root" / "mefor-usage"
+    epoch = int(time.time()) + 280000
+    payload = {
+        "session_id": "A",
+        "rate_limits": {"seven_day": {"used_percentage": 42.0, "resets_at": epoch}},
+    }
+    (tmp_path / "other-root").mkdir()
+    (tmp_path / "root").mkdir()
+    env = _env(tmp_path / "other-root")
+    for _ in range(3):
+        proc = run_single(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(COLLECT),
+                "-StateDir",
+                str(state),
+            ],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=False,
+            env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+    rows = history(state)
+    assert len(rows) == 1, rows
+    assert rows[0]["config_root_env"] not in ("unset", ""), rows
 
 
 def test_a_fast_burn_is_a_rate(tmp_path: Path) -> None:

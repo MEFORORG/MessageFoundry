@@ -345,15 +345,15 @@ def test_a_floor_dated_after_now_says_the_clock_looks_wrong(tmp_path: Path) -> N
 def test_a_fresh_reading_whose_rate_was_refused_shows_its_number_and_no_stale_notes(
     tmp_path: Path,
 ) -> None:
-    """BACKLOG #5494. usage.ps1 refuses a rate from rows a few seconds apart and reads the window
-    UNKNOWN, but the reading is fresh: the number is printed, and the notes for a stale or unrefreshable
-    reading are not."""
+    """BACKLOG #5494. usage.ps1 refuses a rate from rows a few seconds apart and, where main's rate over
+    them projects nothing, as with these flat rows, reads the window UNKNOWN. The reading is fresh: the
+    number is printed, and the notes for a stale or unrefreshable reading are not."""
     state = tmp_path / "s"
     collect(state, reading(86.0))
     epoch = json.loads((state / "latest.json").read_text(encoding="utf-8"))["seven_day"][
         "resets_at_epoch"
     ]
-    rows = [(0.5, 85.0), (0.1, 86.0)]
+    rows = [(0.5, 86.0), (0.1, 86.0)]
     (state / "history.jsonl").write_text(
         "".join(
             json.dumps(
