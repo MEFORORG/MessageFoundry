@@ -57,7 +57,10 @@ from messagefoundry.secretscrub import (
     _BEARER_TAILS,
     _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
+    _FOLD_GATE,
+    _KEY_GLUED_BRANCH,
     _KV_TAILS,
+    _MEFOR_GLUED_BRANCH,
     _MEFOR_TAILS,
     _SHIPPED_TAILS,
     _braced_tail,
@@ -207,13 +210,9 @@ _NOT_BEFORE_QUOTED_LABEL = (
 # The same checks in front of a separator outside ASCII, so a keyword spelled with a fold character
 # for its first letter stops a plain value here as it does in ``messagefoundry/secretscrub.py``
 # (BACKLOG #3114 step 4); why is stated once, on the same fragments there.
-_FOLD_AT = r"(?:(?=[\x00-\x7f])|" + _NOT_AT_QUOTED_LABEL + r")"
-_FOLD_BEFORE = r"(?:(?=[\x00-\x7f])|" + _NOT_BEFORE_QUOTED_LABEL + r")"
-# A braced value holding white space with lower case text glued after its closer, taken whole by
-# ``_MEFOR_SECRET`` and ``_KEY_MATERIAL`` (BACKLOG #2966 steps 1 and 2); why so narrow is stated once,
-# on the same fragments in ``messagefoundry/secretscrub.py``.
-_SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+[^\S\r\n](?:[^{}'\"\r\n;&]|\}\})*+\}(?!\})"
-_GLUED_END = r"(?<!bearer)(?<!basic)(?<!digest)(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+# The gate is secretscrub's object, imported; the label checks behind it are this copy's own.
+_FOLD_AT = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_AT_QUOTED_LABEL + r")"
+_FOLD_BEFORE = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_BEFORE_QUOTED_LABEL + r")"
 
 
 # ``_CREDENTIAL_KV``'s quoted value: the plain quoted form, except where the quote that would close it
@@ -405,10 +404,7 @@ _MEFOR_SECRET = re.compile(
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])|"
-    + _SPACED_GUARDED_BRACED
-    + r"[a-z;,&]++"
-    + rf"(?![^{_PLAIN_TERMINATORS}])"
-    + _GLUED_END
+    + _MEFOR_GLUED_BRANCH
     # A non-empty quoted value with no space in it, closer and all: the span the old plain class took.
     + r"|(?="
     + _GUARDED_QUOTED_VALUE
@@ -448,8 +444,9 @@ _MEFOR_SECRET = re.compile(
 # that keeps it from printing anything its plain class used to hide. ``_MEFOR_SECRET`` and
 # ``_KEY_MATERIAL`` take a quoted value whole, and a braced one whole when the closing "}" ends the
 # value: without that guard ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc". A braced value
-# holding white space is also taken with narrow lower case text glued after its closer
-# (``_SPACED_GUARDED_BRACED``, BACKLOG #2966 steps 1 and 2). ``_BEARER`` takes a
+# holding a space is also taken with lower case text glued after its closer, in one narrow shape
+# (secretscrub's ``_MEFOR_GLUED_BRANCH`` and ``_KEY_GLUED_BRANCH``, imported; BACKLOG #2966 steps 1
+# and 2). ``_BEARER`` takes a
 # quoted value and no braced one, because ``session=`` and ``token=`` carry dict and JSON reprs in this
 # engine's log text. Anything a guarded form refuses -- an unclosed quote, a closer that may belong to
 # a later label -- falls back to the plain class, which carries the stop and is otherwise the old one.
@@ -554,10 +551,7 @@ _KEY_MATERIAL = re.compile(
     + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
-    + _SPACED_GUARDED_BRACED
-    + r"(?-i:[a-z,])++"
-    + rf"(?![^{_KEY_TERMINATORS}])"
-    + _GLUED_END
+    + _KEY_GLUED_BRANCH
     + r"|"
     + _GUARDED_QUOTED_VALUE
     + r"|"

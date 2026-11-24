@@ -583,7 +583,10 @@ _ODBC_BRACED_OVERRUN = r"\{[^\r\n]*"
 # and for the same reason no lookbehind is needed in front of the keyword. Per unit is cheaper than
 # per character, but not by much on a hyphen-and-dot run, where every run is one character long. What
 # keeps ordinary lines level is the fast path at ``_NO_QUOTED_LABEL_AFTER``, which skips the walk
-# entirely.
+# entirely. Since BACKLOG #3114 step 4 a walk also checks in front of a fold letter it reads as a
+# separator, after a character that is not an ASCII letter or digit (:data:`_FOLD_BEFORE`): that is
+# where a unit of the ASCII spelling would start, so the two still agree, and it adds at most one
+# check per such letter.
 #
 # THE MEFOR_ BRANCH KEEPS THE ``\b`` ITS OWN PATTERN HAS, and so does the prefix branch. That is a cost
 # decision. ``\b`` cannot fire inside a word, so a long MEFOR_MEFOR_... or a_a_a_... run offers one
@@ -730,28 +733,50 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # The guard above refuses a closer that does not end the value, and the plain class then stopped at the
 # first white space inside the braces, so ``MEFOR_X={pp ww}x rest`` printed " ww}x rest" and
 # ``private_key={pp ww},rest`` printed " ww},rest". ``_MEFOR_SECRET`` and ``_KEY_MATERIAL`` now take
-# such a value, closer and glued text, when the glued text is only lower case ASCII letters and the
-# separators that pattern's plain class runs over (";", "," and "&" for ``_MEFOR_SECRET``, "," for
-# ``_KEY_MATERIAL``), up to a character that class stops at. Anything else falls back to the plain
-# class, as before.
+# such a value, closer and glued text, in one narrow shape (:data:`_MEFOR_GLUED_BRANCH`,
+# :data:`_KEY_GLUED_BRANCH`). Every other shape falls back to the plain class and prints as before.
 #
-# WHY SO NARROW. What the old class left printing, from the space in the braces to the end of the
-# glued text, was still read by every later pass, and a pass that starts there and runs past the glued
-# text hid something this run would now take away from it. So the glued text holds no ":" or "=" (a
-# label, a ``://`` a DSN pass reads), no capital and no digit (a name run or a date the PHI pass reads
-# across the next space), no "-" (a ``-----BEGIN`` marker), and no "." or "/". It may not end in a
-# scheme word, as ``;bearer tok``, which ``_AUTH_SCHEME`` reads past the space, and it may not be
-# followed by white space and a ":", "=" or quote, as ``;password = v``, or by a quote at all.
-# The braces must hold white space, because without it the plain class already ran on past the closer,
-# and no ";", "&" or "{": the connection-string member pass reads a ``;pwd=`` member and masks its
-# value up to the next ";", across white space, so taking a ``;pwd=vq1 a}b`` in the braces took away
-# the member that hid what followed the glued text. Measured with synthetic values, by a differential
-# against ``origin/main`` over about 240,000 generated lines through ``scrub_credentials`` and
-# ``support.redact.redact_log_line``: with ";" allowed in the braces, five lines printed a value
-# ``origin/main`` hid on each surface; without it, none did on that corpus. That is a sample, not a
-# proof.
-_SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+[^\S\r\n](?:[^{}'\"\r\n;&]|\}\})*+\}(?!\})"
-_GLUED_END = r"(?<!bearer)(?<!basic)(?<!digest)(?!\s*+[:='\"]|\s++(?i:bearer|basic|digest)\s)"
+# WHAT THE OLD CLASS LEFT, from the space in the braces to the end of the glued text, was still read by
+# every later pass, here and in the support bundle's PHI pass. A pass that starts there and reads on,
+# across the next space or to the end of the line, hid text that this branch would take its anchor
+# away from. So the shape is an ALLOWLIST, as :data:`_SPACED_BRACED_TAIL` is, and each condition is a
+# measured or reviewed reason:
+#
+# * Before the braces' first white space, anything the guarded braced form takes except ";", "&" and
+#   "{". The old class took that head too, so no later pass read it either way. ";" is refused because
+#   the connection-string member pass reads a ``;pwd=`` member there and masks its value up to the
+#   next ";", across white space: a differential against ``origin/main`` printed five values with ";"
+#   allowed.
+# * The first white space is a plain space, U+0020. A line separator such as U+2028 would be deleted,
+#   joining two lines of a multi-line record.
+# * After it, up to the closer, and in the glued text after the closer, only lower case ASCII letters,
+#   with spaces in the braces and the separators that pattern's plain class runs over in the glued
+#   text (";", "," and "&" for ``_MEFOR_SECRET``, "," for ``_KEY_MATERIAL``). That refuses at least a
+#   capital, a digit, "|", "(", ":", "=", "-", "." and "/": an HL7 segment ID, a DICOM tag, a
+#   ``PatientName=`` label, a name run or a date the PHI pass reads to the end of the line or across
+#   the next space, a ``://`` or a ``-----BEGIN`` marker. Found by code review on this change, with
+#   ``MEFOR_X={pp PID|x}x rest vq9`` printing "rest vq9" in the bundle.
+# * No word a later pass reads, anywhere in those letters: :data:`_GLUED_REFUSED_WORDS`, which
+#   ``mrn`` and the scheme words are in. ``MEFOR_X={pp ww}mrn 12345`` printed "12345" in the bundle
+#   without it, found by the same review.
+# * The glued text ends where the plain class stops, and is not followed by white space and a ":",
+#   "=" or quote, or by a quote, which is :data:`_NO_QUOTED_LABEL_AFTER`: ``;password = v`` keeps its
+#   label.
+#
+# These are the readings found so far, not a proof that no later pass reads anything else in such
+# text. ``tests/test_secretscrub_braced_glued_fold.py`` compares both surfaces with and without the
+# branch over a seeded corpus that holds the anchors above, with a widened branch as its positive
+# control.
+#: Every word a later pass reads that lower case ASCII letters can spell: :data:`_MEMBER_KEEP_WORDS`
+#: reduced by subsumption, and with its entries holding "_", "-" or a digit left out, since no such
+#: text holds one. ``tests/test_secretscrub_braced_glued_fold.py`` holds it to that tuple.
+_GLUED_REFUSED_WORDS = (
+    r"(?:pass|pwd|secret|credential|auth|bearer|token|session|key|sig|jwt|code|state|basic|digest"
+    r"|mrn|name|address|family|given|birthdate|identifier|telecom|patient|medicalrecordlocator"
+    r"|responsibleperson)"
+)
+_GLUED_LOWER = r"(?!" + _GLUED_REFUSED_WORDS + r")(?-i:[a-z])"
+_SPACED_GUARDED_BRACED = r"\{(?:[^{}'\"\s;&]|\}\})*+ (?: |" + _GLUED_LOWER + r")*+\}(?!\})"
 
 #: One unit of a value walk: a run of letters and digits, SPLIT AT EVERY CAMELCASE BOUNDARY, a capital
 #: after a lower-case letter or a digit (BACKLOG #5545). The walks below check for a later label in
@@ -926,9 +951,15 @@ _NOT_BEFORE_QUOTED_LABEL = (
 #: spelled that way, then ``={pp ww}``, printed " ww}" where the ASCII spelling prints " xx}". Under a
 #: global ``(?i)`` the run class already takes those letters and the separator class never sees them,
 #: so this changes only ``_MEFOR_SECRET`` here and the patterns without a global fold in
-#: ``support/redact.py``. An ASCII separator is not checked, as before.
-_FOLD_AT = r"(?:(?=[\x00-\x7f])|" + _NOT_AT_QUOTED_LABEL + r")"
-_FOLD_BEFORE = r"(?:(?=[\x00-\x7f])|" + _NOT_BEFORE_QUOTED_LABEL + r")"
+#: ``support/redact.py``. The check runs only in front of one of the four :data:`_GATE_FOLDS`
+#: letters, the characters ``(?i)`` reads as an ASCII letter, and only where no ASCII letter or digit
+#: is right before it, which is where a unit of the ASCII spelling starts after a separator. So the
+#: stop lands there as it does for the ASCII spelling, and every other separator is read as before,
+#: unchecked.
+#: ``tests/test_secretscrub_braced_glued_fold.py`` holds the class to :data:`_GATE_FOLDS`.
+_FOLD_GATE = r"(?<![A-Za-z0-9])(?=[İıſK])"
+_FOLD_AT = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_AT_QUOTED_LABEL + r")"
+_FOLD_BEFORE = r"(?:(?!" + _FOLD_GATE + r")|" + _NOT_BEFORE_QUOTED_LABEL + r")"
 
 
 #: A label of any family up to where its value starts, for :data:`_KV_QUOTED_VALUE`. Unlike
@@ -1049,6 +1080,25 @@ _PLAIN_SCHEME_VALUE = (
     rf"|(?:(?:{_NOT_AT_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_AT}[^A-Za-z0-9{_SCHEME_TERMINATORS}])"
     rf"(?:{_NOT_BEFORE_QUOTED_LABEL}{_RUN_UNIT}|{_FOLD_BEFORE}[^A-Za-z0-9{_SCHEME_TERMINATORS}])*+"
     rf"|(?={_BRACED_LABEL}))(?:{_BRACED_RUN_ON})?+)"
+)
+
+#: The branches :data:`_SPACED_GUARDED_BRACED` says why: a braced value holding a space, then glued
+#: text up to where the pattern's plain class stops, with no label after it.
+_MEFOR_GLUED_BRANCH = (
+    _SPACED_GUARDED_BRACED
+    + r"(?:[;,&]|"
+    + _GLUED_LOWER
+    + r")++"
+    + rf"(?![^{_PLAIN_TERMINATORS}])"
+    + _NO_QUOTED_LABEL_AFTER
+)
+_KEY_GLUED_BRANCH = (
+    _SPACED_GUARDED_BRACED
+    + r"(?:,|"
+    + _GLUED_LOWER
+    + r")++"
+    + rf"(?![^{_KEY_TERMINATORS}])"
+    + _NO_QUOTED_LABEL_AFTER
 )
 
 
@@ -1371,8 +1421,8 @@ _AUTH_SCHEME = re.compile(
 # -- which an unquoted form misses entirely.
 #
 # A quoted value is taken whole, and so is a braced one when its closer ends the value; the guard is
-# on ``_CREDENTIAL_KV``'s residuals. A braced value holding white space is also taken with lower case
-# text glued after its closer, within the limits stated on :data:`_SPACED_GUARDED_BRACED`.
+# on ``_CREDENTIAL_KV``'s residuals. A braced value holding a space is also taken with lower case
+# text glued after its closer, in the one shape :data:`_SPACED_GUARDED_BRACED` states.
 #
 # A BRACED VALUE WITH NO SPACE IN IT TAKES ONE QUOTE AFTER ITS CLOSER, as the old plain class's
 # trailing ``['\"]?`` did. Without it ``password='vq0 MEFOR_X={vq1}' vq2'`` printed " vq2'": the old
@@ -1392,10 +1442,7 @@ _MEFOR_SECRET = re.compile(
     + r"['\"]?|"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_PLAIN_TERMINATORS}])|"
-    + _SPACED_GUARDED_BRACED
-    + r"[a-z;,&]++"
-    + rf"(?![^{_PLAIN_TERMINATORS}])"
-    + _GLUED_END
+    + _MEFOR_GLUED_BRANCH
     # A quoted value with no space in it and at least one character, closer and all. With the braced
     # branch above, it takes exactly the span the old plain class and its trailing quote took, so later
     # passes see the same text they always did, wherever the old pattern matched this label at all.
@@ -1426,11 +1473,13 @@ _MEFOR_SECRET = re.compile(
 #   Without that guard, ``MEFOR_X={a}bc`` would redact ``{a}`` and print "bc", which the plain class
 #   used to hide. Both forms are the GUARDED ones. A value either refuses falls back to the plain
 #   class, which now carries the stop before a quoted label and is otherwise the old class. Since
-#   BACKLOG #2966 steps 1 and 2, a braced value holding white space is also taken with text glued
-#   after its closer when that text is narrow enough (:data:`_SPACED_GUARDED_BRACED`), so
-#   ``MEFOR_X={pp ww}x rest`` and ``private_key={pp ww},rest`` no longer print the braced tail. A
-#   glued text holding a capital, a digit, ":", "=", "-", "." or "/", or a braced value holding ";",
-#   "&" or "{", still falls back to the plain class and prints the tail as before.
+#   BACKLOG #2966 steps 1 and 2, a braced value holding a space is also taken with text glued after
+#   its closer in one narrow shape (:data:`_SPACED_GUARDED_BRACED`), so ``MEFOR_X={pp ww}x rest`` and
+#   ``private_key={pp ww},rest`` no longer print the braced tail. Every shape outside it still falls
+#   back to the plain class and prints the tail as before: at least a tail or glued text holding a
+#   capital, a digit, punctuation other than the glued separators, a non-ASCII character or a word a
+#   later pass reads, glued text followed by a quote or by a label, and braces holding ";", "&", "{",
+#   a quote or a line break.
 # * ``_BEARER`` takes a quoted value and NOT a braced one. ``session=`` and ``token=`` legitimately
 #   carry a "{"-opening dict or JSON repr in this engine's log text, and taking braces would change
 #   those lines for no credential.
@@ -1518,10 +1567,7 @@ _KEY_MATERIAL = re.compile(
     + r"(?:"
     + _GUARDED_BRACED_VALUE
     + rf"(?![^{_KEY_TERMINATORS}])|"
-    + _SPACED_GUARDED_BRACED
-    + r"(?-i:[a-z,])++"
-    + rf"(?![^{_KEY_TERMINATORS}])"
-    + _GLUED_END
+    + _KEY_GLUED_BRANCH
     + r"|"
     + _GUARDED_QUOTED_VALUE
     + r"|"
