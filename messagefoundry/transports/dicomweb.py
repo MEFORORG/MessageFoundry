@@ -16,7 +16,9 @@ It needs **no** ``pydicom``: the object rides as bytes, so DICOMweb works withou
 (:func:`_data_set_instance_uid`), both read before the POST (:func:`_read_sent_uids`; BACKLOG
 #5914). An installed ``pydicom`` that does not load, or whose read of the object raises, is taken
 as reading no data set UID, with one WARNING per process for each of the two, so the object is
-still sent as with no ``pydicom``. :func:`_data_set_instance_uid` says which faults do what.
+still sent. A read that raises a fault the codec does not wrap, on an object with no File Meta UID,
+lets a 202 naming any UID confirm it (:func:`_unconfirmed_202`). :func:`_data_set_instance_uid` says
+which faults do what.
 
 **STOW-RS layer (on top of REST):**
 - The outgoing object is a **binary** DICOM Part-10 body, base64-carried through the str/store substrate
@@ -126,8 +128,8 @@ _DICOM_PART_TYPE = "application/dicom"
 _DICOM_JSON = "application/dicom+json"
 # DICOM Tag (group,element) for the STOW-RS FailedSOPSequence in the dicom+json response (DICOM PS3.18).
 _FAILED_SOP_SEQUENCE = "00081198"
-# ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914);
-# see _named_uid and _sent_instance_uid.
+# ReferencedSOPSequence: the instances the server stored. A 202 must name the instance sent (#5914),
+# except as _unconfirmed_202 says; see _named_uid and _sent_instance_uid.
 _REFERENCED_SOP_SEQUENCE = "00081199"
 _REFERENCED_SOP_INSTANCE_UID = "00081155"
 # PS3.10 section 7.1: a 128-byte preamble, then "DICM", then the File Meta group in Explicit VR
@@ -144,13 +146,15 @@ _SHORT_FORM_VRS = frozenset({
 # The File Meta group read is bounded by this many bytes after "DICM": a conformant group is a few
 # hundred bytes, so the cap refuses only a broken or hostile object (BACKLOG #5914).
 _FILE_META_CAP = 64 * 1024
-# Why the object sent has no File Meta UID to compare: fixed text, never a value (PHI-safe).
+# Why the object sent has no File Meta UID to compare: fixed text, never a value (PHI-safe). Lower
+# case, so the PHI name-run redaction leaves them whole, and short, so the stored dead letter's
+# 200-character cut keeps the whole of the unconfirmed-202 reason they end (_unconfirmed_202).
 _META_NO_MAGIC = "no Part-10 preamble and DICM magic"
-_META_NO_0003 = "no (0002,0003) in the File Meta group"
+_META_NO_0003 = "no (0002,0003) in the file meta group"
 _META_WRONG_VR = "a (0002,0003) whose VR is not UI"
 _META_NOT_A_UID = "a (0002,0003) value that is not a UID"
-_META_OVERRUN = "a File Meta element that runs past the end of the object"
-_META_TOO_LONG = "a File Meta group longer than the reader reads"
+_META_OVERRUN = "a file meta element past the object end"
+_META_TOO_LONG = "a file meta group past the read cap"
 # PS3.18 Annex F: the only keys a sequence (SQ) or UID (UI) element may carry. BulkDataURI and
 # InlineBinary are never allowed on SQ or UI, so an element read here carrying any other key is
 # malformed and fails closed -- an allow-list, so a misspelt "value" cannot read as an empty
@@ -593,9 +597,10 @@ def _read_sent_uids(obj: bytes) -> _SentUids:
     """Both comparable UIDs of the object sent: the File Meta one by hand
     (:func:`_sent_instance_uid`) and the data set one with the codec
     (:func:`_data_set_instance_uid`). Called before the POST, as the SCU parses before it
-    associates (BACKLOG #5914). A :class:`MemoryError` from the codec's read is raised; any other
-    fault there reads as no data set UID, and the object is still sent. A fault in finding the
-    extra (:func:`_dicom_extra_installed`) other than a :class:`ValueError` is not caught."""
+    associates (BACKLOG #5914). At least a :class:`MemoryError` from loading the extra or from the
+    codec's read, a :class:`BaseException` that is not an :class:`Exception`, and a fault in finding
+    the extra (:func:`_dicom_extra_installed`) other than a :class:`ValueError` are not caught; any
+    other fault in the read reads as no data set UID, and the object is still sent."""
     meta, cause = _sent_instance_uid(obj)
     data_set, read_fault = _data_set_instance_uid(obj)
     return _SentUids(meta, cause, data_set, read_fault)
@@ -639,8 +644,8 @@ def _stowrs_refusal(body: str, status: int, sent: _SentUids) -> tuple[str, str] 
       UID or its data set SOP Instance UID. An empty 202 is one. When ``sent`` has neither UID
       there is nothing to compare, so a 202 not refused above is one whatever its reply names,
       with a reason naming why (BACKLOG #5914, decisions of 2026-11-23), except where the data
-      set read raised a fault (``read_fault``): then an item naming any UID confirms it, as on
-      origin/main (Manager decision of 2026-11-24).
+      set read raised a fault the codec does not wrap (``read_fault``): then an item naming any UID
+      confirms it, as before BACKLOG #5914 (Manager decision of 2026-11-24).
 
     An empty reply (:func:`_reply_is_empty`) on any other 2xx is not refused. A 200 is not held to
     the ReferencedSOPSequence rule and is not compared with ``sent`` (BACKLOG #5914 ruling), so a 200
@@ -680,20 +685,15 @@ def _unconfirmed_202(referenced: list[Any], sent: _SentUids) -> tuple[str, str] 
     here parses the object. With neither UID to compare, the reason names why the File Meta has
     none (BACKLOG #5914). The exception is an object with no File Meta UID whose data set read
     raised a fault the codec does not wrap (``read_fault``): nothing can be compared, so a 202 is
-    confirmed as origin/main confirms it, by an item that names any UID."""
+    confirmed as before BACKLOG #5914, by an item that names any UID."""
     named = {uid for uid in map(_named_uid, referenced) if uid is not None}
     if any(uid in named for uid in (sent.meta, sent.data_set)):
         return None
     if sent.meta is None and sent.read_fault and named:
         return None
     if sent.meta is None and sent.data_set is None:
-        return (
-            "unconfirmed-202",
-            f"no SOP Instance UID of the instance sent to compare: {sent.cause}, and no data set SOP "
-            "Instance UID (0008,0018) read; a replay of the same object cannot confirm it on a "
-            f"202 unless the [dicom] extra then reads its data set UID, or reading it raises; "
-            f"{_NOT_SENT}",
-        )
+        # The replay advice goes before the cause, so the stored text's 200-character cut keeps it.
+        return "unconfirmed-202", f"no UID to compare; {_NOT_SENT}; the object has {sent.cause}"
     return "unconfirmed-202", f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}"
 
 

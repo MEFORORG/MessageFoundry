@@ -1,10 +1,10 @@
-- **A DICOMweb STOW-RS 202 is now confirmed by the instance that was sent, not by any instance.**
+- **A DICOMweb STOW-RS 202 is now confirmed by the instance that was sent, not by any instance, except where nothing can be compared after a data set read fault.**
   The ReferencedSOPInstanceUID the reply names is compared with the Media Storage SOP Instance UID
   (0002,0003) in the File Meta group of the object sent, read without `pydicom`, and, with the
   `[dicom]` extra installed, with the data set's SOP Instance UID (0008,0018). A 202 that the
   earlier reply rules do not refuse, and that names neither, or that is for an object with neither
   UID to compare, is a permanent refusal (`unconfirmed-202`), not a delivery, except as below
-  where the data set read raised; the reason names why the File Meta has no UID. Both UIDs are read before the POST, whatever the partner then answers.
+  where the data set read raised a fault the codec does not wrap; the reason names why the File Meta has no UID. Both UIDs are read before the POST, whatever the partner then answers.
   An object the codec cannot parse is still sent, and so is one whose read raised a fault of a
   class the codec takes as a parse failure, even from a broken extra. An installed extra that does
   not load is taken as absent, so only the File Meta UID is compared, and one WARNING per process

@@ -32,6 +32,7 @@ from messagefoundry.config.wiring import DICOMweb
 from messagefoundry.parsing import RawMessage
 from messagefoundry.parsing.dicom.errors import DicomPeekError
 from messagefoundry.parsing.dicom.peek import DicomPeek
+from messagefoundry.redaction import safe_exc
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
@@ -724,11 +725,11 @@ _NO_FILE_META = [
 ]
 # The cause each no-comparable-UID refusal names (BACKLOG #5914, round 3 review finding 4).
 _NO_MAGIC = "no Part-10 preamble and DICM magic"
-_NO_0003 = "no (0002,0003) in the File Meta group"
+_NO_0003 = "no (0002,0003) in the file meta group"
 _WRONG_VR = "a (0002,0003) whose VR is not UI"
 _NOT_A_UID = "a (0002,0003) value that is not a UID"
-_OVERRUN = "a File Meta element that runs past the end of the object"
-_TOO_LONG = "a File Meta group longer than the reader reads"
+_OVERRUN = "a file meta element past the object end"
+_TOO_LONG = "a file meta group past the read cap"
 _FILE_META_CAP = 64 * 1024  # the reader's fixed cap on the File Meta group, in bytes
 
 
@@ -856,11 +857,14 @@ async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
     # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
     text = str(exc.value)
     assert cause in text
-    # The data set is read before the POST, whatever the reply names, and has no UID.
-    assert "a replay of the same object cannot confirm it on a 202 unless" in text
     assert "refused again" not in text
     assert "before a replay" in text
     assert SENT_UID not in text
+    # What the dead letter stores is safe_exc's redacted, 200-character text, not str(): the
+    # cause and the replay advice must both survive it (PR 3243 delta review).
+    stored = safe_exc(exc.value)
+    assert cause in stored
+    assert "before a replay" in stored
 
 
 def _pydicom_part10(meta_uid: str, dataset_uid: str) -> bytes:
