@@ -8430,8 +8430,12 @@ class ServiceSettings(_InputHidingModel):
             )
         raise ValueError(
             f"[cluster] on [store].backend = 'sqlserver': {cause}, which reaches the demotion"
-            f" detection margin ({margin:g} s). So a renew issued just before this node self-fences"
-            f" could still land and re-extend the lease it is standing down from. {remedy}"
+            f" detection margin ({margin:g} s). From a 2 s clamp up the claim's pool wait and"
+            " statement share one deadline, so this count over-states them, but it is kept as the"
+            " headroom for what that deadline does not cover: under 2 s the statement can overrun"
+            " the clamp by up to 1 s, and at least the claim's cursor creation and its COMMIT run"
+            " outside that deadline, with nothing known to bound them. A renew issued just before"
+            f" this node self-fences can still commit late. {remedy}"
         )
 
     def sqlserver_renew_bound_warning(self) -> str | None:
