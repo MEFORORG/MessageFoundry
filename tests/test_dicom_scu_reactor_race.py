@@ -10,8 +10,8 @@ The ``gated`` fixture below orders each step of that interleaving on threading e
 sleep-based version only made it likely. That version lost the race on a loaded CI runner and
 failed its control. The gate's one time-based step is a 1 ms poll for the response to reach the
 queue. Each wait the gate adds is bounded, and a bound that runs out is a recorded fault the tests
-fail on. The SCU's ACSE and network timeouts are 30 s, well clear of a loaded runner. Only its
-DIMSE timeout is short: the control waits that out for the response it lost. Every object is a synthetic SR from ``tests/_dicom_sample.py``, on a loopback listener.
+fail on. The SCU's other timeouts are ``_SETUP_TIMEOUT``, below. Every object is a synthetic SR
+from ``tests/_dicom_sample.py``, on a loopback listener.
 
 **These tests need the ``[dicom]`` extra and SKIP without it.** A skipped test is not evidence: see
 the note at the top of ``tests/test_dicom_scp_admission.py``.
@@ -42,11 +42,15 @@ from tests.test_dicom_scu import _carry, _scu, _storage_scp  # noqa: E402
 # fault, which the tests assert on before anything else, so the failure names the lost step.
 _STEP_BOUND = 10.0
 
-# The SCU's ACSE and network (DUL idle) timeouts in both tests. They bound association setup and
-# the reactor's idle check, neither of which these tests are about, so they sit well clear of a
-# loaded runner. Only the DIMSE timeout is short, since the control waits it out for its lost
-# response.
+# The SCU's TCP connect, ACSE and network (DUL idle) timeouts in both tests. They bound
+# association setup and the reactor's idle check, neither of which these tests are about, so they
+# sit well clear of a loaded runner. Only the DIMSE timeout is set per test: the control waits it
+# out for the response it lost, so it is short there.
 _SETUP_TIMEOUT = 30.0
+
+# The held test's DIMSE timeout. Its response is not lost, so this only has to outlast a slow SCP
+# on a loaded runner. A hold regression still fails within it, well inside pytest's timeout.
+_HELD_DIMSE_TIMEOUT = 10.0
 
 
 class _GatedCheckpoint(threading.Event):
@@ -106,8 +110,8 @@ def _dropped(caplog: pytest.LogCaptureFixture) -> list[str]:
 def _short_dimse_scu(
     monkeypatch: pytest.MonkeyPatch, port: int, dimse_timeout: float
 ) -> dicom_module.DicomScuDestination:
-    """The SCU with ``_SETUP_TIMEOUT`` for ACSE and network, and ``dimse_timeout`` for DIMSE."""
-    scu = _scu(port, timeout_seconds=_SETUP_TIMEOUT)
+    """``_SETUP_TIMEOUT`` for connect, ACSE and network; ``dimse_timeout`` for DIMSE."""
+    scu = _scu(port, timeout_seconds=_SETUP_TIMEOUT, connect_timeout=_SETUP_TIMEOUT)
     build_ae = scu._build_ae
 
     def short_dimse() -> Any:
@@ -202,7 +206,7 @@ async def test_the_reactor_never_takes_the_response_to_the_one_store(
     failure: DeliveryError | None = None
     with _storage_scp() as port:
         try:
-            await _short_dimse_scu(monkeypatch, port, dimse_timeout=2.0).send(data)
+            await _short_dimse_scu(monkeypatch, port, dimse_timeout=_HELD_DIMSE_TIMEOUT).send(data)
         except DeliveryError as exc:  # a dropped response raises here; read the gate first
             failure = exc
     assert gated.read_faults() == []
