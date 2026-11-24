@@ -5555,9 +5555,12 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
     the states this checks for. While the borrow is in one of them, the cancel is put off to the
     next loop turn and checked again, at most ``_BORROW_CANCEL_MAX_DEFERRALS`` times; a borrow that
     keeps stepping without parking, as a driver polling with bare yields does, is then cancelled
-    anyway. Otherwise the cancel goes into the future the borrow is parked on, which is a suspension
-    point of the driver's own, and what the driver does there is the driver's. Once the borrow is
-    done, the caller's done-callback returns what it handed over.
+    anyway, and a connection such a driver already holds at that point is lost. Otherwise the cancel
+    goes into the future the borrow is parked on, which is a suspension point of the driver's own,
+    and what the driver does there is the driver's. A state :func:`_value_in_flight` does not check
+    can still lose a connection to the cancel. Once the borrow is done, whoever holds it returns what
+    it handed over: :func:`acquire_pooled`'s done-callback, or the warm-up cleanup in
+    :func:`_drain_and_release` and, past its deadline, the same done-callback.
 
     This reads the task's ``_fut_waiter``, which CPython's task exposes (the test suite pins it on the
     loop's task type). On a task without it the borrow is not cancelled, and one WARNING says so: it
@@ -5583,11 +5586,13 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0) -> None:
 def _value_in_flight(fut: asyncio.Future[Any]) -> bool:
     """Whether cancelling ``fut`` now could throw the cancel in place of a value already on its way.
 
-    It checks at least these: a future already done with a result, a task that is runnable (it
-    yielded with no future, or the future it awaits is done), a task whose awaited future is itself
-    in flight, and a gather future whose children are all done (it refuses the cancel) or has a
-    pending child in flight. A pending future of any other kind counts as not in flight, so a
-    combinator this does not know, or a future that ignores its cancel, is outside it."""
+    It checks these: a future already done with a result, a task that yielded with no future or
+    whose awaited future is in flight, and a gather future whose children are all done (it refuses
+    the cancel) or has a pending child in flight. A task whose awaited future failed or was
+    cancelled is not in flight, since no value is on its way. Outside the check, at least: a gather
+    with a child done with a value beside a pending child (its cancel discards that value), a shield
+    or another combinator, and a future that ignores its cancel; each counts as not in flight. The
+    gather check reads ``_children``, a CPython detail no test pins."""
     if fut.done():
         return not fut.cancelled() and fut.exception() is None
     if isinstance(fut, asyncio.Task):
@@ -5633,8 +5638,9 @@ async def acquire_pooled(
     race, and the explicit cancel afterwards keeps a wedged pool from accumulating one detached borrow
     per retry (on CPython; see :func:`_cancel_borrow` for a task type it cannot read). That cancel
     goes through :func:`_cancel_borrow`, which puts it off while a value is on its way into the
-    borrow. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if
-    one was actually handed over. The caller's own cancellation takes the same path — it must, or a
+    borrow. Whichever of the two wins, :func:`_salvage_late_borrow` returns the connection if the
+    borrow ends holding one; a connection the cancel replaced in a state :func:`_cancel_borrow` does
+    not check is lost before the borrow ends. The caller's own cancellation takes the same path — it must, or a
     shutdown mid-borrow would strand a slot the pool never recovers."""
     borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
     try:
@@ -5668,9 +5674,9 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     no pool and overrides :meth:`QueueStore.warm_pool` with a no-op.
 
     Safe by construction: a per-connection connect failure is absorbed (the pool is left partially
-    warm), the whole warm-up is bounded by ``timeout``, and every connection actually acquired is
-    **always** released — even if a cancellation is delivered mid-cleanup — so warming can never strand a
-    connection out of the pool. Returns the number warmed. The caller leaves headroom below the pool
+    warm), the whole warm-up is bounded by ``timeout``, and a connection the warm-up holds is
+    released even if a cancellation is delivered mid-cleanup. The exceptions are the bounded partial
+    strand below and the borrow states :func:`_cancel_borrow` does not check. Returns the number warmed. The caller leaves headroom below the pool
     maximum so a concurrent startup caller is never starved while connections are held (see
     :func:`warm_pool_target`).
 
