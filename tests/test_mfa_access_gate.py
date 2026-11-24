@@ -41,6 +41,8 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStore
+from messagefoundry.store.crypto import CipherError
+from messagefoundry.store.row_seal import TransitSealUnavailableError
 from messagefoundry.store.store import WebAuthnCredential
 from tests._admin_account import create_admin, create_local_user_chosen
 from tests._enrolment_code import enrolment_code_for
@@ -735,16 +737,26 @@ async def test_the_access_gate_names_enrolment_to_a_pending_session_with_no_fact
     )
 
 
+@pytest.mark.parametrize(
+    "fault",
+    (
+        OSError("synthetic store fault"),
+        TransitSealUnavailableError(),
+        CipherError("synthetic undecryptable row"),
+    ),
+    ids=("store", "transit", "cipher"),
+)
 async def test_a_store_fault_on_the_wording_read_keeps_the_mfa_refusal(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fault: Exception
 ) -> None:
-    """RED when: the read that picks the refusal's wording is unguarded, so a store fault there
-    turns the 403 + ``X-MFA-Required`` into a 500. The fault answers with the verify wording."""
+    """RED when: the read that picks the refusal's wording lets a store, seal or Transit fault
+    through, so the 403 + ``X-MFA-Required`` becomes a 500. The fault answers with the verify
+    wording."""
     service = await _service(engine)
     await _add(service, "fresh", Role.VIEWER)
 
     async def broken(*_: object, **__: object) -> bool:
-        raise OSError("synthetic store fault")
+        raise fault
 
     async with _client(engine, service) as c:
         tok = await _login(c, "fresh")

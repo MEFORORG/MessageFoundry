@@ -4069,9 +4069,9 @@ The complete set, as enumerated in the [route map](#route--permission-map-engine
 
 Ordinary reads — listing users, the AD maps, the audit log, a single message — are **not** step-up
 gated. Four routes take the *password-only* variant (`require_reauth_only[_action]`), **without**
-the MFA gate, so a required-but-unenrolled user can reach enrolment: `POST /me/mfa/enroll`,
-`POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`, `DELETE /me/sessions`. On the two
-enrolment routes the skip serves an account with no factor only: a pending session on an account
+the MFA gate: `POST /me/mfa/enroll`, `POST /me/mfa/confirm`, `DELETE /me/sessions/{session_id}`,
+`DELETE /me/sessions`. On the two enrolment routes the skip is what lets a required-but-unenrolled
+user reach enrolment, and it serves an account with no factor only: a pending session on an account
 that has one gets `403` + `X-MFA-Required` there (BACKLOG #1951). On the two terminate routes it
 serves no pending session: one on an account that has a factor gets the same `403`, and so does one
 on an account with no factor that `[security].require_mfa` covers, whose detail names enrolment as
@@ -6416,7 +6416,11 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   route). For your own sessions, Sign out ends the current one. `DELETE /me/sessions` ends the
   others, but asks for a fresh step-up first. With `[auth].require_action_step_up` on (the
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
-  passwordless or smartcard-only account cannot end its other sessions this way;
+  passwordless or smartcard-only account cannot end its other sessions this way. Under
+  `[security].require_mfa` a Kerberos session that has proven no engine factor is MFA-pending,
+  and `DELETE /me/sessions` refuses it whatever it proves until it enrols one, which for a
+  directory account needs an administrator-issued enrolment code (ADR 0207, BACKLOG #1149). Until
+  then an administrator ends those sessions with `DELETE /users/{user_id}/sessions`;
 - end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session only when
   the revoke re-stamps it and otherwise ends it too, or from the host with
   `messagefoundry admin-revoke-sessions`, which keeps none (BACKLOG #2614). What these and the
@@ -6460,7 +6464,12 @@ it with `X-MFA-Required` (ASVS 6.3.3, BACKLOG #1951). A pending session on an ac
 factor, which `[security].require_mfa` covers, is refused the same way (BACKLOG #1149, ASVS 7.5.2):
 no step-up mints it a `session_terminate`, `save_ends_own_sessions` or `revoke_all_sessions` grant,
 the JSON terminate routes answer `403` + `X-MFA-Required` with a detail that names enrolment, and
-the console twins send it to `/ui/account?m=enroll_first`. It may still reach enrolment and sign-out.
+the console twins send it to `/ui/account?m=enroll_first`, as does `/ui/reauth` when asked to
+re-prove for a terminate. It may still reach at least enrolment and sign-out; `_MFA_EXEMPT_ROUTES`
+in `api/security.py` holds the JSON routes a pending session reaches. This refusal adds a step,
+not a bar, against a holder of a local account's password alone: that holder may enrol a factor of
+its own first, which satisfies the session, and then end sessions. A directory account's first
+enrolment needs an administrator-issued enrolment code (ADR 0207), so there it holds.
 
 Changing the password also ends every session, and it follows the same rule (BACKLOG #1954). A
 pending session on an account with a factor gets `403` + `X-MFA-Required` from `POST /me/password`,

@@ -267,3 +267,15 @@ It changes no route's gate. The bullet's route list is the 2026-07-10 state: the
 amendment moved `PATCH /users/{user_id}` to an action-bound grant. At least the admin password
 reset, admin MFA reset and federated-identity routes have moved since. `api/auth_routes.py` is the
 authority on which gate each route uses today.
+
+## Amendment (2026-11-24, BACKLOG #1149 — ASVS 7.5.2): no pending session terminates
+
+The 2026-07-17 amendment above says the terminate routes stay password-only "so a no-factor user
+can still revoke". That no longer holds under `[security].require_mfa`. A session on an account
+with no factor that the requirement covers is MFA-pending, and `session_terminate`,
+`save_ends_own_sessions` and `revoke_all_sessions` are refused to every pending session, whether
+or not the account holds a factor: no step-up mints those grants, the JSON terminate routes answer
+`403` + `X-MFA-Required` with a detail naming enrolment, and the console sends the session to
+enrolment. The routes keep their password-only, action-bound gate. The text above is kept as it
+was accepted; this note governs where they differ. `docs/SECURITY.md`, under *Session inventory &
+targeted revocation*, states the current rule.

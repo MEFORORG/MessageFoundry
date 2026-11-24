@@ -167,7 +167,8 @@ register_ui_action(
 # Both terminate POSTs are body-less (all params in the PATH), so they register as auto_retry
 # continuations /ui/reauth may re-POST after a stale-window re-auth. step_up=False (password-
 # only, mirrors require_ui_reauth_only). A pending session does not pass the gate, with a factor
-# (#1951) or without one under require_mfa, which is sent to enrol (#1149). permission=None.
+# (#1951) or without one under require_mfa, which is sent to enrol (#1149); /ui/reauth sends it
+# to enrol too, keyed on the action rather than on step_up. permission=None.
 # The two patterns do not overlap: the per-session pattern requires two more segments after
 # sessions/ (<id>/revoke), so /ui/account/sessions/revoke-others (one segment) matches only itself.
 # BACKLOG #1149 (ASVS 7.5.2): both now carry an action= tag, the same treatment the factor lanes got
