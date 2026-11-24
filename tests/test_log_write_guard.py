@@ -4322,15 +4322,16 @@ def test_an_inbounds_lift_keeps_the_shared_hold_while_a_sibling_lane_holds_rows(
     assert ("inbound", INBOUND) in runner._stop_held
 
 
-@pytest.mark.parametrize("recorded", [True, False])
+@pytest.mark.parametrize("record", ["writable", "none", "lease_moved"])
 async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_first(
-    store: MessageStore, recorded: bool
+    store: MessageStore, record: str
 ) -> None:
     # BACKLOG #5704 (re-pend before re-arm): a pooled lane STOPPED with claimed rows in flight that
     # a stranded record covers (BACKLOG #5744) re-pends them at its next chunk assembly, before it
     # claims. The lift at the inbound's restart re-arms it, and its next claim takes the first of
-    # those rows, in order. Rows no record covers (at least a hold that ended on a moved lease)
-    # would be claimed past, so that lane stays STOPPED, with the hold.
+    # those rows, in order. Rows no record covers (at least a hold that ended on a moved lease),
+    # or whose record the re-pend would drop unwritten because the lease moved since, would be
+    # claimed past, so that lane stays STOPPED, with the hold.
     # MEASURED on main: the lift kept the recorded lane STOPPED too, and nothing drained it.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
@@ -4341,12 +4342,16 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     first = await store.claim_next_fifo(INBOUND, stage=Stage.INGRESS.value, now=2.0)
     assert first is not None
     st = stage_dispatcher._LaneState(phase=stage_dispatcher._LanePhase.STOPPED, unlanded=True)
-    if recorded:
+    epoch = [7]
+    if record != "none":
         st.stranded = stage_dispatcher._Stranded(
             None,
             (first.id,),
-            stage_dispatcher.RependFence.capture(lambda: True, lambda: None),
+            stage_dispatcher.RependFence.capture(lambda: True, lambda: epoch[0]),
         )
+    if record == "lease_moved":
+        epoch[0] = 8  # another node led meanwhile, and this one leads again under a new lease
+    recorded = record == "writable"
     dispatcher._states[INBOUND] = st
     runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)
     runner._log_halted.add(INBOUND)
@@ -4357,7 +4362,7 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     assert (("inbound", INBOUND) in runner._stop_held) is not recorded
     claimed: str | None = None
     for _ in range(5):
-        lanes = dispatcher._assemble_chunk(dispatcher._claimers[0])
+        lanes = dispatcher._assemble_chunk(dispatcher._owning_claimer(INBOUND))
         if lanes:
             result = await store.claim_fifo_heads(
                 Stage.INGRESS.value, lanes, now=time.time() + 3600.0
@@ -4372,7 +4377,7 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     if recorded:
         assert claimed == first.message_id, "the re-armed lane claimed past its rows in flight"
     else:
-        assert claimed is None, "a lane holding unrecorded rows was re-armed"
+        assert claimed is None, f"{record}: a lane that would claim past its rows was re-armed"
 
 
 async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(

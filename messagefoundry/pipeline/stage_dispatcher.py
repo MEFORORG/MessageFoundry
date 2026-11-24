@@ -347,7 +347,8 @@ class _LaneState:
     # _run_lane's RETRY branch and _repend_stranded's bound also write it before _apply_retry,
     # which passes it to a T17 STOP;
     # so on a lane that is not STOPPED it can hold a stale value. Read by _apply_retry, for that
-    # T17 STOP, and by StageDispatcher.stopped_holding_rows, which checks the phase.
+    # T17 STOP, and by StageDispatcher.stopped_holding_rows and stopped_past_unrecorded_rows,
+    # which check the phase.
     unlanded: bool = False
     # BACKLOG #5744: rows a hold left in flight that this lane re-pends before its next claim.
     stranded: _Stranded | None = None
@@ -2662,19 +2663,29 @@ class StageDispatcher:
         return st is not None and st.phase is _LanePhase.STOPPED and st.unlanded
 
     def stopped_past_unrecorded_rows(self, key: str) -> bool:
-        """Whether ``key`` is STOPPED holding claimed rows in flight that its next chunk assembly
-        would not re-pend first, because no stranded record covers them (BACKLOG #5704, #5744). At
-        least a hold that ended on a moved lease (``SUPERSEDED``) leaves them so: another node may
-        hold them. A re-arm of such a lane would claim past them, so the log halt's recovery
-        restart leaves it STOPPED. A lane whose rows a record covers re-pends them before it claims,
-        so a re-arm of it is safe. False for an unknown lane."""
-        st = self._states.get(key)
-        return (
-            st is not None
-            and st.phase is _LanePhase.STOPPED
-            and st.unlanded
-            and st.stranded is None
-        )
+        """Whether ``key`` is STOPPED holding claimed rows in flight that a re-arm could claim past
+        (BACKLOG #5704, #5744), so the log halt's recovery restart leaves it STOPPED. True when no
+        stranded record covers them, at least after a hold that ended on a moved lease, and when
+        :meth:`_repend_stranded` would drop the record unwritten: the lane is no longer this
+        engine's, or its lease is superseded. A lease read that raises counts as True, which is
+        logged, so a fault keeps the lane as it was. A lane with a record this node may still write
+        re-pends its rows before it claims. False for an unknown lane."""
+        if not self.stopped_holding_rows(key):
+            return False
+        stranded = self._states[key].stranded
+        if stranded is None:
+            return True
+        try:
+            return key not in self._lane_provider() or stranded.fence.superseded()
+        except Exception:  # noqa: BLE001 — a lease or ownership read fault keeps the lane STOPPED
+            log.warning(
+                "StageDispatcher %s lane %s: reading ownership or leadership for its stranded "
+                "rows failed; leaving it STOPPED",
+                self._stage.value,
+                key,
+                exc_info=True,
+            )
+            return True
 
     def is_dirty(self, key: str) -> bool:
         st = self._states.get(key)

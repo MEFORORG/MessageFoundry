@@ -281,7 +281,8 @@ no internal lane, and STOPs one only through its hand-back of a prefix claimed b
 infra-fault count reaches its bound, for example while the head's re-pend keeps failing on a full
 store). A lane can still STOP while the halt is in force for other causes, at least under its own
 fault policy; a latch a probe clears does not itself re-arm a STOP, and the restart of the
-inbound that lifts its mark does, except a pooled lane still holding claimed rows in flight. `_inbound_log_halted` states this in full
+inbound that lifts its mark does, except a pooled lane that could claim past claimed rows it
+holds in flight (ADR 0162 section 7). `_inbound_log_halted` states this in full
 in the code. It marks every inbound as it latches, before it waits
 for the reload lock, so a reload holding that lock cannot rebind a listener over gated stages. A
 halt whose latch a probe cleared while it waited still completes, as before; decision

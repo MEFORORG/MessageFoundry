@@ -6578,19 +6578,18 @@ class RegistryRunner:
         """Lift the #122 halt's mark on inbound ``name`` and re-arm its internal lanes, as the
         restart that rebinds its listener did before the halt became a claim gate, when the halt
         paused them and this resumed them (BACKLOG #5704), except a pooled lane kept STOPPED
-        because it holds claimed rows in flight that no stranded record covers. Sync and await-free. A restart of an
+        because a re-arm could claim past claimed rows it holds in flight. Sync and await-free. A restart of an
         inbound the halt never gated does not come here, and under pooled re-arms no STOP.
 
         Under pooled each lane the pre-claim gate parked is released
         (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
         :meth:`_resume_pooled_lane`, which re-arms a PAUSED or STOPPED one and lifts the inbound's
         hold when it does. That covers at least a lane the halt's hand-back STOPPED at T17 or on
-        leadership loss. A lane STOPPED with claimed rows still in flight that a stranded record
-        covers (BACKLOG #5744) is re-armed too: its next chunk assembly re-pends those rows before
-        it claims. A lane whose rows in flight no record covers
-        (:meth:`StageDispatcher.stopped_past_unrecorded_rows`), at least after a hold that ended on
-        a moved lease, is not re-armed here, because a re-arm would claim past them; the WARNING
-        says the pooled lane is kept STOPPED. Any later ``notify_work`` broadcast
+        leadership loss. A lane STOPPED with claimed rows still in flight is re-armed too when
+        its next chunk assembly would re-pend them before it claims (BACKLOG #5744), and is not
+        re-armed here when it would not
+        (:meth:`StageDispatcher.stopped_past_unrecorded_rows` says when), because a re-arm would
+        claim past them; the WARNING says the pooled lane is kept STOPPED. Any later ``notify_work`` broadcast
         (:meth:`_broadcast_to`), at least a reload, replay, resend or inject, re-arms it, since the
         mark is lifted, and it can claim past them. Under per_lane the waiting workers are woken here, and the start that
         called this respawns any that a STOP ended (:meth:`_ensure_inbound_workers`)."""
@@ -6871,7 +6870,7 @@ class RegistryRunner:
 
         Lifting the gate re-arms the inbound's internal lanes (:meth:`_lift_log_halt`): under pooled
         a STOPPED or PAUSED one is resumed and its hold lifted here, except a pooled lane kept
-        STOPPED because it holds claimed rows whose return to the queue never landed, and under
+        STOPPED because a re-arm could claim past claimed rows it holds in flight, and under
         per_lane the start that
         called this then respawns the finished workers (:meth:`_ensure_inbound_workers`), which
         re-arms such a STOP."""
@@ -11197,8 +11196,8 @@ class RegistryRunner:
         hand-back cannot land returns with no STOP and no hold, leaving its rows in flight
         (:meth:`_log_gate_after_claim`). Clearing the latch does not
         itself re-arm such a STOP; the rebind of the inbound's listener that lifts its mark does
-        (:meth:`_lift_log_halt`), except a pooled lane kept STOPPED because it holds claimed rows
-        in flight that no stranded record covers."""
+        (:meth:`_lift_log_halt`), except a pooled lane kept STOPPED because a re-arm could claim
+        past claimed rows it holds in flight."""
         # A mark gates only an inbound still in the graph: a removed inbound's worker must reach
         # its claim, see the inbound gone and return, rather than wait on a mark nothing lifts. A
         # re-add finds the mark again.
