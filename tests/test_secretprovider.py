@@ -171,6 +171,45 @@ def test_unknown_provider_name_fails_closed() -> None:
         resolve_secret_provider(SecretsSettings(provider="nope"))
 
 
+#: Synthetic text a broken import might carry: a path and a marker string. Neither may reach
+#: the refusal's own text.
+_BROKEN_IMPORT_TEXT = "DLL load failed: C:/synthetic/site-packages/_sdk.pyd marker zz0451"
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(lambda: ImportError(_BROKEN_IMPORT_TEXT), id="broken-c-extension"),
+        pytest.param(
+            lambda: ImportError(f"cannot import name 'Client' ({_BROKEN_IMPORT_TEXT})"),
+            id="missing-symbol",
+        ),
+        pytest.param(lambda: OSError(_BROKEN_IMPORT_TEXT), id="os-error"),
+        pytest.param(lambda: AttributeError(_BROKEN_IMPORT_TEXT), id="attribute-error"),
+    ],
+)
+def test_an_external_provider_whose_import_breaks_fails_closed_with_a_fixed_text(
+    monkeypatch: pytest.MonkeyPatch, make_error: Any
+) -> None:
+    # Vault BACKLOG #6709 item 1: an SDK that is installed but broken raises a plain ImportError (or
+    # another error from the module's top-level code), not ModuleNotFoundError. The dispatch must
+    # refuse with SecretProviderError, chained to the original, and must not repeat its text.
+    raised: list[BaseException] = []
+
+    def _import(_name: str) -> Any:
+        error = make_error()
+        raised.append(error)
+        raise error
+
+    monkeypatch.setattr("messagefoundry.config.secretprovider.importlib.import_module", _import)
+    with pytest.raises(SecretProviderError) as caught:
+        resolve_secret_provider(SecretsSettings(provider="vault"))
+    text = str(caught.value)
+    assert "[secrets].provider='vault'" in text
+    assert "synthetic" not in text and "0451" not in text and "Client" not in text
+    assert caught.value.__cause__ is raised[0]
+
+
 # --- vault backend: mocked KV ------------------------------------------------
 
 

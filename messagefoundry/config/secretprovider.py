@@ -126,7 +126,8 @@ def _load_external_provider(
     The seam: a per-provider module ``messagefoundry/config/secretprovider_<name>.py`` exposes
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
     dispatch imports it by name with **no edit here**. A missing provider module or a missing
-    backend SDK **fails closed** naming the extra — the base install pulls **zero** external SDK.
+    backend SDK **fails closed** naming the extra, and so does a provider module or SDK that is
+    present but fails to import — the base install pulls **zero** external SDK.
 
     ``posture`` is handed to every external provider, because each one dials a network hop that a
     posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as
@@ -145,6 +146,16 @@ def _load_external_provider(
         raise SecretProviderError(
             f"[secrets].provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra ('messagefoundry[{extra}]')."
+        ) from exc
+    except Exception as exc:
+        # Present but broken: a C extension that fails to load, a name the SDK no longer has, or
+        # another error from the module's top-level code (vault BACKLOG #6709). The text names the
+        # provider and the error's type only: an import error's own text can carry a filesystem
+        # path, and this text reaches operator output. The original is chained for diagnosis.
+        raise SecretProviderError(
+            f"[secrets].provider={name!r} could not load its provider module or backend (an "
+            f"import failed: {type(exc).__name__}) — reinstall MessageFoundry with the optional "
+            f"{extra!r} extra ('messagefoundry[{extra}]')."
         ) from exc
     provider: SecretProvider = module.build_provider(settings, posture=posture)
     return provider

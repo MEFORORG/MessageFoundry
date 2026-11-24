@@ -303,9 +303,12 @@ def _load_external_provider(
             f"[store].key_provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra."
         ) from exc
-    except ImportError as exc:
+    except Exception as exc:
         # Present but broken: a C extension that fails to load, or a name its SDK or the provider
-        # module itself no longer has. resolve_active_key and resolve_decrypt_keys already refuse
+        # module itself no longer has. Importing runs the module's top-level code, which can also
+        # fail with an error that is not an ImportError (an OSError from a native library, an
+        # AttributeError), so this clause takes any Exception (vault BACKLOG #6709 item 3); it is
+        # chained, not swallowed. resolve_active_key and resolve_decrypt_keys already refuse
         # any provider error as a KeyProviderError with a fixed text, so this changes nothing
         # there; it keeps this seam's own contract, KeyProviderError, for a provider module whose
         # import fails. An ImportError raised later, inside build_provider, is the provider's to
