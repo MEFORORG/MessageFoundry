@@ -915,8 +915,10 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       source then says the triple was out of order, and a typo such as 9.5 halts early, not late.
 
       A NaN CANNOT LIFT THE RUNG EITHER. ConvertFrom-Json reads a bare NaN as a number, and no
-      comparison with NaN is true, so a NaN HOLD never fires. A NaN slot takes watch.py's default for
-      that slot instead, (90, 94, 97) and (60, 10, 5), and only then is the strictest number picked
+      comparison with NaN is true, so a NaN HOLD never fires. A NaN slot here takes watch.py's
+      default for that slot instead, (90, 94, 97) and (60, 10, 5). watch.py itself keeps the NaN, so
+      the two disagree on such a file: weekly [NaN, 94, 97] halts here at 90 and never fires in
+      watch.py. Only then is the strictest number picked
       across all three slots. So a NaN in ANY slot, a later one included, can move HOLD: the slot's
       default can be the strictest number, and then it is HOLD. Weekly [96, NaN, 98] gives HOLD 94,
       not 96, and minutes [5, NaN, 2] gives 10, not 5. The move only ever goes stricter than the
