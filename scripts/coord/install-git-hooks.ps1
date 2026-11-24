@@ -65,24 +65,37 @@ if (-not $common) { throw "Not inside a git repository." }
 # one of them governs the rest. Joining the raw value under $RepoRoot got both wrong, and the summary
 # below still printed "governs: all N worktree(s)". `--type=path` gives the ~-expanded value to test;
 # `rev-parse --git-path hooks` gives the directory git itself would run hooks from.
-$hooksPath = (& git -C $RepoRoot config --type=path --get core.hooksPath)
+# Only a value in THIS repository's local config is honoured: a global or system value is a hooks
+# directory every repository on the machine shares, and a worktree or command-line value is not the
+# shared install the summary reports. Every refusal starts "hooks dir UNRESOLVABLE", a word
+# scripts\worktree\hygiene-report.ps1 flags as drift, so a refused -Status is never read as clean.
+$hooksPathScoped = (& git -C $RepoRoot config --show-scope --type=path --get core.hooksPath)
 $hooksPathExit = $LASTEXITCODE
 # Exit 1 is git's "not set"; anything else (an unexpandable `~user/`, a broken config) is a failure.
 if ($hooksPathExit -ne 0 -and $hooksPathExit -ne 1) {
-    throw "Could not read core.hooksPath (git config exit $hooksPathExit); refusing to guess where git runs hooks."
+    throw "hooks dir UNRESOLVABLE -- could not read core.hooksPath (git config exit $hooksPathExit); refusing to guess where git runs hooks."
 }
-if ($hooksPathExit -eq 0 -and -not $hooksPath) {
-    throw "core.hooksPath is set but empty; refusing to guess where git runs hooks. Unset it or give an absolute path."
-}
-if ($hooksPath) {
+$hooksPath = $null
+if ($hooksPathExit -eq 0) {
+    $hooksPathScope, $hooksPath = "$hooksPathScoped" -split "`t", 2
+    if ($hooksPathScope -ne 'local') {
+        throw ("hooks dir UNRESOLVABLE -- core.hooksPath '$hooksPath' is set in $hooksPathScope config, not in this " +
+            "repository's local config, so it is not one directory that only this repository's worktrees share. " +
+            "Refusing. Remove it from that scope (git config --$hooksPathScope --unset core.hooksPath), or set an " +
+            "absolute core.hooksPath in this repository's local config, then re-run.")
+    }
+    if (-not $hooksPath) {
+        throw "hooks dir UNRESOLVABLE -- core.hooksPath is set but empty; refusing to guess. Unset it or give an absolute path."
+    }
     if (-not [System.IO.Path]::IsPathFullyQualified($hooksPath)) {
-        throw ("core.hooksPath is '$hooksPath', which is relative (or, on Windows, has no drive). Git resolves " +
-            "it against each worktree's own root, so no single install reaches every worktree. Refusing. " +
-            "Unset it (git config --unset core.hooksPath) or set it to an absolute path, then re-run.")
+        throw ("hooks dir UNRESOLVABLE -- core.hooksPath is '$hooksPath', which is relative, or on Windows has no " +
+            "drive. Git resolves a relative value against each worktree's own root, and a drive-less one against " +
+            "the current drive, so no single install is sure to reach every worktree. Refusing. Unset it " +
+            "(git config --unset core.hooksPath) or set it to an absolute path, then re-run.")
     }
     $hooksDir = (& git -C $RepoRoot rev-parse --path-format=absolute --git-path hooks)
-    if ($LASTEXITCODE -ne 0 -or -not $hooksDir -or -not [System.IO.Path]::IsPathFullyQualified($hooksDir)) {
-        throw "Could not resolve core.hooksPath '$hooksPath' to an absolute hooks directory; refusing to guess."
+    if ($LASTEXITCODE -ne 0 -or -not $hooksDir -or -not [System.IO.Path]::IsPathFullyQualified($hooksDir.Trim())) {
+        throw "hooks dir UNRESOLVABLE -- could not resolve core.hooksPath '$hooksPath' to an absolute hooks directory; refusing to guess."
     }
     $hooksDir = $hooksDir.Trim()
 } else {

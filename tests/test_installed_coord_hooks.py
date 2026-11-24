@@ -321,18 +321,19 @@ def _git_at(root: Path, *args: str) -> str:
 
 
 def hooks_dir_for(root: Path) -> Path | None:
-    """Where git looks for ``root``'s hooks, resolved exactly as ``install-git-hooks.ps1`` resolves it.
+    """Where git looks for ``root``'s hooks, taken from git as ``install-git-hooks.ps1`` takes it.
 
-    ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. Deriving it any other way
-    would compare a directory git never consults and report parity for a copy that is not the one
-    running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
+    ``core.hooksPath`` wins when set, otherwise ``<git-common-dir>/hooks``. When it is set, the answer
+    is ``git rev-parse --git-path hooks``, because git expands ``~/`` and resolves a relative value
+    against the worktree root, which a join under ``root`` gets wrong (BACKLOG #6258). Deriving it
+    any other way would compare a directory git never consults and report parity for a copy that is
+    not the one running -- and the obvious shortcut is worse than wrong, it is empty: in a linked worktree
     ``root/.git`` is a FILE pointing at the common dir, so ``root/.git/hooks`` never exists and every
     payload would read as "not installed".
     """
-    configured = _git_at(root, "config", "--get", "core.hooksPath")
-    if configured:
-        p = Path(configured)
-        return p if p.is_absolute() else root / configured
+    if _git_at(root, "config", "--get", "core.hooksPath"):
+        resolved = _git_at(root, "rev-parse", "--path-format=absolute", "--git-path", "hooks")
+        return Path(resolved) if resolved else None
     common = _git_at(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
     return Path(common) / "hooks" if common else None
 
@@ -1768,8 +1769,10 @@ def _hookspath_clone(tmp_path: Path, hooks_path: str | None) -> tuple[Path, dict
     home.mkdir()
     gitconfig = tmp_path / "global.gitconfig"
     gitconfig.write_text("", encoding="utf-8")
+    # GIT_* stripped: an inherited GIT_DIR or GIT_CONFIG_PARAMETERS would aim every git call below,
+    # the `config core.hooksPath` write included, at the outer repository instead of this clone.
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
         "HOME": str(home),
         "USERPROFILE": str(home),
         "GIT_CONFIG_GLOBAL": str(gitconfig),
@@ -1788,7 +1791,9 @@ def _hookspath_clone(tmp_path: Path, hooks_path: str | None) -> tuple[Path, dict
     return repo, env
 
 
-def _run_git_hooks_installer(repo: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run_git_hooks_installer(
+    repo: Path, env: dict[str, str], *flags: str
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "pwsh",
@@ -1796,6 +1801,7 @@ def _run_git_hooks_installer(repo: Path, env: dict[str, str]) -> subprocess.Comp
             "-NonInteractive",
             "-File",
             str(repo / "scripts" / "coord" / "install-git-hooks.ps1"),
+            *flags,
         ],
         cwd=repo,
         env=env,
@@ -1837,13 +1843,48 @@ def test_a_relative_hookspath_is_refused_not_reported_as_governing(
     assert "core.hooksPath" in out and "relative" in out, out
     assert "governs" not in out, out
     assert not (repo / hooks_path / "commit-msg").exists()
+    # -Status refuses too, and says UNRESOLVABLE, a word hygiene-report.ps1 flags as drift, so the
+    # refusal cannot read there as "0 hook line(s) flagged".
+    status = _run_git_hooks_installer(repo, env, "-Status")
+    assert status.returncode != 0
+    assert "UNRESOLVABLE" in status.stdout + status.stderr
+
+
+@_NEEDS_PWSH
+@pytest.mark.parametrize("scope", ["--global", "--worktree"])
+def test_a_hookspath_outside_this_repos_local_config_is_refused(tmp_path: Path, scope: str) -> None:
+    """A global ``~/`` value is a hooks directory every repository on the machine shares, and a
+    worktree-scoped value governs one worktree; neither is the shared install this script reports."""
+    repo, env = _hookspath_clone(tmp_path, None)
+    target = (tmp_path / "scoped-hooks").as_posix()
+    if scope == "--worktree":
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "extensions.worktreeConfig", "true"],
+            check=True,
+            env=env,
+            capture_output=True,
+        )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", scope, "core.hooksPath", target],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+    result = _run_git_hooks_installer(repo, env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "UNRESOLVABLE" in out, out
+    assert "governs" not in out, out
+    assert not (tmp_path / "scoped-hooks" / "commit-msg").exists()
 
 
 @_NEEDS_PWSH
 @pytest.mark.skipif(sys.platform != "win32", reason="a drive-relative path exists only on Windows")
 def test_a_drive_relative_hookspath_is_refused_on_windows(tmp_path: Path) -> None:
     """``/x/hooks`` is rooted but not fully qualified on Windows: its drive is whichever is current."""
-    repo, env = _hookspath_clone(tmp_path, "/mefor-no-such-root/hooks")
+    # Drive-less but pointing inside tmp_path, so a regressed install lands nowhere outside it.
+    drive_less = "/" + tmp_path.relative_to(tmp_path.anchor).as_posix() + "/dr-hooks"
+    repo, env = _hookspath_clone(tmp_path, drive_less)
     result = _run_git_hooks_installer(repo, env)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
