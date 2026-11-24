@@ -4411,6 +4411,18 @@ class AuthService:
             if settings.phi_read_rate_limit_enabled
             else None
         )
+        # Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        # 15.2.2), consulted by require_monitoring_read. Its own bucket, so dashboard polling never
+        # spends the PHI-read budget.
+        self._monitoring_read_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.monitoring_read_rate_limit_per_actor,
+                glob=settings.monitoring_read_rate_limit_global,
+                window_seconds=settings.monitoring_read_rate_limit_window_seconds,
+            )
+            if settings.monitoring_read_rate_limit_enabled
+            else None
+        )
         # Per-actor anti-automation pacing for the state-changing admin surface (BACKLOG #193, ASVS
         # 2.4.2). Built like _phi_read_limiter but consulted from the step-up gate for NON-GET sensitive
         # ops. glob=0 (no cross-actor dimension): one operator's write burst must never throttle
@@ -4907,6 +4919,18 @@ class AuthService:
         depends on other accounts' reads (:meth:`SlidingWindowRateLimiter.retry_after`). The JSON
         API and the ``/ui`` console both send it."""
         return _retry_after_seconds(self._phi_read_limiter, actor)
+
+    def allow_monitoring_read(self, actor: str) -> bool:
+        """Per-actor pacing for six monitoring:read GETs (vault BACKLOG #1191, ASVS
+        15.2.2). True = proceed; False = throttle. Always True when the limiter is disabled."""
+        if self._monitoring_read_limiter is None:
+            return True
+        return self._monitoring_read_limiter.allow(actor)
+
+    def monitoring_read_retry_after(self, actor: str) -> int:
+        """The ``Retry-After`` value for a monitoring read just refused for ``actor``, rounded as
+        :meth:`phi_read_retry_after` rounds it, on the monitoring-read limiter."""
+        return _retry_after_seconds(self._monitoring_read_limiter, actor)
 
     def login_retry_after(self) -> int:
         """The ``Retry-After`` value for a sign-in attempt refused by :meth:`allow_login_attempt`:
@@ -17096,8 +17120,10 @@ class AuthService:
         reads, the console's ``phi=True`` arm) and the paced writes (``require_paced``, the
         console's write gate), which refuse on ``True``. Not every caller refuses: the console's
         reauth-only action gate records the signal on a request it is refusing for another reason.
-        The JSON plane's base gate (``require``) never calls it, so the monitoring polls are not
-        refused. The console's base gate (``require_ui``) calls it for a PHI read or a write, and,
+        The JSON plane's base gate (``require``) and its monitoring-read gate
+        (``require_monitoring_read``) never call it, so the JSON monitoring polls are not refused;
+        a monitoring ``reveal`` read is, through the HTTP reveal path above. The console's base
+        gate (``require_ui``) calls it for a PHI read or a write, and,
         since BACKLOG #5646, on every request a step-up gate serves, GET included, because the
         step-up factories hand it their question; the console's plain monitoring polls ride none
         of those, so they are not refused either.
@@ -22436,20 +22462,36 @@ class AuthService:
         *,
         reason: str,
         client: str | None,
+        answered_status: int | None = None,
+        answered_reason: str | None = None,
     ) -> None:
         """Audit a request refused by a check its gate makes AFTER the permission check passed
         (BACKLOG #1197, ASVS 16.3.2), such as a stale step-up (``reason`` ``step_up``) or the
         per-actor pacing (``throttled``).
 
+        Where ``answered_status`` is given, the row also records it and ``answered_reason`` (null
+        if that is not given): a different refusal the caller was actually answered with, as when
+        a held monitoring-read 429 is recorded but a route's own refusal is returned in its place
+        (vault BACKLOG #1191). Without ``answered_status``, ``answered_reason`` is not recorded.
+
         The caller holds ``permission``, so this is not :meth:`audit_permission_denied`: that row
         says the permission was missing, and the denial-burst detector counts it.
-        ``_recorded_decision`` in ``api/security.py`` decides when this row is written for a gate's
-        own refusals, and ``_record_route_refusal`` for the step-up refusals a ``proof_in_route``
-        route body makes. ``client`` is required, as for :meth:`audit_self_target_refused`."""
+        Its writers in ``api/security.py`` include at least ``_recorded_decision`` for a gate's own
+        refusals, ``_record_route_refusal`` for the step-up refusals a ``proof_in_route`` route
+        body makes, and ``raise_deferred_monitoring_refusal`` and
+        ``record_deferred_monitoring_refusal`` for a monitoring-read 429 a gate held for its
+        route body. ``client`` is required, as for :meth:`audit_self_target_refused`."""
         await self._audit(
             "auth.gate_refused",
             actor=identity.username,
-            detail=_json({"permission": permission.value, "path": path, "reason": reason}),
+            detail=_json(
+                {"permission": permission.value, "path": path, "reason": reason}
+                | (
+                    {}
+                    if answered_status is None
+                    else {"answered_status": answered_status, "answered_reason": answered_reason}
+                )
+            ),
             client=client,
         )
 

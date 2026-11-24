@@ -836,3 +836,191 @@ def test_trace_accepts_declined_is_empty_without_predicates() -> None:
     traced = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
     assert traced["accepts_declined"] == []
     assert not [inv for inv in traced["invocations"] if inv["kind"] == "accepts"]
+
+
+# --- bounded capture + the shared Message patch (BACKLOG #6824, #6825) --------------------------
+
+
+def _capture_tracers(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Keep each `_Tracer` that `trace_dry_run` builds, so a test can read its recorders."""
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    made: list = []
+
+    class _Kept(dt._Tracer):
+        def __init__(self, show_phi: bool) -> None:
+            super().__init__(show_phi)
+            made.append(self)
+
+    monkeypatch.setattr(dt, "_Tracer", _Kept)
+    return made
+
+
+def _retained_writes(rec) -> int:
+    pending = sum(len(v) for v in rec._writes_by_line.values())
+    return pending + sum(len(ev.get("writes", [])) for ev in rec.events)
+
+
+def test_writes_after_the_event_cap_are_not_retained(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Past _MAX_EVENTS no line is finalized, so a write recorded then is never emitted. It must not
+    # be kept either, or a long mutating loop grows the recorder without bound (BACKLOG #6824).
+    from messagefoundry.pipeline.dryrun_trace import _MAX_EVENTS
+
+    def handle_loops(msg: Message) -> Send:
+        for _ in range(_MAX_EVENTS * 2):
+            msg["MSH-3"] = "X"
+        return Send("out", msg)
+
+    made = _capture_tracers(monkeypatch)
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_loops}), ADT_A01)
+    assert traced["sends"] == [{"outbound": "out"}]
+    inv = _handler_invocation(traced)
+    assert inv.get("truncated") is True
+    rec = next(r for r in made[0].invocations if r.kind == "handler")
+    assert rec._writes_by_line == {}
+    assert _retained_writes(rec) <= _MAX_EVENTS
+    assert _all_writes(inv), "writes before the cap are still emitted"
+
+
+def test_writes_from_a_helper_loop_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A helper the Handler calls is not line-traced, so all its writes land on one Handler line.
+    # The per-invocation write cap must bound those too, and say so as `writes_truncated` and as
+    # `truncated`, the key the IDE reads, so a capped trace never looks complete (BACKLOG #6824).
+    from messagefoundry.pipeline.dryrun_trace import _MAX_WRITES
+
+    def fill(msg: Message) -> None:
+        for _ in range(_MAX_WRITES * 2):
+            msg["MSH-3"] = "X"
+
+    def handle_calls_fill(msg: Message) -> Send:
+        fill(msg)
+        return Send("out", msg)
+
+    made = _capture_tracers(monkeypatch)
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_calls_fill}), ADT_A01)
+    assert traced["sends"] == [{"outbound": "out"}]
+    inv = _handler_invocation(traced)
+    assert inv.get("writes_truncated") is True
+    assert inv.get("truncated") is True
+    rec = next(r for r in made[0].invocations if r.kind == "handler")
+    assert _retained_writes(rec) <= _MAX_WRITES
+    assert len(_all_writes(inv)) == _MAX_WRITES
+
+
+def test_a_wrapper_write_before_a_one_line_target_is_emitted() -> None:
+    # Before the target frame latches, a write is keyed to the def line; a one-line target's def
+    # line is its body line, so that line's finalize emits it. The write is kept, not dropped.
+    import functools
+
+    def inner(msg: Message) -> Send: return Send("out", msg)  # fmt: skip  # noqa: E704
+
+    @functools.wraps(inner)
+    def wrapper(msg: Message) -> Send:
+        msg["MSH-3"] = "EARLY"
+        return inner(msg)
+
+    traced = trace_dry_run(_registry(route_to_h, {"h": wrapper}), ADT_A01, show_phi=True)
+    assert {"path": "MSH-3", "value": "EARLY"} in _all_writes(_handler_invocation(traced))
+
+
+def test_a_write_that_raises_still_shows_on_its_line() -> None:
+    # The live-debug loop shows the value that broke the Handler; recording happens before the
+    # write so a refused write is not hidden from the failing line.
+    def handle_bad_write(msg: Message) -> Send:
+        msg["PID-5"] = "A|B"
+        return Send("out", msg)
+
+    traced = trace_dry_run(_registry(route_to_h, {"h": handle_bad_write}), ADT_A01, show_phi=True)
+    assert traced["disposition"] == MessageStatus.ERROR.value
+    writes = _all_writes(_handler_invocation(traced))
+    assert {"path": "PID-5", "value": "A|B"} in writes
+
+
+def _run_threads(*targets) -> None:
+    """Run each target on its own thread; re-raise the first error, and fail on a hung thread."""
+    import threading
+
+    errors: list[BaseException] = []
+
+    def guarded(fn):
+        def run() -> None:
+            try:
+                fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the test thread below
+                errors.append(exc)
+
+        return run
+
+    threads = [threading.Thread(target=guarded(t), daemon=True) for t in targets]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(20)
+    assert not any(t.is_alive() for t in threads), "a worker thread hung"
+    if errors:
+        raise errors[0]
+
+
+def test_message_write_patch_survives_a_concurrent_trace_exiting() -> None:
+    # Two threads tracing at once share the class-level Message._write. The one that finishes first
+    # must not restore the original under the other, which would silently stop recording its writes
+    # (BACKLOG #6825).
+    import threading
+
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    assert dt._patch_holders == 0
+    a_entered = threading.Event()
+    b_exited = threading.Event()
+    seen: dict[str, object] = {}
+
+    def run_a() -> None:
+        with dt._patched_message_writes():
+            a_entered.set()
+            assert b_exited.wait(10)
+            seen["a_during"] = Message._write
+
+    def run_b() -> None:
+        assert a_entered.wait(10)
+        with dt._patched_message_writes():
+            pass
+        b_exited.set()
+
+    _run_threads(run_a, run_b)
+    assert seen["a_during"] is dt._recording_write
+    assert Message._write is dt._ORIG_MESSAGE_WRITE
+    assert dt._patch_holders == 0
+
+
+def test_concurrent_traced_dry_runs_each_record_their_writes() -> None:
+    # End to end: a trace that finishes while another is mid-Handler must not cost the other its
+    # later writes (BACKLOG #6825).
+    import threading
+
+    from messagefoundry.pipeline import dryrun_trace as dt
+
+    a_paused = threading.Event()
+    b_done = threading.Event()
+    results: dict[str, dict] = {}
+
+    def handle_pauses(msg: Message) -> Send:
+        a_paused.set()
+        b_done.wait(10)
+        msg["MSH-3"] = "AFTER"
+        return Send("out", msg)
+
+    def run_a() -> None:
+        reg = _registry(route_to_h, {"h": handle_pauses})
+        results["a"] = trace_dry_run(reg, ADT_A01, show_phi=True)
+
+    def run_b() -> None:
+        assert a_paused.wait(10)
+        results["b"] = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
+        b_done.set()
+
+    _run_threads(run_a, run_b)
+    assert any(w["path"] == "MSH-3" for w in _all_writes(_handler_invocation(results["b"])))
+    a_writes = _all_writes(_handler_invocation(results["a"]))
+    assert any(w["path"] == "MSH-3" and w["value"] == "AFTER" for w in a_writes)
+    assert Message._write is dt._ORIG_MESSAGE_WRITE
+    assert dt._patch_holders == 0
