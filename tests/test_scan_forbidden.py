@@ -36,7 +36,7 @@ from typing import Any
 
 import pytest
 
-from tests._growth import _growth_between
+from tests._cpu_clock import interleaved_thread_cpu
 
 #: pytest's param type, read from an instance rather than imported from pytest's private modules.
 ParameterSet = type(pytest.param(None))
@@ -2108,32 +2108,47 @@ def test_an_and_list_searches_a_bounded_window_before_each_identifier(
 #: The scaling check's step and line: a body ``_GROWTH_STEP`` times as large must take under
 #: ``_GROWTH_LINE`` times as long, where linear gives about 8 and quadratic about 64. It is kept
 #: for the two "and" lists only, as an end-to-end guard on the whole sentence path: the searches
-#: the counts above reach are not the only ones it runs. Measured 2026-11-24 on a 32-core Windows
-#: box, eight attempts per shape at 500 against 4000 identifiers: the shipped scanner read 4.7x to
-#: 9.2x, and _PR_MARK_BEFORE searched from the start of the sentence, put back by hand in a copy of
-#: the scanner, read 26.1x to 30.2x and 25.6x to 31.2x, at least 1.8 times the line. Under load an
-#: attempt of that defect read 11.9x, so the count above, not this ratio, is that defect's guard.
+#: the counts above reach are not the only ones it runs. Read on the thread CPU clock, 2026-11-24,
+#: on a 32-core Windows box, eight attempts per shape at 500 against 4000 identifiers. The shipped
+#: scanner read 7.3x to 8.6x. _PR_MARK_BEFORE searched from the start of the sentence, put back by
+#: hand in a copy of the scanner, read 26.1x to 35.3x and 28.7x to 31.4x. Its lowest reading is 1.9
+#: times the line. The count above stays that defect's guard; this ratio is the backstop.
 _GROWTH_STEP, _GROWTH_LINE = 8, 14.0
+
+
+def _cpu_growth(call: Callable[[str], object], small: str, large: str) -> float:
+    """Thread CPU per call of ``call`` on ``large`` over that on ``small``, the calls interleaved by
+    :func:`interleaved_thread_cpu`. Two calls of the large body at least, so its reading averages
+    the clock's 15.625 ms Windows tick over most of a second of CPU rather than one call."""
+    per_call = interleaved_thread_cpu(
+        {"small": lambda: call(small), "large": lambda: call(large)}, min_calls=2
+    )
+    return per_call["large"] / per_call["small"]
 
 
 def _growth_attempts(
     call: Callable[[str], object], small: str, large: str, line: float
 ) -> list[float]:
-    """How much longer ``call`` takes on ``large`` than on ``small``, one reading per attempt, each a
-    reading of :func:`_growth_between` with the collector off.
+    """How much longer ``call`` takes on ``large`` than on ``small``, one reading of
+    :func:`_cpu_growth` per attempt, with the collector off.
 
-    A ratio, not a number of seconds: a slow runner slows both sizes alike. A reading at or over
-    ``line`` is taken again, up to three attempts, and stops at the first under it, so the lowest
-    reading is the verdict and one preemption cannot fake a curve. The rule is
-    ``tests/test_ad_group_dn_only.py``'s ``_scaling_ratios``, with one round per attempt, not
-    three: a long sample here is up to about 0.8 s, and a round more doubles a test whose only
-    defence against load is the retry."""
+    THE THREAD'S CPU CLOCK, NOT WALL TIME. A loaded host takes the core away without charging this
+    thread, so preemption does not land on one size's sample: in one round of wall time, a review
+    run on a loaded box read the shipped scanner over the line in 4 of 16 readings. A ratio, not a
+    number of seconds, because a shared core still slows every instruction alike.
+
+    Both bodies are scanned once, untimed, first, so a freshly loaded scanner's first-call cost
+    lands in no sample. A reading at or over ``line`` is taken again, up to three attempts, and
+    stops at the first under it, so the lowest reading is the verdict. The rule is
+    ``tests/test_ad_group_dn_only.py``'s ``_scaling_ratios``."""
+    call(small)
+    call(large)
     readings: list[float] = []
     for _ in range(3):
         was_enabled = gc.isenabled()
         gc.disable()
         try:
-            readings.append(_growth_between(call, small, large, rounds=1))
+            readings.append(_cpu_growth(call, small, large))
         finally:
             if was_enabled:
                 gc.enable()
@@ -2166,7 +2181,7 @@ def test_the_growth_rule_stops_at_the_first_attempt_under_the_line(
     """The attempt loop: it stops at the first reading under the line and takes at most three. A
     reading of exactly the line is over it."""
     pending = iter(readings)
-    monkeypatch.setitem(globals(), "_growth_between", lambda *_a, **_k: next(pending))
+    monkeypatch.setitem(globals(), "_cpu_growth", lambda *_a, **_k: next(pending))
     assert _growth_attempts(len, "a", "aa", 14.0) == list(readings[:spent])
 
 
@@ -2184,7 +2199,7 @@ def test_the_linear_check_passes_on_any_attempt_under_the_line(
     """The same rule through :func:`_assert_linear`: it passes once any attempt reads under the line,
     and when none does it fails naming the lowest, which here is not the last."""
     pending = iter(readings)
-    monkeypatch.setitem(globals(), "_growth_between", lambda *_a, **_k: next(pending))
+    monkeypatch.setitem(globals(), "_cpu_growth", lambda *_a, **_k: next(pending))
     if failure is None:
         _assert_linear(len, _hard_wrapped, 2)
     else:
