@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5686 remainder: a pooled borrow abandoned by its caller is returned to the pool exactly
-once, whatever loop turn the cancel and the pool's hand-over land in.
+"""BACKLOG #5686 remainder: a pooled borrow abandoned by its caller is returned to the pool once,
+in the turn orders and driver shapes these tests drive (at least a plain hand-off future, a bare
+step after it, an inner task under a gather, and a driver that ignores the cancel).
 
 Driver-free and deterministic: a fake pool hands each connection over through a plain future and
 marks it in use at that instant (``checked_out`` is the ground truth for a stranded connection), and
-every test drives the loop turn by turn with ``asyncio.sleep(0)``. No timed sleep decides an outcome.
-Synthetic connection names only.
+the tests drive the loop turn by turn with ``asyncio.sleep(0)``. The tests that reach the cleanup
+bound set it to zero or lift it, so its real duration decides no outcome. Synthetic connection names
+only.
 """
 
 from __future__ import annotations
@@ -235,16 +237,22 @@ async def test_warm_borrow_taking_a_bare_step_after_the_hand_off_strands_nothing
     assert pool.released == pool.issued == ["conn-1"]
 
 
-async def test_acquire_pooled_borrow_on_a_gather_that_refuses_the_cancel_strands_nothing() -> None:
-    # The hand-off lands and the gather's child finishes before the caller's cancel is handled, so
-    # the gather future the borrow waits on is still pending but refuses the cancel. Task.cancel()
-    # would then throw the cancel in place of the gathered connection.
+@pytest.mark.parametrize("hand_over_first", [True, False], ids=["hand-over-first", "cancel-first"])
+async def test_acquire_pooled_borrow_on_a_gather_strands_nothing(hand_over_first: bool) -> None:
+    # Hand-over first: the gather's child finishes before the caller's cancel is handled, so the
+    # gather future the borrow waits on is still pending but refuses the cancel. Cancel first: the
+    # gather is pending and would accept the cancel, but passes it to a child whose hand-off has
+    # already resolved. Either way Task.cancel() would be thrown in place of the connection.
     pool = _HandOffPool(shape="gather")
     caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
     await _turns()
     assert len(pool.handoffs) == 1
-    pool.hand_over()
-    caller.cancel()
+    if hand_over_first:
+        pool.hand_over()
+        caller.cancel()
+    else:
+        caller.cancel()
+        pool.hand_over()
     with pytest.raises(asyncio.CancelledError):
         await caller
     assert await _until(lambda: not pool.checked_out), "the gathered connection was stranded"
@@ -270,3 +278,52 @@ async def test_acquire_pooled_holds_its_abandoned_borrow_until_it_ends() -> None
         assert pool.checked_out == []
     finally:
         await pool.unstick()
+
+
+async def test_acquire_pooled_cancels_a_borrow_that_never_parks() -> None:
+    # A driver that polls with bare yields is runnable on every look. The cancel is put off for a
+    # bounded number of turns and then lands, so the borrow ends instead of polling on.
+    steps = 0
+
+    class _PollingPool:
+        async def _poll(self) -> str:
+            nonlocal steps
+            while True:
+                steps += 1
+                await asyncio.sleep(0)
+
+        def acquire(self) -> object:
+            return self._poll()
+
+        async def release(self, conn: str) -> None:
+            raise AssertionError("nothing was handed over")
+
+    caller = asyncio.create_task(acquire_pooled(_PollingPool(), timeout=30.0, backend="stub"))
+    await _turns(5)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert getattr(base_module, "_BORROW_CANCEL_MAX_DEFERRALS", 0) < 100
+    await _turns(100)  # past the bound on deferring the cancel
+    settled = steps
+    await _turns(20)
+    assert steps == settled, "the borrow was never cancelled and is still polling"
+
+
+async def test_acquire_pooled_failed_hand_off_in_the_cancel_turn_logs_no_loop_error() -> None:
+    # The pool's hand-off fails in the same turn the caller is cancelled. Nothing was handed over,
+    # so the borrow is cancelled at once and ends cancelled; it does not end with the error, which
+    # the loop would report at ERROR as an exception in a shielded future.
+    loop = asyncio.get_running_loop()
+    errors: list[dict[str, object]] = []
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    pool = _HandOffPool()
+    caller = asyncio.create_task(acquire_pooled(pool, timeout=30.0, backend="stub"))
+    await _turns()
+    caller.cancel()
+    pool.handoffs[0].set_exception(ConnectionResetError("synthetic"))
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    await _turns()
+    assert errors == [], f"unexpected loop-level error(s): {errors}"
+    assert pool.checked_out == []
