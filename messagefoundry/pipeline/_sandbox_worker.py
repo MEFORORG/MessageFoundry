@@ -137,10 +137,14 @@ def _rlimit_data_counts_mmap() -> bool:
     ``major.minor`` digits are read, so a suffix on the minor, as in ``6.12-rc4`` or ``5.15-aws``,
     does not make a new kernel read as unknown (BACKLOG #6811)."""
     try:
-        release = os.uname().release  # type: ignore[attr-defined,unused-ignore]
+        uname = os.uname()  # type: ignore[attr-defined,unused-ignore]
     except AttributeError:
         return False
-    match = re.match(r"(\d+)\.(\d+)", release)
+    if uname.sysname != "Linux":
+        return False  # another kernel's numbering says nothing about Linux 4.7 semantics
+    # Bounded digit runs, so int() never meets a string too long to convert; a longer run reads
+    # as unparseable rather than as its first nine digits.
+    match = re.match(r"(\d{1,9})\.(\d{1,9})(?!\d)", uname.release)
     if match is None:
         return False
     return (int(match[1]), int(match[2])) >= (4, 7)
@@ -182,7 +186,8 @@ def _apply_resource_caps(mem_mb: int | None) -> str:
         rlimit, name = resource.RLIMIT_AS, "RLIMIT_AS"  # type: ignore[attr-defined,unused-ignore]
         baseline = 0
         log.warning(
-            "sandbox worker: no VmData in /proc/self/status, or a kernel older than Linux 4.7, so "
+            "sandbox worker: no VmData in /proc/self/status, or no Linux 4.7 or later read from the "
+            "kernel release, so "
             "[sandbox].mem_mb is an absolute RLIMIT_AS cap of %d MiB here, not headroom above the "
             "loaded graph",
             mem_mb,
