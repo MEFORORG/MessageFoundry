@@ -18,8 +18,9 @@ checks). Two checks are **required** (they can block a commit):
   ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
   ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
   to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
-  never a silent OFF (#230). The section-name refusal
-  (:class:`~messagefoundry.config.settings.SectionNameEnvError`) fails the leg instead.
+  never a silent OFF (#230). When the leg reaches the preview and a settings source resolves, the
+  section-name refusal (:class:`~messagefoundry.config.settings.SectionNameEnvError`) fails the leg
+  instead; with no source resolved nothing is loaded, so nothing is refused.
 
   **THAT PREVIEW GUARANTEE IS SCOPED TO ``snapshot_on_send``, AND ONE OTHER SETTING BREAKS IT.** The
   dry run ALWAYS executes Routers/Handlers **in-process**: :func:`messagefoundry.pipeline.dryrun.dry_run`
@@ -331,7 +332,8 @@ def run_checks(
     results = [
         _check_validate(config_dir, allow_empty=allow_empty_config),
         # Not tagged. Several of its arms read no settings, and its preview falls back to the model
-        # default when a load fails, so a tag here would claim a source the line may not rest on.
+        # default when most loads fail, so a tag here would claim a source the line may not rest
+        # on. Its section-name refusal line does rest on one and is untagged all the same.
         _check_dryrun(
             config_dir,
             messages_dir,
@@ -1934,7 +1936,6 @@ def _resolve_snapshot_on_send(
         return _load_check_settings(toml, env=env).pipeline.snapshot_on_send
     except SectionNameEnvError:
         raise  # why: SectionNameEnvError's docstring
-
     except _SETTINGS_LOAD_ERRORS:
         return PipelineSettings().snapshot_on_send
 

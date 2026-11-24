@@ -8,8 +8,8 @@ and the ``check`` dry-run leg read the file's ``[pipeline].snapshot_on_send``, a
 its transport and recipient-override checks against the file's ``[alerts]``. Read as an ordinary
 load error, the refusal sent each of them to its fallback. ``alert add`` was still refused later,
 by its post-write settings check, but its transport check first reported the wrong cause. These
-tests pin that the refusal is reported where it is met, and that any other load error still falls
-back as before.
+tests pin that the refusal is reported where it is met, and that an unknown-key refusal still falls
+back as before in the two preview helpers.
 
 Synthetic values only."""
 
@@ -241,6 +241,19 @@ def test_the_section_name_refusal_still_refuses_the_load() -> None:
     # Control: the #2600 behaviour holds, now as its own ValueError subclass.
     with pytest.raises(SectionNameEnvError, match="MEFOR_UPDATE_CHECK"):
         load_settings(environ={"MEFOR_UPDATE_CHECK": "false"}, default_file=False)
+
+
+@pytest.mark.parametrize("name", ["MEFOR_UPDATE_CHECK_", "MEFOR_STORE__"])
+def test_a_trailing_underscore_form_is_the_section_name_class(name: str) -> None:
+    with pytest.raises(SectionNameEnvError, match=name):
+        load_settings(environ={name: "x"}, default_file=False)
+
+
+def test_a_mixed_refusal_is_the_section_name_class() -> None:
+    environ = {"MEFOR_STORE": "x", "MEFOR_STORE_REQUIRE_ENCRYPTON": "x"}
+    with pytest.raises(SectionNameEnvError) as caught:
+        load_settings(environ=environ, default_file=False)
+    assert "MEFOR_STORE_REQUIRE_ENCRYPTON" in str(caught.value)
 
 
 def test_an_unknown_key_refusal_is_not_the_section_name_class() -> None:
