@@ -2354,7 +2354,10 @@ the same permission set on the same method reds CI until it is listed here.
 > console checks the rule before it calls in, and `audit_channel_denied` in
 > `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
 > the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
-> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031).
+> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031). At
+> least some refusals that name no channel by design, such as a channel-scoped caller's config
+> reload, carry `"operation"` in their detail, naming the operation refused; `DeniedOperation` in
+> the same file lists the values (vault BACKLOG #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -2703,18 +2706,14 @@ Approvals page keys on.
 
 **`GET /approvals` names at least some of the releases the gate refuses whoever approves them
 (vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
-on directly, so where it names a reason the two cannot disagree. It names at least a request with
-no requester id, an operation no longer registered, one dual control no longer gates, unreadable
-parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), a held reload whose parameters carry no config digest, or one not
-of the form the engine writes, which its release could only refuse whatever the directory holds
-(`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
-reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
-#3189). The requester's standing is read when the queue is listed, by the rule the release
-applies, so a change after the listing, or a standing the listing could not read, is met only at
-release. A `null` does not promise a release: at least the self-approval refusal,
-the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
-`PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
+on directly, so where it names a reason the two cannot disagree. `PendingApprovalInfo` in
+`messagefoundry/api/models.py` lists the values and what each means. One of them,
+`requester_not_authorized` (BACKLOG #3189), turns on the requester's standing, such as a held
+reload or purge whose requester has since been channel-scoped. That standing is read when the
+queue is listed, by the rule the release applies, so a change after the listing, or a standing
+the listing could not read, is met only at release. A `null` does not promise a release: at least
+the self-approval refusal, the expiry, the dwell floor, the row's seal and the operation's own
+refusals are met only then. The console's Approvals
 page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused

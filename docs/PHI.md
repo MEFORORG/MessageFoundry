@@ -745,7 +745,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    the retention prune and the per-uploader quota, and cannot be deleted through the API**, because
    each of those must read its metadata first. They refuse it on purpose: a plaintext sidecar is not
    bound to its path, so trusting it would let a planted one name another upload for the prune to
-   delete, lift a quota with a negative size, or fail every save. `rotate-key` stamps the key's rotation date only when the key
+   delete, lift a quota with a negative size, or fail every save. At least one kind `rotate-key`
+   never seals is the exception, kept inside retention another way, as the paragraph on that kind
+   below says. `rotate-key` stamps the key's rotation date only when the key
    actually changed, so running it with the same key to seal uploads does not reset the key-age
    clock. It also writes no stamp, and exits non-zero, when it skipped an upload or its audit-chain
    step did not complete (BACKLOG #3181). **It refuses a configured `uploads_dir` it cannot list
