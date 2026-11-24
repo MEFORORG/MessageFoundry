@@ -507,7 +507,7 @@ async def test_the_capture_sees_the_planted_uid_and_the_pre_reads_copy_without_t
 
 
 def test_the_line_shapes_the_filter_reads_are_still_pynetdicoms_and_pydicoms() -> None:
-    """Read against pynetdicom 3.0.4 and pydicom 3.0.2. A reworded line would pass the filter whole."""
+    """Read against pynetdicom 3.0.4 and pydicom 3.0.2."""
     import inspect
 
     from pydicom import misc, valuerep

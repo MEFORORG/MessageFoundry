@@ -334,15 +334,24 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
 - **Count-and-log.** Every received object is persisted with a disposition — never accepted-and-dropped; a
   malformed/non-DICOM body dead-letters as `ERROR` (fail-loud).
 - **PHI.** A DICOM object is PHI (header + pixel data). It is stored through the encrypting store, **never logged
-  at INFO+**, and egress-allowlisted. Every log/error line carries only **routing-safe identifiers** (SOP
-  class/instance UID, AE title, peer host) or a redacted URL — never the dataset, an element value, or pixel data.
+  at INFO+**, and egress-allowlisted. Within the limits this section lists, every log/error line carries only
+  **routing-safe identifiers** (SOP class/instance UID, AE title, peer host) or a redacted URL — never the
+  dataset, an element value, or pixel data.
   The rule holds for pynetdicom's and pydicom's own loggers too (owner ruling 2026-11-03, BACKLOG #5081). A
   UID or AE title a peer sent that either library refuses or flags as non-conformant is not a routing-safe
   identifier. The DICOM transport applies that rule by default-deny on
-  every `pynetdicom.*` and `pydicom` logger, at every level (BACKLOG #6637). A line is written only if it is one of
-  the value-free lines or fully matches one of the templates pinned in
-  `messagefoundry/transports/_dicom_log_lines.py`. Anything else is withheld: the record then names its logger,
-  its level and any exception class, with a fixed note, and none of its message or arguments. On a pinned line
+  every `pynetdicom.*` and `pydicom` logger, at every level (BACKLOG #6637).
+
+  **The rule, stated once here.** Where the screen applies, a library log line is written if it is one of the
+  value-free lines or fully matches one of the templates, both pinned in
+  `messagefoundry/transports/_dicom_log_lines.py`, and is withheld otherwise. A withheld line is replaced by its
+  logger name, its level, a fixed note and, where the record carries an exception, that exception's class name,
+  and none of its message or arguments. A screened record's traceback is written where it renders, with its
+  frames and exception class names, since those are code, and with each exception's message screened by the
+  same rule: a message that would be withheld reads `[message withheld]`. Each exception's notes and group
+  members are not written. The rule's limits, at least: those under *How far it reaches*, *The screen assumes a library exception's class behaves as
+  ordinary Python* and *A library exception the SCU does not wrap keeps its text* below, and the known limits
+  listed beside the pin tests. On a pinned line
   the fixed text stays and the value reads `[redacted]` where the library is refusing or flagging it. The UID and AE
   title fields of pynetdicom's DEBUG dumps stay only where they pass `_kept` in
   `messagefoundry/transports/dicom.py`, the source of record: at least an empty value; a conformant UID; a name in
@@ -370,8 +379,7 @@ numpy**), lazily imported so a SQLite-only install and a console peek-import sta
   `logging_setup` handler are all covered. A host that replaces the record factory without calling the one it
   found leaves a logger outside the named list unscreened until the next SCP start, C-STORE or SCU association puts
   the factory back. A record built by hand and given straight to a handler passes neither. Neither library sets
-  `propagate = False` on a logger of its own. A traceback's frames and exception class names are written, since
-  they are code. An `Exception` raised while the screen reads a line withholds that line, and one raised while it
+  `propagate = False` on a logger of its own. An `Exception` raised while the screen reads a line withholds that line, and one raised while it
   renders the traceback withholds the traceback. Matching is linear in the line's length.
 
   A delivery error raised while the SCU stores an object holds, on its chain, at most an engine exception that
