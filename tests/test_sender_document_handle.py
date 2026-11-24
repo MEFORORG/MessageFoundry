@@ -23,8 +23,10 @@ Synthetic HL7 only.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import logging
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,7 @@ from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.binary import (
+    _LATER_HEADER_FORMS_LIMIT,
     DOC_REF_MARKER,
     DOC_TOMBSTONE_MARKER,
     InboundDocRefError,
@@ -55,7 +58,7 @@ from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from tests._log_absence import assert_capture_sees
+from tests._log_absence import assert_no_records
 
 DEST = "OB_PARTNER"
 
@@ -783,22 +786,198 @@ async def test_an_edit_and_resend_child_delivers_the_origins_document(
 
 def _batch(msh2: str, obx5_5: str) -> str:
     """An FHS/BHS-led batch whose header keeps the default delimiters while its one MSH names
-    ``msh2``. ``Message.set`` escapes a value by the MSH's delimiters, not the batch header's."""
+    ``msh2``. The parser splits every line on the batch header's delimiters, and ``Message.set``
+    escapes by them too (BACKLOG #5972)."""
     return (
         "FHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r"
         "BHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r" + _hl7(obx5_5, msh2=msh2)
     )
 
 
-def test_the_gate_opens_when_a_batch_msh2_escapes_the_marker() -> None:
+def test_a_batch_escapes_by_its_header_not_by_its_msh() -> None:
+    """BACKLOG #5972: every line of a batch is split on the delimiters of its first line, so
+    ``Message.set`` escapes by the batch header's, not by an MSH's that names ``:``: the handle is
+    written raw, which the gate's substring test finds. The gate still opens on a batch whose
+    first MSH names a marker character, since a Handler may have written that MSH under its own."""
     handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
     msg = Message.parse(_batch(":~\\&", _b64(10)))
     msg.set("OBX-5.5", handle)
     payload = msg.encode()
     assert payload.startswith("FHS")
-    assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped here
+    assert DOC_REF_MARKER in payload
     assert may_hold_doc_ref(payload)
+    assert may_hold_doc_ref(_batch(":~\\&", _b64(10)))
     assert not may_hold_doc_ref(_batch("^~\\&", _b64(10)))
+
+
+def test_the_gate_opens_when_a_batch_header_escapes_the_marker() -> None:
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    raw = "FHS|:~\\&|APP|FAC|RCV|RCVF|20260101120000\r" + _hl7(_b64(10), msh2="^~\\&")
+    msg = Message.parse(raw)
+    msg.set("OBX-5.5", handle)
+    payload = msg.encode()
+    assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped by the FHS's ":"
+    assert may_hold_doc_ref(payload)
+
+
+async def test_an_envelope_around_an_msh_written_under_its_own_delimiters_is_refused() -> None:
+    """A Handler may wrap an encoded MSH-led payload, whose ``:`` escaped the engine's handle, in an
+    FHS envelope of ordinary delimiters. The message then reads under the envelope's, where the
+    escaped handle is no handle, so the gate opens on the inner MSH and the re-attach refuses the
+    payload rather than send the handle unresolved (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    inner = Message.parse(_hl7(_b64(10), msh2=":~\\&"))
+    inner.set("OBX-5.5", handle)
+    payload = "FHS|^~\\&|APP|FAC\r" + inner.encode()
+    assert DOC_REF_MARKER not in payload
+    assert may_hold_doc_ref(payload)
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+    # The control: the same envelope around an ordinary MSH is carried as it is.
+    plain = "FHS|^~\\&|APP|FAC\r" + _hl7(_b64(10))
+    assert await reattach_documents_in_hl7(plain, _no_read, bound=frozenset()) == plain
+
+
+def _escaped_handle_under(header: str, msh2: str = "^~\\&") -> str:
+    """``header`` and an MSH-led message under ``msh2``, parsed together, with an engine handle
+    set into ``OBX-5.5``: the handle is escaped by the first line's delimiters, which the parse
+    reads every line under. The marker is not in the result's raw text."""
+    msg = Message.parse(header + _hl7(_b64(10), msh2=msh2))
+    msg.set("OBX-5.5", make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application"))
+    encoded = msg.encode()
+    assert DOC_REF_MARKER not in encoded
+    return encoded
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # A second MSH, past an ordinary first one, that escaped the handle.
+        "FHS|^~\\&|APP|FAC\r" + _hl7(_b64(10)) + _escaped_handle_under("", ":~\\&"),
+        # A BHS naming ":" inside an ordinary FHS, its own MSH ordinary.
+        "FHS|^~\\&|APP|FAC\r" + _escaped_handle_under("BHS|:~\\&|APP|FAC\r"),
+        # The same BHS after an ordinary MSH-led message.
+        _hl7(_b64(10)) + _escaped_handle_under("BHS|:~\\&|APP|FAC\r"),
+    ],
+    ids=["second-msh", "bhs-in-fhs", "bhs-after-msh"],
+)
+async def test_a_handle_escaped_under_any_later_header_opens_the_gate(payload: str) -> None:
+    """R2-3 of the round-2 review: the gate read only the leading header and the first MSH, so a
+    handle escaped under a later header passed it and reached the wire unresolved. Every header
+    line is now read, and the re-attach refuses the payload (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    assert may_hold_doc_ref(payload)
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+
+
+async def test_a_bare_marker_under_a_later_header_is_judged_as_a_copy() -> None:
+    """A bare marker under an inner header's delimiters, in a message that holds no document and
+    names no content address, is carried as text, as the same bare marker under the first line's
+    is; one naming an address is refused (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    inner = Message.parse("MSH|:~\\&|APP|FAC\rNTE|1\r")
+    inner.set("NTE-3.1", DOC_REF_MARKER)
+    bare = _hl7(_b64(10)) + inner.encode()
+    assert DOC_REF_MARKER not in bare
+    assert await reattach_documents_in_hl7(bare, _no_read, bound=frozenset()) == bare
+    inner.set("NTE-3.1", make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application"))
+    addressed = _hl7(_b64(10)) + inner.encode()
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(addressed, _no_read, bound=frozenset())
+
+
+def test_the_detach_refuses_a_marker_escaped_under_a_later_header() -> None:
+    """Delivery refuses a handle marker escaped under a later header's delimiters once the message
+    holds a document, so the detach refuses that body before the ACK rather than store the
+    document and dead-letter the row on every outbound (BACKLOG #5972)."""
+    inner = Message.parse("BHS|:~\\&|A\rNTE|1\r")
+    inner.set("NTE-3.1", DOC_REF_MARKER)
+    body = _hl7(_b64(2000)) + inner.encode()
+    assert DOC_REF_MARKER not in body
+    with pytest.raises(InboundDocRefError):
+        next(iter_obx_documents(Message.parse(body), received=body))
+    # The control: the same body with no inner marker is detached.
+    plain = _hl7(_b64(2000)) + "BHS|:~\\&|A\rNTE|1\r"
+    assert [occ for occ, _v, _t in iter_obx_documents(Message.parse(plain), received=plain)] == [1]
+
+
+def test_an_obx_document_under_a_colliding_short_msh2_is_not_reported_absent() -> None:
+    """Under ``MSH|~|`` no OBX-5 component reads where it was written, so the extract raised a
+    BinaryCarriageError a Handler may skip, and every document was dropped with no trace. It now
+    raises CollidingDelimitersRefused, a ValueError, which escapes such a skip (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import (
+        BinaryCarriageError,
+        CollidingDelimitersRefused,
+        extract_obx_document,
+    )
+
+    message = Message.parse(_hl7(_b64(10), msh2="~"))
+    with pytest.raises(CollidingDelimitersRefused, match="cannot be read as written") as caught:
+        extract_obx_document(message)
+    assert not isinstance(caught.value, BinaryCarriageError)
+    assert extract_obx_document(Message.parse(_hl7(_b64(10)))) == b"P" * 10
+
+
+@pytest.mark.parametrize("occurrence", [1, 2], ids=["not-ed", "absent"])
+def test_a_colliding_message_with_no_obx_document_is_refused_as_any_message_is(
+    occurrence: int,
+) -> None:
+    """Review finding 3: the extract refused a colliding message before it read OBX-2, so a
+    message with no OBX document there met the header refusal, where any other message meets
+    the BinaryCarriageError a Handler skips. Only an OBX whose OBX-2 is ED is refused for the
+    header now (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import (
+        BinaryCarriageError,
+        CollidingDelimitersRefused,
+        extract_obx_document,
+    )
+
+    message = Message.parse(_hl7(_b64(10), msh2="~").replace("|ED|", "|TX|", 1))
+    with pytest.raises(BinaryCarriageError, match="not 'ED'") as caught:
+        extract_obx_document(message, occurrence=occurrence)
+    assert not isinstance(caught.value, CollidingDelimitersRefused)
+
+
+def test_the_retention_strip_leaves_a_body_it_cannot_write(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stored body whose short MSH-2 leaves its separators not distinct cannot be written, so the
+    strip returns it unchanged, as its contract says, rather than raise, and reports it through
+    ``on_unwritable`` once (BACKLOG #5972). The codec logs nothing itself."""
+    from messagefoundry.parsing.binary import strip_documents
+
+    calls: list[str] = []
+    with caplog.at_level(logging.DEBUG):
+        for msh2 in ("^~&", "~"):
+            body = _hl7(_b64(2000), msh2=msh2)
+            assert strip_documents(
+                body, pruned_at=0.0, on_unwritable=functools.partial(calls.append, msh2)
+            ) == (body, 0, 0)
+        assert calls == ["^~&", "~"]
+        # The control: a readable body is stripped and reported as nothing.
+        body = _hl7(_b64(2000))
+        report = functools.partial(calls.append, "readable")
+        assert strip_documents(body, pruned_at=0.0, on_unwritable=report)[1] == 1
+        assert calls == ["^~&", "~"]
+        # The codec defines no logger of its own, so the whole parsing tree is probed, inside the
+        # act's capture and at its level (vault BACKLOG #3766 items 27 and 28).
+        assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
+
+
+def test_the_gate_reads_a_header_line_only_to_its_end() -> None:
+    """F13 of the round-1 review: a header's separator read stopped at eight characters, not at
+    the end of the line, so a short header took a separator from the next line, as the parser
+    never does."""
+    # "MSH|^~" then a line break: the parser fills "\\" and "&", neither a marker character; the
+    # next line's ":" is not a separator of this header.
+    assert not may_hold_doc_ref("MSH|^~\r:BC|1\r")
+    # The control: the same character inside the header line opens the gate.
+    assert may_hold_doc_ref("MSH|^:\rABC|1\r")
 
 
 async def test_a_hex_escaped_handle_cannot_offset_a_copy_left_live(store: MessageStore) -> None:
@@ -1547,30 +1726,22 @@ def test_the_dry_run_refuses_the_marker_as_the_listeners_do(msh2: str, refused: 
         assert result.error != DOC_REF_MARKER_REFUSED_REASON
 
 
-async def test_a_raw_marker_under_a_short_msh2_is_refused_at_both_listeners(
+async def test_a_raw_marker_under_a_short_msh2_is_judged_by_the_filled_delimiters(
     store: MessageStore,
 ) -> None:
-    """``Message._encoding_chars`` names no delimiters for a three-character MSH-2, though the
-    parser fills the fourth in. Delivery refuses a raw marker under such a header, so the
-    listeners refuse it before the ACK rather than ACK it and dead-letter it (BACKLOG #5099). The
-    same header with no marker is accepted as before."""
-    from messagefoundry.transports.receipt import RefusalKind
-
+    """A three-character MSH-2 is read under the delimiters the parser fills for it, which hold no
+    base64 character, so a raw marker under it is judged as under ``^~\\&``: accepted, as delivery
+    now reads it the same way (BACKLOG #5972; it was refused before the ACK under BACKLOG #5099,
+    when every ``Message`` read of such a header raised)."""
     head = "MSH|^~\\|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|MSGID003|P|2.5\r"
     ic = _plain_ic()
     runner = _runner(store, ic)
 
     marked = (head + f"NTE|1||{DOC_REF_MARKER}x\r").encode("utf-8")
-    assert _ack_code(await runner._handle_inbound(ic, marked)) == "AR"
-    assert (await runner._handle_inbound_http(ic, marked)).refusal is RefusalKind.PERMANENT
+    assert _ack_code(await runner._handle_inbound(ic, marked)) == "AA"
     plain = (head + "NTE|1||plain\r").encode("utf-8")
     assert _ack_code(await runner._handle_inbound(ic, plain)) == "AA"
-
-    rows = await _rows(store, ic.name)
-    errors = [str(r["error"]) for r in rows if r["status"] == MessageStatus.ERROR.value]
-    assert len(errors) == 2
-    assert all(e.endswith(DOC_REF_MARKER_REFUSED_REASON) for e in errors)
-    assert await _ingress_count(store, ic.name) == 1
+    assert await _ingress_count(store, ic.name) == 2
 
 
 # --- a document is detached only if the splice sets it back verbatim (BACKLOG #5099) ----------
@@ -1758,145 +1929,115 @@ def test_the_splice_check_is_linear_on_a_hostile_value() -> None:
         assert time.perf_counter() - started < 2.0
 
 
-#: A streaming body with a document under a three-character MSH-2, ``^~\\``. ``Message`` reads
-#: no delimiters from it, so every ``OBX-5.5`` read raises.
+#: A streaming body with a document under a three-character MSH-2, ``^~\\``. The parser fills
+#: the missing subcomponent separator with ``&``, and ``Message`` reads under that (BACKLOG #5972).
 _SHORT_MSH2_DOCUMENT = _hl7(_b64(2000), msh2="^~\\")
 
 
-def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> None:
-    from messagefoundry.parsing.binary import UnreadableDelimitersError
-
+def test_the_detach_scan_reads_a_body_under_the_delimiters_the_parser_filled() -> None:
+    """BACKLOG #5972: a three-character MSH-2, and an FHS header with no MSH, are read under the
+    delimiters the parser read from the first line, so the detach scan yields the document rather
+    than refusing every ``OBX-5.5`` read."""
     message = Message.parse(_SHORT_MSH2_DOCUMENT)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        message._encoding_chars()
-    scan = iter_obx_documents(message, received=_SHORT_MSH2_DOCUMENT)
-    with pytest.raises(UnreadableDelimitersError) as caught:
-        next(scan)
-    assert "^~" not in str(caught.value)
-    # The stored reason names the one cause this body has, not "no MSH" beside it.
-    assert str(caught.value).startswith("its first MSH's MSH-2 is shorter than four characters")
-    # The separator read's refusal quotes MSH-1 and MSH-2; none of it rides on the chain.
-    assert caught.value.__cause__ is None and caught.value.__context__ is None
-    # With no MSH at all, the reason says so instead.
-    batch = "FHS|MSH|A\r" + _SHORT_MSH2_DOCUMENT[_SHORT_MSH2_DOCUMENT.index("OBX|") :]
-    with pytest.raises(UnreadableDelimitersError, match="^the body has no MSH,"):
-        next(iter_obx_documents(Message.parse(batch), received=batch))
+    assert message._encoding_chars() == ("|", "^", "~", "\\", "&")
+    assert [
+        occ for occ, _b64, _type in iter_obx_documents(message, received=_SHORT_MSH2_DOCUMENT)
+    ] == [1]
+    batch = "FHS|^~\\&|A\r" + _SHORT_MSH2_DOCUMENT[_SHORT_MSH2_DOCUMENT.index("OBX|") :]
+    assert [
+        occ for occ, _b64, _type in iter_obx_documents(Message.parse(batch), received=batch)
+    ] == [1]
 
 
-def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> None:
-    """The over-threshold detach stores such a body as an ``ERROR`` row, and a smaller one is
-    ingested as before. The retention pass calls ``strip_documents`` on each stored body with no
-    ``try``, so it must leave this one as it is rather than raise, or one row would abort the pass
-    on every run (BACKLOG #5099)."""
-    from messagefoundry.parsing.binary import strip_documents
-
-    body = _SHORT_MSH2_DOCUMENT
-    assert "OBX" in body and body.startswith("MSH")
-    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
-    # A batch header with no MSH passes the strip's "MSH" in the first eight characters gate, and
-    # its separators cannot be read either.
-    batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
-    assert strip_documents(batch, pruned_at=0.0) == (batch, 0, 0)
-    # The control: the same document under a full MSH-2 is stripped.
-    readable = _hl7(_b64(2000))
-    stripped, documents, _reclaimed = strip_documents(readable, pruned_at=0.0)
-    assert documents == 1 and stripped != readable
-
-
-def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
+def test_the_retention_strip_strips_a_body_under_the_delimiters_the_parser_filled(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A row the strip skips because its delimiters cannot be read keeps any document past the
-    strip window, so ``strip_documents`` reports the skip through ``on_unreadable`` for the store
-    to log against the row (BACKLOG #5099). The codec logs nothing itself. A readable body, and a
-    body with no OBX, are not reported: the controls that the call marks this skip alone."""
+    """The retention pass strips the document of a short-MSH-2 body as it strips any other, where
+    it used to skip the row and leave the document past its strip window (BACKLOG #5972). The codec
+    logs nothing on that path, or on a body with no OBX."""
     from messagefoundry.parsing.binary import strip_documents
-
-    calls: list[str] = []
-
-    def report() -> None:
-        calls.append("unreadable")
 
     with caplog.at_level(logging.DEBUG):
-        assert strip_documents(_hl7(_b64(2000)), pruned_at=0.0, on_unreadable=report)[1] == 1
-        assert strip_documents("MSH|^~|A\rPID|1\r", pruned_at=0.0, on_unreadable=report)[1] == 0
-        assert calls == []
         body = _SHORT_MSH2_DOCUMENT
-        assert strip_documents(body, pruned_at=0.0, on_unreadable=report) == (body, 0, 0)
-        assert calls == ["unreadable"]
-        batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
-        assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
-        assert calls == ["unreadable", "unreadable"]
-    assert_capture_sees(caplog, "messagefoundry.parsing.binary")
-    assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
+        stripped, documents, _reclaimed = strip_documents(body, pruned_at=0.0)
+        assert documents == 1 and stripped != body
+        assert strip_documents("MSH|^~|A\rPID|1\r", pruned_at=0.0)[1] == 0
+        # The whole parsing tree, inside the capture at its level (vault BACKLOG #3766 items 27
+        # and 28).
+        assert_no_records(caplog, "messagefoundry.parsing", lambda r: True, logging.DEBUG)
 
 
-def test_the_retention_strip_contains_any_fault_in_the_separator_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unlike the detach, which lets a ``ValueError`` subclass from the separator read out, the
-    retention strip contains it, as it contains a parse failure: one row must not end the pass."""
-    from messagefoundry.parsing.binary import strip_documents
-
-    class _Fault(ValueError):
-        pass
-
-    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
-        raise _Fault("not the header")
-
-    body = _hl7(_b64(2000))
-    monkeypatch.setattr(Message, "_encoding_chars", _raise)
-    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
-
-
-def test_another_fault_in_the_separator_read_is_not_blamed_on_the_header(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only the separator read's own refusal, a bare ``ValueError``, is the sender's header; a
-    subclass from that read is some other fault and escapes as itself."""
-    from messagefoundry.parsing.binary import UnreadableDelimitersError
-
-    class _Fault(ValueError):
-        pass
-
-    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
-        raise _Fault("not the header")
-
-    message = Message.parse(_hl7(_b64(2000)))
-    monkeypatch.setattr(Message, "_encoding_chars", _raise)
-    with pytest.raises(_Fault) as caught:
-        next(iter_obx_documents(message, received=""))
-    assert not isinstance(caught.value, UnreadableDelimitersError)
-
-
-async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_before_the_ack(
-    store: MessageStore,
-) -> None:
-    """A streaming body over the threshold whose MSH-2 is shorter than four characters, with no
-    marker for the listener's check to find: the detach's OBX reads raised a plain ValueError
-    that neither listener records. It is refused by name instead, with an ERROR row, an AR on
-    MLLP, a permanent refusal on HTTP and nothing stored (BACKLOG #5099)."""
-    from messagefoundry.transports.receipt import RefusalKind
-
+async def test_a_streaming_short_msh2_body_is_detached_and_acked(store: MessageStore) -> None:
+    """BACKLOG #5972: a streaming body over the threshold whose MSH-2 is shorter than four
+    characters is read under the parser's filled delimiters, so it is detached and ACKed AA, where
+    the detach used to refuse it with an ERROR row and AR."""
     body = _SHORT_MSH2_DOCUMENT
-    assert DOC_REF_MARKER not in body
     ic = _streaming_ic()
     assert len(body) >= (ic.stream_threshold_bytes or 0)
     runner = _runner(store, ic)
 
-    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
-    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    assert await _attachment_count(store) == 1
+    assert await _ingress_count(store, ic.name) == 1
 
+
+async def test_a_short_msh2_document_is_spliced_back_byte_identical(store: MessageStore) -> None:
+    """F14 of the round-1 review: the partner gets the very short-MSH-2 body the sender sent,
+    the header left short, after the detach and the re-attach (BACKLOG #5972)."""
+    body = _hl7(_EVERY_BASE64_CHARACTER, msh2="^~\\")
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    cur = await store._db.execute("SELECT raw FROM messages WHERE channel_id=?", (ic.name,))
+    row = await cur.fetchone()
+    assert row is not None
+    skeleton = str(row[0])
+    assert skeleton.startswith("MSH|^~\\|")
+    handle = Message.parse(skeleton).field("OBX-5.5") or ""
+    assert is_doc_ref(handle)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    await _deliver_holding(store, runner, skeleton, parse_doc_ref(handle)[0])
+
+    assert col.deliveries == [body]
+
+
+#: A streaming body with a document whose MSH-2, ``^~&``, declares ``&`` as the escape character,
+#: which the parser also fills the subcomponent separator with, so no write to it can be read
+#: back. Its OBX-5 still reads as five components, so the document is found.
+_COLLIDING_MSH2_DOCUMENT = _hl7(_b64(2000), msh2="^~&")
+
+
+async def test_a_document_under_a_colliding_short_msh2_is_refused_before_anything_is_stored(
+    store: MessageStore,
+) -> None:
+    """The detach would have to write its handle into such a body, which ``Message`` refuses, so
+    the body is refused before the ACK with nothing stored, where it would otherwise store the
+    document and then fail on the write (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    message = Message.parse(_COLLIDING_MSH2_DOCUMENT)
+    with pytest.raises(CollidingDelimitersError):
+        next(iter_obx_documents(message, received=_COLLIDING_MSH2_DOCUMENT))
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    ack = await runner._handle_inbound(ic, _COLLIDING_MSH2_DOCUMENT.encode("utf-8"))
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "MSH-2 shorter than four characters" in ack
-    assert receipt.refusal is RefusalKind.PERMANENT
-    rows = await _rows(store, ic.name)
-    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
-    assert all(
-        "streaming detach failed: UnreadableDelimitersError" in str(r["error"]) for r in rows
-    )
+    assert ack is not None and "MSH-2 default collides with a delimiter" in ack
     assert await _attachment_count(store) == 0
     assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_a_handle_under_a_colliding_short_msh2_is_refused_by_the_re_attach() -> None:
+    """A payload whose header leaves two delimiters one character cannot take the splice, so the
+    re-attach refuses it permanently rather than fail on the write (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    payload = _hl7(handle, msh2="^~&")
+    with pytest.raises(UnreattachableDocumentError, match="fills a delimiter it does not name"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
 async def test_an_ordinary_base64_document_is_detached_and_spliced_back_byte_identical(
@@ -1953,3 +2094,845 @@ async def test_a_fault_in_the_marker_check_records_error_and_naks_at_both_listen
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
     assert all("peek read failed (IndexError)" in str(r["error"]) for r in rows)
     assert await _ingress_count(store, ic.name) == 0
+
+
+# --- PR 3135 findings B13b and B13g (BACKLOG #5972) ------------------------------------------
+
+#: A streaming ED body a sender wrote with ``^`` components under a header of ``MSH|~|``: ``~``
+#: is declared the component separator and filled in as the repetition one, so no OBX-5
+#: component reads where it was written and the scan finds no document there.
+_TILDE_HEADER_DOCUMENT = _hl7(_b64(2000)).replace("MSH|^~\\&|", "MSH|~|", 1)
+
+
+def test_the_detach_scan_refuses_an_ed_claim_under_a_colliding_header_it_cannot_read() -> None:
+    """B13b: the scan found no document under ``MSH|~|`` and so did not refuse, where a refusal
+    of every short MSH-2 turned the body away. The OBX-2 ``ED`` claim is now refused."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    body = _TILDE_HEADER_DOCUMENT
+    assert body.startswith("MSH|~|")
+    with pytest.raises(CollidingDelimitersError):
+        next(iter_obx_documents(Message.parse(body), received=body))
+    # The control: the same header over a message with no ED claim is read, not refused.
+    no_claim = "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\rOBX|1|TX|||text\r"
+    assert list(iter_obx_documents(Message.parse(no_claim), received=no_claim)) == []
+
+
+async def test_a_streaming_ed_body_under_a_colliding_header_it_cannot_read_is_refused(
+    store: MessageStore,
+) -> None:
+    """B13b: such a body was ACKed AA and stored with its document undetached. It is refused
+    before the ACK with an ERROR row, nothing stored and nothing queued, as origin/main refused
+    every OBX under a short MSH-2."""
+    ic = _streaming_ic()
+    body = _TILDE_HEADER_DOCUMENT
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "MSH-2 default collides with a delimiter" in ack
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_the_http_listener_refuses_a_streaming_ed_body_under_a_colliding_header_too(
+    store: MessageStore,
+) -> None:
+    """B13b on the receipt listener, which catches the detach's refusals on its own path."""
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    from messagefoundry.transports.receipt import RefusalKind
+
+    receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_DOCUMENT.encode("utf-8"))
+
+    assert receipt.refusal is RefusalKind.PERMANENT
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_no_address_is_named_for_a_handle_under_a_colliding_header() -> None:
+    """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle under a colliding header,
+    which the re-attach refuses whatever it names, so a child carrying it was linked to a document
+    its delivery can never send. origin/main named none under any short MSH-2; under a colliding
+    one it now names none again."""
+    from messagefoundry.parsing.binary import (
+        UnreattachableDocumentError,
+        doc_ref_addresses_in_hl7,
+        reattach_documents_in_hl7,
+    )
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    # ``^~&``: the OBX-5 components still read, so the handle is read as one.
+    payload = _hl7(make_doc_ref(ref, "Application"), msh2="^~&")
+    with pytest.raises(UnreattachableDocumentError, match="fills a delimiter it does not name"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset({ref}))
+    assert doc_ref_addresses_in_hl7(payload) == frozenset()
+    assert attachments_named([ref], payload) == []
+
+
+def test_an_address_is_still_named_for_a_handle_the_re_attach_resolves() -> None:
+    """The control for B13g: an ordinary handle is still named, so no deliverable reference is
+    lost and the child keeps the document its delivery sends."""
+    from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    payload = _hl7(make_doc_ref(ref, "Application"))
+    assert doc_ref_addresses_in_hl7(payload) == frozenset({ref})
+    assert attachments_named([ref], payload) == [ref]
+
+
+# --- PR 3135 review round-103403be: a handle under a colliding header (BACKLOG #5972) ----------
+
+_HIDDEN_HANDLE = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+
+#: A body with no ED claim whose OBX carries a sender's handle where its OBX-5.5 would be, under
+#: ``MSH|~|``, which hides every OBX-5 component; an NTE pads it past the streaming threshold.
+_TILDE_HEADER_HANDLE = (
+    "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
+    f"OBX|1|TX|PDF||^Application^PDF^Base64^{_HIDDEN_HANDLE}||||||F\r"
+    f"NTE|1||{'Q' * 600}\r"
+)
+
+#: The control: the same body with no marker anywhere in it.
+_TILDE_HEADER_NO_MARKER = _TILDE_HEADER_HANDLE.replace(_HIDDEN_HANDLE, "plain text", 1)
+
+_HIDDEN_MARKER_BODIES = {
+    "handle": _TILDE_HEADER_HANDLE,
+    "bare-marker": _TILDE_HEADER_HANDLE.replace(_HIDDEN_HANDLE, f"see {DOC_REF_MARKER}x", 1),
+    # ``:`` is the field separator, so the marker is escaped; ``~`` is declared the component
+    # separator and filled in as the repetition one.
+    "escaped": (
+        "MSH:~:APP:FAC:RCV:RCVF:20260101120000::MDM~T02:MSGID001:P:2.5\r"
+        "OBX:1:TX:PDF::^Application^PDF^Base64^mfdoc\\F\\v1\\F\\ref\\F\\"
+        f"{hashlib.sha256(b'x').hexdigest()}\\F\\Application\r"
+    ),
+    "field-separator-collision": (
+        "MSH^^APP^FAC^RCV^RCVF^20260101120000^^MDM~T02^MSGID001^P^2.5\r"
+        f"OBX^1^TX^PDF^^x~Application~PDF~Base64~{_HIDDEN_HANDLE}\r"
+    ),
+    # Escaped only by a later header's ``:``, so the first line's forms miss it.
+    "later-header": (
+        "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
+        "BHS|:~\\&|A\rNTE|1||mfdoc\\S\\v1\\S\\ref\\S\\"
+        f"{hashlib.sha256(b'x').hexdigest()}\\S\\Application\r"
+    ),
+}
+
+
+@pytest.mark.parametrize("body", _HIDDEN_MARKER_BODIES.values(), ids=_HIDDEN_MARKER_BODIES.keys())
+def test_the_listener_check_refuses_the_marker_under_a_colliding_header(body: str) -> None:
+    """F1: the check both listeners, the dry-run and the re-ingress run refuses each shape, the
+    marker escaped only by a later header included; the control body is not refused."""
+    from messagefoundry.parsing.binary import _received_holds_marker
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    if "BHS|" in body:
+        assert not _received_holds_marker(Message.parse(body), body)  # a later header's form only
+    assert doc_ref_marker_refusal(Peek.parse(body), body) == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    control = _TILDE_HEADER_NO_MARKER
+    assert doc_ref_marker_refusal(Peek.parse(control), control) is None
+
+
+@pytest.mark.parametrize("body", _HIDDEN_MARKER_BODIES.values(), ids=_HIDDEN_MARKER_BODIES.keys())
+def test_the_detach_scan_refuses_the_marker_under_a_colliding_header_with_no_ed_claim(
+    body: str,
+) -> None:
+    """F1: the header hides OBX-5.5, so the per-OBX read found no handle, and with no ED claim
+    nothing was refused, so a streaming body was ACKed AA; where the marker named a content
+    address, delivery then refused it on every outbound. The marker in the received text, raw or
+    as the header's delimiters escape it, is refused now, a bare one included."""
+    from messagefoundry.parsing.binary import _holds_ed_claim
+
+    message = Message.parse(body)
+    assert message._delimiters_collide()
+    assert message.field("OBX-5.5") is None  # the header hides it
+    assert not _holds_ed_claim(message)
+    with pytest.raises(InboundDocRefError, match="handle marker"):
+        list(iter_obx_documents(message, received=body))
+
+
+def test_a_colliding_header_with_no_ed_claim_and_no_marker_is_still_read() -> None:
+    """The control for F1: the read half of BACKLOG #5972 stands, so such a body yields nothing
+    and is not refused."""
+    message = Message.parse(_TILDE_HEADER_NO_MARKER)
+    assert message._delimiters_collide()
+    assert DOC_REF_MARKER not in _TILDE_HEADER_NO_MARKER and "plain text" in _TILDE_HEADER_NO_MARKER
+    assert list(iter_obx_documents(message, received=_TILDE_HEADER_NO_MARKER)) == []
+
+
+#: Both kinds of inbound: one over whose threshold the body is detached, and one that never
+#: detaches, so the refusal is shown to come from the listener's own check at any size.
+_LISTENER_KINDS = pytest.mark.parametrize(
+    "streaming", [True, False], ids=["streaming", "not-streaming"]
+)
+
+
+@_LISTENER_KINDS
+@pytest.mark.parametrize("padded", [True, False], ids=["over-threshold", "under-threshold"])
+async def test_a_hidden_handle_under_a_colliding_header_is_refused_at_both_listeners(
+    store: MessageStore, streaming: bool, padded: bool
+) -> None:
+    """F1 at both listeners: such a body was ACKed AA and queued, then dead-lettered at
+    delivery. It is refused before the ACK at any size, with an AR on MLLP and a permanent
+    refusal on HTTP, an ERROR row each, nothing stored and nothing queued."""
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    from messagefoundry.transports.receipt import RefusalKind
+
+    ic = _streaming_ic() if streaming else _plain_ic()
+    body = _TILDE_HEADER_HANDLE
+    if not padded:
+        body = body[: body.index("NTE|")]
+    assert (ic.stream_threshold_bytes is not None) is streaming
+    assert (len(body) >= (_streaming_ic().stream_threshold_bytes or 0)) is padded
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "handle marker refused by its delimiters" in ack
+    assert receipt.refusal is RefusalKind.PERMANENT
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all(COLLIDING_DOC_REF_MARKER_REFUSED_REASON in str(r["error"]) for r in rows)
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+@_LISTENER_KINDS
+async def test_a_colliding_body_with_no_claim_and_no_marker_is_acked_at_both_listeners(
+    store: MessageStore, streaming: bool
+) -> None:
+    """The listener control for F1: such a body is accepted and queued at both listeners, with
+    nothing detached."""
+    ic = _streaming_ic() if streaming else _plain_ic()
+    body = _TILDE_HEADER_NO_MARKER.encode("utf-8")
+    assert len(body) >= (_streaming_ic().stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body)
+    receipt = await runner._handle_inbound_http(ic, body)
+
+    assert _ack_code(ack) == "AA"
+    assert receipt.refusal is None
+    assert await _ingress_count(store, ic.name) == 2
+    assert await _attachment_count(store) == 0
+
+
+@pytest.mark.parametrize(
+    ("body", "refused"),
+    [(_TILDE_HEADER_HANDLE, True), (_TILDE_HEADER_NO_MARKER, False)],
+    ids=["hidden-handle", "no-marker"],
+)
+def test_the_dry_run_and_the_re_ingress_refuse_a_hidden_handle_as_the_listeners_do(
+    body: str, refused: bool
+) -> None:
+    """F1: the listeners' check is the shared one, so ``messagefoundry check`` and a loopback
+    re-ingress refuse the same body with the same reason, and accept the control."""
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    from messagefoundry.pipeline.wiring_runner import _peek_for_loopback
+
+    reg = Registry()
+    reg.add_inbound(_plain_ic())
+    reg.add_router("r", lambda m: [])
+
+    result = dry_run(reg, body.encode("utf-8"))
+    refusal = _peek_for_loopback(_plain_ic(), body)[3]
+
+    if refused:
+        assert result.disposition is MessageStatus.ERROR
+        assert result.error == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+        assert refusal == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    else:
+        # The router returns no handler, so the accepted control is unrouted.
+        assert result.disposition is MessageStatus.UNROUTED
+        assert refusal is None
+
+
+def test_a_readable_received_handle_under_a_colliding_header_is_refused_as_one() -> None:
+    """Under ``MSH|^~&|`` OBX-5.5 still reads, and a raw handle there under an ED claim is
+    refused by the detach as a received handle, an InboundDocRefError, not for the header,
+    although the header is now judged before the per-OBX read."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    body = _hl7(_HIDDEN_HANDLE, msh2="^~&")
+    assert Message.parse(body).field("OBX-5.5") == _HIDDEN_HANDLE
+    with pytest.raises(InboundDocRefError, match="handle marker") as caught:
+        list(iter_obx_documents(Message.parse(body), received=body))
+    assert not isinstance(caught.value, CollidingDelimitersError)
+
+
+def test_a_body_refused_for_its_header_is_not_value_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4: the header's verdicts come before the per-OBX read, so a large ED body refused for its
+    header is never read value by value first."""
+    from messagefoundry.parsing import binary
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    def _no_scan(*_args: object) -> tuple[bool, bool, bool, bool]:
+        raise AssertionError("an OBX-5 value was scanned for a body refused for its header")
+
+    monkeypatch.setattr(binary, "_scan_obx", _no_scan)
+    for body, refusal in (
+        (_TILDE_HEADER_DOCUMENT, CollidingDelimitersError),
+        (_COLLIDING_MSH2_DOCUMENT, CollidingDelimitersError),
+        (_TILDE_HEADER_HANDLE, InboundDocRefError),
+    ):
+        with pytest.raises(refusal):
+            list(iter_obx_documents(Message.parse(body), received=body))
+    # The control: a body under ordinary delimiters is scanned, so the patch is reached.
+    plain = _hl7(_b64(10))
+    with pytest.raises(AssertionError, match="was scanned"):
+        list(iter_obx_documents(Message.parse(plain), received=plain))
+
+
+@pytest.mark.parametrize(
+    "obx5",
+    ["^Application^PDF^Base64^", "^Application^PDF^A^SGVsbG8="],
+    ids=["empty-value", "not-base64"],
+)
+def test_an_ed_claim_the_detach_would_not_lift_out_is_refused_under_a_colliding_header(
+    obx5: str,
+) -> None:
+    """F9: under ``MSH|^~&|`` an ED OBX whose value is empty, or not encoded Base64, is refused
+    for its header, as the claim alone is judged; under ``MSH|^~\\&|`` the same OBX is read and
+    yields nothing."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    tail = (
+        f"|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGID001|P|2.5\rOBX|1|ED|PDF||{obx5}||||||F\r"
+    )
+    colliding = "MSH|^~&" + tail
+    with pytest.raises(CollidingDelimitersError):
+        list(iter_obx_documents(Message.parse(colliding), received=colliding))
+    ordinary = "MSH|^~\\&" + tail
+    assert list(iter_obx_documents(Message.parse(ordinary), received=ordinary)) == []
+
+
+# --- PR 3135 review round-11130b6d: the marker test is linear in the body (BACKLOG #5972) ------
+
+
+class _CountingText(str):
+    """A body that counts each substring test made against it, so a test can bound the scans
+    the marker check makes rather than time them."""
+
+    scans: int
+
+    def __contains__(self, item: object) -> bool:
+        self.scans += 1
+        return super().__contains__(item)  # type: ignore[operator]
+
+
+def _counting(text: str) -> _CountingText:
+    counted = _CountingText(text)
+    counted.scans = 0
+    return counted
+
+
+def _headers(count: int) -> str:
+    """``count`` BHS lines, each naming ``:`` its component separator, which escapes the handle
+    marker, and its own escape character, so each gives a distinct marker form."""
+    return "".join(f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(count))
+
+
+def _form(index: int) -> str:
+    """The handle marker as :func:`_headers`' header ``index`` escapes it."""
+    esc = chr(0x4E00 + index)
+    return DOC_REF_MARKER.replace(":", f"{esc}S{esc}")
+
+
+_TILDE_HEAD = "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
+
+
+def test_the_listener_check_scans_a_body_of_many_headers_a_bounded_number_of_times() -> None:
+    """R1: the check looked for each distinct form a later header gave with its own scan of the
+    whole body, on the event loop, so a 4 MB ``MSH|~|`` body of about 10,000 such headers took
+    5.7 s; 9,990 is as many as the segment cap admits beside the rest. It now makes at most the
+    limit's scans plus two, and refuses such a body, as it could not look for every form, with a
+    reason that says so."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    body = _TILDE_HEAD + _headers(9_990) + f"NTE|1||{'Q' * (4 * 1024 * 1024)}\r"
+    assert DOC_REF_MARKER not in body
+    counted = _counting(body)
+    assert doc_ref_marker_refusal(Peek.parse(body), counted) == (HEADER_FORMS_REFUSED_REASON)
+    # The floor shows the instrument saw the first line's scan, so the bound is not vacuous.
+    assert 1 <= counted.scans <= _LATER_HEADER_FORMS_LIMIT + 2
+
+
+def test_the_listener_check_looks_for_every_form_up_to_the_limit() -> None:
+    """R1: up to the limit every form is still looked for, so the verdict is the exact one; one
+    form past it, the body is refused without the scans, and a marker the first line's forms find
+    is still named as held, not as the limit."""
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
+        HEADER_FORMS_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    limit = _LATER_HEADER_FORMS_LIMIT
+    at_limit = _TILDE_HEAD + _headers(limit)
+    held = at_limit + f"NTE|1||{_form(limit - 1)}x\r"
+    over = _TILDE_HEAD + _headers(limit + 1)
+    over_raw = over + f"NTE|1||{DOC_REF_MARKER}x\r"
+    for body, reason, scans in (
+        (at_limit, None, limit + 1),
+        (held, COLLIDING_DOC_REF_MARKER_REFUSED_REASON, limit + 1),
+        (over, HEADER_FORMS_REFUSED_REASON, 1),
+        (over_raw, COLLIDING_DOC_REF_MARKER_REFUSED_REASON, 1),
+    ):
+        counted = _counting(body)
+        assert doc_ref_marker_refusal(Peek.parse(body), counted) == reason
+        assert counted.scans == scans
+
+
+def test_a_small_body_past_the_limit_is_refused_as_a_large_one_is() -> None:
+    """The limit does not depend on the body's length, so a small body past it is refused for its
+    count as a large one is, whether or not it holds the marker in a later header's form."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    count = _LATER_HEADER_FORMS_LIMIT * 4
+    clean = _TILDE_HEAD + _headers(count)
+    held = clean + f"NTE|1||{_form(count - 1)}x\r"
+    for body in (clean, held):
+        assert doc_ref_marker_refusal(Peek.parse(body), body) == HEADER_FORMS_REFUSED_REASON
+
+
+def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the_limit() -> None:
+    """R1 at the detach, under ordinary delimiters where it alone looks: a body with a document
+    and more forms than the limit is refused as :class:`HeaderFormsLimitError`, and at the limit
+    its document is yielded. Under a colliding header the same refusal comes before the claim's,
+    and a marker the first line's forms find is refused as held."""
+    from messagefoundry.parsing.binary import HeaderFormsLimitError
+
+    limit = _LATER_HEADER_FORMS_LIMIT
+    document = _hl7(_b64(10))
+    at_limit = document + _headers(limit)
+    assert [
+        occ for occ, _, _ in iter_obx_documents(Message.parse(at_limit), received=at_limit)
+    ] == [1]
+    for body in (document + _headers(limit + 1), _TILDE_HEADER_DOCUMENT + _headers(limit + 1)):
+        counted = _counting(body)
+        with pytest.raises(HeaderFormsLimitError, match="distinct ways"):
+            list(iter_obx_documents(Message.parse(body), received=counted))
+        assert 1 <= counted.scans <= limit + 2
+    for body in (
+        document + _headers(limit + 1) + f"NTE|1||{DOC_REF_MARKER}x\r",
+        _TILDE_HEADER_DOCUMENT + _headers(limit + 1) + f"NTE|1||{DOC_REF_MARKER}x\r",
+    ):
+        with pytest.raises(InboundDocRefError, match="handle marker") as caught:
+            list(iter_obx_documents(Message.parse(body), received=body))
+        assert not isinstance(caught.value, HeaderFormsLimitError)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        _hl7(_b64(2000)) + _headers(5),
+        _TILDE_HEAD + _headers(5) + f"NTE|1||{'Q' * 600}\r",
+    ],
+    ids=["streaming-detach", "colliding-listener-check"],
+)
+async def test_the_mllp_listener_names_a_body_of_too_many_header_forms(
+    store: MessageStore, body: str
+) -> None:
+    """R1: a body refused for more header forms than the limit, by the detach under ordinary
+    delimiters or by the listeners' check under a colliding header, gets an AR that names the
+    headers, not a marker, an ERROR row, and nothing stored or queued."""
+    assert _LATER_HEADER_FORMS_LIMIT < 5
+    ic = _streaming_ic()
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "too many header delimiter sets to check" in ack
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+# --- PR 3135 Lander hold: the form limit binds before the ACK under any header (BACKLOG #5972) --
+
+
+_ORDINARY_HEAD = "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|MSGID001|P|2.5\r"
+
+
+def _lander_probe_body() -> str:
+    """The shape of the Lander's probe: an ordinary first header, then 5,040 later headers that
+    each give a distinct marker form, about 230 KB in all, with no marker anywhere."""
+    body = _ORDINARY_HEAD + _headers(5_040) + f"NTE|1||{'Q' * (175 * 1024)}\r"
+    assert DOC_REF_MARKER not in body
+    return body
+
+
+def test_an_ordinary_header_body_past_the_form_limit_is_refused_by_the_shared_check() -> None:
+    """The shared check returned ``None`` at once for a first header that does not collide, so a
+    body of many later-header forms was ACKed and then cost one scan of the whole payload per
+    form at every delivery attempt. It is now refused for its form count under any header, with
+    no scan of the text."""
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    body = _lander_probe_body()
+    counted = _counting(body)
+    assert doc_ref_marker_refusal(Peek.parse(body), counted) == HEADER_FORMS_REFUSED_REASON
+    assert counted.scans == 0
+
+
+def test_the_shared_check_keeps_its_verdict_at_or_under_the_limit() -> None:
+    """At the limit an ordinary-header body is still accepted, and one past it is refused, with
+    no scan of the text either way; later headers naming the first line's delimiters give no
+    form at all, however many there are."""
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    limit = _LATER_HEADER_FORMS_LIMIT
+    same = "".join("BHS|^~\\&|A\r" for _ in range(limit * 3))
+    for body, reason in (
+        (_ORDINARY_HEAD + _headers(limit), None),
+        (_ORDINARY_HEAD + same, None),
+        (_ORDINARY_HEAD + _headers(limit + 1), HEADER_FORMS_REFUSED_REASON),
+    ):
+        counted = _counting(body)
+        assert doc_ref_marker_refusal(Peek.parse(body), counted) == reason
+        assert counted.scans == 0
+
+
+async def test_the_mllp_listener_refuses_an_ordinary_header_body_past_the_form_limit(
+    store: MessageStore,
+) -> None:
+    """Past the limit under an ordinary first header, below the streaming threshold so no detach
+    runs: an AR naming the headers, an ERROR row carrying the reason, and no ingress row. At the
+    limit the same shape is accepted."""
+    from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
+
+    ic = _streaming_ic()
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    assert len(over) < (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, over.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "too many header delimiter sets to check" in ack
+    rows = await _rows(store, ic.name)
+    assert [(r["status"], r["error"]) for r in rows] == [
+        (MessageStatus.ERROR.value, HEADER_FORMS_REFUSED_REASON)
+    ]
+    assert await _ingress_count(store, ic.name) == 0
+
+    at_limit = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+    assert _ack_code(await runner._handle_inbound(ic, at_limit.encode("utf-8"))) == "AA"
+    assert await _ingress_count(store, ic.name) == 1
+
+
+async def test_the_http_listener_refuses_an_ordinary_header_body_past_the_form_limit(
+    store: MessageStore,
+) -> None:
+    """The same body on HTTP is refused as permanent, with an ERROR row and no ingress row; at the
+    limit it is accepted."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    receipt = await runner._handle_inbound_http(ic, over.encode("utf-8"))
+
+    assert receipt.refusal is RefusalKind.PERMANENT
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _ingress_count(store, ic.name) == 0
+
+    at_limit = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+    accepted = await runner._handle_inbound_http(ic, at_limit.encode("utf-8"))
+    assert accepted.refusal is None
+    assert await _ingress_count(store, ic.name) == 1
+
+
+class _CountedForms:
+    """Wraps ``binary._later_header_forms`` and counts the forms the re-attach draws from it."""
+
+    def __init__(self, real: Callable[[Message], Iterator[str]]) -> None:
+        self.real = real
+        self.drawn = 0
+
+    def __call__(self, message: Message) -> Iterator[str]:
+        for form in self.real(message):
+            self.drawn += 1
+            yield form
+
+
+@pytest.mark.parametrize("count_over", [0, 1, 50], ids=["at-limit", "one-over", "far-over"])
+async def test_the_reattach_draws_at_most_one_form_past_the_limit(
+    monkeypatch: pytest.MonkeyPatch, count_over: int
+) -> None:
+    """The re-attach looked for every later-header form with a scan of the payload. It now draws
+    at most its limit's forms plus one, scans the text for at most its limit's, and refuses a
+    payload past the limit without those scans."""
+    from messagefoundry.parsing import binary
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    counter = _CountedForms(binary._later_header_forms)
+    monkeypatch.setattr(binary, "_later_header_forms", counter)
+    limit = _LATER_HEADER_FORMS_LIMIT
+    body = _ORDINARY_HEAD + _headers(limit + count_over)
+    counted = _counting(body)
+    if count_over:
+        with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
+            await reattach_documents_in_hl7(counted, _no_read, bound=frozenset())
+        assert counted.scans == 0
+    else:
+        assert await reattach_documents_in_hl7(counted, _no_read, bound=frozenset()) == body
+        # The forms, then the first line's marker forms: the floor shows the instrument saw the
+        # scans, so the bound is not vacuous.
+        assert limit <= counted.scans <= limit + 2
+    assert counter.drawn <= limit + 1
+
+
+async def test_the_reattach_bounds_the_lander_probe_at_its_real_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe body itself: the re-attach draws at most one form past the limit and makes no
+    scan per form."""
+    from messagefoundry.parsing import binary
+    from messagefoundry.parsing.binary import (
+        _LATER_HEADER_FORMS_LIMIT,
+        UnreattachableDocumentError,
+        reattach_documents_in_hl7,
+    )
+
+    counter = _CountedForms(binary._later_header_forms)
+    monkeypatch.setattr(binary, "_later_header_forms", counter)
+    body = _lander_probe_body()
+    counted = _counting(body)
+    with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
+        await reattach_documents_in_hl7(counted, _no_read, bound=frozenset())
+    assert counted.scans == 0
+    assert counter.drawn <= _LATER_HEADER_FORMS_LIMIT + 1
+
+
+async def test_a_handler_built_payload_past_the_form_limit_dead_letters_at_delivery(
+    store: MessageStore,
+) -> None:
+    """A payload that never met the listeners' check, such as a Handler's child, is judged at the
+    re-attach: past the limit it is the payload's own refusal and
+    dead-letters at once, and nothing is sent. A payload with a few later headers is delivered
+    unchanged."""
+    runner = _runner(store)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    assert may_hold_doc_ref(over)
+    _mid, rows = await _deliver(store, runner, over)
+    assert _dead_lettered_at_once(rows)
+    assert col.deliveries == []
+
+    few = _ORDINARY_HEAD + _headers(2) + "BHS|^~\\&|A\r"
+    assert may_hold_doc_ref(few)
+    _mid, rows = await _deliver(store, runner, few)
+    assert col.deliveries == [few]
+    assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+
+
+def test_a_payload_longer_than_a_body_the_listeners_admitted_is_not_refused_for_its_forms() -> None:
+    """Review round-158ac8b0: the limit fell with the length, so a re-attach measured on a
+    delivery payload longer than its received body refused a form count the listeners had
+    admitted. The limit no longer reads the length: a body at the limit is admitted, a payload
+    many times as long holding the same headers re-attaches, and one past the limit is refused."""
+    import asyncio
+
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import doc_ref_marker_refusal
+
+    probe = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+    assert doc_ref_marker_refusal(Peek.parse(probe), probe) is None
+    grown = probe + "NTE|1||" + "y" * (64 * len(probe)) + "\r"
+    assert asyncio.run(reattach_documents_in_hl7(grown, _no_read, bound=frozenset())) == grown
+    past = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    with pytest.raises(UnreattachableDocumentError, match="more distinct ways"):
+        asyncio.run(reattach_documents_in_hl7(past, _no_read, bound=frozenset()))
+
+
+def _tiny_documents_body(forms: int, control_id: str, count: int = 2_000) -> str:
+    """``count`` OBX segments, each an ED Base64 value of four characters, which the detach swaps
+    for a handle some twenty times as long, then ``forms`` later headers that each give a distinct
+    marker form."""
+    head = (
+        f"MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|{control_id}|P|2.5\r"
+        "EVN|T02|20260101120000\r"
+    )
+    documents = "".join(
+        f"OBX|{occ}|ED|PDF||^Application^PDF^Base64^QQ==||||||F\r" for occ in range(1, count + 1)
+    )
+    return head + documents + _headers(forms)
+
+
+async def _ack_then_deliver(
+    store: MessageStore, runner: RegistryRunner, ic: InboundConnection, body: str
+) -> tuple[str | None, list]:
+    """Send ``body`` to the streaming listener; once it is ACKed, carry the committed skeleton
+    through the router and transform stages to ``DEST`` and deliver it once. Returns the ACK
+    code and the outbound rows, none where the listener refused the body."""
+    code = _ack_code(await runner._handle_inbound(ic, body.encode("utf-8")))
+    if code != "AA":
+        return code, []
+    ingress = await store.claim_next_fifo(ic.name, stage="ingress")
+    assert ingress is not None
+    skeleton, mid = ingress.payload, ingress.message_id
+    # The probe's shape: the detach grew the skeleton past twice the body the listener judged.
+    assert len(skeleton) > 2 * len(body)
+    assert await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id=ic.name,
+        handlers=[("h", skeleton)],
+        disposition=MessageStatus.ROUTED,
+    )
+    routed = await store.claim_next_fifo(ic.name, stage="routed")
+    assert routed is not None and routed.message_id == mid
+    await store.transform_handoff(
+        routed_id=routed.id,
+        message_id=mid,
+        channel_id=ic.name,
+        deliveries=[(DEST, skeleton)],
+        pt_deliveries=[],
+    )
+    await _deliver_queued(store, runner, mid)
+    return code, list(await store.outbox_for(mid))
+
+
+async def test_a_body_the_listener_acks_is_never_refused_for_its_forms_after_a_detach_grew_it(
+    store: MessageStore,
+) -> None:
+    """Review of d58d873ae09: with a low ``stream_threshold_bytes`` and many tiny ED values the
+    detach grew the skeleton past twice its received body, so the re-attach's limit, taken at half
+    the payload's length, fell below the count the listener had admitted, and an ACKed body
+    dead-lettered. The limit is now one number for both, read from header lines the detach does
+    not change: a body the listener ACKs delivers, and one past the limit is refused before the
+    ACK."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    # 550 forms in a body of about 110,000 characters, whose skeleton is about 280,000.
+    code, rows = await _ack_then_deliver(store, runner, ic, _tiny_documents_body(550, "MSGPROBE"))
+    # The guarantee itself, checked before the refusal, so a limit that still falls with the
+    # length fails here, as the probe did, with the ACKed body dead-lettered.
+    if code == "AA":
+        assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+    assert code == "AR"
+
+    code, rows = await _ack_then_deliver(
+        store, runner, ic, _tiny_documents_body(_LATER_HEADER_FORMS_LIMIT, "MSGATLIMIT")
+    )
+    assert code == "AA"
+    assert [str(r["status"]) for r in rows] == [OutboxStatus.DONE.value]
+    assert len(col.deliveries) == 1 and DOC_REF_MARKER not in col.deliveries[0]
+
+
+def test_the_dry_run_and_the_re_ingress_refuse_an_ordinary_header_body_past_the_form_limit() -> (
+    None
+):
+    """The dry-run and the loopback re-ingress run the shared check, so they refuse the body the
+    listeners refuse, with the same reason, and accept one at the limit."""
+    from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
+    from messagefoundry.pipeline.wiring_runner import _peek_for_loopback
+
+    reg = Registry()
+    reg.add_inbound(_plain_ic())
+    reg.add_router("r", lambda m: [])
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    at_limit = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+
+    result = dry_run(reg, over.encode("utf-8"))
+    assert result.disposition is MessageStatus.ERROR
+    assert result.error == HEADER_FORMS_REFUSED_REASON
+    assert _peek_for_loopback(_plain_ic(), over)[3] == HEADER_FORMS_REFUSED_REASON
+
+    assert dry_run(reg, at_limit.encode("utf-8")).disposition is MessageStatus.UNROUTED
+    assert _peek_for_loopback(_plain_ic(), at_limit)[3] is None
+
+
+def test_a_resubmitted_body_past_the_form_limit_is_refused_before_it_is_committed() -> None:
+    """The upload resend and the edit-resend re-route admit a body through
+    ``admit_resubmitted_body``, which ran the listeners' parse but not their marker check, so a
+    body a listener refuses was committed and then refused by every outbound's re-attach."""
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        IngressGuardError,
+        admit_resubmitted_body,
+    )
+
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    with pytest.raises(IngressGuardError) as caught:
+        admit_resubmitted_body(over, _plain_ic())
+    assert caught.value.phase == "ingest"
+    assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
+    at_limit = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+    assert admit_resubmitted_body(at_limit, _plain_ic()) == at_limit
+
+
+def test_the_edit_resend_direct_path_refuses_a_body_past_the_form_limit() -> None:
+    """Review of d58d873ae09, finding 4: the edit-resend direct path (``to=``, no inbound) ran
+    only the NUL rule and the ceiling, so a body past the form limit was committed to an outbound
+    row and dead-lettered at the re-attach. It now meets the listeners' check where it parses as
+    HL7; a body at the limit, and one that is not HL7, are returned as they came."""
+    from messagefoundry.pipeline.ingress_guards import (
+        HEADER_FORMS_REFUSED_REASON,
+        IngressGuardError,
+        admit_resubmitted_body,
+    )
+
+    over = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT + 1)
+    with pytest.raises(IngressGuardError) as caught:
+        admit_resubmitted_body(over, None)
+    assert caught.value.phase == "ingest"
+    assert str(caught.value) == HEADER_FORMS_REFUSED_REASON
+    at_limit = _ORDINARY_HEAD + _headers(_LATER_HEADER_FORMS_LIMIT)
+    assert admit_resubmitted_body(at_limit, None) == at_limit
+    not_hl7 = '{"note": "' + DOC_REF_MARKER + '"}'
+    assert admit_resubmitted_body(not_hl7, None) == not_hl7
+
+
+def test_the_api_answers_a_marker_refused_resubmission_with_422() -> None:
+    """Review round-4d17e09a: the API maps a guard's phase to a status, and ``ingest`` was not in
+    the map, so the new refusal raised ``KeyError`` there and the operator got a 500."""
+    from messagefoundry.api.app import _INGRESS_GUARD_STATUS
+
+    assert _INGRESS_GUARD_STATUS["ingest"] == 422

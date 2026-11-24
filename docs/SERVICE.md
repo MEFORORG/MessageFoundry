@@ -245,6 +245,21 @@ Administrator from an elevated shell on the host:
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
 ```
 
+Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
+LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
+install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
+describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
+environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
+`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
+`[security].enforcement = 'enforce'` the provider also refuses an account that is not local to
+this host, such as a domain user or a gMSA, and the script does not check for that.
+
+The steps above do not yet cover that provider. It refuses a store key set beside it, so step 1's
+key makes `provision-admin` refuse; and it mints the store key, which `--service-account` mints for
+the service's account rather than yours. The script grants that account read only on the secrets
+directory, where the service's first start must write its own key file, so a service the script
+installs under this provider does not start yet (vault BACKLOG #3411).
+
 If the service started first, at the shipped posture it refuses to start. Once the earlier start
 checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
 log; run the command, then restart the service. In the data directory the install script hardens,
@@ -310,6 +325,38 @@ Restart-Service MessageFoundry
 Run them from an elevated prompt. Services.msc and `sc.exe` work too. NSSM's own start, stop and
 restart commands send the same request, so there is no reason to use them.
 
+**A stop holds some of its waits to a budget, to keep inside NSSM's stop window, and that can cut
+them short** (BACKLOG #3191; the owner ruled on 2026-11-22 that the budget wins over the work it
+cuts). The service's shutdown hands `engine.stop()` what is left of its budget after the floors of
+the steps after it, never less than 3 s. The budget covers at least these waits: a CRL reload pass
+in flight, the remote-debug refusal watch's two waits, for its last audit pass and then for that
+pass's cancel, and the drain of alert-instance writes. A budgeted wait is shortened only when what
+is left of the budget, less the time kept for the stop steps after it, is under that wait's fixed
+bound, and it still gets at least 0.1 s. The graph supervisor's exit is not budgeted: it waits up
+to its fixed 10 s, and then, once cancelled, for that cancel to land with no bound. It and the
+other stop steps are not held to the budget, so a slow one can still carry the stop past NSSM's
+window, and it spends budget the waits after it would have had. On a tight stop, at least these
+can be lost:
+
+- **The remote-debug watch's last pass** can be cut to about 0.1 s and cancelled. Every stop step
+  before it, the graph supervisor's wait and the stopping of the message graph included, shortens
+  its waits by what it took, so a slow graph stop alone can leave the pass only that floor. When
+  the budget cuts the pass, a WARNING says so, and a refusal seen since the pass before it may then
+  have no audit row and no alert. A cancel of the stop itself, in either wait, logs no WARNING.
+  A pass whose cancel has not landed when the second wait ends is left running and can outlive the
+  store's close, so its row may not be written; the WARNING then says it may still be running.
+- **The alert-instance drain** can be cut to about 0.1 s. A raise or clear write still running
+  then is not retried, and may fail when the store closes and go unrecorded. A clear still waiting
+  to retry is cancelled, and an ERROR counts it. An alert whose clear is lost can still read open
+  in the alert list. This drain covers alert records in the store, not the
+  sending of alert notifications, which a later shutdown step closes.
+- **A CRL reload pass in flight** gets at most about 1.8 s at the 3 s minimum, or about 0.8 s
+  while a config write is still running, and less when an earlier stop step was slow, down to the
+  same 0.1 s. When the budget cuts the pass, it is abandoned with a WARNING; a cancel of the stop
+  itself cancels it and logs none. Abandoning it does not end its read: the worker
+  thread running the pass cannot be cancelled and runs on, and it can hold the process's exit past
+  NSSM's window. The next start loads every CRL from the file again.
+
 The service's own `nssm.exe` is in `C:\Program Files\MessageFoundry\nssm` (the installer's
 `-NssmDir`). The installer checked that copy's hash, and keeps it where only administrators can
 write ([DANGEROUS-FUNCTIONALITY.md](DANGEROUS-FUNCTIONALITY.md) section 8). It never puts that
@@ -325,7 +372,8 @@ Restart-Service MessageFoundry   # the running engine keeps its old settings unt
 variable the service needs in one call, or the ones you leave out are gone at the next start.
 That includes the `MEFOR_SECRETS_DIRECTORY` entry the installer wrote: without it the engine reads
 no file in the secrets directory, and every secret moved there is missing, with no error naming
-the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`.
+the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentExtra`, unless it
+may hold a value `serve` or `supervise` refused, as the next paragraph says.
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
 settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
@@ -333,6 +381,25 @@ or retired store key found in their own environment, never another secret settin
 key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
+
+**While a list holds a value `serve` or `supervise` refused, edit it in the registry, never with
+`nssm get` or `nssm set`.** `nssm get` prints every value in the list, and `nssm set` takes the
+values on its command line, where they reach at least the shell's history, a transcript and
+process-creation audit events. Read `AppEnvironment` and `AppEnvironmentExtra`, under `Parameters`
+in the service's registry key, and the service's own `Environment` value, on that key itself, into
+a variable with `Get-ItemProperty`, printing nothing. Edit the strings in that same session, and
+write each value back with `Set-ItemProperty -Type MultiString`:
+
+```powershell
+$service = 'MessageFoundry'   # the service the refusal names
+$key = "HKLM:\SYSTEM\CurrentControlSet\Services\$service\Parameters"
+$extra = (Get-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra).AppEnvironmentExtra
+# edit $extra here, printing nothing
+Set-ItemProperty -LiteralPath $key -Name AppEnvironmentExtra -Value $extra -Type MultiString
+```
+
+install-service.ps1's `Set-ServiceEnvironmentValue` writes `AppEnvironmentExtra` back the same
+way, with `Set-ItemProperty -Type MultiString`.
 
 **A `PYTHON*` variable in that list does nothing for the engine.** The service starts the
 interpreter in isolated mode, which ignores every one of them
@@ -487,10 +554,12 @@ directory to the service account only, as the installer does.
 
 The engine resolves the account with `LookupAccountSid` each time it opens the store. It refuses
 the directory at least when the lookup fails, when the account resolves to anything but a user, such as a
-group, or when the directory names a second account. A refused directory gets a store restricted
-by `_secure_file` (see ADR 0163, *Note (2026-11-05)*), and the engine logs a WARNING naming the
-reason. Then the service and the operator who provisions the first Administrator can lock each
-other out of the store.
+group, or when the directory names a second account, and logs a WARNING naming the reason. In a
+refused directory the engine tries to remove each store file's inherited entries and grant the
+account that opened the store full control of it, and any other entry set on the file itself
+stays (see ADR 0163, *Note (2026-11-05)*). Where that fails, the file keeps the entries it
+inherited, and the engine logs a WARNING. With that fallback, the service and the operator who
+provisions the first Administrator can lock each other out of the store.
 
 At least these are unmeasured:
 
@@ -501,8 +570,8 @@ At least these are unmeasured:
 - **A start with no domain controller.** A gMSA resolves through a domain controller, or through
   the local lookup cache when no controller answers, and a slow or absent controller can delay
   the open or fail the lookup. A later start does not always repair what a failed lookup leaves.
-  Why a time-out can read as an account that does not exist, and what a store restricted by
-  `_secure_file` leaves on each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
+  Why a time-out can read as an account that does not exist, and what that restriction leaves on
+  each file, are in ADR 0163, *Note (2026-11-05)*, *Left open*.
 
 The rule and its reasons are in ADR 0163, *Note (2026-11-05)*.
 
@@ -560,8 +629,9 @@ What that changes for you:
   install keeps it. It refuses to install when it finds neither. Pass `-PythonExe` then.
 - **A `pip install --user` copy of the engine will not start as the service.** Isolated mode
   leaves the user's site directory out. Install into a virtual environment.
-- **`messagefoundry serve` from a prompt has remote debugging on** unless its environment sets
-  `PYTHON_DISABLE_REMOTE_DEBUG`, so under `enforce` the start refusal for it stops the engine
+- **`messagefoundry serve` from a prompt has remote debugging on** unless something turns it
+  off, such as its environment setting `PYTHON_DISABLE_REMOTE_DEBUG`; give it a non-empty value, such as 1, since some shells delete a
+  variable set to an empty value. With remote debugging on, under `enforce` the start refusal for it stops the engine
   unless `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). The variable works
   there only because the console script passes neither `-I` nor `-E`: a start by hand that keeps
   `-I` and drops `-X disable-remote-debug` has the interface on whatever the variable says, as
@@ -788,7 +858,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
     to fix what made the read fail. Where it is honoured (see *Dev/test escape* below),
     `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
-    WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
+    WARNING for a dev/CI checkout only, as it does every refusal of this owner and access-list
+    read. It does not downgrade the refusal of a trust-list link that cannot be resolved or leads
+    to nothing at check time, on either platform. A `*.py` deleted while the
     load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs
@@ -851,9 +923,21 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
-    can still read every file. The loader checks the same paths as on Windows, following links, so
-    the layout also depends on at least these, which it does not check: every directory above the
-    config directory is writable only by root; a file that is a link points into such a directory;
+    can still read every file. The loader checks the same paths as on Windows, following links.
+    For each of them that is a symbolic link or a junction, the
+    config directory included, it also checks what Python's path resolution says the link leads
+    to and, for a file, the folder holding that file, on both platforms, and it refuses the load
+    where a link it lists, a module, `__pycache__` entry, `connections.toml`, `codesets` or
+    code-set table link among them, leads to nothing it can read at check time or cannot be
+    resolved (vault BACKLOG #2596), and the dev/test escape does not downgrade that refusal. For
+    a linked folder the folder holding its target is not
+    checked. That
+    resolution is not checked against what the load's open then reaches. It does not check the
+    links in between, for a link to a link, a folder outside the config directory that holds a
+    link, from which a writer could re-point it, or on Windows a reparse point other than a
+    symbolic link or a junction, which it does not follow. So the layout also depends on at least these, which it
+    does not check: every directory above the config directory, and above each folder a link
+    leads to, is writable only by root; no link leads through a folder another account can write;
     and the file system reports real owners and modes (a network mount may synthesize them).
     - **Why the loader does not walk the directories above it (vault BACKLOG #3106).** The trust
       anchor check, `anchor_path.posix_path_verdict`, does walk them: it reads every directory from
@@ -873,15 +957,18 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       take this walk either, but it does walk the links an open of each file passes through, as
       it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-      states. The config load's trust list still vets each module by its own path, not the links
-      it passes through, so the two checks answer a linked file differently.
+      states. The config load's trust list does not take that walk: it checks what each link
+      resolves to, as the bullet above says, so the two checks still answer a linked file
+      differently.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
       there before it passes when it is a link to any directory owned by root or by the engine's
       own account that is not group- or world-writable, such as the engine's data directory.
-      Nothing here detects either. An account that can write the directory a link points into can
-      replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
+      Nothing here detects either. An account that can write the directory a link points into
+      can replace the file the check passed, after the check, and an account that can write a
+      directory above that one, or a folder holding a link in between, can put another in its
+      place, after the check or, with the same limit as above, before it. Before you deploy, run `namei -l <config dir>` to list
       every directory on the path. It does not look inside the directory, so also run `ls -lR` on
       the config directory, which lists at least its `codesets` and `environments` folders, and
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own
@@ -1081,7 +1168,7 @@ holds claimed rows whose return to the queue never landed. Under the pooled clai
 restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
 under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
-inject or a dead-letter replay, and it then claims past the unlanded rows; until one arrives it
+inject or a dead-letter replay, and it can then claim past the unlanded rows; until one arrives it
 stays STOPPED. At least a service restart returns them to the queue first, because the engine does that as it starts, so restart the service
 to recover it.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine

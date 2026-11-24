@@ -45,6 +45,11 @@ class FakeMemento implements LegacyStore {
   }
 }
 
+/** The store hands back a null-prototype map (BACKLOG #5846); compare its own keys and values only. */
+function plain(map: Record<string, TestCollection>): Record<string, TestCollection> {
+  return { ...map };
+}
+
 const BODY = "MSH|^~\\&|APP|FAC|RCV|RFAC|20260101||ADT^A01|C1|P|2.5\rPID|1||MRN-123||DOE^JANE";
 
 /** The first 32 hex digits of SHA-256("file:///ws/a"), written out so no change to the module moves it. */
@@ -72,7 +77,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const memento = new FakeMemento();
     const store = new CollectionStore(secrets, memento, "file:///ws/a");
     await store.save({ smoke: coll("smoke") });
-    assert.deepStrictEqual(await store.load(), { smoke: coll("smoke") });
+    assert.deepStrictEqual(plain(await store.load()), { smoke: coll("smoke") });
     assert.strictEqual(memento.data.size, 0);
     const stored = secrets.data.get(collectionsSecretKey("file:///ws/a"));
     assert.ok(stored?.includes("MRN-123"), "the body is in SecretStorage");
@@ -80,7 +85,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
 
   test("an empty store loads as an empty map", async () => {
     const store = new CollectionStore(new FakeSecrets(), new FakeMemento(), "file:///ws/a");
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
   });
 
   test("each workspace has its own key, as workspaceState was per-workspace", async () => {
@@ -88,7 +93,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const a = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
     const b = new CollectionStore(secrets, new FakeMemento(), "file:///ws/b");
     await a.save({ onlyA: coll("onlyA") });
-    assert.deepStrictEqual(await b.load(), {});
+    assert.deepStrictEqual(plain(await b.load()), {});
     assert.notStrictEqual(collectionsSecretKey("file:///ws/a"), collectionsSecretKey("file:///ws/b"));
   });
 
@@ -121,7 +126,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     await secrets.store(UNVERSIONED_A, JSON.stringify({ kept: coll("kept") }));
     secrets.calls.length = 0;
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
-    assert.deepStrictEqual(await store.load(), { kept: coll("kept") });
+    assert.deepStrictEqual(plain(await store.load()), { kept: coll("kept") });
     assert.ok(!secrets.data.has(UNVERSIONED_A), "the unversioned copy is removed");
     const key = collectionsSecretKey("file:///ws/a");
     assert.ok(secrets.data.get(key)?.includes("MRN-123"));
@@ -134,7 +139,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     await secrets.store(UNVERSIONED_A, JSON.stringify({ stale: coll("stale") }));
     await secrets.store(collectionsSecretKey("file:///ws/a"), JSON.stringify({ current: coll("current") }));
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
-    assert.deepStrictEqual(await store.load(), { current: coll("current") });
+    assert.deepStrictEqual(plain(await store.load()), { current: coll("current") });
     assert.ok(!secrets.data.has(UNVERSIONED_A));
   });
 
@@ -156,7 +161,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     await assert.rejects(store.load());
     assert.ok(secrets.data.has(UNVERSIONED_A), "unversioned copy kept when the write failed");
     fail = false;
-    assert.deepStrictEqual(await store.load(), { kept: coll("kept") });
+    assert.deepStrictEqual(plain(await store.load()), { kept: coll("kept") });
     assert.ok(!secrets.data.has(UNVERSIONED_A));
   });
 
@@ -166,7 +171,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
     await assert.rejects(store.load(), CollectionStoreError);
     await store.reset();
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
     assert.strictEqual(secrets.data.size, 0);
   });
 
@@ -179,7 +184,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     // The legacy merge reads the moved, unreadable secret and fails.
     await assert.rejects(store.load(), CollectionStoreError);
     await store.reset();
-    assert.deepStrictEqual(await store.load(), { old: coll("old") }, "readable collections survive");
+    assert.deepStrictEqual(plain(await store.load()), { old: coll("old") }, "readable collections survive");
     assert.strictEqual(memento.data.size, 0);
   });
 
@@ -190,8 +195,8 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const resetting = store.reset(); // no migration has run, so the unversioned value is still there
     const loading = store.load();
     await resetting;
-    assert.deepStrictEqual(await loading, {});
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await loading), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
     assert.strictEqual(secrets.data.size, 0);
   });
 
@@ -218,7 +223,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const resetting = store.reset();
     held.open();
     await Promise.all([loading, resetting]);
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
     assert.strictEqual(secrets.data.size, 0);
   });
 
@@ -227,7 +232,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const memento = new FakeMemento();
     memento.data.set(LEGACY_COLLECTIONS_KEY, { old: coll("old") });
     const store = new CollectionStore(secrets, memento, "file:///ws/a");
-    assert.deepStrictEqual(await store.load(), { old: coll("old") });
+    assert.deepStrictEqual(plain(await store.load()), { old: coll("old") });
     assert.strictEqual(memento.get(LEGACY_COLLECTIONS_KEY), undefined, "legacy copy removed");
     assert.ok(secrets.data.get(collectionsSecretKey("file:///ws/a"))?.includes("MRN-123"));
   });
@@ -265,7 +270,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const secrets = new FakeSecrets();
     const memento = new FakeMemento();
     memento.data.set(LEGACY_COLLECTIONS_KEY, {});
-    assert.deepStrictEqual(await new CollectionStore(secrets, memento, "file:///ws/a").load(), {});
+    assert.deepStrictEqual(plain(await new CollectionStore(secrets, memento, "file:///ws/a").load()), {});
     assert.strictEqual(memento.data.size, 0);
     assert.strictEqual(secrets.data.size, 0);
   });
@@ -277,7 +282,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     await store.load();
     // A value appearing in workspaceState later is not this build's to write; it is not re-read.
     memento.data.set(LEGACY_COLLECTIONS_KEY, { late: coll("late") });
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
   });
 
   test("a save racing the first load is not overwritten by the migration", async () => {
@@ -310,7 +315,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     await assert.rejects(store.load());
     assert.ok(memento.data.has(LEGACY_COLLECTIONS_KEY), "legacy copy kept when the secret write failed");
     fail = false;
-    assert.deepStrictEqual(await store.load(), { old: coll("old") });
+    assert.deepStrictEqual(plain(await store.load()), { old: coll("old") });
     assert.strictEqual(memento.data.size, 0);
   });
 
@@ -321,7 +326,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
       JSON.stringify({ good: coll("good"), noCases: { name: "noCases" }, notAMap: 3 }),
     );
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
-    assert.deepStrictEqual(await store.load(), { good: coll("good") });
+    assert.deepStrictEqual(plain(await store.load()), { good: coll("good") });
   });
 
   test("a case whose recorded disposition is not a string drops its collection (BACKLOG #5416)", async () => {
@@ -342,7 +347,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const secrets = new FakeSecrets();
     const memento = new FakeMemento();
     memento.data.set(LEGACY_COLLECTIONS_KEY, "not a map");
-    assert.deepStrictEqual(await new CollectionStore(secrets, memento, "file:///ws/a").load(), {});
+    assert.deepStrictEqual(plain(await new CollectionStore(secrets, memento, "file:///ws/a").load()), {});
     assert.strictEqual(memento.data.size, 0);
   });
 
@@ -353,7 +358,7 @@ suite("collectionStore -- Test Bench case bodies live in SecretStorage (BACKLOG 
     const store = new CollectionStore(secrets, new FakeMemento(), "file:///ws/a");
     await assert.rejects(store.load(), CollectionStoreError);
     await store.reset();
-    assert.deepStrictEqual(await store.load(), {});
+    assert.deepStrictEqual(plain(await store.load()), {});
     assert.ok(secrets.data.has(collectionsSecretKey("file:///ws/b")), "another workspace is untouched");
   });
 

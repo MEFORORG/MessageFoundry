@@ -223,15 +223,25 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       not run this check, though each new connect of its store reads the swapped file too.
     * A server that answers has at least three ways to keep the change out of the real store. It
       can answer the read with the new fingerprint: then the change check writes no row and logs
-      nothing, and where the file passes its other checks too, nothing in this preflight records
-      the swap. It can answer with no row: then a fresh ``observed`` row is written in place of
+      nothing, and where the file passes its other checks too, no row this preflight writes
+      records the swap; only the in-process compare below logs it, and only for a swap made
+      after the process first checked the pin. It can answer with no row: then a fresh ``observed`` row is written in place of
       ``changed``. Or it can acknowledge the ``changed`` row, which the real store never
       receives. Where a row is written and its commit returns, the audit tee
       (:mod:`messagefoundry.store.audit_tee`) still logs a copy. A collector receives it only
       where a log forwarder is configured and up, and the first way writes no ``changed`` or
       ``observed`` row to copy.
 
-    So the change audit in the store is only as good as the hop it is meant to catch. The file
+    So the change audit in the store is only as good as the hop it is meant to catch. **The
+    in-process compare** (vault BACKLOG #3714 step 9) does not read the store: each settings
+    preflight of the pin compares the file with the first pin bytes this engine process checked
+    and passed, at a store open or else at a preflight (:data:`_STORE_PIN_FIRST_CHECKED`), and logs
+    a WARNING at each check that finds them different; the baseline does not move until a
+    restart. It writes no row and refuses nothing. It reads the file only when a check runs, so
+    at least a swap undone before the next check is not seen. A restart starts a new baseline, so
+    it does not see a swap made before the process first checked the pin, and each engine process
+    holds its own. A pin that passes a preflight with only a warning, such as an expired one, can
+    become the baseline where no store open in this process passed one first. The file
     checks are judged on the file, not on the store, and refuse or warn as they do elsewhere (the
     next paragraph says which a reload runs); only their rows travel the hop. A file that cannot
     be read refuses before this anchor writes any row. **A refusal at a reload refuses only the
@@ -268,7 +278,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     start the store has already been opened with this file when this check runs, so its
     connections may have trusted the file and sent the store login. A command that opens the
     store and runs no preflight does not check the file at all. What the paragraphs above say of the pin's audit riding its own hop, and of a refused reload
-    leaving the pool open, holds for this CA too.
+    leaving the pool open, holds for this CA too, except the in-process compare, which runs for
+    the pin alone: a swap of this CA that the store's answer hides is not logged.
 12. **A generic DATABASE connection's driver CA** (vault BACKLOG #3090, step 7). The CA file a
     generic-dialect ``Database`` outbound or ``DatabasePoll`` names as ``odbc_params`` ``sslca``
     is a lane CA, as in item 9 (:func:`database_ca_anchor_spec`), under the lane's own label. It
@@ -281,8 +292,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     checked (:func:`unread_ca_reason`), and neither is a missing file or a directory, which the
     build leaves to the driver. A value the build's remote-path check refuses is refused here as a
     setting, in every ``sslmode`` (BACKLOG #2705), for ``sslcapath``, ``sslcert`` and ``sslkey``
-    too, and for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18), though none
-    of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
+    too, and on Windows for each entry of an ``sslcapath`` folder (vault BACKLOG #5197 item 18),
+    though none of those is an anchor; ``docs/CONNECTIONS.md``, Generic ODBC, states that check's limits.
     A pipe or device is refused unread, since :func:`evaluate_anchor` reads only a regular file;
     that holds for every anchor here since vault BACKLOG #3090. Unread is not unopened on Windows:
     the stat that judges the path opens it there, so a named pipe's server sees a connect first
@@ -295,7 +306,7 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
     only signal. Any check-then-load leaves a swap window, as for ``sslkey``. There is no pin:
     ``odbc_params`` has no pin setting. An ``sslcapath`` CA directory, which a driver also reads
     to choose whom to trust, is not an anchor at all: no ACL, path, content or audit check covers
-    it or its entries, only the remote-path check of the folder and of each entry. Nor
+    it or its entries, only the remote-path check of the folder and, on Windows, of each entry. Nor
     is the lane check skipped for a TLS-off keyword other than ``sslmode``, such as ``Encrypt``.
 """
 
@@ -1697,6 +1708,44 @@ def _warned_state(verdict: AnchorVerdict) -> tuple[object, ...] | None:
 #: command that opens the store and runs no preflight still logs the warning at open.
 _WARNED_AT_OPEN: dict[tuple[str, str], tuple[object, ...]] = {}
 
+#: The SQL Server store pin's in-process baseline (vault BACKLOG #3714 step 9), keyed by label and
+#: path: the fingerprint of the first pin bytes this process checked and passed, at a store open
+#: or, failing that, at a settings preflight (:func:`note_store_pin_checked`). Only the first is
+#: kept, so a later open or preflight of a swapped file cannot move it. The settings
+#: preflight compares the file with it (:func:`_warn_off_hop_pin_change`) without reading the
+#: store, so the compare does not ride the hop the pin secures (module item 11).
+_STORE_PIN_FIRST_CHECKED: dict[tuple[str, str], str] = {}
+
+
+def note_store_pin_checked(spec: AnchorSpec, fingerprint: str) -> None:
+    """Record ``fingerprint`` as the SQL Server pin's in-process baseline unless one is already
+    held (:data:`_STORE_PIN_FIRST_CHECKED`). The store open and the settings preflight call it once
+    their checks of the pin pass, so a file the open or the preflight refuses never becomes the
+    baseline."""
+    _STORE_PIN_FIRST_CHECKED.setdefault((spec.label, spec.path), fingerprint)
+
+
+def _warn_off_hop_pin_change(spec: AnchorSpec, fingerprint: str) -> None:
+    """Log a WARNING when the SQL Server pin's bytes differ from its in-process baseline
+    (:data:`_STORE_PIN_FIRST_CHECKED`); with no baseline held, do nothing. It reads no store row,
+    so a server the swapped pin admits cannot answer it. Module item 11 states its limits."""
+    first = _STORE_PIN_FIRST_CHECKED.get((spec.label, spec.path))
+    if first is None or first == fingerprint:
+        return
+    log.warning(
+        "%s: the SQL Server pin %r on disk (%s %s) differs from the pin this engine process first "
+        "checked (%s). This compare reads no store row, so it does not depend on the store hop "
+        "the pin secures. Connections the store opened since the change trust the new file. If "
+        "the change is not a certificate renewal you made, treat the store login and the traffic "
+        "on those connections as exposed, correct the file, and restart each engine process that "
+        "uses this store",
+        spec.setting,
+        spec.path,
+        ANCHOR_DIGEST,
+        fingerprint,
+        first,
+    )
+
 
 def enforced_anchor(
     spec: AnchorSpec, *, enforcing: bool, remember_warning: bool = False
@@ -1903,6 +1952,39 @@ def _token_hop_reads_ca(settings: Mapping[str, Any]) -> bool:
     return smart_auth_configured(settings) or oauth2_auth_configured(settings)
 
 
+#: The boolean flags :func:`unread_ca_reason` reads, each with its default.
+_UNREAD_CA_FLAGS: tuple[tuple[str, bool], ...] = (
+    ("tls", False),
+    ("use_tls", True),
+    ("tls_verify", True),
+    ("verify_tls", True),
+)
+
+
+def _flag_or_unresolved(settings: Mapping[str, Any], key: str, *, default: bool) -> bool:
+    """``bool_setting``, except that an unresolved ``env()`` reference reads as on: its value is
+    not known yet, so no CA reads as unread on it, and the check after resolution decides. Any
+    other non-bool is refused, as ``bool_setting`` refuses it (vault BACKLOG #3234). Imported here,
+    not at the top, for the reason :func:`_token_hop_reads_ca` gives."""
+    from messagefoundry.config.wiring import EnvRef
+
+    if isinstance(settings.get(key), EnvRef):
+        return True
+    return bool_setting(settings, key, default=default)
+
+
+def unread_ca_flags_refused(settings: Mapping[str, Any]) -> bool:
+    """Whether any flag in ``_UNREAD_CA_FLAGS`` holds a value the strict read refuses, whether or
+    not :func:`unread_ca_reason` would reach that flag on these settings, so a reader that collects
+    problems can leave that connection to the pass naming the literal."""
+    for key, default in _UNREAD_CA_FLAGS:
+        try:
+            _flag_or_unresolved(settings, key, default=default)
+        except ValueError:
+            return True
+    return False
+
+
 def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     """Why a dialling connection would never read its ``tls_ca_file``, or ``None`` when it reads
     it or the settings cannot tell yet (vault BACKLOG #2371).
@@ -1916,26 +1998,34 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
 
     A generic DATABASE connection's CA is its ``odbc_params`` ``sslca`` (module item 12), which
     its driver does not read under ``sslmode=disable``, or MySQL's ``SSLMODE=DISABLED``, in any
-    case (vault BACKLOG #3090)."""
+    case (vault BACKLOG #3090).
+
+    It reads the four flags in ``_UNREAD_CA_FLAGS`` (``tls``, ``use_tls``, ``tls_verify`` and
+    ``verify_tls``) strictly: when one it reads is neither a ``bool``, ``None``, an empty string
+    nor an ``env()`` reference, it raises :class:`ValueError`, as ``bool_setting`` refuses it
+    (vault BACKLOG #3234). It reads ``verify_tls`` only when no token hop reads the CA. It does not
+    read every flag that way: at least ``smart_enabled`` and ``ech_egress`` are still read by
+    truthiness, and ``oauth2_enabled`` through ``oauth2_auth_configured``, which reads a non-bool
+    as off and does not raise."""
     if _odbc_tls_disabled(settings):
         return "odbc_params sslmode turns TLS off, so the driver reads no CA"
     # Each flag is read as its connector reads it: an explicit None is the default (vault BACKLOG
     # #3230), so a None that turns nothing off does not make a read CA look unread.
     for key, default in (("tls", False), ("use_tls", True)):
-        if key in settings and not bool_setting(settings, key, default=default):
+        if key in settings and not _flag_or_unresolved(settings, key, default=default):
             return f"{key} is off, so the hop builds no TLS context"
     # Ftp() refuses a CA beside a literal tls=False itself. An env() tls resolves only later, into
     # this protocol (vault BACKLOG #3234), so the resolved check is where that case is caught.
     protocol = settings.get("protocol")
     if isinstance(protocol, str) and remote_file_protocol(settings) == "ftp":
         return "plain FTP (tls=False) builds no TLS context"
-    if not bool_setting(settings, "tls_verify", default=True):
+    if not _flag_or_unresolved(settings, "tls_verify", default=True):
         return "tls_verify=False verifies no server certificate"
     if settings.get("ech_egress") and _is_http_url(settings.get("ech_sidecar")):
         return "ech_egress sends both hops to an http:// sidecar, which does the TLS itself"
     if _token_hop_reads_ca(settings):
         return None
-    if not bool_setting(settings, "verify_tls", default=True):
+    if not _flag_or_unresolved(settings, "verify_tls", default=True):
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
     if _is_http_url(settings.get("url")):
         return "the url is http://, so the hop has no TLS, and no token hop reads it"
@@ -2061,9 +2151,10 @@ def database_ca_anchor_spec(
     answers ``None``, left to the build's refusal, which names the keyword.
 
     The other driver file keywords, ``sslcapath``, ``sslcert`` and ``sslkey``, are judged here
-    again the same way first, and each entry of an ``sslcapath`` folder too, so a path the build
-    cleared that leads off the host later is refused at the lane check (item 18). None of them is
-    read as an anchor: no ACL, path or audit check covers them (module item 12)."""
+    again the same way first, and on Windows each entry of an ``sslcapath`` folder too, so on
+    Windows a path the build cleared that leads off the host later is refused at the lane check
+    (item 18). None of them is read as an anchor: no ACL, path or audit check covers them (module
+    item 12)."""
     files = _lane_driver_files(settings)
     if not files:
         return None
@@ -2071,6 +2162,7 @@ def database_ca_anchor_spec(
         driver_file_rule,
         driver_file_spellings,
         file_keyword_verdicts,
+        judging_file_keyword,
         odbc_param_text,
     )
 
@@ -2087,8 +2179,9 @@ def database_ca_anchor_spec(
         odbc_param_text(keyword, value, connection=name)
     ca: tuple[object, Mapping[str, bool | None]] | None = None
     for keyword, value in values.items():
-        verdicts = file_keyword_verdicts(value)
-        rule = driver_file_rule(keyword, value, verdicts)
+        with judging_file_keyword(f"{kind} '{name}' odbc_params {keyword}"):
+            verdicts = file_keyword_verdicts(value)
+            rule = driver_file_rule(keyword, value, verdicts)
         if rule is not None:
             raise ValueError(f"{kind} '{name}' odbc_params {keyword} {rule}")
         if keyword == "sslca":
@@ -2796,6 +2889,8 @@ async def _preflight_checks(
             spec.path,
         )
         raise
+    if spec.server_pin:
+        _warn_off_hop_pin_change(spec, verdict.fingerprint)  # before any store call (step 9)
     # The item 6 escape, the one `_enforce_verdict` grants: a matching pin over the bytes loaded.
     pin_escapes = verdict.pin_ok is True and spec.loads_verified_bytes
     if pin_warning is not None:
@@ -2841,6 +2936,8 @@ async def _preflight_checks(
     except TrustAnchorError as refusal:
         refusal.unaudited = store_fault is not None
         raise
+    if spec.server_pin:
+        note_store_pin_checked(spec, verdict.fingerprint)  # the file passed (step 9)
     if store_fault is not None:
         raise store_fault
     return verdict.fingerprint

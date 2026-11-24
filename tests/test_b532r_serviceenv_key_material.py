@@ -21,15 +21,21 @@ from messagefoundry.serviceenv import (
     service_env_refusal,
 )
 from tests._serviceenv_remedy import (
-    ADD_BACK_JOINED,
+    ADD_BACK_ANY,
+    ADD_BACK_CREATE,
+    ADD_BACK_DOUBT,
     CREATE,
+    DOUBT_CREATE,
+    DOUBT_PASS_BACK,
+    DOUBT_STEP,
+    DOUBT_STEP_LEAVING,
     KEEP,
+    PUT_DOUBT,
     REMOVE,
     REMOVE_SPARING,
     RUNS_ON,
     RUNS_ON_SPARING,
     SET_NO,
-    WIDER,
 )
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
@@ -217,12 +223,17 @@ def test_the_create_guidance_is_printed_only_where_a_setting_goes_to_the_directo
     key_alone = service_env_refusal(_read([f"{_KEY}=", _DIRECTORY_KEY]))
     assert key_alone is not None
     remedy = key_alone.split("each value refused here. ", 1)[1]
-    # The key file comes first and the removal last (fourth hold, H1).
-    assert remedy.startswith("Keep the store key in a DPAPI-protected key file instead")
-    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_JOINED}{_END}")
+    # The doubt step comes first, keeping the joined string that may hold the key whole, then the
+    # key file, and the removal last (fourth hold, H1; the Lander's ruling (a) on PR 3142's
+    # repair handback, comment 7112155891).
+    assert remedy.startswith(
+        f"{DOUBT_STEP_LEAVING}. Keep the store key in a DPAPI-protected key file instead"
+    )
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{_END}")
     # The directory item may still be read as its own variable, so no "set no" opener, and the
-    # pass-back leaves out the strings the run-on step removes, which hold the key (the Lander's hold on PR 3142, comment 7088102723).
-    assert WIDER in remedy and SET_NO not in remedy
+    # pass-back leaves out the strings the run-on step removes, which hold the key (the
+    # Lander's hold on PR 3142, comment 7088102723).
+    assert DOUBT_PASS_BACK in remedy and SET_NO not in remedy
     # No create guidance anywhere, the add-back step included (the third hold, H2).
     assert "how it is created" not in remedy and "how the directory is created" not in remedy
     assert "The other secrets: a secrets directory" not in remedy
@@ -432,15 +443,41 @@ def test_a_directory_named_on_its_own_gets_no_create_guidance() -> None:
 
 
 def test_a_refused_variable_inside_the_directorys_own_string_names_no_string() -> None:
-    """A refused variable on a later line of the directory's own string: the remedy says to
-    remove that variable, and names no string to remove (the third hold, H1)."""
+    """A refused variable on a later line of the directory's own string: the removal step says
+    to remove that variable and names no string to remove (the third hold, H1). The directory
+    line shares its string with other lines, so it is in doubt, and removing the variable may
+    change the directory the engine reads, so the add-back step names it again (the Lander's
+    ruling B on PR 3142's repair handback, comment 7106776128). The directory is listed only by
+    that entry, so the doubt step, then the create step, print before the Put step (the
+    Lander's ruling (a) on that handback's round-3 open findings 1 and 2, comment 7112155891)."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=C:\\d\nMEFOR_STORE_PASSWORD=", "abc"])
-    assert posture.value_runs_on
+    assert posture.value_runs_on and posture.directory_in_doubt
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
-    assert "string" not in refusal.split("each value refused here. ", 1)[1]
+    assert REMOVE in refusal and RUNS_ON in refusal
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{DOUBT_CREATE}. Put MEFOR_STORE_PASSWORD {PUT_DOUBT}")
+    # The password moves to the secrets directory, so the step carries its create clause.
+    assert remedy.endswith(f"{REMOVE}. {RUNS_ON}. {ADD_BACK_DOUBT}{ADD_BACK_CREATE}{_END}")
+    # The third hold's H1: no step between the doubt step and the add-back step names a string.
+    # Those two read and pass back a list, so they name the strings they keep or leave out. The
+    # create step's installer clause (CREATE_INSTALLER) names one too, but it prints only where
+    # the doubt step leaves a string as it is, which it does not here.
+    assert "string" not in remedy.split(DOUBT_STEP, 1)[1].split(ADD_BACK_DOUBT, 1)[0]
+
+
+def test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step() -> None:
+    """The Lander's ruling B on PR 3142's repair handback, comment 7106776128: where any
+    directory entry is in doubt, the remedy says to take every directory line out and add one
+    back, for a store key alone too, though no step above removes the entry. A store key alone
+    goes to a key file, so the step carries no create clause (the third hold, H2)."""
+    refusal = service_env_refusal(
+        _read([f"{_KEY}={_KEY_B64}", "TZ=UTC\nMEFOR_SECRETS_DIRECTORY=C:\\d"])
+    )
+    assert refusal is not None
+    assert refusal.endswith(f"{REMOVE}. {ADD_BACK_DOUBT}{_END}"), refusal
+    assert ADD_BACK_CREATE not in refusal and CREATE not in refusal and KEEP not in refusal
 
 
 @pytest.mark.parametrize("prefix", ["", "MEFOR_AI_ENVIRONMENT=prod\n"], ids=["line", "later-line"])
@@ -561,23 +598,6 @@ _PLAIN = "Parameters\\AppEnvironment"
             ],
             id="joined-lower-case-path",
         ),
-        pytest.param(
-            [
-                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
-                (_EXTRA, "MEFOR_VALUE_A="),
-                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
-            ],
-            id="joined-equals-beside-a-listed-one",
-        ),
-        pytest.param(
-            [
-                (_PLAIN, "MEFOR_VALUE_A=synthetic"),
-                (_PLAIN, "MEFOR_VALUE_A="),
-                (_PLAIN, " MEFOR_SECRETS_DIRECTORY=="),
-                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\real"),
-            ],
-            id="joined-padded-beside-the-scm-one",
-        ),
         # Review round 2 on the repair: the only directory entry is in AppEnvironment, so the
         # step says to add the one it keeps to AppEnvironmentExtra.
         pytest.param(
@@ -607,3 +627,163 @@ def test_a_joined_directory_entry_keeps_one_entry_and_spares_it_from_removal(
     assert "Keep any of them that sets" not in refusal
     assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
     assert "synthetic" not in refusal and "C:\\other" not in refusal
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # The hold's scenario: the joined entry's value is key-shaped, not a path.
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\x"),
+                (_EXTRA, f"{_KEY}="),
+                (_EXTRA, f"MEFOR_SECRETS_DIRECTORY={_KEY_B64}"),
+            ],
+            id="joined-key-text-beside-a-listed-path",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+                (_EXTRA, "MEFOR_VALUE_A="),
+                (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+            ],
+            id="joined-equals-beside-a-listed-one",
+        ),
+        pytest.param(
+            [
+                (_PLAIN, "MEFOR_VALUE_A=synthetic"),
+                (_PLAIN, "MEFOR_VALUE_A="),
+                (_PLAIN, " MEFOR_SECRETS_DIRECTORY=="),
+                ("Environment", "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+            ],
+            id="joined-padded-beside-the-scm-one",
+        ),
+    ],
+)
+def test_a_joined_directory_entry_that_is_not_plainly_a_path_is_removed_and_named_again(
+    entries: list[tuple[str, str]],
+) -> None:
+    """The Lander's hold on PR 3142, comment 7104660861, item 1, its first param the hold's
+    scenario, under the Lander's ruling B on the repair handback, comment 7106776128. A joined
+    directory entry whose value is not plainly a path is in doubt, so no step spares or keeps
+    it, and the removal and run-on steps take it out with the value. That changes the entry the
+    engine reads, so a step of its own says to take every directory line out and the add-back
+    step names the path again, never a silent change of directory. The parametrized control
+    ``joined-path-beside-a-listed-one`` above, the same lists with a joined path, still keeps one
+    entry."""
+    posture = read_service_env_posture(probe=_Probe(entries), environ={})
+    assert posture.directory_in_doubt and posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    # The create clause follows only where a setting moves, as MEFOR_VALUE_A=synthetic does.
+    moves = any(value == "MEFOR_VALUE_A=synthetic" for _where, value in entries)
+    create = ADD_BACK_CREATE if moves else ""
+    assert refusal.endswith(f"{RUNS_ON}. {ADD_BACK_DOUBT}{create}{_END}"), refusal
+    assert "a step below covers" not in refusal and REMOVE in refusal and KEEP not in refusal
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON)
+    assert SET_NO not in refusal
+    assert _KEY_B64 not in refusal and "C:\\x" not in refusal
+
+
+def _remedy(entries: list[tuple[str, str]]) -> str:
+    refusal = service_env_refusal(read_service_env_posture(probe=_Probe(entries), environ={}))
+    assert refusal is not None
+    return refusal
+
+
+@pytest.mark.parametrize(
+    "string",
+    [
+        # Round 3's open finding 1: a key-text directory line absorbed into a broken whole-string
+        # name, MEFOR_VALUE_A with no equals sign on its own line.
+        pytest.param(f"MEFOR_VALUE_A\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="absorbed"),
+        # Round 3's open finding 2: the same line where a later line sets a name ``_names``
+        # keeps, so only the uncounted whole-string twin holds it.
+        pytest.param(
+            f"MEFOR_VALUE_A\nMEFOR_VALUE_B=synthetic\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}",
+            id="uncounted-twin",
+        ),
+        pytest.param(
+            f"MEFOR_VALUE_A=synthetic\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="refused-value"
+        ),
+        pytest.param(f"\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="blank-led-directory-string"),
+        pytest.param(f"TZ=UTC\nMEFOR_SECRETS_DIRECTORY={_KEY_B64}", id="ordinary-variable-string"),
+        # Round 3's open finding 4: a padded ``==`` second line under a directory entry.
+        pytest.param(
+            "MEFOR_SECRETS_DIRECTORY=C:\\real\n MEFOR_SECRETS_DIRECTORY==", id="padded-equals-line"
+        ),
+    ],
+)
+def test_a_directory_line_in_doubt_beside_a_joined_path_keeps_no_entry(string: str) -> None:
+    """The Lander's ruling B on PR 3142's repair handback, comment 7106776128, round 3's open
+    findings 1, 2 and 4: a joined plain path would be kept, but another registry string holds a
+    directory line that is not, alone, plainly a path. The rule reads every string as written,
+    whatever the line reading made of it, so that line is in doubt: no step spares or keeps a
+    directory line, a step of its own says to take every one out, and the add-back step names
+    the path."""
+    refusal = _remedy(
+        [
+            (_EXTRA, f"{_KEY}="),
+            (_EXTRA, "mefor_secrets_directory=C:\\d"),
+            (_EXTRA, string),
+        ]
+    )
+    assert KEEP not in refusal and "a step below covers" not in refusal
+    assert refusal.count(ADD_BACK_DOUBT) == 1 and RUNS_ON in refusal
+    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_DOUBT)
+    assert _KEY_B64 not in refusal and "C:\\d" not in refusal
+
+
+def test_a_joined_plain_path_that_differs_from_a_listed_one_is_kept_not_dropped() -> None:
+    """Round 3's open finding 5: a joined plain path, the entry the engine reads since it is in
+    AppEnvironmentExtra, beside a different path listed in AppEnvironment, while another refused
+    value runs on into other text. At 2ff1f095 the run-on step removed the joined path with no
+    keep-one and no add-back step, a silent change of directory. No entry is in doubt, so the
+    keep-one step now names the path and the removal steps spare the directory lines."""
+    refusal = _remedy(
+        [
+            (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\real"),
+            (_EXTRA, f"{_KEY}="),
+            (_EXTRA, "mefor_secrets_directory=C:\\d"),
+            (_EXTRA, "MEFOR_STORE_PASSWORD="),
+            (_EXTRA, "synthetic-run-on"),
+        ]
+    )
+    assert refusal.endswith(f"{KEEP}{_END}"), refusal
+    assert REMOVE_SPARING in refusal and RUNS_ON_SPARING in refusal
+    assert ADD_BACK_ANY not in refusal and "synthetic-run-on" not in refusal
+
+
+def test_a_look_alike_directory_name_joined_to_a_key_is_added_back() -> None:
+    """The Lander's hold on PR 3142, comment 7104660861: Python's ``os.environ`` on Windows
+    upper-cases names and ``'\\u017f'.upper() == 'S'``, so the engine reads
+    ``MEFOR_\\u017fECRETS_DIRECTORY`` as the directory. Joined to an empty store key, the run-on
+    step removes it; under ruling B (comment 7106776128) it is in doubt, so the add-back step
+    names the directory again. At 2ff1f095 nothing did."""
+    posture = read_service_env_posture(
+        probe=_Probe([(_EXTRA, f"{_KEY}="), (_EXTRA, "MEFOR_\u017fECRETS_DIRECTORY=C:\\d")]),
+        environ={},
+    )
+    assert posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert refusal.endswith(f"{RUNS_ON}. {ADD_BACK_DOUBT}{_END}"), refusal
+    assert KEEP not in refusal and "C:\\d" not in refusal
+
+
+def test_a_single_plain_path_entry_is_kept() -> None:
+    """The control for the per-entry rule (the Lander's ruling B on PR 3142's repair handback,
+    comment 7106776128): the only directory entry is its own string and plainly a path, and no
+    value runs on into it, so it is not in doubt and no step touches it, and the remedy says
+    nothing about the directory."""
+    posture = read_service_env_posture(
+        probe=_Probe(
+            [(_EXTRA, "MEFOR_VALUE_A=synthetic"), (_EXTRA, "MEFOR_SECRETS_DIRECTORY=C:\\real")]
+        ),
+        environ={},
+    )
+    assert not posture.directory_in_doubt and "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert ADD_BACK_ANY not in refusal and KEEP not in refusal and RUNS_ON not in refusal
+    assert "a step below covers" not in refusal and "C:\\real" not in refusal

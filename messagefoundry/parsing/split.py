@@ -30,13 +30,28 @@ import itertools
 import re
 from dataclasses import dataclass
 
-from messagefoundry.parsing._builtin_hl7 import _extract_separators, _first_line_head
-from messagefoundry.parsing.message import Message
-from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
+from messagefoundry.parsing._builtin_hl7 import (
+    _SEPARATOR_HEAD,
+    HEADER_IDS,
+    CollidingDelimitersRefused,
+    _extract_separators,
+    _first_line_head,
+    _whitespace_end,
+    filled_default_collides,
+)
+from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
+from messagefoundry.parsing.peek import (
+    enforce_expansion_budget,
+    normalize,
+    parse_or_refuse,
+    starts_with_msh,
+)
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
+    "batch_member_collides",
     "encode_batch",
+    "head_control_id",
     "split_batch",
     "split_batch_bytes",
     "one_message_bytes",
@@ -384,8 +399,9 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     row's sequence, ADR 0082 ratified decision #3), so a crash re-run that re-claims the same prefix
     re-derives the **byte-identical** envelope (the at-least-once purity requirement).
 
-    The ``BHS`` header is built from the **head member's own** MSH-1 (field separator) and MSH-2
-    (encoding characters) — never hardcoded ``|^~\\&`` — so a custom-delimiter feed frames correctly:
+    The ``BHS`` header is built from the **head member's own** delimiters, the ones its parse reads
+    from its first line (an MSH's MSH-1 and MSH-2, a short MSH-2 filled as the parser fills it) —
+    never hardcoded ``|^~\\&`` — so a custom-delimiter feed frames correctly:
 
     * ``BHS-1`` = the field separator (the literal char after ``BHS``), ``BHS-2`` = the encoding chars,
     * ``BHS-7`` = ``timestamp`` (batch creation date/time), ``BHS-11`` = ``control_id`` (batch control
@@ -400,11 +416,11 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     """
     if not messages:
         raise ValueError("encode_batch requires at least one message")
-    # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
+    # Read the batch separators from the HEAD member's own header (never hardcode |^~\&). The head drives
     # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
     head = messages[0]
     if isinstance(head, Message):
-        field_sep, comp_sep, rep_sep, esc, sub_sep = head._encoding_chars()
+        field_sep, comp_sep, rep_sep, esc, sub_sep = head._write_encoding_chars()
         head_text = head.encode()
     else:
         head_text = normalize(head)
@@ -426,44 +442,117 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     return "".join(pieces)
 
 
-#: How wide an MSH line's opening must be to hold MSH-1 and four encoding characters.
-_SEPARATORS_WIDTH = len(_MSH) + 1 + 4
+def batch_member_collides(member: Message | str) -> bool:
+    """Whether ``member``'s first line names too few encoding characters and a default filled in
+    for one is already another of its delimiters (BACKLOG #5972), so it cannot be written in its
+    own delimiters: as a batch's head, :func:`encode_batch` refuses it, since the BHS is such a
+    write, and as any member, a send that rewrites the envelope's delimiters would rewrite it
+    under the BHS's. The delivery stage asks this of every member and refuses each such one alone
+    rather than let one refuse the whole batch.
+
+    Read from the first line's opening characters alone, as
+    :func:`~messagefoundry.parsing._builtin_hl7._first_line_head` reads them after
+    :func:`~messagefoundry.parsing.peek.normalize`, so a large hydrated member is neither copied
+    nor scanned: the read stops at the first ``\\r`` or ``\\n`` within those characters, and only
+    a head that ends in whitespace looks past them, as the parser's strip does. On a message the parse accepts it is the parse's own verdict,
+    :meth:`Message._delimiters_collide`. It judges the first line only, so it is also ``True``
+    for a colliding first line whose message a parse refuses for something later, such as its
+    escape budget or a later header line too short to read; the delivery stage then refuses that
+    member alone for its header. ``False`` for a member whose first line a parse refuses, such as
+    one led by a byte order mark or a non-HL7 one, which ``encode_batch`` still refuses as it
+    did."""
+    if isinstance(member, Message):
+        return member._delimiters_collide()
+    end = len(member)
+    start = _whitespace_end(member, 0, end)
+    line = member[start : start + _SEPARATOR_HEAD].split("\r", 1)[0].split("\n", 1)[0]
+    # The parse strips the text's trailing whitespace, which shortens the first line only when
+    # everything after it is whitespace, so only a line ending in whitespace needs the scan.
+    if line[-1:].isspace() and _whitespace_end(member, start + len(line), end) == end:
+        line = line.rstrip()
+    return (
+        line[:3] in HEADER_IDS and len(line) >= _SEPARATORS_WIDTH and filled_default_collides(line)
+    )
+
+
+#: The shortest MSH line the parser reads separators from: the id, MSH-1 and one more
+#: character, which may be the field separator again (an empty MSH-2). A shorter one is refused
+#: by the parse, so it goes there.
+_SEPARATORS_WIDTH = len(_MSH) + 1 + 1
 
 
 def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
-    member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
+    member, normalized as ``norm``, as :meth:`Message._write_encoding_chars` reads them after a
+    parse: the batch header is a write of them.
 
-    For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
-    they are read from that line's first few characters alone, through the parser's own window
+    For a head that opens with ``MSH`` after whitespace, with MSH-1 and at least one more
+    character, they are read from that line's first few characters alone, through the parser's own window
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
     #5919): a full parse of a large hydrated head to read eight characters copied the whole head
-    at least twice. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
-    non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
-    it did, ``ValueError`` and its message included.
+    at least twice. A short MSH-2 is filled with the parser's defaults, as the parse fills it;
+    one whose filled default is already another separator is refused with the ``ValueError``
+    every write to such a message raises. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
+    order mark or a non-HL7 one, is parsed, so it frames or raises exactly as a parse does.
 
     A head read from its MSH line is still checked against the parser's own escape expansion
     budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
     ``norm`` itself, the text encode_batch frames: a head a parse refuses for its escapes raises
     the same ``HL7PeekError`` here, whatever its caller checked. On the delivery path that text is
-    the hydrated head, and the caller's own parse of the head's stored payload checks the same
-    budget first, so there this is a second check, not the only one. What else a parse checks in the
-    rest of the head is not checked: at least a later header line too short to read."""
+    the hydrated head. The caller's own read (:func:`head_control_id`) checks the same budget on
+    the head's stored payload, which is other text wherever a document was re-attached, so on
+    the hydrated text this check is the one that runs. What else a parse checks in the rest of
+    the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
-    # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
-    # the line must hold MSH-1 and four encoding characters with no field separator among them. A
-    # window narrower than that only sends every head to the parse.
-    if (
-        not line.startswith(_MSH)
-        or len(line) < _SEPARATORS_WIDTH
-        or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
-    ):
-        return Message.parse(norm)._encoding_chars()
+    # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
+    # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
+    # read takes the fast read; one whose filled default collides takes the write's refusal.
+    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH:
+        return Message.parse(norm)._write_encoding_chars()
     # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
     # refused here too, with the same error. The parse above checks it for itself.
     enforce_expansion_budget(norm)
+    if filled_default_collides(line):
+        # The parse would only reach the same write refusal, at the cost of parsing the head.
+        raise CollidingDelimitersRefused(COLLIDING_DELIMITERS_WRITE)
     field_sep, comp_sep, rep_sep, sub_sep, esc = _extract_separators(line)
     return field_sep, comp_sep, rep_sep, esc, sub_sep
+
+
+#: A header line after the first that is too short for the parse to read (``_builtin_hl7.parse``
+#: refuses one): a line that is a header ID alone, or the text's last line once the parse's strip
+#: leaves only a header ID there. A literal, so the static ReDoS scanner can read it; a test
+#: holds its IDs to HEADER_IDS.
+_SHORT_LATER_HEADER = re.compile(r"\r(?:MSH|BHS|FHS)(?:\r|\s*\Z)")
+
+
+def head_control_id(text: str) -> str | None:
+    """MSH-10 of a batch's head member as stored, what ``Message.parse(text).control_id``
+    returns, read from its first line alone where that gives the same result (BACKLOG #5919).
+
+    A full parse of a large head to read one field copied the whole head. For a head whose first
+    line opens with ``MSH`` after whitespace and holds MSH-1 and one more character, the parse's
+    escape budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`) is checked on
+    the whole text, as the parse checks it first, and that one line is parsed. The MSH segment is
+    split from its own line and separators alone, so its MSH-10 is the full parse's. Every other
+    head, and one the full parse could refuse for a later line or read differently, is parsed in
+    full, so it reads or raises exactly as the parse does: at least an ``FHS``/``BHS``-led or
+    non-HL7 head, one with a later header line too short to read, and one whose first line ends in
+    whitespace, which the parse's strip keeps or drops depending on what follows."""
+    norm = normalize(text)
+    end = len(norm)
+    start = _whitespace_end(norm, 0, end)
+    cr = norm.find("\r", start)
+    stop = end if cr == -1 else cr
+    if (
+        norm.startswith(_MSH, start)
+        and stop - start >= _SEPARATORS_WIDTH
+        and not norm[stop - 1].isspace()
+        and _SHORT_LATER_HEADER.search(norm, stop) is None
+    ):
+        enforce_expansion_budget(norm)
+        return Message(parse_or_refuse(norm[start:stop])).control_id
+    return Message.parse(norm).control_id
 
 
 def _framed(text: str) -> tuple[str, ...]:

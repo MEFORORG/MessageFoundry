@@ -36,13 +36,14 @@ establishes that the off-loopback security controls are already built; this is p
 |---|---|---|
 | **slim (default)** | `docker build -f docker/Dockerfile -t messagefoundry .` | Core engine + SQLite store. The build's default target. |
 | **`-sqlserver`** | `docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .` | Adds the OS-level Microsoft ODBC Driver 18 + `[sqlserver]` extra — needed **only** for the SQL Server store or the DATABASE / `db_lookup` connectors. |
+| **`-postgres`** | `docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .` | Adds the `[postgres]` extra (`asyncpg`), which the Postgres store needs. The `ha` compose profile and [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) run that store, so they need this variant; the slim default carries no `asyncpg`. |
 
-Both are multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
+Each is multi-stage, runs as **non-root uid 10001**, installs from per-profile **hash-locked**
 requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 step in
-`.github/workflows/security.yml`), and are based on `python:3.14-slim-bookworm`, pinned by digest
+`.github/workflows/security.yml`), and is based on `python:3.14-slim-bookworm`, pinned by digest
 (see the [`Dockerfile`](Dockerfile) header). The pin freezes the base's OS packages, so rebuilding
 an old checkout does not pick up newer Debian fixes; build from a current release. The slim default omits
-PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the variant.
+PySide6, dev tools, and ODBC; the SQL Server layer (a Microsoft-EULA apt repo) is only in the `-sqlserver` variant.
 
 ## How the image starts the engine
 
@@ -70,7 +71,8 @@ Two things undo this, and the engine refuses or reports each:
   in Kubernetes) can start the engine without the options. Remote debugging is then on unless
   something turns it off, as at least these do: the start passes `-X disable-remote-debug`; or the start passes
   neither `-I` nor `-E`, as the `messagefoundry` console script does, and the container's
-  environment sets `PYTHON_DISABLE_REMOTE_DEBUG`. The interpreter ignores that variable under
+  environment sets `PYTHON_DISABLE_REMOTE_DEBUG` to a non-empty value, such as 1 (some shells
+  delete a variable set to an empty value). The interpreter ignores that variable under
   either option, so an override that keeps `-I` and drops only `-X disable-remote-debug` has it
   on. With it on, under `enforce` the start refusal for it stops the engine unless
   `[security].allow_remote_debugging` accepts it (vault BACKLOG #2700). A start that goes on
@@ -170,6 +172,14 @@ against one case that matters, described under
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
+  The local Postgres serves TLS from `./pg-tls`, and the engines pin its CA as
+  `./config/pki/store-ca.pem`; `compose.yaml` says what each file must hold and how to own it. The
+  default `engine` has no profile, so it starts beside the pair; `compose.yaml` says how to run the
+  pair alone, and which host port publishes the pair's MLLP, and when.
+  Build the `runtime-postgres` variant first, beside the slim default and from the same checkout
+  (see *Image variants*): at least the `ha` engines, `schema-provision` and
+  `revocation-attestation-check-ha` run `messagefoundry:postgres`,
+  and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
 
@@ -183,9 +193,11 @@ against one case that matters, described under
   every substituted value, at least this one and the Postgres password, in the file substitution
   reads; the `ha` engines still read their own store password from `secrets.env`). The
   `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
-  `docker compose up` and `docker compose --profile ha up` run that check before they start any
-  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. Not
-  every command runs the check: at least `docker compose up --no-deps <engine>` and
+  `docker compose up` and `docker compose --profile ha up` run that check before they start the
+  default `engine`, and `docker compose logs revocation-attestation-check` shows why it refused. The
+  `ha` engines run `messagefoundry:postgres`, so they wait instead on
+  `revocation-attestation-check-ha`, the same check in that image; read its logs for them. Not
+  every command runs either check: at least `docker compose up --no-deps <engine>` and
   `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
   comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;
   the file never sets it for you.

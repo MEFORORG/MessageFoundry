@@ -763,7 +763,9 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     # leaking how many remain, which is the half an attacker with only the password can measure.
     codes = ["AAAA-1111", "BBBB-2222", "CCCC-3333"]
     # enable_totp needs a staged secret (BACKLOG #2224); this test never verifies a TOTP code.
-    staged_cell = await engine.store.set_totp_secret(user.id, secret="JBSWY3DPEHPK3PXP")
+    staged_cell = await engine.store.set_totp_secret(
+        user.id, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
+    )
     assert await engine.store.enable_totp(
         user.id,
         expected_secret_cell=staged_cell,

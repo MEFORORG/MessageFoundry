@@ -33,6 +33,7 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     WiringError,
+    env,
     load_config,
     parse_env_setting,
     validate_config,
@@ -395,7 +396,9 @@ def test_env_ref_decode_with_named_cast(tmp_path: Path) -> None:
     host = reg.outbound["OB"].spec.settings["host"]
     port = reg.outbound["OB"].spec.settings["port"]
     assert isinstance(host, EnvRef) and host.key == "epic_host" and host.cast is None
-    assert isinstance(port, EnvRef) and port.key == "epic_port" and port.cast is int
+    assert isinstance(port, EnvRef) and port.key == "epic_port"
+    # The strict whole-number cast, not the builtin, which read `true` as 1 (BACKLOG #1650).
+    assert port.cast is not None and port.cast is not int and port.cast("2575") == 2575
 
 
 def test_parse_env_setting_discriminates_plain_dicts() -> None:
@@ -417,8 +420,13 @@ def test_named_bool_cast_is_not_the_builtin(tmp_path: Path) -> None:
     assert isinstance(ref, EnvRef) and ref.key == "debug_flag"
     assert ref.cast is not None and ref.cast is not bool
     assert ref.cast("false") is False and ref.cast("true") is True
-    # The other named casts are unchanged, and `int` is still the builtin it always was.
-    assert parse_env_setting({"env": "p", "cast": "int"}).cast is int
+    # `int` is not the builtin either: it is the strict whole-number cast (BACKLOG #1650).
+    assert parse_env_setting({"env": "p", "cast": "int"}).cast is not int
+    # `float` refuses a bool (BACKLOG #1650); `str` is still the builtin.
+    named_float = parse_env_setting({"env": "p", "cast": "float"}).cast
+    assert named_float is not float and named_float is env("p", cast=float).cast
+    assert named_float is not None and named_float("2.5") == 2.5
+    assert parse_env_setting({"env": "p", "cast": "str"}).cast is str
 
 
 def test_duplicate_name_across_file_and_code_fails(tmp_path: Path) -> None:

@@ -1600,7 +1600,7 @@ count is above `0` (vault BACKLOG #2613).
   no posture.
 - **What you lose:** that refusal. A revoked but unexpired certificate is then accepted unless
   something outside the engine stops it. The SMTP hop carries the login password; the webhook
-  carries its path token. **Setting the flag adds no check on the wire.**
+  URL can carry its path token. **Setting the flag adds no check on the wire.**
 - **What the attestation can truthfully rest on:** for the SMTP relay, `[tls].crl_file` reaches
   that hop and adds a real check, where you hold the relay issuer's CRL. It is instance-wide:
   every non-loopback hop the `[tls]` policy reaches then needs its issuer's CRL in that file, or
@@ -1632,10 +1632,10 @@ count is above `0` (vault BACKLOG #2613).
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
   endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
-  to a `TlsSettings`.
+  `create_app` (the embedded path) holds none unless its embedder passes a `TlsSettings` as
+  `tls_settings` or sets `app.state.tls_settings` to one.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
-  the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
+  the `[tls]` section never reached, such as a direct `create_app` whose embedder did neither.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
@@ -1692,8 +1692,12 @@ count is above `0` (vault BACKLOG #2613).
   a directory or module that a broad or low-privilege principal can write, one owned by any
   account other than root or the engine's own (only root when the engine runs as root), and on
   Windows one whose access list cannot be read. With the escape
-  honoured, each of those is a WARNING and the load goes on. Whoever can write there would then run
-  code as the engine's account at the next start, reload or worker respawn.
+  honoured, each of those is a WARNING and the load goes on, and so is at least the same fault on
+  `connections.toml`, `__pycache__`, the `codesets` folder and its tables, and the target of a link
+  among them. Whoever can write there would then run code as the engine's account, or change what
+  it reads, at the next start, reload or worker respawn. The escape does not
+  cover a link on the check's list that cannot be resolved or leads to nothing at check time: the
+  load is still refused.
 - **When acceptable:** a dev or CI checkout that is user-writable on purpose, with synthetic data.
   Never a deployment.
 - **Compensating controls:** none that substitute. Lock the directory instead:
@@ -2095,9 +2099,11 @@ count is above `0` (vault BACKLOG #2613).
   outbound connections and `FhirLookup` connections. The WARNING labels a lookup
   `FhirLookup '<name>'`; the `check` line and the posture entry name it with a `fhir_lookup:`
   prefix. The WARNING reads the resolved URL. The posture entry reads an `env()` URL against the
-  values the graph builds with, falling back to its literal `default=`. The `check` line does not
-  load the instance's environment values, so it reads the `default=` only, and misses a URL that
-  only the environment supplies. A lane the engine has not built (for example `auto_start=False`,
+  values the graph builds with, falling back to its literal `default=`. The `check` line reads it
+  against the environment values `build-check` loads, falling back the same way, when a settings
+  file or an environment declaration resolves and those values load. Otherwise it reads the
+  `default=` only, and misses a URL that only the environment supplies; its detail says which
+  reading ran. Both skip a URL whose value does not resolve, such as one whose cast fails. A lane the engine has not built (for example `auto_start=False`,
   or DR-parked) logs no WARNING until it is built or checked, though the posture entry and the
   `check` line still read its URL as above. A `deployed=False` outbound is never built or
   build-checked, so no WARNING fires for it, and both readers skip one whose `url` is `env()`, whose
@@ -2361,10 +2367,12 @@ count is above `0` (vault BACKLOG #2613).
   - **Stopping can lose the last row and the last alert.** The read at stop has no later read.
     A row or an alert it cannot deliver is lost. Where the store or the sink refused it, its
     ERROR line still says the next pass will retry. The engine stops the reads late in its own
-    stop, after the message graph has stopped. It then gives them about 5 seconds to finish,
-    which covers a read already in progress as well as the read at stop. If they have not
-    finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING that
-    a row may be missing. A row cut off this way has no ERROR line. The engine then goes on
+    stop, after the message graph has stopped. It then gives them up to about 5 seconds to
+    finish, which covers a read already in progress as well as the read at stop. If they have
+    not finished, the engine cancels them, waits up to about 5 seconds more, and logs a WARNING
+    that a row may be missing. Under `serve`, the shutdown's stop budget can cut each of those
+    two waits to about 0.1 seconds (BACKLOG #3191), so on a tight stop the read at stop may get
+    almost no time at all. [SERVICE.md](SERVICE.md#start--stop--status) says when, and which other stop waits the budget covers. The graph supervisor's wait is not one of them, but every stop step before the read, at least that wait and the stop of the message graph, leaves the read less of the budget. A row cut off this way has no ERROR line. The engine then goes on
     stopping, even if a read is still running. A read in progress that is cancelled this way
     keeps the read at stop from running at all. Refusals that no read had reached then get
     neither a row nor an alert. Their WARNING lines may remain, within the limits the **No file
@@ -2446,7 +2454,8 @@ count is above `0` (vault BACKLOG #2613).
   start has passed its remote-debugging gate, so a fleet refused at an earlier gate logs none.
   Where that gate refuses, `serve` and `supervise` log `remote_debug_unguarded` if the hook did not
   answer, and nothing for `remote_debug_enabled`. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
-  copy has it. No API reports that process afterwards. The engine's Python children start with the interface
+  copy has it. Where the gate refuses, `supervise` writes its `remote_debug_unguarded` line to
+  standard output, before the refusal, which goes to standard error. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook

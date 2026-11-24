@@ -219,14 +219,14 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
 
     # --- the TOTP secret's stored bytes are sealed: an earlier value put back is refused ------
     enrolled = await h.account("enrolled")
-    await store.set_totp_secret(enrolled, secret="JBSWY3DPEHPK3PXP")
+    await store.set_totp_secret(enrolled, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     earlier = (await _record(store, enrolled)).row.totp_secret
-    await store.set_totp_secret(enrolled, secret="AAAAAAAAAAAAAAAA")
+    await store.set_totp_secret(enrolled, secret="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
     assert await h.service._load_user(enrolled) is not None  # control: the store's own write
     await raw("UPDATE users SET totp_secret=? WHERE id=?", (earlier, enrolled))
     assert await h.service._load_user(enrolled) is None
     cleared = await h.account("cleared")
-    await store.set_totp_secret(cleared, secret="JBSWY3DPEHPK3PXP")
+    await store.set_totp_secret(cleared, secret="JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
     await raw("UPDATE users SET totp_secret=NULL WHERE id=?", (cleared,))
     assert await h.service._load_user(cleared) is None
 

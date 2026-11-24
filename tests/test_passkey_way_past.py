@@ -784,7 +784,7 @@ async def test_every_refused_passkey_outcome_is_padded_into_the_first_slot(
 
 # --- BACKLOG #3422 beside wave 2: a TOTP enrolment this release refuses is no way past ------------
 
-_TOTP_SECRET = "JBSWY3DPEHPK3PXP"
+_TOTP_SECRET = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP"
 #: An enrolment whose marker this release does not compile in: no code ever matches it.
 _REFUSED_TOTP = f"totp1:SHA1:6:30:{_TOTP_SECRET}"
 #: A usable enrolment, the control arm.

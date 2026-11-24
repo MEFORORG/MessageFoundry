@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Collection
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -45,40 +47,146 @@ _ROOT = Path(__file__).resolve().parents[2]
 # A second implementation of that mapping is exactly the drift this repo keeps writing parity tests to
 # catch (ruff/bandit scan scope, the required-set prose). One resolver, two callers.
 sys.path.insert(0, str(_ROOT))
-from tests._workflow_contexts import required_contexts, resolve  # noqa: E402
+
+# Run as a script, an import failure would exit 1, the findings code, so it exits 2 here. The script
+# imports yaml first: without it the resolver falls back to pytest's importorskip, whose Skipped is a
+# BaseException. Imported by a test module, the failure propagates, so that skip still works there.
+try:
+    if __name__ == "__main__":
+        import yaml as _yaml_before_resolver  # noqa: F401
+
+    from scripts.ci.required_contexts import gh_api
+    from tests._workflow_contexts import (
+        reportable_contexts,
+        required_contexts,
+        resolve,
+    )
+except ImportError as exc:
+    if __name__ != "__main__":
+        raise
+    print(
+        f"::error::could not import a dependency ({exc!r}). Treating as a FAILURE.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2) from exc
+
+# isort: split
+# After the resolver, which owns the handling of an absent PyYAML.
+import yaml  # noqa: E402
 
 #: GitHub reports a runnable workflow as ``active``. Everything else -- ``disabled_manually``,
 #: ``disabled_inactivity`` (60 days idle on a fork/scheduled-only repo), ``disabled_fork`` -- means it
 #: will not dispatch, so a required context it owns can never report.
 _RUNNABLE = "active"
 
+#: One path segment, ASCII only. The literal ``.github`` below is the only leading dot allowed.
+_SEGMENT = r"[A-Za-z0-9_][A-Za-z0-9._-]*"
 
-def _workflow_states(repo: str | None, states_json: Path | None) -> dict[str, str]:
-    """``{workflow filename: state}`` for every workflow in the repo.
+#: Every path this script accepts. Group 1 is set only for a file directly in ``.github/workflows``.
+_WORKFLOW_PATH = re.compile(
+    rf"\.github/workflows/(?:({_SEGMENT})|{_SEGMENT}(?:/{_SEGMENT})+)"
+    rf"|dynamic/{_SEGMENT}(?:/{_SEGMENT})+"
+)
+
+#: What reading the local contexts file and workflow YAML can raise. The resolver asserts a mapping
+#: and then indexes into the parse, so a wrongly shaped file surfaces as an assertion, attribute or
+#: type error. RuntimeError covers RecursionError from deeply nested YAML.
+_LOCAL_READ_ERRORS = (
+    OSError,
+    ValueError,
+    RuntimeError,
+    yaml.YAMLError,
+    AssertionError,
+    AttributeError,
+    TypeError,
+)
+
+
+def _workflow_entries(payload: object) -> list[object]:
+    """The workflow entries in any payload shape this script accepts, or ``RuntimeError``.
+
+    THREE SHAPES: one API page (``{"workflows": [...]}``), the LIST OF PAGES that ``--slurp`` emits, and
+    a saved bare list of workflows. A list is told apart by whether its entries carry ``workflows``, and
+    a list mixing the two is refused rather than guessed at. An error object on any page lands here too,
+    so one bad page cannot pass as a short list.
+    """
+    if isinstance(payload, dict):
+        pages: list[object] = [payload]
+    elif not isinstance(payload, list):
+        raise RuntimeError(f"workflow payload is a {type(payload).__name__}, not an object or list")
+    elif not any(isinstance(entry, dict) and "workflows" in entry for entry in payload):
+        return payload  # bare workflows; _workflow_state refuses a bad one
+    else:
+        pages = payload
+
+    entries: list[object] = []
+    for page in pages:
+        block = page.get("workflows") if isinstance(page, dict) else None
+        if not isinstance(block, list):
+            raise RuntimeError("a workflow page has no `workflows` array")
+        entries.extend(block)
+    return entries
+
+
+def _workflow_state(entry: object) -> tuple[str, str]:
+    """``(path, state)`` of one entry, or ``RuntimeError``.
+
+    A missing field must not default to ``""``, and a padded one must not pass through: either would
+    report a malformed payload as a disabled or absent workflow, exit 1, which is the findings code.
+    """
+    if not isinstance(entry, dict):
+        raise RuntimeError("a workflow entry is not an object")
+    path, state = entry.get("path"), entry.get("state")
+    # Two isinstance checks rather than one all(): mypy narrows these and not a generator.
+    if not (isinstance(path, str) and isinstance(state, str)) or not all(
+        value and value == value.strip() for value in (path, state)
+    ):
+        raise RuntimeError("a workflow entry lacks a usable `path` or `state`")
+    return path, state
+
+
+def _direct_workflow_file(path: str) -> str | None:
+    """The filename of an allowlisted direct path, ``None`` for a well-formed other, else raises.
+
+    An ALLOWLIST on the raw path, because a list of bad spellings cannot be complete: a backslash, a
+    case change, ``%2e``, or a trailing NUL or zero-width space each once passed as an ignorable
+    entry, which would hide a disabled workflow. The well-formed others are a file nested under
+    ``.github/workflows`` and a ``dynamic/`` entry, each at least two segments deep. Anything else
+    raises ``RuntimeError``.
+    """
+    match = _WORKFLOW_PATH.fullmatch(path)
+    if match is None:
+        raise RuntimeError(f"workflow path {path!r} is not canonical")
+    return match[1]
+
+
+def _workflow_states(
+    repo: str | None, states_json: Path | None, required: Collection[str]
+) -> dict[str, str]:
+    """``{filename: state}`` of the direct workflow files.
+
+    Raises ``RuntimeError`` at least on a path that ``_direct_workflow_file`` refuses, even one
+    directly in ``.github/workflows``.
 
     Keyed on the FILENAME rather than the display name: the display name is what ``workflow_run``
     matches on, but a required context resolves to a FILE, and two workflows may legitimately share a
-    display name (this repo has two called "CodeQL").
+    display name (this repo has two called "CodeQL"). ``required`` names the files a required context
+    resolves to, the only ones whose conflicting repeat is refused.
     """
     if states_json is not None:
         payload = json.loads(states_json.read_text(encoding="utf-8"))
     else:
-        cmd = ["gh", "api", "--paginate"]
-        cmd.append(
-            f"repos/{repo}/actions/workflows" if repo else "repos/{owner}/{repo}/actions/workflows"
-        )
-        # B603 asks whether untrusted input reaches a subprocess. It cannot here: argv is a fixed
-        # literal list, there is no shell, and the only variable element is `--repo`, an operator-typed
-        # CLI argument on a CI runner — not message, config, or network data. Annotated per-line with a
-        # reason, the posture security.yml's bandit notes require.
-        out = subprocess.run(  # noqa: S603  # nosec B603 — fixed argv, no shell, operator-supplied repo
-            cmd, capture_output=True, text=True, timeout=120
-        )
-        if out.returncode != 0:
-            raise RuntimeError(f"gh api failed ({out.returncode}): {out.stderr.strip()[:400]}")
-        payload = json.loads(out.stdout)
-    workflows = payload.get("workflows", payload if isinstance(payload, list) else [])
-    return {Path(str(w.get("path", ""))).name: str(w.get("state", "")) for w in workflows}
+        # --slurp because --paginate alone concatenates one JSON document per page, which does not
+        # parse. gh requests 100 per page here, so that would start at more than 100 workflows.
+        route = f"repos/{repo or '{owner}/{repo}'}/actions/workflows"
+        payload = gh_api(["--paginate", "--slurp", route])
+    # A repeat that disagrees on a required file is refused.
+    states: dict[str, str] = {}
+    for path, state in map(_workflow_state, _workflow_entries(payload)):
+        name = _direct_workflow_file(path)
+        if name is not None and states.setdefault(name, state) != state and name in required:
+            raise RuntimeError(f"workflow {name} is listed with conflicting states")
+    return states
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,7 +199,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    contexts = required_contexts()
+    try:
+        contexts = required_contexts()
+        resolved = {ctx: resolve(ctx) for ctx in contexts}
+        # A missing or empty directory globs to nothing and raises nothing.
+        if not reportable_contexts():
+            raise RuntimeError("no workflow jobs found in the local .github/workflows")
+    except _LOCAL_READ_ERRORS as exc:
+        # Exit 1 is the findings code, and an uncaught exception would exit 1 too.
+        print(
+            f"::error::could not read the required contexts or workflow files ({exc!r}). Treating "
+            "as a FAILURE.",
+            file=sys.stderr,
+        )
+        return 2
     if not contexts:
         print(
             "::error::.github/required-contexts.txt parsed to ZERO contexts — the format changed under "
@@ -101,10 +222,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        states = _workflow_states(args.repo, args.states_json)
-    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError, OSError) as exc:
+        required = {where[0] for where in resolved.values() if where is not None}
+        states = _workflow_states(args.repo, args.states_json, required)
+    except (RuntimeError, ValueError, subprocess.SubprocessError, OSError) as exc:
         # FAIL CLOSED. "We could not read workflow state" must never read as "every workflow is fine" —
-        # that is the same blindness this script exists to catch, one level up.
+        # that is the same blindness this script exists to catch, one level up. ValueError covers both
+        # JSONDecodeError and UnicodeDecodeError; RuntimeError covers RecursionError from deep JSON.
         print(
             f"::error::could not read workflow state ({exc!r}). Treating as a FAILURE.",
             file=sys.stderr,
@@ -112,7 +235,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if not states:
         print(
-            "::error::the API returned ZERO workflows — refusing to report success.",
+            "::error::the API returned ZERO workflows in .github/workflows — refusing to report "
+            "success.",
             file=sys.stderr,
         )
         return 2
@@ -121,7 +245,7 @@ def main(argv: list[str] | None = None) -> int:
     unresolved: list[str] = []
     checked = 0
     for ctx in contexts:
-        where = resolve(ctx)
+        where = resolved[ctx]
         if where is None:
             unresolved.append(ctx)
             continue
@@ -132,7 +256,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         checked += 1
         if state != _RUNNABLE:
-            unreachable.append(f"{ctx}  ->  {workflow}  [state={state}]")
+            # !r because the value is server data, and a raw newline would start a new `::` command.
+            unreachable.append(f"{ctx}  ->  {workflow}  [state={state!r}]")
 
     # Liveness receipt: report what was EXAMINED. "no unreachable contexts" and "nothing was checked"
     # are otherwise indistinguishable from the exit code.

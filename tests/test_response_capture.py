@@ -37,6 +37,7 @@ from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.mllp import MLLPDestination
 from tests._admin_account import create_local_user_chosen
+from tests._fake_dbapi_driver import DriverError
 from tests._store_audit import no_operator_audit
 
 
@@ -272,6 +273,16 @@ def test_mllp_capture_accepts_positive_ack() -> None:
 
 def test_mllp_noncapture_returns_none_on_positive_ack() -> None:
     assert _mllp(False)._check_ack(_ack("AA")) is None
+
+
+def test_mllp_accepts_an_ack_whose_short_msh_2_fills_a_colliding_default() -> None:
+    """``MSH|~|`` declares ``~`` as the component separator, and the parser fills the repetition
+    separator with ``~`` too. Such a partner ACK is read, not retried as unparseable: only a
+    ``Message`` write refuses that header (BACKLOG #5972)."""
+    ack = b"MSH|~|R|R|S|S|20240101||ACK|1|P|2.5\rMSA|AA|1|"
+    assert _mllp(False)._check_ack(ack) is None
+    r = _mllp(True)._check_ack(ack)
+    assert isinstance(r, DeliveryResponse) and r.outcome == "accepted"
 
 
 @pytest.mark.parametrize(
@@ -543,7 +554,7 @@ async def test_database_capture_propagates_a_fetch_driver_error() -> None:
 
     class _FailingFetch(_Cur):
         async def fetchall(self) -> list[tuple[Any, ...]]:
-            raise Exception("08S01", "[08S01] communication link failure (10054) (SQLFetch)")
+            raise DriverError("08S01", "[08S01] communication link failure (10054) (SQLFetch)")
 
     d = _db(True)
     with pytest.raises(Exception, match="08S01"):

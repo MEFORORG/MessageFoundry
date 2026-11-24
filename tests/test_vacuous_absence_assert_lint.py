@@ -120,7 +120,6 @@ _BASELINE: dict[str, int] = {
     "tests/test_cutover_slug_rot.py": 2,
     "tests/test_dast_auth_sweep.py": 2,
     "tests/test_dast_claims.py": 1,
-    "tests/test_dast_ingress_sweep.py": 1,
     "tests/test_dependency_boundaries.py": 3,
     "tests/test_dicom_parse_error_contract.py": 1,
     "tests/test_doc_guards_lane.py": 1,

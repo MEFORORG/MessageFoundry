@@ -19,6 +19,8 @@ view widgets, so they now live beside it.
 from __future__ import annotations
 
 import html
+import logging
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -49,6 +51,8 @@ from harness._async import AsyncRunner
 from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.apiclient import ApiError, EngineClient, StepUpRequired
 from messagefoundry.parsing import HL7PeekError, parse_tree
+
+_log = logging.getLogger(__name__)
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
 #: error labels, and the heart's stopped state — so the palette can't drift across modules.
@@ -292,10 +296,30 @@ class MessageDetailPanel(QWidget):
         # an in-flight one (rapid row clicks / replay), so a stale result is dropped in _apply.
         self._open_seq += 1
         self._pending_id = message_id
-        # No Show body until this open lands: a press now would fetch the previous message's body.
-        self._show_body.setEnabled(False)
+        # Nothing is open until this open lands. The previous message leaves the screen now, and
+        # Show body or Replay pressed meanwhile would act on it, so both go too (BACKLOG #5848).
+        self._reset("Opening the message...")
         open_seq = self._open_seq
-        self._runner.submit(lambda: self._fetch(message_id, open_seq), on_done=self._apply)
+        self._runner.submit(
+            lambda: self._fetch(message_id, open_seq),
+            on_done=self._apply,
+            on_error=lambda exc: self._open_raised(message_id, open_seq, exc),
+        )
+
+    def _open_raised(self, message_id: str, open_seq: int, exc: BaseException) -> None:
+        """The open raised something other than ApiError. The client wraps transport errors in
+        ApiError, so this is a contract break, such as a closed client or a decode bug: log it and
+        take _apply's error path, which drops it if a newer open superseded it. Its text can quote
+        message fields (a decode error names its input), so no level logs the text: WARNING carries
+        the type name, and DEBUG the traceback's frames without the message."""
+        _log.warning("message detail open raised %s", type(exc).__name__)
+        _log.debug(
+            "message detail open raised %s at:\n%s",
+            type(exc).__name__,
+            "".join(traceback.format_tb(exc.__traceback__)),
+        )
+        error = f"the message could not be opened: {type(exc).__name__}"
+        self._apply(_DetailSnapshot(message_id, open_seq, None, error))
 
     def stop(self) -> None:
         """Stop the background runner (call on window close) so a late result can't touch dead widgets."""
@@ -409,14 +433,19 @@ class MessageDetailPanel(QWidget):
         self._raw.setPlainText(snap.raw.replace("\r", "\n"))
 
     def _on_replay(self) -> None:
-        if self._message_id is None:
-            return
+        # Read once: replay() can open a step-up prompt whose nested event loop runs a load() or
+        # clear(). That newer selection wins, so the refresh below runs only if none did.
+        message_id = self._message_id
+        if message_id is None:
+            return  # nothing open, or a newer load() is still in flight
+        open_seq = self._open_seq
         try:
-            self._client.replay(self._message_id)
+            self._client.replay(message_id)
         except ApiError as exc:
             self.error.emit(str(exc))
             return
-        self.load(self._message_id)  # refresh detail (status/events updated)
+        if open_seq == self._open_seq:
+            self.load(message_id)  # refresh detail (status/events updated)
         self.changed.emit()
 
 

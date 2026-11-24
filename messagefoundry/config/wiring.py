@@ -44,6 +44,8 @@ import json
 import logging
 import math
 import ntpath
+import numbers
+import operator
 import os
 import re
 import stat
@@ -52,7 +54,15 @@ import threading
 import tokenize
 import traceback
 import urllib.parse
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -342,6 +352,14 @@ class EnvRef:
         # ``object.__setattr__``; ``_cast_bool`` is defined below and only looked up at call time.
         if self.cast is bool:
             object.__setattr__(self, "cast", _cast_bool)
+        # vault BACKLOG #1650: the builtin ``int`` reads a TOML ``true`` in ``environments/<env>.toml``
+        # as 1 and ``2575.9`` as 2575, so ``env("p", cast=int)`` built a port nobody wrote, and the
+        # connector's own check saw only the cast's result. The same swap, for the same reason.
+        elif self.cast is int:
+            object.__setattr__(self, "cast", _cast_int)
+        # The builtin ``float`` reads a TOML ``true`` as 1.0 the same way.
+        elif self.cast is float:
+            object.__setattr__(self, "cast", _cast_float)
         # A default is never cast at resolve time, so ``default="false"`` would reach the connector
         # as text and read True there. Read it strictly here, once, on both routes: ``connections.toml``
         # hands in ``_cast_bool`` itself. ``None`` stays a deliberate None. The value is withheld for
@@ -401,7 +419,12 @@ def env(key: str, *, default: Any = _UNSET, cast: Callable[[Any], Any] | None = 
     resolve time naming the setting and the key. A TOML ``true``/``false`` (or ``1``/``0``) from
     ``environments/<env>.toml`` passes through. The builtin ``bool`` would read every non-empty
     string as True. A ``default=`` with ``cast=bool`` is read the same way when the reference is
-    made, and an unreadable one is refused then. Any other callable runs as given. On a boolean
+    made, and an unreadable one is refused then. ``cast=int`` means a strict whole-number reading
+    (vault BACKLOG #1650, :func:`_cast_int`), and ``cast=float`` a strict finite-number reading
+    (:func:`_cast_float`). Any other callable runs as given, a builtin such as ``abs`` or a
+    type such as ``decimal.Decimal`` included, on the environment value as it arrives, a TOML bool
+    included, so ``cast=lambda v: int(v)`` still reads ``true`` as 1; the connector's own check
+    sees only what the cast returned. On a boolean
     setting (a factory parameter annotated ``bool``, a composer's ``enabled``, or ``Ftp``'s ``tls``),
     the result is then read the same strict way, so an uncast or ``str``-cast ``env()`` there cannot
     hand the connector the text ``"false"`` (vault BACKLOG #3234). A cast that itself returns a ``bool`` is trusted:
@@ -473,12 +496,73 @@ def _cast_bool(raw: Any) -> bool:
 _cast_bool.__name__ = "bool"
 
 
+def _cast_int(raw: Any) -> int:
+    """Read an environment value as a whole number: the ``cast = "int"`` named cast, and what a
+    code-first ``env(..., cast=int)`` runs, since :class:`EnvRef` swaps the builtin ``int`` for it
+    (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1 and ``2575.9`` into 2575. ``environments/<env>.toml`` is TOML,
+    so either one reaches a cast typed, and a port read that way would have dialled a port nobody
+    named. So a bool is refused, ``False`` as well as ``True``, and so is a number that is not whole
+    or not finite. Text is read by ``int()``, as before. An integer passes, and so does another
+    number that is whole, such as ``2575.0`` or ``Decimal("2575")``. Anything else is refused.
+
+    Raises ``ValueError`` with the value withheld, by the rule :func:`_cast_bool` states, outside the
+    handler, so ``int()``'s own message, which quotes the value, is not left on ``__context__``."""
+    reason: str
+    if isinstance(raw, bool):
+        reason = "a bool is not a whole number"
+    elif isinstance(raw, str):
+        try:
+            return int(raw)
+        except ValueError:
+            reason = "text must be a whole number in digits"
+    elif isinstance(raw, numbers.Integral):
+        return operator.index(raw)
+    elif isinstance(raw, numbers.Number):
+        number: Any = raw  # numbers.Number promises no int(); a complex makes it raise TypeError
+        try:
+            whole: int = int(number)
+        except (TypeError, ValueError, OverflowError):
+            reason = "not a finite real number"
+        else:
+            if whole == number:
+                return whole
+            reason = "not a whole number, and int() would truncate it"
+    else:
+        reason = f"a {type(raw).__name__} is not a number or text"
+    raise ValueError(f"{reason} (value withheld)")
+
+
+# Named "int" for the reason ``_cast_bool`` is named "bool": the resolver's message names the cast.
+_cast_int.__name__ = "int"
+
+
+def _cast_float(raw: Any) -> float:
+    """Read an environment value as a number: the ``cast = "float"`` named cast, and what a
+    code-first ``env(..., cast=float)`` runs, since :class:`EnvRef` swaps the builtin ``float`` for
+    it (vault BACKLOG #1650).
+
+    The builtin turns ``True`` into 1.0, and a TOML ``true`` in ``environments/<env>.toml`` reaches
+    the cast typed. It also takes ``"nan"`` and ``"inf"``, and rounds ``"1e-400"`` to 0.0, so a
+    float cap read through the cast could turn off from a value nobody wrote as zero. So the value
+    is read by the rule ``transports.base.float_setting`` holds, which refuses each of those with a
+    ``ValueError`` that withholds the value, by the rule :func:`_cast_bool` states."""
+    from messagefoundry.transports.base import float_setting
+
+    return float_setting(raw, knob="value", transport="env()")
+
+
+# Named "float" for the reason ``_cast_bool`` is named "bool".
+_cast_float.__name__ = "float"
+
+
 #: Named casts a ``connections.toml`` env-ref may request (ADR 0007). A data file/GUI can't author an
 #: arbitrary Python callable the way :func:`env` can, so the file form is restricted to these — and
 #: ``int`` is the only cast used across the migration estate today.
 _NAMED_CASTS: dict[str, Callable[[Any], Any]] = {
-    "int": int,
-    "float": float,
+    "int": _cast_int,
+    "float": _cast_float,
     "bool": _cast_bool,
     "str": str,
 }
@@ -917,7 +1001,8 @@ _UNREAD_CA_ON_TLS_OFF: Final = MappingProxyType(
 def _tls_off_reason(tls: object) -> str | None:
     """Why a CA beside this ``tls`` is never read, or ``None``: the one predicate the factories and
     :func:`refuse_resolved_verify_off` share (``unread_ca_reason``'s ``tls`` arm). An ``env()``
-    ``tls`` is truthy, so it reads as on until it resolves."""
+    ``tls`` reads as on until it resolves, by ``unread_ca_reason``'s own rule, since
+    ``bool_setting`` refuses one."""
     from messagefoundry.auth.trust_anchors import unread_ca_reason
 
     return unread_ca_reason({"tls": tls})
@@ -925,8 +1010,9 @@ def _tls_off_reason(tls: object) -> str | None:
 
 def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: object) -> None:
     """The ``tls_ca_file`` and ``tls_ca_pin`` checks of a factory in :data:`_UNREAD_CA_ON_TLS_OFF`
-    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, since the unread
-    reason reads it by truthiness."""
+    (BACKLOG #5329, #5331). A non-bool ``tls`` beside a CA is refused first, so the refusal names
+    the factory: the unread reason reads ``tls`` strictly and would raise a bare ``ValueError``
+    that does not (vault BACKLOG #3234)."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
         refuse_bool_literals({"tls": tls}, factory)
@@ -1783,10 +1869,10 @@ def _bool_settings() -> _BoolSettings:
 
 
 def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
-    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, as
-    :func:`~messagefoundry.config.models.bool_setting` does, so a connector that reads the flag with
-    plain ``bool()`` cannot turn a default-on check off on a ``None``. Anything else is
-    :func:`_cast_bool`, which raises ``ValueError`` with the value withheld."""
+    """One boolean setting, read strictly: ``None`` takes the setting's own ``default``, so a
+    connector that reads the flag with plain ``bool()`` cannot turn a default-on check off on a
+    ``None``. Anything else is :func:`_cast_bool`, which raises ``ValueError``, with the value
+    withheld, on a spelling it does not know, an empty string included."""
     return default if value is None else _cast_bool(value)
 
 
@@ -2027,6 +2113,29 @@ def resolve_env_settings(
     if parts:
         raise WiringError("; ".join(parts))
     return resolved
+
+
+#: What :func:`_resolved_setting` returns for an ``env()`` reference it cannot resolve.
+_UNRESOLVED = object()
+
+
+def _resolved_setting(
+    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
+) -> object:
+    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
+    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
+    values, a key the values do not hold and no default, or a value the resolution refuses, such
+    as one whose cast fails, with no fall back to the default. The graph readers share it, at least
+    the DATABASE, ECH, FHIR path-form and query-credential ones (vault BACKLOG #3766 item 32)."""
+    value = settings.get(key, default)
+    if not isinstance(value, EnvRef):
+        return value
+    if env_values is None:
+        return _UNRESOLVED
+    try:
+        return resolve_env_settings({key: value}, env_values)[key]
+    except WiringError:
+        return _UNRESOLVED
 
 
 #: The ``env()`` values the graph a registry guard is judging resolves against, set only while
@@ -2342,7 +2451,7 @@ def connector_secret_env_values(
     * a URL setting (:func:`_is_url_setting`) whose value carries userinfo or a query parameter
       ``secretscrub`` reads as a credential.
 
-    The last two are resolved as the build resolves them (:func:`_db_setting`, so the reference's
+    The last two are resolved as the build resolves them (:func:`_resolved_setting`, so the reference's
     ``cast`` runs and a missing key falls back to its ``default=``), and only the credential VALUES
     are MAC'd, in a fixed encoding, so a renamed header or parameter, a harmless header or a new host
     is not read as a rotation. Values are returned **transiently** to be MAC'd — never persisted or
@@ -2366,7 +2475,9 @@ def connector_secret_env_values(
                 material = raw if isinstance(raw, str) and raw else None
             elif name == "headers" or _is_url_setting(name):
                 # Resolved only for these two, so no other setting's cast runs here.
-                material = _env_secret_material(name, _db_setting(settings, name, None, env_values))
+                material = _env_secret_material(
+                    name, _resolved_setting(settings, name, None, env_values)
+                )
             else:
                 continue
             if material:
@@ -4641,9 +4752,11 @@ def Direct(
     (which must chain to ``trust_anchor`` and carry an RSA key), and submits the S/MIME message to
     ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
     except the certificates' validity window: construction only warns on it, and each send refuses
-    a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
-    What construction refuses in the recipient cert, including one that does not name every address
-    in ``recipients``, is listed under *Recipient trust* in ``docs/CONNECTIONS.md``.
+    a recipient cert, issuing anchor or signing cert outside it (code ``direct-cert-validity``,
+    BACKLOG #5631). Construction also checks the recipient cert well beyond issuance by
+    ``trust_anchor``, including that it names every address in ``recipients``: what it refuses,
+    and which anchors it skips rather than refuses, is stated once, under *Recipient trust* in
+    ``docs/CONNECTIONS.md``.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -4702,10 +4815,10 @@ class _RoleDefault:
         return "<each role's default>"
 
 
-#: ``DICOM(max_object_bytes=...)`` left unset. One factory builds both roles and each has its own
-#: default (``transports/dicom.py``; vault BACKLOG #4908), so the factory writes no value it was not
-#: given. Typed ``Any`` so that the parameter's annotation stays ``int | None``, which is what an
-#: author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
+#: ``DICOM(max_object_bytes=...)`` or ``min_message_bytes_per_second`` left unset. One factory builds
+#: both roles and the transport holds each default (``transports/dicom.py``; vault BACKLOG #4908,
+#: #6637), so the factory writes no value it was not given. Typed ``Any`` so that the parameter's
+#: annotation stays what an author may pass. DICOM is not a connections.toml transport today, so no file reads this default.
 #: Not ``_UNSET``, which is ``env()``'s.
 _ROLE_DEFAULT: Any = _RoleDefault()
 
@@ -4756,6 +4869,9 @@ def DICOM(
     max_pdu_size: int = 16384,  # largest PDU offered; the SCP aborts a longer one (SCP: 4096 to 1 MiB)
     timeout_seconds: float = 30.0,  # ACSE/DIMSE/network timeout; SCP: deadline per read and send, >= 1 s
     connect_timeout: float = 10.0,  # outbound SCU: association-request timeout (Phase 2)
+    min_message_bytes_per_second: int = _ROLE_DEFAULT,  # SCP: the rate in each message's deadline;
+    # unset = 64 KiB a second. Lower it for a slower link. At least 16 KiB a second: it cannot be
+    # off. Refused on an outbound.
 ) -> ConnectionSpec:
     """A **DICOM DIMSE** endpoint (ADR 0025). **Phase 1 (built): the inbound C-STORE SCP** — pair it
     with ``content_type="dicom"`` on ``inbound(...)`` so a received object is base64-carried (ADR 0028)
@@ -4843,6 +4959,8 @@ def DICOM(
     }
     if max_object_bytes is not _ROLE_DEFAULT:
         settings["max_object_bytes"] = max_object_bytes
+    if min_message_bytes_per_second is not _ROLE_DEFAULT:
+        settings["min_message_bytes_per_second"] = min_message_bytes_per_second
     return ConnectionSpec(ConnectorType.DIMSE, settings)
 
 
@@ -6078,6 +6196,57 @@ def _accepts_run_scoped_reads(pred: object) -> set[str]:
     return found
 
 
+# The verdict types :func:`accepts_verdict` refuses unless the class has a truth value of its own:
+# each otherwise reads as True without being awaited or iterated.
+_ALWAYS_TRUE_VERDICT_TYPES: Final = (Awaitable, Iterator, AsyncIterator)
+
+
+def accepts_verdict(hname: str, verdict: object) -> bool:
+    """The truth value of ``verdict``, the value an ``accepts=`` predicate returned, or
+    :class:`TypeError` when it is an awaitable, an iterator or an async iterator (BACKLOG #5514).
+
+    The router stage reads the verdict as a truth value without awaiting or iterating it. A coroutine,
+    a generator, an async generator and iterators such as ``filter`` or ``re.finditer`` each read as
+    True, so the handler would accept every message. The static check in
+    :func:`_check_accepts_predicate` misses a plain function that returns one. The raise propagates
+    out of ``route_only`` like any predicate raise, into the router-stage error path. The text names
+    the handler and the verdict's type, never its value. Every mode applies this one rule, so
+    ``[sandbox].mode`` does not change the verdict (ADR 0087).
+
+    The refusal neither consumes nor closes the object, because the predicate may share it, for
+    example a module-level generator, and closing it would end it for its other holders. It drops its
+    own reference before raising. ``dryrun._accepted`` and the sandbox worker pass the verdict straight
+    in rather than binding it to a local, so on those paths an object the predicate made for this
+    call, and that is in no reference cycle, is collected before the error leaves this function, on
+    the calling thread and inside whatever run context the caller holds. The dry-run tracer's
+    recorder keeps the predicate's frame, so on the traced path the object waits for the cyclic
+    collector, as does an object in a cycle on any path. When Python finalizes it, a started
+    generator's ``finally`` runs, a raise from that ``finally`` goes to Python's unraisable-exception
+    hook rather than into this error, and a coroutine draws Python's "never awaited" warning.
+
+    An object whose class defines ``__bool__`` or ``__len__`` has a truth value of its own, so it is
+    read by that value as before, iterator or not."""
+    if verdict is None or type(verdict) is bool:  # the contract's shapes: the routing hot path
+        return bool(verdict)
+    cls = type(verdict)
+    if (
+        isinstance(verdict, _ALWAYS_TRUE_VERDICT_TYPES)
+        and not hasattr(cls, "__bool__")
+        and not hasattr(cls, "__len__")
+    ):
+        # A class name is author-controlled and type() accepts one with CR or LF in it, so it is
+        # escaped before it reaches text that is logged. hname goes in through repr, which escapes.
+        type_name = scrub_log_argument(cls.__name__)
+        del verdict, cls  # see the docstring: the traceback must not keep the verdict alive
+        raise TypeError(
+            f"accepts= predicate for handler {hname!r} returned an object of type "
+            f"{type_name}, which the router stage cannot await or iterate "
+            "and would read as True; it must return a value whose truth value is the verdict, "
+            "such as a bool"
+        )
+    return bool(verdict)
+
+
 def _check_accepts_predicate(hname: str, pred: object) -> None:
     """Fail closed on an ``accepts=`` predicate that can't hold its contract (ADR 0084).
 
@@ -6090,7 +6259,9 @@ def _check_accepts_predicate(hname: str, pred: object) -> None:
     * **Async** — an ``async def`` predicate, or a partial, method, wrapper or callable instance that
       runs one (:func:`_accepts_is_async`), returns a coroutine, which the router stage reads as
       truthy, so the handler would accept every message (BACKLOG #5514). A plain function that returns
-      an awaitable is not seen.
+      an awaitable, an iterator or an async iterator is not seen here; :func:`accepts_verdict`
+      refuses such a verdict at run time instead, as a router-stage error, unless its class has a
+      truth value of its own.
     * **Fail-open run-scoped read** — a predicate that can reach ``state_get``/``response_get`` (ADR
       0005/0013) would see an EMPTY view in the router phase and silently invert (deliver what a
       suppression rule excluded). Those accessors return ``default`` instead of raising, so nothing
@@ -7096,7 +7267,11 @@ class Registry:
         ``auth/trust_anchors.py``. Literal values only, as :meth:`encoding_problems` judges every
         ``env()`` reference but an inbound encoding's: an ``env()`` value reads as unknown, and the
         check after resolution refuses it then."""
-        from messagefoundry.auth.trust_anchors import unread_ca_reason, unread_pin_message
+        from messagefoundry.auth.trust_anchors import (
+            unread_ca_flags_refused,
+            unread_ca_reason,
+            unread_pin_message,
+        )
 
         dialling = [
             ("outbound connection", c.name, c.spec.settings) for c in self.outbound.values()
@@ -7110,6 +7285,11 @@ class Registry:
         problems: list[str] = []
         for kind, name, settings in dialling:
             if settings.get("tls_ca_pin") is None or not settings.get("tls_ca_file"):
+                continue
+            if unread_ca_flags_refused(settings):
+                # The strict read in unread_ca_reason may raise on it, ending validate_config's
+                # collection; bool_literal_problems names the literal. The skip covers all four
+                # flags, read or not, so an unread-CA problem here shows once the literal is fixed.
                 continue
             if (unread := unread_ca_reason(settings)) is not None:
                 problems.append(unread_pin_message(f"{kind} {name!r}:", unread))
@@ -7767,10 +7947,16 @@ def _declares_hostname_check_off(settings: Mapping[str, Any]) -> bool:
     An ``env()`` reference counts, because it is unresolved here and could resolve to false: a
     reader that skipped it would miss exactly the hop whose value nobody can read in the config. The
     construction WARNING names the resolved value either way."""
-    # An explicit None is the default, on, as the connectors read it (vault BACKLOG #3230).
-    if isinstance(settings.get("tls_check_hostname"), EnvRef):
+    # An explicit None or an empty string is the default, on, as bool_setting reads it (vault
+    # BACKLOG #3230). Any other value counts when bool() reads it as false, without raising, as
+    # before bool_setting turned strict (vault BACKLOG #3234), so this lists at least the hops that
+    # read listed. That is a deliberate second reading beside bool_setting's: the connectors refuse
+    # a non-bool where they read the key, and a Registry build refuses one, but the settings dict
+    # stays mutable after the build, so this reader can still meet one and must not raise on it.
+    value = settings.get("tls_check_hostname")
+    if isinstance(value, EnvRef):
         return True
-    return not bool_setting(settings, "tls_check_hostname", default=True)
+    return value is not None and not (isinstance(value, str) and value == "") and not bool(value)
 
 
 def hostname_unchecked_hops(registry: Registry) -> list[tuple[str, str]]:
@@ -7829,7 +8015,9 @@ def query_credential_hops(
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
     0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
-    ``env()`` URL's operator ``cast``, as the build does. An outbound whose type is in
+    ``env()`` URL's operator ``cast``, as the build does. The cast runs synchronously in the
+    caller's thread, so ``GET /security/posture`` runs each one on the event loop, once per request
+    (vault BACKLOG #3766 item 46). An outbound whose type is in
     ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS`` is left off: its build refuses any url
     query (vault BACKLOG #5358), so the hop never exists."""
     from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
@@ -7839,12 +8027,12 @@ def query_credential_hops(
         *(
             (oc.name, oc.spec.settings)
             for oc in registry.outbound.values()
-            if (oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef))
+            if not _dark_env_setting(oc, "url")
             and oc.spec.type not in URL_QUERY_REFUSED_DESTINATIONS
         ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
-        url = _db_setting(settings, "url", None, env_values or {})
+        url = _resolved_setting(settings, "url", None, env_values or {})
         if isinstance(url, str) and (names := credential_query_params(url)):
             out.append((name, ", ".join(names)))
     return sorted(out)
@@ -7893,20 +8081,20 @@ def path_form_fhir_updates(
         if oc.spec.type != ConnectorType.FHIR:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and isinstance(settings.get("update_url_form"), EnvRef):
+        if _dark_env_setting(oc, "update_url_form"):
             continue
         # A not-deployed connection's values are never resolved (ADR 0111 AC-1), so none are read
         # for it: a literal path form beside an env() interaction or conditional is named possibly.
         values = env_values if oc.deployed else None
-        form = _db_setting(settings, "update_url_form", "transaction", values)
+        form = _resolved_setting(settings, "update_url_form", "transaction", values)
         # FhirDestination's own read: an unset or empty value is the transaction form.
         if form is not _UNRESOLVED and str(form or "transaction") != "path":
             continue
-        kind = _db_setting(settings, "interaction", "create", values)
-        cond = _db_setting(settings, "conditional", None, values)
+        kind = _resolved_setting(settings, "interaction", "create", values)
+        cond = _resolved_setting(settings, "conditional", None, values)
         # A list this cannot resolve rules nothing out; one that resolves to None is unset.
         lists = [
-            _db_setting(settings, key, None, values)
+            _resolved_setting(settings, key, None, values)
             for key in ("allowed_entry_methods", "allowed_entry_types")
         ]
         lists_set = any(value is not None and value is not _UNRESOLVED for value in lists)
@@ -8057,12 +8245,10 @@ def ech_cleartext_sidecar_hops(
         if oc.spec.type not in _ECH_ROUTING_DESTINATIONS:
             continue
         settings = oc.spec.settings
-        if not oc.deployed and any(
-            isinstance(settings.get(key), EnvRef) for key in ("ech_egress", "ech_sidecar")
-        ):
+        if _dark_env_setting(oc, "ech_egress", "ech_sidecar"):
             continue
-        egress = _db_setting(settings, "ech_egress", None, env_values)
-        sidecar = _db_setting(settings, "ech_sidecar", None, env_values)
+        egress = _resolved_setting(settings, "ech_egress", None, env_values)
+        sidecar = _resolved_setting(settings, "ech_sidecar", None, env_values)
         if not egress:
             continue
         if sidecar is _UNRESOLVED:
@@ -8112,10 +8298,9 @@ def listener_trusted_proxy_hops(
     for ic in registry.inbound.values():
         if ic.spec.type != ConnectorType.HTTP:
             continue
-        raw = ic.spec.settings.get("trusted_proxies")
-        if not ic.deployed and isinstance(raw, EnvRef):
+        if _dark_env_setting(ic, "trusted_proxies"):
             continue
-        value = _db_setting(ic.spec.settings, "trusted_proxies", None, env_values)
+        value = _resolved_setting(ic.spec.settings, "trusted_proxies", None, env_values)
         if value is _UNRESOLVED:
             out.append((ic.name, UNRESOLVED_LISTENER_PROXIES))
             continue
@@ -8148,27 +8333,6 @@ REFUSED_DRIVER_REASON = "refused at build: odbc_driver is not one the generic di
 UNRESOLVED_REFUSED_DRIVER_REASON = "possibly refused: odbc_driver is an unresolved env() reference"
 
 
-#: What :func:`_db_setting` returns for an ``env()`` reference it cannot resolve.
-_UNRESOLVED = object()
-
-
-def _db_setting(
-    settings: Mapping[str, Any], key: str, default: object, env_values: Mapping[str, Any] | None
-) -> object:
-    """A connection's ``key`` setting, an ``env()`` reference resolved as the build
-    resolves it with :func:`resolve_env_settings`, or :data:`_UNRESOLVED` when it cannot be: no
-    values, or a key the values do not hold and no default."""
-    value = settings.get(key, default)
-    if not isinstance(value, EnvRef):
-        return value
-    if env_values is None:
-        return _UNRESOLVED
-    try:
-        return resolve_env_settings({key: value}, env_values)[key]
-    except WiringError:
-        return _UNRESOLVED
-
-
 def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | None) -> str | None:
     """A DATABASE connection's dialect in lower case, or ``None`` when it is an ``env()`` reference
     this reader cannot resolve.
@@ -8177,7 +8341,7 @@ def _db_dialect(settings: Mapping[str, Any], env_values: Mapping[str, Any] | Non
     values, so a reader handed those values resolves it the same way, default included. With no
     values, or a key the values do not hold and no default, the answer is ``None``: a reader must not
     guess an arm, since each arm reads the same settings differently."""
-    dialect = _db_setting(settings, "dialect", "sqlserver", env_values)
+    dialect = _resolved_setting(settings, "dialect", "sqlserver", env_values)
     return None if dialect is _UNRESOLVED else str(dialect).lower()
 
 
@@ -8189,7 +8353,20 @@ def _dark_env_dialect(conn: InboundConnection | OutboundConnection) -> bool:
     operator's ``cast`` never runs for it, and the engine never builds it. Skipped rather than read as
     unresolved, so neither reader lists a connection that is not built because of a value it never
     reads. A not-deployed connection with a literal dialect resolves nothing and is read as before."""
-    return not conn.deployed and isinstance(conn.spec.settings.get("dialect"), EnvRef)
+    return _dark_env_setting(conn, "dialect")
+
+
+def _dark_env_setting(conn: InboundConnection | OutboundConnection, *keys: str) -> bool:
+    """Whether ``conn`` is ``deployed=False`` and any of ``keys`` is an ``env()`` reference, which
+    the graph readers skip before resolving it (vault BACKLOG #3766 item 31): at least the DATABASE,
+    ECH, FHIR path-form, listener-proxy and query-credential ones.
+
+    ADR 0111 AC-1: a not-deployed connection's ``env()`` values are never resolved on any path, so
+    an operator's ``cast`` never runs for it, and the engine never builds it."""
+    if conn.deployed:
+        return False
+    settings = conn.spec.settings
+    return any(isinstance(settings.get(key), EnvRef) for key in keys)
 
 
 def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None]]:
@@ -8212,7 +8389,7 @@ def odbc_hops(registry: Registry) -> list[tuple[str, str, str | None, str | None
     from messagefoundry.transports.db_endpoint import SQLSERVER_DEFAULT_DRIVER
 
     def driver(settings: Mapping[str, Any]) -> str | None:
-        value = _db_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
+        value = _resolved_setting(settings, "odbc_driver", SQLSERVER_DEFAULT_DRIVER, None)
         return None if value is _UNRESOLVED else str(value)
 
     connections = [
@@ -8314,7 +8491,7 @@ def unverified_generic_db_hops(
         # for an advisory list, under a reason that says the name was not read.
         # A not-deployed connection's env() values are never resolved (ADR 0111 AC-1), so its
         # env() driver stays unread; a no-TLS value beside it is still reported.
-        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        driver = _resolved_setting(settings, "odbc_driver", None, env_values if deployed else None)
         # Possibly delegated only where some family would clear the params: a hop at risk on
         # every driver keeps the reason they all give.
         reason: str | None
@@ -8384,7 +8561,7 @@ def refused_generic_db_drivers(
         raw_driver = settings.get("odbc_driver")
         # ADR 0111 AC-1: a not-deployed connection's env() values are never resolved, so its
         # env() driver stays unread and is listed as such, as unverified_generic_db_hops lists it.
-        driver = _db_setting(settings, "odbc_driver", None, env_values if deployed else None)
+        driver = _resolved_setting(settings, "odbc_driver", None, env_values if deployed else None)
         # Only an env() reference resolves to _UNRESOLVED, so raw_driver has a key to name.
         if driver is _UNRESOLVED and isinstance(raw_driver, EnvRef):
             reason = (
@@ -9829,13 +10006,17 @@ _CONFIG_SOURCE_LEAD = "refusing to load config from"
 _BYTECODE_CACHE_DIR = "__pycache__"
 
 
-def config_source_trust_paths(directory: Path) -> list[Path]:
+def config_source_trust_paths(
+    directory: Path, *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
     """Every path in ``directory`` whose writer could change what a load of it runs or reads.
 
     The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
     ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
-    with each table the loader reads from it. Both config-source trust checks walk this list (vault
-    BACKLOG #2626 step 3, #2596 step 4).
+    with each table the loader reads from it. Each of those that is a symbolic link or a junction,
+    the directory included, is followed by the object it resolves to and, for a file, that file's
+    folder (:func:`_with_link_targets`, which says what ``refuse`` is handed). Both config-source
+    trust checks walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
 
     **The cache folder is on the list although no load reads it.** The loader compiles each module
     from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
@@ -9846,7 +10027,13 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
 
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
-    folders above ``directory``."""
+    folders above ``directory``, except where a link's target or the folder holding it lies
+    there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
+    leads to nothing, so that it is refused, as a dangling module link is: a writer of the folder
+    it points into could create the missing name before the read. So is a ``__pycache__`` link.
+    The directory's own link is followed with no ``refuse``, so one that dangles raises ``OSError``
+    rather than a refusal; a lax read (:func:`read_trusted_snapshot`) then lists the directory
+    again, and refuses one that is gone as missing."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9855,8 +10042,11 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     if cache.is_dir():
         paths.append(cache)
         paths.extend(sorted(cache.iterdir()))
+    elif _is_link(cache):
+        paths.append(cache)
     connections = directory / CONNECTIONS_FILE_NAME
-    if connections.exists():
+    # A dangling link is listed too, so the link check refuses it rather than leaving it unread.
+    if connections.exists() or _is_link(connections):
         paths.append(connections)
     codesets = directory / CODESETS_DIR_NAME
     if codesets.is_dir():
@@ -9864,9 +10054,83 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         # The loader's own rule (code_sets.is_code_set_name), so a table spelled .CSV is vetted on
         # POSIX too.
         paths.extend(
-            p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
+            p
+            for p in sorted(codesets.iterdir())
+            if (p.is_file() or _is_link(p)) and is_code_set_name(p.name)
         )
-    return paths
+    elif _is_link(codesets):
+        paths.append(codesets)
+    # The directory raises rather than being handed to refuse: see _with_link_targets.
+    listed = _with_link_targets(paths[:1]) + _with_link_targets(paths[1:], refuse=refuse)
+    return list(dict.fromkeys(listed))
+
+
+def _is_link(path: Path) -> bool:
+    """Whether ``path`` is a symbolic link or, on Windows, a junction, whether or not it leads
+    anywhere."""
+    return path.is_symlink() or path.is_junction()
+
+
+def _with_link_targets(
+    paths: list[Path], *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
+    """``paths`` with, after each one that is a symbolic link or a junction, the config directory
+    included, the object it resolves to and, for a file, the folder holding that file (vault
+    BACKLOG #2596).
+
+    A load reads a link's target, so vetting the link alone let a config module that is a link into
+    a writable folder pass: whoever can write that folder can swap the code the load runs, and on
+    Windows the link object's own access list was read rather than the target's. The target is
+    what :meth:`~pathlib.Path.resolve` answers: on POSIX that is Python's own ``realpath`` walk in
+    userspace, and nothing here checks it against the object an open of the path reaches, as the
+    ``serve`` start check does (:func:`_file_and_folder`).
+
+    A link whose target cannot be resolved, or that leads to nothing at check time, is refused: a
+    writer of the folder it points into could create the missing name before the read (Manager
+    decision under the owner's standing instruction of 2026-10-22). That refusal is handed to
+    ``refuse`` where one is given, and the link is listed with no target if ``refuse`` returns;
+    with none given it raises ``OSError`` naming the link. The load's check hands it
+    :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
+
+    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
+    links outside the config directory, from which a writer could re-point one, the folders above
+    each target's folder, as the folders above the config directory are not, and on Windows a
+    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
+    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
+    of its own files further. A path already listed is not repeated."""
+    out: list[Path] = []
+    for path in paths:
+        out.append(path)
+        target = _resolved_link(path)
+        if target is None:
+            continue
+        if isinstance(target, str):
+            if refuse is None:
+                raise OSError(errno.EINVAL, target, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {target}")
+            continue
+        out.append(target)
+        if not target.is_dir():
+            out.append(target.parent)
+    return list(dict.fromkeys(out))
+
+
+def _resolved_link(path: Path) -> Path | str | None:
+    """What the link at ``path`` resolves to: ``None`` where ``path`` is not a link, and the reason
+    as text where its target cannot be resolved or leads to nothing at check time."""
+    if not _is_link(path):
+        return None
+    try:
+        target = path.resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Not expected from a non-strict resolve on the interpreters this project supports;
+        # caught so an unforeseen failure refuses the load rather than escaping it.
+        return f"a link could not be resolved ({type(exc).__name__})"
+    if not target.exists():
+        # exists() is False for any stat failure, so this also covers a target the check
+        # cannot reach (a permission fault, a link loop), not only one that is gone.
+        return "a link leads to nothing the check can read at check time"
+    return target
 
 
 def _config_module_name(path: Path) -> str:
@@ -11396,6 +11660,15 @@ def _refuse_unsafe_config_source(message: str) -> None:
     raise WiringError(message)
 
 
+def _refuse_unvetted_link(message: str) -> NoReturn:
+    """Raise ``WiringError(message)`` for a trust-list link that cannot be resolved or leads to
+    nothing at check time, whatever the dev/test escape says: nothing about what it leads to was
+    vetted (Manager decision d20261121T195422910-02289f, after vault BACKLOG #6654 item 2). The
+    ``serve`` start check differs for a link it can walk to a missing name: it vets the folder
+    that name would sit in, through the escape-aware refusal."""
+    raise WiringError(message)
+
+
 def _assert_safe_config_source(directory: Path) -> None:
     """Refuse to execute config Python from a writable-by-others location.
 
@@ -11407,8 +11680,9 @@ def _assert_safe_config_source(directory: Path) -> None:
     :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
     root-owned, read-only config is therefore accepted under a service-account engine. This check
     reads the paths :func:`config_source_trust_paths` lists (following links): the directory, its
-    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables. It does not read the
-    directories above it, as that function does; docs/SERVICE.md states what the layout then still
+    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables, and for a link what it
+    resolves to. It does not read the directories above it, except where that function lists a
+    link's target or the folder holding it there; docs/SERVICE.md states what the layout then still
     depends on. On Windows the equivalent NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the owner and DACL of each of those
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
@@ -11431,7 +11705,7 @@ def _assert_safe_config_source(directory: Path) -> None:
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
-        paths = config_source_trust_paths(directory)
+        paths = config_source_trust_paths(directory, refuse=_refuse_unvetted_link)
     except OSError as exc:
         if is_missing_directory(exc):
             # Moved away since the caller's own check: missing, as that check answers (#3157).

@@ -50,7 +50,6 @@ from pathlib import Path
 
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
-from tee.anon.hl7 import SurrogateSeparatorRefused
 from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
@@ -68,7 +67,11 @@ from tee.anon.rules import (
     load_rules,
     retargeted_defaults,
 )
-from tee.anon.surrogates import SiteCodeSeparatorRefused, site_prefixes_loaded
+from tee.anon.surrogates import (
+    SiteCodeSeparatorRefused,
+    SurrogateSeparatorRefused,
+    site_prefixes_loaded,
+)
 from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
@@ -140,6 +143,19 @@ def _positive_seconds(value: str) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         raise argparse.ArgumentTypeError(f"expected a finite positive number, got {value!r}")
     return seconds
+
+
+def _positive_int(value: str) -> int:
+    """A positive integer (refuses 0, negatives and non-integers)."""
+    # The message names the rule, not the raw input, so a value pasted into the wrong flag is not
+    # echoed to stderr or a captured log.
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected a positive integer") from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("expected a positive integer")
+    return number
 
 
 def _parse_age(spec: str) -> float:
@@ -220,12 +236,18 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--send-timeout", type=float, default=30.0)
     run.add_argument(
         "--corepoint-attempts",
-        type=int,
+        type=_positive_int,
         default=3,
-        help="quick retries on the Corepoint leg before tripping fail-closed",
+        help="tries on the Corepoint leg, counting the first, before tripping fail-closed"
+        " (a positive integer; 1 means no retry)",
     )
     run.add_argument("--corepoint-retry-delay", type=float, default=1.0)
-    run.add_argument("--mefor-queue-max", type=int, default=1000)
+    run.add_argument(
+        "--mefor-queue-max",
+        type=_positive_int,
+        default=1000,
+        help="bound on the shadow MEFOR queue (a positive integer); the oldest copy is dropped when full",
+    )
     run.add_argument(
         "--stop-grace",
         type=_positive_seconds,
@@ -523,6 +545,11 @@ async def _scrub_only(args: argparse.Namespace) -> int:
 async def _purge(args: argparse.Namespace) -> int:
     if args.scrub_only:
         return await _scrub_only(args)
+    if not os.path.isfile(args.db):
+        # RelayStore.open would create it, and a purge of a new empty file would read as success,
+        # so a mistyped --db would report a clean purge while the real DB kept every row.
+        print(f"error: {args.db} does not exist; nothing to purge", file=sys.stderr)
+        return 2
     scope = "captured bodies only" if args.captures_only else "all logged rows + captured bodies"
     window = "older than the cutoff" if args.before is not None else "EVERYTHING"
     target = f"{scope} ({window}) in {args.db}"
@@ -601,7 +628,8 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     --show-diffs`` report holds field values from both engines; an ``anonymize-captures`` dataset
     holds surrogates and every value a rule kept; an ``export`` carries control ids, message types
     and NAK details from the capture DB. ``write_text`` would create any of them at the process
-    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
+    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600 on
+    POSIX.
 
     ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
     ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
@@ -620,10 +648,11 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
     flushed to disk, then renamed to ``path``. A failed write leaves no temp file. On Windows the
-    0600 mode means nothing and the new file takes its directory's access list, the stance
-    :mod:`tee.store` takes for the capture DB; the tee imports nothing from ``messagefoundry``, so
-    the engine's ``restricted_file`` is out of reach. There the rename refuses a name that appeared
-    since the check, and that name is then written in place as below rather than replaced.
+    0600 mode means nothing and the new file takes its directory's access list. :mod:`tee.store`
+    gives the capture DB an owner-only access list on open, but this writer does not; the tee
+    imports nothing from ``messagefoundry``, so the engine's ``restricted_file`` is out of reach.
+    There the rename refuses a name that appeared since the check, and that name is then written
+    in place as below rather than replaced.
 
     On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
     rather than written into, so neither its owner nor its mode carries over, and a reader holding
@@ -854,8 +883,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     residue_advice: dict[str, None] = {}
     # Whether such a report also had another cause, which needs the general advice as well.
     residue_mixed = False
-    # Messages refused because a rule's surrogate would hold the field separator or a control
-    # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
+    # Messages refused because a rule's surrogate would hold the field separator, a control byte
+    # or a delimiter MSH-2 declares (BACKLOG #5540). A keep is the wrong advice for one: it would
+    # emit the captured value.
     separator_refused = 0
     separator_paths: dict[str, None] = {}
     # Messages refused because no site-code surrogate could avoid a declared separator digit. A
@@ -952,7 +982,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             # A keep is the wrong advice here too: it would emit the captured value whole.
             steps = [
                 f"{separator_refused} of them were refused because the surrogate a rule wrote "
-                "would hold the message's field separator or a control byte, in "
+                "would hold the message's field separator, a control byte or a delimiter MSH-2 "
+                "declares, in "
                 f"{', '.join(separator_paths)}. A keep on such a field would emit the captured "
                 "value: point the field at drop in an overlay.",
                 *(

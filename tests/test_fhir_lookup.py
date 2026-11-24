@@ -798,11 +798,27 @@ async def test_smart_token_failure_on_probe_is_a_lookup_error(_ec_pem: str, fail
     _assert_token_failure_is_a_lookup_error(err, cause_type, fhir_opener)
 
 
-async def test_smart_token_url_over_the_length_limit_is_a_lookup_error(_ec_pem: str) -> None:
-    # The mint measures the configured token URL and raises ValueError when it is over the limit.
-    # That is a config fault the Handler cannot fix, but it must still arrive as the lookup error.
+async def test_smart_token_url_length_refused_at_build_and_mint_value_error_is_lookup_error(
+    _ec_pem: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #5800 added item 1: the provider measures the configured token URL at construction,
+    # so an over-length one refuses the build rather than each mint.
+    with pytest.raises(SmartAuthError, match="over the"):
+        SmartBackendTokenProvider(
+            token_url=_TOKEN_URL + "?" + "a" * 9000,
+            client_id="cid",
+            private_key=_ec_pem,
+            algorithm=SignatureAlgorithm.ES256,
+            audience=_TOKEN_URL,
+        )
+    # A ValueError a mint still raises is a config fault the Handler cannot fix, but it must still
+    # arrive as the lookup error.
     ex, fhir_opener = _smart_executor(_ec_pem, _FakeOpener())
-    ex._token["epic"].token_url = _TOKEN_URL + "?" + "a" * 9000
+
+    def _refused() -> tuple[str, float]:
+        raise ValueError("outbound URL is over the limit")
+
+    monkeypatch.setattr(ex._token["epic"], "_fetch_token", _refused)
     for call in (lambda: ex.read("epic", "Patient/123"), lambda: ex.test_connection("epic")):
         with pytest.raises(FhirLookupError) as err:
             await call()

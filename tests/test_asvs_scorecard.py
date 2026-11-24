@@ -2578,6 +2578,426 @@ def test_prove_absences_refuses_an_async_swap(tmp_path: Path) -> None:
     assert findings.proved_absences == 0
 
 
+# --- BACKLOG #5590 item 79: generator, decorator and nested swaps ----------------------------------
+#
+# The pre-change screen compared module-level functions only, and its signature carried neither a
+# generator flag nor decorators. So most "refuses" tests below are red on it; where one is green on
+# it, its docstring says so. Each "accepts" test is green on it, and pins a shape an earlier attempt
+# at this item, or a review of this one, found wrongly refused.
+
+
+def _screen(mutation: str, target_source: str, tmp_path: Path) -> list[str]:
+    """The problems `_screen_mutation` records for `mutation` appended to `target_source`."""
+    target = tmp_path / "target.py"
+    target.write_text(target_source, encoding="utf-8")
+    claim = _live_claim(mutation, "target.py", "test_target.py::test_x").absence[0]
+    findings = Findings()
+    passed = scorecard_module._screen_mutation(claim, "1.1.1", target, findings)
+    assert passed is (not findings.problems)
+    return findings.problems
+
+
+def _refused(mutation: str, target_source: str, tmp_path: Path) -> bool:
+    return any("PROVE-ERROR" in p for p in _screen(mutation, target_source, tmp_path))
+
+
+def test_signature_tells_a_generator_from_a_function() -> None:
+    """A function that now yields keeps every parameter and hands each caller a generator object in
+    place of its value. A ``yield`` in a NESTED function's body is that function's, not the outer's.
+    """
+    assert _sig("def f(a):\n    return a") != _sig("def f(a):\n    yield a")
+    assert _sig("def f(a):\n    return a") != _sig("def f(a):\n    yield from a")
+    assert _sig("async def f(a):\n    return a") != _sig("async def f(a):\n    yield a")
+    assert _sig("def f(a):\n    return a") == _sig(
+        "def f(a):\n    def g():\n        yield a\n    return g"
+    )
+
+
+def test_signature_counts_a_yield_in_a_nested_defs_default_for_the_outer() -> None:
+    """A nested function's defaults and decorators run in the enclosing function, so a ``yield``
+    there makes the enclosing one a generator."""
+    assert _sig("def f():\n    def g(x=(yield)):\n        pass\n    return g") != _sig(
+        "def f():\n    def g(x=None):\n        pass\n    return g"
+    )
+
+
+def test_prove_absences_screen_refuses_a_generator_swap(tmp_path: Path) -> None:
+    assert _refused("def f(a):\n    yield a\n", "def f(a):\n    return a\n", tmp_path)
+    assert not _refused("def f(a):\n    return 2\n", "def f(a):\n    return a\n", tmp_path)
+
+
+def test_prove_absences_screen_refuses_dropping_a_bare_functools_cache(tmp_path: Path) -> None:
+    target = "from functools import cache\n\n@cache\ndef f(a): ...\n"
+    assert _refused("def f(a):\n    return 1\n", target, tmp_path)
+    assert not _refused("@cache\ndef f(a):\n    return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_refuses_dropping_an_aliased_module_cache(tmp_path: Path) -> None:
+    target = "import functools as ft\n\n@ft.cache\ndef f(a): ...\n"
+    assert _refused("def f(a):\n    return 1\n", target, tmp_path)
+    # The same decorator spelled another way is the same decorator.
+    assert not _refused(
+        "from functools import cache\n\n@cache\ndef f(a):\n    return 1\n", target, tmp_path
+    )
+
+
+def test_prove_absences_screen_refuses_adding_a_property(tmp_path: Path) -> None:
+    target = "class C:\n    def m(self): ...\n"
+    assert _refused("class C(C):\n    @property\n    def m(self): ...\n", target, tmp_path)
+    assert not _refused("class C(C):\n    def m(self):\n        return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_refuses_an_overload_stub_over_a_live_def(tmp_path: Path) -> None:
+    target = "from typing import overload\n\ndef get(key, default=None): ...\n"
+    assert _refused("@overload\ndef get(key, default=None): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_refuses_a_def_class_swap(tmp_path: Path) -> None:
+    assert _refused("class scan: ...\n", "def scan(p): ...\n", tmp_path)
+    assert _refused("def Scanner(p): ...\n", "class Scanner:\n    pass\n", tmp_path)
+
+
+def test_prove_absences_screen_refuses_a_reshaped_method_in_a_redefined_class(
+    tmp_path: Path,
+) -> None:
+    target = (
+        "class Scanner:\n    def scan(self, p): ...\n\n"
+        "    class Inner:\n        def go(self, x): ...\n"
+    )
+    assert _refused("class Scanner(Scanner):\n    def scan(self): ...\n", target, tmp_path)
+    assert _refused(
+        "class Scanner:\n    class Inner:\n        def go(self): ...\n", target, tmp_path
+    )
+    assert not _refused(
+        "class Scanner(Scanner):\n    def scan(self, p):\n        return 1\n", target, tmp_path
+    )
+
+
+def test_prove_absences_screen_refuses_a_mutation_wrapped_in_try(tmp_path: Path) -> None:
+    target = "def scan(p):\n    return 'clean'\n"
+    wrapped = "try:\n    def scan():\n        return 'infected'\nexcept Exception:\n    pass\n"
+    assert _refused(wrapped, target, tmp_path)
+    honest = "try:\n    def scan(p):\n        return 'infected'\nexcept Exception:\n    pass\n"
+    assert not _refused(honest, target, tmp_path)
+
+
+def test_prove_absences_screen_refuses_the_dead_stub_under_not_type_checking(
+    tmp_path: Path,
+) -> None:
+    target = "if not TYPE_CHECKING:\n    def f(x, y=None): ...\nelse:\n    def f(x): ...\n"
+    assert _refused("def f(x): ...\n", target, tmp_path)
+    assert not _refused("def f(x, y=None): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_refuses_a_copy_of_a_shadowed_def(tmp_path: Path) -> None:
+    """A later ``def`` replaces an earlier one, so a mutation copied from the shadowed one breaks
+    every call the live one takes. An earlier attempt let it pass by matching any definition.
+
+    The module-level pair is green on the pre-change screen, which compared the last module-level
+    def; the pairs under ``if`` and in a class body are read only by the second check."""
+    target = "def f(a): ...\ndef f(a, b): ...\n"
+    assert _refused("def f(a): ...\n", target, tmp_path)
+    assert not _refused("def f(a, b): ...\n", target, tmp_path)
+    guarded = "if X:\n    def f(a): ...\n    def f(a, b): ...\n"
+    assert _refused("def f(a): ...\n", guarded, tmp_path)
+    member = "class C:\n    def m(self, a): ...\n    def m(self, a, b): ...\n"
+    assert _refused("class C(C):\n    def m(self, a): ...\n", member, tmp_path)
+    assert not _refused("class C(C):\n    def m(self, a, b): ...\n", member, tmp_path)
+
+
+def test_prove_absences_screen_accepts_an_override_of_one_inherited_accessor(
+    tmp_path: Path,
+) -> None:
+    """``@C.x.setter`` in a subclass builds a property on the inherited one, so callers of ``obj.x``
+    and ``obj.x = v`` see the same shape. Found refused by review of this item."""
+    prop = "class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n"
+    setter = "class C(C):\n    @C.x.setter\n    def x(self, v):\n        self._x = v\n"
+    assert _screen(setter, prop, tmp_path) == []
+    getter = "class C(C):\n    @C.x.getter\n    def x(self):\n        return 2\n"
+    assert _screen(getter, prop, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_global_in_a_method_as_a_module_name(
+    tmp_path: Path,
+) -> None:
+    """``global scan`` in a method names the MODULE's ``scan``, so it must not hide the class's own
+    ``scan`` from the comparison."""
+    target = "class S:\n    def scan(self, p): ...\n    def reset(self):\n        global scan\n"
+    assert _refused("class S(S):\n    def scan(self): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_walrus_in_a_lambda_as_the_lambdas(tmp_path: Path) -> None:
+    """A ``:=`` inside a lambda binds in the lambda, so it must not hide the module's ``f``."""
+    target = "if X:\n    def f(a): ...\ng = lambda: (f := 1)\n"
+    assert _refused("def f(): ...\n", target, tmp_path)
+    # Control: a walrus in the module's own expression does rebind f.
+    rebound = "if X:\n    def f(a): ...\ng = (f := 1)\n"
+    assert not _refused("def f(): ...\n", rebound, tmp_path)
+
+
+def test_prove_absences_screen_names_the_first_mismatch_in_source_order(tmp_path: Path) -> None:
+    """The refusal names the first mismatching definition in source order, not one picked by string
+    hashing, so the same input gives the same message on every run."""
+    names = ("alpha", "beta", "gamma", "delta", "eps", "zeta", "eta", "theta")
+    target = "".join(f"def {n}(a): ...\n" for n in names)
+    mutation = "if X:\n" + "".join(f"    def {n}(): ...\n" for n in names)
+    problems = _screen(mutation, target, tmp_path)
+    assert len(problems) == 1 and "redefines alpha()" in problems[0], problems
+
+
+def test_prove_absences_screen_reads_cache_as_an_unbounded_lru_cache(tmp_path: Path) -> None:
+    """``functools.cache`` is ``lru_cache(maxsize=None)``, so swapping one for the other changes no
+    call site. Found refused by review of this item."""
+    target = "import functools\n\n@functools.lru_cache(maxsize=128)\ndef f(a): ...\n"
+    assert _screen("@functools.cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _refused("def f(a):\n    return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_decorator_name_at_the_point_its_def_runs(
+    tmp_path: Path,
+) -> None:
+    """A local ``def cache`` that a later functools import replaces does not make the ``@cache``
+    after both a local decorator."""
+    target = (
+        "def cache(fn):\n    return fn\n\nfrom functools import cache\n\n@cache\ndef f(a): ...\n"
+    )
+    assert _refused("def f(a): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_accepts_call_compatible_shapes(tmp_path: Path) -> None:
+    """Shapes the pre-change screen accepted and an earlier attempt at this item refused."""
+    prop = "class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n"
+    getter = "class C(C):\n    @property\n    def x(self):\n        return 2\n"
+    assert _screen(getter, prop, tmp_path) == []
+    method = "class C:\n    def m(self, a): ...\n"
+    assert _screen("class C(C):\n    def m(this, a): ...\n", method, tmp_path) == []
+    loop = "for _ in r:\n    def f(a): ...\n    break\nelse:\n    def f(a, b): ...\n"
+    assert _screen("def f(a): ...\n", loop, tmp_path) == []
+    assert _screen("def f(a, b): ...\n", loop, tmp_path) == []
+    alternatives = "try:\n    def f(x): ...\nexcept ImportError:\n    def f(x, y): ...\n"
+    assert _screen("def f(x): ...\n", alternatives, tmp_path) == []
+    assert _screen("def f(x, y): ...\n", alternatives, tmp_path) == []
+    assert _screen("@acl.define('admin')\ndef f(a): ...\n", "def f(a): ...\n", tmp_path) == []
+    assert _screen("def f(a): ...\n", "@acl.define('admin')\ndef f(a): ...\n", tmp_path) == []
+    routed = "@router.getter\ndef handler(a): ...\n"
+    assert _screen("def handler(a): ...\n", routed, tmp_path) == []
+    local = "def cache(fn):\n    return fn\n\n@cache\ndef f(a): ...\n"
+    assert _screen("def f(a): ...\n", local, tmp_path) == []
+    bare = "from acl import define\n\n@define('admin')\ndef f(a): ...\n"
+    assert _screen("def f(a): ...\n", bare, tmp_path) == []
+    abstract = (
+        "from abc import ABC, abstractmethod\n\n"
+        "class Base(ABC):\n    @abstractmethod\n    def run(self, x): ...\n"
+    )
+    override = "class Base(Base):\n    def run(self, x):\n        return 1\n"
+    assert _screen(override, abstract, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_decorator_name_in_its_own_scope(tmp_path: Path) -> None:
+    """A ``def cache`` nested in another function binds nothing at module level, so a module-level
+    ``@cache`` from functools stays a shape decorator."""
+    target = (
+        "from functools import cache\n\n"
+        "def outer():\n    def cache(fn):\n        return fn\n    return cache\n\n"
+        "@cache\ndef f(a): ...\n"
+    )
+    assert _screen("@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _refused("def f(a):\n    return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_keeps_builtins_after_a_star_import(tmp_path: Path) -> None:
+    """A ``from m import *`` is read as rebinding the names already bound, not ``property``: a
+    getter override stays accepted, and dropping ``@property`` stays refused. Found by review of
+    this item, where a star import turned builtins off."""
+    prop = (
+        "from os import *\n\nclass C:\n    @property\n    def x(self): ...\n"
+        "    @x.setter\n    def x(self, v): ...\n"
+    )
+    getter = "class C(C):\n    @property\n    def x(self):\n        return 2\n"
+    assert _screen(getter, prop, tmp_path) == []
+    assert _refused("class C(C):\n    def x(self): ...\n", prop, tmp_path)
+
+
+def test_prove_absences_screen_survives_nesting_deeper_than_the_stack(tmp_path: Path) -> None:
+    """A long ``elif`` chain nests deeper than the interpreter's stack. The second check is skipped
+    there rather than aborting the pass, and the first still runs."""
+    chain = "if v == 0:\n    pass\n" + "".join(
+        f"elif v == {i}:\n    pass\n" for i in range(1, 1500)
+    )
+    target = "def scan(p): ...\n" + chain
+    assert _screen("def scan(p):\n    return 1\n", target, tmp_path) == []
+    assert _refused("def scan(): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_positional_only_self_as_a_bound_parameter(
+    tmp_path: Path,
+) -> None:
+    """``self, /`` and ``self`` are one bound parameter to every caller through the instance, while a
+    method that loses its bound parameter breaks every such call."""
+    target = "class C:\n    def m(self, /, a): ...\n"
+    assert _screen("class C(C):\n    def m(self, a):\n        return 1\n", target, tmp_path) == []
+    plain = "class C:\n    def m(self): ...\n"
+    assert _refused("class C(C):\n    def m(): ...\n", plain, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_walrus_in_a_match_guard(tmp_path: Path) -> None:
+    """A ``:=`` in a ``case`` guard binds in the enclosing scope, so the name may no longer be the
+    target's ``def`` and there is nothing to compare it against."""
+    target = "if X:\n    def f(a): ...\nmatch v:\n    case 1 if (f := 2):\n        pass\n"
+    assert _screen("def f(): ...\n", target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_both_overload_spellings_as_one(tmp_path: Path) -> None:
+    """``typing_extensions.overload`` and ``typing.overload`` give a call site the same stub."""
+    target = "from typing_extensions import overload\n\n@overload\ndef f(a: int): ...\n"
+    mutation = "from typing import overload\n\n@overload\ndef f(a: int): ...\n"
+    assert _screen(mutation, target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_partial_run_of_the_target_as_live(tmp_path: Path) -> None:
+    """A ``with`` body an ``__exit__`` may cut short, a loop broken mid-body, and a compound
+    statement interrupted inside a ``try`` each leave an earlier definition live, so a copy of it
+    is accepted, as the pre-change screen accepted it. Each was refused by the second check before
+    the target was read with its prefixes. The control in each case: a wrong-arity copy is still
+    refused."""
+    suppressed = (
+        "import contextlib\ndef f(a): ...\n"
+        "with contextlib.suppress(ImportError):\n    import fastthing\n    def f(a, b): ...\n"
+    )
+    broken = "for x in r:\n    def f(a): ...\n    if x:\n        break\n    def f(a, b): ...\n"
+    interrupted = (
+        "try:\n    if X:\n        def f(a): ...\n        import missing\n        def f(a, b): ...\n"
+        "except ImportError:\n    pass\n"
+    )
+    for target in (suppressed, broken, interrupted):
+        assert _screen("def f(a): ...\n", target, tmp_path) == [], target
+        assert _refused("def f(): ...\n", target, tmp_path), target
+    # The first check compares the last module-level def, as the pre-change screen did, so in
+    # `suppressed` only the copy of f(a) is accepted.
+    for target in (broken, interrupted):
+        assert _screen("def f(a, b): ...\n", target, tmp_path) == [], target
+
+
+def test_prove_absences_screen_reads_nested_loop_elses_in_linear_time(tmp_path: Path) -> None:
+    """Each loop's ``else`` is read once, so loop-elses nested 18 deep do not cost 2**18 reads."""
+    depth = 18
+    target = (
+        "".join(
+            f"{'    ' * i}for _ in r:\n{'    ' * (i + 1)}pass\n{'    ' * i}else:\n"
+            for i in range(depth)
+        )
+        + f"{'    ' * depth}def f(a): ...\n"
+    )
+    started = time.monotonic()
+    assert _refused("def f(): ...\n", target, tmp_path)
+    assert time.monotonic() - started < 5
+
+
+def test_prove_absences_screen_keeps_an_import_bound_inside_a_with_body(tmp_path: Path) -> None:
+    """A prefix of a ``with`` body where a name is not bound yet gives it no origin of its own, so
+    a decorator naming it after the ``with`` still resolves, and an exact copy is accepted."""
+    target = (
+        "import contextlib\nwith contextlib.suppress(ImportError):\n    import functools\n"
+        "@functools.lru_cache\ndef scan(a): ...\n"
+    )
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+    assert _refused("def scan(a):\n    return 1\n", target, tmp_path)
+
+
+def test_prove_absences_screen_reads_a_400_branch_chain_with_both_checks(tmp_path: Path) -> None:
+    """Nesting about 400 deep stays inside the stack, so an exact decorated copy is accepted. Found
+    refused by review once the walk spent an extra frame per level."""
+    chain = "if v == 0:\n    pass\n" + "".join(f"elif v == {i}:\n    pass\n" for i in range(1, 400))
+    target = "import functools\n@functools.lru_cache\ndef scan(a): ...\n" + chain
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+
+
+def test_prove_absences_screen_reads_a_continue_mid_body_as_ending_the_loop(
+    tmp_path: Path,
+) -> None:
+    """A ``continue`` on the last pass ends the loop at its prefix, as a ``break`` does."""
+    target = "for x in r:\n    def f(a): ...\n    if x:\n        continue\n    def f(a, b): ...\n"
+    assert _screen("def f(a): ...\n", target, tmp_path) == []
+    assert _refused("def f(): ...\n", target, tmp_path)
+
+
+def test_prove_absences_screen_skips_decorators_one_side_cannot_resolve(tmp_path: Path) -> None:
+    """The appended mutation's decorator resolves against the target's final state. Where that
+    state no longer names the decorator's module, the two records would differ for want of a
+    reading, so an exact copy is accepted, as before decorators were compared."""
+    head = "import functools\n@functools.lru_cache\ndef f(a): ...\n"
+    copy = "@functools.lru_cache\ndef f(a):\n    return 1\n"
+    for tail in (
+        "try:\n    from x import *\nexcept ImportError:\n    pass\n",
+        "if DEBUG:\n    functools = None\n",
+        "def g():\n    global functools\n",
+    ):
+        assert _screen(copy, head + tail, tmp_path) == [], tail
+
+
+def test_prove_absences_screen_skips_decorators_after_the_recursion_fallback(
+    tmp_path: Path,
+) -> None:
+    """After a walk too deep for the stack, the decorators were not all read, so none is compared."""
+    chain = "if v == 0:\n    pass\n" + "".join(f"elif v == {i}:\n    pass\n" for i in range(1, 700))
+    target = "import functools\n@functools.lru_cache\ndef scan(a): ...\n" + chain
+    copy = "import functools\n@functools.lru_cache\ndef scan(a):\n    return 1\n"
+    assert _screen(copy, target, tmp_path) == []
+    assert _refused("def scan(): ...\n", target, tmp_path)
+
+
+# --- BACKLOG #5590 follow-up: the PR 3144 review findings on the decorator rule -----------------
+#
+# The first assertion of each test below is red on the screen PR 3144 merged. Every other
+# assertion is a control that is green on it.
+
+
+def test_prove_absences_screen_compares_shape_decorators_beside_the_same_unnamed_one(
+    tmp_path: Path,
+) -> None:
+    """A decorator the screen cannot name cancels where both sides hold the same one, so dropping
+    ``@cache`` beside it is still a shape change. Where the unnamed decorators differ, none is
+    compared, as before."""
+    target = "from functools import cache\n\ndef deco(f):\n    return f\n\n@deco\n@cache\ndef f(a): ...\n"
+    assert _refused("@deco\ndef f(a):\n    return 1\n", target, tmp_path)
+    assert _screen("@deco\n@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    # Dropping the unnamed decorator too: the two sides' unnamed decorators differ.
+    assert _screen("@cache\ndef f(a):\n    return 1\n", target, tmp_path) == []
+    assert _screen("def f(a):\n    return 1\n", target, tmp_path) == []
+    # The same text naming another binding is another decorator: here the new one caches.
+    rebound = "from functools import lru_cache\n\ndef deco(f):\n    return lru_cache(f)\n\n"
+    assert _screen(rebound + "@deco\ndef f(a):\n    return 1\n", target, tmp_path) == []
+
+
+def test_prove_absences_screen_keeps_a_staticmethod_beside_an_unnamed_decorator(
+    tmp_path: Path,
+) -> None:
+    """A ``staticmethod``'s first parameter is passed by its callers, so renaming it breaks a
+    keyword call even when decorators beside it cannot be named and differ. Only one side read as
+    a ``staticmethod`` is compared as before."""
+    target = (
+        "def deco(f):\n    return f\n\ndef deco2(f):\n    return f\n\n"
+        "class C:\n    @staticmethod\n    @deco\n    def m(x): ...\n"
+    )
+    renamed = "class C(C):\n    @staticmethod\n    @deco2\n    def m(y): ...\n"
+    assert _refused(renamed, target, tmp_path)
+    # Control: a decorator that returns a staticmethod is a staticmethod the screen cannot name.
+    wraps = "def deco(f):\n    return staticmethod(f)\n\nclass C:\n    @deco\n    def m(x): ...\n"
+    assert _screen("class C(C):\n    @staticmethod\n    def m(x): ...\n", wraps, tmp_path) == []
+    same = "class C(C):\n    @staticmethod\n    @deco\n    def m(x):\n        return 1\n"
+    assert _screen(same, target, tmp_path) == []
+    # Control: a method's first parameter is still bound, so its name is not part of the shape.
+    method = "def deco(f):\n    return f\n\nclass C:\n    @deco\n    def m(self, x): ...\n"
+    assert _screen("class C(C):\n    @deco\n    def m(this, x): ...\n", method, tmp_path) == []
+
+
+def test_signature_fields_name_every_signature_value() -> None:
+    """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
+    assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))
+
+
 def test_prove_absences_runs_one_baseline_per_observable_and_one_tree_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

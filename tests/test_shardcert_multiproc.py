@@ -42,6 +42,7 @@ from harness.load.coord import (
     SHARDS_READY,
     SINK_BOUND,
     SINK_DONE,
+    CoordTimeout,
     FileDropCoord,
 )
 
@@ -1194,6 +1195,102 @@ async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
     assert report.no_loss
     assert report.drained is False  # the advisory drain went unread, and says so
     assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+    # BACKLOG #5640: the ladder reads this to stop retrying a refused sign-in on later rungs.
+    assert report.sign_in_refused
+
+
+@pytest.mark.parametrize("case", ["unreachable", "rate-limited", "skipped"])
+async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """BACKLOG #5640: an engine box that did not answer is not a refusal, so a later rung may try
+    again; and ``sign_in=False`` skips the sign-in altogether, with a note, so a ladder that saw a
+    refusal does not retry it on every rung and lock the rig Administrator out.
+
+    A 429 is transient too, so it is not a refusal either.
+
+    Mutation: flag every sign-in error as refused, or open the poller under ``sign_in=False``.
+    Red: the unreachable or rate-limited case reads refused, or the skipped case builds a poller."""
+    import types
+
+    from harness.load.rigadmin import RigSignInRateLimited, RigUnreachable
+
+    _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally={
+            0: {
+                "sink_received": 40,
+                "lane_inversions": 0,
+                "lane_repeats": 0,
+                "lanes_observed": 2,
+                "ports": [3700],
+            }
+        },
+        worker_tally={
+            0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+        },
+        engine_final=types.SimpleNamespace(done=40, dead=0, in_pipeline=0),
+    )
+    built: list[object] = []
+
+    class UnreachablePoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            built.append(urls)
+
+        async def open(self) -> None:
+            if case == "rate-limited":
+                raise RigSignInRateLimited("HTTP 429 on every attempt")
+            raise RigUnreachable("the engine did not answer")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", UnreachablePoller)
+    coord = FileDropCoord(tmp_path, run_id=f"signin{case}")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": "broadcast",
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    report = await sc.run_shardcert_drive(
+        engine_host="10.0.0.5",
+        aggregate_rate=20.0,
+        hold_seconds=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="10.0.0.9",
+        coord=coord,
+        await_engine_drained=True,
+        engine_drained_timeout=0.2,
+        sign_in=case != "skipped",
+    )
+    assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+    if case != "skipped":
+        # Neither an engine that did not answer nor a transient 429 is a refused credential.
+        assert len(built) == 1
+        assert not report.sign_in_refused
+    else:
+        assert built == [], "a poller was built, so the refused sign-in was retried"
+        assert report.sign_in_refused
+
+
+async def test_ungated_drive_refuses_to_skip_the_sign_in(tmp_path: Path) -> None:
+    """Without the ENGINE_DRAINED gate the poll is the barrier, so it cannot be skipped."""
+    with pytest.raises(ValueError, match="await_engine_drained"):
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5", coord=FileDropCoord(tmp_path, run_id="nogate"), sign_in=False
+        )
 
 
 def _gated_drive_fakes(
@@ -1363,6 +1460,209 @@ async def test_gated_drive_notes_an_advisory_poll_that_raises(
     assert report.tallied_behind_gate
     assert report.drained is False
     assert any("advisory /stats drain poll failed" in n for n in report.notes), report.notes
+
+
+_BAD_DRIVE_VALUES = [float("nan"), float("inf"), 0.0, -1.0]
+
+
+@pytest.mark.parametrize("bad", _BAD_DRIVE_VALUES, ids=["nan", "inf", "zero", "negative"])
+@pytest.mark.parametrize("field", ["aggregate_rate", "hold_seconds"])
+@pytest.mark.parametrize("entry", ["drive", "driver", "driver_worker"])
+async def test_drive_entries_refuse_a_rate_or_hold_that_is_not_finite_and_positive(
+    tmp_path: Path, entry: str, field: str, bad: float
+) -> None:
+    """BACKLOG #5977, S27-64: the CLI parses ``--aggregate-rate``/``--hold-seconds`` with
+    ``type=float``, which takes nan, inf, 0 and negatives. Each entry refuses them with a ValueError
+    before any coord wait, so no SHARDS_READY is posted here. Red on the unvalidated code: the entry
+    waits for SHARDS_READY and raises CoordTimeout instead."""
+    coord = FileDropCoord(tmp_path, run_id=f"bad-{entry}-{field}")
+    shape: dict[str, Any] = {"aggregate_rate": 20.0, "hold_seconds": 1.0, field: bad}
+    calls: dict[str, Callable[[], Any]] = {
+        "drive": lambda: sc.run_shardcert_drive(
+            engine_host="10.0.0.5", coord=coord, shards_ready_timeout=0.05, **shape
+        ),
+        "driver": lambda: sc.run_shardcert_driver(
+            engine_host="10.0.0.5", coord=coord, shards_ready_timeout=0.05, **shape
+        ),
+        "driver_worker": lambda: sc.run_shardcert_driver_worker(
+            engine_host="10.0.0.5",
+            driver_index=0,
+            driver_count=1,
+            coord=coord,
+            shards_ready_timeout=0.05,
+            **shape,
+        ),
+    }
+    with pytest.raises(ValueError, match=f"{field} must be a finite number above 0"):
+        await calls[entry]()
+
+
+class _ExitedProc:
+    """A child that has already exited: ``returncode`` is set and its output is its last words."""
+
+    def __init__(self, returncode: int | None, output: bytes) -> None:
+        self.returncode = returncode
+        self._output = output
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return (self._output, b"")
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+async def test_drive_fails_fast_with_the_tail_of_a_child_that_exited_before_posting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977, S27-65: a sink child that exits before posting SINK_BOUND must end the wait at
+    once, not after ``child_ready_timeout``, and the raised error carries the child's output tail
+    rather than leaving it in a note the unwinding CoordTimeout discards. Red on the unfixed code:
+    the drive waits out the 60s child_ready_timeout, so the 10s outer bound fires."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "crashedsink", poll_seconds=0.0)
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 0.05)
+
+    async def crashed_spawn(argv: list[str]) -> _ExitedProc:
+        return _ExitedProc(
+            1, b"Traceback (most recent call last):\nValueError: synthetic sink crash\n"
+        )
+
+    monkeypatch.setattr(sc, "_spawn_proc", crashed_spawn)
+    with pytest.raises(CoordTimeout) as raised:
+        await asyncio.wait_for(
+            sc.run_shardcert_drive(
+                coord=coord, drain_timeout=1.0, child_ready_timeout=60.0, **_GATED_DRIVE_KWARGS
+            ),
+            timeout=10.0,
+        )
+    assert isinstance(raised.value, sc.ShardCertChildExited), repr(raised.value)
+    text = str(raised.value)
+    assert "sink-0" in text and "code 1" in text and f"{SINK_BOUND}.0" in text, text
+    assert "ValueError: synthetic sink crash" in text, text
+    # The coord channel gets the rendezvous message alone, never the child's output.
+    detail = raised.value.coord_detail  # type: ignore[attr-defined]
+    assert "synthetic sink crash" not in detail and f"{SINK_BOUND}.0" in detail, detail
+
+
+def test_a_long_child_tail_keeps_its_label_and_its_last_line() -> None:
+    """BACKLOG #5977: the cap on a child's tail keeps the end, where the exception line is."""
+    tail = "[sink-3] " + "x" * 1000 + " / ValueError: synthetic last line"
+    cut = sc._tail_end(tail)
+    assert cut.startswith("[sink-3] ...") and cut.endswith("ValueError: synthetic last line")
+    assert len(cut) <= sc._CHILD_TAIL_CHARS + len("[sink-3] ...")
+
+
+async def test_drive_timeout_carries_the_tail_of_a_child_still_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977, S27-65: when a child never posts and never exits, the wait still times out,
+    and the CoordTimeout raised carries the reaped child's output tail. Red on the unfixed code: the
+    tail is appended only to the local notes, so the raised message names no child output."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "hungsink", poll_seconds=0.0)
+
+    async def hung_spawn(argv: list[str]) -> _ExitedProc:
+        return _ExitedProc(None, b"sink: waiting on a port that never bound\n")
+
+    monkeypatch.setattr(sc, "_spawn_proc", hung_spawn)
+    with pytest.raises(CoordTimeout) as raised:
+        await sc.run_shardcert_drive(
+            coord=coord, drain_timeout=1.0, child_ready_timeout=0.3, **_GATED_DRIVE_KWARGS
+        )
+    assert not isinstance(raised.value, sc.ShardCertChildExited)
+    text = str(raised.value)
+    assert f"{SINK_BOUND}.0" in text and "not received within 0.3s" in text, text
+    assert "[sink-0] sink: waiting on a port that never bound" in text, text
+
+
+async def test_await_indexed_sees_a_crashed_child_at_any_pending_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977, S27-65: with child 0 still running and child 1 already exited, the wait names
+    child 1 within the exit grace rather than waiting out child 0's timeout first."""
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 0.05)
+    coord = FileDropCoord(tmp_path, run_id="anyindex")
+    children = [("sink-0", _ExitedProc(None, b"")), ("sink-1", _ExitedProc(3, b""))]
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(sc.ShardCertChildExited, match="sink-1 exited with code 3"):
+        await sc._await_indexed(
+            coord, SINK_BOUND, 2, timeout=30.0, children=children, interval=0.01
+        )
+    assert loop.time() - start < 10.0
+
+
+async def test_await_indexed_bounds_the_whole_step_by_one_timeout(tmp_path: Path) -> None:
+    """BACKLOG #5977: one deadline covers every index, so three silent children time out after
+    ``timeout``, not three times it. A NaN timeout times out at once rather than never."""
+    coord = FileDropCoord(tmp_path, run_id="onedeadline")
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(CoordTimeout, match=f"{SINK_BOUND}.0"):
+        await sc._await_indexed(coord, SINK_BOUND, 3, timeout=0.3, interval=0.01)
+    assert loop.time() - start < 0.8
+    with pytest.raises(CoordTimeout):
+        await asyncio.wait_for(
+            sc._await_indexed(coord, SINK_BOUND, 1, timeout=float("nan"), interval=0.01), 5.0
+        )
+
+
+async def test_await_indexed_reads_a_message_that_lands_just_after_its_child_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: a read that returns None just after a clean exit (a file a scanner holds open)
+    is not a crash; the message that turns up inside the exit grace is read."""
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 1.0)
+    coord = FileDropCoord(tmp_path, run_id="lateread")
+
+    async def post_late() -> None:
+        await asyncio.sleep(0.3)
+        coord.post(f"{SINK_BOUND}.0", {"sink_index": 0})
+
+    poster = asyncio.create_task(post_late())
+    got = await sc._await_indexed(
+        coord,
+        SINK_BOUND,
+        1,
+        timeout=30.0,
+        children=[("sink-0", _ExitedProc(0, b""))],
+        interval=0.01,
+    )
+    await poster
+    assert got == [{"sink_index": 0}]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"soak_hold_seconds": 0.0}, "hold_seconds"),
+        ({"soak_rate_override": float("nan")}, "aggregate_rate"),
+        ({"rates": [0.0, 40.0]}, "aggregate_rate"),
+        ({"hold_seconds": float("inf")}, "hold_seconds"),
+    ],
+)
+async def test_drive_ladder_refuses_a_bad_rate_or_hold_before_the_climb(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, overrides: dict[str, Any], field: str
+) -> None:
+    """BACKLOG #5977, S27-64: the ladder refuses every rate and hold it would hand the drive before
+    any rung runs, so a bad soak value cannot discard a finished climb. No rung may be driven."""
+    import harness.load.shardcert_ladder as ladder
+
+    async def no_drive(**kw: Any) -> Any:
+        raise AssertionError("a rung was driven")
+
+    monkeypatch.setattr(ladder, "run_shardcert_drive", no_drive)
+    kwargs: dict[str, Any] = {
+        "engine_host": "10.0.0.5",
+        "rates": [40.0],
+        "hold_seconds": 1.0,
+        "drain_timeout": 1.0,
+        "driver_count": 1,
+        "sink_count": 1,
+        "sink_host": "127.0.0.1",
+        "base_coord": FileDropCoord(tmp_path, run_id="ladderbad"),
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=f"{field} must be a finite number above 0"):
+        await ladder.run_drive_ladder(**kwargs)
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(

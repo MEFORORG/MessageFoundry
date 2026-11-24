@@ -256,8 +256,10 @@ def test_unanonymizable_inputs_fail_closed_on_both_sides() -> None:
 
 
 def test_surrogate_pools_carry_no_hl7_delimiter() -> None:
-    # Whole-field writes assume a surrogate value never contains a delimiter; enforce it on the pools
-    # so a future "realistic" name/street with ^ ~ & | can't silently diverge the two re-encoders.
+    # Under the DEFAULT delimiters no pool value may hold one, so a future "realistic" name or street
+    # with ^ ~ & | cannot make every default-encoded message refuse. Under a custom MSH-1 or MSH-2 a
+    # pool value can hold a delimiter (every street holds a space); both adapters refuse that
+    # message rather than emit it (BACKLOG #5540, tests/test_anon_declared_delimiter_5540.py).
     delimiters = set("|^~\\&")
     flat: list[str] = [
         *_hl7data.FAMILY_NAMES,

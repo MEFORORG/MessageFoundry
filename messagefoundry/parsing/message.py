@@ -315,10 +315,16 @@ class Message:
         delimiters, which the parser read once from the first line and every other line is written
         in. A write to one of them that would change a delimiter raises ``ValueError``, so a write
         there cannot leave a header advertising delimiters its body is not written in (BACKLOG
-        #5972). Accepted there: a value equal to what :meth:`field` reads at that path, and, at field
+        #5972). Accepted there: a value equal to what :meth:`field` reads at that path; at field
         2, a whole-field value that keeps the four encoding characters and adds, drops or changes
-        only the one v2.7 truncation character after them. To send under other delimiters, re-encode the whole message, as
-        a per-outbound ``encoding_characters`` does."""
+        only the one v2.7 truncation character after them; and, on the leading header's short
+        field 2, the four characters the parser filled it with, which declares them. To send under other delimiters, re-encode the whole message, as
+        a per-outbound ``encoding_characters`` does.
+
+        Every write to a message whose first line names fewer than four encoding characters while
+        its five separators, the parser's defaults filled in, are not distinct (``MSH|~|``,
+        ``MSH|^~~|``) raises ``ValueError``, since two structures there share one character; such a
+        message reads as the sender sent it (BACKLOG #5972)."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
     def _write(
@@ -338,11 +344,10 @@ class Message:
         if not self._segment_present(seg, occurrence):
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot set absent segment {where}")
+        field_sep, comp_sep, rep_sep, esc, sub_sep = self._write_encoding_chars()
         if _builtin_hl7.is_delimiter_field(seg, fld):
             self._write_delimiter_field(path, seg, fld, occurrence, value, comp, repetition)
             return
-
-        field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
 
         if comp is None:
             if as_data:
@@ -445,7 +450,7 @@ class Message:
         if _builtin_hl7.is_delimiter_field(seg, fld):
             raise self._delimiter_write_refusal(seg, fld, repetition=True)
         _refuse_frame_bytes(value)
-        field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
+        field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._write_encoding_chars()
         if field_sep in value:
             raise ValueError(
                 f"a repetition value may not contain the field separator {field_sep!r}"
@@ -473,7 +478,7 @@ class Message:
                 "add_segment takes one segment line (no CR/LF); call it once per segment"
             )
         _refuse_frame_bytes(line)
-        field_sep, *_ = self._encoding_chars()
+        field_sep, *_ = self._write_encoding_chars()
         tokens = line.split(field_sep)
         segment_id = tokens[0]
         if not _SEG_ID_RE.match(segment_id):
@@ -499,15 +504,41 @@ class Message:
             raise ValueError(f"index {index} out of range (1..{seg_count}); index 1 is after MSH")
         _builtin_hl7.add_segment_line(self._m, segment_id, tokens, index)
 
-    def delete_segments(self, segment_id: str) -> int:
-        """Remove every segment with ``segment_id`` and return how many were removed.
+    def delete_segments(self, segment_id: str, *, occurrence: int | None = None) -> int:
+        """Remove every segment with ``segment_id``, or only its ``occurrence``-th, and return how
+        many were removed.
 
-        Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
+        Deleting ``MSH`` is refused — the message must keep its header — and so is deleting the
+        ``BHS`` or ``FHS`` that leads the message, whose delimiters every line is read and
+        written in (BACKLOG #5972). Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
         :meth:`add_segment`. A fieldless bare line of that id is removed and counted too, though
-        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind."""
+        :meth:`count_segments` skips it, so a delete leaves no stray bare line behind.
+
+        ``occurrence`` (1-based) removes only that one segment instead, numbered as :meth:`field`
+        and :meth:`count_segments` number it, so a fieldless bare line is no occurrence. It returns
+        1, or 0 when that occurrence is absent, and leaves every other segment as it was. It raises
+        ``ValueError`` at least for an ``occurrence`` below 1, for any ``MSH`` (as the delete-all
+        form does), and for the occurrence that is the leading header. So on a ``BHS``-led message
+        ``delete_segments("BHS")`` and ``delete_segments("BHS", occurrence=1)`` are both refused
+        and delete nothing, while ``occurrence=2`` removes a later ``BHS``."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
+        if occurrence is not None:
+            if occurrence < 1:
+                raise ValueError("occurrence is 1-based (>= 1)")
+            position = _builtin_hl7.segment_index(self._m, segment_id, occurrence)
+            if position is None:
+                return 0
+            # _delete_segment_at refuses position 0, the header that leads the message, so only
+            # that occurrence is refused and a later BHS or FHS of the same id may go.
+            self._delete_segment_at(position)
+            return 1
+        if segment_id in _builtin_hl7.HEADER_IDS and self._m["segments"][0]["id"] == segment_id:
+            raise ValueError(
+                f"refusing to delete the {segment_id} header that leads the message, whose "
+                "delimiters every line is read and written in"
+            )
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
         ids = _builtin_hl7.segment_ids(self._m)
@@ -523,15 +554,29 @@ class Message:
 
         This is the positional delete that group-scoped edits use: a group addresses its members by
         position, not by id (an ``OBX`` may belong to any order), so id-based
-        :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
-        refused so the header always survives. Raises ``ValueError`` on an out-of-range position."""
+        :meth:`delete_segments` can't target one order's segments. Deleting the leading header
+        (position 0) is refused so it always survives. Raises ``ValueError`` on an out-of-range
+        position."""
+        refusal = self._positional_delete_refusal(position)
+        if refusal is not None:
+            raise refusal
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
-        seg_count = len(_builtin_hl7.segment_ids(self._m))
-        if position < 1 or position >= seg_count:
-            raise ValueError(
-                f"position {position} out of range (1..{seg_count - 1}); position 1 is after MSH"
-            )
         _builtin_hl7.delete_segment_at(self._m, position)
+
+    def _positional_delete_refusal(self, position: int) -> ValueError | None:
+        """The ``ValueError`` :meth:`_delete_segment_at` raises for ``position``, or None if it
+        would delete it. A caller deleting several positions checks every one first, so a refusal
+        leaves the message unchanged."""
+        segments = self._m["segments"]
+        if position == 0:
+            return ValueError(
+                f"refusing to delete the {segments[0]['id']} header that leads the message"
+            )
+        if position < 1 or position >= len(segments):
+            return ValueError(
+                f"position {position} out of range (1..{len(segments) - 1}); position 1 is after MSH"
+            )
+        return None
 
     # --- group-scoped structural view ----------------------------------------
 
@@ -676,6 +721,22 @@ class Message:
             self.field(path, occurrence=occurrence, repetition=repetition) or ""
         ):
             return
+        # A short field 2 on the leading header may be completed to the four characters the
+        # parser filled it with, so the header declares the delimiters every line is read and
+        # written in; nothing moves.
+        completion = ""
+        if (
+            whole
+            and fld == 2
+            and len(current) < 4
+            and occurrence == 1
+            and self._m["segments"][0]["id"] == seg
+        ):
+            _f, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
+            completion = comp_sep + rep_sep + esc + sub_sep
+            if value == completion:
+                self._assign_field(seg, fld, occurrence, value)
+                return
         truncation = whole and fld == 2 and len(current) >= 4
         if truncation and value[:4] == current[:4]:
             tail = value[4:]
@@ -688,11 +749,16 @@ class Message:
             ):
                 self._assign_field(seg, fld, occurrence, value)
                 return
-        raise self._delimiter_write_refusal(seg, fld, truncation=truncation)
+        raise self._delimiter_write_refusal(seg, fld, truncation=truncation, completion=completion)
 
     @staticmethod
     def _delimiter_write_refusal(
-        seg: str, fld: int, *, truncation: bool = False, repetition: bool = False
+        seg: str,
+        fld: int,
+        *,
+        truncation: bool = False,
+        repetition: bool = False,
+        completion: str = "",
     ) -> ValueError:
         """The refusal of a write that would change a header's delimiter field (BACKLOG #5972). The
         parser reads the message's separators once, from the first line, and splits and re-encodes
@@ -703,9 +769,16 @@ class Message:
         so it stays true of that write. ``truncation`` is True when the write could have changed
         the v2.7 truncation character instead: a whole-field (or repetition 1) write at field 2 of
         a header whose field 2 holds all four encoding characters. ``repetition`` is for
-        :meth:`add_repetition`, which accepts nothing there."""
+        :meth:`add_repetition`, which accepts nothing there. ``completion`` is the four encoding
+        characters the parser filled a short field 2 of the leading header with, the one other
+        value that write accepts."""
         if repetition:
             accepted = "a repetition cannot be added to it"
+        elif completion:
+            accepted = (
+                "a write there must leave it reading as it does, or complete it to "
+                f"{completion!r}, the four encoding characters the parser filled it with"
+            )
         elif truncation:
             accepted = (
                 "a write there must leave it reading as it does, or keep its four encoding "
@@ -720,18 +793,45 @@ class Message:
         )
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:
-        """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters, read
-        from its **own** MSH-1 (field separator) + MSH-2 (the other four).
+        """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters: the
+        ones the parser read from the first line (an ``MSH``, ``BHS`` or ``FHS`` header) and split
+        every other line on.
 
         Derived from the actual encoding characters, not hardcoded defaults — so a custom-delimiter
-        message isn't split on the wrong characters. Raises ``ValueError`` if they can't be determined
-        rather than guess (XFORM-2/3). The read-side unescape uses the same MSH-2-derived characters,
-        so write-escaping and read-unescaping stay consistent."""
-        field_sep = self._raw_field("MSH", 1)  # MSH-1 is the field separator itself
-        enc = self._raw_field("MSH", 2)  # e.g. "^~\&": component, repetition, escape, subcomponent
-        if len(field_sep) != 1 or len(enc) < 4:
-            raise ValueError(f"cannot determine HL7 separators: MSH-1={field_sep!r}, MSH-2={enc!r}")
-        return field_sep, enc[0], enc[1], enc[2], enc[3]
+        message isn't split on the wrong characters (XFORM-2/3). A short field 2 has its missing
+        characters filled exactly as the parser filled them (``^``, ``~``, ``\\``, ``&``), so a read
+        here agrees with the split, and with ``Peek.field``, on every message the parser accepts:
+        reading them from ``MSH-2`` instead refused a short ``MSH-2``, or a ``BHS`` or ``FHS`` with
+        no ``MSH``, that the parser had already split (BACKLOG #5972). The header's delimiter fields
+        cannot be rewritten through this API (:meth:`_write_delimiter_field`), so the parser's read
+        stays the message's. The read-side unescape uses the same characters, so write-escaping and
+        read-unescaping stay consistent."""
+        field_sep, comp_sep, rep_sep, sub_sep, esc = _builtin_hl7.separators(self._m)
+        return field_sep, comp_sep, rep_sep, esc, sub_sep
+
+    def _write_encoding_chars(self) -> tuple[str, str, str, str, str]:
+        """:meth:`_encoding_chars` for a write, which refuses a message whose first line names too
+        few encoding characters while its five separators, defaults filled in, are not distinct,
+        as ``MSH|~|``, ``MSH^^`` or ``MSH|^~~|`` (BACKLOG #5972). Two structures there share one
+        character, so a value joined on one would read back as the other. A read of such a message
+        is not refused: it reads what the sender sent, as ``Peek`` does, so a message that is only
+        read, routed or acknowledged is accepted. A batching outbound's ``encode_batch`` comes
+        here too, since its BHS writes the head's delimiters, so such a head is refused at frame
+        time."""
+        if self._delimiters_collide():
+            raise _builtin_hl7.CollidingDelimitersRefused(COLLIDING_DELIMITERS_WRITE)
+        return self._encoding_chars()
+
+    def _delimiters_collide(self) -> bool:
+        """Whether the first line fills a delimiter it does not declare with a default that is
+        already another of its delimiters (:func:`~messagefoundry.parsing._builtin_hl7.filled_default_collides`),
+        read from the header's parsed fields 1 and 2, never from a slice of the raw text."""
+        # The same verdict as filled_default_collides on the first line, from what the parse
+        # stored: field 2 shorter than four characters, and the five recorded separators not
+        # distinct. No delimiter write can change either.
+        first = self._m["segments"][0]["fields"]
+        short = len(first) < 3 or len(_builtin_hl7._field_text(first[2])) < 4
+        return short and len(set(self._m["seps"])) < 5
 
     @staticmethod
     def _escape_leaf(
@@ -745,6 +845,15 @@ class Message:
         that ``unescape()`` then mis-decoded, silently corrupting them (review M-13). The one
         implementation is :func:`~messagefoundry.parsing._builtin_hl7.escape_leaf`."""
         return _builtin_hl7.escape_leaf(value, (field_sep, comp_sep, rep_sep, sub_sep, esc))
+
+
+#: The refusal of a write to a message whose short MSH-2 leaves its separators not distinct
+#: (BACKLOG #5972), shared with ``split.encode_batch``'s header-only read.
+COLLIDING_DELIMITERS_WRITE = (
+    "the message header names too few encoding characters, and a default filled in for one is "
+    "already another of its delimiters, so a write could not be read back as written; the "
+    "message can be read but not written"
+)
 
 
 def emit_raw_separators(payload: str) -> str:

@@ -106,7 +106,8 @@ function collectElements(n: NormalGraph): Map<string, FlatElement> {
 
 /** Every statically-known edge, provenance carried through; targets that resolve to no known
  *  element are omitted here (the element's `dynamic` flag + stub covers unresolvables). A
- *  handler→inbound pass-through edge is legal and kept — its target lays out in the inbound column. */
+ *  handler→inbound pass-through edge is legal and kept — its target lays out in the inbound column —
+ *  and so is an outbound's reingress_to back-edge into its Loopback inbound, which closes a cycle. */
 function collectEdges(n: NormalGraph): MapEdge[] {
   const edges: MapEdge[] = [];
   const seen = new Set<string>();
@@ -136,6 +137,12 @@ function collectEdges(n: NormalGraph): MapEdge[] {
       } else if (e.target_kind === "inbound" && n.inbound.has(e.target)) {
         push("handler", h.name, "inbound", e.target, e.provenance);
       }
+    }
+  }
+  // reingressTo is keyed by names read off g.outbound, so only the inbound end can miss.
+  for (const [o, inbounds] of n.reingressTo) {
+    for (const i of inbounds.filter((name) => n.inbound.has(name))) {
+      push("outbound", o, "inbound", i, "declared");
     }
   }
   return edges;

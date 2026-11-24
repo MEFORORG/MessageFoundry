@@ -76,10 +76,11 @@ transformed/routed output against Corepoint's — without MEFOR delivering to re
   (`AE`/`AR`) **does not propagate back to Epic** — Epic sees the relay, not Corepoint. That's why the
   relay **logs every NAK** (see below). Corepoint still NAKs internally; transport failures are surfaced
   via the fail-closed shutdown.
-* **Fail-closed.** On a Corepoint **transport** failure (unreachable, after `--corepoint-attempts` quick
-  retries), the relay **stops accepting on Listener A and drops live Epic connections** so Epic sees the
-  outage and queues/retries on its side. It does **not** exit (so it can't crash-loop against a down
-  Corepoint) — **restart it once Corepoint is healthy.** A message in flight at the instant of the failure
+* **Fail-closed.** On a Corepoint **transport** failure (unreachable on every one of the
+  `--corepoint-attempts` tries, which count the first try, so `1` means no retry), the relay **stops
+  accepting on Listener A and drops live Epic connections** so Epic sees the outage and
+  queues/retries on its side. It does **not** exit (so it can't crash-loop against a down Corepoint)
+  — **restart it once Corepoint is healthy.** A message in flight at the instant of the failure
   may be `AA`'d-but-undelivered; the shutdown bounds further loss and Epic's resend/queue covers the rest.
   (This is a simple fail-closed relay, **not** durable store-and-forward — by design.)
 * **Shadow leg is decoupled.** The MEFOR copy goes through a bounded in-memory queue drained by its own
@@ -110,9 +111,10 @@ python -m tee run --listen-epic :6661 --corepoint corehost:5000 --mefor meforhos
 python -m tee naks --db ./tee.db
 ```
 
-Useful flags: `--corepoint-attempts` / `--corepoint-retry-delay` (quick retries before tripping
-fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame-size DoS cap),
-`--mefor-queue-max` (shadow buffer bound), `--capture-bodies` (persist full bodies — **test data only**),
+Useful flags: `--corepoint-attempts` (tries before tripping fail-closed, a positive integer; see
+*Fail-closed* above) / `--corepoint-retry-delay` (seconds between tries), `--connect-timeout` /
+`--send-timeout`, `--max-frame-bytes` (frame-size DoS cap), `--mefor-queue-max` (shadow buffer
+bound, a positive integer), `--capture-bodies` (persist full bodies — **test data only**),
 `-y/--yes` (skip the test-data-only confirmation for an unattended/service start), `--log-level`,
 `--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
 messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
@@ -248,7 +250,9 @@ prints no counts; and an error while closing the store after a scrub error, whic
 To finish an unfinished scrub without deleting anything, run
 `python -m tee purge --db ./tee.db --scrub-only` once the cause is gone. A plain re-run of the
 purge works too, as above, but deletes under its own arguments. `--scrub-only` needs no `-y`,
-refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes.
+refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes. A
+plain purge refuses a missing `--db` path too, exiting 2 and creating nothing, so a mistyped path
+cannot report a clean purge.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
@@ -257,8 +261,11 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 
 ## Limits (by design, for the test-only scope)
 
-* **Test data only** — not hardened for production PHI (no at-rest encryption; the DB is `chmod 0600`
-  best-effort only). Keep every tee DB on a protected volume, capture on or off, because a log row's
+* **Test data only** — not hardened for production PHI (no at-rest encryption; on open the DB and
+  its `-wal` and `-shm` are restricted to their owner best-effort only, `chmod 0600` on POSIX and an
+  owner-only access list on Windows, with a logged warning when that fails). On Windows the DB is
+  then usable only by the account that opened it last, so run the relay and the commands that read
+  its DB under one account. Keep every tee DB on a protected volume, capture on or off, because a log row's
   detail can name a patient. Enable `--capture-bodies` only with test data.
 * **Not store-and-forward** — no durable retry queue; recovery of post-trip traffic is delegated to Epic's
   resend/queue (see *Fail-closed* above).

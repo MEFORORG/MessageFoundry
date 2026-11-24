@@ -337,6 +337,26 @@ async def test_edit_resend_direct_with_a_nul_is_refused(engine: Engine, tmp_path
     assert row is not None and row[0] == 0
 
 
+async def test_edit_resend_direct_past_the_header_form_limit_is_refused(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # BACKLOG #5972: an HL7 body on the direct path meets the listeners' document-marker check, so
+    # one whose later headers escape the handle marker in more ways than are looked for answers
+    # 422 rather than being committed and dead-lettered at the re-attach.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    engine.add_registry(_registry(tmp_path, _inbound(tmp_path)))
+    mid, r = await _edit_resend(
+        engine,
+        {"raw": EDITED + f"NTE|1||{PHI_MARKER}\r" + headers, "idempotency_key": "k1", "to": "OB2"},
+    )
+    assert r.status_code == 422, r.text
+    await _assert_nothing_committed(engine, mid, r)
+
+
 async def test_upload_resend_into_a_binary_inbound_commits_carriage(
     engine: Engine, tmp_path: Path
 ) -> None:
@@ -375,6 +395,139 @@ def test_guard_applies_the_hl7_ceiling_per_connection() -> None:
     with pytest.raises(IngressGuardError) as exc:
         admit_resubmitted_body(ADT, _ic(ContentType.HL7V2, max_message_bytes=len(ADT) - 1))
     assert exc.value.phase == "size"
+
+
+def test_guard_direct_path_refuses_a_body_the_parser_faults_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5972: on the edit-resend direct path (no inbound) a body the re-attach's gate opens
+    # on, which the parser faults on, is refused rather than admitted unchecked: the re-attach
+    # re-raises such a fault too. A short body the parser refuses as not HL7 is still left to the
+    # outbound.
+    from messagefoundry.parsing import _builtin_hl7
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+
+    not_hl7 = "not hl7 " + DOC_REF_MARKER
+    assert admit_resubmitted_body(not_hl7, None) == not_hl7
+    body = EDITED + f"NTE|1||{DOC_REF_MARKER}x\r"
+
+    def _fault(text: str) -> None:
+        raise RuntimeError("stand-in parser fault")
+
+    monkeypatch.setattr(_builtin_hl7, "parse", _fault)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, None)
+    assert exc.value.phase == "parse"
+    assert (
+        exc.value.reason == "parse error: HL7PeekError: could not parse HL7 message (RuntimeError)"
+    )
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # A body the gate does not open on never reaches the parser.
+    assert admit_resubmitted_body(EDITED, None) == EDITED
+
+
+def test_guard_direct_path_judges_the_form_limit_on_the_reattach_parse() -> None:
+    # BACKLOG #5972: Peek.parse refuses an FHS-led batch, but the delivery re-attach parses it and
+    # refuses it for its form count, so the direct path judges the limit on that parse rather than
+    # admitting the body to dead-letter.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT, DOC_REF_MARKER
+    from messagefoundry.parsing.peek import HL7PeekError, Peek
+    from messagefoundry.pipeline.ingress_guards import HEADER_FORMS_REFUSED_REASON
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    note = f"NTE|1||{DOC_REF_MARKER}x\r"
+    body = "FHS|^~\\&|APP|FAC\r" + headers + EDITED + note
+    with pytest.raises(HL7PeekError):
+        Peek.parse(body)  # control: the listeners' parse refuses this shape
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, None)
+    assert exc.value.phase == "ingest"
+    assert exc.value.reason == HEADER_FORMS_REFUSED_REASON
+    # Control: within the limit the same shape is still left to the outbound.
+    within = body.replace(headers, "BHS|:~X&|A\r")
+    assert admit_resubmitted_body(within, None) == within
+
+
+def test_guard_direct_path_refuses_the_marker_in_an_fhs_or_bhs_led_body() -> None:
+    # BACKLOG #5972: Peek.parse refuses a body led by FHS or BHS, but the delivery re-attach parses
+    # it and dead-letters one holding the marker under a header it refuses, so the direct path runs
+    # the listeners' whole marker check on that parse rather than committing the body. The same
+    # body led by MSH is refused at ingest too.
+    from messagefoundry.parsing.peek import HL7PeekError, Peek
+    from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
+
+    tail = "MSH|^~\\/|A|B\rNTE|1||mfdoc:v1:ref:x\r"
+    with pytest.raises(IngressGuardError) as msh_led:
+        admit_resubmitted_body(tail, None)
+    assert msh_led.value.phase == "ingest"
+    assert msh_led.value.reason == DOC_REF_MARKER_REFUSED_REASON
+    for lead in ("FHS", "BHS"):
+        body = f"{lead}|^~\\/|APP\r" + tail
+        with pytest.raises(HL7PeekError):
+            Peek.parse(body)  # control: the listeners' parse refuses this shape
+        with pytest.raises(IngressGuardError) as exc:
+            admit_resubmitted_body(body, None)
+        assert exc.value.phase == "ingest"
+        assert exc.value.reason == msh_led.value.reason
+
+
+def test_guard_direct_path_refuses_a_body_past_the_segment_cap_unparsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5972: Message.parse has no segment cap, so a body Peek.parse refuses past its cap is
+    # refused on the direct path before that parse, rather than parsed whole on the request.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from messagefoundry.parsing.message import Message
+    from messagefoundry.parsing.peek import DEFAULT_MAX_SEGMENTS
+
+    calls: list[str] = []
+    real_parse = Message.parse
+
+    def _counted(raw: str) -> Message:
+        calls.append(raw)
+        return real_parse(raw)
+
+    monkeypatch.setattr(Message, "parse", staticmethod(_counted))
+    note = f"NTE|1||{DOC_REF_MARKER}x\r"
+    head = "FHS|^~\\&|APP|FAC\r" + EDITED + note
+    # Peek.parse counts the text after the last segment terminator as one more segment.
+    at_cap = head + "ZZZ|1\r" * (DEFAULT_MAX_SEGMENTS - head.count("\r") - 1)
+    over = at_cap + "ZZZ|1\r"
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(over, None)
+    # The size phase, as the re-route answers an over-cap body.
+    assert exc.value.phase == "size"
+    assert exc.value.reason == (
+        f"message exceeds max segments ({DEFAULT_MAX_SEGMENTS + 1} > {DEFAULT_MAX_SEGMENTS})"
+    )
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    assert calls == []
+    # Control: the same batch at the cap still reaches the re-attach's parse and is admitted.
+    assert admit_resubmitted_body(at_cap, None) == at_cap
+    assert calls == [at_cap]
+
+
+def test_guard_direct_path_gives_the_listeners_reason_on_a_body_they_parse() -> None:
+    # BACKLOG #5972: a body Peek.parse accepts meets the listeners' check whole and in its order,
+    # so one holding the marker under a colliding header and past the form limit is refused for
+    # the marker, as the listeners and the re-route refuse it, not for its form count.
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT, DOC_REF_MARKER
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+
+    headers = "".join(
+        f"BHS|:~{chr(0x4E00 + index)}&|A\r" for index in range(_LATER_HEADER_FORMS_LIMIT + 1)
+    )
+    body = (
+        "MSH|~|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\r" + f"NTE|1||{DOC_REF_MARKER}x\r" + headers
+    )
+    with pytest.raises(IngressGuardError) as direct:
+        admit_resubmitted_body(body, None)
+    with pytest.raises(IngressGuardError) as routed:
+        admit_resubmitted_body(body, _ic(ContentType.HL7V2))
+    assert direct.value.phase == routed.value.phase == "ingest"
+    assert direct.value.reason == routed.value.reason == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
 
 
 def test_guard_sniffs_the_declared_type() -> None:
@@ -450,6 +603,101 @@ def test_guard_admits_what_peek_parse_admits_and_the_sniff_refuses(lead: str) ->
     # Peek.parse strips leading whitespace with str.lstrip(); the byte sniff does not. The listener
     # never applies the sniff to HL7, so a body it accepts must stay resendable.
     admit_resubmitted_body(lead + ADT, _ic(ContentType.HL7V2))
+
+
+def test_guard_refuses_the_document_marker_the_listeners_refuse() -> None:
+    # BACKLOG #5099: both listeners refuse a body holding the handle marker under a base64
+    # delimiter before the ACK, so a resend of it is refused too, rather than left to delivery.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
+    from tests.test_sender_document_handle import _copy_in_nte_component
+
+    body = _copy_in_nte_component("|", "^~\\/", DOC_REF_MARKER + "x")
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "ingest"
+    assert exc.value.reason == DOC_REF_MARKER_REFUSED_REASON
+    # Controls: the same body without the marker, and the marker under ordinary delimiters, which
+    # the listeners' check does not refuse, are both admitted.
+    admit_resubmitted_body(_copy_in_nte_component("|", "^~\\/", "SYNTH"), _ic(ContentType.HL7V2))
+    admit_resubmitted_body(
+        _copy_in_nte_component("|", "^~\\&", DOC_REF_MARKER + "x"), _ic(ContentType.HL7V2)
+    )
+
+
+async def test_admission_refuses_the_document_marker() -> None:
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from tests.test_sender_document_handle import _copy_in_nte_component
+
+    body = _copy_in_nte_component("|", "^~\\/", DOC_REF_MARKER + "x")
+    with pytest.raises(IngressGuardError) as exc:
+        await admit_resubmission(body, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "ingest"
+
+
+def test_guard_answers_a_fault_in_the_parse_as_a_parse_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline import ingress_guards
+
+    class _FaultingPeek:
+        @staticmethod
+        def parse(_text: str, **_kwargs: object) -> object:
+            raise LookupError("synthetic")
+
+    monkeypatch.setattr(ingress_guards, "Peek", _FaultingPeek)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+    assert exc.value.reason == "parse error: peek read failed (LookupError)"
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    # The direct path (no inbound) answers the same fault the same way, for a body the gate opens on.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+
+    with pytest.raises(IngressGuardError) as direct:
+        admit_resubmitted_body(ADT + f"NTE|1||{DOC_REF_MARKER}x\r", None)
+    assert direct.value.phase == "parse"
+    assert direct.value.reason == "parse error: peek read failed (LookupError)"
+    assert direct.value.__cause__ is None and direct.value.__context__ is None
+
+
+def test_guard_answers_a_fault_in_the_marker_read_as_an_ingest_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The marker check runs after the parse, at the ingest phase, and a fault in its header read
+    # refuses the body there, as the direct path does (BACKLOG #5972).
+    from messagefoundry.pipeline import ingress_guards
+
+    def faulting(_peek: object, _text: str) -> str | None:
+        raise IndexError("synthetic")
+
+    monkeypatch.setattr(ingress_guards, "doc_ref_marker_refusal", faulting)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "ingest"
+    # The fault's type is recorded, and nothing of its message (#5972).
+    assert exc.value.reason == f"{ingress_guards._MARKER_CHECK_FAULT_REASON} (IndexError)"
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+
+
+def test_guard_direct_path_records_the_type_of_a_marker_read_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5972: on the direct path a fault in the marker check over the re-attach's own parse
+    # is an ingest refusal naming the fault's type alone.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from messagefoundry.pipeline import ingress_guards
+
+    def faulting(_message: object, _text: str) -> str | None:
+        raise IndexError("synthetic")
+
+    monkeypatch.setattr(ingress_guards, "_message_marker_refusal", faulting)
+    body = "FHS|^~\\&|APP\r" + EDITED + f"NTE|1||{DOC_REF_MARKER}x\r"
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, None)
+    assert exc.value.phase == "ingest"
+    assert exc.value.reason == f"{ingress_guards._MARKER_CHECK_FAULT_REASON} (IndexError)"
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
 
 
 def test_guard_stores_canonical_carriage() -> None:

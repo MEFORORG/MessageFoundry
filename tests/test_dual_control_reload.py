@@ -1882,10 +1882,10 @@ async def test_a_directory_unlistable_only_at_the_trust_walk_is_audited_unreadab
     walked = wiring.config_source_trust_paths
     lost = False
 
-    def _walk(directory: Path) -> list[Path]:
+    def _walk(directory: Path, **kwargs: Any) -> list[Path]:
         nonlocal lost
         lost = True  # the share drops as the walk starts, after the load's own check listed it
-        return walked(directory)
+        return walked(directory, **kwargs)
 
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
@@ -1915,10 +1915,10 @@ async def test_a_directory_moved_away_during_the_trust_walk_listing_is_not_found
     cfg = tmp_path / "cfg"
     walked = wiring.config_source_trust_paths
 
-    def _moved_then_walked(directory: Path) -> list[Path]:
+    def _moved_then_walked(directory: Path, **kwargs: Any) -> list[Path]:
         if cfg.exists():
             cfg.rename(tmp_path / "moved")
-        return walked(directory)
+        return walked(directory, **kwargs)
 
     service = await _service(engine)
     await _add(service, "op", Role.ADMINISTRATOR)
@@ -2977,9 +2977,9 @@ async def test_a_row_wait_with_no_grace_left_does_not_wait() -> None:
 
 
 def test_the_undrained_row_wait_fits_inside_the_engine_stop_reserve() -> None:
-    """Nothing hands engine.stop() a remaining time, so the cap alone bounds a cancelled convergence
-    reload's row wait there, and it must leave most of the reserve to the rest of the stop
-    (BACKLOG #3191)."""
+    """engine.stop()'s budget does not reach this wait, so the cap alone bounds a cancelled
+    convergence reload's row wait there, and it must leave most of the reserve to the rest of the
+    stop (BACKLOG #3191)."""
     from messagefoundry.api import app as app_module
 
     assert app_module._ROW_CANCEL_WAIT_SECONDS <= app_module._ENGINE_STOP_RESERVE_SECONDS / 3

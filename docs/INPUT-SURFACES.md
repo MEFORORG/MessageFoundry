@@ -287,7 +287,7 @@ need and the engine does not enforce is written in your Handler, as
 
 | Payload | Rules the engine checks over two or more items | Where |
 |---|---|---|
-| HL7 v2 | At least these. At ingress, both shared handlers and the Loopback re-ingress refuse a body that holds the document handle marker where a delimiter is a base64 character or the delimiters cannot be read. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses. What else strict validation holds the segments to, and what it lets through, segment order and Z-segments among them, is stated in [HL7-VALIDATION.md](HL7-VALIDATION.md). On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`, called by both handlers and by `_peek_for_loopback`, a module-level function in `pipeline/wiring_runner.py`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
+| HL7 v2 | At least these. At ingress, both shared handlers and the Loopback re-ingress refuse a body that holds the document handle marker where a delimiter is a base64 character, or where the first header line names too few encoding characters and fills a missing one with a delimiter it already uses. At ingress too, where check 8 runs, strict validation refuses at least an MSH-2 that repeats an encoding character, which the `hl7apy` parse it runs refuses. What else strict validation holds the segments to, and what it lets through, segment order and Z-segments among them, is stated in [HL7-VALIDATION.md](HL7-VALIDATION.md). On a streaming inbound, the document detach can refuse a body as well; [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md) defines it. The Tier 3 primitives, such as `same_across` and `dates_in_order`, compare fields with each other only when your Router or Handler calls them, and refuse nothing themselves: they return the violations, and your code decides. | `doc_ref_marker_refusal` in `pipeline/ingress_guards.py`, called by at least both handlers, the dry-run, `admit_resubmitted_body` in the same module, and `_peek_for_loopback`, a module-level function in `pipeline/wiring_runner.py`; `validate` in `parsing/validate.py`; `RegistryRunner._detach_documents` in `pipeline/wiring_runner.py`; `parsing/consistency.py` |
 | `json` | None. | |
 | `text` | None. | |
 | `binary` | None. | |
@@ -347,9 +347,12 @@ It does hold them to a structure when it loads them. The rules live in
   the top-level `*.py` files the loader may run or import (`config_py_files`, which skips a
   dot-named file), helpers included, and, where they exist, its `__pycache__` folder and the
   entries in it, `connections.toml`, and the `codesets` folder and the code-set tables the loader
-  reads from it. Any other path in the directory is not on it. A dev and test escape turns the
-  refusal into a warning; the conditions it needs are under *Dev/test escape* in
-  [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
+  reads from it, and, for each of those that is a link, what it resolves to and, for a file, that
+  file's folder, which can lie outside the directory; [SERVICE.md](SERVICE.md), in
+  its POSIX loader bullet, says what that leaves unchecked (vault BACKLOG #2596). Any other path is not on it. A dev and test escape
+  turns at least those refusals into a warning. It does not cover the check's refusal of a link on that
+  list that cannot be resolved or leads to nothing at check time. The escape's conditions are
+  under *Dev/test escape* in [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
   check reads and what it leaves out.
 - A module declares nothing by being loaded. It registers objects by calling `inbound()`,
   `outbound()`, `@router` and `@handler`, at least. Those calls outside a load are refused.

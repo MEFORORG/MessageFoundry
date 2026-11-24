@@ -8,6 +8,7 @@ gate reads the settings, not what any one leg does with them."""
 
 from __future__ import annotations
 
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,19 @@ import messagefoundry.checks as checks
 from messagefoundry.checks import run_checks
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test runs in an empty working directory with no ``MEFOR_*`` variables, so neither a
+    ``./messagefoundry.toml`` where pytest was started nor a variable the shell exports reaches
+    what the legs grade."""
+    work = tmp_path / "cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    for name in list(os.environ):
+        if name.upper().startswith("MEFOR_"):
+            monkeypatch.delenv(name)
 
 
 def _count_reads(monkeypatch: pytest.MonkeyPatch) -> Counter[str]:

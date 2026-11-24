@@ -60,6 +60,7 @@ import sys
 import weakref
 from collections.abc import Awaitable, Callable, Coroutine, Generator, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -92,6 +93,7 @@ from messagefoundry.config.models import (
     Source,
     bool_setting,
     check_db_connect_timeout,
+    flag_from_settings,
     hop_attestation_from_settings,
     whole_seconds,
 )
@@ -107,6 +109,7 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.config.wiring import _is_text_codec
 from messagefoundry.connection_names import db_lookup_record_name, inbound_record_name
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.hostlist import names_no_host
 from messagefoundry.keywrap import KeyWrapRefused, refuse_weak_key_wrap
 from messagefoundry.odbc_call_gate import (
     CallGate,
@@ -120,7 +123,17 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
-from messagefoundry.redaction import prints_a_codec_error, safe_exc, safe_text
+from messagefoundry.redaction import (
+    args_hold_a_message,
+    is_a_sqlite_error,
+    known_driver_error,
+    prints_a_codec_error,
+    raised_by_a_driver,
+    safe_exc,
+    safe_text,
+    sqlite_errorname_of,
+    sqlstate_text,
+)
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -257,7 +270,8 @@ def _build_dsn(
 
     It refuses settings under which the driver might not read ``SERVER={server},{port}`` as one
     host and its port (:func:`~messagefoundry.transports.db_endpoint.sqlserver_preset_refusal`,
-    BACKLOG #4873).
+    BACKLOG #4873), and a ``server`` that :func:`~messagefoundry.hostlist.names_no_host` reads,
+    whatever the posture or declaration (BACKLOG #5512).
 
     Quoting and the TLS tail: :mod:`messagefoundry.odbc_dsn` (BACKLOG #3714). It sends no
     ``ServerCertificate`` pin. A weakened TLS posture is **refused** (:func:`_weakened_tls_permitted`,
@@ -277,11 +291,27 @@ def _build_dsn(
     actually refuses a write is the privilege of the account this DSN dials, which only the operator
     can set (``docs/CONNECTIONS.md``, BACKLOG #1574)."""
     where = hop_name_prefix(connection)
+    # BACKLOG #5512: `str(None)` is the host name `None`, which no check below reads as unnamed,
+    # and the DatabaseRef path has no required-setting check ahead of this build.
+    if s.get("server", "") is None:
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
+        )
     refusal = sqlserver_preset_refusal(s)
     if refusal is not None:
         raise ValueError(f"{where}DATABASE {refusal}")
+    # BACKLOG #5512: after the preset's refusals, so a value holding a comma keeps their remedy,
+    # and before the weakened-TLS check, at every posture, as on the generic dialect. `,{port}` is
+    # added to whatever `server` holds, so one that names no host reaches the driver as
+    # `SERVER=,1433`. No declaration speaks for a hop with no named destination.
+    if names_no_host(str(s.get("server", ""))):
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
+        )
     encrypt = bool_setting(s, "encrypt", default=True)
-    trust = bool(s.get("trust_server_certificate", False))
+    # Strict: bool("false") is True, so on an attested hop "false" sent TrustServerCertificate=yes
+    # (vault BACKLOG #3234).
+    trust = flag_from_settings(s, "trust_server_certificate")
     if (trust or not encrypt) and not _weakened_tls_permitted(attested=attested):
         raise ValueError(
             f"{where}DATABASE connection TLS is weakened "
@@ -986,9 +1016,15 @@ def _windows_path_verdict(
         try:
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
-            if getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+            winerror = getattr(exc, "winerror", None)
+            if winerror in _WINDOWS_UNREACHABLE:
                 raise _LeavesHost("the path is on a share Windows could not reach") from None
-            raise _PathEnds from None
+            if isinstance(exc, NotADirectoryError) or winerror in _MISSING_WINERRORS:
+                raise _PathEnds from None
+            # Another not-found code, at least 161 or 206, may come from a name that is there,
+            # so the walk stops on it with a cause, as on any read it could not make.
+            stopped_unread = True
+            raise
         except OSError as exc:
             # windows_chain ends the walk here with a cause the verdict below reads as None. Only
             # a failure the system reported counts as unread, not _win_probe's own refusal of a
@@ -1029,15 +1065,36 @@ def _windows_path_verdict(
     return False
 
 
+#: The setting whose path a walk is judging, naming the connection and the keyword in its
+#: caller's spelling (:func:`judging_file_keyword`), or ``None`` outside such a judgement.
+_JUDGED_SETTING: ContextVar[str | None] = ContextVar("database_judged_setting", default=None)
+
+
+@contextlib.contextmanager
+def judging_file_keyword(setting: str) -> Iterator[None]:
+    """Name ``setting`` on every line :func:`_not_cleared` logs inside the block, so the WARNING
+    says which connection and keyword it is about (vault BACKLOG #5197, engine PR 2738 finding 3).
+    ``setting`` names no path."""
+    token = _JUDGED_SETTING.set(setting)
+    try:
+        yield
+    finally:
+        _JUDGED_SETTING.reset(token)
+
+
 def _not_cleared(kind: str, detail: object) -> None:
     """Log why the walk did not clear a file keyword path, or what it found leads off the host:
     ``kind``, which names no path, at WARNING, so the operator who meets the refusal sees a reason,
     and ``detail``, which can name the path, at DEBUG only (``docs/PHI.md``; vault BACKLOG #5197
-    item 22)."""
+    item 22). Inside :func:`judging_file_keyword`, both lines name the setting it was given."""
+    setting = _JUDGED_SETTING.get()
+    about = f" for {setting}" if setting else ""
     logger.warning(
-        "DATABASE file keyword path not cleared: %s (the path, if any, is logged at DEBUG)", kind
+        "DATABASE file keyword path not cleared%s: %s (the path, if any, is logged at DEBUG)",
+        about,
+        kind,
     )
-    logger.debug("DATABASE file keyword path not cleared: %s", detail)
+    logger.debug("DATABASE file keyword path not cleared%s: %s", about, detail)
 
 
 #: A link target :func:`is_remote_spelling` matches that :func:`_windows_path_verdict` does not
@@ -1160,8 +1217,9 @@ def _refuse_remote_paths(
     verdicts: dict[str, FileVerdicts] = {}
     for name in sorted(_ODBC_PATH_KEYS & named.keys()):
         value = named[name]
-        verdicts[name] = file_keyword_verdicts(value)
-        _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
+        with judging_file_keyword(f"{hop_name_prefix(connection)}odbc_params {name}"):
+            verdicts[name] = file_keyword_verdicts(value)
+            _refuse_remote_path(value, verdicts[name], name=name, connection=connection)
     return verdicts
 
 
@@ -1250,7 +1308,7 @@ def _capath_folder_clear(folder: str) -> bool:
                 # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
                 _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
                 return False
-            if isinstance(exc, FileNotFoundError) and winerror not in _CAPATH_MISSING_WINERRORS:
+            if isinstance(exc, FileNotFoundError) and winerror not in _MISSING_WINERRORS:
                 # CPython raises other Windows codes as not found too, at least 161
                 # ERROR_BAD_PATHNAME and 206 ERROR_FILENAME_EXCED_RANGE, where a folder may be
                 # there. Nothing in it was judged, so it is refused as an unlistable folder is.
@@ -1401,10 +1459,18 @@ _WINDOWS_INVALID_NAME = 123
 #: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
 #: CPython raises as ``FileNotFoundError`` though a file may be there.
 _WINDOWS_UNREACHABLE = frozenset({53, 67})
-#: The not-found answers at an ``sslcapath`` folder's open that mean no folder is there
-#: (:func:`_capath_folder_clear`): 2 ``ERROR_FILE_NOT_FOUND`` and 3 ``ERROR_PATH_NOT_FOUND``, and
-#: ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT is off Windows.
-_CAPATH_MISSING_WINERRORS = frozenset({None, 2, 3})
+#: The not-found answers that mean no file or folder is there: 2 ``ERROR_FILE_NOT_FOUND`` and 3
+#: ``ERROR_PATH_NOT_FOUND``, and ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT
+#: is off Windows. Read at an ``sslcapath`` folder's open (:func:`_capath_folder_clear`), by the
+#: walk's probe (:func:`_windows_path_verdict`) and at a driver file's read
+#: (:func:`_names_no_file`). CPython raises other Win32 codes as ``FileNotFoundError`` too, at
+#: least 15, 18, 161 and 206, and none of those is read as a missing name where CPython sets the
+#: code. A failure it raises with no ``winerror`` counts as ``None`` whatever caused it, at least
+#: an ``os.open`` on Windows, which reports through the C runtime's errno. Measured on Windows 11
+#: with CPython 3.14 (vault BACKLOG #5197): ``lstat`` and ``scandir`` gave only 2 or 3 for at least a
+#: missing file, a missing folder, a path through a file, a drive letter with no volume, a missing
+#: volume GUID and a missing ``\\?\GLOBALROOT`` device.
+_MISSING_WINERRORS = frozenset({None, 2, 3})
 #: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
 #: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
 #: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
@@ -1434,6 +1500,9 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: on a directory too. This set judges the file's own ``stat``. Before it, the
 #: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
 #: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
+#: The walk's probe also reads the file's own name, and refuses there a not-found code other than
+#: 2 and 3 (:data:`_MISSING_WINERRORS`, vault BACKLOG #5197), so 15, 161 and 206 are left here only
+#: when the ``stat`` meets one the walk's probe did not.
 _LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
 
 
@@ -1699,7 +1768,8 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
     """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
     what = "root certificate file"
     unread: dict[str, str] = {}
-    verdicts = file_keyword_verdicts(path, unread)
+    with judging_file_keyword(setting):
+        verdicts = file_keyword_verdicts(path, unread)
     if names_another_host(path, verdicts):
         cause = unread.get(path.strip())
         if cause is not None and True not in verdicts.values():
@@ -1753,7 +1823,11 @@ def _driver_file_spellings(
     value = named.get(keyword)
     if not _sent_text(value):
         return
-    given = file_keyword_verdicts(value) if verdicts is None else verdicts[keyword]
+    if verdicts is None:
+        with judging_file_keyword(setting):
+            given = file_keyword_verdicts(value)
+    else:
+        given = verdicts[keyword]
     if names_another_host(value, given):
         raise error(
             f"{setting}: the {what} is not a plain local path on this host, so it was not read "
@@ -1878,16 +1952,20 @@ def _names_no_file(exc: OSError) -> bool:
     """Whether a failure to read one spelling of a driver file says no file is there, so the
     driver cannot load it either, rather than that a file is there the engine cannot check.
 
-    A missing name counts, unless Windows reports it for a share it could not reach (53 and 67,
-    as :mod:`messagefoundry.config.key_file_access` reads them): the driver may reach that file
-    at a later connect. So does Windows' ``ERROR_INVALID_NAME``, a padded path for one, and only
+    A missing name counts: :data:`_MISSING_WINERRORS`, or ENOENT off Windows. Another code
+    Windows raises as not found does not (vault BACKLOG #5197): 53 and 67, a share it could not
+    reach (as :mod:`messagefoundry.config.key_file_access` reads them), where the driver may reach
+    that file at a later connect, and at least 161 and 206, which may come from a file that is
+    there. That holds only where the failure carries its ``winerror``: an ``os.open`` failure
+    carries none on Windows, so any not-found it raises counts as a missing name, as on main.
+    Windows' ``ERROR_INVALID_NAME`` counts too, a padded path for one, and only
     by that Win32 code: CPython maps every Win32 error it has no errno for to EINVAL, so testing
     errno would leave a real read failure unchecked. On POSIX an EINVAL is refused too, even from
     a filesystem that rejects a padded spelling with it, because errno cannot tell that from a
     failed read; that refuses the build rather than check the trimmed spelling."""
     winerror = getattr(exc, "winerror", None)
     if isinstance(exc, FileNotFoundError):
-        return winerror not in _WINDOWS_UNREACHABLE
+        return winerror in _MISSING_WINERRORS
     return winerror == _WINDOWS_INVALID_NAME
 
 
@@ -1940,7 +2018,9 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
     Every value must be printable ASCII (STORE-5 injection guard). ``database``, ``username`` and
     every ``odbc_params`` value are sent WITHOUT braces (:func:`_odbc_literal`, BACKLOG #2705), so
     they refuse at least ``;``, ``{``, ``}``, ``=``, a quote, an empty or blank value and a leading
-    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, an
+    or trailing space. ``server`` and every ``odbc_params`` value also refuse ``None``, a ``server``
+    that :func:`~messagefoundry.hostlist.names_no_host` reads is refused whatever the
+    posture or declaration (BACKLOG #5512), an
     ``odbc_params`` value refuses a boolean, and ``sslmode`` takes only the spellings
     :func:`_refuse_unread_sslmode` accepts for the driver. ``odbc_driver`` is braced and
     refuses ``;``, ``{`` and ``}``, and must be on the generic driver allowlist. ``password`` is
@@ -1975,6 +2055,12 @@ def _build_odbc_dsn(s: dict[str, Any], *, connection: str | None = None) -> str:
         raise ValueError(
             f"{where}DATABASE server must not contain ';', '{{', '}}', '=', a quote, a control "
             "character or a non-ASCII character (ODBC injection risk)"
+        )
+    # BACKLOG #5512: here and not in the cleartext guard, which stands down on a TLS mode. Neither
+    # tls_hop_attested nor cleartext_accepted can speak for a hop with no named destination.
+    if names_no_host(server):
+        raise InsecureHopRefused(
+            f"{where}DATABASE server names no host; name the host to connect to"
         )
     # The driver name stays braced: names hold spaces and parentheses, and no probe found a driver
     # manager that reads a braced DRIVER wrongly. The delimiters are still refused, not escaped.
@@ -2195,19 +2281,21 @@ def _build_connection(
     meant "this hop is safe" — it means "this preset's TLS keywords are not what governs it". The
     generic arm's own refusal is :func:`generic_cleartext_hop_guard`, called by the connectors beside
     this dispatcher rather than from inside it, so a direct DSN-shape caller (tests, checks) still gets
-    a string back without a hop decision it did not ask for.
+    a string back without a hop decision it did not ask for. The exception is a generic ``server``
+    that :func:`~messagefoundry.hostlist.names_no_host` matches, which
+    :func:`_build_odbc_dsn` refuses at every posture (BACKLOG #5512).
 
-    ``connection`` names the declaring connection in that WARNING (#333); it is used on the generic path
-    only, since the SQL Server preset refuses rather than warns."""
+    ``connection`` names the declaring connection. On the generic path it names that WARNING (#333).
+    On the SQL Server arm it is passed to :func:`_build_dsn`, which uses it to name its refusals and
+    the WARNING it logs when an attested weakened hop is permitted."""
     dialect = str(s.get("dialect", "sqlserver")).lower()
     if dialect == "sqlserver":
-        weakened = bool(s.get("trust_server_certificate", False)) or not bool_setting(
+        # After _build_dsn, so its server-shape refusals still come before a flag refusal.
+        dsn = _build_dsn(s, read_only=read_only, attested=attested, connection=connection)
+        weakened = flag_from_settings(s, "trust_server_certificate") or not bool_setting(
             s, "encrypt", default=True
         )
-        return (
-            _build_dsn(s, read_only=read_only, attested=attested, connection=connection),
-            weakened,
-        )
+        return dsn, weakened
     if dialect == "generic":
         return _build_odbc_dsn(s, connection=connection), False
     raise ValueError(f"DATABASE dialect must be 'sqlserver' or 'generic', got {dialect!r}")
@@ -2668,7 +2756,25 @@ def _driver_code(message: str) -> str | None:
     return str(found[-1]) if found else None
 
 
-def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False) -> DeliveryError:
+def _send_refusal(sqlstate: str | None, exc: BaseException) -> DeliveryError:
+    """A destination send's error for ``exc``: :func:`_classify_db_error` for a SQLSTATE, and for
+    a ``UnicodeEncodeError`` with none a permanent rejection naming its type alone. A parameter
+    the driver's codec cannot encode fails on this message's data, not on the code, so it is
+    dead-lettered rather than raised as an internal error, as it was on main for a codec whose name
+    read as a SQLSTATE (vault BACKLOG #1661, added item 2). A ``UnicodeDecodeError``, text the
+    driver returned, is not this message's, and the caller raises it as an internal error."""
+    if sqlstate is not None:
+        return _classify_db_error(sqlstate, str(exc), shown=_shown_state(sqlstate, exc))
+    return NegativeAckError(
+        f"database driver could not encode the message's text ({type(exc).__name__})",
+        code="db",
+        permanent=True,
+    )
+
+
+def _classify_db_error(
+    sqlstate: str, message: str, *, shown: str | None, connecting: bool = False
+) -> DeliveryError:
     """Map a DB error's SQLSTATE to a transient :class:`DeliveryError` (retry) or a permanent
     :class:`NegativeAckError` (dead-letter), with **PHI-free** text.
 
@@ -2687,56 +2793,116 @@ def _classify_db_error(sqlstate: str, message: str, *, connecting: bool = False)
     (``Key (mrn)=(...) already exists``) — and the returned error is persisted to ``queue.last_error``
     and ``message_events.detail`` and rendered into the ``connection_error`` alert, so interpolating
     it would carry a partner's identifier into all three on a first deployment. The same rule the
-    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows."""
-    code = _driver_code(message)
-    detail = f"[{sqlstate}]" + (f" driver error {code}" if code else "")
+    ``db_lookup`` arm already follows: name the SQLSTATE, never the statement, params or rows.
+
+    ``shown`` is what the text and ``code`` name, :func:`_shown_state`'s answer for the error,
+    which says when a state may be named; ``sqlstate`` classifies the error and is not printed
+    (vault BACKLOG #1661, engine PR 3163). ``None`` or empty, at least for an error that is no
+    driver's or whose state was read from asyncpg's message, still classifies the error, but the
+    text and ``code`` name neither a state nor a native number read from ``message``."""
+    code = _driver_code(message) if shown else None
+    detail = (f"[{shown}]" if shown else "[SQLSTATE withheld]") + (
+        f" driver error {code}" if code else ""
+    )
+    sqlstate_code = shown or "db"
     if _is_transient(sqlstate):
         return DeliveryError(f"database transient error {detail}")
     if connecting:
         if sqlstate[:2] in _CREDENTIAL_PREFIXES:
             return NegativeAckError(
                 f"database refused the login {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 credential_fault=True,
             )
         if sqlstate[:2] in _CONFIG_PREFIXES or sqlstate in _CONFIG_STATES:
             return NegativeAckError(
                 f"database connection refused by its configuration {detail}",
-                code=sqlstate,
+                code=sqlstate_code,
                 permanent=True,
                 config_fault=True,
             )
         return DeliveryError(f"database connect failed {detail}")
     return NegativeAckError(
         f"database rejected the statement {detail}",
-        code=sqlstate or "db",
+        code=sqlstate_code,
         permanent=True,
     )
 
 
 def _sqlstate(exc: BaseException) -> str | None:
-    """The 5-character SQLSTATE a DB driver error carries in ``args[0]`` (pyodbc/aioodbc), or ``None``
-    if ``exc`` isn't shaped like a DB error — letting a genuine bug propagate as an internal error
-    rather than being misread as a transport failure."""
-    args = getattr(exc, "args", ())
-    if args and isinstance(args[0], str) and len(args[0]) == 5 and args[0].isalnum():
-        return args[0]
-    return None
+    """The 5-character SQLSTATE ``exc`` carries in ``args[0]``, the shape pyodbc/aioodbc's error
+    has, or ``None`` if ``exc`` isn't shaped like a DB error, letting a genuine bug propagate as an
+    internal error rather than being misread as a transport failure. It CLASSIFIES the failure, by
+    shape: a non-driver error shaped like one, such as ``KeyError('MRN42')``, is classified the same
+    way, but its state may be a value, so only a driver's own error names it in text
+    (:func:`_shown_state`; vault BACKLOG #1661, engine PR 3150 finding 1). Never for a
+    ``UnicodeError``, whose first argument is the codec name, nor for a SQLite error, whose
+    ``args[0]`` is its message. An asyncpg error is classified by the same shape, though its
+    ``args[0]`` is its message; for one, :func:`_shown_state` names a state only from the error's
+    own ``sqlstate`` attribute, and only when that equals the state read. What this returns is an
+    exact ``str`` copy (:func:`~messagefoundry.redaction.sqlstate_text`). It reads no attribute but
+    ``args``, with ``getattr`` and a default, and reads the class with ``type()``, since
+    ``isinstance`` falls back to ``exc.__class__``, which a class can define to raise (engine PR
+    3163). That is a bound, not a guarantee that it never raises: an ``args`` that raises other
+    than ``AttributeError`` when read, or a tuple subclass whose item read raises, propagates, and
+    a caller that runs it before its cleanup skips that cleanup."""
+    if issubclass(type(exc), UnicodeError) or is_a_sqlite_error(exc):
+        return None
+    return _shaped_state(getattr(exc, "args", ()))
 
 
 def _log_sqlstate(exc: BaseException) -> str | None:
-    """The SQLSTATE a log line may name for ``exc``, or ``None`` when it is not read as a driver
-    error: asyncpg's ``sqlstate`` attribute, else :func:`_sqlstate`'s ``args[0]``.
-
-    Never for a ``UnicodeError`` or an exception that holds one. ``UnicodeEncodeError``'s first
-    argument is the codec name, and ``ascii`` is five alphanumerics, so it would read as one."""
-    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+    """:func:`_sqlstate`, read first from asyncpg's ``sqlstate`` attribute when that is a SQLSTATE,
+    for the arms that classify an error a PostgreSQL store's driver may raise. Past an attribute
+    that is absent, None or no SQLSTATE it reads ``args[0]`` by shape, as :func:`_sqlstate` does,
+    an asyncpg error's included, whose ``args[0]`` is its message; for one, :func:`_shown_state`
+    names a state only from the error's own ``sqlstate`` attribute, and only when that equals the
+    state read. What this returns is an exact ``str`` copy
+    (:func:`~messagefoundry.redaction.sqlstate_text`), the attribute's or ``args[0]``'s. Never
+    for a ``UnicodeError`` or an exception that holds one, whose text a codec name can make read
+    like a SQLSTATE. Like :func:`_sqlstate`, it classifies, and reads the class with ``type()``;
+    :func:`_shown_state` says what text names."""
+    if issubclass(type(exc), UnicodeError) or is_a_sqlite_error(exc) or prints_a_codec_error(exc):
         return None
-    state = getattr(exc, "sqlstate", None)
-    if isinstance(state, str) and len(state) == 5 and state.isalnum():
-        return state
-    return _sqlstate(exc)
+    state = sqlstate_text(getattr(exc, "sqlstate", None))
+    return state if state is not None else _shaped_state(getattr(exc, "args", ()))
+
+
+def _shaped_state(args: object) -> str | None:
+    """``args[0]`` as :func:`~messagefoundry.redaction.sqlstate_text` returns it, when ``args`` is
+    a tuple whose first item reads like a SQLSTATE."""
+    return sqlstate_text(args[0] if isinstance(args, tuple) and args else None)
+
+
+def _shown_state(state: str | None, exc: BaseException) -> str | None:
+    """``state`` as text may name it: a driver's own error's SQLSTATE, and ``None`` for any other
+    error's, whose first argument may be a value such as ``KeyError('MRN42')``'s (engine PR 3150,
+    finding 1). The failure is still classified by ``state``; only its text is withheld. A class
+    whose driver test raises names nothing (:func:`~messagefoundry.redaction.known_driver_error`).
+    Nor does an asyncpg error whose ``state`` is not its ``sqlstate`` attribute: that state was
+    read from ``args[0]``, which is asyncpg's message, such as ``MRN42``
+    (:func:`~messagefoundry.redaction.args_hold_a_message`). An attribute that raises when read or
+    compared names nothing.
+
+    What it returns is an exact ``str`` copy of a SQLSTATE's data
+    (:func:`~messagefoundry.redaction.sqlstate_text`), never a ``str`` subclass, whose
+    ``__str__`` could print a value however its data reads (engine PR 3163): for an asyncpg
+    error, a copy of the ``sqlstate`` attribute it vetted, and for any other driver's, a copy of
+    ``state``."""
+    if state is None or not known_driver_error(exc):
+        return None
+    if not args_hold_a_message(exc):
+        return sqlstate_text(state)
+    try:
+        attribute = sqlstate_text(getattr(exc, "sqlstate", None))
+        # Compared by str's own method on the exact copy: ``==`` would run a str subclass's
+        # reflected __eq__ in ``state`` first, and that could say yes to anything.
+        if attribute is not None and str.__eq__(attribute, state) is True:
+            return attribute
+    except Exception:  # noqa: BLE001 - an unreadable attribute names nothing, as the docstring says
+        return None
+    return None
 
 
 def _connection_lost(exc: BaseException | None) -> bool:
@@ -2763,38 +2929,19 @@ def _connection_lost(exc: BaseException | None) -> bool:
     return False
 
 
-#: Driver packages whose errors :func:`_raised_by_a_driver` counts though the package has no DB-API
-#: ``apilevel``: asyncpg, the PostgreSQL store's driver, whose handler-failure arm meets it.
-_NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
-
-
-def _raised_by_a_driver(exc: BaseException) -> bool:
-    """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
-    a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
-    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
-    builtin exception a driver raises does not count, though its cause chain is withheld under a
-    driver error that holds it (:func:`_redacted_copy`)."""
-    for kind in type(exc).__mro__:
-        parts = kind.__module__.split(".")
-        if parts[0] in _NON_DBAPI_DRIVERS:
-            return True
-        for depth in range(1, len(parts) + 1):
-            module = sys.modules.get(".".join(parts[:depth]))
-            if getattr(module, "apilevel", None) == "2.0":
-                return True
-    return False
-
-
-#: SQLite's own name for a result code, as ``sqlite3`` sets ``sqlite_errorname``: a fixed word
-#: such as ``SQLITE_CONSTRAINT_UNIQUE``, never a value.
-_SQLITE_ERRORNAME_RE = re.compile(r"SQLITE_[A-Z_]{1,40}")
+#: :func:`~messagefoundry.redaction.raised_by_a_driver`, the one test of a driver's error that
+#: this module and the log chain's traceback both read (vault BACKLOG #1661, added item 3). A
+#: builtin exception a driver raises does not count, though its cause chain is withheld under a
+#: driver error that holds it (:func:`_redacted_copy`).
+_raised_by_a_driver = raised_by_a_driver
 
 
 def _withheld(exc: BaseException) -> str:
-    """A driver error with no SQLSTATE: its type, and SQLite's result-code name when it has one,
-    since SQLite has no SQLSTATE and that name is its only PHI-free diagnostic."""
-    name = getattr(exc, "sqlite_errorname", None)
-    code = f" {name}" if isinstance(name, str) and _SQLITE_ERRORNAME_RE.fullmatch(name) else ""
+    """``<type> [driver message withheld]``, for a driver error with no SQLSTATE or a link held
+    under one, with SQLite's result-code name inside the brackets when it has one, since SQLite has
+    no SQLSTATE and that name is its only PHI-free diagnostic."""
+    name = sqlite_errorname_of(exc)
+    code = f" {name}" if name is not None else ""
     return f"{type(exc).__name__} [driver message withheld{code}]"
 
 
@@ -2809,17 +2956,24 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     identifier in the middle rather than removing it. asyncpg's errors, from a PostgreSQL store,
     count too: their ``str()`` appends a ``DETAIL`` that quotes the key. A driver error with no
     SQLSTATE (:func:`_raised_by_a_driver`), such as asyncpg's client-side ``DataError``, which quotes
-    the argument it could not encode, renders as its type alone (engine PR 2658, finding 4). Anything
-    else with no SQLSTATE keeps the ``safe_exc`` rendering, which is the more useful text for a bug or
-    an unreachable host, unless ``withhold`` says it is held by a driver error, as a link of its
-    chain (:func:`_redacted_copy`). That is a bound, not a guarantee: an error a driver raises as a
-    builtin type, or wraps in another library's, is printed as ``safe_exc`` prints it.
+    the argument it could not encode, renders as ``<type> [driver message withheld]``, with SQLite's
+    result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
+    4). Under ``withhold``, which says ``exc`` is held by a driver error as a link of its chain
+    (:func:`_redacted_copy`), an error no driver raised renders as ``<type> [driver message
+    withheld]`` before any state is read. Otherwise, an error whose state :func:`_shown_state`
+    does not name renders as ``<type> [message withheld]``: at least an error that is no known
+    driver's own, a class whose driver test raises, and an asyncpg error whose state was read from
+    its message; and anything else with no SQLSTATE keeps the ``safe_exc``
+    rendering, which is the more useful text for a bug or an unreachable host. That is a bound,
+    not a guarantee:
+    an error a driver raises as a builtin type with any other arguments, or wraps in another
+    library's, is printed as ``safe_exc`` prints it.
 
-    Under ``withhold``, only a driver's own error may name a SQLSTATE: any other link renders as
-    its type alone, since ``args[0]`` of five letters or digits may be a value.
+    Only a driver's own error names a SQLSTATE (:func:`_shown_state`), since ``args[0]`` of five
+    letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
-    ``withhold``, its type alone, so this never prints a codec error's text;
+    ``withhold``, ``<type> [driver message withheld]``, so this never prints a codec error's text;
     ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an
@@ -2831,18 +2985,27 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
+        shown = _shown_state(state, exc)
+        if shown is None:  # its arguments may carry a value: name no state
+            return f"{type(exc).__name__} [message withheld]"
         code = _driver_code(str(exc))
     except Exception as failure:  # noqa: BLE001 - see docstring
         return (
             f"{type(exc).__name__} [message withheld: {type(failure).__name__} while rendering it]"
         )
-    return f"{type(exc).__name__} [{state}]" + (f" driver error {code}" if code else "")
+    return f"{type(exc).__name__} [{shown}]" + (f" driver error {code}" if code else "")
 
 
 class RedactedDbError(Exception):
     """Stands in for one exception of a logged chain: the original's frames, and
     :func:`_poll_log_line`'s line as its message (BACKLOG #1661, #5348). Never raised. Unprefixed because
     its name prints on every line it stands in for."""
+
+
+class RedactedDbErrorGroup(ExceptionGroup[RedactedDbError], RedactedDbError):
+    """:class:`RedactedDbError` for an exception group: its members are their own copies, so the
+    traceback prints each member's frames and line, as it prints the original's (vault BACKLOG
+    #1661, added item 6). Never raised."""
 
 
 def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
@@ -2855,7 +3018,8 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
     The record then takes the logging chain's own path: ``prepare_log_record`` renders it into
     ``exc_text`` with the stdlib's walker, and the control-character scrub keeps its line breaks.
 
-    What the copy loses: an exception group's members, any ``__notes__``, the stdlib's extra hints
+    An exception group is copied as a :class:`RedactedDbErrorGroup` holding its members' copies.
+    What the copy loses: any ``__notes__``, the stdlib's extra hints
     (``Did you mean``, a ``SyntaxError``'s location), each link's module name, and the text of
     every link :func:`_poll_log_line` withholds; ``safe_exc``'s 200-character bound applies to
     every non-driver line it keeps, and :data:`_ENGINE_TEXT_LIMIT` to the engine's fixed text.
@@ -2883,9 +3047,19 @@ def _redacted_copy(
     found = made.get(id(exc))
     if found is not None:
         return found
-    copy = RedactedDbError(_poll_log_line(exc, under=under)).with_traceback(exc.__traceback__)
-    made[id(exc)] = copy
+    line = _poll_log_line(exc, under=under)
     below = under or _raised_by_a_driver(exc)
+    members = exc.exceptions if isinstance(exc, BaseExceptionGroup) else ()
+    if members:
+        # A group's members exist before the group does, so a member whose chain leads back to the
+        # group meets this stand-in, which closes the cycle with the group's line and frames.
+        made[id(exc)] = RedactedDbError(line).with_traceback(exc.__traceback__)
+        copies = [_redacted_copy(member, made, under=below) for member in members]
+        copy: RedactedDbError = RedactedDbErrorGroup(line, copies)
+    else:
+        copy = RedactedDbError(line)
+    copy = copy.with_traceback(exc.__traceback__)
+    made[id(exc)] = copy
     if exc.__cause__ is not None:
         copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
@@ -2912,10 +3086,9 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     bug's message included; the frames still locate it, and their source lines still print. An
     error with no arguments has no text to
     withhold and is named by its type alone. It never raises: a link whose classification raises
-    is named by its type and a fixed note. A failure in :func:`_redacted_copy`'s own driver test
-    on that link still falls to :func:`_safe_db_exc_info`'s whole-chain fallback."""
+    is named by its type and a fixed note."""
     try:
-        if under or _log_sqlstate(exc) is not None or _raised_by_a_driver(exc):
+        if under or _raised_by_a_driver(exc):
             return _safe_db_error(exc, withhold=under)
         if isinstance(exc, _ENGINE_FIXED_TEXT):
             return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
@@ -3023,7 +3196,8 @@ class AutocommitNotConfirmed(RuntimeError):
 
     The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
     on it until a later borrow has set the mode. A setter that raises a driver error raises that
-    error instead, and its connection goes back unconfirmed the same way. The text names neither
+    error instead, and its connection goes back unconfirmed the same way, unless the error is a
+    connection failure (class 08), which discards it (BACKLOG #5748). The text names neither
     the DSN nor the server."""
 
 
@@ -3045,7 +3219,9 @@ _ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
 _ENGINE_TEXT_LIMIT = 400
 
 
-def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
+def _thread_settled[T](
+    fn: Callable[[], T], *, gate: CallGate | None = None, pool: Any = None
+) -> asyncio.Future[T]:
     """Run ``fn`` on a worker thread and return a future that the THREAD resolves, once ``fn`` has
     returned or raised.
 
@@ -3059,8 +3235,15 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
     runs beside another pyodbc call on the connection. When a call is running there, as after a
     cancelled ``execute``, ``fn`` is handed to that call, which runs it on its own thread as it
     returns. So no second thread waits for a statement that may have no timeout. Otherwise ``fn``
-    goes to a worker thread through the gate, as before."""
+    goes to a worker thread through the gate, as before.
+
+    **With ``pool``, that worker thread is the pool's own executor** (:func:`_make_pool`, BACKLOG
+    #5756), so a hung close or set holds a thread of that pool, never one of the event loop's
+    default executor. A pool with no tracked executor, and no ``pool``, use the default one. A
+    pool's executor is shut down once a close of the pool has ended, and a call submitted after
+    that raises ``RuntimeError`` here, as one on a shut-down default executor does."""
     loop = asyncio.get_running_loop()
+    executor = None if pool is None else _tracked(_POOL_EXECUTORS, pool)
     settled: asyncio.Future[T] = loop.create_future()
 
     def _resolve(value: T | None, error: BaseException | None) -> None:
@@ -3090,9 +3273,9 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
             )
 
     if gate is None:
-        loop.run_in_executor(None, _work)
+        loop.run_in_executor(executor, _work)
     elif not gate.run_after_running_call(_work):
-        loop.run_in_executor(None, partial(gate.run, _work))
+        loop.run_in_executor(executor, partial(gate.run, _work))
     return settled
 
 
@@ -3155,7 +3338,9 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
     worker thread can still be using ``conn`` (the rule :func:`_return_when_settled` enforces).
     Never raises: the caller, if any, is already raising its own reason.
 
-    A connection whose autocommit was not confirmed is returned, not closed. It is not marked
+    A connection whose autocommit was not confirmed is returned, not closed; a caller whose set
+    failed with a connection failure calls :func:`_discard_to_pool` instead (BACKLOG #5748), since
+    this function never discards. It is not marked
     confirmed, so its next borrow sets autocommit again before any statement runs on it, and refuses
     again if the driver still rejects the set. Closing it would add nothing to that rule, and
     aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot.
@@ -3301,7 +3486,34 @@ async def _return_held(pool: Any, conn: Any) -> None:
         _settle_held(pool)
 
 
-def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: str) -> None:
+async def _discard_to_pool(pool: Any, conn: Any) -> None:
+    """Close ``conn``, whose handle is presumed dead, and give it back to ``pool`` closed (BACKLOG
+    #5748). Call it only once no worker thread can still be using ``conn``. Never raises an
+    ``Exception``, as :func:`_return_to_pool` never does: the caller, if any, is already raising
+    its own reason, and a failed return is logged as one."""
+    try:
+        await _close_and_release(pool, conn, None, discard=True)
+    except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
+        logger.warning("DATABASE: discarding a pooled connection failed: %s", _safe_db_error(exc))
+
+
+async def _discard_held(pool: Any, conn: Any) -> None:
+    """:func:`_discard_to_pool` for a held-back ``conn``, then take it off the count as
+    :func:`_return_held` does."""
+    try:
+        await _discard_to_pool(pool, conn)
+    finally:
+        _settle_held(pool)
+
+
+def _return_when_settled(
+    pool: Any,
+    conn: Any,
+    work: asyncio.Future[Any],
+    what: str,
+    *,
+    discard_on: Callable[[BaseException], bool] | None = None,
+) -> None:
     """Once ``work`` is done, return ``conn`` to ``pool``, but only if ``work`` ending proves the
     worker thread it waited on has finished with ``conn`` (PR 2593 review).
 
@@ -3317,7 +3529,13 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
     aioodbc that renamed ``_impl``) passes a task, and a CANCELLED task proves nothing: loop
     teardown cancels every task and leaves the thread running. That connection is kept out of the
     pool, and logged. Not closed either, since that is the same crash. It then holds any
-    ``wait_closed`` on its pool, so this fallback is a known cost, logged when it happens."""
+    ``wait_closed`` on its pool, so this fallback is a known cost, logged when it happens.
+
+    **A ``work`` that failed is logged, and one whose failure ``discard_on`` accepts discards the
+    connection rather than returning it** (BACKLOG #5748): by default a connection failure, class
+    08, whose handle is presumed dead (:func:`_connection_lost`). No borrower is left to raise
+    either to."""
+    discards = _connection_lost if discard_on is None else discard_on
 
     def _done(finished: asyncio.Future[Any]) -> None:
         if finished.cancelled():
@@ -3327,6 +3545,22 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
                 what,
             )
             return
+        failure = finished.exception()
+        if failure is not None and discards(failure):
+            logger.warning(
+                "DATABASE: %s failed after its borrower left (%s); the connection is discarded "
+                "rather than returned to its pool",
+                what,
+                _safe_db_error(failure),
+            )
+            _detach(_discard_held(pool, conn))
+            return
+        if failure is not None:
+            logger.warning(
+                "DATABASE: %s failed after its borrower left (%s); the connection goes back",
+                what,
+                _safe_db_error(failure),
+            )
         _detach(_return_held(pool, conn))
 
     _hold_back(pool)
@@ -3407,11 +3641,13 @@ class _AutocommitPool:
             return conn
         try:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
-            # if the default executor is already shut down, and neither starts a thread then.
+            # if the pool's executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
             # Through the gate (BACKLOG #2394): the set uses the raw handle, which aioodbc's gated
             # _execute never sees.
-            work = _thread_settled(partial(_set_and_read_autocommit, raw), gate=call_gate(conn))
+            work = _thread_settled(
+                partial(_set_and_read_autocommit, raw), gate=call_gate(conn), pool=self._pool
+            )
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -3422,8 +3658,13 @@ class _AutocommitPool:
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
                 # Returned open, not closed: a close here is itself a worker-thread call that a
                 # cancellation could abandon, and a driver error on a set does not leave a
-                # transaction open the way a failed rollback can (BACKLOG #5010).
-                await _return_to_pool(self._pool, conn)
+                # transaction open the way a failed rollback can (BACKLOG #5010). A connection-class
+                # failure (class 08) is the exception: that handle is presumed dead, so it is
+                # closed rather than lent again, as every other borrow site does (BACKLOG #5748).
+                if _connection_lost(exc):
+                    await _discard_to_pool(self._pool, conn)
+                else:
+                    await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
                 # be inside the setter. Settled when the thread resolves ``work``, never sooner,
@@ -3444,7 +3685,8 @@ class _AutocommitPool:
     def _settle_detached(self, conn: Any, work: asyncio.Future[bool]) -> None:
         """Settle ``conn`` once the thread has resolved a set its borrower abandoned: marked
         confirmed and returned if it passed, otherwise logged (no borrower is left to raise to,
-        CLAUDE.md section 6) and returned unconfirmed, so its next borrow sets it again. A done
+        CLAUDE.md section 6) and returned unconfirmed, so its next borrow sets it again, or
+        discarded when the set failed with a connection failure (BACKLOG #5748). A done
         callback, so it never raises. ``work`` is a :func:`_thread_settled` future, which only
         its thread completes, so this runs only once the setter has returned (PR 2593 review)."""
         if work.cancelled():  # nothing cancels a _thread_settled future; refuse to guess if one is
@@ -3457,6 +3699,14 @@ class _AutocommitPool:
         if failure is None and work.result():
             self._mark_confirmed(conn)
             _detach(_return_held(self._pool, conn))
+            return
+        if failure is not None and _connection_lost(failure):
+            logger.warning(
+                "DATABASE: an abandoned borrow's autocommit set failed with a connection failure "
+                "(%s); the connection is discarded rather than returned to its pool",
+                _safe_db_error(failure),
+            )
+            _detach(_discard_held(self._pool, conn))  # BACKLOG #5748
             return
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
@@ -3563,18 +3813,22 @@ def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None
         return None
 
 
-async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
+async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
     pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
-    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``), on the loop
-    with no call running on a connection just lent, as the SQL Server store sets
-    ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
-    connection attribute, so the write is skipped when the connection already holds the value: a
-    connection lent before, and ``0`` on a fresh one.
+    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``). pyodbc's
+    setter also hands the value to the driver as a connection attribute, so the write runs on the
+    pool's own executor, inside the connection's call gate (:func:`_thread_settled`), never on the
+    event loop. The read of the current value is pyodbc's own record of it and stays on the loop.
+    The write is skipped when the connection already holds the value: a connection lent before,
+    and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
+    connection goes back only once the write has returned (:func:`_return_when_settled`), or is
+    discarded if the write then failed with a transient state.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
-    ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
+    ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
+    a ``config_fault`` naming the setting is raised,
     so the lane stops rather than running with a bound the operator believes is set.
 
     **A transient driver state from the setter, class 08 or ``HYT00`` among them, is the
@@ -3598,7 +3852,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
             # call ran on it, and the exception propagates unchanged, as _cursor_refused's does.
             await _return_to_pool(pool, conn)
             raise
-        await _close_and_release(pool, conn, None, discard=True)
+        await _discard_to_pool(pool, conn)
         raise DeliveryError(
             f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
         ) from exc
@@ -3609,21 +3863,59 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     if current == seconds:
         return
     try:
-        raw.timeout = seconds
-    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
-        state = _log_sqlstate(exc)
-        if state is not None and _is_transient(state):
-            await _close_and_release(pool, conn, None, discard=True)
-            raise _classify_db_error(state, str(exc), connecting=True) from exc
+        work = _thread_settled(
+            partial(_set_driver_timeout, raw, seconds), gate=call_gate(conn), pool=pool
+        )
+    except RuntimeError:  # the pool's executor is shut down: no thread started, nothing ran
         await _return_to_pool(pool, conn)
-        raise NegativeAckError(
-            "database driver refused statement_timeout"
-            + (f" [{state}]" if state else f" ({type(exc).__name__})")
-            + "; set statement_timeout = 0 on this connection if it cannot take one",
-            code=state or "db",
-            permanent=True,
-            config_fault=True,
-        ) from exc
+        raise
+    try:
+        await asyncio.wait_for(asyncio.shield(work), timeout)
+    except BaseException as exc:
+        if not (work.done() and isinstance(exc, Exception)):
+            # The borrower left (a cancel, or the bound) while the thread may still be inside the
+            # setter: the connection goes back only once the thread has resolved ``work``, as a
+            # cursor close's does, and is discarded if the write failed as the arm below would.
+            _return_when_settled(
+                pool, conn, work, "a statement_timeout write", discard_on=_transient_driver_error
+            )
+            if isinstance(exc, TimeoutError):
+                raise DeliveryError(
+                    "DATABASE statement_timeout write did not finish within the borrow's "
+                    "acquire_timeout"
+                ) from exc
+            raise
+    failure = work.exception()  # done here; the thread resolved it, so it is never cancelled
+    if failure is None:
+        return
+    state = _log_sqlstate(failure)
+    if state is not None and _is_transient(state):  # _transient_driver_error's test
+        await _discard_to_pool(pool, conn)
+        raise _classify_db_error(
+            state, str(failure), connecting=True, shown=_shown_state(state, failure)
+        ) from failure
+    await _return_to_pool(pool, conn)
+    shown = _shown_state(state, failure)
+    raise NegativeAckError(
+        "database driver refused statement_timeout"
+        + (f" [{shown}]" if shown else f" ({type(failure).__name__})")
+        + "; set statement_timeout = 0 on this connection if it cannot take one",
+        code=shown or "db",
+        permanent=True,
+        config_fault=True,
+    ) from failure
+
+
+def _transient_driver_error(exc: BaseException) -> bool:
+    """Whether ``exc`` carries a SQLSTATE this connector retries (:func:`_is_transient`)."""
+    state = _log_sqlstate(exc)
+    return state is not None and _is_transient(state)
+
+
+def _set_driver_timeout(raw: Any, seconds: int) -> None:
+    """On a worker thread: write ``seconds`` to pyodbc's ``Connection.timeout``, whose setter hands
+    it to the driver (BACKLOG #5756), so a driver slow to take it holds no event-loop time."""
+    raw.timeout = seconds
 
 
 #: Pools already warned that their driver connection has no ``timeout`` (BACKLOG #5756), so the
@@ -3681,7 +3973,7 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    await _apply_statement_timeout(pool, conn)
+    await _apply_statement_timeout(pool, conn, timeout=timeout)
     return conn
 
 
@@ -3700,8 +3992,9 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
     for it, as the store's refusal does not: nothing runs on the connection, so the close can race
     nothing, and the borrow is not held behind a busy executor or a slow disconnect. Where the
-    executor is already shut down, at loop teardown, no thread can take the close, and the handle
-    is freed as this refusal unwinds, on the event loop thread.
+    pool's executor is already shut down, once a close of the pool has ended (or the default
+    executor at loop teardown, for a pool with none tracked), no thread can take the close, and
+    the handle is freed as this refusal unwinds, on the event loop thread.
 
     **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
     no handle to drop, so it is closed through its own ``close()``
@@ -3716,7 +4009,9 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
         raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
         if raw is not None:
             try:
-                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+                asyncio.get_running_loop().run_in_executor(
+                    _tracked(_POOL_EXECUTORS, pool), _close_refused, raw
+                )
             except RuntimeError as exc:  # the executor is shut down; see the docstring
                 logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
         else:
@@ -3762,7 +4057,8 @@ async def _close_cursor(cur: Any) -> None:
     try:
         await cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = False) -> None:
@@ -3860,9 +4156,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         else:
             close = partial(_close_raw_cursor, raw_cur)
         try:
-            work = _thread_settled(close, gate=gate)
+            work = _thread_settled(close, gate=gate, pool=pool)
         except RuntimeError as exc:
-            # The default executor is shut down: no close thread started, so none runs on it.
+            # The executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
             # A dropped handle is left for pyodbc to close when it is collected.
             logger.debug("DATABASE: cursor close not run, executor shut down: %s", exc)
@@ -3870,7 +4166,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
             return
     else:
         work = asyncio.ensure_future(
-            _close_cursor(cur) if dropped is None else _close_cursor_then_drop(cur, dropped, gate)
+            _close_cursor(cur)
+            if dropped is None
+            else _close_cursor_then_drop(cur, dropped, gate, pool)
         )
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
@@ -3891,12 +4189,12 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     await _release(pool, conn)
 
 
-async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None) -> None:
+async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None, pool: Any) -> None:
     """The discard for a cursor with no raw pyodbc cursor: close it through its own ``close()``,
     then close the dropped handle on a worker thread, through the gate. Never raises."""
     await _close_cursor(cur)
     try:
-        closing = _thread_settled(partial(_close_dropped, raw), gate=gate)
+        closing = _thread_settled(partial(_close_dropped, raw), gate=gate, pool=pool)
     except RuntimeError as exc:  # the executor is shut down: pyodbc closes it when collected
         logger.debug("DATABASE: discarded connection not closed, executor shut down: %s", exc)
         return
@@ -3909,7 +4207,8 @@ def _close_raw_cursor(raw_cur: Any) -> None:
     try:
         raw_cur.close()
     except Exception as exc:  # noqa: BLE001 - hygiene only; the caller's outcome always wins
-        logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
+        if logger.isEnabledFor(logging.DEBUG):  # render only a line kept (vault BACKLOG #1661)
+            logger.debug("DATABASE: cursor close failed, ignored: %s", _safe_db_error(exc))
 
 
 def _close_after_a_cancel(conn: Any, raw_cur: Any) -> None:
@@ -4113,7 +4412,9 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         if state is None:
             # Type alone, never the text: a connect error can carry DSN attributes (#5348).
             raise DeliveryError(f"DATABASE connect failed: {_credential_free_cause(exc)}") from exc
-        raise _classify_db_error(state, str(exc), connecting=True) from exc
+        raise _classify_db_error(
+            state, str(exc), connecting=True, shown=_shown_state(state, exc)
+        ) from exc
 
 
 #: Cursor-allocation states that are the driver refusing the query timeout ``statement_timeout``
@@ -4135,15 +4436,27 @@ def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
     if state is None:
         return None
     seconds = _tracked(_STATEMENT_TIMEOUTS, pool)
+    shown = _shown_state(state, exc)
     if state in _QUERY_TIMEOUT_REFUSED_STATES and seconds:
         return NegativeAckError(
-            f"database driver refused a cursor [{state}]; if it cannot take the ODBC query "
-            "timeout, set statement_timeout = 0 on this connection",
-            code=state,
+            f"database driver refused a cursor [{shown or 'SQLSTATE withheld'}]; if it cannot take "
+            "the ODBC query timeout, set statement_timeout = 0 on this connection",
+            code=shown or "db",
             permanent=True,
             config_fault=True,
         )
-    return _classify_db_error(state, str(exc), connecting=True)
+    return _classify_db_error(state, str(exc), connecting=True, shown=shown)
+
+
+def _cursor_refusal_discards(refused: DeliveryError) -> bool:
+    """Whether a borrow whose cursor :func:`_cursor_refused` classified as ``refused`` discards its
+    connection (BACKLOG #5749): every refusal but a static one, a ``config_fault`` or a
+    ``credential_fault``, which a fresh connection would meet the same way, so a discard would
+    only add a login per borrow. At least the poll, mark, lookup, ``DatabaseRef`` sync and login
+    role probe use it; at least ``send()`` and :func:`_probe_db` discard on every refusal."""
+    return not (
+        isinstance(refused, NegativeAckError) and (refused.config_fault or refused.credential_fault)
+    )
 
 
 async def _probe_db(
@@ -4167,7 +4480,7 @@ async def _probe_db(
             )  # classified as send() classifies it (BACKLOG #5749)
             if refused is None:
                 raise
-            discard = True
+            discard = True  # every refusal, as send() discards (BACKLOG #5749)
             raise refused from exc
         await cur.execute("SELECT 1")
     except DeliveryError:
@@ -4175,7 +4488,7 @@ async def _probe_db(
     except Exception as exc:
         state = _sqlstate(exc)
         raise (
-            _classify_db_error(state, str(exc))
+            _classify_db_error(state, str(exc), shown=_shown_state(state, exc))
             if state
             else DeliveryError(f"DATABASE probe failed: {_credential_free_cause(exc)}")
         ) from exc
@@ -4219,7 +4532,8 @@ async def _fetch_result_set(cur: Any) -> list[Any] | None:
         if state is None:
             raise _ResultUnreadable(type(exc).__name__) from exc
         if state in _CLIENT_FETCH_STATES:
-            raise _ResultUnreadable(f"{type(exc).__name__} [{state}]") from exc
+            shown = _shown_state(state, exc)
+            raise _ResultUnreadable(type(exc).__name__ + (f" [{shown}]" if shown else "")) from exc
         raise
     return rows
 
@@ -4239,7 +4553,10 @@ async def _next_result_set(advance: Callable[[], Awaitable[Any]]) -> bool:
     except Exception as exc:
         state = _log_sqlstate(exc)
         if state in _NO_NEXTSET_STATES:
-            logger.debug("DATABASE: nextset() ended the capture walk with [%s]", state)
+            logger.debug(
+                "DATABASE: nextset() ended the capture walk with [%s]",
+                _shown_state(state, exc) or "SQLSTATE withheld",
+            )
             return False
         if state is None:
             logger.warning(
@@ -4373,9 +4690,9 @@ class DatabaseDestination(DestinationConnector):
                 refused = _cursor_refused(exc, pool)
                 if refused is None:
                     raise  # not a DB driver error, so an internal/code error, as below
-                discard = (
-                    True  # BACKLOG #5749: a handle that cannot make a cursor is not lent again
-                )
+                # BACKLOG #5749: a handle that cannot make a cursor is not lent again, whatever
+                # the refusal (_cursor_refusal_discards says where a static one keeps it).
+                discard = True
                 raise refused from exc
             try:
                 await cur.execute(self._sql, params)
@@ -4399,17 +4716,17 @@ class DatabaseDestination(DestinationConnector):
                         "discarded rather than returned to its pool: %s",
                         _safe_db_error(rollback_exc),
                     )
-                    if state is None:
+                    if state is None and not isinstance(exc, UnicodeEncodeError):
                         raise  # the send's failure is no driver error: the rollback's propagates
                     # Classified by the send's own error, as it would be had the rollback passed,
                     # never by the rollback's: the send's error is the best evidence of the
                     # message's fate, and a transient rollback state overriding a permanent one
                     # would retry a poison message for as long as the retry budget lasts. A
                     # dead-letter can be replayed. The rollback's error stays the context.
-                    raise _classify_db_error(state, str(exc)) from exc
-                if state is None:
+                    raise _send_refusal(state, exc) from exc
+                if state is None and not isinstance(exc, UnicodeEncodeError):
                     raise  # not a DB driver error → an internal/code error, let the runner handle it
-                raise _classify_db_error(state, str(exc)) from exc
+                raise _send_refusal(state, exc) from exc
         finally:
             await _close_and_release(pool, conn, cur, discard=discard)
         return captured
@@ -5146,8 +5463,16 @@ class DatabaseSource(SourceConnector):
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                raise refused from exc
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
             if self._body_column is not None and self._body_column not in columns:
@@ -5222,7 +5547,7 @@ class DatabaseSource(SourceConnector):
                     ceiling,
                 )
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> bytes:
@@ -5287,11 +5612,19 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                raise refused from exc
             await cur.execute(self._mark_sql, params)
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
 
     async def test_connection(self) -> None:
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
@@ -5604,11 +5937,18 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     cur: Any = None
     lost = False
     try:
-        cur = await conn.cursor()
+        try:
+            cur = await conn.cursor()
+        except Exception as exc:
+            refused = _cursor_refused(exc, pool)
+            # BACKLOG #5749: a handle that cannot make a cursor is not lent to the next borrower.
+            lost = refused is not None and _cursor_refusal_discards(refused)
+            raise
         await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
-        lost = _connection_lost(exc)  # handled here, so the release below cannot see it (#5748)
+        # Handled here, so the release below cannot see it (#5748).
+        lost = lost or _connection_lost(exc)
         reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     except BaseException:  # a cancellation: the connection still goes back, then it propagates
         await _close_and_release(pool, conn, cur)
@@ -5793,8 +6133,17 @@ class DatabaseLookupExecutor:
         except Exception as exc:
             raise DbLookupError(_lookup_connect_failure(connection, exc)) from exc
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                # A failure to borrow a usable connection, mapped as the acquire's is above.
+                raise DbLookupError(f"db_lookup on {connection!r}: {refused}") from exc
             await cur.execute(sql, bound)
             columns = [d[0] for d in cur.description] if cur.description else []
             limit = self._max_rows[connection]
@@ -5814,13 +6163,13 @@ class DatabaseLookupExecutor:
         except DbLookupError:
             raise
         except Exception as exc:
-            state = _sqlstate(exc)
+            state = _shown_state(_sqlstate(exc), exc)
             # PHI-free: name the connection + SQLSTATE (if any) only — never the statement/params/rows.
             raise DbLookupError(
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
             ) from exc
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:

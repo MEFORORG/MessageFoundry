@@ -84,7 +84,8 @@ class TimerScenario(BaseScenario):
                 delivered = sum(1 for r in records if control_id_of(r.payload) == self.control_id)
                 processed = statuses.count(_PROCESSED)
                 done = processed >= self.arrivals and delivered >= self.arrivals
-                if done or time.monotonic() >= deadline:
+                # A sink fault fails the run whatever else arrives, so the wait ends on one too.
+                if done or sink_faults(records) or time.monotonic() >= deadline:
                     break
                 time.sleep(0.2)
         others = sorted({s for s in statuses if s in _TERMINAL and s != _PROCESSED})

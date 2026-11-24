@@ -347,6 +347,25 @@ def test_status_page_without_a_failed_inbound_keeps_the_plain_stopped_line() -> 
     assert "Inbound start failures" not in html
 
 
+def test_status_page_renders_an_isolated_lookup_in_the_hearts_words() -> None:
+    """Vault BACKLOG #3008: the page names an isolated FhirLookup in the heart's own sentence, so a
+    failed inbound that wins the heart's tooltip does not hide the lookup everywhere."""
+    from messagefoundry_webconsole.pages._common import _failed_lookup_reason
+
+    html = _status_html(
+        _sysinfo(
+            50 * _GIB, channels=3, failed_names=["IB_ACME_ADT"], fhir_lookups_failed=["<b>L</b>"]
+        )
+    )
+    assert "FHIR lookup start failures" in html
+    assert "inbound IB_ACME_ADT failed to start" in html
+    # The name is free text, so it goes through the escaping builder like any other value.
+    assert "<b>L</b>" not in html
+    assert _failed_lookup_reason(["&lt;b&gt;L&lt;/b&gt;"]) in html
+    # The control: no isolated lookup, no row.
+    assert "FHIR lookup start failures" not in _status_html(_sysinfo(50 * _GIB))
+
+
 # Gap 3 — per-connection stats reset ---------------------------------------------------------------
 
 

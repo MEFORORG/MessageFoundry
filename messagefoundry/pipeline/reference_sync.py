@@ -122,8 +122,6 @@ class ReferenceKeyRefused(ReferenceSyncError):
 
 #: The SQLSTATE a statement that ran past its ODBC query timeout fails with.
 _STATEMENT_TIMEOUT_STATE = "HYT00"
-#: The SQLSTATEs a driver that refuses the query timeout on a cursor raises (docs/CONNECTIONS.md).
-_CURSOR_TIMEOUT_REFUSALS = frozenset({"HYC00", "HY092"})
 
 
 @dataclass(frozen=True)
@@ -336,11 +334,15 @@ async def _load_database_source(
     open is not probed, and a probe that did not run is not remembered, so the next pass probes
     either again."""
     from messagefoundry.transports.database import (
+        _QUERY_TIMEOUT_REFUSED_STATES,
         LoginRoleVerdict,
         _apply_statement_timeout,
         _bound_statements,
         _close_and_release,
         _close_pool_bounded,
+        _cursor_refusal_discards,
+        _cursor_refused,
+        _log_sqlstate,
         _login_timeout,
         _make_pool,
         _sqlstate,
@@ -413,21 +415,30 @@ async def _load_database_source(
         # made, and before the try below: on a refusal it gives the connection back itself.
         timeout_refused = False
         try:
-            await _apply_statement_timeout(pool, conn)
+            await _apply_statement_timeout(pool, conn, timeout=acquire_timeout)
         except NegativeAckError:
             timeout_refused = True  # raised below, outside the handler, so no chain is carried
         if timeout_refused:
             raise ReferenceStatementTimeoutRefused(refused_text)
         timed_out = False
+        discard = False
         cur: Any = None
         try:
             try:
                 cur = await conn.cursor()
             except Exception as exc:
                 # A driver that takes the connection timeout but refuses it on a cursor refuses
-                # every cursor (docs/CONNECTIONS.md, the statement_timeout facts).
-                if not statement_timeout or _sqlstate(exc) not in _CURSOR_TIMEOUT_REFUSALS:
-                    raise
+                # every cursor (docs/CONNECTIONS.md, the statement_timeout facts). The states are
+                # the connector's own, read as _cursor_refused reads them, so the two cannot drift.
+                state = _log_sqlstate(exc)
+                if not statement_timeout or state not in _QUERY_TIMEOUT_REFUSED_STATES:
+                    # Any other driver refusal is the connection's failure, classified as a
+                    # DATABASE connector's is, and the handle is not lent again (BACKLOG #5749).
+                    refused = _cursor_refused(exc, pool)
+                    if refused is None:
+                        raise
+                    discard = _cursor_refusal_discards(refused)
+                    raise refused from exc
                 timeout_refused = True  # raised below, outside the handler
             if cur is not None:
                 try:
@@ -445,7 +456,7 @@ async def _load_database_source(
             # at a bound, so once a stop cancels this sync, a statement with no time limit does not
             # hold that stop. An uncancelled statement's calls are bounded by statement_timeout
             # except in the cases the comment at the _bound_statements call above lists.
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
     if timeout_refused:

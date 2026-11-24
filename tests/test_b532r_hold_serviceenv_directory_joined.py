@@ -26,23 +26,23 @@ from messagefoundry.serviceenv import (
     service_env_refusal,
 )
 from tests._serviceenv_remedy import (
-    ADD_BACK_BARE,
+    ADD_BACK_ANY,
     ADD_BACK_CREATE,
-    ADD_BACK_JOINED,
-    ADD_BACK_JOINED_MIXED,
-    ADD_BACK_MIXED,
+    ADD_BACK_DOUBT,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
+    COUNTED_ONCE,
     CREATE,
+    CREATE_INSTALLER,
+    DOUBT_PASS_BACK,
+    DOUBT_STEP,
+    DOUBT_STEP_LEAVING,
     KEEP,
     REMOVE,
-    REMOVE_OTHER,
     REMOVE_SPARING,
     RUNS_ON,
     RUNS_ON_SPARING,
     SET_NO,
-    TAKE_LINE,
-    TAKE_OUT,
     WIDER,
 )
 
@@ -88,17 +88,17 @@ def test_a_joined_directory_entry_is_removed_with_the_value(refused: str, direct
     # directory entry, so a MEFOR_VALUE_* name joined to it is moved.
     moved = refused.startswith("MEFOR_VALUE_") and " " in directory
     assert (CREATE in refusal) is moved and ("Put " in refusal) is moved
-    # The lists set no directory once the joined string goes, so the remedy says to add one
-    # back (the Lander's ruling on handback 7085947392, F1), for a store key alone too
-    # (the Lander's ruling on comment 7087145957, F1 on H3's terms).
-    # The joined string may still be read as its own item, so no "set no" opener, and the
-    # pass-back leaves out what the steps above say to remove (the Lander's hold on PR 3142, comment 7088102723).
-    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
+    # The joined entry is not plainly a path, so it is in doubt: the remedy says to take every
+    # directory line out and add one back (the Lander's ruling B on PR 3142's repair handback,
+    # comment 7106776128), for a store key alone too (the Lander's ruling on comment 7087145957,
+    # F1 on H3's terms). No "set no" opener, and the pass-back leaves out what the steps above
+    # say to remove (the Lander's hold on PR 3142, comment 7088102723).
+    assert refusal.count(ADD_BACK_DOUBT) == 1 and SET_NO not in refusal
     assert ADD_BACK_STEP not in refusal
-    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+    assert refusal.index(RUNS_ON) < refusal.index(ADD_BACK_DOUBT)
     # The create clause only where a setting moves (the Lander's ruling on handback
     # 7087574833, R1), and next to the step it qualifies.
-    assert (ADD_BACK_JOINED + ADD_BACK_CREATE in refusal) is moved
+    assert (ADD_BACK_DOUBT + ADD_BACK_CREATE in refusal) is moved
     assert (ADD_BACK_CREATE in refusal) is moved
     assert ("An empty or blank MEFOR_VALUE_* entry is refused too: delete it" in refusal) is (
         refused.startswith("MEFOR_VALUE_") and " " not in directory
@@ -295,6 +295,26 @@ def test_an_empty_value_name_is_told_to_go_and_not_to_move(
     assert not any(text in refusal for text in _VALUE_TEXT)
 
 
+@pytest.mark.parametrize(
+    "pairs",
+    [
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A="), (_EXTRA, "MEFOR_VALUE_A=")], id="empty-in-both"),
+        # Only the empty copy is told to go; the other moves.
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A=1"), (_EXTRA, "mefor_value_a=")], id="mixed"),
+        # The control: a name that moves printed the clause before the fix too.
+        pytest.param([(_PLAIN, "MEFOR_VALUE_A=1"), (_EXTRA, "mefor_value_a=2")], id="moving"),
+    ],
+)
+def test_a_duplicate_value_name_is_told_to_go_from_every_value(
+    pairs: list[tuple[str, str]],
+) -> None:
+    """The Lander's hold on PR 3142, comment 7104660861, item 3: the name is counted once, so
+    the remedy says to remove it from every value that sets it whether it moves or is only told
+    to go, as origin/main does, or the copy left behind refuses the next start."""
+    refusal = service_env_refusal(_read_pairs(pairs))
+    assert refusal is not None and refusal.count(COUNTED_ONCE) == 1
+
+
 def test_an_oddly_spelled_name_told_only_to_go_gets_no_rename() -> None:
     """Code review on the repair of the Lander's hold on PR 3142, comment 7100710066, item 10:
     the rename sentence is about moving a name, so an empty one, which is only told to go, does
@@ -332,10 +352,13 @@ def test_a_value_name_alone_joined_to_a_directory_path_keeps_the_path_entry() ->
     assert order == sorted(order)
 
 
-def test_a_path_the_fail_closed_rule_does_not_keep_is_added_back() -> None:
-    """U1: the store password's only value is a joined path entry, which moves nothing, but the
-    store key beside it runs on into other text, so the fail-closed rule keeps no entry. The
-    run-on sentence then removes the path, and the remedy says to add the directory back."""
+def test_a_plain_path_beside_a_run_on_into_other_text_is_kept() -> None:
+    """U1, under the per-entry rule (the Lander's ruling B on PR 3142's repair handback, comment
+    7106776128; round 3's finding 6): the store password's only value is a joined path entry,
+    which moves nothing, and the store key beside it runs on into other text. The path entry is
+    plainly a path on its own and no directory entry is in doubt, so the removal and run-on
+    steps spare it, the run-on step removes the other text, and the keep-one step names the
+    path."""
     refusal = service_env_refusal(
         _read(
             [
@@ -347,13 +370,10 @@ def test_a_path_the_fail_closed_rule_does_not_keep_is_added_back() -> None:
         )
     )
     assert refusal is not None
-    assert KEEP not in refusal and "Put " not in refusal
-    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
-    # Nothing moves to the directory, so no create clause (the Lander's ruling on handback
-    # 7087574833, R1).
-    assert ADD_BACK_CREATE not in refusal
-    assert "synthetic-run-on" not in refusal
+    assert "Put " not in refusal and ADD_BACK_ANY not in refusal
+    assert refusal.endswith(f'{KEEP}. [security].enforcement = "warn" does not change this refusal')
+    assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
+    assert "synthetic-run-on" not in refusal and "C:\\d" not in refusal
 
 
 @pytest.mark.parametrize(
@@ -374,8 +394,8 @@ def test_a_store_key_alone_run_on_into_the_directory_is_added_back(entries: list
     refusal = service_env_refusal(_read(entries))
     assert refusal is not None
     assert CREATE not in refusal and KEEP not in refusal
-    assert refusal.count(ADD_BACK_JOINED) == 1 and SET_NO not in refusal
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+    assert refusal.count(ADD_BACK_DOUBT) == 1 and SET_NO not in refusal
+    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_DOUBT)
     # A store key alone needs no secrets directory: no create clause (third hold, H2; the
     # Lander's ruling on handback 7087574833, R1).
     assert ADD_BACK_CREATE not in refusal
@@ -384,8 +404,9 @@ def test_a_store_key_alone_run_on_into_the_directory_is_added_back(entries: list
 def test_a_lower_case_directory_item_is_not_said_to_be_absent() -> None:
     """The Lander's hold on PR 3142, comment 7088102723, fix 2: the store key runs on into
     ``mefor_secrets_directory=C:\\d``, which NSSM may read as its own item, and a second key runs
-    on into other text, so nothing keeps the item. The remedy says to add the directory back,
-    but never that the lists set none, and the pass-back leaves out the strings it removes."""
+    on into other text. The item is plainly a path on its own, so under the per-entry rule (the
+    Lander's ruling B on PR 3142's repair handback, comment 7106776128) the keep-one step names
+    it, and nothing says the lists set none."""
     refusal = service_env_refusal(
         _read(
             [
@@ -397,26 +418,24 @@ def test_a_lower_case_directory_item_is_not_said_to_be_absent() -> None:
         )
     )
     assert refusal is not None
-    assert KEEP not in refusal and SET_NO not in refusal
-    assert refusal.count(ADD_BACK_JOINED) == 1
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
-    assert ADD_BACK_CREATE not in refusal and "synthetic-run-on" not in refusal
+    assert refusal.count(KEEP) == 1 and SET_NO not in refusal and ADD_BACK_ANY not in refusal
+    assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
+    assert "synthetic-run-on" not in refusal
 
 
 def test_no_opener_while_a_list_string_sets_the_directory() -> None:
     """The Lander's hold on PR 3142, comment 7088663896, finding 1: the password runs on past
     its name, written alone, into ``mefor_secrets_directory=C:\\d``, which NSSM may read as its
     own item. The first string the value takes does not set the directory, so origin/main said
-    the lists set none. The step reads every string as the run-on step does, so it says no
-    such thing, and since a value runs on it leaves out the strings the steps above say to
-    remove."""
+    the lists set none. The item is plainly a path on its own, so under the per-entry rule (the
+    Lander's ruling B on PR 3142's repair handback, comment 7106776128) the keep-one step names
+    it, and nothing says the lists set none."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_STORE_PASSWORD", "mefor_secrets_directory=C:\\d"])
     )
     assert refusal is not None
-    assert SET_NO not in refusal and ADD_BACK_STEP not in refusal
-    assert refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
-    assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(ADD_BACK_JOINED)
+    assert SET_NO not in refusal and ADD_BACK_ANY not in refusal
+    assert refusal.index(REMOVE_SPARING) < refusal.index(RUNS_ON_SPARING) < refusal.index(KEEP)
 
 
 def test_a_value_that_runs_on_is_not_passed_back() -> None:
@@ -437,47 +456,31 @@ def test_a_value_that_runs_on_is_not_passed_back() -> None:
 def test_no_opener_while_a_later_line_sets_the_directory() -> None:
     """The Lander's hold on PR 3142, comment 7089064404, B: the directory is set on the second
     line of a string, which NSSM may read as its own variable, so the step never says the lists
-    set none. The string's first line sets MEFOR_VALUE_A, so the string sets something else too:
-    no clause says to remove it whole (comment 7089400537), and one says to take its directory
-    line out (comment 7090314503)."""
+    set none. The string's first line sets MEFOR_VALUE_A, so the directory line is in doubt (the
+    Lander's ruling B on PR 3142's repair handback, comment 7106776128), and the step says to
+    take it out and keep each other line no step above removes (comments 7089400537 and
+    7090314503)."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=\nMEFOR_SECRETS_DIRECTORY=C:\\d"]))
     assert refusal is not None
     assert SET_NO not in refusal
-    assert REMOVE_OTHER not in refusal and WIDER not in refusal
-    assert refusal.count(ADD_BACK_MIXED + ADD_BACK_CREATE) == 1
+    assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
 
 
-def test_a_string_that_also_sets_another_variable_is_not_removed_whole() -> None:
-    """The Lander's hold on PR 3142, comment 7089400537, finding 5: ``PATH=C:\\x`` and a
-    directory line share one string. The clause covers only strings that set the directory and
-    nothing else, so nothing says to remove this one; its directory line still means the step
-    never says the lists set none (comment 7089064404, B), and the step says to take that line
-    out and keep PATH (comment 7090314503)."""
-    refusal = service_env_refusal(
-        _read(["MEFOR_VALUE_A=x", "PATH=C:\\x\nMEFOR_SECRETS_DIRECTORY=C:\\d"])
-    )
+@pytest.mark.parametrize(
+    "mixed",
+    ["PATH=C:\\x\nMEFOR_SECRETS_DIRECTORY=C:\\d", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"],
+    ids=["directory-line-later", "directory-line-first"],
+)
+def test_a_string_that_also_sets_another_variable_is_not_removed_whole(mixed: str) -> None:
+    """The Lander's hold on PR 3142, comment 7089400537, finding 5 and the review's finding 6:
+    ``PATH=C:\\x`` and a directory line share one string, either line first. The directory line
+    is in doubt, so the step says to take it out of every list and keep each other line no step
+    above removes, which keeps PATH, and never that the lists set none (comments 7089064404, B,
+    and 7090314503)."""
+    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", mixed]))
     assert refusal is not None
     assert SET_NO not in refusal
-    assert REMOVE_OTHER not in refusal and WIDER not in refusal
-    step = ADD_BACK_MIXED + ADD_BACK_CREATE
-    assert refusal.count(step) == 1
-    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
-
-
-def test_a_string_whose_first_line_sets_the_directory_and_a_later_line_more_stays() -> None:
-    """The Lander's hold on PR 3142, comment 7089400537, the review's finding 6: the string's
-    first line sets the directory and its second sets PATH, so it sets something else too, and
-    the removal clause, which covers only strings that set the directory on every non-blank line,
-    does not say to remove it. A reader of the first line alone would. The Lander's hold on PR
-    3142, comment 7090314503, items 1 and 5: the step says to take the directory line out and
-    keep PATH."""
-    refusal = service_env_refusal(
-        _read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
-    )
-    assert refusal is not None
-    assert SET_NO not in refusal and REMOVE_OTHER not in refusal and WIDER not in refusal
-    assert refusal.count(TAKE_LINE) == 1
-    step = ADD_BACK_MIXED + ADD_BACK_CREATE
+    step = ADD_BACK_DOUBT + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(step)
 
@@ -492,35 +495,37 @@ def test_a_string_that_sets_the_directory_and_more_has_its_directory_line_taken_
 ) -> None:
     """The Lander's hold on PR 3142, comment 7090314503, item 1: the store password runs on
     into a string that sets only the directory, and a string sets the directory along with
-    PATH. The step
-    says to remove the first and to take only the directory line out of the second, so, read
-    line by line, the entry the operator adds is the only one in the list."""
+    PATH. One step says to take every directory line out of every list, removing a string that
+    holds nothing else and keeping PATH, so, read line by line, the entry the operator adds is
+    the only one (the Lander's ruling B on PR 3142's repair handback, comment 7106776128)."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1", mixed])
     )
     assert refusal is not None
     assert SET_NO not in refusal
-    assert refusal.count(REMOVE_OTHER) == 1 and refusal.count(TAKE_LINE) == 1
-    assert refusal.count(WIDER) == 1
-    step = ADD_BACK_JOINED_MIXED + ADD_BACK_CREATE
+    assert refusal.count(DOUBT_STEP_LEAVING) == 1 and refusal.count(DOUBT_PASS_BACK) == 1
+    step = ADD_BACK_DOUBT + ADD_BACK_CREATE
     assert refusal.count(step) == 1
     assert refusal.index(REMOVE) < refusal.index(RUNS_ON) < refusal.index(step)
+    # The password runs on into an AppEnvironmentExtra string the installer reads as the
+    # directory, which the doubt step keeps for it, so the create step says so.
+    assert refusal.count(CREATE + CREATE_INSTALLER) == 1
 
 
 def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
     """The review of the repair for the Lander's hold on PR 3142, comment 7090314503, finding
     1, and round 2's finding 3: the store password runs on into a string that holds a
-    directory line and a PATH line. The run-on step says to remove that string, so the
-    take-line clause keeps only the other lines no step above says to remove, rather than
-    telling the operator to keep all of them."""
+    directory line and a PATH line. The doubt step now comes first and keeps that string whole,
+    since it may hold the password, for the Put step (the Lander's ruling (a) on comment
+    7112155891); the run-on step below the Put step removes it, and the add-back step passes
+    back none of it."""
     refusal = service_env_refusal(
         _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"])
     )
     assert refusal is not None
-    assert refusal.count(RUNS_ON) == 1 and refusal.count(TAKE_LINE) == 1
-    assert "keeping each other line no step above says to remove" in refusal
-    assert refusal.count(WIDER) == 1 and refusal.count(TAKE_OUT) == 1
-    assert refusal.index(RUNS_ON) < refusal.index(TAKE_LINE)
+    assert refusal.count(RUNS_ON) == 1 and refusal.count(DOUBT_STEP_LEAVING) == 1
+    assert refusal.count(DOUBT_PASS_BACK) == 1 and WIDER not in refusal
+    assert refusal.index(DOUBT_STEP_LEAVING) < refusal.index("Put ") < refusal.index(RUNS_ON)
 
 
 @pytest.mark.parametrize("where", [_PLAIN, "Environment"], ids=["AppEnvironment", "Environment"])
@@ -529,18 +534,25 @@ def test_a_string_a_value_runs_on_into_is_left_to_the_run_on_step() -> None:
     ["MEFOR_SECRETS_DIRECTORY=", "MEFOR_SECRETS_DIRECTORY=\nPATH=C:\\x"],
     ids=["directory-only", "directory-and-more"],
 )
-def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause(
+def test_a_directory_entry_in_doubt_outside_the_extra_list_is_taken_out_too(
     plain: str, where: str
 ) -> None:
-    """The Lander's hold on PR 3142, comment 7090314503, item 3: the step's clauses act
-    inside AppEnvironmentExtra, the list it says to read and pass back, so a directory entry
-    in AppEnvironment, whether it sets only the directory or more, gets neither clause. The
-    lists still set the directory, so the step never says they set none."""
+    """The Lander's ruling B on PR 3142's repair handback, comment 7106776128: a directory
+    entry in doubt is taken out whatever list holds it, so the doubt step names every list, says
+    to read AppEnvironment and AppEnvironmentExtra with `Get-ItemProperty` and write them back
+    with `Set-ItemProperty`, since they still hold every refused value (the Lander's hold on PR
+    3142, comment 7116005396, F2), and says the service's own Environment value is edited the
+    same way in its registry key (the Lander's hold on PR 3142, comment 7090314503, item 3, read
+    under that ruling; code review round 2 on the repair). The lists still set the directory, so
+    the step never says they set none."""
     refusal = service_env_refusal(_read_pairs([(_EXTRA, "MEFOR_VALUE_A=x"), (where, plain)]))
     assert refusal is not None
     assert SET_NO not in refusal
-    assert REMOVE_OTHER not in refusal and TAKE_LINE not in refusal and WIDER not in refusal
-    assert refusal.count(ADD_BACK_BARE + ADD_BACK_CREATE) == 1
+    assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
+    assert refusal.count(DOUBT_STEP) == 1
+    assert "Read AppEnvironment and AppEnvironmentExtra, under Parameters" in DOUBT_STEP
+    assert "write each back with `Set-ItemProperty -Type MultiString`" in DOUBT_STEP
+    assert "Environment value is no NSSM list, and is read and written the same way" in DOUBT_STEP
 
 
 @pytest.mark.parametrize(
@@ -551,32 +563,31 @@ def test_a_directory_entry_outside_the_extra_list_gets_no_removal_clause(
         "\u00a0MEFOR_SECRETS_DIRECTORY",
     ],
 )
-def test_a_non_ascii_name_does_not_set_the_directory(name: str) -> None:
+def test_a_non_ascii_name_does_not_set_the_directory_but_is_in_doubt(name: str) -> None:
     """The Lander's hold on PR 3142, comment 7090314503, item 4: ``str.upper`` maps U+017F
-    onto S and U+0131 onto I, so without an ASCII check these names would read as
-    MEFOR_SECRETS_DIRECTORY, drop the opener
-    and print the removal clause; ``str.strip`` would do the same for a U+00A0 blank. The ASCII
-    spelling, the control, does both."""
+    onto S and U+0131 onto I, and ``str.strip`` removes a U+00A0 blank, so ``_sets_directory``
+    holds a name to ASCII. Python's ``os.environ`` on Windows upper-cases names, so the engine
+    may read a U+017F or U+0131 name as the directory (the Lander's hold on PR 3142, comment
+    7104660861); it does not strip a U+00A0 blank, but the reader's whole-string reading does.
+    Under ruling B (comment 7106776128) each entry is in doubt, and the remedy says to take it
+    out and add the directory back, as for the blank ASCII control."""
     assert not _sets_directory(f"{name}=") and _sets_directory("MEFOR_SECRETS_DIRECTORY=")
-    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{name}="]))
-    assert refusal is not None
-    assert SET_NO in refusal and REMOVE_OTHER not in refusal
-    control = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
-    assert control is not None
-    assert SET_NO not in control and REMOVE_OTHER in control
+    for spelled in (name, "MEFOR_SECRETS_DIRECTORY"):
+        refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", f"{spelled}="]))
+        assert refusal is not None
+        assert SET_NO not in refusal and refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
 
 
 def test_a_blank_directory_item_is_not_passed_back() -> None:
     """The Lander's hold on PR 3142, comment 7089064404, A: the blank
-    ``MEFOR_SECRETS_DIRECTORY=`` is no refused variable, and no value runs on into it, so only
-    origin/main's clause says to remove it, and the wider exclusion leaves out what this step
-    says to remove. The step is the form every directory-setting shape prints (finding C)."""
+    ``MEFOR_SECRETS_DIRECTORY=`` is no refused variable, and no value runs on into it. It is not
+    plainly a path, so it is in doubt, the doubt step says to take it out, and the add-back
+    step passes back none of what the steps above remove or take out (finding C)."""
     refusal = service_env_refusal(_read(["MEFOR_VALUE_A=x", "MEFOR_SECRETS_DIRECTORY="]))
     assert refusal is not None
     assert SET_NO not in refusal and RUNS_ON not in refusal
-    assert refusal.count(ADD_BACK_JOINED + ADD_BACK_CREATE) == 1
-    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK_JOINED)
-    assert refusal.count(REMOVE_OTHER) == 1 and refusal.count(WIDER) == 1
+    assert refusal.count(ADD_BACK_DOUBT + ADD_BACK_CREATE) == 1
+    assert refusal.index("Put ") < refusal.index(REMOVE) < refusal.index(ADD_BACK_DOUBT)
 
 
 def test_an_empty_value_beside_a_listed_directory_path_is_told_to_go_and_not_to_move() -> None:
@@ -595,10 +606,12 @@ def test_an_empty_value_beside_a_listed_directory_path_is_told_to_go_and_not_to_
 
 
 def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
-    """A joined ``==`` directory entry in AppEnvironmentExtra overrides the AppEnvironment one,
-    so the remedy keeps one entry, rewritten to the path, and the removal steps spare the
-    directory lines it covers (the Lander's hold on PR 3142, comment 7100710066, items 5 and
-    8)."""
+    """A joined ``==`` directory entry in AppEnvironmentExtra would override the AppEnvironment
+    one. It is not plainly a path, so it is in doubt and no step keeps or spares it: the removal
+    and run-on steps take it out with the value. That changes the entry the engine reads, so the
+    add-back step names the directory again, last, with no create clause, since nothing moves
+    there (the Lander's hold on PR 3142, comment 7104660861, item 1, and its ruling B on the
+    repair handback, comment 7106776128)."""
     posture = _read_pairs(
         [
             (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\synthetic-secrets"),
@@ -609,8 +622,10 @@ def test_a_directory_set_elsewhere_too_gets_no_create_guidance() -> None:
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert REMOVE_SPARING in refusal and RUNS_ON_SPARING in refusal and CREATE not in refusal
-    assert refusal.endswith(f'{KEEP}. [security].enforcement = "warn" does not change this refusal')
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE not in refusal
+    assert refusal.endswith(
+        f'{RUNS_ON}. {ADD_BACK_DOUBT}. [security].enforcement = "warn" does not change this refusal'
+    )
 
 
 def test_a_directory_joined_to_an_empty_pem_key_is_removed_with_it() -> None:

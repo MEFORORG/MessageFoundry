@@ -507,14 +507,19 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         }
         if (el.dataset.kind === 'checkbox') {
           // A checkbox has no "untouched" state, so one the record did not set, left at the schema
-          // default, writes nothing: the rule coerce in connectionForm.ts applies. Without it every
+          // default, writes nothing: the rule coerce in connectionForm.ts documents. Without it every
           // edit save wrote an explicit value for each default bool. "The record set it" is judged
           // against the record itself, not the descriptor: a transport or direction rebuild carries
           // what was ticked as the field's value, so a box moved off its default and back before
           // the rebuild would otherwise write the default (BACKLOG #5976).
-          const dflt = f.defaultValue;
+          // A box with no schema default is drawn unticked for "never set", so for this rule its unset
+          // position is unticked: an unticked box the record did not set posts nothing rather than
+          // false. Ticked and unticked again looks the same as never touched, and posts the same.
+          // A REQUIRED one is the exception: omitting it is a missing setting the engine refuses, so
+          // it always posts what it shows.
+          const dflt = f.defaultValue === undefined || f.defaultValue === null ? false : f.defaultValue;
           const fromRecord = f.value !== undefined && RECORDED_KEYS.has(key);
-          if (!fromRecord && dflt !== undefined && dflt !== null && el.checked === dflt) continue;
+          if (!fromRecord && !f.required && el.checked === dflt) continue;
           settings[key] = el.checked;
           continue;
         }

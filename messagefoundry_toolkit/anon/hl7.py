@@ -70,6 +70,20 @@ def anonymize_message(
     seps, _field_sep = parsed
     try:
         msg = Message.parse(text)
+        # Message reads and writes under the first line's delimiters (BACKLOG #5972), the surrogates
+        # and the leak check under the MSH's that read_message_seps found. Where they differ, as
+        # under a BHS or FHS header of other delimiters, refuse rather than build under one and
+        # write under the other.
+        if msg._encoding_chars() != (
+            seps.field,
+            seps.component,
+            seps.repetition,
+            seps.escape,
+            seps.subcomponent,
+        ):
+            raise AnonError(
+                "message's first line names other delimiters than its MSH; refusing to emit"
+            )
         for rule in rules:
             seg_id = _segment_id(rule.path)
             for occ in range(1, msg.count_segments(seg_id) + 1):

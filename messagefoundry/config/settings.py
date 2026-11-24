@@ -61,7 +61,6 @@ from pydantic import (
     PrivateAttr,
     ValidationError,
     ValidationInfo,
-    ValidatorFunctionWrapHandler,
     field_validator,
     model_validator,
 )
@@ -73,6 +72,7 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     SecurityEnforcement,
 )
+from messagefoundry.config.bool_numbers import NumbersRefuseBool
 from messagefoundry.config.input_hiding import HIDDEN_INPUT as HIDDEN_INPUT
 from messagefoundry.config.input_hiding import _InputHidingModel as _InputHidingModel
 from messagefoundry.config.models import (
@@ -113,7 +113,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
-from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
+from messagefoundry.hostlist import allow_entry_problem, names_no_host, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -371,76 +371,7 @@ def _refuse_a_missing_crl_file(value: str | None, setting: str) -> str | None:
     return value
 
 
-#: pydantic error types a number's own bound raises. One raised where a bool was given means the
-#: bool was read as a number first, so the bool refusal names it instead (BACKLOG #5509).
-_NUMBER_BOUND_ERRORS: Final = frozenset(
-    {"greater_than", "greater_than_equal", "less_than", "less_than_equal", "multiple_of"}
-)
-
-
-def _bool_on_a_number_refusal(where: str) -> str:
-    """The refusal of a bool on a number at ``where``. It quotes no value (BACKLOG #5509)."""
-    return f"{where} expects a number, not a boolean (true or false); write a number in its place"
-
-
-def _bool_at(given: Any, loc: tuple[int | str, ...], where: str) -> str | None:
-    """The path of ``loc`` inside ``given`` when a bool sits there, or ``None`` (#5509).
-
-    ``loc`` cannot tell a model field from a dict key, so a key that is not a plain identifier is
-    left out of the path rather than echoed."""
-    for part in loc:
-        if isinstance(given, Mapping) and part in given:
-            given = given[part]
-            where = f"{where}.{part}" if isinstance(part, str) and part.isidentifier() else where
-        elif isinstance(given, list | tuple) and isinstance(part, int) and part < len(given):
-            given = given[part]
-            where = f"{where}[{part}]"
-        else:
-            return None
-    return where if isinstance(given, bool) else None
-
-
-def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
-    """Where a bool in ``given`` came out of validation as a number in ``got``, or ``None`` (#5509).
-
-    Read off the validated value rather than the annotation, so it holds for at least a constrained
-    or optional int, an int subclass, a list, tuple, set or dict of numbers, and the fields of a
-    nested model such as ``[[alerts.rules]]``. It misses at least a dict whose keys validation
-    rewrites, a list an inner validator shortens, and a bool read as a ``timedelta`` or an enum
-    member. A field that deliberately keeps a bool keeps it, since its validated value is still a
-    bool. The path names model fields and list positions only, never a dict key the operator
-    wrote."""
-    if isinstance(given, bool):
-        return where if isinstance(got, int | float) and not isinstance(got, bool) else None
-    if isinstance(given, Mapping):
-        if isinstance(got, BaseModel):
-            fields = type(got).model_fields
-            pairs = [(f"{where}.{k}", v, getattr(got, k)) for k, v in given.items() if k in fields]
-        elif isinstance(got, Mapping):
-            pairs = [(f"{where}[a key]", v, got[k]) for k, v in given.items() if k in got]
-        else:
-            return None
-        for path, inner_given, inner_got in pairs:
-            if found := _bool_read_as_number(inner_given, inner_got, path):
-                return found
-        return None
-    if isinstance(given, list | tuple):
-        if isinstance(got, list | tuple) and len(got) == len(given):
-            for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
-                if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
-                    return found
-        # A set reorders and merges, so no element pairs with its input: a bool given where none
-        # survived was read as a number.
-        elif (
-            isinstance(got, set | frozenset)
-            and any(isinstance(item, bool) for item in given)
-            and not any(isinstance(item, bool) for item in got)
-        ):
-            return where
-    return None
-
-
-class _Section(_InputHidingModel):
+class _Section(_InputHidingModel, NumbersRefuseBool):
     # extra="ignore" stays on the MODEL; unknown keys are refused by the LOADER instead
     # (_reject_unknown_file_keys for the file, _reject_unknown_env_keys for the environment). A model-level extra="forbid" would refuse the engine's OWN writes:
     # _env_overrides scrapes every MEFOR_<section>_<key> into its section dict, and a dozen documented
@@ -477,43 +408,6 @@ class _Section(_InputHidingModel):
                 if key in data:
                     raise ValueError(refusal)
         return data
-
-    @field_validator("*", mode="wrap")
-    @classmethod
-    def _refuse_a_bool_on_a_number(
-        cls, value: Any, handler: ValidatorFunctionWrapHandler, info: ValidationInfo
-    ) -> Any:
-        """Refuse ``true``/``false`` on a numeric key rather than read it as 1 or 0 (BACKLOG #5509).
-
-        pydantic's lax mode coerces a bool to an int or float, so
-        ``delete_message_bodies_after_days = false`` would read as 0, "keep indefinitely", and a
-        byte cap set to ``true`` as one byte. Lax mode stays on for everything else, because the
-        environment layer hands every value over as a string. A subclass ``before`` validator
-        that turns a bool into a number itself runs ahead of this one and is not seen."""
-        where = str(info.field_name)
-        try:
-            validated = handler(value)
-        except ValidationError as exc:
-            # A bool read as 0 can then fail the number's own bound (``gt=0``), and that message
-            # would hide the coercion: name the bool instead.
-            found = next(
-                (
-                    path
-                    for err in exc.errors(include_url=False)
-                    if err["type"] in _NUMBER_BOUND_ERRORS
-                    and (path := _bool_at(value, err["loc"], where))
-                ),
-                None,
-            )
-            if found is None:
-                raise
-        else:
-            found = _bool_read_as_number(value, validated, where)
-            if found is None:
-                return validated
-        # Raised outside the handler, so the bound error, whose input a nested plain model does not
-        # hide, is not chained onto the refusal (BACKLOG #1796).
-        raise ValueError(_bool_on_a_number_refusal(found))
 
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
@@ -1339,6 +1233,16 @@ class StoreSettings(_Section):
                 missing.append("username")  # SQL login needs a user (+ MEFOR_STORE_PASSWORD)
             if missing:
                 raise ValueError(f"{label} backend requires: " + ", ".join(missing))
+            # BACKLOG #5512. No hop guard reads a SQL Server store's host, so one that names none
+            # would reach the driver as `SERVER=,1433`. On Postgres only spaces are refused: the
+            # `server` row of docs/CONFIGURATION.md says what an empty value means there.
+            server = self.server or ""  # `missing` above already refused None
+            if self.backend is StoreBackend.SQLSERVER:
+                unnamed = names_no_host(server)
+            else:
+                unnamed = bool(server) and not server.strip()
+            if unnamed:
+                raise ValueError(f"[store].server names no host: name the {label} host")
         return self
 
     @field_validator("ssl_root_cert")
@@ -2995,7 +2899,8 @@ class LoggingSettings(_Section):
     # The engine writes no log FILE of its own unless `file` below is set (opt-in, #122), but if an
     # operator tells us where the supervisor parks them, GET /status meters that directory's total bytes
     # + filesystem free space alongside the DB metrics (#50). None (the default) = stdout-only, no
-    # metering. Metadata only — the contents are never read.
+    # metering. Other code reads the files' contents; docs/CONFIGURATION.md, the [logging] log_dir
+    # row, says which.
     log_dir: str | None = None
 
     # --- Engine-managed application log file + fail-closed write guard (#122, ADR 0162) ----------
@@ -3990,7 +3895,9 @@ class AuthSettings(_Section):
     # (_issuer_fits_the_column): a bind stores it, and the narrowest issuer column is SQL Server
     # NVARCHAR(256), so a longer one could be configured and never bound (BACKLOG #2331).
     oidc_issuer: str | None = None
-    oidc_client_id: str | None = None  # also the required `aud`/`azp`
+    # The id_token aud/azp rule this feeds, and its known limit: docs/CONFIGURATION.md, the
+    # oidc_client_id row, and _check_core_claims in auth/oidc/claims.py.
+    oidc_client_id: str | None = None
     # The confidential-client secret. ENV ONLY (MEFOR_AUTH_OIDC_CLIENT_SECRET) — never the config file
     # (_FILE_SECRET_KEYS warns) — or via a [secrets].provider reference in oidc_client_secret_ref. The
     # `_ref` suffix (not the house `_secret`) avoids the absurd `oidc_client_secret_secret`; ADR 0142.
@@ -4477,7 +4384,7 @@ class AuthSettings(_Section):
     @field_validator("ad_session_recheck_seconds")
     @classmethod
     def _check_ad_recheck_seconds(cls, value: int) -> int:
-        # 0 = off (the default). Anything else is floored at 60 s: a pass costs one LDAP bind per
+        # 0 = off. Anything else must be at least 60 s: a pass costs one LDAP bind per
         # signed-in directory user, so a mistyped `1` would hammer the domain controller.
         if value < 0:
             raise ValueError("ad_session_recheck_seconds must be >= 0 (0 = disabled)")
@@ -5255,11 +5162,12 @@ def _names_this_host(host: str) -> bool:
     """Whether ``host`` is loopback or the unspecified address, for the #1966 gate. Stricter than
     :func:`is_loopback_hop_host`, which fails toward "remote" because it guards a CLEARTEXT hop,
     where "remote" is the cautious answer. Here "remote" is the permissive one, so ``0.0.0.0``,
-    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host. No DNS.
+    ``::``, ``localhost.`` and the IPv4 shorthand ``127.1`` must all count as this host, and so must
+    a value that trims to nothing, which names no other system (BACKLOG #5512). No DNS.
 
     The host's own name and its own non-loopback addresses are :func:`_is_own_name_or_address`."""
     h = _bare_host(host)
-    if is_loopback_hop_host(h) or h == "localhost" or h.endswith(".localhost"):
+    if not h or is_loopback_hop_host(h) or h.endswith(".localhost"):
         return True
     addr = _host_ip_literal(h)
     return addr is not None and (addr.is_loopback or addr.is_unspecified)
@@ -5536,7 +5444,8 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     the SAME authority the transports consume — so the forwarder decides identically to every other
     egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
     verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
-    MITM-able and go to the gradient:
+    MITM-able and go to the gradient. A forwarder with no host returns ALLOW before any of this:
+    ``serve`` builds none without a host, so there is no hop to judge (BACKLOG #5512).
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
@@ -5556,15 +5465,16 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     instance carrying patient data there is no instance left for it to fire on, so it is gone. A
     ``[logging]`` sibling of ``cleartext_accepted`` remains the recorded follow-up and is now the only
     way this cell could express an acceptance."""
+    if not log.forward_host:
+        # An unconfigured forwarder: `serve` builds none without a host, so there is no hop to
+        # refuse. Said here because the shared predicate no longer reads "" as loopback (#5512).
+        return HopDisposition.ALLOW
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         enforcing=posture.enforcing,
-        # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
-        # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
-        # can never be refused.
-        is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
+        is_loopback_hop=is_loopback_hop_host(log.forward_host),
         hop_attested=log.forward_hop_attested,
         # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
         # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
@@ -5626,7 +5536,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
     machine. An IP literal is returned in :mod:`ipaddress`'s compressed form, so ``::1`` and
-    ``0:0:0:0:0:0:0:1`` are one host; a name is returned lowercased."""
+    ``0:0:0:0:0:0:0:1`` are one host, and an IPv4-mapped IPv6 literal as the IPv4 address it
+    can reach, so ``::ffff:127.0.0.1`` and ``127.0.0.1`` are one host; a name is returned lowercased."""
     host, _, port = entry.strip().rpartition(":")
     host = host.strip()
     if host.startswith("[") and host.endswith("]"):
@@ -5641,12 +5552,16 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     number = int(port)
     # A '%' is refused: urlsplit keeps an IPv6 zone ID still encoded, and urllib decodes it before
     # it dials, so `[::1%31]` would compare as one host here and be dialled as `::11`.
-    if not host or "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
+    if "%" in host or not 1 <= number <= 65535 or not is_loopback_hop_host(host):
         return None
     try:
-        return ipaddress.ip_address(host).compressed, number
+        address = ipaddress.ip_address(host)
     except ValueError:
         return host.lower(), number
+    # An IPv4-mapped IPv6 address can reach no listener but its IPv4 address, so it compares as
+    # that (BACKLOG #5528).
+    mapped = address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) else None
+    return (mapped or address).compressed, number
 
 
 class EgressSettings(_Section):
@@ -6406,7 +6321,7 @@ class AlertsSettings(_Section):
     # must be listed or the transport refuses to send. Comma- or os.pathsep-separated via env.
     webhook_allowed_hosts: list[str] = []
     # BACKLOG #2193 (ADR 0173 section 12 pattern, owner ruling 2026-10-27): attests that revocation of
-    # the webhook host's certificate is covered outside the engine. The POST carries the webhook's
+    # the webhook host's certificate is covered outside the engine. The POST can carry the webhook's
     # path token over https the engine verifies and checks no CRL or OCSP on, so an off-box https
     # webhook on an enforcing instance is refused at build unless this is true, with its mandatory
     # reason. It is the only way across: the webhook rides one shared opener, which no CRL
@@ -6519,6 +6434,22 @@ class AlertsSettings(_Section):
         if isinstance(v, str):
             return [addr.strip() for addr in v.split(",") if addr.strip()]
         return v
+
+    @model_validator(mode="after")
+    def _webhook_url_is_buildable(self) -> AlertsSettings:
+        """Vault BACKLOG #3533 item 14: refuse at load a webhook URL the notifier build would refuse.
+
+        It runs the build's own posture-free checks, ``refuse_unbuildable_webhook_url``, so settings
+        load, ``check`` and the serve pre-flight refuse what the build refuses on them; that
+        function's docstring lists them. The value is kept as written. The revocation guard reads
+        the posture and stays at the build. An empty value stays "not configured", as every
+        consumer reads it."""
+        if self.webhook_url:
+            # Lazy, to keep the edit local; the module imports no transports package.
+            from messagefoundry.config.alert_webhook import refuse_unbuildable_webhook_url
+
+            refuse_unbuildable_webhook_url(self.webhook_url, self.webhook_allowed_hosts)
+        return self
 
     @model_validator(mode="after")
     def _refuse_a_login_over_an_unauthenticated_hop(self) -> AlertsSettings:
@@ -11398,10 +11329,10 @@ def security_loosenings(
     # is dialled. The reason is in the entry for the same reason as the Vault pairs above.
     # BACKLOG #5527: the CRL clause states the three conditions a CRL check needs, and names the
     # paths that check none, and stays static. Whether the [tls] section reached the app is a fact
-    # of the app (app.state.tls_settings, which create_managed_app stashes from its tls_settings
-    # argument, None unless passed, and an embedder of a direct create_app may set), not of these
-    # arguments. Loopback could be read off ai.endpoint, but the
-    # app half would still be static, so both stay named.
+    # of the app (app.state.tls_settings: create_app stashes its tls_settings argument, None unless
+    # passed, and create_managed_app's lifespan stashes its own at start), not of these arguments.
+    # Loopback could be read off ai.endpoint, but the app half would still be static, so both stay
+    # named.
     if ai.endpoint_revocation_attested:
         out.append(
             (
@@ -11410,8 +11341,10 @@ def security_loosenings(
                 f"the engine (reason: {ai.endpoint_revocation_attested_reason}) -- the AI broker "
                 "verifies that certificate but its own handshake checks no OCSP, and checks no CRL "
                 "unless all three hold: [tls].crl_file is set, the [tls] section reaches the app "
-                "serving POST /ai/chat (`messagefoundry serve` hands it; a direct create_app holds "
-                "none unless the embedder sets it), and the endpoint is not loopback. So at least "
+                "serving POST /ai/chat (`messagefoundry serve` hands it; an embedder's "
+                "create_managed_app holds none unless it passes tls_settings, and a direct "
+                "create_app none unless it passes tls_settings or sets app.state.tls_settings), "
+                "and the endpoint is not loopback. So at least "
                 "a loopback endpoint, and an app the [tls] section never reached, check no CRL "
                 "whatever [tls].crl_file says. The "
                 "attestation adds no check. Where no CRL is checked, the revocation refusal is "

@@ -68,6 +68,7 @@ import re
 import socket
 import socketserver
 import ssl
+import sys
 import threading
 import time
 import warnings
@@ -78,7 +79,13 @@ from io import BytesIO
 from typing import Any, ClassVar, NamedTuple, assert_never, cast
 
 from messagefoundry.auth.trust_anchors import inbound_ca_cadata, refuse_an_unread_ca_pin
-from messagefoundry.config.models import ConnectorType, Destination, Source, bool_setting
+from messagefoundry.config.models import (
+    ConnectorType,
+    Destination,
+    Source,
+    bool_setting,
+    flag_from_settings,
+)
 from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchorPolicy,
@@ -106,7 +113,14 @@ from messagefoundry.parsing.dicom._inflate import (
 )
 from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
-from messagefoundry.redaction import _REDACTED, safe_exc, safe_traceback
+from messagefoundry.redaction import (
+    _REDACTED,
+    prepare_log_record,
+    prints_a_codec_error,
+    safe_exc,
+    safe_text,
+    safe_traceback,
+)
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -372,9 +386,18 @@ _ANSWER_SEND_SECONDS = 1.0
 
 #: The least rate, in data set bytes a second, at which one DIMSE message has to arrive once its
 #: first fragment has (vault BACKLOG #5080); :class:`_ReceiptTally` says how the deadline is built
-#: from it, and docs/DICOM.md section 3 states the bound it gives. A constant, not a setting, chosen
-#: far under any real link: 64 KiB a second is a quarter of a 2 Mbit/s line.
-_MIN_MESSAGE_BYTES_PER_SECOND = 64 * 1024
+#: from it, and docs/DICOM.md section 3 states the bound it gives. The default of the SCP's
+#: ``min_message_bytes_per_second``, chosen far under most links: 64 KiB a second is a quarter of a
+#: 2 Mbit/s line. A slower link needs the setting (vault BACKLOG #6637).
+_DEFAULT_MESSAGE_BYTES_PER_SECOND = 64 * 1024
+
+#: The least ``min_message_bytes_per_second`` the SCP takes. The deadline is the slow-sender defence,
+#: so no value may switch it off or make it unbounded. At this rate the longest message the SCP
+#: holds, twice its 16 MiB ceiling, has about 34 minutes plus ``timeout_seconds``. That halves the
+#: longest slot hold against the 8 KiB a second first proposed, which the Lander's ruling decided
+#: (vault BACKLOG #6637). The row's test delivered its object with this rate set over a 32 KiB a
+#: second link, so it shows that a setting at the minimum delivers; it sets no lower bound.
+_LEAST_MESSAGE_BYTES_PER_SECOND = 16 * 1024
 
 #: The least and the most ``max_pdu_size`` the SCP takes. pynetdicom fragments an object into PDVs
 #: of six bytes less than the size a peer offers, so a size of six or less breaks its senders, and
@@ -476,13 +499,22 @@ class _Shape(NamedTuple):
     """One kind of log line that names a peer's value. ``head`` is matched at the start of the line,
     or found anywhere in it where ``anywhere`` is set; the value runs from there to ``tail``, the
     fixed text the line ends with, found from its last ``anchor``. A line whose end is not ``tail``
-    loses everything after its head. No pattern here can backtrack over the peer's text, so a long
-    value costs one pass, on whatever thread logged it."""
+    loses everything after its head. ``whole`` is for a line with more than one value: it stays as
+    it is where it matches whole and :func:`_kept` keeps each group, and otherwise loses everything
+    after its head. ``warning`` is the pattern of the ``UserWarning`` pydicom raises beside the line,
+    with the same value in it. ``anchor_required`` is for a head this general: it counts only in a
+    line that holds ``anchor``. In ``head``, ``tail`` and ``whole``, each unbounded run stops at the literal after
+    it, so a long value costs one pass, on whatever thread logged it. A ``warning`` pattern can
+    backtrack over the value: ``.*`` gives text back one character at a time. Each is matched from
+    the start of the warning with at most one such run, so its cost stays linear in the text."""
 
     head: re.Pattern[str]
     anchor: str | None = None
     tail: re.Pattern[str] | None = None
     anywhere: bool = False
+    whole: re.Pattern[str] | None = None
+    warning: str | None = None
+    anchor_required: bool = False
 
 
 #: The lines, by logger, that name a value a peer sent which pynetdicom or pydicom refuses or flags
@@ -492,24 +524,121 @@ class _Shape(NamedTuple):
 #: <reason>`` at ERROR, whose reasons are fixed strings in ``pynetdicom._validators``.
 #: ``pynetdicom.presentation`` and ``pynetdicom.pdu_primitives`` write ``The <name> '<value>' is
 #: non-conformant``, and ``pynetdicom.presentation`` names a proposed or accepted transfer syntax
-#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom.dul`` logs the
-#: exception a PDU it receives raised as it decoded, which is the refusal ``set_uid`` or ``set_ae``
-#: raises with the value in it, or ``decode_bytes``'s ``Unable to decode '<hex>'`` with the value's
-#: bytes. ``pydicom`` writes ``warn_and_log``'s ``Invalid value for VR <VR>: <repr>.``,
-#: with a pointer to PS3.5 after it when a data element is read, and sometimes after its own length
-#: message in the same line. ``pynetdicom._handlers`` writes ``<label> : <value>`` at DEBUG for each
-#: association request and DIMSE message it receives or sends; a head with a ``label`` group keeps a
-#: value that passes :func:`_kept`, since a real UID or AE title may be logged. At least these
+#: again when it is under the DICOM root and no transfer syntax. ``pynetdicom._handlers`` writes
+#: ``<label> : <value>`` at DEBUG for each association request and DIMSE message it receives or
+#: sends; a head with a ``label`` group keeps a value that passes :func:`_kept`, since a real UID or
+#: AE title may be logged. :data:`_REFUSALS` holds the shapes an exception can carry. At least these
 #: shapes, read from pynetdicom 3.0.4 and pydicom 3.0.2; a line of another shape, or on another
 #: logger, passes whole.
 _NON_CONFORMANT_NAME = _Shape(
     re.compile(r"The [A-Za-z ]{1,64} '"), "' is non-conformant", re.compile("' is non-conformant")
 )
-_REFUSED_VALUE = _Shape(re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^']*"))
+_NOT_A_PRIVATE_CREATOR = "' is not a valid private creator"
+#: What ``set_uid``, ``set_ae``, ``decode_bytes`` and pydicom's ``validate_value`` say as they refuse
+#: a value, read wherever it appears in any record or traceback on a filtered logger, since a
+#: refusal is logged by whichever module caught it and pydicom's ``tag_in_exception`` wraps it in a
+#: longer message. Each tail is one line: text after it is not known to be fixed, so it goes too.
+_REFUSALS: tuple[_Shape, ...] = (
+    _Shape(
+        re.compile(r"Invalid '[^']*' value '"), "' - ", re.compile(r"' - [^'\n]*"), anywhere=True
+    ),
+    _Shape(
+        re.compile(r"Unable to decode '"),
+        "' using the ",
+        re.compile(r"' using the [^'\n]*"),
+        anywhere=True,
+    ),
+    # With a pointer to PS3.5 after it when a data element is read, and sometimes after pydicom's own
+    # length message in the same line.
+    _Shape(
+        re.compile(r"Invalid value for VR [A-Z]{2}: "),
+        ". Please see <",
+        re.compile(r"\. Please see <[^<>\n]*> for allowed values for each VR\."),
+        anywhere=True,
+        warning=r".*Invalid value for VR [A-Z]{2}: ",  # not first where a length message leads it
+    ),
+    # pydicom's Specific Character Set lines. The first names the value twice, its second copy
+    # patched from the first, so nothing after the head is fixed text.
+    _Shape(
+        re.compile(r"Incorrect value for Specific Character Set '"),
+        anywhere=True,
+        warning=r"Incorrect value for Specific Character Set '",
+    ),
+    _Shape(
+        re.compile(r"Unknown encoding '"),
+        "' - using default encoding instead",
+        re.compile(r"' - using default encoding instead"),
+        anywhere=True,
+        warning=r"Unknown encoding '",
+    ),
+    _Shape(
+        re.compile(
+            r"Value '[^']*' for Specific Character Set does not allow code extensions, ignoring: "
+        ),
+        anywhere=True,
+        warning=r"Value '[^']*' for Specific Character Set does not allow code extensions, ",
+    ),
+    # A DS or IS value, with the note pydicom adds to it when it raises rather than warns. Its
+    # warning is matched from the start of the text: with a leading ``.*``, this pattern, the first
+    # filter every UserWarning meets, would be quadratic on a value of repeated ``Value "``.
+    _Shape(
+        re.compile(r'Value "'),
+        '" is not valid for elements with a VR of ',
+        re.compile(
+            r'" is not valid for elements with a VR of (?:DS|IS)'
+            r"(?:\nSet reading_validation_mode to WARN or IGNORE to bypass)?"
+        ),
+        anywhere=True,
+        warning=r'Value "(?s:.*)" is not valid for elements with a VR of ',
+    ),
+    # A numeric element whose length is no multiple of its VR's size: pydicom quotes its raw bytes.
+    _Shape(
+        re.compile(r"Instead received "),
+        " with length ",
+        re.compile(
+            r" with length \d+ and struct format '[^'\n]*' which corresponds to bytes per value of "
+            r"\d+\."
+        ),
+        anywhere=True,
+        warning=r"Expected total bytes to be an even multiple of bytes per value\. Instead received ",
+    ),
+    # Python's own refusal of a DS or IS that is no number, which quotes the text whole.
+    _Shape(re.compile(r"could not convert string to float: "), anywhere=True),
+    _Shape(re.compile(r"invalid literal for int\(\) with base \d+: "), anywhere=True),
+    # A private element's creator with more than one value, which pydicom prints whole, as a line
+    # and in the KeyError it raises, whose str() is the repr of the line: it ends in a quote, and
+    # escapes each single quote where the value holds a double one.
+    _Shape(
+        re.compile(r"\([0-9A-F]{4},[0-9A-F]{4}\) \\?'"),
+        _NOT_A_PRIVATE_CREATOR,
+        re.compile(_NOT_A_PRIVATE_CREATOR + "[\"']?"),
+        anywhere=True,
+        warning=r"\([0-9A-F]{4},[0-9A-F]{4}\) '(?s:.*)" + _NOT_A_PRIVATE_CREATOR,
+        anchor_required=True,
+    ),
+)
 _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
+    # An object's SOP class and transfer syntax, as the SCU found no accepted context for them.
+    "pynetdicom.association": (
+        _Shape(
+            re.compile(r"No presentation context for '"),
+            whole=re.compile(
+                r"No presentation context for '([^']*)' has been accepted by the peer"
+                r"(?: with '([^']*)' transfer syntax)? for the (?:SCU|SCP) role"
+            ),
+        ),
+        # The SOP class of a request pynetdicom has no service for, which a peer's command names.
+        _Shape(
+            re.compile(r"No supported service class available for the SOP Class UID '"),
+            whole=re.compile(
+                r"No supported service class available for the SOP Class UID '([^']*)', please see "
+                r"the pynetdicom\.sop_class\.register_uid\(\) function if you need to add support "
+                r"for a private, retired or otherwise unknown SOP Class UID"
+            ),
+        ),
+    ),
     "pynetdicom.utils": (
         _Shape(re.compile(r"Non-conformant '[^']*' value '"), "'", re.compile("'")),
-        _REFUSED_VALUE,
     ),
     "pynetdicom.presentation": (
         _NON_CONFORMANT_NAME,
@@ -522,18 +651,6 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
         ),
     ),
     "pynetdicom.pdu_primitives": (_NON_CONFORMANT_NAME,),
-    "pynetdicom.dul": (
-        _REFUSED_VALUE,
-        _Shape(re.compile(r"Unable to decode '"), "' using the ", re.compile(r"' using the [^']*")),
-    ),
-    "pydicom": (
-        _Shape(
-            re.compile(r"Invalid value for VR [A-Z]{2}: "),
-            ". Please see <",
-            re.compile(r"\. Please see <[^<>]*> for allowed values for each VR\."),
-            anywhere=True,
-        ),
-    ),
     "pynetdicom._handlers": (
         _Shape(
             re.compile(
@@ -545,6 +662,11 @@ _PEER_VALUE_LINES: dict[str, tuple[_Shape, ...]] = {
             )
         ),
         _Shape(re.compile(r"(?P<label>) +=")),  # a transfer syntax, alone under its context
+        # A user identity's fields, in clear in the dump of an association request either way: never
+        # kept, whatever they spell, and the bracket pynetdicom opens goes with the value.
+        _Shape(re.compile(r" +(?:Username|Password): ")),
+        # pretty_bytes' hex of an extended negotiation item's application information.
+        _Shape(re.compile(r" +(?=[0-9a-f]{2}(?:  [0-9a-f]{2})*$)")),
     ),
 }
 
@@ -562,38 +684,72 @@ _TITLE_LABELS = frozenset(
 
 
 def _redacted_line(shapes: tuple[_Shape, ...], text: str) -> str | None:
-    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value."""
+    """``text`` with the peer's value in it redacted, or ``None`` where it keeps its value. The head
+    earliest in the text decides, since all after it is the value or a fixed tail, so a second value
+    further on goes with the first."""
+    found: tuple[_Shape, re.Match[str]] | None = None
     for shape in shapes:
-        head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
-        if head is None:
+        if shape.anchor_required and (shape.anchor or "") not in text:
             continue
-        rest = text[head.end() :]
-        label = head.groupdict().get("label")
-        if label is not None and _kept(label, rest):
+        head = shape.head.search(text) if shape.anywhere else shape.head.match(text)
+        if head is not None and (found is None or head.start() < found[1].start()):
+            found = (shape, head)
+            if head.start() == 0:  # no later shape can start ahead of it
+                break
+    if found is None:
+        return None
+    shape, head = found
+    if shape.whole is not None:
+        line = shape.whole.fullmatch(text)
+        if line is not None and all(_kept("", value) for value in line.groups() if value):
             return None
-        tail = ""
-        if shape.anchor is not None and shape.tail is not None:
-            cut = rest.rfind(shape.anchor)
-            if cut >= 0 and shape.tail.fullmatch(rest, cut):
-                tail = rest[cut:]
-        return f"{text[: head.end()]}{_REDACTED}{tail}"
-    return None
+    rest = text[head.end() :]
+    label = head.groupdict().get("label")
+    if label is not None and _kept(label, rest):
+        return None
+    tail = ""
+    if shape.anchor is not None and shape.tail is not None:
+        cut = rest.rfind(shape.anchor)
+        if cut >= 0 and shape.tail.fullmatch(rest, cut):
+            tail = rest[cut:]
+    return f"{text[: head.end()]}{_REDACTED}{tail}"
 
 
-#: Every logger the filter is on: those above, and three more a pre-read of a command set writes to
-#: with no peer value in the line, so that the hold covers them: ``message_to_primitive``'s WARNING for an element with more than
-#: one value, the Move Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
+#: Every logger the filter is on. Those above; ``pydicom``, for :data:`_REFUSALS`; each pynetdicom
+#: module that logs an exception it caught, which can be a refusal or hold one in its chain; and
+#: three a pre-read of a command set writes to with no peer value in the line, so that the hold
+#: covers them: ``message_to_primitive``'s WARNING for an element with more than one value, the Move
+#: Originator setter's ERROR, and ``dsutils.decode``'s DEBUG line.
 _FILTERED_LOGGERS = (
     *_PEER_VALUE_LINES,
+    "pydicom",
+    "pynetdicom.acse",
+    "pynetdicom.dimse",
     "pynetdicom.dimse_messages",
     "pynetdicom.dimse_primitives",
     "pynetdicom.dsutils",
+    "pynetdicom.dul",
+    "pynetdicom.events",
+    "pynetdicom.fsm",
+    "pynetdicom.service_class",
+    "pynetdicom.transport",
 )
 
-#: The start of the ``UserWarning`` pydicom's ``warn_and_log`` raises beside its log line, with the
-#: same value in it. It is ignored; the log line, redacted, still says what was wrong. Unignored, it
-#: goes to stderr, which the Windows service writes to a file.
-_PYDICOM_INVALID_VALUE_WARNING = r".*Invalid value for VR [A-Z]{2}: "
+#: What the filter reads on each logger: its own lines, then the refusals every logger can carry.
+_SHAPES_BY_LOGGER: dict[str, tuple[_Shape, ...]] = {
+    name: (*_PEER_VALUE_LINES.get(name, ()), *_REFUSALS) for name in _FILTERED_LOGGERS
+}
+
+#: The start of each ``UserWarning`` pydicom's ``warn_and_log`` raises beside a log line above, with
+#: the same value in it. Each is ignored; the log line, redacted, still says what was wrong.
+#: Unignored, it goes to stderr, which the Windows service writes to a file.
+_PYDICOM_VALUE_WARNINGS = tuple(shape.warning for shape in _REFUSALS if shape.warning is not None)
+
+#: Those patterns as ``warnings.filterwarnings`` leaves them at the front of ``warnings.filters``.
+_PYDICOM_WARNING_FILTERS = [
+    ("ignore", re.compile(message, re.IGNORECASE), UserWarning, None, 0)
+    for message in reversed(_PYDICOM_VALUE_WARNINGS)
+]
 
 #: ``held`` is a list only inside :func:`_logs_held` on this thread, and every record the filter
 #: sees on the thread then goes into it instead of the log.
@@ -649,19 +805,24 @@ def _uid_names() -> frozenset[str]:
 
 
 class _PeerValueFilter(logging.Filter):
-    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` names, and
-    hold every line inside :func:`_logs_held`. The line itself is kept, so the warning, its element
-    and its reason are still in the log; only the value goes. A filter on a logger sees only what is
-    logged on that logger itself, so it is added to each by name."""
+    """Redact a refused or flagged peer value from the lines :data:`_PEER_VALUE_LINES` and
+    :data:`_REFUSALS` name, render a codec error without its byte, and hold every line inside
+    :func:`_logs_held`. The line itself is kept, so the warning, its element and its reason are still
+    in the log; only the value goes. A filter on a logger sees only what is logged on that logger
+    itself, so it is added to each by name."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         held: list[logging.LogRecord] | None = getattr(_PRE_READ, "held", None)
         if held is not None:
             held.append(record)
             return False
-        shapes = _PEER_VALUE_LINES.get(record.name, ())
-        if not shapes:
-            return True
+        shapes = _SHAPES_BY_LOGGER.get(record.name, _REFUSALS)
+        # A codec error in the message or its args names a byte of what it failed on. The engine's
+        # log chain renders it safely, but a host's handler need not, so it is done here as well. The
+        # traceback is left out of this step and read below.
+        info, record.exc_info = record.exc_info, None
+        prepare_log_record(record)
+        record.exc_info = info
         try:
             text = record.getMessage()
         except Exception as failed:  # noqa: BLE001 - bad %-args, or a msg whose str() raises
@@ -696,18 +857,29 @@ def _redact_traceback(
     which redacting the record's own message does not reach. The traceback is rendered through
     :func:`~messagefoundry.redaction.safe_traceback` into ``exc_text`` and ``exc_info`` cleared, as
     ``prepare_log_record`` does, so a formatter writes the rendered copy and its codec-error lines
-    keep that function's protection. A traceback with no such message is left as it was.
+    keep that function's protection. A traceback with no such message is left as it was, unless it
+    holds a codec error, whose line only that rendering rewrites.
 
     The redaction is a replace of each message in the rendered text, so a message the rendering
     does not hold verbatim withholds the whole traceback. ``safe_traceback`` rewrites a line, or
     falls back to :func:`~messagefoundry.redaction.safe_exc`'s single line, at least for a codec
     error and on a CPython without ``TracebackException._str``, and the value could survive there
-    in a form the replace does not find."""
+    in a form the replace does not find. A link with notes or group members withholds it too, since
+    the stdlib prints those and this walk does not read them. A codec error's own notes are
+    ``safe_traceback``'s to keep or drop."""
     redactions: list[tuple[str, str]] = []
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup) or (
+            getattr(current, "__notes__", None) and not isinstance(current, UnicodeError)
+        ):
+            record.exc_info = None
+            record.exc_text = (
+                f"{type(exc).__name__} (traceback withheld: it has notes or group members)"
+            )
+            return
         message = str(current)
         redacted = _redacted_line(shapes, message)
         if redacted is not None:
@@ -717,15 +889,20 @@ def _redact_traceback(
             current = current.__cause__
         else:
             current = None if current.__suppress_context__ else current.__context__
+    info = (type(exc), exc, exc.__traceback__)
+    rendered = safe_traceback(info)
     if not redactions:
+        # Where safe_traceback rewrote a codec error's line, a stock formatter would write it raw.
+        if rendered != logging.Formatter().formatException(info):
+            record.exc_info, record.exc_text = None, rendered
         return
-    rendered = safe_traceback((type(exc), exc, exc.__traceback__))
     # All checked before any replace, since one link's message can repeat or hold another's.
     if any(message not in rendered for message, _ in redactions):
         record.exc_info = None
         record.exc_text = f"{type(exc).__name__} (traceback withheld: its value was not redacted)"
         return
-    for message, redacted in redactions:
+    # Longest first: a shorter message replaced first would break the match of one that holds it.
+    for message, redacted in sorted(redactions, key=lambda pair: len(pair[0]), reverse=True):
         rendered = rendered.replace(message, redacted)
     record.exc_info, record.exc_text = None, rendered
 
@@ -744,10 +921,38 @@ def _redact_flagged_peer_values() -> None:
     idempotent."""
     for name in _FILTERED_LOGGERS:
         logging.getLogger(name).addFilter(_PEER_VALUE_FILTER)
-    warnings.filterwarnings("ignore", message=_PYDICOM_INVALID_VALUE_WARNING, category=UserWarning)
+    _ignore_pydicom_value_warnings()
+
+
+def _ignore_pydicom_value_warnings() -> None:
+    """Put the ignores for pydicom's warning copies first in ``warnings.filters``, unless they are.
+
+    The check keeps this cheap enough for the SCU to run per association, and it matters beyond the
+    cost: each ``filterwarnings`` call resets every module's once-per-location record, so installing
+    them per send would repeat any other library's warning on stderr once per message. With
+    context-aware warnings, ``warnings.filters`` is not the list in force, so it decides nothing."""
+    context_aware = getattr(sys.flags, "context_aware_warnings", 0)
+    in_place = list(warnings.filters[: len(_PYDICOM_WARNING_FILTERS)]) == _PYDICOM_WARNING_FILTERS
+    if in_place and not context_aware:
+        return
+    for message in _PYDICOM_VALUE_WARNINGS:
+        warnings.filterwarnings("ignore", message=message, category=UserWarning)
 
 
 _redact_flagged_peer_values()
+
+
+def _safe_library_exc(exc: BaseException) -> str:
+    """:func:`~messagefoundry.redaction.safe_exc` of an exception pydicom or pynetdicom raised, with
+    a refusal's value redacted. ``redact()`` does not recognise a UID, so a refused one survives it,
+    and it rewrites some of the text a shape starts with, so the shapes read the message before it
+    does. A codec error's ``str()`` is never read here: it names a byte."""
+    if isinstance(exc, UnicodeError) or prints_a_codec_error(exc):
+        return safe_exc(exc)
+    redacted = _redacted_line(_REFUSALS, str(exc))
+    if redacted is None:
+        return safe_exc(exc)
+    return f"{type(exc).__name__}: {safe_text(redacted)}"
 
 
 def _write_held(held: list[logging.LogRecord]) -> None:
@@ -866,8 +1071,8 @@ class _ReceiptTally:
     fragments are read through a ``memoryview``, so counting one copies nothing.
 
     A message also has a deadline, from the PDU that brings its first fragment (vault BACKLOG #5080):
-    ``timeout_seconds`` plus its data set bytes so far at :data:`_MIN_MESSAGE_BYTES_PER_SECOND`. It
-    is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
+    ``timeout_seconds`` plus its data set bytes so far at ``min_bytes_per_second``, the SCP's
+    ``min_message_bytes_per_second``. It is checked as each P-DATA-TF is counted, so a message that is past it ends the association when
     its next PDU lands. A peer that sends nothing more is ended by pynetdicom's idle timer, and one
     that stops part way through a PDU by the read deadline. A
     message that completes is never ended by it, and the clock starts again with the next one."""
@@ -877,12 +1082,15 @@ class _ReceiptTally:
         *,
         max_data_set_bytes: int,
         timeout_seconds: float,
+        min_bytes_per_second: int,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         #: Past this the association is ended: twice the SCP's effective ``max_object_bytes``.
         self.max_data_set_bytes = max_data_set_bytes
         #: The fixed part of a message's deadline: the SCP's ``timeout_seconds``.
         self.timeout_seconds = timeout_seconds
+        #: The rate part of a message's deadline, in data set bytes a second.
+        self.min_bytes_per_second = min_bytes_per_second
         self._clock = clock
         #: When the message in progress began, on ``clock``, or ``None`` between messages.
         self.began: float | None = None
@@ -926,12 +1134,12 @@ class _ReceiptTally:
         names the bound, never a byte count or a time the peer's sending made."""
         if self.began is None:  # the PDU completed its message
             return None
-        allowed = self.timeout_seconds + self.data_set_bytes / _MIN_MESSAGE_BYTES_PER_SECOND
+        allowed = self.timeout_seconds + self.data_set_bytes / self.min_bytes_per_second
         if self._clock() - self.began <= allowed:
             return None
         return _ABORT_OVER_LIMIT, (
             "a message did not arrive within timeout_seconds plus its data set at "
-            f"{_MIN_MESSAGE_BYTES_PER_SECOND} bytes a second"
+            f"{self.min_bytes_per_second} bytes a second (min_message_bytes_per_second)"
         )
 
     def _take_command(
@@ -1101,6 +1309,7 @@ def _admitting_server_class() -> type[Any]:
             stopping: threading.Event,
             max_pdu_size: int,
             max_object_bytes: int,
+            min_message_bytes_per_second: int,
             **kwargs: Any,
         ) -> None:
             #: The longest P-DATA-TF variable field the SCP offers to take, and so takes.
@@ -1108,6 +1317,8 @@ def _admitting_server_class() -> type[Any]:
             #: The SCP's effective object cap. An association whose object passes twice this is
             #: ended (owner ruling B462-R3).
             self.max_object_bytes = max_object_bytes
+            #: The rate part of each message's deadline; see :class:`_ReceiptTally`.
+            self.min_message_bytes_per_second = min_message_bytes_per_second
             self._admit = admit
             self._refused = refused
             #: Called besides ``refused`` for a connection refused at a connection cap, which the
@@ -1768,6 +1979,7 @@ def _admitting_server_class() -> type[Any]:
             sock.tally = _ReceiptTally(
                 max_data_set_bytes=2 * server.max_object_bytes,
                 timeout_seconds=cast(float, server.ae.network_timeout),
+                min_bytes_per_second=server.min_message_bytes_per_second,
             )
             assoc.start()
 
@@ -1785,8 +1997,11 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     default) loads an unencrypted key exactly as before.
 
     ``name`` is the connection's, for the inbound CA's messages and audit label (BACKLOG #1142)."""
+    # Read strictly, before the pin check reads tls by truthiness, so a non-bool is refused as
+    # itself rather than as an unread pin: bool("false") is True (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
     refuse_an_unread_ca_pin(s, inbound=True, connector="DICOM listener")
-    if not s.get("tls"):
+    if not tls:
         return None
     cert, key, ca = s.get("tls_cert_file"), s.get("tls_key_file"), s.get("tls_ca_file")
     if not cert:
@@ -1826,6 +2041,27 @@ def _server_ssl_context(s: dict[str, Any], *, name: str = "") -> ssl.SSLContext 
     harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
     return ctx
+
+
+def _message_rate_setting(s: Mapping[str, Any]) -> int:
+    """The SCP's ``min_message_bytes_per_second``. Unset is the shipped rate; a value that is set
+    has to be a whole number at or over :data:`_LEAST_MESSAGE_BYTES_PER_SECOND`, so ``None``, zero
+    and every other spelling of "off" are refused rather than read as no deadline. The refusal
+    withholds the value, by the rule in :func:`~messagefoundry.transports.base.count_setting`."""
+    if "min_message_bytes_per_second" not in s:
+        return _DEFAULT_MESSAGE_BYTES_PER_SECOND
+    rate = count_setting(
+        s["min_message_bytes_per_second"],
+        knob="min_message_bytes_per_second",
+        transport="DICOM-SCP source",
+    )
+    if rate < _LEAST_MESSAGE_BYTES_PER_SECOND:
+        raise ValueError(
+            "DICOM-SCP source: min_message_bytes_per_second must be at least "
+            f"{_LEAST_MESSAGE_BYTES_PER_SECOND} (value withheld); it bounds how long a slow sender "
+            "can hold an association, and it cannot be turned off"
+        )
+    return rate
 
 
 #: The end of the SCP's refusal for a ``max_object_bytes`` that is not above zero (BACKLOG #2103). The
@@ -1899,6 +2135,7 @@ class DicomScpSource(SourceConnector):
                 "second; it is a deadline on every read and send, so a smaller one would end "
                 "nearly every peer"
             )
+        self._min_message_bytes_per_second = _message_rate_setting(s)
         # Association-rate pacing (ASVS 2.4.1 / 15.2.2, BACKLOG #1114). The keys are NOT
         # max_messages_per_second/message_burst and are not read through mllp._pacing_settings, because
         # the UNIT here is an association, not a message — see _pace_association for why a message-rate
@@ -1981,7 +2218,7 @@ class DicomScpSource(SourceConnector):
         # #1182 and #316. Read at vault origin/main the same day, #316 is closed (shipped
         # 2026-07-30, the AE-title half) and #1182 is about backend-hop credentials, so no open row
         # yet names this half; #2622 holds it until one does.
-        mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
+        mtls_on = flag_from_settings(s, "tls") and bool(s.get("tls_ca_file"))
         allowlist_on = allowlist_restricts(self._source_ip_allowlist)
         if self._host not in _LOOPBACK_HOSTS and not (allowlist_on or mtls_on):
             unpaired = (
@@ -2116,6 +2353,7 @@ class DicomScpSource(SourceConnector):
             stopping=self._stopping,
             max_pdu_size=self._max_pdu_size,
             max_object_bytes=self._max_object_bytes,
+            min_message_bytes_per_second=self._min_message_bytes_per_second,
         )
         server.start_serving()
         self._ae = ae
@@ -2415,6 +2653,7 @@ class DicomScpSource(SourceConnector):
         DIMSE status int. Any failure is caught and returned as a failure status; it must never raise
         (that would break the association). Logs carry only routing-safe identifiers."""
         try:
+            _ignore_pydicom_value_warnings()  # a filter changed since the start would bring them back
             requestor = event.assoc.requestor
             peer_ip = str(getattr(requestor, "address", "") or "")
             calling_ae = str(getattr(requestor, "ae_title", "") or "")
@@ -2460,7 +2699,7 @@ class DicomScpSource(SourceConnector):
                     "DICOM C-STORE from %s (AE %r): object could not be decoded/encoded: %s",
                     peer_ip,
                     calling_ae,
-                    safe_exc(exc),
+                    _safe_library_exc(exc),
                 )
                 return _STATUS_CANNOT_UNDERSTAND
             # For the log lines below alone, so a value pydicom flags as it reads it goes no further.
@@ -2484,7 +2723,7 @@ class DicomScpSource(SourceConnector):
                 object_bytes, peer_ip=peer_ip, sop_instance=sop_instance, sop_class=sop_class
             )
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
-            logger.error("DICOM C-STORE failed unexpectedly: %s", safe_exc(exc))
+            logger.error("DICOM C-STORE failed unexpectedly: %s", _safe_library_exc(exc))
             return _STATUS_CANNOT_UNDERSTAND
 
     def _raw_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
@@ -2670,8 +2909,11 @@ def _client_ssl_context(
     CA per the resolved anchor. ``None`` (a direct test build) keeps the historical
     ``create_default_context(cafile=…)`` trust store. It only selects WHICH roots verify the
     peer — verification is never disabled — so the internal CA never weakens a refusal."""
+    # Both read strictly and first, as the listener's tls is (vault BACKLOG #3234 added step 8).
+    tls = flag_from_settings(s, "tls")
+    allow_expired = flag_from_settings(s, "tls_allow_expired")
     refuse_an_unread_ca_pin(s, inbound=False, connector="DICOM destination")
-    if not s.get("tls"):
+    if not tls:
         return None
     ca = s.get("tls_ca_file")
     # #190 (ADR 0093): the connection's own tls_ca_file wins verbatim, else the internal-CA anchor.
@@ -2701,7 +2943,7 @@ def _client_ssl_context(
     # while STILL validating the chain's signatures, the hostname and key usage. At least the
     # intermediates' and the trust anchor's validity periods, and a CRL's own window, go unchecked too
     # (vault BACKLOG #5089). Verification stays ON; default off = byte-identical.
-    if s.get("tls_allow_expired"):
+    if allow_expired:
         relax_verify_expiry(ctx, host=str(s.get("host", "")))
     return ctx
 
@@ -2719,6 +2961,17 @@ def recover_dicom_object_bytes(payload: str, *, label: str) -> bytes:
             code="bad-carriage",
             permanent=True,
         ) from exc
+
+
+def _hold_the_reactor(event: Any) -> None:
+    """Keep a requestor's reactor at its checkpoint until the association's one send has its answer
+    (vault BACKLOG #6637, item 19). pynetdicom 3.0.4's send clears the checkpoint and trusts
+    ``_is_paused``, which still reads ``True`` for a reactor just past it. That reactor runs one more
+    pass, can take the response off the queue and drops it, so the send waits out its DIMSE timeout
+    and a peer that stored the object is sent it again. Cleared here, on ``EVT_ACCEPTED``, before
+    the association reads as established and before the reactor starts, its first pass stops at the
+    checkpoint. The send's own ``set()``, or ``release()``'s, lets it go on."""
+    event.assoc._reactor_checkpoint.clear()
 
 
 class DicomScuDestination(DestinationConnector):
@@ -2739,6 +2992,12 @@ class DicomScuDestination(DestinationConnector):
             )
         self._host = str(host)
         self._port = port_setting(s.get("port", 104), transport="DICOM-SCU destination")
+        if "min_message_bytes_per_second" in s:
+            # Refused rather than ignored: on a slow link the sender's limit is timeout_seconds.
+            raise ValueError(
+                "DICOM-SCU destination: min_message_bytes_per_second is a setting of the receiving "
+                "SCP; on the sending side, raise timeout_seconds past the object's time on the link"
+            )
         self._calling_ae_title = str(s["ae_title"])
         called = s.get("called_ae_title")
         # pynetdicom's accept-any token when the peer AE title is left unset.
@@ -2850,6 +3109,7 @@ class DicomScuDestination(DestinationConnector):
     def _build_ae(self) -> Any:
         from pynetdicom import AE
 
+        _ignore_pydicom_value_warnings()  # the SCP's start does this too; this host may have none
         ae = AE(ae_title=self._calling_ae_title)
         ae.acse_timeout = self._timeout
         ae.dimse_timeout = self._timeout
@@ -2859,12 +3119,15 @@ class DicomScuDestination(DestinationConnector):
 
     def _associate(self, ae: Any) -> Any:
         """Open a blocking association to the peer (DICOM-over-TLS when configured). Caller releases it."""
+        from pynetdicom import evt
+
         return ae.associate(
             self._host,
             self._port,
             ae_title=self._called_ae_title,
             max_pdu=self._max_pdu_size,
             tls_args=(self._ssl, self._host) if self._ssl is not None else None,
+            evt_handlers=[(evt.EVT_ACCEPTED, _hold_the_reactor)],
         )
 
     def _c_store(self, object_bytes: bytes) -> None:
@@ -2889,7 +3152,10 @@ class DicomScuDestination(DestinationConnector):
         inflate here too, ahead of ``dcmread``. (The network-facing SCP has its own guard over the
         negotiated transfer syntax in ``_on_c_store``.) A deflate bomb is a permanent dead-letter (a retry
         re-sends the identical bad object)."""
+        _ignore_pydicom_value_warnings()  # ahead of the reads below, which can flag a value
         dcmread = load_dcmread()
+        from pydicom.uid import UID
+
         # Also outside the try, for the same reason: a pydicom without the readers the guard replays is
         # a deploy error, and the broad except below must not turn it into a per-message bad-object.
         load_header_readers()
@@ -2911,18 +3177,42 @@ class DicomScuDestination(DestinationConnector):
         try:
             dataset = dcmread(BytesIO(object_bytes))
             transfer_syntax = dataset.file_meta.TransferSyntaxUID
-            sop_class = str(dataset.SOPClassUID)
+            read_class = dataset.SOPClassUID
+            sop_class = str(read_class)
+            # For the log lines and errors alone; the raw class is what the association proposes.
+            # The read is lazy, so an instance UID that does not convert raises here.
+            instance = getattr(dataset, "SOPInstanceUID", "")
+            # A value of another type or count fails the same way inside send_c_store on every
+            # attempt, as an error that reads as transient there. An absent UID is caught at that
+            # call, below.
+            if (
+                not isinstance(transfer_syntax, UID)
+                or not isinstance(read_class, str)
+                or not isinstance(instance, str)
+                or ("SOPInstanceUID" in dataset and not instance)
+            ):
+                raise ValueError("a transfer syntax, SOP class or SOP instance UID is not one UID")
+            sop_instance = _loggable_uid(instance)
         except Exception as exc:  # noqa: BLE001 - untrusted/forwarded object; never escape as internal
             raise NegativeAckError(
                 "DICOM C-STORE client (SCU): outgoing object is not a parseable DICOM Part-10 object (no retry)",
                 code="bad-object",
                 permanent=True,
             ) from exc
-        # For the log lines and errors alone; the raw class is what the association proposes.
-        sop_instance = _loggable_uid(getattr(dataset, "SOPInstanceUID", ""))
         logged_class = _loggable_uid(sop_class)
         ae = self._build_ae()
-        ae.add_requested_context(sop_class, transfer_syntax)
+        try:
+            ae.add_requested_context(sop_class, transfer_syntax)
+        except ValueError as exc:
+            # pynetdicom refuses the object's own class or syntax (at least one over 64 characters),
+            # so a retry repeats it; raw, its text would carry the value into last_error, and the
+            # internal-error arm could stop the lane on one object.
+            raise NegativeAckError(
+                "DICOM C-STORE client (SCU): outgoing object names a SOP class or transfer syntax "
+                "that cannot be proposed (no retry)",
+                code="bad-object",
+                permanent=True,
+            ) from exc
         assoc = self._associate(ae)
         if not assoc.is_established:
             # A peer that **answered** but accepted no presentation context for this object (rejected the
@@ -2956,12 +3246,20 @@ class DicomScuDestination(DestinationConnector):
                 permanent=True,
             ) from exc
         except Exception as exc:  # noqa: BLE001 - a genuine DIMSE/transport error mid-store is transient
+            if isinstance(exc, AttributeError) and "SOPInstanceUID" not in dataset:
+                # pynetdicom reads the UID before it sends anything; a retry repeats this.
+                raise NegativeAckError(
+                    "DICOM C-STORE client (SCU): outgoing object has no SOP Instance UID (no retry)",
+                    code="bad-object",
+                    permanent=True,
+                ) from exc
             # No response either, so it counts toward the same bound as an empty status below.
             final = self._count_unanswered(_unanswered_key(object_bytes), len(object_bytes))
             if final is not None:
                 raise final from exc
             raise DeliveryError(
-                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: {safe_exc(exc)}"
+                f"DICOM C-STORE client (SCU) to {self._host}:{self._port} failed: "
+                f"{_safe_library_exc(exc)}"
             ) from exc
         finally:
             assoc.release()

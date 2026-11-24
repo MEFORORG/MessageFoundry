@@ -24,7 +24,7 @@ to a guard call. It does not prove that every branch reaches the call, or that t
 or that a guard checks a CRL: the behaviour tests (at least
 ``tests/test_revocation_guard_remaining_hops.py``, ``tests/test_hop_refusal_revocation.py`` and
 ``tests/test_vault_revocation_hop_guard.py``) prove that. A second hop added inside a function that
-is already guarded passes here too, so read the function in review.
+is already listed, Guarded or Exempt, passes here too, so read the function in review.
 
 **It goes red.** Delete the guard call from one guarded site and
 :func:`test_every_guarded_site_calls_a_guard` fails naming that site; measured when this file was
@@ -34,7 +34,10 @@ renaming the ``mount_strict_reply_adapter`` call in either one failed that test 
 renaming either link of the chain from the mount to the Vault guard failed
 :func:`test_every_guard_name_reaches_a_root`. So did a second def named ``refuse_an_unrevoked_hop``
 in another module, and renaming the Vault guard's ``_crossed_unrevoked`` call failed
-:func:`test_the_vault_root_decides_through_the_authority`.
+:func:`test_the_vault_root_decides_through_the_authority`. Moving the ``EmailDestination.__init__``
+entry from Guarded to Exempt and deleting its ``RevocationHopGuard.capture`` call failed
+:func:`test_the_exempt_sites_are_the_pinned_list` and no other test in this file; before that test
+existed, the same change passed them all (vault BACKLOG #3512).
 
 **The relaxed-hop handoff census** at the end of this file is a second list, of the sites that
 reach ``relax_verify_expiry`` (vault BACKLOG #5086). ``RevocationHopGuard.capture`` gives no CRL
@@ -87,6 +90,9 @@ _BUILDERS = frozenset(
         # transports/
         "build_strict_opener",  # with no HTTPS handler, urllib supplies a verifying one
         "_no_redirect_opener",
+        # The shared-or-own choice over the two openers (BACKLOG #5527 item 10), so the hops that
+        # call it stay the sites, as for the IdP wrapper below.
+        "_verifying_opener",
         "_expiry_relaxed_opener",
         "_client_cert_opener",
         "_client_ssl_context",
@@ -324,6 +330,32 @@ _CENSUS: dict[str, Guarded | Exempt] = {
     ),
 }
 
+#: The sites :data:`_CENSUS` lists as Exempt, pinned exactly (vault BACKLOG #3512). A Guarded hop
+#: moved to Exempt, with its guard call deleted, can pass every other check here (a relaxed hop
+#: fails its own census below), so this list is the second edit such a change needs. A diff that
+#: edits both still passes, so review stays the check on what is added here. What this census
+#: does not prove is in the module docstring.
+_EXEMPT_SITES = frozenset(
+    {
+        "messagefoundry/apiclient/client.py::_build_verify_context",
+        "messagefoundry/auth/trust_anchors.py::anchor_cadata",
+        "messagefoundry/config/tls_policy.py::<module>",
+        "messagefoundry/config/tls_policy.py::crl_scratch_context",
+        "messagefoundry/config/tls_probe.py::_offer_context",
+        "messagefoundry/pki.py::_all_load_as_no_ca",
+        "messagefoundry/pki.py::_openssl_reads_as_ca",
+        "messagefoundry/pki.py::_refuse_unless_openssl_loads",
+        "messagefoundry/transports/http_listener.py::HttpSource.__init__",
+        "messagefoundry/transports/mllp.py::MLLPSource.__init__",
+        "messagefoundry/transports/rest.py::_insecure_opener",
+        "messagefoundry/transports/rest.py::_shared_no_redirect_opener",
+        "messagefoundry/tray/probe.py::_pinned_context",
+        "messagefoundry/tray/probe.py::build_verify",
+        "messagefoundry/verify/federation.py::_idp_opener",
+        "messagefoundry/verify/smoke.py::live_smoke_ssl_context",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class _Scan:
@@ -435,18 +467,27 @@ def _scan() -> _Scan:
 
 def test_every_site_is_in_the_census() -> None:
     """The check that stops the next unguarded hop: a new site fails here until it is classified."""
-    unlisted = sorted(_scan().sites - _CENSUS.keys())
+    sites = _scan().sites
+    # 42 sites when this floor was set (vault BACKLOG #3512), so 30 lets twelve go with no edit
+    # here. Each retired site still needs its census entry deleted, by the test below.
+    # It fails a scan that finds nothing, over which the check below would pass.
+    assert len(sites) >= 30, f"the scan found only {len(sites)} sites, floor 30"
+    unlisted = sorted(sites - _CENSUS.keys())
     assert not unlisted, (
         f"verifying client TLS context(s) with no census entry: {unlisted}. Add a guard "
         f"(RevocationHopGuard.capture, refuse_unrevoked_verified_hop for an https hop, or "
         f"mount_strict_reply_adapter for an hvac Vault client, which must not use "
-        f"RevocationHopGuard) and list the site as Guarded, or list it as Exempt with the reason. "
+        f"RevocationHopGuard) and list the site as Guarded, or list it as Exempt with the reason "
+        f"and add it to _EXEMPT_SITES. "
         f"See ADR 0173 and docs/DEPLOYMENT.md, 'Revocation-guard behavior'."
     )
 
 
 def test_every_census_entry_is_still_a_site() -> None:
     """A stale entry would keep an exemption alive for code that no longer exists."""
+    # 42 entries when this floor was set (vault BACKLOG #3512). It fails a census emptied, over
+    # which the check below would pass.
+    assert len(_CENSUS) >= 30, f"only {len(_CENSUS)} census entries, floor 30"
     stale = sorted(_CENSUS.keys() - _scan().sites)
     assert not stale, f"census entries that are no longer a site: {stale}"
 
@@ -454,9 +495,9 @@ def test_every_census_entry_is_still_a_site() -> None:
 def test_every_guarded_site_calls_a_guard() -> None:
     scan = _scan()
     guarded = {site: entry for site, entry in _CENSUS.items() if isinstance(entry, Guarded)}
-    # 15 sites were Guarded when this floor was set, so 10 lets up to five retire with no edit here.
-    # It is a floor against a census emptied or turned all Exempt, over which the check below would
-    # pass on nothing. It does not catch a single hop moved from Guarded to Exempt; review does.
+    # A floor against a census emptied or turned all Exempt, over which the check below would pass
+    # on nothing. A single hop moved from Guarded to Exempt fails the next test unless
+    # _EXEMPT_SITES moves too.
     assert len(guarded) >= 10, f"only {len(guarded)} Guarded census entries, floor 10"
     unguarded = [
         f"{site} (guard expected in {entry.by or 'the site itself'}; {entry.note or 'no note'})"
@@ -464,6 +505,17 @@ def test_every_guarded_site_calls_a_guard() -> None:
         if (entry.by or site) not in scan.guard_calls
     ]
     assert not unguarded, f"census sites marked Guarded whose guard call is gone: {unguarded}"
+
+
+def test_the_exempt_sites_are_the_pinned_list() -> None:
+    """A Guarded hop moved to Exempt fails here, named, unless :data:`_EXEMPT_SITES` moves too."""
+    exempt = {site for site, entry in _CENSUS.items() if isinstance(entry, Exempt)}
+    assert exempt == _EXEMPT_SITES, (
+        f"Exempt in the census, not in _EXEMPT_SITES: {sorted(exempt - _EXEMPT_SITES)}; in "
+        f"_EXEMPT_SITES, not Exempt in the census: {sorted(_EXEMPT_SITES - exempt)}. Add a site to "
+        f"_EXEMPT_SITES only once review has read the exemption's reason; a hop moved there from "
+        f"Guarded loses its revocation guard"
+    )
 
 
 def _def_count(name: str) -> int:
@@ -764,7 +816,8 @@ def _holds_when_relaxed(
     expr: ast.expr, fn: ast.AST, builders: frozenset[str], seen: frozenset[str] = frozenset()
 ) -> bool:
     """Whether ``expr``, read in ``fn``, is true on a relaxed hop, read off its shape. It is when it
-    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)``; asks
+    is ``True``; reads the setting as ``<x>.get("tls_allow_expired", ...)`` or
+    ``flag_from_settings(<x>, "tls_allow_expired")`` (vault BACKLOG #3234); asks
     ``skips_validity_period`` of the context a relaxing builder returned
     (:func:`_from_relaxing_builder`), never of some other context; is ``bool(...)`` of one of
     those; is an ``or`` with one of them as a part, or an ``and`` of them; or is a local name every
@@ -789,6 +842,9 @@ def _holds_when_relaxed(
             return _holds_when_relaxed(first, fn, builders, seen)
         if name == "skips_validity_period" and len(expr.args) == 1:
             return _from_relaxing_builder(first, fn, builders)
+        if name == "flag_from_settings" and len(expr.args) == 2:
+            key = expr.args[1]
+            return isinstance(key, ast.Constant) and key.value == "tls_allow_expired"
     if isinstance(expr, ast.Call) and callee_name(expr) == "get" and expr.args:
         first = expr.args[0]
         return isinstance(first, ast.Constant) and first.value == "tls_allow_expired"
@@ -1073,6 +1129,10 @@ def test_a_relaxed_hop_whose_guard_call_could_credit_a_crl_is_flagged() -> None:
         ("None if relaxed else self._other", "False", "pass", False),
         ("None if not relaxed else self._other", "False", "pass", True),
         ("None if skips_validity_period(self._other) else self._other", "False", "pass", True),
+        # The strict read of the setting holds; the same reader on another key does not (#3234).
+        ("self._other", 'flag_from_settings(config.settings, "tls_allow_expired")', "pass", False),
+        ("self._other", 'flag_from_settings(config.settings, "tls")', "pass", True),
+        ("self._other", "flag_from_settings(config.settings)", "pass", True),
     ):
         text = _SYNTHETIC_HOP.replace("HANDOFF", handoff).replace("FLAG", flag)
         pre, post = (extra[4:], "pass") if extra.startswith("PRE:") else ("pass", extra)

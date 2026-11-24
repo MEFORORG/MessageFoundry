@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import enum
 import logging
+import math
 import socket
 import sys
 import time
@@ -44,6 +45,7 @@ from harness.config.shardcert._shape import (
     BROADCAST,
     PARTITIONED_FANOUT,
     destinations_for_seq,
+    fanout_refusal,
     fifo_lane_destination,
     load_routing,
     reported_shape,
@@ -75,7 +77,12 @@ from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
-from harness.load.rigadmin import REMOTE_RIG_SESSION, RIG_SESSION
+from harness.load.rigadmin import (
+    REMOTE_RIG_SESSION,
+    RIG_SESSION,
+    RigSignInRateLimited,
+    RigSignInRefused,
+)
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context
@@ -136,6 +143,24 @@ def _derive_driver_done_timeout(
     if override is not None:
         return override
     return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
+
+
+class DriveShapeError(ValueError):
+    """An offered rate or hold that is not a finite number above 0 (:func:`require_drive_shape`). Its own
+    class so a CLI can report this setup error without also swallowing every other ValueError."""
+
+
+def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
+    """Refuse an offered rate or hold that is not a finite positive number (BACKLOG #5977, S27-64).
+
+    The CLI parses both with ``type=float``, which accepts ``nan``, ``inf``, ``0`` and negatives. An
+    infinite rate removes the pacing, so the drive floods the engine box at whatever rate the sockets
+    take; an infinite or NaN hold makes every timeout derived from it unbounded or NaN; a zero or
+    negative one drives nothing and then reads the empty run as a verdict. Checked at entry, before any
+    coord wait or child spawn, so a bad value is a setup error rather than a stall or a fake rung."""
+    for name, value in (("aggregate_rate", aggregate_rate), ("hold_seconds", hold_seconds)):
+        if not (math.isfinite(value) and value > 0):
+            raise DriveShapeError(f"{name} must be a finite number above 0, got {value!r}")
 
 
 #: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
@@ -745,8 +770,21 @@ def fidelity_note(
 ) -> str | None:
     """The operator-facing reason a rung is VOID for the ceiling, or ``None`` when it is admissible. Says
     WHOSE fault it was in words — and, where the cause was NOT measured, says THAT instead of guessing."""
-    if fidelity is RungFidelity.ADMISSIBLE:
+    if offered > 0 and fidelity is RungFidelity.ADMISSIBLE:
         return None
+    # Keyed on the INPUT, not the verdict, so that no verdict can reach a division by offered below.
+    if offered == 0:
+        return (
+            f"FIDELITY UNKNOWN — this rung planned zero messages (offered=0 sent={sent} acked={acked}), "
+            "for example because rate x hold rounded to zero, so it has no plan to be faithful to and "
+            "establishes no rate. It is VOID for the ceiling. Raise the rate or the hold and re-run"
+        )
+    unknown = (
+        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
+        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
+    )
+    if offered < 0 or fidelity is RungFidelity.UNKNOWN:
+        return unknown
     short = f"sent {sent} of {offered} offered ({sent / offered:.1%} < {_FIDELITY_SENT_FLOOR:.0%})"
     causes = f"deferred: backpressure={deferred_backpressure} schedule={deferred_schedule}"
     if fidelity is RungFidelity.DRIVE_SHORTFALL:
@@ -780,10 +818,8 @@ def fidelity_note(
             "finding, and a DIFFERENT one from a lane/claim wall: the bind is at INTAKE (ingress/routed are "
             "hard-1 per-lane pools keyed on the INBOUND connection — check G, not L)"
         )
-    return (
-        f"FIDELITY UNKNOWN — the gate's inputs were not recorded (sent={sent} acked={acked} "
-        f"offered={offered}); the rung is VOID for the ceiling. An unmeasured gate is never a pass"
-    )
+    # Fail-closed for a verdict added later: falling off the end would return None, which reads ADMISSIBLE.
+    return unknown
 
 
 #: WHY a ceiling was suppressed, keyed by the NOT-DRIVEN fidelity that suppressed it. Only the not-driven
@@ -925,7 +961,10 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     """Copies of ACKed messages that never arrived, against exactly the destinations the served router
     picks for each seq (:func:`destinations_for_seq`), read from each copy's lane label. O(A x D) under
     broadcast and O(A x dests) under the partitioned modes, so an async caller runs it off the loop."""
-    fanout = max(delivering, 0)
+    fanout = delivering
+    # Unmeasured, never a guess: the walk would raise on a routing or fan-out the router never serves.
+    if fanout < 1 or fanout_refusal(routing, dests=dests, fanout=fanout) is not None:
+        return -1
     if routing == BROADCAST:
         every = frozenset(destinations_for_seq(0, routing=BROADCAST, dests=dests, fanout=fanout))
         return tracker.acked_copies_missing(lambda _seq: every, fifo_lane_destination)
@@ -1544,6 +1583,15 @@ async def _queue_breakdown(env: Mapping[str, str]) -> QueueBreakdown:
 # --- the bench ---------------------------------------------------------------
 
 
+def _store_view_rounded_up(summed: int, n_shards: int) -> int:
+    """The summed in-pipeline gauge over ``n_shards`` engine shards, rounded UP (BACKLOG #5950).
+
+    Engine shards read the store one after another, so the last rows can show on only some of them,
+    and a floor division would read that nonzero residual as 0, which is the drained value. A
+    negative value is returned as a floor division leaves it, because rounding it up could make 0."""
+    return summed // n_shards if summed < 0 else -(-summed // n_shards)
+
+
 async def _sample_in_pipeline_peak(
     urls: list[str], stop: asyncio.Event, out: list[int], *, interval: float = 0.5
 ) -> None:
@@ -1561,7 +1609,7 @@ async def _sample_in_pipeline_peak(
         while not stop.is_set():
             sample = await poller.sample_once()
             if sample is not None:
-                depth = sample.in_pipeline // n_shards
+                depth = _store_view_rounded_up(sample.in_pipeline, n_shards)
                 if depth > out[0]:
                     out[0] = depth
             with contextlib.suppress(TimeoutError):
@@ -1969,7 +2017,9 @@ async def run_shardcert(
         engine_dead=(final.dead if final else -1),
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This value
         # feeds ShardCertReport.ok/drained, unlike the advisory drive-side poller cross-checks (left as N×).
-        in_pipeline_final=(final.in_pipeline // max(1, len(ids_list)) if final else -1),
+        in_pipeline_final=(
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        ),
         drained=drain_s is not None,
         drain_seconds=drain_s,
         stranded_nonterminal=stranded,
@@ -2125,6 +2175,30 @@ class ShardCertStepRecord:
     def _acked_waived(self) -> bool:
         """The something-acknowledged bar does not apply: a ceiling rung whose offer never reached the engine."""
         return self.ceiling and self.fidelity.not_driven and self.sent <= 0
+
+    @property
+    def correctness_broken(self) -> bool:
+        """The report's FAIL test: :attr:`correctness_ok` failed, and not merely because this rung planned
+        zero messages (BACKLOG #5861). On such a rung the lane term is vacuous: the pacer still emits its
+        first-tick message, so one message on one lane is the normal shape. The acknowledged term applies
+        only if something was sent, and the loss term is vacuous only if nothing moved at all, because a
+        paced message that went unacknowledged or was lost is a real fault. An unrecorded ``-1`` is not
+        evidence of a break here. Any positive fault count still is."""
+        if self.offered != 0:
+            return not self.correctness_ok
+        nothing_moved = (
+            max(self.achieved_intake, self.sent, self.delivered, self.in_pipeline_peak) <= 0
+        )
+        return not _invariants_held(
+            acked=self.achieved_intake,
+            require_acked=self.sent > 0,
+            lossless=self.no_loss or nothing_moved,
+            lane_inversions=self.lane_inversions,
+            duplicates_ok=self.lane_repeats == 0,
+            engine_dead=max(self.engine_dead, 0),
+            dead_total=max(self.dead_total, 0),
+            stranded_nonterminal=max(self.stranded_nonterminal, 0),
+        )
 
     def correctness_faults(self) -> list[str]:
         """The terms of :attr:`correctness_ok` this rung broke, named for an operator note (empty when it
@@ -2420,8 +2494,9 @@ class ShardCertLadderReport:
     ceiling_rate: float | None = None
     #: WHY there is no ``ceiling_rate`` despite the climb stopping (see :data:`_CEILING_VOID_REASONS`):
     #: ``"drive_shortfall"`` (the rig ran out), ``"offer_shortfall"`` (the plan never reached the wire and
-    #: the CAUSE WAS NOT MEASURED) or ``"fidelity_unknown"`` (the gate's inputs were not recorded). All three
-    #: exit 2 — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
+    #: the CAUSE WAS NOT MEASURED), ``"fidelity_unknown"`` (the gate's inputs were not recorded) or
+    #: ``"zero_offered"`` (the plan held no messages). All four exit 2 unless the rung also broke correctness
+    #: — nothing was established about the engine at the stopping rung. ``None`` when the ceiling is
     #: admissible (or engine-bound, which KEEPS its rate) or the climb never stopped.
     ceiling_void_reason: str | None = None
     #: BACKLOG #5576: the climb stopped because a rung's store reset failed (:class:`StoreResetFailed`).
@@ -2447,8 +2522,15 @@ class ShardCertLadderReport:
         """A correctness FAIL (exit 1): a measured rung broke an invariant, or nothing was measured and
         no setup abort explains why. A climb a failed reset stopped before its first rung is SETUP."""
         if self.records:
-            return not self._records_ok
+            return any(r.correctness_broken for r in self.records)
         return self.aborted_reason is None
+
+    @property
+    def zero_offered_rates(self) -> list[float]:
+        """The rates of the rungs that planned zero messages (BACKLOG #5861). Read at the verdict, so a
+        zero-offered record fails closed by whatever route it reached this report. An unrecorded ``-1``
+        is a different fault and is not counted here."""
+        return [r.aggregate_rate for r in self.records if r.offered == 0]
 
     @property
     def ceiling_pool_bound(self) -> bool:
@@ -2478,11 +2560,13 @@ class ShardCertLadderReport:
         ``ceiling_rate`` null (see :attr:`ceiling_void_reason`).
 
         ARTIFACT 2 adds the POOL: a ceiling measured on a rung that tripped the pre-registered store-pool
-        tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either."""
+        tripwire is a POOL BIND, not an engine ceiling, and must not publish a rate either. A rung that
+        planned zero messages (:attr:`zero_offered_rates`) established no rate either."""
         return (
             self.ceiling_void_reason is not None
             or self.ceiling_pool_bound
             or self.aborted_reason is not None
+            or bool(self.zero_offered_rates)
         )
 
     @property
@@ -2498,8 +2582,8 @@ class ShardCertLadderReport:
         if self._broken:
             return "FAIL"
         # An aborted climb outranks POOL_BOUND, as in the two-box report: the climb never finished, so no
-        # ceiling it names (pool-bound or not) is the run's answer.
-        if self.aborted_reason is not None:
+        # ceiling it names (pool-bound or not) is the run's answer. A zero-offered rung outranks it too.
+        if self.aborted_reason is not None or self.zero_offered_rates:
             return "SETUP_DEGRADED"
         # POOL_BOUND is called out by name, not folded into SETUP_DEGRADED: "the pool was the wall" is a
         # specific, actionable finding (raise --store-pool-size and re-run), and the whole point of ARTIFACT
@@ -2713,7 +2797,13 @@ class ShardCertLadderReport:
                 "  ceiling: NONE — the climb ABORTED before it found one "
                 f"({self.aborted_reason}). Fix the store and re-run."
             )
-        elif self.ceiling_void_reason is not None:
+        elif self.zero_offered_rates and not self._broken:
+            rates = ", ".join(f"{rate:g}" for rate in self.zero_offered_rates)
+            lines.append(
+                f"  ceiling: NONE — the rung(s) at {rates} msg/s planned zero messages, so they "
+                "establish no rate. Raise the rate or the hold and re-run."
+            )
+        elif self.ceiling_void_reason is not None and not self.zero_offered_rates:
             # NEVER print a rate here: the rung that stopped the climb was not evidence about the engine.
             lines.append(
                 f"  ceiling: NONE PUBLISHED — the climb stopped on a rung that FAILED FIDELITY "
@@ -2863,6 +2953,14 @@ async def run_shardcert_ladder(
         # ARTIFACT 2: the pool tripwire, RECORDED at the rung that tripped it (it gates `ceiling_pool_bound`).
         if rec.pool.tripped and rec.pool.trip_reason is not None:
             report.notes.append(f"{rate:g} msg/s: {rec.pool.trip_reason}")
+        if rec.offered == 0 and not rec.correctness_broken:
+            # BACKLOG #5861: stopped here so neither branch below can name this rung a correctness break.
+            report.ceiling_void_reason = "zero_offered"
+            report.notes.append(
+                f"CLIMB STOPPED at {rate:g} msg/s: the rung planned zero messages, a setup fault and "
+                "not an engine result"
+            )
+            break
         if rec.ceiling:
             # ARTIFACT 4 — THE CEILING IS ADMISSIBILITY-GATED. `_is_ceiling` fires on
             # `achieved_intake < offered * (1 - _INTAKE_TOL)`, and that is EXACTLY what a DRIVE SHORTFALL
@@ -3661,7 +3759,9 @@ async def run_shardcert_engine(
         # D4: de-dup the N×-summed unified-store poller aggregate to a single store view (#841). This is
         # stored on ShardCertEngineReport AND posted in the ENGINE_DRAINED gate, so the two-box report's
         # engine_in_pipeline_final is the TRUE fleet backlog, not N× it.
-        in_pipeline_final = final.in_pipeline // max(1, len(ids_list)) if final else -1
+        in_pipeline_final = (
+            _store_view_rounded_up(final.in_pipeline, max(1, len(ids_list))) if final else -1
+        )
         # On an abort the store's stranded/dead are a teardown artifact, not a measurement — do not read them
         # (they would only re-confirm the fabricated collapse). A genuine failed drain still reads them.
         if rung_aborted:
@@ -3787,7 +3887,14 @@ def _remote_engine_poller(
     half's only when both shells export the same pair.
 
     ``allow_insecure`` keeps the old posture for an engine box that serves plain http: http, and
-    no credential, since the client refuses to put one on a cleartext hop to another box."""
+    no credential, since the client refuses to put one on a cleartext hop to another box.
+
+    An empty ``cacert`` is refused: the poller would read it as unset and verify against the default
+    trust instead."""
+    if cacert is not None and not cacert.strip():
+        raise ValueError(
+            "cacert names no certificate: an empty value would fall back to the default trust"
+        )
     if allow_insecure:
         if cacert is not None:
             raise ValueError(
@@ -3866,6 +3973,7 @@ async def run_shardcert_driver(
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -3904,6 +4012,14 @@ async def run_shardcert_driver(
         notes.append(
             "SHARDS_READY carried no `dests` for a partitioned run: the per-message copy check cannot "
             "know each message's destinations, so it FAILS"
+        )
+    # A fan-out or routing the served router never runs would divide by zero or guess in the copy walk.
+    refusal = fanout_refusal(routing, dests=dests, fanout=delivering) if delivering >= 1 else None
+    if refusal is not None:
+        delivering = 0
+        notes.append(
+            f"SHARDS_READY carried {refusal}: the per-message copy check cannot know each message's "
+            "destinations, so it FAILS"
         )
 
     ids = SHARDCERT_IDS
@@ -4330,6 +4446,7 @@ async def run_shardcert_driver_worker(
     It NEVER binds a sink (the external sink tier owns delivery) and NEVER spawns an engine — the whole
     point is CPU isolation and horizontal sender scale. **Fail loud** if the band slice is empty / the
     worker count exceeds the bands (see :func:`_band_slice`)."""
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -4452,13 +4569,81 @@ async def _spawn_proc(argv: list[str]) -> Any:
     )
 
 
+class ShardCertChildExited(CoordTimeout):
+    """A spawned child exited before posting the coord message the coordinator was waiting on
+    (BACKLOG #5977, S27-65). A :class:`CoordTimeout` on purpose: the message will now never arrive, and
+    every caller already treats that as a broken rendezvous (the ladder aborts the rung, the CLI exits 2),
+    so a crashed child gets the same handling at once instead of after the whole wait."""
+
+
+#: How long a child's exit may precede its coord message being readable before the wait calls it a
+#: crash. ``FileDropCoord.read`` returns None for a file it cannot read yet (a scanner or a share holding
+#: it open), so one None read after a clean post-and-exit must not abort a healthy rung.
+_CHILD_EXIT_GRACE = 2.0
+
+
 async def _await_indexed(
-    coord: FileDropCoord, base_name: str, count: int, *, timeout: float
+    coord: FileDropCoord,
+    base_name: str,
+    count: int,
+    *,
+    timeout: float,
+    children: Sequence[tuple[str, Any]] = (),
+    interval: float = 0.25,
 ) -> list[dict[str, Any]]:
     """Await the per-child-index messages ``base_name.0 .. base_name.<count-1>`` (each posted by one
-    child), returning their payloads in index order. Sequential awaits are fine — the children post
-    around the same time, so the total wait is bounded by the slowest to appear, not their sum."""
-    return [await coord.await_message(f"{base_name}.{i}", timeout=timeout) for i in range(count)]
+    child), returning their payloads in index order. ONE deadline covers the whole step, so the wait is
+    bounded by ``timeout`` however many children there are, as the B6 sink budget assumes.
+
+    ``children[i]``, where given, is the ``(label, proc)`` that posts message ``i``. Every pending index
+    is checked on each poll, so a child that has exited with its message still absent (after
+    :data:`_CHILD_EXIT_GRACE`) raises :class:`ShardCertChildExited` rather than stalling for ``timeout``,
+    whichever index it holds (BACKLOG #5977, S27-65)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    payloads: dict[int, dict[str, Any]] = {}
+    exited_at: dict[int, float] = {}
+    while True:
+        now = loop.time()
+        for i in range(count):
+            if i in payloads:
+                continue
+            label, proc = children[i] if i < len(children) else ("", None)
+            # The exit code is taken BEFORE the read, so a child that posted and then exited is read
+            # as posted, never as crashed.
+            code = getattr(proc, "returncode", None)
+            payload = coord.read(f"{base_name}.{i}")
+            if payload is not None:
+                payloads[i] = payload
+            elif code is not None and now - exited_at.setdefault(i, now) >= _CHILD_EXIT_GRACE:
+                raise ShardCertChildExited(
+                    f"child {label} exited with code {code} before posting coord message "
+                    f"{f'{base_name}.{i}'!r}"
+                )
+        if len(payloads) == count:
+            return [payloads[i] for i in range(count)]
+        # Written as "not before", so a NaN deadline (a NaN timeout) times out at once, as
+        # FileDropCoord.await_message does, rather than waiting forever.
+        if not now < deadline:
+            missing = next(i for i in range(count) if i not in payloads)
+            raise CoordTimeout(
+                f"coord message {f'{base_name}.{missing}'!r} not received within {timeout}s "
+                f"(dir={coord.directory})"
+            )
+        await asyncio.sleep(interval)
+
+
+#: The longest stretch of one child's output tail the raised error carries. The ladder posts the error
+#: text across the coord channel (RUNG_ABORTED), which refuses a message over its byte cap.
+_CHILD_TAIL_CHARS = 400
+
+
+def _tail_end(tail: str) -> str:
+    """``tail`` (``"[label] ..."`` from :func:`_reap_child`) cut to its label and last characters."""
+    if len(tail) <= _CHILD_TAIL_CHARS:
+        return tail
+    label, _, rest = tail.partition(" ")
+    return f"{label} ...{rest[-_CHILD_TAIL_CHARS:]}"
 
 
 async def _reap_child(label: str, proc: Any, *, grace: float) -> str:
@@ -4551,6 +4736,11 @@ class ShardCertDriveReport:
     #: #5577). Only then is ``sink_received`` a post-drain count; a gate that lands on disk after the wait
     #: timed out does not make an early tally late. False = no barrier (default OFF, or timed out).
     tallied_behind_gate: bool = False
+    #: Whether the engine box refused this drive's sign-in (:class:`RigSignInRefused`, a 429's
+    #: :class:`RigSignInRateLimited` excepted), or an earlier
+    #: refusal kept it from trying (``sign_in=False``). The ladder reads it to stop retrying a refused
+    #: sign-in on every rung.
+    sign_in_refused: bool = False
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -4885,6 +5075,7 @@ async def run_shardcert_drive(
     cacert: str | None = None,
     await_engine_drained: bool = False,
     engine_drained_timeout: float | None = None,
+    sign_in: bool = True,
 ) -> ShardCertDriveReport:
     """The multi-process SIZING drive COORDINATOR (load-gen box). Learns the topology from
     :data:`SHARDS_READY` (the engine half posts it), spawns ``sink_count`` :func:`run_shardcert_sink` +
@@ -4909,7 +5100,15 @@ async def run_shardcert_drive(
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
     closes that window. The advisory poll runs beside the gate: once the gate lands it gets
     :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
-    the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
+    the advisory-drain fallback (the poll then runs in full) with a note, never a hang.
+
+    ``sign_in=False`` skips the sign-in, with a note, for a caller that already saw this engine box
+    refuse it; it needs ``await_engine_drained``, the only path on which the poll is advisory."""
+    require_drive_shape(aggregate_rate, hold_seconds)
+    if not sign_in and not await_engine_drained:
+        raise ValueError(
+            "sign_in=False needs await_engine_drained: without the gate the poll is the barrier"
+        )
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -4967,8 +5166,12 @@ async def run_shardcert_drive(
 
     coord_dir = str(coord.directory)
     run_id = coord.run_id
-    procs: list[tuple[str, Any]] = []
+    sink_procs: list[tuple[str, Any]] = []
+    worker_procs: list[tuple[str, Any]] = []
+    coord_failure: CoordTimeout | None = None
+    child_tails: list[str] = []
     notes: list[str] = []
+    sign_in_refused = not sign_in
     poller: EnginePoller | None = None
     advisory_drain: asyncio.Task[float | None] | None = None
     advisory_stop = asyncio.Event()
@@ -4997,17 +5200,29 @@ async def run_shardcert_drive(
         #     error, raised before any child exists: tallying with no barrier would read the in-flight
         #     tail as loss. With the gate armed, the poller's terms are advisory only, so a refusal is
         #     a note and the run goes on.
-        try:
-            poller = await _open_remote_poller(
-                engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
-            )
-        except RemoteEngineSignInError as exc:
-            if not await_engine_drained:
-                raise
+        if not sign_in:
             notes.append(
                 "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
-                + escape_for_terminal(str(exc), single_line=True)
+                "the engine box refused an earlier sign-in, and a retry could lock the account out"
             )
+        else:
+            try:
+                poller = await _open_remote_poller(
+                    engine_host, api_ports, allow_insecure=allow_insecure, cacert=cacert
+                )
+            except RemoteEngineSignInError as exc:
+                if not await_engine_drained:
+                    raise
+                # Only a refusal, never an engine that did not answer: a retry of a refused
+                # credential is what counts toward a lockout.
+                # A 429 (RigSignInRateLimited) is transient, so it does not stop a later rung's try.
+                sign_in_refused = isinstance(exc.__cause__, RigSignInRefused) and not isinstance(
+                    exc.__cause__, RigSignInRateLimited
+                )
+                notes.append(
+                    "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
+                    + escape_for_terminal(str(exc), single_line=True)
+                )
 
         # (1) Spawn the M sink children over CONTIGUOUS chunks of the [sink_base, sink_base+sink_ports)
         #     (== dests) band; await each SINK_BOUND.<m>.
@@ -5033,8 +5248,10 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            procs.append((f"sink-{m}", proc))
-        await _await_indexed(coord, SINK_BOUND, sink_count, timeout=child_ready_timeout)
+            sink_procs.append((f"sink-{m}", proc))
+        await _await_indexed(
+            coord, SINK_BOUND, sink_count, timeout=child_ready_timeout, children=sink_procs
+        )
 
         # (2) Spawn the K sender-worker children over CONTIGUOUS band slices; await each DRIVER_ARMED.<j>.
         for j in range(driver_count):
@@ -5057,8 +5274,10 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            procs.append((f"worker-{j}", proc))
-        await _await_indexed(coord, DRIVER_ARMED, driver_count, timeout=child_ready_timeout)
+            worker_procs.append((f"worker-{j}", proc))
+        await _await_indexed(
+            coord, DRIVER_ARMED, driver_count, timeout=child_ready_timeout, children=worker_procs
+        )
 
         # (3) Release: DRIVE_START keeps the ENGINE half's handshake unchanged (its kill anchor; no kill
         #     here); DRIVE_GO releases the armed sender-workers into their hold in lockstep.
@@ -5074,7 +5293,7 @@ async def run_shardcert_drive(
             hold_seconds, drain_timeout, driver_done_timeout
         )
         driver_dones = await _await_indexed(
-            coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
+            coord, DRIVER_DONE, driver_count, timeout=driver_done_wait, children=worker_procs
         )
         # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
         # Without the gate the poll is the barrier, awaited here in full. With the gate armed it is
@@ -5156,7 +5375,14 @@ async def run_shardcert_drive(
 
         # (5) Signal drained → every sink records its final tally and posts SINK_DONE.<m>.
         coord.post(DRIVE_COMPLETE, {"t": time.time()})
-        sink_dones = await _await_indexed(coord, SINK_DONE, sink_count, timeout=sink_done_timeout)
+        sink_dones = await _await_indexed(
+            coord, SINK_DONE, sink_count, timeout=sink_done_timeout, children=sink_procs
+        )
+    except CoordTimeout as exc:
+        # Held until the children are reaped below, so the raised error can carry their output tails:
+        # a crashed child's traceback is otherwise only a local note, lost when this unwinds
+        # (BACKLOG #5977, S27-65).
+        coord_failure = exc
     finally:
         if advisory_drain is not None and not advisory_drain.done():
             # An early failure (or a cancel) leaves the poll running: stop it and let it finish before
@@ -5171,12 +5397,22 @@ async def run_shardcert_drive(
         # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still
         # live, some blocked on DRIVE_COMPLETE) tears the whole tier down in ~one reap_grace, not
         # (M+K)*reap_grace — no lingering child processes on the load-gen box between ladder steps.
+        procs = sink_procs + worker_procs
         if procs:
-            notes.extend(
-                await asyncio.gather(
-                    *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
-                )
+            child_tails = await asyncio.gather(
+                *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
             )
+            notes.extend(child_tails)
+    if coord_failure is not None:
+        # The LAST characters of each tail: the exception line is at its end. The label stays in front.
+        tails = "; ".join(escape_for_terminal(_tail_end(t), single_line=True) for t in child_tails)
+        # Rebuilt as its own class (every CoordTimeout here takes one message), so a caller that tells
+        # the subclasses apart, as the ladder does for EngineSetupFailed, still can.
+        enriched = type(coord_failure)(f"{coord_failure}; child output: {tails or '(none)'}")
+        # What crosses the box boundary (the ladder's RUNG_ABORTED detail) is the rendezvous message
+        # alone: the coord channel carries metadata only, and a child's output is not that.
+        enriched.coord_detail = str(coord_failure)  # type: ignore[attr-defined]
+        raise enriched from coord_failure
 
     # (6) Aggregate the children's coord DONE files (the authority) + the engine's REMOTE drain gauge.
     a = sum(int(d["acked"]) for d in driver_dones)
@@ -5250,5 +5486,6 @@ async def run_shardcert_drive(
         drained=drain_s is not None,
         drain_seconds=drain_s,
         tallied_behind_gate=tallied_behind_gate,
+        sign_in_refused=sign_in_refused,
         notes=notes,
     )

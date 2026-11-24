@@ -791,8 +791,9 @@ def _dec_response_view(node: Any, reader: _Reader) -> dict[str, CapturedResponse
 def enc_result(phase: str, result: object, blobs: _Blobs) -> dict[str, Any]:
     """Describe a Router/Handler/predicate return value, phase-typed."""
     if phase == "accepts":
-        # Strict: the caller coerces with bool() BEFORE this point (see _sandbox_worker), which is what
-        # stops a truthy non-bool such as an re.Match from ever reaching the encoder.
+        # Strict: the caller reads the verdict through accepts_verdict BEFORE this point (see
+        # _sandbox_worker), which returns a bool or raises, so a truthy non-bool such as an re.Match
+        # never reaches the encoder.
         if not isinstance(result, bool):
             raise SandboxCodecError(f"accepts verdict must be a bool, got {type(result).__name__}")
         return {"r": "bool", "b": result}
@@ -1128,8 +1129,9 @@ def decode_boot(body: bytes) -> Boot:
 class GraphShape:
     """The names one loaded graph declares, and how its inbounds are bound (vault BACKLOG #2587).
 
-    The worker loads the config directory again, in its own process and under an allowlisted
-    environment, so its graph can differ from the engine's. It reports this in its ``ready`` frame
+    The worker runs the engine's config again, from the snapshot the engine sends it (vault
+    BACKLOG #2596), in its own process and under an allowlisted environment, so its graph can
+    differ from the engine's. It reports this in its ``ready`` frame
     and the engine compares (:func:`messagefoundry.pipeline.sandbox.graph_differences`).
 
     ``bindings`` maps an inbound to its Router, for the inbounds the process holds. An engine shard

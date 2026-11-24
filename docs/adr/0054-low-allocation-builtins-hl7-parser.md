@@ -119,7 +119,13 @@ an hl7apy tree; the two trees stay disjoint, sharing only `normalize()` + MSH se
   structural delimiters (`^ ~ & | \`) as data and pass other chars (CJK/accented) through; a whole-field
   write rejects `|` (`ValueError` XFORM-1); CR/LF in any write raises; missing segment occurrence → `KeyError`.
   Escape format `\F\ \S\ \R\ \T\ \E\` (+ `\X..\`); read MSH-1/MSH-2 via the encoding chars, never hardcoded
-  (`ValueError` XFORM-2/3 if undeterminable).
+  (`ValueError` XFORM-2/3 if undeterminable). *(Note 2026-11-20, vault BACKLOG #5972: reads and
+  writes now use the delimiters the parser recorded from the first line, MSH, BHS or FHS, with a
+  short MSH-2 filled by the defaults, so nothing is undeterminable once the parse accepts the
+  message. The parse still accepts a short MSH-2 whose filled default is already another of its
+  separators, such as `MSH|~|`, so `Peek` and every read see it as the sender sent it; a
+  `Message` write that would join a value on those separators (`set`, `set_data`,
+  `add_repetition`, `add_segment`) raises `ValueError` there instead.)*
 - `SegmentGroup` (from `Message.groups()`): `boundary`, `ordinal` (re-indexes after delete; stale view →
   `LookupError`), `segment_ids`, `__len__`, `count`, `field`, `append_segment`, `clear`, `delete`,
   `rebuild`; `DEFAULT_BOUNDARY='OBR'`; `groups_of` raises `ValueError` on `boundary='MSH'`.

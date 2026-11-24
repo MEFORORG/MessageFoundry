@@ -376,8 +376,11 @@ async def _store_doc_with_a_cr(store: MessageStore, line_end: str = "\r") -> str
 
 
 def _with_a_bad_msh2(hl7: str) -> str:
-    """``hl7`` with an MSH-2 too short to name its separators: a payload-caused re-attach failure."""
-    return hl7.replace("|^~\\&|", "|^~\\|", 1)
+    """``hl7`` with a short MSH-2 whose declared escape, ``&``, is also the subcomponent separator
+    the parser fills. The parse accepts it and its OBX-5.5 handle still reads, and the re-attach
+    refuses that handle, since no write to it can be read back (BACKLOG #5972): a payload-caused
+    re-attach failure."""
+    return hl7.replace("|^~\\&|", "|^~&|", 1)
 
 
 def _without_an_msh(hl7: str) -> str:
@@ -881,8 +884,8 @@ async def test_a_long_error_still_names_the_member(
 
 
 async def test_a_non_hl7_head_names_the_head(store: MessageStore) -> None:
-    # Vault BACKLOG #5100: the head's parse for BHS-11 is that member's own step, so a non-HL7 head
-    # names the head, not the last member.
+    # Vault BACKLOG #5100: the head's MSH-10 read for BHS-11 is that member's own step, so a
+    # non-HL7 head, which that read parses in full and refuses, names the head, not the last member.
     mids, ids = await _enqueue(store, ["not an HL7 message at all", _hl7_with_value("clean")])
     col = _Collector()
     runner, _ = _batch_runner(store, col)

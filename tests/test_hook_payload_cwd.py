@@ -69,10 +69,13 @@ def _primary_with(tmp_path: Path, worktree_leaf: str) -> tuple[Path, Path]:
     return repo, wt
 
 
-def _run(script: Path, cwd: Path, stdin: bytes) -> subprocess.CompletedProcess[bytes]:
+def _run(
+    script: Path, cwd: Path, stdin: bytes, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
         cwd=str(cwd),
+        env=env,
         input=stdin,
         capture_output=True,
         timeout=TIMEOUT,
@@ -862,19 +865,39 @@ def test_lane_level_says_aloud_when_the_cwd_does_not_exist(
 SEAT_RECORD = HOOKS / "seat-record.ps1"
 
 
+def _seats_dir(start: Path) -> Path:
+    """The seat registry of the clone ``start`` belongs to."""
+    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    return common / "mefor-coord" / "seats"
+
+
 def _seat_records(start: Path) -> list[dict[str, Any]]:
     """Every seat record in the registry of the clone ``start`` belongs to."""
-    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    seats = common / "mefor-coord" / "seats"
+    seats = _seats_dir(start)
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(seats.rglob("*.json"))]
 
 
-def _record_stop(repo: Path, payload: dict[str, Any]) -> None:
-    """Run the Stop hook in the primary, as the app runs it.
+def _record_stop(
+    repo: Path,
+    payload: dict[str, Any],
+    *,
+    project_dir: Path | None = None,
+    entrypoint: str = "claude-desktop",
+) -> None:
+    """Run the Stop hook in ``repo``, by default the primary, as the app runs it.
+
+    ``CLAUDE_PROJECT_DIR`` is ``project_dir``, or ``repo``: the app sets it to the project it
+    opened, and a plain CLI (``entrypoint`` ``cli``) to the directory it was launched in. Both are
+    set either way, so the values of the session running the tests never reach the hook.
 
     tests/conftest.py drops MEFOR_COORD_ROOT for the whole run, so no record can reach the real
     shared root: each fixture clone's own ``.git/mefor-coord`` is its registry."""
-    _run(SEAT_RECORD, repo, _raw(payload))
+    env = {
+        **os.environ,
+        "CLAUDE_PROJECT_DIR": str(project_dir or repo),
+        "CLAUDE_CODE_ENTRYPOINT": entrypoint,
+    }
+    _run(SEAT_RECORD, repo, _raw(payload), env)
 
 
 @pytest.fixture
@@ -926,15 +949,34 @@ def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
 
 
-def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there(
+def test_the_other_repository_takes_a_record_when_one_is_meant_for_it(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """BACKLOG #5954: with no pin, a cwd in a worktree of this repository is recorded at that
-    worktree, as seat-record.ps1 says, since only a pin can tell its own worktree from a sibling."""
+    """The negative control for the absence pin above. Run from the other repository itself, the
+    same hook records there, so an empty registry above is the pin rule and not a fixture whose
+    other repository can hold no record."""
+    _, _, _, other = seat_clones
+    _record_stop(other, _stop("s1", other))
+    recs = _seat_records(other)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], other), recs
+
+
+UNPINNED_SOURCE = (
+    "hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)"
+)
+
+
+def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there_labelled_unpinned(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """DECIDED, NOT A BUG (BACKLOG #5961 remainder, under #5954): with no pin, a cwd in a worktree
+    of this repository is recorded at that worktree, and the record says no pin vouches for it.
+    seat-record.ps1's comment on that branch says why; no reader consults the label yet."""
     repo, _, sibling, _ = seat_clones
     _record_stop(repo, _stop("s1", sibling))
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
 
 
 def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
@@ -945,6 +987,141 @@ def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
     _record_stop(repo, _stop("s1", repo))
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], repo), recs
+    # The label's control: the start checkout is the one cwd rule 4 takes, so nothing says unpinned.
+    assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
+
+
+LAUNCHED_SOURCE = (
+    "session launch worktree, unpinned: CLAUDE_PROJECT_DIR (scripts/hooks/seat-record.ps1)"
+)
+
+
+@pytest.mark.parametrize("hook_runs_in", ["launch worktree", "sibling"])
+def test_a_cli_session_launched_in_a_linked_worktree_is_recorded_there_after_a_clear_in_a_sibling(
+    seat_clones: tuple[Path, Path, Path, Path], hook_runs_in: str
+) -> None:
+    """BACKLOG #5961 remainder. A plain CLI session launched in linked worktree W moves to sibling S
+    and runs /clear, which mints a new session id and never pins. Its CLAUDE_PROJECT_DIR still names
+    W, so the record goes to W, labelled. Both places the hook may run from are covered: W, and S
+    for a hook whose working directory followed the cd. Before the fix both recorded S."""
+    repo, wt, sibling, _ = seat_clones
+    start = wt if hook_runs_in == "launch worktree" else sibling
+    _record_stop(start, _stop("s1", sibling), project_dir=wt, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert not any(_same_dir(r["worktree"], sibling) for r in recs), recs
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == LAUNCHED_SOURCE, recs
+
+
+def test_a_desktop_session_whose_project_is_a_linked_worktree_keeps_the_cwd_record(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control for the arm above. The desktop app sets CLAUDE_PROJECT_DIR to the project it
+    opened, which can be a linked worktree holding the session's own worktree, so only a plain CLI
+    takes the launch worktree. The same inputs from the app keep the #5954 cwd record, labelled."""
+    repo, wt, sibling, _ = seat_clones
+    _record_stop(wt, _stop("s1", sibling), project_dir=wt)
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
+
+
+def test_a_cli_session_launched_in_the_primary_keeps_the_cwd_record(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The launch worktree must be a LINKED worktree: a plain CLI launched in the primary is the
+    desktop-app shape, so a sibling cwd keeps the #5954 record there, labelled unpinned."""
+    repo, _, sibling, _ = seat_clones
+    _record_stop(repo, _stop("s1", sibling), project_dir=repo, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
+
+
+def test_a_cli_cwd_rule_4_refused_is_recorded_at_the_launch_worktree_labelled(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """A hook started outside the launch worktree, with the cwd still in it: rule 4 refuses the
+    cwd, so the record says the launch worktree chose it."""
+    repo, wt, _, _ = seat_clones
+    _record_stop(repo, _stop("s1", wt), project_dir=wt, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == LAUNCHED_SOURCE, recs
+
+
+def test_a_cli_launch_directory_that_is_gone_is_not_walked_up_from(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """A CLAUDE_PROJECT_DIR that no longer exists names no launch worktree, even inside one."""
+    repo, wt, sibling, _ = seat_clones
+    _record_stop(wt, _stop("s1", sibling), project_dir=wt / "removed", entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
+
+
+def test_a_cli_session_still_in_its_launch_worktree_carries_no_launch_label(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control for the arm above: a cwd in the launch worktree itself is recorded there, as
+    before, and nothing says the cwd left it."""
+    repo, wt, _, _ = seat_clones
+    _record_stop(wt, _stop("s1", wt), project_dir=wt, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
+
+
+def test_a_pin_still_wins_over_the_launch_worktree(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """Rule 3: a pinned session answers for its pin whatever CLAUDE_PROJECT_DIR names."""
+    repo, wt, sibling, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(sibling, _stop("s1", sibling), project_dir=sibling, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"].startswith("session pin"), recs
+
+
+def test_a_cli_session_in_another_repository_is_still_refused(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The launch worktree is used only for a cwd in its own repository, so this stays a refusal."""
+    repo, wt, _, other = seat_clones
+    _record_stop(wt, _stop("s1", other), project_dir=wt, entrypoint="cli")
+    assert _seat_records(repo) == [] and _seat_records(other) == []
+    lines = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+
+
+def test_a_hook_refusal_leaves_a_refusal_line(seat_clones: tuple[Path, Path, Path, Path]) -> None:
+    """seat-record.ps1 refuses a cwd in another repository itself and hands its Reason to seat.ps1
+    as -Refused, so the refusal reaches .writer-refusals.txt and not only the turn's notice."""
+    repo, _, _, other = seat_clones
+    seats = _seats_dir(repo)
+    _record_stop(repo, _stop("s1", other))
+    assert _seat_records(repo) == [] and _seat_records(other) == []
+    lines = (seats / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[2] == "s1", lines
+    errors = seats / ".writer-errors.txt"
+    assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+
+
+def test_a_hook_refusal_wins_over_input_seat_ps1_would_accept(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """-Refused is the hook's verdict, passed rather than re-derived: seat.ps1 records nothing even
+    for input its own resolution would record (a cwd in the start checkout)."""
+    repo, _, _, _ = seat_clones
+    _record_seat_direct(repo, _stop("s1", repo), "-Refused", "the hook refused it")
+    assert _seat_records(repo) == []
+    lines = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[-1] == "the hook refused it", lines
+    # The control: the same input with no -Refused is recorded.
+    _record_seat_direct(repo, _stop("s1", repo))
+    assert len(_seat_records(repo)) == 1
 
 
 def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(
@@ -976,16 +1153,46 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     assert _seat_records(repo) == []
     # A refusal is not a writer failure: fleet.ps1 counts .writer-errors.txt lines as failures, so
     # an unpinned session must not add one on every Stop.
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    errors = _seats_dir(repo) / ".writer-errors.txt"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
 
 
-def _record_seat_direct(repo: Path, payload: dict[str, Any]) -> None:
-    """Run seat.ps1 -Record with no -Worktree, the one route on which it refuses input."""
-    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+def test_a_named_worktree_record_still_logs_a_hook_input_fault(
+    seat_clones: tuple[Path, Path, Path, Path], tmp_path: Path
+) -> None:
+    """seat.ps1 -Record -Worktree recorded at the named worktree and dropped its own helper's Fault
+    unread. A copy of seat.ps1 with no scripts/hooks/_hookinput.ps1 beside it still records where
+    -Worktree says, and leaves the hook-input line rule 2 wants in .writer-errors.txt."""
+    repo, wt, _, _ = seat_clones
+    sandbox = Path(os.path.realpath(tmp_path)) / "sandbox" / "scripts"
+    shutil.copytree(ROOT / "scripts" / "coord", sandbox / "coord")
+    shutil.copytree(ROOT / "scripts" / "worktree", sandbox / "worktree")
+    assert not (sandbox / "hooks").exists()
+    seat = sandbox / "coord" / "seat.ps1"
+    _record_seat_direct(repo, _stop("s1", wt), "-Worktree", str(wt), seat=seat)
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    errors = _seats_dir(repo) / ".writer-errors.txt"
+    assert errors.is_file(), "the helper's Fault left no .writer-errors.txt line"
+    lines = errors.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[2] == "hook-input", lines
+
+    # With -Refused as well, the fault is still a writer error, and the hook's refusal still a line.
+    _record_seat_direct(repo, _stop("s2", wt), "-Refused", "the hook refused it", seat=seat)
+    assert len(errors.read_text(encoding="utf-8").splitlines()) == 2
+    refusals = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(refusals) == 1 and refusals[0].split("\t")[-1] == "the hook refused it", refusals
+
+
+def _record_seat_direct(
+    repo: Path,
+    payload: dict[str, Any],
+    *args: str,
+    seat: Path = ROOT / "scripts" / "coord" / "seat.ps1",
+) -> None:
+    """Run seat.ps1 -Record directly, with no -Worktree unless ``args`` name one."""
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record"],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record", *args],
         cwd=str(repo),
         input=_raw(payload),
         capture_output=True,
@@ -1000,10 +1207,10 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
 ) -> None:
     """seat.ps1 -Record with no -Worktree writes each refusal to .writer-refusals.txt, one line
     per session key and host per hour, never to .writer-errors.txt. Run directly, because
-    seat-record.ps1 answers a refused input itself and never runs seat.ps1 for it."""
+    seat-record.ps1 never refuses a sibling cwd: it records it at the pin, at a plain CLI's launch
+    worktree, or otherwise there."""
     repo, _, sibling, _ = seat_clones
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    seats = common / "mefor-coord" / "seats"
+    seats = _seats_dir(repo)
     refusals = seats / ".writer-refusals.txt"
     errors = seats / ".writer-errors.txt"
 
@@ -1057,8 +1264,7 @@ def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
     the time separator as '.', and th-TH counts years in the Buddhist era, so the stamp never parsed
     and every refusal added a line. The second refusal within the hour must add none."""
     repo, _, sibling, _ = seat_clones
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    refusals = common / "mefor-coord" / "seats" / ".writer-refusals.txt"
+    refusals = _seats_dir(repo) / ".writer-refusals.txt"
 
     before = time.strftime("%Y", time.gmtime())
     _record_stop_in_culture(repo, _stop("s1", sibling), culture)

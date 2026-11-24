@@ -23,6 +23,7 @@
 # tests/test_tooling_partition.py pins this file against the tree and fails if a new non-engine test
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
+tests/test_adr_0019_0173_revert_guard.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py
@@ -112,6 +113,7 @@ tests/test_cloud_setup_hook.py
 tests/test_collision_gate.py
 tests/test_coord_box_activity.py
 tests/test_coord_claim_adjudicate.py
+tests/test_coord_claim_list_culture.py
 tests/test_coord_claim_liveness.py
 tests/test_coord_claim_reconcile.py
 tests/test_coord_claim_refresh.py
@@ -284,3 +286,9 @@ tests/test_zizmor_config_hygiene.py
 tests/test_worktree_gate_per_invocation.py
 tests/test_cla_precheck.py
 tests/test_worktree_gate_quoted_and_every_invocation.py
+tests/test_coord_fleet_live_fence.py
+tests/test_coord_seat_record_facts.py
+tests/test_dashboard_collect_metrics.py
+tests/test_dashboard_to_rows.py
+tests/test_dashboard_render_html.py
+tests/test_dashboard_ps_scripts.py

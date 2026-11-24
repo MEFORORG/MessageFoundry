@@ -43,6 +43,7 @@ import hmac
 import io
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -56,7 +57,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, NamedTuple, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -97,10 +98,11 @@ from messagefoundry.store.cipher_cells import (
 from messagefoundry.store.crypto import (
     StoreKeylessError,
     _decode_key,
+    gave_no_verdict,
     store_data_key_id,
 )
 from messagefoundry.store.gcm_bound import bounded_cipher
-from messagefoundry.store.schema_verify import SchemaMismatchError
+from messagefoundry.store.schema_verify import SchemaMismatchError, is_schema_step_error
 from messagefoundry.terminal_text import escape_for_terminal
 from messagefoundry.transports.file import (
     _FLAG_BACKUP_SEMANTICS,
@@ -110,6 +112,7 @@ from messagefoundry.transports.file import (
     _WIN_UNSUPPORTED,
     _attribute_tag,
     _fd_for,
+    _file_id,
     _handle_final_path,
     _os_handle,
     _Replaced,
@@ -279,10 +282,13 @@ class VerifyResult:
     row_counts: dict[str, int] = field(default_factory=dict)
     manifest_counts: dict[str, int] = field(default_factory=dict)
     reason: str | None = None
-    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot. A
-    #: count, never a plaintext. ``0`` on a lightweight verify (it does not run the pass) and on an
-    #: unencrypted store (there is nothing sealed to open) — so it distinguishes "read the PHI" from
-    #: "opened the file", which is the whole difference a full verify is meant to prove.
+    #: How many cipher-covered cells the FULL verify decrypted AND authenticated in the snapshot as
+    #: the archive holds it, before its open. A count, never a plaintext. ``0`` on a lightweight
+    #: verify (it does not run the pass) and on an unencrypted store (there is nothing sealed to
+    #: open) — so it distinguishes "read the PHI" from "opened the file", which is the whole
+    #: difference a full verify is meant to prove. A cell only the walk after the open reads, one a
+    #: migration makes readable, is authenticated toward the verdict but not counted here
+    #: (:func:`_full_open_check`).
     decrypted_cells: int = 0
 
     @property
@@ -1963,11 +1969,18 @@ def _clear_readonly_and_retry(func: Callable[..., object], path: str, exc: BaseE
     ``TemporaryDirectory`` did and a plain ``rmtree`` does not. Only an unlink or rmdir is retried,
     and never through a link; anything else re-raises, so ``rmtree`` fails rather than skipping a
     subtree it could not read. A sharing violation is also a ``PermissionError``: its retry raises
-    again, and the caller's own schedule takes over."""
+    again, and the caller's own schedule takes over.
+
+    Windows only. POSIX re-raises: its retry would change the entry's mode and remove it by its full
+    path, which follows a directory above it that was swapped for a link, while ``rmtree`` itself
+    removes relative to directory descriptors there. A POSIX unlink or rmdir is refused by the mode
+    of the directory holding the entry, which a change to the entry's own mode does not lift
+    (BACKLOG #2420)."""
     if isinstance(exc, FileNotFoundError):
         return
     if (
-        not isinstance(exc, PermissionError)
+        sys.platform != "win32"
+        or not isinstance(exc, PermissionError)
         or func not in (os.unlink, os.remove, os.rmdir)
         or os.path.islink(path)
     ):
@@ -1978,14 +1991,25 @@ def _clear_readonly_and_retry(func: Callable[..., object], path: str, exc: BaseE
 
 def _remove_tree(path: Path) -> bool:
     """Remove ``path`` and everything in it. ``True`` only when it is gone, including when it
-    already was: a clean return from ``rmtree`` is checked rather than trusted."""
+    already was: a clean return from ``rmtree`` is checked rather than trusted.
+
+    On Windows it removes through the verbatim path (:func:`_win_verbatim`), so each name below
+    ``path`` is opened exactly as listed. By the plain path Win32 rewrites a name such as ``sub.`` to
+    ``sub``, and a junction planted at ``sub`` then took the removal outside ``path`` (BACKLOG #2420).
+    A path whose verbatim form cannot be made is not removed."""
+    target: str | Path = path
+    if sys.platform == "win32":
+        try:
+            target = _win_verbatim(path)
+        except (OSError, ValueError):
+            return False
     try:
-        shutil.rmtree(path, onexc=_clear_readonly_and_retry)
+        shutil.rmtree(target, onexc=_clear_readonly_and_retry)
     except FileNotFoundError:
         pass
     except OSError:
         return False
-    return not os.path.lexists(path)
+    return not os.path.lexists(target)
 
 
 def _fd_walk(
@@ -2070,7 +2094,8 @@ def _empty_files_in_place(staging: Path, *, spared: Mapping[str, str] | None = N
       as another object (:func:`_win_opens_another`) is reported.
 
     A listed file that is gone from its name before it is opened is reported, never read as nothing to
-    empty: a rename leaves its bytes under another name.
+    empty: a rename leaves its bytes under another name. So is one whose name, by its open, names
+    another file than the one its screen found there.
 
     What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
     ``mefor-verify-*`` staging row."""
@@ -2200,8 +2225,9 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
     it. ``None`` when it was emptied or holds nothing to empty, else what to report.
 
     ``dir_fd`` is its directory's descriptor on POSIX; ``here`` is that directory's final path on
-    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first only skips a link or a hard
-    link without opening it; the check that decides is the one on the open handle.
+    Windows, as :func:`_win_held_walk` yields it. The ``lstat`` first skips a link or a hard link
+    without opening it, and names the file the open handle must be; the type and link checks that
+    decide are the ones on the open handle.
 
     A name that is gone at the ``lstat`` or the open is reported, not read as nothing to empty: it
     was listed, so it was renamed or removed since, and a rename leaves the file full under a name
@@ -2250,7 +2276,12 @@ def _truncate_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> s
         # Checked on the handle that truncates: POSIX's only check, and on Windows the reopened
         # handle of a file a filter serves (the handle opened as itself was checked before that,
         # inside test included, and the reopen must be that same file).
-        _vet_for_truncate(fd)
+        opened = _vet_for_truncate(fd)
+        # And it must be the file screened above: a file renamed away after its screen, with a new
+        # one made under its name, would otherwise have the new one emptied and the directory
+        # reported clean while the renamed one keeps its bytes (BACKLOG #2420).
+        if _file_id(opened) != _file_id(st):
+            raise _Replaced("not the file screened")
         os.ftruncate(fd, 0)
     except OSError as exc:
         return _not_truncated(name, exc)
@@ -2322,10 +2353,10 @@ def _open_unfollowed(entry: Path, dir_fd: int | None, here: str | None) -> int:
     return os.open(entry.name, flags, dir_fd=dir_fd)
 
 
-#: ``O_NOFOLLOW`` where the platform has it: the sweep's lock open and the teardown's re-mark refuse a
-#: lock file or marker planted as a link. Windows has none, and follows one there.
+#: ``O_NOFOLLOW`` where the platform has it, at least for the spare-marker read
+#: (:func:`_read_spare_marker`). Windows has none.
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-#: ``O_NONBLOCK`` where the platform has it, for the teardown's re-mark (see :func:`_teardown_staging`).
+#: ``O_NONBLOCK`` where the platform has it, for the spare-marker read too.
 _O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 #: The bit a Windows reparse tag carries when it names another path (a symbolic link, a junction),
 #: read at least by :func:`_owner_of`, :func:`_names_another_path` and :func:`_stat_names_another_path`.
@@ -2337,19 +2368,22 @@ _WIN_NAME_SURROGATE = _NAME_SURROGATE
 # confines its drops with, so one copy of that code serves both (BACKLOG #4992).
 
 
-def _vet_for_truncate(fd: int) -> None:
+def _vet_for_truncate(fd: int) -> os.stat_result:
     """Refuse, on the open file, what the fail-safe never truncates: something that is not a regular
     file, or a file with a second link.
 
     On Windows :func:`_win_open_file` calls this on the file opened as itself, before it lets a
     filter serve a reparse point that names no path, and the screen before that open is
     :func:`_win_lstat`, not ``os.lstat`` (BACKLOG #4992). What still reaches a filter first is
-    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row."""
+    listed in docs/PHI.md section 2's ``mefor-backup-*`` / ``mefor-verify-*`` staging row.
+
+    Returns the file's ``fstat``, for a caller's identity check."""
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         raise _Unconfined("not a regular file")
     if st.st_nlink > 1:
         raise _HardLinked("a second link")
+    return st
 
 
 def _win_final_path(handle: int) -> str:
@@ -3138,6 +3172,149 @@ def _unlock_and_close(fd: int) -> None:
         os.close(fd)
 
 
+#: The Win32 access right :func:`_win_create_new` asks for.
+_GENERIC_WRITE = 0x40000000
+
+
+def _win_create_new(path: Path) -> None:
+    """Windows: create the empty file ``path``, opening any entry already there as itself, so a
+    link there, dangling or not, is a name in use (``FileExistsError``) and is never followed."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("the Windows file API runs only on Windows")
+    kernel32 = _win_api()
+    handle = kernel32.CreateFileW(
+        str(path), _GENERIC_WRITE, _SHARE_ALL, None, 1, _FLAG_OPEN_REPARSE_POINT, None
+    )  # 1 is CREATE_NEW
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        error = ctypes.get_last_error()
+        if error in (80, 183):  # ERROR_FILE_EXISTS, ERROR_ALREADY_EXISTS
+            raise FileExistsError(errno.EEXIST, "a name in use")
+        raise ctypes.WinError(error)
+    kernel32.CloseHandle(handle)
+
+
+class _HeldStagingDir:
+    """A staging directory through which the sweep reads its owner, opens its lock and tests its
+    marker, and the teardown puts both back (BACKLOG #2420). Used as a context manager.
+
+    POSIX opens it with ``O_NOFOLLOW`` and goes relative to that descriptor, so a directory swapped
+    for a link has neither its lock opened nor its marks made in the link's target. Where the
+    platform has no ``O_PATH`` and the read-only open that stands in for it is refused for want of
+    read permission, it goes by path instead, as the opens it replaced did, so such a directory is
+    still swept and re-marked.
+
+    Windows opens nothing here and goes by path, as the opens it replaced did; only its re-mark
+    differs, by an exclusive create (:meth:`mark`).
+
+    What this leaves open is listed once, in docs/PHI.md section 2's ``mefor-backup-*`` /
+    ``mefor-verify-*`` staging row."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        #: None where the directory goes by path (Windows, and POSIX as said above).
+        self.fd: int | None = None
+        if sys.platform != "win32":
+            flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            o_path = getattr(os, "O_PATH", None)
+            if o_path is not None:
+                # Linux: needs only search permission, as the by-path opens it replaced did.
+                self.fd = os.open(path, o_path | flags)
+            else:
+                try:
+                    self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | flags)
+                except PermissionError:
+                    self.fd = None  # by path, as before (see the class docstring)
+
+    def __enter__(self) -> _HeldStagingDir:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError as exc:  # never raised over the caller's own outcome
+                log.warning("DR staging: could not close a staging directory: %s", safe_exc(exc))
+
+    def owner(self) -> object | None:
+        """The directory's owner, read from the open directory (:func:`_owner_of_fd`), or by path
+        (:func:`_owner_of`) where it goes by path."""
+        if self.fd is None:
+            return _owner_of(self.path)
+        return _owner_of_fd(self.fd, self.path)
+
+    def open_lock(self) -> int:
+        """Open the lock file for reading and writing and return a descriptor. ``O_NONBLOCK``
+        where the platform has it, so a FIFO planted there does not hold the sweep; ``O_NOFOLLOW``
+        where it has that, which Windows does not."""
+        if sys.platform == "win32" or self.fd is None:
+            return os.open(
+                self.path / _LOCK_NAME,
+                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
+            )
+        return os.open(
+            _LOCK_NAME,
+            os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=self.fd,
+        )
+
+    def has(self, name: str) -> bool:
+        """Whether an entry named ``name`` is in the directory, a link included; ``False`` when that
+        cannot be read."""
+        if self.fd is None:
+            return os.path.lexists(self.path / name)
+        try:
+            os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except OSError:
+            return False  # as `os.path.lexists`, which the by-path arm uses, reads a fault
+        return True
+
+    def mark(self, name: str) -> None:
+        """Create the empty file ``name`` unless an entry has that name.
+
+        On Windows, and on POSIX where the directory is open, the create is exclusive, so it never
+        follows a link planted at that name, a dangling one included: on POSIX ``O_EXCL`` with
+        ``O_CREAT`` never follows a final link, and on Windows ``CREATE_NEW`` with
+        ``FILE_FLAG_OPEN_REPARSE_POINT`` takes the link itself as the name in use, where an
+        ``os.open`` create would make the file at a dangling link's target. Where that create finds
+        the name taken, the entry there is checked (on Windows by :func:`_win_lstat`, which opens it
+        as itself for its attributes), and ``OSError`` is raised when it is not a plain file.
+        Windows still reaches that name by path. An entry that goes between the refused create and
+        its check is created once more.
+
+        Where POSIX goes by path, the open is the one it replaced: ``O_CREAT`` with ``O_NOFOLLOW``
+        and ``O_NONBLOCK``, by path, which opens an entry already there and checks nothing more."""
+        if sys.platform != "win32" and self.fd is None:
+            flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
+            os.close(os.open(self.path / name, flags, 0o600))
+            return
+        for attempt in (1, 2):
+            try:
+                if sys.platform == "win32":
+                    _win_create_new(self.path / name)
+                else:
+                    os.close(
+                        os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=self.fd)
+                    )
+                return
+            except FileExistsError:
+                pass
+            try:
+                if sys.platform == "win32":
+                    st, tag = _win_lstat(self.path / name)
+                    plain = stat.S_ISREG(st.st_mode) and not tag & _WIN_NAME_SURROGATE
+                else:
+                    plain = stat.S_ISREG(
+                        os.stat(name, dir_fd=self.fd, follow_symlinks=False).st_mode
+                    )
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
+                continue
+            if not plain:
+                raise OSError(errno.EEXIST, f"{name} is there, but is not a plain file")
+            return
+
+
 class _Staging:
     """One staging directory and the lock that proves it is live. Released exactly once.
 
@@ -3311,12 +3488,12 @@ def _teardown_staging(
             ", ".join(unrecorded),
         )
     else:
-        # `_O_NONBLOCK` too, as the fail-safe's own opens: a FIFO planted at either name would
-        # otherwise hold this thread in the open until a reader came, which may be never.
-        flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW | _O_NONBLOCK
+        # Through `_HeldStagingDir`, which says where it goes by path; on POSIX, where the
+        # directory is open, the exclusive create does not follow a planted link (BACKLOG #2420).
         try:
-            for name in (_LOCK_NAME, _HELD_MARKER_NAME):
-                os.close(os.open(path / name, flags, 0o600))
+            with _HeldStagingDir(path) as held_dir:
+                for name in (_LOCK_NAME, _HELD_MARKER_NAME):
+                    held_dir.mark(name)
         except OSError as exc:
             log.warning(
                 "DR staging directory %s survived its teardown and could not be marked for the next "
@@ -4129,45 +4306,8 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
         # security-descriptor read, so a temp dir full of other programs' leftovers stays cheap.
         if not os.path.lexists(path / _LOCK_NAME):
             continue
-        if _owner_of(path) != owner:
-            # Not this account's, or an owner that could not be read: another account's run, such as
-            # an administrator's interactive one, or a plant. Said, not skipped silently.
-            log.warning(
-                "DR staging: staging directory %s has another owner, so the sweep leaves it", path
-            )
+        if not _proven_abandoned(path, owner):
             continue
-        try:
-            # `_O_NONBLOCK` as the re-mark has it: a FIFO planted at the lock must not hold the sweep.
-            fd = os.open(
-                path / _LOCK_NAME,
-                os.O_RDWR | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK,
-            )
-        except FileNotFoundError:
-            continue  # no lock file: no proof either way
-        except OSError as exc:
-            # A directory with this account's owner whose lock file this account still cannot open;
-            # another owner's directory never reaches here, since the owner is checked first. Said,
-            # not skipped silently.
-            log.warning(
-                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
-                path,
-                safe_exc(exc),
-            )
-            continue
-        try:
-            if not file_lock.lock_exclusive(fd, wait=False):
-                continue  # a live run holds it
-            if not os.path.lexists(path / _HELD_MARKER_NAME):
-                continue  # locked by nobody, but no marker: not proven abandoned
-        except OSError as exc:
-            log.warning(
-                "DR staging: could not test the lock of staging directory %s: %s",
-                path,
-                safe_exc(exc),
-            )
-            continue
-        finally:
-            _unlock_and_close(fd)
         leftover = _teardown_staging(path)
         if leftover is not None:
             log.error("DR staging: an abandoned staging directory survived the sweep: %s", leftover)
@@ -4181,6 +4321,70 @@ def _sweep_owned(root: Path, owner: object, *, own: Path | None) -> int:
             swept += 1
             log.info("DR staging: removed abandoned staging directory %s", path)
     return swept
+
+
+def _another_owner(path: Path) -> None:
+    # Not this account's, or an owner that could not be read: another account's run, such as an
+    # administrator's interactive one, or a plant. Said, not skipped silently.
+    log.warning("DR staging: staging directory %s has another owner, so the sweep leaves it", path)
+
+
+def _proven_abandoned(path: Path, owner: object) -> bool:
+    """Whether the sweep may tear down the candidate ``path``, which holds a lock file: it has
+    ``owner``, its lock can be taken, and it holds the marker. What it refuses is
+    logged, except at least a live run's lock, a missing lock or marker, and a candidate gone by its
+    open.
+
+    The owner is read by path first; when it cannot be read, the sweep logs it as another owner.
+    Where :class:`_HeldStagingDir` has the directory open, the owner is read again from it, and that
+    read decides; where it goes by path, the first read is the only one, as before. What that class
+    leaves to a path is said there (BACKLOG #2420)."""
+    if _owner_of(path) != owner:
+        _another_owner(path)
+        return False
+    try:
+        held_dir = _HeldStagingDir(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning(
+            "DR staging: cannot open staging directory %s as itself, so the sweep leaves it: %s",
+            path,
+            safe_exc(exc),
+        )
+        return False
+    with held_dir:
+        if held_dir.fd is not None and held_dir.owner() != owner:
+            _another_owner(path)
+            return False
+        try:
+            fd = held_dir.open_lock()
+        except FileNotFoundError:
+            return False  # no lock file: no proof either way
+        except OSError as exc:
+            # A directory with this account's owner whose lock file this account still cannot
+            # open, or on POSIX one planted there as a link; another owner's directory never
+            # reaches here, since the owner is checked first. Said, not skipped silently.
+            log.warning(
+                "DR staging: cannot open the lock of staging directory %s, so the sweep leaves it: %s",
+                path,
+                safe_exc(exc),
+            )
+            return False
+        try:
+            if not file_lock.lock_exclusive(fd, wait=False):
+                return False  # a live run holds it
+            # Locked by nobody, but no marker: not proven abandoned.
+            return held_dir.has(_HELD_MARKER_NAME)
+        except OSError as exc:
+            log.warning(
+                "DR staging: could not test the lock of staging directory %s: %s",
+                path,
+                safe_exc(exc),
+            )
+            return False
+        finally:
+            _unlock_and_close(fd)
 
 
 def _verify_in_staging(
@@ -4580,9 +4784,16 @@ def _full_open_check(
         return "FAIL", "no live store settings were supplied for the full restore-verify", 0
     snap_settings = settings.model_copy(update={"path": str(snap), "backend": StoreBackend.SQLITE})
 
+    # Whether the last `_walk` returned `_decrypt_check`'s own verdict, rather than one for a raise.
+    walk_read: list[bool] = [False]
+    # The last walk's `WalkVerdict.kind`, or None for one that raised or carries no kind.
+    walk_kind: list[WalkKind | None] = [None]
+
     def _walk() -> tuple[str, str, int]:
+        walk_read[0] = False
+        walk_kind[0] = None
         try:
-            return _decrypt_check(snap, snap_settings, posture=posture)
+            result = _decrypt_check(snap, snap_settings, posture=posture)
         except (RuntimeError, ValueError, OSError, sqlite3.Error) as exc:
             # Its cipher build and its read-only connect are the open's own, so a failure there (a
             # key provider or DPAPI, a cipher config or a refused hop, a file the connect cannot
@@ -4590,14 +4801,17 @@ def _full_open_check(
             # open it is still behind an incompatible snapshot's verdict, so the open runs and the
             # order below decides; after the open it is the verdict.
             return "FAIL", safe_exc(exc), 0
+        walk_read[0] = True
+        walk_kind[0] = getattr(result, "kind", None)
+        return result
 
     # The cells are read FIRST, from the snapshot as the archive holds it (BACKLOG #1719). The open
     # below is a keyed open, and its at-open sweep seals what it reads as legacy plaintext: under
     # the opt-out, or on a surface no keyed open recorded, that includes a value whose marker is
     # damaged, which would then open cleanly and PASS. Read first, the walk judges that value as
-    # it was archived, and the verdict matches `cipher-audit`'s on the same store. A second walk
-    # after the open reads the cells a migration adds or renames, which this one cannot see.
+    # it was archived, and the verdict matches `cipher-audit`'s on the same store.
     walked = _walk()
+    walked_cells = walk_read[0]
     # ADR 0196 AC-8: the snapshot is a copy of the LIVE store and carries its salt. Opened as it is,
     # anything the open seals (the at-open sweep) would land under the live store's data sub-key and
     # be counted only in this throwaway copy's row. Dropping the salt makes the open mint a new one,
@@ -4635,7 +4849,40 @@ def _full_open_check(
     try:
         ok, msg = run_guarded(_open())
     except SchemaMismatchError as exc:
-        return "FAIL", _incompatible_snapshot(exc, engine_version), 0
+        # The walk's finding rides along, so it is not lost behind the remedy (BACKLOG #1719 item
+        # 3). `_walk` turns an exception that escapes `_decrypt_check` (its cipher build, its
+        # connect, or a RuntimeError, ValueError or OSError partway) into a FAIL of its own, which
+        # says nothing here. A sqlite3.Error or CipherWalkInterrupted partway is
+        # `_decrypt_check`'s own FAIL, and does ride along.
+        walk = None
+        if walked_cells:
+            # No count here: this arm reports none (`decrypted_cells` stays 0 on it).
+            if walked[0] != "PASS":
+                # Which findings get the misread reading, and what it does not claim, is
+                # `_MISREADABLE_KINDS`'s to say.
+                why = (
+                    " (the remedy leads because this build can misread another version's cells"
+                    " or schema)"
+                    if walk_kind[0] in _MISREADABLE_KINDS
+                    else ""
+                )
+                # Redacted by `_incompatible_snapshot` under `_WALK_REASON_LIMIT`, not safe_text's
+                # 200-character default, which the prefix and a reading's line together can pass.
+                walk = (
+                    f"Before the open, the walk of the cells this build knows reported {walked[0]}"
+                    f"{why}: {walked[1]}"
+                )
+            elif walked[2]:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed: every sealed"
+                    " value it read decrypted and authenticated."
+                )
+            else:
+                walk = (
+                    "Before the open, the walk of the cells this build knows passed, holding no"
+                    " sealed value to decrypt."
+                )
+        return "FAIL", _incompatible_snapshot(exc, engine_version, walk=walk), 0
     except StoreKeylessError as exc:
         # The store's own eager `state`/`reference` warm-ups fail closed on a keyless open of an
         # encrypted store. Same cause, same verdict — an absent keyring, not a bad archive — as
@@ -4660,13 +4907,36 @@ def _full_open_check(
 #: Longer than safe_exc's default, so the remedy and at least the first differences survive.
 _INCOMPATIBLE_REASON_LIMIT = 600
 
+#: The most characters of the walk's sentence the incompatible-snapshot refusal quotes. Its parts
+#: are bounded where they are made: at least a cell's locator values, at 64 characters and an
+#: elision mark each (`cipher_cells._shown`), and error text, cut at safe_text's 200 plus its
+#: notes. safe_exc's ordinary arm adds the class name and ": " outside that 200; the SQLite arm's
+#: text is bounded by safe_text in `_sqlite_error_reason`, with its class name inside the 200. A
+#: reading's line, the foreign-key note included, is then expected to stay well inside this,
+#: verdict and reason words included, so the cut is there to stop a defect from making the
+#: sentence unbounded.
+_WALK_REASON_LIMIT = 2000
 
-def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str:
+#: How :func:`_decrypt_check` opens the reason for a decrypt the key service gave no verdict on.
+_OUTAGE_LEAD = "the key service did not return a usable answer"
+
+
+def _error_classes(error: BaseException) -> str:
+    """The error's class, and its cause's when it has one, as a PHI-free label."""
+    cause = error.__cause__
+    named = type(error).__name__
+    return named if cause is None else f"{named} from {type(cause).__name__}"
+
+
+def _incompatible_snapshot(
+    exc: SchemaMismatchError, engine_version: str, *, walk: str | None = None
+) -> str:
     """The restore-verify refusal of a snapshot this build's schema cannot open (BACKLOG #2101).
 
     The store's own message tells an operator to move the store aside and recreate it, and for an
     encrypted store to change its key first. Neither applies to an archive, so this names the
-    version to restore it with instead. The remedy leads and the differences follow, so a short
+    version to restore it with instead. The remedy leads, the differences follow, and ``walk``,
+    the cell walk's sentence when one read the cells before the open, comes last, so a short
     display loses only the detail."""
     # The manifest is inside the authenticated archive, but it is still a string this build did not
     # write, so only a short, printable version label is quoted back.
@@ -4678,11 +4948,15 @@ def _incompatible_snapshot(exc: SchemaMismatchError, engine_version: str) -> str
         tail = f"The schema step failed: {exc.cause or ''}."
     # Redacted and bounded like every other arm's reason (safe_exc there): the tail is driver text
     # and a difference list with no length of its own. The remedy leads, so a cut loses only detail.
-    return safe_text(
+    head = safe_text(
         "the archive's store is from an incompatible version, so this build cannot open it: restore"
-        f" it with {wrote}. The archive opened and passed its integrity and row-count checks. {tail}",
+        f" it with {wrote}. The archive opened and passed its integrity and row-count checks."
+        f" {tail}",
         limit=_INCOMPATIBLE_REASON_LIMIT,
     )
+    # Redacted here, and appended after the head's cut, so a long differences list cannot cut it
+    # away.
+    return f"{head} {safe_text(walk, limit=_WALK_REASON_LIMIT)}" if walk else head
 
 
 def _sqlite_error_reason(exc: sqlite3.Error) -> str:
@@ -4693,11 +4967,85 @@ def _sqlite_error_reason(exc: sqlite3.Error) -> str:
     return safe_text(f"{type(exc).__name__}: {text}")
 
 
+#: What decided a :func:`_decrypt_check` verdict. ``cell`` is, under a key, at least a sealed value
+#: that did not open, other than one :func:`gave_no_verdict` reads as the key service's
+#: (``outage``). Which Transit replies give no verdict is for
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt` and
+#: :meth:`~messagefoundry.store.crypto_transit.TransitCipher.decrypt_many` to say, and the two do
+#: not always agree: at least a reply hvac returns unparsed (a 2xx other than 200, a 200 body that
+#: is not JSON, or one cut short where no length framed it) is ``cell`` for a value asked for alone
+#: and ``outage`` for a value asked for in a batch. ``cell`` is also a value that opened
+#: but its reader refuses (a ``QueueTagError``); a value whose AAD the open refused (an
+#: ``AADComponentError``); a marker in another ASCII case; and, on a surface the keyed store sealed
+#: and without ``allow_unmarked_ciphertext``, a value with no marker. ``damaged`` is a BLOB, or a
+#: TEXT value that is not UTF-8, for which Python's sqlite3 module raises a decode error; at least
+#: this build's own writer stores neither. ``sqlite_schema`` is a statement the snapshot's schema
+#: could not answer, by :func:`is_schema_step_error`, other than a virtual table's missing module;
+#: ``sqlite`` any other SQLite fault; ``interrupted`` a schema change mid-walk; ``outage`` a key
+#: service that gave no verdict; ``key_mismatch`` a keyed snapshot read with no key; ``pass`` none.
+WalkKind = Literal[
+    "pass",
+    "cell",
+    "damaged",
+    "sqlite_schema",
+    "sqlite",
+    "interrupted",
+    "outage",
+    "key_mismatch",
+]
+
+#: The kinds, by this set exactly, for which the incompatible-snapshot refusal offers the reading
+#: that a walk under this build read another version's cells or schema differently, as well as
+#: real damage. The reading is a possible cause there, never a finding that the cells are sound.
+#: They are not every kind a fault of that shape can reach, and a fault of any other kind gets no
+#: such framing. At least two such gaps are known, each a misread where another version wrote the
+#: snapshot. One is kind ``damaged`` (see :data:`WalkKind`), should another version's writer store
+#: what that kind names. The other is a keyed walk of a cipher column with an unregistered
+#: collation ("no such collation sequence"), kind ``sqlite`` where the collation's name holds no
+#: ``schema_verify._SHAPE_MESSAGES`` entry, or holds "no such module", which :func:`_sqlite_kind`
+#: excludes. :func:`is_schema_step_error` matches those entries as substrings of the whole
+#: message, so it rejects the first, and :func:`_sqlite_kind` falls through to ``sqlite`` for both.
+_MISREADABLE_KINDS: frozenset[WalkKind] = frozenset({"cell", "sqlite_schema"})
+
+
+class WalkVerdict(tuple[str, str, int]):
+    """A :func:`_decrypt_check` verdict: ``(status, reason, cells)``, as every caller unpacks it,
+    with the :data:`WalkKind` that decided it on ``kind``."""
+
+    kind: WalkKind
+
+    def __new__(cls, status: str, reason: str, cells: int, kind: WalkKind) -> WalkVerdict:
+        verdict = super().__new__(cls, (status, reason, cells))
+        verdict.kind = kind
+        return verdict
+
+    def __getnewargs__(self) -> tuple[str, str, int, WalkKind]:
+        # So copy and pickle rebuild it with its kind; tuple's own supplies only the three items.
+        return (self[0], self[1], self[2], self.kind)
+
+    def __repr__(self) -> str:
+        return f"WalkVerdict({self[0]!r}, {self[1]!r}, {self[2]!r}, kind={self.kind!r})"
+
+
+def _sqlite_kind(exc: sqlite3.Error) -> WalkKind:
+    """``sqlite_schema`` where the store's own schema classifier (:func:`is_schema_step_error`)
+    calls the fault a wrong shape, except a virtual table's missing module, which is an object
+    another tool left rather than another version's schema; ``damaged`` for a TEXT value Python's
+    sqlite3 module could not decode; else ``sqlite``."""
+    text = str(exc)
+    if is_schema_step_error(exc) and "no such module" not in text:
+        return "sqlite_schema"
+    if isinstance(exc, sqlite3.OperationalError) and text.startswith(_DECODE_ERROR_PREFIX):
+        return "damaged"
+    return "sqlite"
+
+
 def _decrypt_check(
     snap: Path, settings: StoreSettings, *, posture: HopPosture | None = None
-) -> tuple[str, str, int]:
+) -> WalkVerdict:
     """Decrypt AND authenticate every cipher-covered cell retained in the snapshot, under the store's own
-    cipher. Returns ``(status, message, cells)`` — a COUNT and a PHI-free reason, never a plaintext.
+    cipher. Returns a :class:`WalkVerdict`, ``(status, message, cells)`` with the :data:`WalkKind`
+    that decided it — a COUNT and a PHI-free reason, never a plaintext.
 
     Opening the store proves the file is a readable SQLite database. It does not prove the PHI inside it
     is readable, and those are the two different claims a disaster-recovery check gets confused about: a
@@ -4717,9 +5065,8 @@ def _decrypt_check(
     key opened, then a failure. Under a key no keyless reading can come, so this pass stops at the
     first value that does not open. With no key it reads on past a BLOB, which fails under any
     cipher, so a sealed value later in the walk still decides KEY_MISMATCH, as ``cipher-audit``
-    decides it, whichever row comes first. A full verify runs this pass before the store's own
-    open (:func:`_full_open_check`), so the open cannot decide first or change a cell this reads,
-    and again after it, over the migrated copy.
+    decides it, whichever row comes first. When a full verify runs this pass, and why, is
+    :func:`_full_open_check`'s to say.
 
     It also reads the non-blank values with no marker, as ``cipher-audit`` does: one on a surface
     the keyed store has sealed fails, unless ``allow_unmarked_ciphertext`` is set, because the
@@ -4735,7 +5082,7 @@ def _decrypt_check(
     try:
         mismatch = keyed_store_mismatch(conn, cipher, store_tables(conn), source="snapshot")
         if mismatch is not None:
-            return "KEY_MISMATCH", mismatch, cells
+            return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
         for reading in read_cipher_cells(conn, cipher, unmarked=True):
             if reading.kind == "unmarked":
                 # A non-blank value with no marker on a surface the keyed store sealed: the store
@@ -4744,12 +5091,13 @@ def _decrypt_check(
                 # plaintext, and so does this. Only a keyed walk yields one.
                 if settings.allow_unmarked_ciphertext:
                     continue
-                return (
+                return WalkVerdict(
                     "FAIL",
                     f"{reading.cell.table}.{reading.cell.column} {reading.where} carries no "
                     "at-rest marker on a surface this keyed store has sealed, so the store "
                     "refuses it at read: a damaged or stripped marker, or a planted row",
                     cells,
+                    "cell",
                 )
             if reading.kind == "legacy":
                 # Plaintext on a surface no keyed open recorded, which the next keyed open seals.
@@ -4760,29 +5108,41 @@ def _decrypt_check(
                 # unambiguously the cause. Keylessness is the CIPHER's, never a plaintext's: a
                 # decrypted value may itself begin with the marker. A BLOB never comes here.
                 mismatch = with_first_failure(reading.failure(source="snapshot"), first_blob)
-                return "KEY_MISMATCH", mismatch, cells
+                return WalkVerdict("KEY_MISMATCH", mismatch, cells, "key_mismatch")
             elif reading.kind == "blob":
                 # FAIL under any cipher, and never the keyring's: no key makes a BLOB readable.
                 if cipher.encrypts:
-                    return "FAIL", reading.failure(source="snapshot"), cells
+                    return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "damaged")
                 first_blob = first_blob or reading.failure(source="snapshot")
             elif reading.kind == "failed":
+                if reading.error is not None and gave_no_verdict(reading.error):
+                    # The key service failed, not the value: the walk stops here, as
+                    # `cipher-audit` stops on an outage, and the reason says so rather than
+                    # calling the cell undecryptable (BACKLOG #1719 item 12). Still no PASS.
+                    return WalkVerdict(
+                        "FAIL",
+                        f"{_OUTAGE_LEAD} ({_error_classes(reading.error)}) while "
+                        f"{reading.cell.table}.{reading.cell.column} {reading.where} was read, so "
+                        f"the walk stopped without a verdict on it: {safe_exc(reading.error)}",
+                        cells,
+                        "outage",
+                    )
                 # Only under a key: a keyless walk never decrypts. FAIL, not KEY_MISMATCH:
                 # CipherError cannot separate a corrupted ciphertext from a key that was never
                 # supplied, so the softer verdict on a bit-flipped PHI cell is the reading that
                 # must not be talked down.
-                return "FAIL", reading.failure(source="snapshot"), cells
+                return WalkVerdict("FAIL", reading.failure(source="snapshot"), cells, "cell")
             elif reading.kind == "opened":
                 cells += 1
         if first_blob is not None:
-            return "FAIL", first_blob, cells
+            return WalkVerdict("FAIL", first_blob, cells, "damaged")
     except sqlite3.Error as exc:
-        return "FAIL", _sqlite_error_reason(exc), cells
+        return WalkVerdict("FAIL", _sqlite_error_reason(exc), cells, _sqlite_kind(exc))
     except CipherWalkInterrupted as exc:  # nothing else writes a snapshot, but never PASS a part
-        return "FAIL", str(exc), cells
+        return WalkVerdict("FAIL", str(exc), cells, "interrupted")
     finally:
         conn.close()
-    return "PASS", "ok", cells
+    return WalkVerdict("PASS", "ok", cells, "pass")
 
 
 def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
@@ -4950,9 +5310,12 @@ def _safe_segment(value: str) -> str:
 # activation is the consumer (the DR box restores here, then activates onto the restored store).
 
 #: A WAL-mode store is three files. Restoring `store.db` beside a leftover `store.db-wal` from a
-#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so the sidecars
-#: are refused as destinations too, not just the main file.
-_SIDECAR_SUFFIXES = ("-wal", "-shm")
+#: DIFFERENT database would let SQLite replay that stale WAL over the restored pages, so a taken
+#: sidecar name is refused too, not just the main file: a file, a directory or a link, a dangling one
+#: included. When the names are read, and what that misses, is :func:`_refuse_taken_store_names`.
+#: ``-journal`` is here for the same reason: SQLite replays a hot rollback journal on first open, even
+#: into a WAL-mode store (measured).
+_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 #: ASVS 5.2.3 bounds on the restored CONFIG bundle, which the per-member cap alone cannot give: N
 #: members each just under that cap would still fill the destination volume. A real config dir is a
@@ -4964,7 +5327,8 @@ _MAX_CONFIG_MEMBERS = 10_000
 #: the same sentence as the one who was refused up front.
 _OVERWRITE_REFUSAL = (
     "refusing to overwrite an existing path at {path} — restoring over a live store is unrecoverable; "
-    "choose an empty --to path (or move the existing store aside first)"
+    "choose an empty --to path, or stop the engine and move the existing store aside with its -wal, "
+    "-shm and -journal as one set"
 )
 
 #: The one place the RESTORE path words a codec-level archive failure, so the operator whose header will
@@ -5522,6 +5886,9 @@ def _restore_blocking(
             except sqlite3.Error as exc:
                 raise BackupError("restore", safe_exc(exc)) from exc
             row_counts = {**row_counts, "restore_marker": 1}
+            # The second read of the store's names, while nothing is placed; its docstring says why
+            # and what it misses.
+            _refuse_taken_store_names(dest_store_path)
             # The exclusive create sits OUTSIDE the rollback on purpose: a lost create race raises
             # FileExistsError, and the file then at the destination belongs to the winner -- deleting
             # it would turn a refusal into the unrecoverable overwrite the refusal exists to prevent.
@@ -6148,10 +6515,101 @@ def _verify_extracted_store(snap: Path, manifest: dict[str, object]) -> dict[str
     return row_counts
 
 
+#: The ``--to`` refusals of :func:`_refuse_existing_destination`, one per trigger, so each is true
+#: on every host it can fire on. The ':' one fires on every host; the other two only on Windows.
+_COLON_TO_REFUSAL = (
+    "refusing --to {path}: its file name holds a ':'. It is refused on every host, so one --to means "
+    "the same everywhere: on Windows, and on some NTFS volumes reached from other systems, a ':' "
+    "names an alternate data stream, where the never-overwrite check could miss the store's real "
+    "-wal, -shm and -journal — choose a --to whose file name holds no ':'"
+)
+_TRAILING_TO_REFUSAL = (
+    "refusing --to {path}: its file name ends in a {what}, which Windows does not keep as part of "
+    "the name, so the never-overwrite check could miss the store's real -wal, -shm and -journal — "
+    "choose a --to whose file name does not end in a dot or a space"
+)
+_DEVICE_TO_REFUSAL = (
+    "refusing --to {path}: Windows would not open that name as a file of its own, for example a "
+    "device name such as NUL, or a path with no file name — choose another --to file name"
+)
+#: The fault refusal of :func:`_occupied` for WinError 123, an invalid name.
+_INVALID_NAME_REFUSAL = (
+    "cannot use {path}: {exc} — Windows refuses the path as invalid, for example for a character "
+    "such as < > | ? or * in its file name or in one of its directories; choose another --to path"
+)
+_FAULT_REFUSAL = (
+    "cannot tell whether {path} is free: {exc} — choose another --to path, or check that this "
+    "account can read its directory"
+)
+
+
+def _rewritten_to_refusal(path: Path) -> str:
+    """The refusal for a ``--to`` that :func:`_refuse_existing_destination` refuses by its spelling."""
+    if ":" in path.name:
+        return _COLON_TO_REFUSAL.format(path=path)
+    if path.name.endswith((".", " ")) and path.name not in (".", ".."):
+        what = "dot" if path.name.endswith(".") else "space"
+        return _TRAILING_TO_REFUSAL.format(path=path, what=what)
+    return _DEVICE_TO_REFUSAL.format(path=path)
+
+
+def _occupied(path: Path) -> bool:
+    """Whether anything has the name ``path``, a link included, dangling or not. Read without
+    following a link, so a dangling ``store.db-wal`` symlink, which SQLite would write through,
+    counts as taken. ``FileNotFoundError`` and ``NotADirectoryError`` read as free; on Windows
+    ``FileNotFoundError`` also covers at least network, invalid-drive, bad-path and too-long-path
+    errors (WinError 53, 67, 15, 161 and 206). Any other fault is a refusal, where
+    ``os.path.lexists`` would answer ``False``."""
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except (OSError, ValueError) as exc:  # ValueError: an embedded NUL, from a programmatic caller
+        text = _INVALID_NAME_REFUSAL if getattr(exc, "winerror", None) == 123 else _FAULT_REFUSAL
+        raise BackupError("destination", text.format(path=path, exc=safe_exc(exc))) from exc
+    return True
+
+
+def _store_names(dest_store_path: Path) -> tuple[Path, ...]:
+    """The store's name, then the ``-wal``, ``-shm`` and ``-journal`` names SQLite derives from it."""
+    return (
+        dest_store_path,
+        *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
+    )
+
+
+def _refuse_taken_store_names(dest_store_path: Path) -> None:
+    """Refuse a ``--to`` whose store name or any sidecar name is taken, by a file, a directory or a link
+    (:func:`_occupied`), naming the first one taken.
+
+    Run up front by :func:`_refuse_existing_destination` and again just before the placement in
+    :func:`_restore_blocking`, because the decrypt between them can take minutes. A sidecar planted
+    then would be replayed over the verified pages on first open. A dangling link planted at the
+    store's own name would be followed by the copy fallback's exclusive create on Windows, which
+    writes the store to the link's target (measured), so the store name is read again too.
+
+    After the second read, a regular file at the store name is still refused, by the placement's
+    exclusive create. Not caught, at least: a sidecar created after the second read, including while
+    the store is copied into place; and, on Windows when the store is copied rather than hard-linked
+    into place, a dangling link planted at the store name after it, which that create follows."""
+    for path in _store_names(dest_store_path):
+        if _occupied(path):
+            raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+
+
 def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path | None) -> None:
     """Refuse every destination that already holds something, BEFORE any decrypt work. Restoring over a
     live store is unrecoverable and a CLI cannot ask for permission, so the answer is no and the message
     names the path the operator must move or choose differently.
+
+    The store arm refuses at least: an existing store name, and an existing ``-wal``, ``-shm`` or
+    ``-journal`` beside it, whether file, directory or link, a dangling link included
+    (:func:`_occupied`); and a ``--to`` whose last component holds a ``:``, or that Windows would open
+    as another name, such as one ending in a dot or a space (:func:`_win_rewritten`). On Windows those
+    spellings derive sidecar names SQLite never uses, so the sidecar check would read the wrong files.
+    The ``:`` is refused on every host, so one ``--to`` means the same everywhere; a POSIX host can
+    reach an NTFS volume, where a ``:`` can name a stream. The names are read again just before the
+    placement (:func:`_refuse_taken_store_names`).
 
     The last arm refuses a pair of destinations that are individually empty and still collide, because
     this restore writes BOTH of them: see :func:`_refuse_config_dest_under_the_store`. Its mirror image
@@ -6160,12 +6618,9 @@ def _refuse_existing_destination(dest_store_path: Path | None, config_dest: Path
     ``dest_store_path`` is ``None`` on the config-only route (vault BACKLOG #5233): there is no store
     to place, so only the config destination is checked."""
     if dest_store_path is not None:
-        for path in (
-            dest_store_path,
-            *(dest_store_path.with_name(dest_store_path.name + s) for s in _SIDECAR_SUFFIXES),
-        ):
-            if path.exists():
-                raise BackupError("destination", _OVERWRITE_REFUSAL.format(path=path))
+        if ":" in dest_store_path.name or _win_rewritten(dest_store_path):
+            raise BackupError("destination", _rewritten_to_refusal(dest_store_path))
+        _refuse_taken_store_names(dest_store_path)
     if config_dest is not None:
         # is_file() BEFORE iterdir(): a --config-to that names an existing FILE is a typo to report, and
         # iterdir() on one raises NotADirectoryError, which escapes the CLI's BackupError handler as a
@@ -6230,7 +6685,13 @@ def _refuse_colliding_config_members(
     Run before the store is extracted, so a refusal costs neither the extract nor a half-finished
     restore. Traversal names are compared like any other: a ``../store.db`` member resolving back onto
     the store is the same collision, and refusing it here beats refusing it after placement. The
-    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control."""
+    exclusive create in :func:`_extract_config_members` is the backstop under this, not the control.
+
+    On a Windows host the question is also asked under Win32 naming, of the member and of each
+    directory above it (:func:`_win32_path_key`). There ``config/store.db-wal.`` compares unequal to
+    ``store.db-wal`` and is then created AS it once the store is placed, and the exclusive create
+    cannot catch that, because no WAL exists yet. A planted WAL would change verified rows on first
+    open, after ``integrity_check`` and the row-count compare."""
     published = {
         _norm_for_compare(p)
         for p in (
@@ -6240,6 +6701,21 @@ def _refuse_colliding_config_members(
     }
     seen: set[str] = set()
     try:
+        win32_root_key: tuple[str, ...] = ()
+        win32_published: set[tuple[str, ...]] = set()
+        store_key: tuple[str, ...] = ()
+        win32_depth = 0  # the store key's length; 0 off Windows, where this comparison never runs
+        if sys.platform == "win32":
+            win32_root_key = _win32_path_key(str(config_dest.resolve()))
+            store_key = _win32_path_key(str(dest_store_path.resolve()))
+            # Sidecars are suffixed AFTER normalizing: SQLite names them from the path spelling the
+            # store is opened with, and `--to D/store.db.` places `store.db`, whose plain spelling
+            # has its WAL at `store.db-wal`, not `store.db.-wal`.
+            win32_published = {
+                store_key,
+                *(store_key[:-1] + (store_key[-1] + s,) for s in _SIDECAR_SUFFIXES),
+            }
+            win32_depth = len(store_key)
         with tarfile.open(tar_path, "r:") as tar:
             for member in tar.getmembers():
                 if not _is_config_payload_member(member):
@@ -6255,8 +6731,45 @@ def _refuse_colliding_config_members(
                         "same command without --config-to",
                     )
                 seen.add(member.name)
-                out = config_dest / member.name[len(_CONFIG_PREFIX) :]
-                if _norm_for_compare(out) not in published:
+                rel = member.name[len(_CONFIG_PREFIX) :]
+                out = config_dest / rel
+                exact = _norm_for_compare(out) in published
+                if not exact and win32_depth:
+                    # Resolved first, so an 8.3 spelling of an existing parent is expanded.
+                    resolved = ntpath.normpath(str(out.resolve()))
+                    prefix = _win32_path_key(resolved)[:win32_depth]
+                    # The short-name case applies to the COPY-FALLBACK placement: a hard-linked
+                    # store has no 8.3 name (measured), so there `RESTOR~1.DB` is an unrelated new
+                    # file. A copied store gets its 8.3 name only when placed, so it cannot be
+                    # resolved here. A plain spelling of it then meets the exclusive create; a
+                    # STREAM on it would not, and would write onto the store. So a stream on any
+                    # `~` name in the store's directory is refused under BOTH placements, failing
+                    # closed because which one will run is not known yet. The generated name itself
+                    # is not predicted.
+                    # LIMIT, on the copy path: this does not cover a plain `RESTOR~1.DB-wal` member.
+                    # It lands, and becomes the store's WAL if the store is later opened by its 8.3
+                    # path, because SQLite names sidecars from the spelling the store was opened with.
+                    at_store_dir = len(prefix) == win32_depth and prefix[:-1] == store_key[:-1]
+                    component = resolved.split("\\")[win32_depth - 1] if at_store_dir else ""
+                    stem, stream_mark, _ = component.partition(":")
+                    # A prefix equal to the root's own is the operator's path, not the member's.
+                    if (prefix in win32_published and prefix != win32_root_key[:win32_depth]) or (
+                        stream_mark and "~" in stem
+                    ):
+                        # The member's name is not echoed, because this check runs before the name
+                        # gate and a name can still carry control characters. The exact-match
+                        # refusal below does echo it, so it is not safe against such a name.
+                        raise BackupError(
+                            "destination",
+                            "the archive's config bundle carries a member that may resolve, on "
+                            "Windows, to or under a path this restore would publish for the store "
+                            f"({dest_store_path}), so it could replace or corrupt the restored "
+                            "database. Nothing was extracted. The name may be a forgery or may simply "
+                            "alias on Windows. If --config-to contains the --to path, choose a "
+                            "--config-to directory that does not contain the --to path; a name "
+                            "that climbs out of --config-to is refused wherever it is restored",
+                        )
+                if not exact:
                     continue
                 raise BackupError(
                     "destination",
@@ -6271,6 +6784,26 @@ def _refuse_colliding_config_members(
         # this reads ATTACKER-SUPPLIED member names into ``Path``: a name the platform cannot parse
         # must be a refusal, not a traceback out of a check whose whole job is to refuse.
         raise BackupError("restore", safe_exc(exc)) from exc
+
+
+def _win32_path_key(path: str) -> tuple[str, ...]:
+    """A deliberately CONSERVATIVE key for "could this name reach that path on Windows", one
+    lower-cased entry per component. Pure, on every platform. It is not how Win32 names a path.
+
+    Each component loses an alternate-stream suffix and then its trailing dots and spaces. Win32
+    does less (measured): it keeps a trailing space on an intermediate component, and ``name.:x``
+    is a stream on a literal ``name.``. So this key OVER-REFUSES ``store.db-wal /x.toml`` and
+    ``store.db-wal.:x``, which name other paths; failing closed on a forged-looking name is the
+    intent. A component of ONLY dots or spaces keeps its spelling, so it cannot fuse its neighbours,
+    although Win32 can collapse one in final position; this key does not model that. Case is lowered ONE
+    CHARACTER AT A TIME, because ``str.lower`` on a whole string picks final sigma by context and would
+    separate two names NTFS treats as one. Per character, measured against ``RtlUpcaseUnicodeChar``
+    over the BMP on one Windows 11 host, it separates no two characters that function folds together."""
+    key: list[str] = []
+    for part in ntpath.normpath(path).split("\\"):
+        stem = part.split(":", 1)[0]
+        key.append("".join(map(str.lower, stem.rstrip(". ") or stem)))
+    return tuple(key)
 
 
 def _dangling_link_refusal(member: tarfile.TarInfo) -> str:
@@ -6438,7 +6971,8 @@ def _extract_config_members(
     streamed bytes counted). Member names are gated by the shared ASVS 5.3.2 check
     (:func:`~messagefoundry.parsing.sniff.archive_member_name_reason`) rather than a second private one,
     so a traversal, a backslash separator, a drive-relative prefix or a control character is refused
-    here exactly as it is on the inbound-archive path.
+    here exactly as it is on the inbound-archive path. On a Windows host a colon anywhere in the name
+    is refused as well, because NTFS would read it as an alternate data stream.
 
     The per-member cap is not enough on its own here — N members each just under it would still fill the
     disk — so the bundle also carries an AGGREGATE byte ceiling and a member-count ceiling.
@@ -6481,6 +7015,13 @@ def _extract_config_members(
                 )
             rel = member.name[len(_CONFIG_PREFIX) :]
             reason = archive_member_name_reason(rel)
+            # The shared gate refuses a colon only as a drive prefix (an ASCII letter, then a colon
+            # at index 1), and NTFS reads any other as a data stream: `a.toml:evil` would land
+            # hidden inside the restored `a.toml`. Only the colon, and only on this host: POSIX
+            # opens a name the gate admits, such as `ab:c.toml`, as itself, and refusing the other
+            # Windows name shapes here would fail a recovery of bundles that back up fine.
+            if reason is None and sys.platform == "win32" and ":" in rel:
+                reason = f"{member.name!r} contains a colon, which Windows reads as a data stream"
             if reason is not None:
                 raise BackupError(
                     "restore", f"archive carries an unsafe config member name ({reason})"
@@ -6509,9 +7050,9 @@ def _extract_config_members(
             src = tar.extractfile(data)
             if src is None:
                 continue
-            # The directories this member's mkdir is about to CREATE, deepest first, read before the
-            # mkdir so the ledger holds exactly what it made and never a directory that was already
-            # there. The walk stops at the destination root; the second guard is belt-and-braces
+            # The directories this member may need to CREATE, deepest first, read before any mkdir;
+            # the loop below records only those it really made. The walk stops at the
+            # destination root; the second guard is belt-and-braces
             # against a path whose parent is itself (a filesystem root), which the `is_relative_to`
             # check above already rules out.
             new_dirs: list[Path] = []
@@ -6523,15 +7064,29 @@ def _extract_config_members(
             # pass the name gate, and the second one's mkdir then re-raises FileExistsError because the
             # existing path is not a directory -- uncaught all the way out to a CLI traceback.
             try:
-                out.parent.mkdir(parents=True, exist_ok=True)
+                # The nearest existing ancestor first: a mkdir beneath a file reads as
+                # FileNotFoundError on Windows, which is not the collision it is. A regular file
+                # only: a device such as `nul` is no extracted member, so the OS reports that.
+                if probe.is_file():
+                    raise FileExistsError(probe)
+                # One level at a time, each recorded as it is made, so a failure part way down the
+                # chain (a component too long for the filesystem) leaves nothing unrecorded to trip
+                # the non-empty refusal on the retry.
+                for new_dir in reversed(new_dirs):
+                    try:
+                        new_dir.mkdir()
+                    except FileExistsError:
+                        if not new_dir.is_dir():
+                            raise
+                        continue  # another process made it, so it is not this restore's to remove
+                    if written is not None:
+                        written.append(new_dir)
             except (FileExistsError, NotADirectoryError) as exc:
                 raise BackupError(
                     "restore",
                     f"archive carries a config member at {member.name} whose parent directory "
                     "collides with a member already extracted as a file",
                 ) from exc
-            if written is not None:
-                written.extend(reversed(new_dirs))  # shallowest first: creation order
             streamed = 0
             # EXCLUSIVE create, so a member can never land on a file that is already there. The
             # overlapping-destination refusal is the control for the case that made this reachable

@@ -52,8 +52,14 @@ one. The harness wheel declares none of them, so they are not in its closure and
 for it. `pyodbc` is assessed in the `sqlserver` section, for the engine.
 
 An install that enables any other extra (`postgres`, `sftp`, `dicom`, `fhir`, `xml`, `x12`,
-`webauthn`, `otel`, `vault`) carries dependencies **outside** all three sets. Those are not assessed
+`webauthn`, `otel`, `vault`) carries dependencies **outside** the three assessed sets. Those are not assessed
 here, and that is a gap rather than an assertion of safety.
+
+The `postgres` extra's closure is recorded, in
+[`security/runtime-closure-postgres.txt`](../security/runtime-closure-postgres.txt), because the
+container image's `runtime-postgres` variant installs it (BACKLOG #5933). It adds one name to the
+core closure, `asyncpg`. It is still not assessed: an assessed extra needs its own section here and
+a reading in the public-data snapshot below, and that snapshot is re-read whole, on one date.
 
 ## The criterion
 

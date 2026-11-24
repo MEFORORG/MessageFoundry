@@ -270,12 +270,13 @@ def test_the_settings_hops_are_reported_with_their_classification() -> None:
     )
     assert hops["settings:vault.store_key"].compliant_kind is False
     assert hops["settings:vault.secrets"].compliant_kind is False
-    # The webhook sink declares no credential field of any kind: a "none" hop with no compliant kind.
+    # The webhook URL's path can carry a token (vault BACKLOG #3533 item 24): a "static" hop, and
+    # the sink offers no compliant kind.
     assert (
         hops["settings:alerts.webhook"].credential,
         hops["settings:alerts.webhook"].compliant_kind,
     ) == (
-        "none",
+        "static",
         False,
     )
     assert hops["settings:alerts.smtp"].credential == "static"
@@ -901,8 +902,8 @@ def test_the_least_privilege_auth_rows_need_their_feature(feature: str, row: str
 
 def test_an_smtp_secret_reference_dials_vault_even_with_smtp_off() -> None:
     """Not a never-dialled hop, measured: ``notifier_from_settings`` resolves the SMTP password's
-    reference before it decides which transports to build, so the reference reaches the provider
-    with no SMTP transport configured. The reader reports what the engine does."""
+    reference whether or not an SMTP transport is configured, so the reference reaches the provider
+    with none. The reader reports what the engine does."""
     from messagefoundry.config.settings import AlertsSettings
     from messagefoundry.pipeline.alert_sinks import notifier_from_settings
 

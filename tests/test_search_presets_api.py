@@ -715,6 +715,164 @@ async def test_a_transit_tag_refusal_on_the_criteria_is_an_audited_integrity_ref
     assert len(audits) == 1 and pid[:12] in (audits[0]["detail"] or ""), audits
 
 
+async def test_a_repeated_outage_on_the_criteria_logs_one_warning(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: an outage fails every recall, so its WARNING is logged once per preset per
+    interval, as the route's other refusal records are. Each recall still answers 503 and writes
+    the route's refusal row."""
+    outage = CipherUnavailableError("Transit unreachable")
+    r, _raised, pid = await _layered_with_decrypt_raising(
+        engine, monkeypatch, caplog, outage, recalls=2
+    )
+    assert r.status_code == 503, r.text
+    assert [rec.levelno for rec in _layered_refusal_log(caplog)] == [logging.WARNING]
+    refused = {"presets": 1, "refused": pid, "status": 503, "cause": "CipherUnavailableError"}
+    assert await _refusal_audits(engine) == [refused, refused]
+
+
+async def _layered_with_preset_read(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    read: Any,
+    audit_raises: Exception | None = None,
+) -> tuple[httpx.Response, str]:
+    """A layered recall of a fresh preset whose ``get_search_preset`` is ``read``, an async
+    stand-in for a store, with the route's refusal audit write raising ``audit_raises`` when set.
+    Control: the preset recalls with 200 before the patch."""
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _user(engine, Role.OPERATOR, "op")
+    app = create_app(engine, auth=service)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
+        h = await _login(c, "op")
+        r = await c.post(
+            "/search/presets", json={"name": "n", "criteria": {"content": "MRN999"}}, headers=h
+        )
+        assert r.status_code == 200, r.text
+        pid = str(r.json()["id"])
+        r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+        assert r.status_code == 200, r.text  # control
+        caplog.set_level(logging.WARNING, logger="messagefoundry.api.app")
+        with monkeypatch.context() as patched:
+            patched.setattr(engine.store, "get_search_preset", read)
+            if audit_raises is not None:
+                record_audit = engine.store.record_audit
+
+                async def _audit(action: str, *a: Any, **kw: Any) -> None:
+                    if action == "preset.layered_search":
+                        raise audit_raises
+                    await record_audit(action, *a, **kw)
+
+                patched.setattr(engine.store, "record_audit", _audit)
+            r = await c.get("/search/layered", params={"presets": pid}, headers=h)
+    return r, pid
+
+
+@pytest.mark.parametrize("criteria", [None, b"{}"], ids=["null", "bytes"])
+async def test_a_store_returning_non_text_criteria_answers_400_not_500(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    criteria: object,
+) -> None:
+    """BACKLOG #5523: a store that hands back criteria that are not text, against its contract (a
+    test double, say), is the malformed 400, logged and audited, not a TypeError's 500."""
+
+    async def _read(**kw: Any) -> dict[str, Any]:
+        return {"id": kw["preset_id"], "criteria": criteria}
+
+    r, pid = await _layered_with_preset_read(engine, monkeypatch, caplog, _read)
+    assert r.status_code == 400, r.text
+    assert r.json()["detail"] == f"preset {pid} has malformed criteria"
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 400, "cause": "malformed"}
+    ]
+
+
+async def test_a_sealed_blank_criteria_cell_answers_423_naming_what_opened(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: a sealed cell that opens to an empty value takes the blank arm, and its 423
+    says what opened, not that the cell is blank: on disk it is ciphertext."""
+    from messagefoundry.store.cell_tag import SealedBlankCellError
+
+    async def _read(**kw: Any) -> dict[str, Any]:
+        raise SealedBlankCellError("search_presets", "criteria", kw["preset_id"], None)
+
+    r, pid = await _layered_with_preset_read(engine, monkeypatch, caplog, _read)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == (
+        f"preset {pid} has criteria that open to an empty value, written outside the store, and"
+        " cannot be used"
+    )
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 423, "cause": "SealedBlankCellError"}
+    ]
+
+
+@pytest.mark.parametrize("kind", ["CorruptCellError", "CellTagError"])
+async def test_a_corrupt_or_tag_failed_criteria_cell_answers_423(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kind: str
+) -> None:
+    """BACKLOG #5523: the integrity arm takes every ``CellTagError`` the store raises, a corrupt
+    cell under a held key included: a 423 naming no cipher detail, and the route's refusal row
+    naming the class."""
+    from messagefoundry.store import cell_tag
+
+    async def _read(**kw: Any) -> dict[str, Any]:
+        raise getattr(cell_tag, kind)("search_presets", "criteria", kw["preset_id"], None)
+
+    r, pid = await _layered_with_preset_read(engine, monkeypatch, caplog, _read)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == f"preset {pid} failed its integrity check and cannot be used"
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 423, "cause": kind}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("audit_error", "label"),
+    [
+        (LookupError("no row"), "defect LookupError"),
+        (NotImplementedError("no audit"), "defect NotImplementedError"),
+        (RuntimeError("acquire timed out"), "RuntimeError"),
+    ],
+    ids=["backstop", "audit-write-defect", "store-refusal"],
+)
+async def test_a_refusal_whose_audit_write_fails_is_logged_with_its_failure_class(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    audit_error: Exception,
+    label: str,
+) -> None:
+    """BACKLOG #5523: the refusal is still the answer when its audit row cannot be written, and the
+    ERROR names the failure class by type name only. A fault outside the store-refusal set (the
+    backstop) and a class in ``AUDIT_WRITE_DEFECTS``, which sits inside that set, are both labelled
+    a defect; a store refusal is not."""
+    from messagefoundry.store.cell_tag import CellTagError
+
+    async def _tagged(**kw: Any) -> dict[str, Any]:
+        raise CellTagError("search_presets", "criteria", kw["preset_id"], None)
+
+    r, pid = await _layered_with_preset_read(
+        engine, monkeypatch, caplog, _tagged, audit_raises=audit_error
+    )
+    assert r.status_code == 423, r.text
+    assert [(rec.levelno, rec.getMessage()) for rec in _layered_refusal_log(caplog)] == [
+        (
+            logging.ERROR,
+            f"layered search could not audit its refusal of preset {pid}"
+            f" (423 CellTagError; {label})",
+        )
+    ]
+    assert "no row" not in caplog.text and "no audit" not in caplog.text
+    assert await _refusal_audits(engine) == []
+
+
 async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> None:
     """BACKLOG #5523: a layered recall that returns summaries is coalesced into ``summary_access``
     like ``/messages/search`` (review M-5), so it is no way round the harvest signal. Control: a
@@ -743,12 +901,23 @@ async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> 
             assert r.status_code == 200, r.text
             ids.append(r.json()["id"])
         miss, hit = ids
+        noted: list[object] = []
+        note = app.state.summary_auditor.note
+
+        async def _note(*a: Any, **kw: Any) -> None:
+            noted.append(a)
+            await note(*a, **kw)
+
+        app.state.summary_auditor.note = _note
         r = await c.get("/search/layered", params={"presets": miss}, headers=h)
         assert r.status_code == 200 and r.json()["matched"] == 0, r.text
+        # BACKLOG #5523: skipped when nothing is exposed or masked, as the other call sites skip it.
+        assert noted == []
         await app.state.summary_auditor.flush(engine.store)
         assert await engine.store.list_audit(action="summary_access") == []  # control
         r = await c.get("/search/layered", params={"presets": hit}, headers=h)
         assert r.status_code == 200 and r.json()["matched"] == 1, r.text
+        assert len(noted) == 1  # positive control: the spy sees the route's call
         await app.state.summary_auditor.flush(engine.store)
     rows = await engine.store.list_audit(action="summary_access")
     assert [a["actor"] for a in rows] == ["op"]
@@ -880,6 +1049,25 @@ async def test_a_recreated_username_does_not_inherit_the_departed_operators_pres
         assert layered.status_code == 404, layered.text
 
 
+async def _store_criteria(engine: Engine, pid: str, criteria: dict[str, Any]) -> None:
+    """Replace a preset's stored criteria THROUGH the store, so the cell is sealed by the cipher as
+    every real write is. A raw ``UPDATE`` of plaintext works only on an engine with no key, so a
+    test that planted it would pass for a reason a keyed store does not share (BACKLOG #6700)."""
+    assert isinstance(engine.store, MessageStore)  # a SQLite engine: the owner read needs _db
+    cur = await engine.store._db.execute(
+        "SELECT owner_user_id, name FROM search_presets WHERE id=?", (pid,)
+    )
+    row = await cur.fetchone()
+    assert row is not None, pid
+    effective, replaced = await engine.store.upsert_search_preset(
+        preset_id=pid,
+        owner_user_id=row["owner_user_id"],
+        name=row["name"],
+        criteria=json.dumps(criteria),
+    )
+    assert (effective, replaced) == (pid, True)
+
+
 async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) -> None:
     """BACKLOG #6700: create_search_preset ran make_spec only beside content or field_path, so a
     criteria holding only field_value was saved and never applied. Control: beside a field path it
@@ -922,12 +1110,7 @@ async def test_a_lone_field_value_is_refused_not_saved_unread(engine: Engine) ->
         # A stored lone field_value (saved before the refusal existed) is refused on the layered
         # read rather than dropped by the compose.
         pid = meta_only.json()["id"]
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"field_value": "MRN999"}), pid),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, pid, {"field_value": "MRN999"})
         r = await c.get("/search/layered", params={"presets": pid}, headers=h)
         assert r.status_code == 400, r.text
         assert "field_value needs an HL7 field path" in r.json()["detail"]
@@ -941,7 +1124,6 @@ async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engin
     non-str field_value on a preset that is NOT the needle was never read on origin/main, so it must
     not become a 500 now. Control: the same layering with an intact second preset also answers 200."""
     pytest.importorskip("psutil")
-    import json
 
     from messagefoundry.api import create_app
 
@@ -958,21 +1140,12 @@ async def test_a_non_str_stored_field_value_beside_the_needle_is_not_a_500(engin
             ids.append(r.json()["id"])
         control = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert control.status_code == 200, control.text
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"channel_id": "ch1", "field_value": 5}), ids[1]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[1], {"channel_id": "ch1", "field_value": 5})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
         # On the NEEDLE preset the same malformed field_value is read by make_spec, which refuses a
         # non-text needle value: a 400, never an AttributeError's 500.
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"content": "MRN999", "field_value": 5}), ids[0]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[0], {"content": "MRN999", "field_value": 5})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 400, r.text
         assert "field_value must be text" in r.json()["detail"]
@@ -985,7 +1158,6 @@ async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_nee
     spaces beside a channel filter is not a second content predicate, so the layered search runs
     the other preset's DOE search inside IB_A (BACKLOG #6700)."""
     pytest.importorskip("psutil")
-    import json
 
     from messagefoundry.api import create_app
 
@@ -1003,12 +1175,7 @@ async def test_a_blank_stored_content_on_a_non_needle_preset_is_not_a_second_nee
             )
             assert r.status_code == 200, r.text
             ids.append(r.json()["id"])
-        assert isinstance(engine.store, MessageStore)  # a SQLite engine: the raw write needs _db
-        await engine.store._db.execute(
-            "UPDATE search_presets SET criteria=? WHERE id=?",
-            (json.dumps({"content": "   ", "channel_id": "IB_A"}), ids[1]),
-        )
-        await engine.store._db.commit()
+        await _store_criteria(engine, ids[1], {"content": "   ", "channel_id": "IB_A"})
         r = await c.get("/search/layered", params={"presets": ",".join(ids)}, headers=h)
         assert r.status_code == 200, r.text
         assert r.json()["matched"] == 1

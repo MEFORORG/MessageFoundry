@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``python -m harness --fuzz``: exit 0 when every invariant held, 1 when one broke or the run
-checked nothing (``CampaignResult.vacuous``), 2 on setup."""
+proved nothing (``CampaignResult.vacuous``: no case sent, or a campaign with no positive ACK
+matched to a new stored row, even if every ACK passed a presence-only check), 2 on setup."""
 
 from __future__ import annotations
 

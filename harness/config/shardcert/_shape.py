@@ -101,10 +101,12 @@ The graph is synthetic and generic — no real partner/site/host/volume.
 from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import wraps
+from typing import Final
 
-from harness.config._refusal import prints_its_refusal
-from harness.load.ids import SHARDCERT_IDS
 from messagefoundry.parsing.message import Message, RawMessage
 
 CHEAP = "cheap"
@@ -127,6 +129,44 @@ _M64 = (1 << 64) - 1
 # is still fed through _mix64, so the D picks stay non-linear + seed-free (same rationale as _mix64).
 # Deliberately DISTINCT from _mix64's internal add-constant (a different avalanche input per pick).
 _FANOUT_STRIDE = 0xD1B54A32D192ED03
+
+
+# A copy of harness/config/_refusal.py, because this file is served to its graph as a bare sibling
+# helper and must not need the harness package (BACKLOG #5854).
+# tests/test_harness_graph_engine_only.py holds the two equal.
+def prints_its_refusal[R](read_shape: Callable[[], R]) -> Callable[[], R]:
+    """Wrap ``read_shape`` so a ``ValueError`` it raises is printed to stderr, then raised as is."""
+
+    @wraps(read_shape)
+    def reading() -> R:
+        try:
+            return read_shape()
+        except ValueError as exc:
+            print(f"harness shape refused: {exc}", file=sys.stderr, flush=True)
+            raise
+
+    return reading
+
+
+@dataclass(frozen=True)
+class _ControlIdScheme:
+    """The parsing half of ``harness.load.ids.ControlIds``, copied for the same reason as the
+    decorator above. The senders stamp with the original; the same test holds the two equal."""
+
+    prefix: str
+    width: int
+
+    def parse(self, control_id: str | None) -> int | None:
+        """Recover the sequence number from a control id, or ``None`` if it isn't one of ours."""
+        if not control_id or not control_id.startswith(self.prefix):
+            return None
+        tail = control_id[len(self.prefix) :]
+        if not tail.isdigit():
+            return None
+        return int(tail)
+
+
+SHARDCERT_IDS: Final = _ControlIdScheme(prefix="SC", width=12)
 
 
 def _mix64(x: int) -> int:
@@ -160,14 +200,35 @@ def destinations_for_seq(seq: int, *, routing: str, dests: int, fanout: int) -> 
     :meth:`ShardCertShape.destination_indices` for why the mix is load-bearing.
 
     One function, so the two-box driver's per-message copy check expects exactly the destinations the
-    served router picks."""
+    served router picks.
+
+    Raises ``ValueError`` on what :func:`fanout_refusal` refuses for a partitioned routing or an
+    unknown one, rather than divide by zero or guess: :func:`load_shape` never builds such a shape, but
+    the two-box driver reads these values off the engine box's post."""
     if routing == BROADCAST:
         return list(range(fanout))
+    if routing not in _ROUTINGS or not 0 <= fanout <= dests:
+        raise ValueError(fanout_refusal(routing, dests=dests, fanout=fanout))
     pool = list(range(dests))
     for i in range(fanout):
         j = i + (_mix64((seq + i * _FANOUT_STRIDE) & _M64) % (dests - i))
         pool[i], pool[j] = pool[j], pool[i]
     return pool[:fanout]
+
+
+def fanout_refusal(routing: str, *, dests: int, fanout: int) -> str | None:
+    """Why :func:`destinations_for_seq` cannot answer for this routing and fan-out, or ``None``.
+
+    Refused: an unknown routing, a negative fan-out, and a partitioned fan-out above the destination
+    count, which :func:`load_shape` never serves (a pick out of ``dests - i`` destinations would divide
+    by zero). A broadcast fan-out needs no destination count: its picks are ``0 .. fanout-1``."""
+    if routing not in _ROUTINGS:
+        return f"unknown routing {routing!r}"
+    if fanout < 0:
+        return f"negative fan-out {fanout}"
+    if routing != BROADCAST and fanout > dests:
+        return f"fan-out {fanout} above the {dests} destinations"
+    return None
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -287,7 +348,7 @@ class ShardCertShape:
     def destination_index(self, msg: Message | RawMessage) -> int:
         """PARTITIONED: the ONE destination this message is routed to — ``splitmix64(seq) % dests``, where
         ``seq`` is the dense monotonic sequence number the harness sender stamps into MSH-10 as
-        ``SC<12 digits>`` (:data:`~harness.load.ids.SHARDCERT_IDS`).
+        ``SC<12 digits>``, decoded here by this module's :data:`SHARDCERT_IDS`, a copy of the senders' parser.
 
         **The MIX is load-bearing — a bare ``seq % dests`` is a DEFECT, not a simplification.** The sender's
         connection round-robin is keyed on the SAME counter: :func:`harness.load.shardcert._drive_load` does
@@ -544,7 +605,12 @@ def fifo_lane_destination(label: str) -> int | None:
     """The destination index a :func:`fifo_lane` label names (its last ``_`` field), or ``None`` for
     a label it did not write, such as an empty MSH-6 under the ``cheap`` transform."""
     _, sep, tail = label.rpartition("_")
-    return int(tail) if sep and tail.isdigit() else None
+    # At most 9 ASCII digits: str.isdigit accepts digits such as superscript two, which int() refuses,
+    # and int() refuses a run past its digit limit, so a hostile MSH-6 label at the sink would raise at
+    # report time and end the run with no report. fifo_lane writes two digits.
+    if not sep or len(tail) > 9 or not (tail.isascii() and tail.isdigit()):
+        return None
+    return int(tail)
 
 
 def apply_transform(

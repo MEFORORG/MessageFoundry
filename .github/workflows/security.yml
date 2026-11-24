@@ -143,8 +143,9 @@ jobs:
     # Wheels only (vault BACKLOG #3861): pip, the auditor's dry-runs included, builds no pinned sdist
     # in this job. uv reads no PIP_* variable, so it takes its own switch, for `uv lock --check` and
     # the exports. Measured 2026-10-26 on Windows with uv 0.12.0 and an empty cache: the lock check and
-    # all eight exports below pass under it, unchanged, and a lock needing an sdist-only pin fails
-    # "building from source is disabled".
+    # the eight exports below at that date pass under it, unchanged, and a lock needing an sdist-only
+    # pin fails "building from source is disabled". The postgres image export came later and was not
+    # part of that measurement.
     env:
       PIP_ONLY_BINARY: ":all:"
       UV_NO_BUILD: "1"
@@ -179,6 +180,7 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          uv export --no-emit-project --no-dev --extra postgres --format requirements.txt -o docker/locks/requirements-postgres.lock
           # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
           uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
@@ -187,7 +189,7 @@ jobs:
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -195,7 +197,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -270,9 +272,11 @@ jobs:
       # Stdlib-only (no install). Fails CLOSED: it exits 2, "could not see", in at least these cases:
       # PyPI unreachable, a pyproject unreadable, no packaging/*/pyproject.toml found, the root's
       # runtime tables yielding no name, and zero distributions examined with nothing refused. A
-      # refusal or a failed check exits 1. What it sweeps, refuses and does not read, and its blind
-      # spots -- a real package that is not the INTENDED one among them -- are stated in the script's
-      # module docstring and pinned by tests/test_new_dependency_check.py.
+      # refusal or a failed check exits 1 only when none of the exit-2 cases occurred; beside one
+      # of them the run exits 2. The full exit table is the script's module docstring, EXIT CODES.
+      # What it sweeps, refuses and does not read, and its blind spots -- a real package that is not
+      # the INTENDED one among them -- are stated in that docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         run: python scripts/security/new_dependency_check.py
 
@@ -794,7 +798,8 @@ jobs:
     # A REAL INSTALL, not `--dry-run`, so a wheel that downloads and hashes clean but will not install
     # is caught too. Each lock goes into a freshly cleared venv, so one lock cannot satisfy another's
     # pin. Measured 2026-11-14 on Windows 11 with CPython 3.14, as a `--dry-run` under these flags:
-    # all five locks resolve, and zeroing sspilib's hashes in a copy of the core lock fails with a
+    # all five locks then on this list resolve (the postgres lock came later and was not measured),
+    # and zeroing sspilib's hashes in a copy of the core lock fails with a
     # hash mismatch. release.yml installs release-tools.lock without `--only-binary`, so a red on
     # that line here is stricter than the release, not a prediction of it.
     #
@@ -805,7 +810,7 @@ jobs:
     # `ci/locks/release-tools.lock` is here too: it is not a runtime lock, but release.yml's
     # `sbom-windows` job installs it on Windows, so a gap there would first fail during a release.
     runs-on: windows-latest
-    # Five hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
+    # Six hash-locked installs, the largest carrying PySide6. Sized like `sbom-windows`.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -828,6 +833,8 @@ jobs:
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-core.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-sqlserver.lock
+          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
+          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-postgres.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r security/locks/requirements-harness.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
@@ -902,6 +909,12 @@ jobs:
         with:
           name: sbom-container-image
           path: sbom-image.cdx.json
+      - name: Build the -postgres engine image
+        # The runtime-postgres variant the `ha` compose profile and docker/k8s/ha-postgres.yaml run
+        # (BACKLOG #5933). It adds asyncpg's compiled wheel to the slim image, so the scan below reads
+        # it too. Built AFTER the slim image's SBOM is uploaded, so a failure of this build alone cannot
+        # skip that inventory. It does skip the scan, which then reports no verdict and reds the job.
+        run: docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:scan-postgres .
       - name: Scan the image (advisory - fixable HIGH/CRITICAL reported, never gates)
         continue-on-error: true
         # --ignore-unfixed keeps the gate ACTIONABLE: a Debian CVE with no upstream fix can't be
@@ -925,20 +938,47 @@ jobs:
         # its own fatal errors (vuln DB download, image not found), so `--exit-code 1` made "found a
         # CVE" and "could not scan" the same number. Anything other than 0 or 5 is a scan that produced
         # no verdict, and the next step reds the job for it.
+        #
+        # TWO IMAGES, ONE VERDICT. The slim image and the -postgres variant are each scanned to their
+        # own table. A fault on either is the step's status, since the pair then has no verdict;
+        # otherwise a finding on either is 5, and only two clean scans are 0. The tables are joined
+        # into the one report the next step reads only AFTER the status is handed on, each under a
+        # line naming its image.
         run: |
           set -euo pipefail
           # RUNNER_TEMP is outside the checkout, so nothing here can be committed by accident.
-          report="${RUNNER_TEMP:-/tmp}/trivy-scan.txt"
+          tmp="${RUNNER_TEMP:-/tmp}"
+          report="${tmp}/trivy-scan.txt"
+          rm -f "${report}" "${tmp}/trivy-scan-slim.txt" "${tmp}/trivy-scan-postgres.txt"
           status=0
-          trivy image --no-progress --scanners vuln \
-            --vex security/vex/messagefoundry.openvex.json --show-suppressed \
-            --ignorefile security/trivy/trivyignore.yaml \
-            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 5 \
-            --output "${report}" \
-            messagefoundry:scan || status=$?
+          for pair in slim=messagefoundry:scan postgres=messagefoundry:scan-postgres; do
+            one=0
+            trivy image --no-progress --scanners vuln \
+              --vex security/vex/messagefoundry.openvex.json --show-suppressed \
+              --ignorefile security/trivy/trivyignore.yaml \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 5 \
+              --output "${tmp}/trivy-scan-${pair%%=*}.txt" \
+              "${pair#*=}" || one=$?
+            if [ "${one}" -ne 0 ] && [ "${one}" -ne 5 ]; then
+              # The first fault is kept: a later finding must not turn "no verdict" into a verdict.
+              if [ "${status}" -eq 0 ] || [ "${status}" -eq 5 ]; then
+                status="${one}"
+              fi
+            elif [ "${one}" -eq 5 ] && [ "${status}" -eq 0 ]; then
+              status=5
+            fi
+          done
           # Handed on AS SOON AS IT IS KNOWN, before anything else in this step can fail.
           echo "MEFOR_TRIVY_REPORT=${report}" >> "${GITHUB_ENV}"
           echo "MEFOR_TRIVY_STATUS=${status}" >> "${GITHUB_ENV}"
+          for pair in slim=messagefoundry:scan postgres=messagefoundry:scan-postgres; do
+            part="${tmp}/trivy-scan-${pair%%=*}.txt"
+            if [ -f "${part}" ]; then
+              { echo "== ${pair#*=} =="; cat "${part}"; } >> "${report}"
+            else
+              echo "== ${pair#*=} == (no table written)" >> "${report}"
+            fi
+          done
           if [ -f "${report}" ]; then
             cat "${report}"
           fi
@@ -978,10 +1018,10 @@ jobs:
           {
             case "${verdict}" in
               clean)
-                echo "## trivy: no fixable HIGH/CRITICAL vulnerability in the engine image"
+                echo "## trivy: no fixable HIGH/CRITICAL vulnerability in either engine image"
                 ;;
               finding)
-                echo "## trivy: fixable HIGH/CRITICAL vulnerabilities in the engine image"
+                echo "## trivy: fixable HIGH/CRITICAL vulnerabilities in at least one engine image (each table below names its image)"
                 echo
                 echo "Advisory: this job stays green. Remediate by bumping the lock or the base image,"
                 echo "or record an assessed not_affected in security/vex/messagefoundry.openvex.json."
@@ -1016,7 +1056,7 @@ jobs:
               echo "trivy: clean"
               ;;
             finding)
-              echo "::warning title=trivy finding::fixable HIGH/CRITICAL vulnerabilities in the engine image. See the job summary."
+              echo "::warning title=trivy finding::fixable HIGH/CRITICAL vulnerabilities in an engine image. See the job summary."
               ;;
             *)
               echo "::error title=trivy produced no verdict::complete='${complete}' status='${status}'. See the scan step's log."
@@ -1771,6 +1811,7 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
+          uv export --no-emit-project --no-dev --extra postgres --format requirements.txt -o docker/locks/requirements-postgres.lock
           # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
           uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
@@ -1779,7 +1820,7 @@ jobs:
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -1787,7 +1828,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         if: ${{ !cancelled() }}
         run: |
@@ -1864,9 +1905,11 @@ jobs:
       # Stdlib-only (no install). Fails CLOSED: it exits 2, "could not see", in at least these cases:
       # PyPI unreachable, a pyproject unreadable, no packaging/*/pyproject.toml found, the root's
       # runtime tables yielding no name, and zero distributions examined with nothing refused. A
-      # refusal or a failed check exits 1. What it sweeps, refuses and does not read, and its blind
-      # spots -- a real package that is not the INTENDED one among them -- are stated in the script's
-      # module docstring and pinned by tests/test_new_dependency_check.py.
+      # refusal or a failed check exits 1 only when none of the exit-2 cases occurred; beside one
+      # of them the run exits 2. The full exit table is the script's module docstring, EXIT CODES.
+      # What it sweeps, refuses and does not read, and its blind spots -- a real package that is not
+      # the INTENDED one among them -- are stated in that docstring and pinned by
+      # tests/test_new_dependency_check.py.
       - name: Verify every declared dependency is a real, established distribution
         if: ${{ !cancelled() }}
         run: python scripts/security/new_dependency_check.py

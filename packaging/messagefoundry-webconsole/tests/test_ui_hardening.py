@@ -320,6 +320,14 @@ async def test_csp_report_endpoint_accepts_and_204(engine: Engine) -> None:
         # an empty body is tolerated, still 204
         empty = await c.post("/ui/csp-report", content=b"")
         assert empty.status_code == 204
+        # a blocked URL that urlsplit refuses (an unclosed IPv6 bracket) is not the canary, and
+        # still 204 rather than 500, in both delivery shapes
+        for shape in (
+            {"csp-report": {"blocked-uri": "http://[x/ui/static/csp-probe.js"}},
+            [{"body": {"blockedURL": "https://[zz]/q"}}],
+        ):
+            hostile = await c.post("/ui/csp-report", json=shape)
+            assert hostile.status_code == 204
 
 
 def test_csp_report_summary_shapes() -> None:

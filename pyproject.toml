@@ -91,7 +91,7 @@ dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
     # pydantic floor 2.12.0: the lowest release whose pydantic-core has a cp314 wheel (BACKLOG #3177).
     "pydantic>=2.12.0",     # channel config models / validation
-    "aiosqlite>=0.20",      # async SQLite for the message store/queue
+    "aiosqlite>=0.22.1",    # async SQLite for the message store/queue; 0.22.1 first has Connection.stop(), which a failed open's forced release calls (BACKLOG #5720)
     # FastAPI floor 0.143.1: the locked release (vault BACKLOG #3916). Its RouteContext answers from
     # the rebuilt route, the shape route_gates.py and api/security.py read. The required legs run
     # only the lock, so a lower floor would allow an older shape that no required leg runs.
@@ -578,7 +578,7 @@ release-tools = [
 #                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
 #                  disagree.
 ci-quality = [
-    "diff-cover==11.0.2",
+    "diff-cover==11.0.3",
     "mutmut==3.8.1",
     "pytest-cov>=7.0",
     "pytest-timeout>=2.3.1",

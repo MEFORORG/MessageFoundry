@@ -763,8 +763,8 @@ def test_webhook_url_length_is_bounded_at_construction() -> None:
     """ASVS 4.2.5. Construction-only is sufficient and not a shortcut: the URL is operator config and
     the sole header is a fixed Content-Type, so nothing is added between construction and the wire.
 
-    Mutation: delete the `enforce_outbound_length_limits` call in `WebhookTransport.__init__`. Red:
-    DID NOT RAISE."""
+    Mutation: delete the length check in `config.alert_webhook.refuse_unbuildable_webhook_url`.
+    Red: DID NOT RAISE."""
     with pytest.raises(ValueError, match="over the 8192-char limit"):
         WebhookTransport("https://hooks.example/x?q=" + "a" * 9000, timeout=5.0)
 

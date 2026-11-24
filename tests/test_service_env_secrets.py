@@ -55,10 +55,12 @@ from tests._serviceenv_remedy import (
     ADD_BACK,
     ADD_BACK_ANY,
     ADD_BACK_CREATE,
-    ADD_BACK_JOINED,
+    ADD_BACK_DOUBT,
     ADD_BACK_RUN_ON,
     ADD_BACK_STEP,
     CREATE,
+    DOUBT_CREATE,
+    DOUBT_STEP,
     KEEP,
     REMOVE,
     RUNS_ON,
@@ -433,24 +435,85 @@ def test_every_other_secret_class_name_on_a_later_line_refuses(name: str) -> Non
 
 def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
     """NSSM may take the whole item as one variable, so a later line's MEFOR_SECRETS_DIRECTORY is
-    not evidence the service has one, and the refusal still says to add it."""
+    not evidence the service has one, and the refusal still says to add it. The line shares its
+    string with others, so it is in doubt, unlisted, and the doubt step, then the create step,
+    open the remedy (the Lander's ruling (a) on PR 3142's repair handback, comment
+    7112155891)."""
     posture = _service(
         ["MEFOR_AI_ENVIRONMENT=prod\nMEFOR_SECRETS_DIRECTORY=C:\\s\nMEFOR_VALUE_X=1"]
     )
+    assert "MEFOR_SECRETS_DIRECTORY" not in posture.listed and posture.directory_in_doubt
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert CREATE in refusal
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{DOUBT_CREATE}. Put each MEFOR_VALUE_* variable")
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
-    """The whole-string reading strips the name, so a blank first line moves the first name down.
-    The secrets directory below one is set, and the refusal must not tell the operator to add
-    it."""
+    """The whole-string reading strips the name, so a blank first line moves the first name down,
+    and the secrets directory below one is listed. The string is two lines, so its entry is in
+    doubt, the doubt step takes it out first, and the create step prints before the Put step
+    (the Lander's ruling (a) on PR 3142's repair handback, comment 7112155891)."""
     posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
-    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and posture.directory_in_doubt
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert CREATE not in refusal
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{DOUBT_CREATE}. Put each MEFOR_VALUE_* variable")
+    # The directory is listed, so the refusal does not say the lists set none.
+    assert SET_NO not in refusal
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [" MEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"],
+        ["MEFOR_SECRETS_DIRECTORY=C:\\s", " MEFOR_SECRETS_DIRECTORY=C:\\t", "MEFOR_VALUE_X=1"],
+    ],
+    ids=["only-in-doubt", "plain-beside-in-doubt"],
+)
+def test_a_listed_directory_in_doubt_gets_the_doubt_and_create_steps_before_the_put_step(
+    entries: list[str],
+) -> None:
+    """Round-3 open findings 1 and 2 on PR 3142's repair handback, comment 7110577570, and the
+    Lander's ruling (a) on comment 7112155891: where a directory entry is in doubt, the doubt
+    step takes out every line that may name the directory, a plain one beside it too, and comes
+    first, then the create step, and only then the Put step moves a setting into the directory,
+    so the installer the create step points at runs with no such line left. A blank before the
+    name puts a one-line entry in doubt."""
+    posture = _service(entries)
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{DOUBT_CREATE}. Put each MEFOR_VALUE_* variable")
+    assert remedy.count(DOUBT_STEP) == 1
+    assert remedy.index("Put each MEFOR_VALUE_* variable") < remedy.index(REMOVE)
+    assert "install-service.ps1 only once" not in remedy
+
+
+def test_a_directory_listed_plainly_gets_no_create_step() -> None:
+    """The control for the test above: one plain directory entry, not in doubt, keeps the order
+    and text it had, with no create step and no add-back step, the Put step first."""
+    posture = _service(["MEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
+    assert "MEFOR_SECRETS_DIRECTORY" in posture.listed and not posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith("Put each MEFOR_VALUE_* variable in the secrets directory")
+    assert CREATE not in refusal and ADD_BACK_ANY not in refusal and DOUBT_STEP not in refusal
+
+
+def test_an_unlisted_directory_not_in_doubt_keeps_the_plain_create_step() -> None:
+    """The second control: no directory entry at all, so nothing is in doubt, and the create
+    step prints first with its text as before, with no installer clause."""
+    posture = _service(["MEFOR_VALUE_X=1"])
+    assert not posture.directory_in_doubt
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    remedy = refusal.split("each value refused here. ", 1)[1]
+    assert remedy.startswith(f"{CREATE}. Put each MEFOR_VALUE_* variable")
+    assert DOUBT_STEP not in refusal
 
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
@@ -641,17 +704,19 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
             None,
             id="directory-listed",
         ),
-        # A joined directory string that no step keeps goes with the run-on (the Lander's
-        # ruling on handback 7085947392, F1), in either spelling, and so does a path the
-        # fail-closed rule does not keep.
+        # A joined directory string in doubt goes with the run-on (the Lander's ruling on
+        # handback 7085947392, F1), in either spelling, and a step of its own says to take every
+        # directory line out (the Lander's ruling B on PR 3142's repair handback, comment
+        # 7106776128). A joined plain path beside a run-on into other text is in no doubt, so
+        # the keep-one step names it instead.
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY==", "MEFOR_VALUE_B=1"],
-            "joined",
+            "doubt",
             id="directory-joined",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory ==", "MEFOR_VALUE_B=1"],
-            "joined",
+            "doubt",
             id="directory-joined-spaced",
         ),
         pytest.param(
@@ -661,8 +726,8 @@ def test_a_service_that_names_its_secrets_directory_is_not_told_to_add_it() -> N
                 "MEFOR_VALUE_A=",
                 "synthetic-run-on",
             ],
-            "joined",
-            id="directory-path-not-kept",
+            None,
+            id="directory-path-kept-beside-a-run-on",
         ),
         pytest.param(
             ["MEFOR_STORE_PASSWORD=", "mefor_secrets_directory=C:\\d", "MEFOR_VALUE_B=1"],
@@ -678,10 +743,13 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
     """The add-back step, printed once after the Put step and the removal where no listed variable
     is MEFOR_SECRETS_DIRECTORY and the remedy keeps no joined path entry: as origin/main prints it
     where main prints it (the Lander's hold on PR 3142, comment 7085002242), and where a joined
-    string sets the directory with no opener and main's wider pass-back exclusion (comment
-    7088102723). Where a value runs on, the step keeps the opener but leaves out the strings
-    the steps above say to remove (comment 7088663896). A store key alone with no run-on goes
-    to a key file and gets none."""
+    directory string is in doubt after the step that takes every directory line out, with no
+    opener and a pass-back exclusion of what the steps above remove or take out (comment
+    7088102723; the Lander's ruling B on the repair handback, comment 7106776128). Where a value runs on, the step keeps the opener but
+    leaves out the strings the steps above say to remove (comment 7088663896). A store key alone
+    with no run-on and no directory entry in doubt goes to a key file and gets none; beside an
+    entry in doubt it gets the step, as
+    ``test_a_store_key_alone_beside_a_directory_entry_in_doubt_gets_the_add_back_step`` pins."""
     refusal = service_env_refusal(_service(entries))
     assert refusal is not None
     if form is None:
@@ -691,7 +759,7 @@ def test_an_unnamed_directory_is_added_back_as_main_says(
         step = {
             "main": ADD_BACK,
             "run-on": ADD_BACK_RUN_ON + ADD_BACK_CREATE,
-            "joined": ADD_BACK_JOINED + ADD_BACK_CREATE,
+            "doubt": ADD_BACK_DOUBT + ADD_BACK_CREATE,
         }[form]
         assert refusal.count(step) == 1
         assert (SET_NO in refusal) is (form in ("main", "run-on"))

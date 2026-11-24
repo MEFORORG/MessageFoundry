@@ -48,7 +48,13 @@ from messagefoundry.logging_setup import (
     scrub_log_text,
     sink_readings,
 )
-from messagefoundry.redaction import _REDACTED, clamp_untrusted, safe_text, safe_text_bound
+from messagefoundry.redaction import (
+    _REDACT_WINDOW,
+    _REDACTED,
+    clamp_untrusted,
+    safe_text,
+    safe_text_bound,
+)
 
 __all__ = [
     "AuditObserver",
@@ -100,8 +106,87 @@ audit_logger.setLevel(logging.INFO)
 _TEE_FAILURE_LOGGED = False
 
 
+#: The keys of a JSON ``detail`` whose values the tee withholds, in the objects
+#: :func:`_withhold_detail` reaches; its docstring names at least what it misses. ``recovery_wrap`` is
+#: the store master key wrapped under the recovery key, which a host-provider store's genesis row
+#: keeps (``store.store.audit_genesis_detail``). The row keeps it, behind the audit read gates; the
+#: tee's copy does not. ``tests/test_audit_tee_recovery_wrap.py`` holds this name to the writer's.
+_WITHHELD_DETAIL_FIELDS = frozenset({"recovery_wrap"})
+#: The action of the audit chain's genesis and range rows, ``store.store.AUDIT_KEY_EPOCH_ACTION``,
+#: which only the engine writes. Only these rows' details are withheld from. A literal, since
+#: ``store.store`` imports this module; ``tests/test_audit_tee_recovery_wrap.py`` holds it to the
+#: constant.
+_KEY_EPOCH_ACTION = "audit.key_epoch"
+#: What a withheld value ships as, so a reader sees the field exists.
+_DETAIL_WITHHELD = "<withheld>"
+#: What a ``detail`` ships as, whole, when withholding a field in it faults.
+_DETAIL_WITHHELD_WHOLE = json.dumps({"withheld": _DETAIL_WITHHELD})
 #: What a field scrubbed whole is shipped as: the redactor's own placeholder.
 _FIELD_REDACTED = _REDACTED
+
+
+#: Whether this process has logged a fault while withholding; see :func:`_withhold_detail`.
+_WITHHOLD_FAULT_LOGGED = False
+
+
+def _names_a_withheld_field(text: str) -> bool:
+    return any(name in text for name in _WITHHELD_DETAIL_FIELDS)
+
+
+def _withhold_detail(detail: str | None) -> str | None:
+    """``detail`` as the tee may copy it: where it is JSON holding a withheld key in any object it
+    nests, with each such key's value as :data:`_DETAIL_WITHHELD`, and otherwise unchanged.
+
+    The text is parsed only where it holds a withheld field's name, and re-encoded only where a
+    value was replaced, by ``json.dumps``'s defaults. That is the genesis writer's encoder, and the
+    parse keeps its sorted key order; another writer's separators or number forms can change. An
+    object's string value that is itself such a JSON text, and a detail that is a JSON string
+    holding one, is withheld the same way. What is not matched includes at least a key spelled
+    with a JSON escape, unless the name also appears unescaped elsewhere in the text, a JSON text
+    held in a string inside a list or in an object key, and text that strict JSON parsing refuses, such as one with a raw control character, a byte order mark or trailing text;
+    no engine writer writes the wrap in any of those. Any other fault, such as a nest too deep to
+    read or an integer too long to parse, ships the text being read as
+    :data:`_DETAIL_WITHHELD_WHOLE`, since the value may still be in it: the whole detail, or, for
+    a fault in a JSON text held in a string value, that value. It is logged once per process. A
+    detail longer than the redaction window, :data:`~messagefoundry.redaction._REDACT_WINDOW`, that
+    holds a withheld field's name is not parsed, and ships whole as withheld."""
+    if not detail or not _names_a_withheld_field(detail):
+        return detail
+    if len(detail) > _REDACT_WINDOW:
+        # Bound the work as the other passes are: a longer detail naming a field is not parsed.
+        return _DETAIL_WITHHELD_WHOLE
+    changed = False
+
+    def hook(obj: dict[str, object]) -> dict[str, object]:
+        nonlocal changed
+        for key, value in obj.items():
+            if key in _WITHHELD_DETAIL_FIELDS:
+                obj[key], changed = _DETAIL_WITHHELD, True
+            elif isinstance(value, str) and (inner := _withhold_detail(value)) is not value:
+                obj[key], changed = inner, True
+        return obj
+
+    try:
+        try:
+            parsed = json.loads(detail, object_hook=hook)
+        except json.JSONDecodeError:  # not JSON; an over-long integer is a plain ValueError
+            return detail
+        if isinstance(parsed, str) and (inner := _withhold_detail(parsed)) is not parsed:
+            parsed, changed = inner, True
+        return json.dumps(parsed) if changed else detail
+    except Exception as exc:  # noqa: BLE001 - fail closed; the tee must still ship the record
+        global _WITHHOLD_FAULT_LOGGED
+        if not _WITHHOLD_FAULT_LOGGED:
+            _WITHHOLD_FAULT_LOGGED = True
+            log.warning(
+                "the audit tee could not withhold a field in a detail (%s); the text it was "
+                "reading ships whole as withheld, and further such faults in this process are not "
+                "logged",
+                type(exc).__name__,
+            )
+        return _DETAIL_WITHHELD_WHOLE
+
+
 #: A raw C0 control, U+0000 to U+001F, which ``json.dumps`` escapes.
 _RAW_C0 = re.compile(r"[\x00-\x1f]")
 #: One JSON string escape, matched from the left, so the second half of an escaped backslash is
@@ -465,6 +550,15 @@ def emit_audit_tee(
     redacting here keeps the off-box guarantee independent of handler config and **identical across
     every backend**.
 
+    **A withheld field ships as a placeholder (owner ruling 2026-11-22).** On a row whose
+    ``action`` is :data:`_KEY_EPOCH_ACTION`, which only the engine writes, where ``detail`` is JSON
+    holding a key in :data:`_WITHHELD_DETAIL_FIELDS` in an object it nests, that key's value ships
+    as ``<withheld>``, before the passes below read it. The genesis row of a store minted under
+    ``[store].key_provider = "host"`` holds one, ``recovery_wrap``. The row in ``audit_log`` keeps
+    the value, and the observers are passed it. :func:`_withhold_detail` names at least what it
+    does not match, and says what a fault there ships. Any other row's ``detail`` is not read for
+    this, so it ships as it did before the placeholder existed.
+
     **The record survives the scrub, and the scrub is what makes it so.** A failed sign-in sets
     ``actor`` to the typed name, so a client chooses its characters. ``ControlCharScrubFilter``
     runs last on every configured handler, and since vault BACKLOG #3012 every escape it writes is
@@ -526,8 +620,18 @@ def emit_audit_tee(
     Best-effort: a logging failure must never fail the audit write (already committed), so it is
     caught and logged, not raised. Callers invoke this **after commit** and **outside any write
     lock/transaction**, so a synchronous syslog send can't block the event loop under a lock."""
-    # safe_text(head) + note is safe_text(detail); the note is kept for a scrubbed detail.
-    head, note = safe_text_bound(detail) if detail else ("", "")
+    # On the engine's key epoch rows only, the line copies the row's detail with any withheld
+    # field's value replaced, before any other pass reads it. Every other row's detail is not read
+    # for withholding, so text a client writes cannot use this pass to change its copy; the C0
+    # field scrub below still can. The observers below are passed the row's own.
+    tee_detail = detail
+    if action == _KEY_EPOCH_ACTION:
+        try:
+            tee_detail = _withhold_detail(detail)
+        except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
+            tee_detail = _DETAIL_WITHHELD_WHOLE
+    # safe_text(head) + note is safe_text(tee_detail); the note is kept for a scrubbed detail.
+    head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
     old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {
         "action": action,
@@ -546,17 +650,17 @@ def emit_audit_tee(
         "seq": seq,
         "row_hash": row_hash,
         # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
-        "detail": old_detail if detail else None,
+        "detail": old_detail if tee_detail else None,
     }
     try:
         # Each text field is scrubbed before json.dumps escapes a C0 control in the window it
         # scans (#3045).
         try:
             scrubbed: dict[str, object] = {k: _scrub_field(v) for k, v in texts.items()}
-            if detail:
-                kept = _scrub_field(detail, detail=True)
+            if tee_detail:
+                kept = _scrub_field(tee_detail, detail=True)
                 scrubbed["detail"] = (
-                    old_detail if kept is detail else _bounded_detail(kept, note, old_detail)
+                    old_detail if kept is tee_detail else _bounded_detail(kept, note, old_detail)
                 )
             # A detail hidden whole keeps its bound note, and its JSON-ness where it parsed before.
             # Built lazily, so a record whose detail the scrub left alone never pays for it.

@@ -966,8 +966,12 @@ def test_the_git_invocation_pattern_is_defined_EXACTLY_ONCE(repo: SimpleNamespac
         "the pattern must be defined in exactly one place"
     )
     # No bare copy of the leading class may survive anywhere else in the file.
-    bare = "])git(" + chr(92) + ".exe)?"
+    # The suffix is read in any case (BACKLOG #5655 step 3), so the class carries an inline flag. The
+    # backtick that ends the leading class is part of the match: Get-GitWordBefore's lookbehind ends
+    # in the same `git(?i:.exe)?` and is a different pattern.
+    bare = "`])git(?i:" + chr(92) + ".exe)?"
     occurrences = source.count(bare)
+    assert source.count("`])git(" + chr(92) + ".exe)?") == 0, "the case-sensitive suffix is back"
     assert occurrences == 1, (
         f"found {occurrences} literal copies of the git-invocation class; expected 1 (the definition). "
         "A second copy is a rule that will not receive the next correction to this pattern."

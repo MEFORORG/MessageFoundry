@@ -75,9 +75,8 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _insecure_opener,
     _latin1_refusal_position,
-    _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     assert_probe_hop,
     auth_challenge_refused,
     egress_route_from_settings,
@@ -89,6 +88,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
     refuse_unrevoked_verified_hop,
+    refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
     url_scheme,
@@ -469,6 +469,17 @@ class DicomWebDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time. The url judged is the
+        # STOW-RS target, which is sent with no further path appended.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            self._resolve_target_url(),
+            self._headers,
+            setting="DICOMweb destination",
+            sent_as_is=True,
+            leave_proxy_credential_names=True,
+        )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
@@ -479,7 +490,6 @@ class DicomWebDestination(DestinationConnector):
         )
         proxy_dest = self._proxy.for_host(self.base_url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())
@@ -513,10 +523,8 @@ class DicomWebDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
             )
-            self._opener: urllib.request.OpenerDirector = (
-                _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
-                if proxy_handlers or anchor.narrows
-                else _shared_no_redirect_opener()
+            self._opener: urllib.request.OpenerDirector = _verifying_opener(
+                *proxy_handlers, trust_anchor=anchor
             )
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
             # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI

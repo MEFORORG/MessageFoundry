@@ -1479,26 +1479,78 @@ async def _recorded_decision(
     inside it writes ``auth.gate_refused`` instead, naming the permission the grant row would have
     named and why.
 
-    A refusal row is written exactly where the grant row would have been, so a request still writes
-    at most one decision row, and a gate that wrote no grant row writes no refusal row either. That
-    keeps the per-request volume where the shipped trail already put it while the audit chain has no
-    drain (BACKLOG #1421). The reason comes from the :class:`_GateRefusal` the check raised. Any
-    other exception leaves the block with no decision row from it, which is right for the
-    :func:`_mfa_refusal` 403: it wrote its own ``auth.mfa_denied`` row where it was raised."""
+    A refusal row is written exactly where the grant row would have been, so a gate writes at most
+    one decision row per request, and a gate that wrote no grant row writes no refusal row either.
+    The audit chain has no drain (BACKLOG #1421); a refused route-body request writes at most two
+    decision rows. For the step-up refusals of :func:`spend_step_up_action` and
+    :func:`refuse_unless_step_up_window_live`, made in a route body after its gate admitted the
+    request, see :func:`_record_route_refusal`. Other refusals a route body makes after its gate
+    admitted the request write no ``auth.gate_refused`` row. The reason comes from the
+    :class:`_GateRefusal` the check raised. Any other exception leaves the block with no decision
+    row from it, which is right for the :func:`_mfa_refusal` 403: it wrote its own
+    ``auth.mfa_denied`` row where it was raised. A failed refusal-row write raises in place of the
+    refusal, so the request is still refused."""
     try:
         yield
     except _GateRefusal as refusal:
-        audited = _audited_permission(request, permissions)
-        if audited is not None:
-            await auth.audit_gate_refused(
-                identity,
-                audited,
-                request.url.path,
-                reason=refusal.reason,
-                client=client_ip(request),
-            )
+        await _record_gate_refusal(request, auth, identity, permissions, refusal)
         raise
     await _record_grant(request, auth, identity, permissions)
+
+
+async def _record_gate_refusal(
+    request: Request,
+    auth: AuthService,
+    identity: Identity,
+    permissions: tuple[Permission, ...],
+    refusal: _GateRefusal,
+) -> None:
+    """Write the ``auth.gate_refused`` row for ``refusal``, where a grant row would have been."""
+    audited = _audited_permission(request, permissions)
+    if audited is not None:
+        await auth.audit_gate_refused(
+            identity,
+            audited,
+            request.url.path,
+            reason=refusal.reason,
+            client=client_ip(request),
+        )
+
+
+@dataclass(frozen=True)
+class _AdmittedDecision:
+    """What a ``proof_in_route`` gate admitted, kept for the refusal row its route body may owe."""
+
+    auth: AuthService
+    identity: Identity
+    permissions: tuple[Permission, ...]
+
+
+#: The ``request.state`` attribute a ``proof_in_route`` gate leaves its :class:`_AdmittedDecision` on.
+_ADMITTED_DECISION_ATTR = "mefor_admitted_decision"
+
+
+async def _record_route_refusal(request: Request, refusal: _GateRefusal) -> None:
+    """Record a step-up refusal a route body makes after its ``proof_in_route`` gate admitted it.
+
+    BACKLOG #1197 (ASVS 16.3.2), for the refusals of :func:`spend_step_up_action` and
+    :func:`refuse_unless_step_up_window_live`. This is where the rule for their row is stated. It
+    writes ``auth.gate_refused``, through the writer the gate's own refusals use, only where the
+    admitting ``proof_in_route`` gate left its decision on ``request.state`` and
+    :func:`_audited_permission` names a permission for the request, which is where that gate wrote
+    its grant row. Where the gate wrote no grant row it writes none and logs nothing. With no
+    admitting gate it logs a WARNING and writes none. The caller raises the refusal either way."""
+    admitted = getattr(request.state, _ADMITTED_DECISION_ATTR, None)
+    if not isinstance(admitted, _AdmittedDecision):
+        log.warning(
+            "a route-body step-up refusal has no admitting proof_in_route gate to record against:"
+            " path=%s",
+            scrub_log_argument(request.url.path),
+        )
+        return
+    await _record_gate_refusal(
+        request, admitted.auth, admitted.identity, admitted.permissions, refusal
+    )
 
 
 #: The step-up refusal's detail for a session whose step-up is a password or directory re-proof.
@@ -1520,7 +1572,7 @@ _IDP_STEP_UP_DETAIL = (
 
 async def _step_up_refusal(
     auth: AuthService, token: str | None, action: str | None = None
-) -> HTTPException:
+) -> _GateRefusal:
     """The 403 every JSON step-up gate raises, for the session that holds ``token``.
 
     One place for the step-up raise sites (BACKLOG #2158), at least the four ``require_step_up*``
@@ -2139,6 +2191,13 @@ def require_step_up_action(
                         raise await _step_up_refusal(auth, token, action)
                 elif new_ip or not await _action_step_up_ok(auth, token, action):
                     raise await _step_up_refusal(auth, token, action)
+            if proof_in_route:
+                # For the refusal row the route body's spend may owe (_record_route_refusal).
+                setattr(
+                    request.state,
+                    _ADMITTED_DECISION_ATTR,
+                    _AdmittedDecision(auth, identity, permissions),
+                )
         return identity
 
     return _gate(dependency, _authenticate_session_before_body)
@@ -2154,13 +2213,15 @@ async def spend_step_up_action(request: Request, action: str) -> None:
     ``AuthService.refund_action_step_up``, as edit-resend does for a refusal before its store write
     (owner ruling 2026-10-13, #3241 R1), other than one in ``_EDIT_RESEND_SPENDING_REFUSALS`` in
     ``api/app.py`` (owner ruling 2026-11-07, #3241 added item 1). With no auth service attached it
-    does nothing, as the dependency does."""
+    does nothing, as the dependency does. :func:`_record_route_refusal` records its refusal."""
     auth = get_auth(request)
     if auth is None:
         return
     token = bearer_token(request)
     if not await _action_step_up_ok(auth, token, action):
-        raise await _step_up_refusal(auth, token, action)
+        refusal = await _step_up_refusal(auth, token, action)
+        await _record_route_refusal(request, refusal)
+        raise refusal
 
 
 async def step_up_window_live(request: Request) -> bool:
@@ -2184,11 +2245,14 @@ async def refuse_unless_step_up_window_live(request: Request) -> None:
     Moving a route to ``proof_in_route=True`` drops its dependency's window check, so without this
     call that branch would take no step-up at all. The 403 carries ``X-Step-Up-Required`` and no
     ``X-Step-Up-Action``, so a client refreshes the window with a plain ``POST /me/reauth``. Does
-    nothing with no auth service attached, as the dependency then checks nothing."""
+    nothing with no auth service attached, as the dependency then checks nothing.
+    :func:`_record_route_refusal` records its refusal."""
     auth = get_auth(request)
     if auth is None or await step_up_window_live(request):
         return
-    raise await _step_up_refusal(auth, bearer_token(request))
+    refusal = await _step_up_refusal(auth, bearer_token(request))
+    await _record_route_refusal(request, refusal)
+    raise refusal
 
 
 def require_reauth_only_action(

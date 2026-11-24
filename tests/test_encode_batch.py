@@ -14,9 +14,10 @@ import tracemalloc
 
 import pytest
 
-from messagefoundry.parsing import encode_batch, split_batch
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing import HL7PeekError, encode_batch, split_batch
+from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
 from messagefoundry.parsing.peek import normalize
+from messagefoundry.parsing.split import batch_member_collides, head_control_id
 
 M1 = "MSH|^~\\&|A|B|C|D|20260101010101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JOHN\r"
 M2 = "MSH|^~\\&|A|B|C|D|20260101010102||ADT^A02|MSG2|P|2.5.1\rPID|1||200||ROE^JANE\r"
@@ -94,7 +95,7 @@ _TS = "20260101120000"
 
 
 def _no_parse(*_args: object, **_kwargs: object) -> Message:
-    raise AssertionError("encode_batch parsed a member")
+    raise AssertionError("a member was parsed in full")
 
 
 @pytest.mark.parametrize("head", [M1, M1.replace("\r", "\n")])
@@ -104,7 +105,7 @@ def test_the_head_member_is_not_parsed(monkeypatch: pytest.MonkeyPatch, head: st
     env = encode_batch([head, M2], control_id="1", timestamp=_TS)
     assert env.startswith("BHS|^~\\&|")
     # Negative control: the patch sees a parse when one happens. An envelope-led head is parsed.
-    with pytest.raises(AssertionError, match="parsed a member"):
+    with pytest.raises(AssertionError, match="parsed in full"):
         encode_batch(["BHS|^~\\&\r" + head, M2], control_id="1", timestamp=_TS)
 
 
@@ -136,8 +137,10 @@ _Reading = tuple[str, ...]
 
 
 def _parser_reading(head: str) -> _Reading:
+    # The write read: the BHS is a write of the head's delimiters, so a head whose short MSH-2
+    # fills a default it already uses is refused as any write to it is (BACKLOG #5972).
     try:
-        return Message.parse(head)._encoding_chars()
+        return Message.parse(head)._write_encoding_chars()
     except ValueError as exc:  # HL7PeekError is one
         return type(exc).__name__, str(exc)
 
@@ -150,33 +153,80 @@ def _batch_reading(head: str) -> _Reading:
     return bhs[3], bhs[4], bhs[5], bhs[6], bhs[7]
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        "  \r\n" + M1,  # leading whitespace, as the parser strips it
-        M1.replace("\r", "\n"),  # LF line endings
-        "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
-        "MSH#@~\\&#A#B\r",  # custom delimiters
-        "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
-        "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
-        "MSH|^~\\&",  # MSH-2 and nothing more
-        "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
-        "MSH|^~\\\t",
-        "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
-        "MSH\r",
-        "MSH|^~\r",
-        "MSH|^~|A|B\r",
-        "MSH|",
-        "not an HL7 message",
-        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
-        "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
-        "BHS|^~\\&\rPID|1\r",
-    ],
-)
+#: Heads a header-only read must judge as a parse does.
+_HEADS = [
+    "  \r\n" + M1,  # leading whitespace, as the parser strips it
+    M1.replace("\r", "\n"),  # LF line endings
+    "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
+    "MSH#@~\\&#A#B\r",  # custom delimiters
+    "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
+    "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
+    "MSH|^~\\&",  # MSH-2 and nothing more
+    "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
+    "MSH|^~\\\t",
+    "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
+    "MSH\r",
+    "MSH|^~\r",
+    "MSH|^~|A|B\r",
+    "MSH|~|A|B\r",  # a filled default the head already uses, refused as a write
+    "MSH^^A^B\r",
+    "MSH|",
+    "not an HL7 message",
+    "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
+    "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
+    "BHS|^~\\&\rPID|1\r",
+    "MSH|~\nPID|1\n",  # a colliding head with LF line endings
+    "  \nMSH|^~&|A\r",  # a colliding head after whitespace
+    "BHS|~|A\rMSH|^~\\&|A\r",  # a colliding envelope-led head
+    "MSH|~ \n",  # a trailing space the parser's strip removes, after an LF
+    "MSH|~ \nPID|1\n",  # the same space kept, as more follows it
+    "MSH|^~\\ \t \n\n",  # whitespace past the eight characters the read takes
+]
+
+
+@pytest.mark.parametrize("head", _HEADS)
 def test_the_head_separators_match_the_parser(head: str) -> None:
     # The contract Message._encoding_chars kept: the separators it reads, or a refusal rather than
     # a guess.
     assert _batch_reading(head) == _parser_reading(head)
+
+
+@pytest.mark.parametrize("head", _HEADS)
+def test_batch_member_collides_is_the_parse_verdict(head: str) -> None:
+    # The delivery stage refuses a member alone on this verdict (BACKLOG #5972), so on every head
+    # the parse accepts it must match what the parse and the write read decide, without parsing.
+    try:
+        expected = Message.parse(head)._delimiters_collide()
+    except ValueError:  # HL7PeekError is one: encode_batch still refuses it as a parse does
+        expected = False
+    assert batch_member_collides(head) is expected
+    if expected:
+        assert _batch_reading(head)[1] == COLLIDING_DELIMITERS_WRITE
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "MSH|~|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r",  # over the escape budget
+        "BHS|~|A\rMSH",  # a later header line too short to read
+    ],
+)
+def test_a_colliding_first_line_is_judged_alone_whatever_a_parse_refuses_later(head: str) -> None:
+    # The verdict reads the first line only, as documented, so a parse refusal later in the text
+    # does not change it; encode_batch still raises the parse's own refusal for such a head, the
+    # budget checked before the collision, as a parse checks it before it reads anything.
+    with pytest.raises(HL7PeekError):
+        Message.parse(head)
+    assert batch_member_collides(head) is True
+    assert _batch_reading(head)[0] == "HL7PeekError"
+
+
+def test_a_message_head_whose_filled_default_collides_is_refused() -> None:
+    # The BHS writes the head's delimiters, so a parsed head is refused as a str head is.
+    head = Message.parse("MSH|~|A|B\rPID|1\r")
+    with pytest.raises(ValueError, match="a default filled in for one"):
+        encode_batch([head], control_id="1", timestamp=_TS)
+    assert encode_batch([Message.parse(M1)], control_id="1", timestamp=_TS).startswith("BHS|")
 
 
 #: A head whose escapes could expand past the parser's budget (ASVS 1.3.3).
@@ -246,3 +296,94 @@ def test_the_head_separators_match_the_parser_over_random_heads() -> None:
 def test_each_member_is_framed_with_one_trailing_cr(member: str, framed: str) -> None:
     env = encode_batch([M1, member], control_id="1", timestamp=_TS)
     assert env == "BHS|^~\\&|||||" + _TS + "||||1\r" + M1 + framed + "BTS|2\r"
+
+
+# --- BACKLOG #5919 step 1: the delivery reads the head's MSH-10 for BHS-11 without a full parse ---
+
+
+def _parsed_control_id(head: str) -> tuple[str | None, ...]:
+    try:
+        return (Message.parse(head).control_id,)
+    except ValueError as exc:  # HL7PeekError is one
+        return type(exc).__name__, str(exc)
+
+
+def _read_control_id(head: str) -> tuple[str | None, ...]:
+    try:
+        return (head_control_id(head),)
+    except ValueError as exc:
+        return type(exc).__name__, str(exc)
+
+
+@pytest.mark.parametrize("head", [M1, M1.replace("\r", "\n"), " \r" + M1])
+def test_the_head_control_id_is_read_without_a_full_parse(
+    monkeypatch: pytest.MonkeyPatch, head: str
+) -> None:
+    monkeypatch.setattr(Message, "parse", staticmethod(_no_parse))
+    assert head_control_id(head) == "MSG1"
+    # Negative control: an envelope-led head is parsed in full.
+    with pytest.raises(AssertionError, match="parsed in full"):
+        head_control_id("BHS|^~\\&\r" + head)
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        pytest.param("MSH|^~\\&|A|B|C|D|T||ADT^A01|ID1  \rPID|1", id="first-line-trailing-space"),
+        pytest.param("MSH|^~\\&|A|B|C|D|T||ADT^A01|ID1\rMSH", id="later-short-header"),
+        pytest.param("MSH|^~\\&|A|B|C|D|T||ADT^A01|ID1\rBHS \r", id="later-short-header-at-end"),
+        pytest.param("MSH|^~\\&|A|B|C|D|T||ADT^A01|" + "\\.sp512\\" * 40_000, id="escape-budget"),
+        pytest.param("MSH|^~\\&|A|B|C|D|T||ADT^A01|I\\T\\D~2", id="escaped-repeating-id"),
+        pytest.param("NOT-HL7|X\r", id="non-hl7"),
+        pytest.param("MSH|", id="short-header"),
+    ],
+)
+def test_the_head_control_id_reads_or_refuses_as_a_parse_does(head: str) -> None:
+    assert _read_control_id(head) == _parsed_control_id(head)
+
+
+def _random_control_head(rng: random.Random) -> str:
+    """A head with an MSH-10 of noise, then noise lines that may be short headers or blank."""
+    lead_ws = "".join(rng.choice(" \t\r\n") for _ in range(rng.choice((0, 0, 0, 1, 2))))
+    lead = rng.choice(("MSH", "MSH", "MSH", "MSH", "BHS", "FHS", "PID", "MS"))
+    first = lead + rng.choice(("|^~\\&", "|^~\\&", "#^~\\&", "|^", "|"))
+    first += "|A|B|C|D|T||ADT^A01|" + "".join(rng.choice("AB^~\\&| \t") for _ in range(5))
+    tail = "".join(
+        rng.choice(("\r", "\n", "\r\n")) + rng.choice(("PID|1", "MSH", "BHS", "FHS ", "", " "))
+        for _ in range(rng.randrange(0, 3))
+    )
+    return lead_ws + first + tail
+
+
+def test_the_head_control_id_matches_the_parser_over_random_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = random.Random(59191)
+    heads = [_random_control_head(rng) for _ in range(5000)]
+    expected = {h: _parsed_control_id(h) for h in heads}
+    full_parses: list[object] = []
+    real_parse = Message.parse
+
+    def counting_parse(raw: str | bytes) -> Message:
+        full_parses.append(raw)
+        return real_parse(raw)
+
+    monkeypatch.setattr(Message, "parse", staticmethod(counting_parse))
+    for head in heads:
+        assert _read_control_id(head) == expected[head], repr(head)
+    # Positive controls for the generator: heads read and heads refused, heads with a later header
+    # line too short to read, and enough heads read from their first line alone.
+    read = [h for h in heads if len(expected[h]) == 1]
+    assert len(read) >= 1000, len(read)
+    assert len(heads) - len(read) >= 100
+    assert sum(_has_a_short_later_header(h) for h in heads) >= 100
+    assert len(heads) - len(full_parses) >= 500, len(full_parses)
+
+
+def test_the_short_later_header_pattern_names_the_parsers_header_ids() -> None:
+    # A literal for the static ReDoS scanner, so a change to HEADER_IDS must reach it by hand.
+    from messagefoundry.parsing._builtin_hl7 import HEADER_IDS
+    from messagefoundry.parsing.split import _SHORT_LATER_HEADER
+
+    named = _SHORT_LATER_HEADER.pattern.split("(?:", 2)[1].split(")", 1)[0].split("|")
+    assert sorted(named) == sorted(HEADER_IDS)

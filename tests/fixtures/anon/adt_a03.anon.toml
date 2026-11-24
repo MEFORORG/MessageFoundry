@@ -1,0 +1,35 @@
+# The anon.toml overlay for samples/messages/hapi-hl7v2/adt_a03.txt (BACKLOG #5825).
+#
+# That file was vendored from HAPI HL7v2 byte-verbatim, with a named hospital and ward, a patient
+# key, a fiscal-code-shaped identifier, a birth date, a visit number and clinicians in it. It was
+# then scrubbed by DEFAULT_RULES plus THIS file, over its one message. This file is the record of
+# that pass. It holds the fields this corpus scrubs that are NOT defaults, says why each is not one,
+# and lists under [hl7] keep the other fields the leak-check walks that it would otherwise report
+# undecided, each decided as safe to leave. A few more it walks (at least PID-8, PV1-2 and PR1-1)
+# are short coded values the framework decides itself, so they are not listed. So no field it
+# walks is undecided, and tests/test_anon_hapi_samples.py holds the corpus to that.
+#
+# The salt was not recorded, so nothing here reproduces the committed surrogates.
+#
+# Use it with:  anonymize_checked(raw, salt=..., rules=load_rules(Path("tests/fixtures/anon/adt_a03.anon.toml")))
+
+[hl7.fields]
+# The message time and the sending and receiving facility. The leak-check does not walk the MSH
+# header and no default maps it, because ADR 0030 keeps MSH for routing. Here MSH-7 is one minute
+# before the event and would give back the event time the EVN rules reduce to a year, and the
+# facility code is not plainly a placeholder. Nothing routes on this sample, so they are scrubbed.
+# That is a fact about one corpus, not a reason to change the ratified default.
+"MSH-4" = "freetext"
+"MSH-6" = "freetext"
+"MSH-7" = "date"
+
+[hl7]
+# At least the fields the leak-check would report undecided, reviewed and left intact. A keep
+# makes a field decided; the leak-check still scans it for PHI shapes. A keep rewrites nothing.
+keep = [
+    # The patient death indicator (N) and the procedure functional type (02): table-coded flags.
+    "PID-30", "PR1-6",
+    # The coded clinical content, which ADR 0030 keeps: the procedure code and its description,
+    # a generic word (a prosthesis) that names no person, place or date.
+    "PR1-3", "PR1-4",
+]

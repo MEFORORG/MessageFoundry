@@ -42,6 +42,7 @@ secrets/
 # Container deployment secrets + TLS material — never commit (the *.example templates ARE tracked)
 /docker/secrets.env
 /docker/tls/
+/docker/pg-tls/
 
 # are never committed. Ignore every samples/ subdirectory by DEFAULT rather than naming the partner
 # here — fail-closed, so a new unlisted staging dir cannot reach a public repo just because nobody

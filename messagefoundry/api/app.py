@@ -69,6 +69,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.telemetry import TelemetryConfig
 from pydantic import PrivateAttr
 from starlette.datastructures import MutableHeaders
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
@@ -244,7 +245,7 @@ from messagefoundry.api.outlive import (
 )
 from messagefoundry.api.outlive import DRAIN_TIMEOUT_SECONDS as OUTLIVING_DRAIN_SECONDS
 from messagefoundry.api.paging import page_total
-from messagefoundry.api.request_timeout import RequestTimeoutMiddleware
+from messagefoundry.api.request_timeout import BODY_REFUSED_KEY, RequestTimeoutMiddleware
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
     DIRECTORY_GRANTED_BY,
@@ -533,12 +534,18 @@ from messagefoundry.serviceenv import (
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
     ResendError,
     Store,
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
+from messagefoundry.store.cell_tag import (
+    BlankCellError,
+    CellTagError,
+    NonTextCellError,
+    SealedBlankCellError,
+)
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -1431,8 +1438,9 @@ async def _reconcile_approvals_after_restart(gate: ApprovalGate) -> None:
 _SHUTDOWN_BUDGET_SECONDS: Final = 10.0
 #: The share of that budget kept back for engine.stop(). Reserved, never a bound: the stop is not cut
 #: short, because it ends in store.close(), and a store left open keeps a non-daemon worker thread
-#: alive, which is the hang BACKLOG #2087 fixed. The stop's own waits are bounded inside the engine,
-#: and nothing here holds them to this reserve.
+#: alive, which is the hang BACKLOG #2087 fixed. The stop is handed the step's bound as its budget,
+#: which shortens the waits ``pipeline.engine._StopBudget`` names, as that class says; its other
+#: steps are not held to it.
 _ENGINE_STOP_RESERVE_SECONDS: Final = 3.0
 #: The part of a step's bound handed to the step's own graceful wait, so that wait ends, and cancels
 #: what it owns, before the teardown cuts the step.
@@ -1784,7 +1792,7 @@ def _managed_teardown_steps(
         _TeardownStep(
             "engine.stop()",
             _ENGINE_STOP_RESERVE_SECONDS,
-            lambda _b: engine.stop(),
+            lambda bound: engine.stop(budget_seconds=bound),
             bounded=False,
         )
     )
@@ -1826,32 +1834,47 @@ async def _unwind_failed_start(store: Store, notifier: NotifierAlertSink | None)
     and a tight cut would drop the page that explains this refusal. The test that pins #2597,
     test_the_alert_fires_even_when_the_start_then_fails, fails at or after engine.start(), so it
     runs the managed teardown, not this. The drain's own wait ends at _INNER_SHARE of its bound,
-    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered.
+    before the teardown would cut it. It then logs one ERROR with the count not confirmed delivered
+    when that count is not zero, or when the cut reached a send still running
+    (NotifierAlertSink.sends_cut), even at a zero count, which a send cut beside a sibling that took
+    the alert leaves. A cut that reached no running send and left nothing counted logs
+    nothing, as a drain that ends in time with nothing counted does. NotifierAlertSink._handle says
+    what that count holds, the same rule on a cut as on a drain that ends in time.
     A blackholed webhook does not hold the alert being sent from a healthy email relay, though an
-    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). The count
-    includes an alert one transport delivered while another had not finished. The cut does not
-    end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring say
-    which run on."""
+    alert queued behind it is still lost to the cut (NotifierAlertSink's docstring). A send still
+    running at the cut is named by transport in NotifierAlertSink._cut_sends's WARNING. The cut
+    does not end every send: NotifierAlertSink._cut_sends and the _BackgroundDispatcher docstring
+    say which run on."""
     budget = _SHUTDOWN_BUDGET_SECONDS - _ENGINE_STOP_RESERVE_SECONDS
     steps: list[_TeardownStep] = []
     if notifier is not None:
 
         async def _close_notifier(bound: float) -> None:
             notifier.start()
+            sends_cut_before = notifier.sends_cut
             wait = bound * _INNER_SHARE
+            was_cut = False
             try:
                 async with asyncio.timeout(wait) as deadline:
                     await notifier.aclose()
             except TimeoutError:
                 if not deadline.expired():
                     raise
-                if not notifier.undelivered:
-                    return  # the last send ended at the deadline: nothing was lost
-                # A count only: an alert's content can carry a partner's text (docs/PHI.md).
+                was_cut = True
+            # BACKLOG #5907: a cut that reached a running send is logged at a zero count too,
+            # since a send cut beside one that took the alert leaves no count. Counts only: an
+            # alert's content can carry a partner's text (docs/PHI.md).
+            sends_cut = notifier.sends_cut - sends_cut_before if was_cut else 0
+            if sends_cut or notifier.undelivered:
+                cut = (
+                    f"the alert notifier did not drain within {wait:.2f}s, "
+                    f"cutting {sends_cut} running send(s); "
+                    if was_cut
+                    else ""
+                )
                 _log.error(
-                    "startup unwind: the alert notifier did not drain within %.2fs; %d alert(s) "
-                    "not confirmed delivered",
-                    wait,
+                    "startup unwind: %s%d alert(s) not confirmed delivered",
+                    cut,
                     notifier.undelivered,
                 )
 
@@ -2626,8 +2649,9 @@ async def _reload_and_record(
 #: (:func:`_write_through_cancel`). A store write may have no bound of its own, so a hung write must
 #: not hold the shutdown. A drain's cancel waits for what its grace has left instead
 #: (:func:`_row_cancel_wait`). This is the bound for the rest, at least the convergence reload
-#: engine.stop() cancels and awaits with no bound: nothing hands engine.stop() a remaining time, so
-#: this cap is what keeps that wait well inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
+#: engine.stop() cancels and awaits with no bound: engine.stop()'s budget does not reach that wait
+#: (``pipeline.engine._StopBudget`` names the ones it does), so this cap is what keeps that wait well
+#: inside _ENGINE_STOP_RESERVE_SECONDS (BACKLOG #3191).
 #: tests/test_dual_control_reload.py pins it there.
 _ROW_CANCEL_WAIT_SECONDS: Final = 1.0
 #: The part of a drain's remaining grace a row wait leaves for the reload's task to unwind, so the
@@ -3848,10 +3872,6 @@ def _export_ndjson_line(row: Row) -> bytes:
 #: shape screen ONLY — it admits ``image/svg+xml``/``text/html``/``application/hta``; the allow-list
 #: below is what makes the served type inert (ASVS 1.3.4).
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
-#: Length bound on the served ``Content-Type``. The token grammar above is unbounded and the stored
-#: label has no column check, so an arbitrarily long attacker string would otherwise be echoed into a
-#: response header; no registered media type comes close to this.
-_MAX_ATTACHMENT_MIME_LEN = 255
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 
 #: The **inert** media types an attachment download may DECLARE, each mapped to the extension its download
@@ -3999,7 +4019,12 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. An SVG's SERVED
     copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
-    if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
+    # The length bound is the store's column width (BACKLOG #1619), so the served type and the stored
+    # one share one limit. SQLite and PostgreSQL store a label of any length, and the bound keeps the
+    # shape screen and the lookup from working over an arbitrarily long attacker string; no type on
+    # the allow-list comes close to it. The screen admits ASCII only, where a character is one UTF-16
+    # unit.
+    if len(ct) > ATTACHMENT_CONTENT_TYPE_MAX or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
     # case-fold is the only normalization an exact lookup still needs.
@@ -4236,13 +4261,17 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
-#: an HL7 body ``Peek.parse`` refuses, or one a ``validation.strict`` inbound's strict hl7apy validation
-#: refuses or times out on, is 422.
+#: an HL7 body ``Peek.parse`` or the document-marker check refuses, or one a ``validation.strict``
+#: inbound's strict hl7apy validation refuses or times out on, is 422. The edit-resend direct path
+#: refuses fewer bodies than the listener: ``admit_resubmitted_body`` says which. A ``parse``
+#: refusal there is at least a parser fault, and a body past ``Peek.parse``'s segment cap is a
+#: ``size`` refusal, as on a re-route.
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,
     "decode": 422,
     "parse": 422,
+    "ingest": 422,
     "strict": 422,
 }
 
@@ -4745,6 +4774,9 @@ def create_app(
     approvals: ApprovalsSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     service_settings: ServiceStatusSettings | None = None,
+    # The [tls] section POST /ai/chat and POST /alerts/test-email resolve their trust anchor and
+    # CRL from (BACKLOG #5527 item 8), stashed on app.state. None stashes no [tls] policy.
+    tls_settings: TlsSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
     # ON by default (BACKLOG #1277), matching [diagnostics].audit_all_authz. Two defaults for one
@@ -4842,6 +4874,10 @@ def create_app(
         app.state.auth = auth
     if ai_settings is not None:
         app.state.ai = ai_settings
+    # #323 layer 3, BACKLOG #5527 item 8: the [tls] policy the AI broker and the alerts test send
+    # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
+    # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
+    app.state.tls_settings = tls_settings
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
     # store opens; here it supports the direct-construction (test) path.
@@ -4919,8 +4955,8 @@ def create_app(
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
     app.state.service_settings = service_settings
-    # Configured [logging].log_dir for the GET /status app-log metering (#50). None = stdout-only (no
-    # metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
+    # Configured [logging].log_dir for the GET /status app-log metering (#50) and GET /logs/tail.
+    # None = stdout-only (no metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
     app.state.log_dir = log_dir
     # BACKLOG #171 (ADR 0130): the startup [logging].level baseline GET /logging/level reports next to the
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
@@ -5111,8 +5147,10 @@ def create_app(
 
             async def send_with_headers(message: Message) -> None:
                 # The response start is where the router has run, so the matched route the
-                # no-store arm reads is in the scope by now.
-                if message["type"] == "http.response.start":
+                # no-store arm reads is in the scope by now. After a counted 413 the body limit
+                # drops this response, and building its headers reads request.url, which raises on
+                # a query string that is not UTF-8.
+                if message["type"] == "http.response.start" and not scope.get(BODY_REFUSED_KEY):
                     _apply_security_headers(request, MutableHeaders(scope=message))
                 await send(message)
 
@@ -5164,20 +5202,115 @@ def create_app(
 
     def _limit_request_body(inner: ASGIApp) -> ASGIApp:
         async def middleware(scope: Scope, receive: Receive, send: Send) -> None:
-            refusal = _body_refusal(Request(scope)) if scope["type"] == "http" else None
-            if refusal is None:
+            if scope["type"] != "http":
                 await inner(scope, receive, send)
+                return
+            request = Request(scope)
+            refusal = _body_refusal(request)
+            if refusal is None:
+                await _run_counting_body(inner, request, receive, send)
             else:
                 await refusal(scope, receive, send)
 
         return middleware
 
+    async def _run_counting_body(
+        inner: ASGIApp, request: Request, receive: Receive, send: Send
+    ) -> None:
+        """Run ``inner`` on an admitted HTTP request, holding the body it delivers to the cap.
+
+        ``_body_refusal`` judges what the request declares, and a host need not deliver that, so
+        every chunk is counted as the route pulls it; docs/SECURITY.md control 5 says on which hosts
+        the count can fire. The body is not read ahead of the route: that would buffer a body for a
+        caller the route's own gate refuses before reading (AuthenticatedBeforeBodyRoute).
+
+        At the first chunk past the cap the route gets ``http.disconnect`` in place of that chunk,
+        so it never holds a partial body as if it were whole, and no later read pulls anything. The
+        413 goes out unless the route already started a response, which cannot then be replaced."""
+        seen = 0
+        over_cap = False
+        started = False
+
+        async def counted_receive() -> Message:
+            nonlocal seen, over_cap
+            if over_cap:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if over_cap:  # a concurrent read crossed the cap while this one waited
+                return {"type": "http.disconnect"}
+            if message["type"] != "http.request" or not message.get("body"):
+                return message
+            seen += len(message["body"])
+            # Read here, not up front: most requests through this path carry no body.
+            if seen <= _body_cap(request):
+                return message
+            over_cap = True  # before the first await, so no route response can interleave
+            if started:
+                _log.warning(
+                    "oversized request body on %s from %s after a response started: "
+                    "no 413 was sent, and the route's read got a disconnect",
+                    scrub_log_argument(request.scope["path"]),
+                    scrub_log_argument(client_ip(request) or "unknown"),
+                )
+            else:
+                # Before the 413's start: the request deadline must see that the route still runs.
+                request.scope[BODY_REFUSED_KEY] = True
+                refusal = _refuse_body(
+                    request, 413, "request body too large", "oversized request body"
+                )
+                try:
+                    await refusal(request.scope, receive, send)
+                except OSError as exc:  # the client went away; the route still gets its disconnect
+                    _log.warning(
+                        "could not send the 413 for an oversized request body on %s from %s: %s",
+                        scrub_log_argument(request.scope["path"]),
+                        scrub_log_argument(client_ip(request) or "unknown"),
+                        type(exc).__name__,
+                    )
+            return {"type": "http.disconnect"}
+
+        async def route_send(message: Message) -> None:
+            nonlocal started
+            # Past the cap with no response started, the 413 is the response.
+            if started or not over_cap:
+                started = started or message["type"] == "http.response.start"
+                await send(message)
+
+        try:
+            await inner(request.scope, counted_receive, route_send)
+        except ClientDisconnect:
+            # The route's read of the disconnect above, already answered or logged. A real client
+            # disconnect under the cap is not this refusal's to absorb. A response the route had
+            # started stays unfinished: uvicorn closes the connection on that return, and what
+            # another host does with it has not been measured.
+            if not over_cap:
+                raise
+
+    def _body_cap(request: Request) -> int:
+        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        # The scope's decoded path: request.url drops a TAB, CR or LF from it, and raises on a query
+        # string that is not UTF-8, which would stop the refusal.
+        upload_store = getattr(request.app.state, "upload_store", None)
+        if upload_store is not None and request.scope["path"] in _UPLOAD_BODY_PATHS:
+            return int(upload_store.max_bytes)
+        return _MAX_REQUEST_BODY_BYTES
+
     def _refuse_body(request: Request, status: int, detail: str, what: str) -> JSONResponse:
-        _log.warning("rejected %s on %s from %s", what, request.url.path, client_ip(request))
-        # `Connection: close` makes the server drop the connection after every refusal, so bytes
-        # it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body the
-        # client never sent, are never read as a next request.
-        return JSONResponse({"detail": detail}, status_code=status, headers={"Connection": "close"})
+        _log.warning(
+            "rejected %s on %s from %s",
+            what,
+            scrub_log_argument(request.scope["path"]),
+            scrub_log_argument(client_ip(request) or "unknown"),
+        )
+        # On HTTP/1.x, `Connection: close` makes the server drop the connection after every refusal,
+        # so bytes it framed one way and a proxy another (RFC 9112 §6.1, §6.3), or a refused body
+        # the client never sent, are never read as a next request. HTTP/2 and HTTP/3 frame each
+        # stream and make a response with this field malformed (RFC 9113 §8.2.2, RFC 9114 §4.2).
+        # Exact ASGI tokens: llhttp takes an `HTTP/2.0` request line on HTTP/1 framing and reports
+        # `2.0`, so a prefix test would let any client turn this close off.
+        multiplexed = request.scope.get("http_version") in ("2", "3")
+        headers = None if multiplexed else {"Connection": "close"}
+        return JSONResponse({"detail": detail}, status_code=status, headers=headers)
 
     def _body_refusal(request: Request) -> JSONResponse | None:
         """The response refusing ``request``'s body before any route runs, or None to admit it."""
@@ -5187,8 +5320,8 @@ def create_app(
         # DoS probe) and were previously dropped silently. We log to the rotating general log rather
         # than the audit_log: it's pre-auth (no actor) and a flood must not grow the audit DB.
         lengths = request.headers.getlist("content-length")
-        # The API takes only Content-Length bodies, so ANY Transfer-Encoding is refused, by presence
-        # on any line and whatever its value, and the connection is closed. Beside a Content-Length
+        # A chunked body is not accepted: ANY Transfer-Encoding is refused, by presence on any line
+        # and whatever its value, and on HTTP/1.x the connection is closed. Beside a Content-Length
         # the request is ambiguously framed (RFC 9112 §6.1, the CL.TE smuggling vector, ASVS 4.2.1).
         # Under serve llhttp refuses most such pairs itself (BACKLOG #1125); h11, for one, passes
         # them on. Without a Content-Length, a coding list that does not end in `chunked` leaves the
@@ -5219,19 +5352,16 @@ def create_app(
                 "chunked request body",
             )
         if not lengths:
+            # Nothing declared to judge. A bodyless POST, PUT or DELETE looks like this, so it is
+            # not refused here: _run_counting_body holds whatever body does arrive to the cap.
             return None
         # One line holding `1*DIGIT` (RFC 9112 §6.2), not int(): int() takes `+2`, `-5` and `0_2`,
-        # and a repeated line is a second framing claim (an invalid length closes, §6.3 item 5).
+        # and a repeated line is a second framing claim (on HTTP/1.x an invalid length closes the
+        # connection, §6.3 item 5).
         value = lengths[0].strip(" \t")
         if len(lengths) > 1 or not (value.isascii() and value.isdigit()):
             return _refuse_body(request, 400, "invalid Content-Length", "invalid Content-Length")
-        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
-        upload_store = getattr(request.app.state, "upload_store", None)
-        cap = (
-            upload_store.max_bytes
-            if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
-            else _MAX_REQUEST_BODY_BYTES
-        )
+        cap = _body_cap(request)
         # Digit count first: int() raises past 4300 digits, and a longer number is over any cap.
         digits = value.lstrip("0") or "0"
         if len(digits) > len(str(cap)) or int(digits) > cap:
@@ -5348,13 +5478,18 @@ def create_app(
         # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
-        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes none, so
-        # None goes down.
+        # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its
+        # tls_settings argument, and its embedder may set the stash itself; create_managed_app's
+        # lifespan stashes its own argument at start. With none, None goes down.
         # Off the event loop: the constructor builds rest.py's shared opener on first use, a TLS
-        # context that reads the system trust store, under a lock a worker thread may hold, or an
-        # opener of its own that reads the [tls] CA and CRL files.
+        # context that reads the system trust store, under a lock a worker thread may hold, or
+        # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
         tls_settings = getattr(request.app.state, "tls_settings", None)
         try:
+            # BACKLOG #5527: an embedder's stash of another type is a misconfiguration, mapped to
+            # the 503 below, rather than an AttributeError the route would answer 500 for.
+            if tls_settings is not None and not isinstance(tls_settings, TlsSettings):
+                raise AiBrokerError("app.state.tls_settings is not a TlsSettings")
             broker = await asyncio.to_thread(
                 ai_broker_from_settings,
                 ai,
@@ -8963,8 +9098,9 @@ def create_app(
                     await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                     raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
                 # BACKLOG #1911: an outbound row has no inbound whose declared type to sniff against, so
-                # only the engine-wide guards apply here (the NUL rule and the 16 MiB ceiling). They
-                # read nothing from the target, and where they sit in the order is ADR 0197
+                # the engine-wide guards apply here, at least the NUL rule, the 16 MiB ceiling and,
+                # for an HL7 body, the document-marker check (BACKLOG #5972). They read nothing from the
+                # target, and where they sit in the order is ADR 0197
                 # Amendment D, "The order of the checks", which says what their refusal tells.
                 admitted = await _guard_resubmission(
                     engine,
@@ -9034,7 +9170,8 @@ def create_app(
                         actor=identity.username,
                     )
                 except ResendError as exc:
-                    # Empty edited body / idempotency-key reused for a different target gives 409. str(exc)
+                    # At least an empty edited body, an idempotency key reused for a different target,
+                    # or origin metadata with unreadable lineage (BACKLOG #5758) gives 409. str(exc)
                     # carries ids only (never the body — the messages don't interpolate ``raw``).
                     raise HTTPException(409, str(exc)) from None
                 return EditResendResult(
@@ -10181,10 +10318,14 @@ def create_app(
                     ),
                     client=client_ip(request),
                 )
+            except AUDIT_WRITE_DEFECTS as exc:
+                # Inside the refusal set below, so caught first: they still mean a defect, and
+                # the record says so (BACKLOG #5523). Not re-raised: a raise would replace the
+                # refusal owed with a 500, the case write_audit_soft's docstring says to pass
+                # defects=() for.
+                failed = f"defect {type(exc).__name__}"
             except audit_write_errors() as exc:
-                # The store-refusal set the other fail-soft audit writes catch. Defects
-                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
-                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # The store-refusal set the other fail-soft audit writes catch.
                 # write_audit_soft itself is not used: it logs the traceback, whose frames reach
                 # the route frame's decrypted `criterias`. Names the refusal's own status and
                 # cause, which the row would have held, at most once per preset, cause and failure
@@ -10217,16 +10358,21 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except (BlankCellError, NonTextCellError) as exc:
-                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
-                # it never writes (audited and logged there, and alerted on a keyed store), so it
-                # never reads as an empty filter that would widen the search. Its own text: a
-                # keyless store has no integrity tag for such a cell to fail.
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, or a
+                # sealed one that opens to an empty value, which it never writes (audited and
+                # logged there, and alerted on a keyed store), so it never reads as an empty filter
+                # that would widen the search. Its own text: a keyless store has no integrity tag
+                # for such a cell to fail.
                 cause = type(exc).__name__
-                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                if isinstance(exc, SealedBlankCellError):
+                    shape = "criteria that open to an empty value"
+                elif isinstance(exc, BlankCellError):
+                    shape = "blank criteria"
+                else:
+                    shape = "non-text criteria"
                 refusal = HTTPException(
                     423,
-                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
-                    " cannot be used",
+                    f"preset {preset_id} has {shape}, written outside the store, and cannot be used",
                 )
             except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
@@ -10241,8 +10387,13 @@ def create_app(
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
-                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                # Once per preset and reason per interval, as the other arms log: an outage fails
+                # every recall, and a changed reason is logged again (BACKLOG #5523).
                 cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, f"{cause}:{exc}"):
+                    _log.warning(
+                        "layered search answered 503 on preset %s: %s", preset_id, str(exc)
+                    )
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -10278,7 +10429,12 @@ def create_app(
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher as a
             # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
-            criteria, refused = json_loads_or_refusal(row["criteria"])
+            # A store that broke that contract, a test double say, gets this 400, not a TypeError's
+            # 500 (BACKLOG #5523).
+            stored = row["criteria"]
+            criteria, refused = (
+                json_loads_or_refusal(stored) if isinstance(stored, str) else (None, "not text")
+            )
             if refused is not None or not isinstance(criteria, dict):
                 # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
                 # outside it. Logged, once per preset per interval, and audited each time.
@@ -10327,15 +10483,18 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
-        await request.app.state.summary_auditor.note(
-            engine.store,
-            identity.username,
-            meta["channel_id"],
-            count_exposed(messages),
-            time.time(),
-            masked=count_masked(messages),
-        )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero, and is
+        # skipped then, as the other call sites skip it.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,
@@ -10475,7 +10634,9 @@ def create_app(
         for name in reg.handlers:
             nodes[("handler", name)] = GraphNode(name=name, kind="handler", status=None)
 
-        edges = list(graph.edges)
+        # The data-flow graph: a reply_from names an outbound but sends it nothing, so drawing it
+        # would put a forward line against the reply's own flow (BACKLOG #5966).
+        edges = [e for e in graph.edges if e.carries_data]
 
         # Per-channel RBAC (#76 review — SECURITY): a channel-scoped caller must NOT see shared-outbound
         # topology or its live status — an outbound spans channels, so its running/failed/filtered state
@@ -10964,7 +11125,8 @@ def create_app(
         offset: int = Query(0, ge=0),
     ) -> LogTailPage:
         """A paginated, **redacted** page of the newest application-log file's tail (#171, ADR 0130) — the
-        in-console viewer over the same redacted tail the support bundle produces. ``offset`` counts lines
+        in-console viewer. It picks and reads its file on its own terms, not the support bundle's
+        (docs/DANGEROUS-FUNCTIONALITY.md section 7 has both rows). ``offset`` counts lines
         back from the END (``offset=0`` = the most recent ``limit`` lines).
 
         This is a genuine **new PHI read surface**: the app log is best-effort-redacted (a residual
@@ -11862,7 +12024,8 @@ def create_app(
     # request rather than on the route function alone. It stays INSIDE ClientNetworkMiddleware
     # (registered after it, so further out): a refused address must be rejected before it can occupy
     # a deadline at all. The clock is cancelled at http.response.start, so a response that has begun
-    # streaming is never cut mid-body — see api/request_timeout.py.
+    # streaming is never cut mid-body; the body limit's counted 413 is the exception, because the
+    # route is still running behind it — see api/request_timeout.py.
     app.add_middleware(RequestTimeoutMiddleware)
 
     # [security].allowed_client_networks — registered so that only the response-header floor below is
@@ -13715,11 +13878,14 @@ def create_managed_app(
             # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
             # the embedded/test path — then only a plain env-sourced email_password can be tested.
             app.state.secret_provider = secret_provider
-            # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
-            # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+            # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
+            # read, stashed at start from the argument the live notifier and the connections read,
+            # so a stash written before start cannot split the two. create_app below is not
+            # handed it, so it writes None at build and this overwrites that at start (BACKLOG
+            # #5527 item 8).
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
-            app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
+            app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail
             app.state.approval_gate = _build_approval_gate(
                 engine,
                 approvals_settings or ApprovalsSettings(),

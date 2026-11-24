@@ -52,6 +52,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.transports.base import float_setting, positive_seconds
+from messagefoundry.transports.bounded_read import _TCHARS
 from messagefoundry.transports.rest import (
     HttpAuthError,
     ProxyConfig,
@@ -472,10 +473,8 @@ class _ApprovedDigestAuthHandler(_ApprovedDigestMixin, urllib.request.HTTPDigest
     which the proxy 407 handler shares, so the origin and proxy paths cannot drift apart."""
 
 
-#: RFC 9110 ``tchar``: the characters a field name can hold. The same set as
-#: ``bounded_read._TCHARS``, which reads ``Proxy-Authorization`` by this rule.
-_TCHARS = r"!#$%&'*+\-.^_`|~0-9A-Za-z"
 #: ``Authorization`` in any ASCII letter case, with any run of characters no field name can hold
+#: (RFC 9110 ``tchar``, ``bounded_read._TCHARS``, imported so the two cannot drift; BACKLOG #5526)
 #: before it, and after it either nothing or such a character and then anything (the rule
 #: ``bounded_read.is_proxy_credential_header_name`` applies to ``Proxy-Authorization``).
 _AUTHORIZATION_NAME = re.compile(

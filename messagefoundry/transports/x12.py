@@ -67,7 +67,11 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import declared_encoding, encode_reply
+from messagefoundry.transports.framing import (
+    ReplyReplacements,
+    declared_encoding,
+    encode_reply_reporting,
+)
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -707,7 +711,7 @@ class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
     **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
     (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
-    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply`
+    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply_reporting`
     (BACKLOG #5958); the engine's returns ``None`` for every non-HL7 content type,
     so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
     see this module's docstring."""
@@ -767,6 +771,7 @@ class X12Source(SourceConnector):
         # Names this connection in a pacing report (BACKLOG #290) and in the reply-encoding warnings
         # (BACKLOG #5958).
         self._pacing_name = config.name or ""
+        self._reply_replacements = ReplyReplacements()  # BACKLOG #5799
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
         sa = s.get("source_ip_allowlist")
@@ -1037,9 +1042,9 @@ class X12Source(SourceConnector):
                                 # event is sent outside the except clause, so nothing chains the
                                 # encode error, whose `object` is the whole reply.
                                 reply_fault: str | None = None
-                                wire = b""
+                                wire, replaced = b"", False
                                 try:
-                                    wire = encode_reply(
+                                    wire, replaced = encode_reply_reporting(
                                         reply, self.encoding, connection=self._pacing_name
                                     )
                                 except (LookupError, UnicodeError) as exc:
@@ -1068,6 +1073,11 @@ class X12Source(SourceConnector):
                                         break
                                     continue
                                 writer.write(wire)  # unframed: the interchange is the frame
+                                if replaced and (note := self._reply_replacements.note()):
+                                    # BACKLOG #5799, throttled as the MLLP listener throttles it.
+                                    await self._emit_event(
+                                        "reply_replaced", peer_host=peer_host, reason=note
+                                    )
                                 await self._drain_reply(writer)
                         if failed:
                             break

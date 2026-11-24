@@ -30,8 +30,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _log = logging.getLogger(__name__)
 
-#: Default listener ports referenced by section A5 (informational bindability check).
-_DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "API": 8765}
+#: Fixed reference ports for section A5 (informational bindability check), one entry per listener
+#: the A5 row names (BACKLOG #5849). Each is a stock default, not what a given deployment binds,
+#: which depends on its config and --env. TCP is the default of ``IB_Harness_TCP``, the raw-TCP
+#: inbound in ``harness/config/tcp_x12.py`` (endpoint ``tcp_in``); a test pins the two together.
+_DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "TCP": 2580, "API": 8765}
 
 
 class _ChainCut(Exception):

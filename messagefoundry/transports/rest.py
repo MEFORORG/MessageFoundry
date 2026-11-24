@@ -93,6 +93,8 @@ from messagefoundry.transports.base import (
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
+    _FIELD_NAME,
+    _VALUE_CTL,
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
@@ -111,6 +113,21 @@ from messagefoundry.transports.proxy_address import (
     read_like_urllib,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
+from messagefoundry.urlscreen import (  # moved there for config's load check (#3533 item 14)
+    _URL_CREDENTIAL_USE,
+    _host_holds_encoded_colon,
+    _split_or_refuse,
+    refuse_url_credentials,
+)
+from messagefoundry.urlscreen import (
+    MAX_OUTBOUND_URL_LEN as MAX_OUTBOUND_URL_LEN,
+)
+from messagefoundry.urlscreen import (
+    request_target_as_sent as request_target_as_sent,
+)
+from messagefoundry.urlscreen import (
+    unsendable_request_target as unsendable_request_target,
+)
 
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
@@ -139,6 +156,9 @@ __all__ = [
     "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
+    "digest_password_unmatched",
+    "request_target_as_sent",
+    "unsendable_request_target",
     "url_host_label",
     "url_scheme",
 ]
@@ -358,7 +378,6 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
 # that also surfaces a misconfiguration early — e.g. an env() secret that resolved to an unexpected
 # blob, or a runaway concatenated header — as a clear config error instead of a wire-level surprise on
 # the first delivery. 8 KiB comfortably exceeds any legitimate endpoint URL or Basic/Bearer credential.
-MAX_OUTBOUND_URL_LEN = 8192
 MAX_OUTBOUND_HEADER_VALUE_LEN = 8192
 # Header NAMES are bounded too. Values were bounded from the start, but a name is equally
 # attacker-influenceable at send time -- ``outbound_headers_from_metadata`` derives it from a
@@ -424,9 +443,10 @@ def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = Fa
     """Call a bearer provider's ``access_token`` for ``label``'s hop (BACKLOG #5795, #5797).
 
     The provider raises ``DeliveryError`` for a failed mint, but a token request it cannot build or
-    encode raises a plain ``ValueError``: at least an over-length token URL or proxy credential
-    (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That is the
-    connection's fault, the same for every queued row, so for a delivery it becomes a permanent
+    encode raises a plain ``ValueError``: at least a header value ``http.client`` refuses. (The
+    SMART and OAuth2 client-credentials providers refuse an over-length token URL or proxy
+    credential when they are built, BACKLOG #5800, so this arm is not their length control.) That
+    is the connection's fault, the same for every queued row, so for a delivery it becomes a permanent
     configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
     the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead: a
     REST or FHIR test-connection probe raises only that type.
@@ -477,9 +497,8 @@ def http_family_trust_anchor(
     :data:`~messagefoundry.config.tls_policy.SYSTEM_TRUST_ANCHOR`, which is the same value the shipped
     default resolves to, so callers have ONE "nothing configured" value to handle rather than two.
 
-    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207). Read as
-    ``""`` it took the loopback arm, which drops the instance CA and the CRL from a hop nobody can
-    place. ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
+    A ``url`` that names no host raises ``ValueError`` (:func:`hop_url_host`, BACKLOG #2207).
+    ``cell`` leads that refusal. The two token-endpoint factories resolve the anchor before
     their provider checks the URL, so they pass the setting's name and the operator learns which
     URL to fix."""
     ca = settings.get("tls_ca_file")
@@ -495,6 +514,7 @@ def http_family_trust_anchor(
 def _no_redirect_opener(
     *extra_handlers: urllib.request.BaseHandler,
     trust_anchor: TrustAnchor = SYSTEM_TRUST_ANCHOR,
+    connector: str = _HTTP_FAMILY_CELL,
 ) -> urllib.request.OpenerDirector:
     """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
     ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
@@ -511,12 +531,31 @@ def _no_redirect_opener(
     narrows nothing — the default — leaves the opener handler-for-handler what it was (apart from the
     strict reply class every opener gets, BACKLOG #2052), which is why a
     connection needs one of these openers only when it carries an extra handler OR an anchor that
-    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`."""
+    ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`.
+    :func:`_verifying_opener` makes that choice for the hops that call it.
+
+    ``connector`` is the hop label an opener-build refusal names, such as a cipher-assertion or
+    handler-context refusal. A CA or CRL load refusal names the ``[tls]`` setting instead.
+    The AI broker's anchored opener passes its own (BACKLOG #5527 item 9); the shared opener is
+    built once, with the default."""
     return build_strict_opener(
         _NoRedirectHandler,
-        build_anchored_https_handler(anchor=trust_anchor, connector=_HTTP_FAMILY_CELL),
+        build_anchored_https_handler(anchor=trust_anchor, connector=connector),
         *extra_handlers,
     )
+
+
+def _verifying_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+    trust_anchor: TrustAnchor,
+) -> urllib.request.OpenerDirector:
+    """The verifying, no-redirect opener for a hop with ``extra_handlers`` and ``trust_anchor``:
+    rest.py's shared opener when there is no handler and the anchor narrows nothing, otherwise one
+    of the hop's own from :func:`_no_redirect_opener` (BACKLOG #5527 item 10). At least the
+    DICOMweb destination and the token hops call it."""
+    if extra_handlers or trust_anchor.narrows:
+        return _no_redirect_opener(*extra_handlers, trust_anchor=trust_anchor)
+    return _shared_no_redirect_opener()
 
 
 # Shared opener that verifies TLS and never follows redirects, reused by every connection that needs
@@ -603,33 +642,6 @@ def _expiry_relaxed_opener(
     )
 
 
-def _port_fields(netloc: str) -> tuple[str, ...]:
-    """Every port field a reader takes from ``netloc``; empty when no reader sees a port.
-
-    Two readers, because they disagree. ``urlsplit`` reads the RAW authority, after an IPv6
-    literal's ``]`` or else after the first ``:``. urllib unquotes the host before ``http.client``
-    reads it, after the last ``:`` that follows any ``]``. So ``svc%3A12`` dials port 12, and
-    ``svc:ab%5Dc`` hides its port from ``http.client`` alone. The caller has refused userinfo."""
-    fields: list[str] = []
-    raw = netloc.partition("]")[2] if netloc.startswith("[") else netloc
-    if ":" in raw:
-        fields.append(raw.partition(":")[2])
-    dial = urllib.parse.unquote(netloc)
-    colon = dial.rfind(":")
-    if colon > dial.rfind("]"):
-        fields.append(dial[colon + 1 :])
-    return tuple(fields)
-
-
-def _is_port(value: str) -> bool:
-    """Is ``value`` empty or a number from 0 to 65535? Leading zeros count, since ``urlsplit`` and
-    ``http.client`` both accept them. The length is capped before ``int``, so nothing raises."""
-    digits = value.lstrip("0")
-    return value == "" or (
-        value.isascii() and value.isdigit() and len(digits) <= 5 and int(digits or "0") <= 65535
-    )
-
-
 def _redact_url(url: str) -> str:
     """``scheme://host[:port]/path`` only — drops query/userinfo so a token or PHI in the query
     string never reaches a log line.
@@ -671,20 +683,10 @@ def _host_hides_userinfo(p: urllib.parse.SplitResult) -> bool:
     return "@" in urllib.parse.unquote(p.netloc.rpartition("@")[2]) or _host_holds_encoded_colon(p)
 
 
-def _host_holds_encoded_colon(p: urllib.parse.SplitResult) -> bool:
-    """Does an unbracketed host hold ``:`` once unquoted? No host name holds one."""
-    return not p.netloc.rpartition("@")[2].startswith("[") and ":" in urllib.parse.unquote(
-        p.hostname or ""
-    )
-
-
 def _withholds_host(p: urllib.parse.SplitResult) -> bool:
     """Must a render of ``p`` withhold its host? :func:`_redact_url` says why (BACKLOG #2686)."""
     return _host_hides_userinfo(p) or "@" in urllib.parse.unquote(f"{p.path}{p.query}{p.fragment}")
 
-
-#: Where a refusal tells the operator to put an endpoint's credential instead of its URL.
-_URL_CREDENTIAL_USE = "basic_user/basic_password or bearer_token"
 
 #: What :func:`url_host_label` prints in place of a host it must not print.
 HOST_WITHHELD = "(withheld: an '@' or encoded ':' in the URL may hide a credential)"
@@ -704,98 +706,6 @@ def url_host_label(url: str) -> str:
     except ValueError:
         return HOST_WITHHELD
     return HOST_WITHHELD if _withholds_host(p) else (p.hostname or "")
-
-
-def refuse_url_credentials(
-    url: str,
-    setting: str,
-    *,
-    use: str = _URL_CREDENTIAL_USE,
-    error: type[ValueError] = ValueError,
-) -> None:
-    """Refuse an endpoint URL that carries a credential, at CONSTRUCTION time (BACKLOG #1793).
-
-    WHY IT IS REFUSED RATHER THAN SUPPORTED. urllib never turns URL userinfo into an ``Authorization``
-    header. It hands ``user:pw@host`` to ``http.client`` as the HOST, which reads ``pw@host`` as the
-    port and raises ``InvalidURL("nonnumeric port: 'pw@host'")``. With an explicit port the lookup fails
-    on a host that still holds the password, and through a plain-http forward proxy the password goes
-    out in the request line and the ``Host`` header. So the shape never authenticated anything, and its
-    error text carried the password into ``queue.last_error`` and the test-connection reply.
-
-    At least three shapes are refused, all read after unquoting, because urllib unquotes the host: so
-    ``%40`` leaks exactly like ``@`` and ``%3A`` names a port like ``:``. An ``@`` in the authority is
-    userinfo. A port that is not a number is what a password holding an unencoded ``/``, ``?`` or
-    ``#`` looks like: the authority stops there, no ``@`` is seen, and the password's head becomes the
-    port. When that head is a number or empty the port passes, so an ``@`` after a port is refused
-    too (BACKLOG #2686). An EMPTY port (``host:/``) with no ``@`` after it passes, because ``urlsplit``
-    reads it as no port and ``http.client`` as the default. Not every shape is caught: an ``@`` with
-    no port is ordinary path text, and the comment on the third check names another.
-
-    ``proxy_url`` is deliberately NOT screened here: :func:`proxy_config_from_settings` has its own
-    refusal, which reads the URL as urllib does, and #1207 masks a credential for display.
-
-    PHI- and secret-safe: names the setting, never the URL or any part of it. ``error`` keeps each
-    seam's own ``ValueError`` subclass, so a caller catching ``HttpAuthError`` still catches this."""
-    p = _split_or_refuse(url, setting, use=use, error=error)
-    if "@" in urllib.parse.unquote(p.netloc):
-        raise error(
-            f"{setting} must not carry credentials in the URL (the user:password@ part); "
-            f"set them in {use} instead"
-        )
-    # Read as strings, never through ``p.port``: its ValueError quotes the port field, which is the
-    # password in ``https://svc:PW/path`` (#1796).
-    ports = _port_fields(p.netloc)
-    if not all(_is_port(port) for port in ports):
-        raise error(
-            f"{setting} has a port that is not a number from 0 to 65535. A password written "
-            f"into the URL can cause this; set credentials in {use} instead"
-        )
-    # A numeric password head passes the port check (BACKLOG #2686): ``svc:12/ss@host`` reads as
-    # host ``svc``, port 12. Refused when an ``@`` follows the port in the path, or anywhere after
-    # it when the path is empty (the ``?`` and ``#`` heads), or in a fragment, which is never sent.
-    # An ``@`` in a query value after a real path still passes; so does any ``@`` with no port. That
-    # leaves a password such as ``12/a?b`` constructible; ``_redact_url`` still withholds it.
-    tail = p.path + (p.query if not p.path else "") + p.fragment
-    if ports and "@" in tail:
-        raise error(
-            f"{setting} has a port followed by an '@'. A password written into the URL can cause "
-            f"this; set credentials in {use} instead. Write a literal '@' as %40, or leave out a "
-            "default port"
-        )
-    # A password head written with ``%3A`` and then ``%5D`` hides its port from both readers above,
-    # since the dialling reader takes the ``]`` for an IPv6 literal's end (BACKLOG #2686). No host
-    # name holds a ``:``, so an encoded one outside brackets is refused whatever follows it.
-    if _host_holds_encoded_colon(p):
-        raise error(
-            f"{setting} has a ':' written as %3A in its host. A password written into the URL can "
-            f"cause this; set credentials in {use} instead"
-        )
-
-
-def _split_or_refuse(
-    url: str, setting: str, *, use: str, error: type[ValueError]
-) -> urllib.parse.SplitResult:
-    """``urlsplit(url)``, or a refusal that names ``setting`` and nothing of the URL.
-
-    Raised after the handler ends: urlsplit's NFKC ValueError quotes the whole netloc, password and
-    all, and ``from None`` would leave it on ``__context__`` (#1796).
-
-    Split uncached (vault BACKLOG #5287). At least :func:`url_scheme` and
-    :func:`refuse_url_credentials` call this on a URL that may hold a credential, and a cached split
-    would make a refused password a key in urllib's process-wide cache. The uncached function is
-    the same code, so it raises the same NFKC ValueError. This keeps only this split from adding
-    the key: a reader that splits the same value cached first, such as the egress gate's query
-    credential warning on an endpoint ``url``, still adds one."""
-    try:
-        parsed: urllib.parse.SplitResult | None = _UNCACHED_URLSPLIT(url)
-    except ValueError:
-        parsed = None
-    if parsed is None:
-        raise error(
-            f"{setting} is not a URL that can be parsed. A password written into the URL can "
-            f"cause this; set credentials in {use} instead"
-        )
-    return parsed
 
 
 def url_scheme(
@@ -923,8 +833,9 @@ class InsecureHopGuard:
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture.
 
-        An empty ``host`` is refused whatever the posture (BACKLOG #2207): the authority below reads
-        ``""`` as loopback and would ALLOW it. The text is fixed and names no part of the URL."""
+        An empty ``host`` is refused whatever the posture (BACKLOG #2207), where the authority below
+        could still let an attested or accepted hop cross. The text is fixed and names no part of
+        the URL."""
         if not host:
             raise InsecureHopRefused(
                 f"{hop_name_prefix(self.connection)}{self.cell}: send-time refusal: the URL names "
@@ -1235,13 +1146,17 @@ def refuse_cleartext_credentials(
     http off this machine*, says why and defines which values are credential-shaped. A static
     ``Proxy-Authorization``, in any spelling, is left out when :func:`hop_reaches_a_proxy` answers
     ``True``, since the send-time proxy rule judges it then; otherwise it is judged like any other
-    header. An ``Authorization`` header in the built ``headers``,
-    in any case, counts as well; the bearer re-checks pass one in, as defense in depth should the
+    header. An ``Authorization`` header in the built ``headers``, in any spelling
+    :func:`~messagefoundry.transports.http_auth.is_authorization_header_name` reads (BACKLOG
+    #5526), counts as well; the bearer re-checks pass one in, as defense in depth should the
     inventory and the bearer providers ever disagree. As for
     :func:`refuse_cleartext_credential_hop`, only a loopback host lifts it. Shared by the REST,
     SOAP, FHIR and DICOMweb cells and the ``FhirLookup`` read path."""
+    # Lazy: http_auth imports this module.
+    from messagefoundry.transports.http_auth import is_authorization_header_name
+
     sent = list(credentials)
-    if not sent and any(str(name).strip().lower() == "authorization" for name in headers):
+    if not sent and any(is_authorization_header_name(str(name)) for name in headers):
         sent = ["Authorization header"]
     if not sent:
         return
@@ -1857,30 +1772,63 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     )
 
 
-def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
+def digest_password_unmatched(url: str) -> bool:
+    """True when a Digest password stored under ``url`` as written would not be found for the
+    url urllib requests (BACKLOG #5911). Asked of ``urllib.request.HTTPPasswordMgr.reduce_uri``."""
+    reduce = urllib.request.HTTPPasswordMgr().reduce_uri
+    return reduce(url) != reduce(request_target_as_sent(url))
+
+
+def refuse_unsendable_static_request(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    setting: str,
+    sent_as_is: bool = False,
+    leave_proxy_credential_names: bool = False,
+) -> None:
     """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
 
     The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
     bounds lengths only, and these values are the same for every message, so one the wire refuses
-    would fail every send. A URL must be ASCII with no whitespace: ``http.client`` sends the request
-    target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
-    host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
-    too, because urllib splits it off client-side, so every path the connector appends to the URL
-    would be dropped. Each header is put to ``http.client`` itself, as
+    would fail every send. The URL is judged by :func:`unsendable_request_target`, with
+    ``sent_as_is`` passed through. Each header name must be an RFC 9110 token. Each header is put
+    to ``http.client`` itself, as
     :func:`~messagefoundry.transports.bounded_read._refusal_by_http_client` does for a proxy
-    header, so the screen follows its name and value rules in every Python version.
+    header, so the screen follows its name and value rules in every Python version. Those rules
+    let a NUL or a folded line through in a value, so a control character other than HTAB, which
+    RFC 9110 section 5.5 forbids in a value, is refused here as well.
+
+    A header whose name :func:`~messagefoundry.transports.bounded_read.is_proxy_credential_header_name`
+    reads is a proxy credential, which the proxy-header rule judges by name (vault BACKLOG #3443,
+    #3457), so the RFC 9110 name check skips it; ``http.client``'s own name check still applies.
+    ``leave_proxy_credential_names`` skips such a header entirely, for a connector that left it to
+    that rule alone before this screen reached it.
 
     Raises :class:`ValueError` naming ``setting``, and a header key only as
     :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
     credential. Every raise sits outside any ``except`` block, so no ``__context__`` carries the
     value (see :func:`_latin1_refusal_position`).
     """
-    if not url.isascii() or any(ch.isspace() for ch in url) or "#" in url:
+    if unsendable_request_target(url, sent_as_is=sent_as_is):
+        refused = (
+            "whitespace or a control character once the whitespace around it is stripped"
+            if sent_as_is
+            else ("whitespace, a control character or '#'")
+        )
         raise ValueError(
-            f"{setting} 'url' must be ASCII with no whitespace or '#' (http.client sends it as "
-            "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
+            f"{setting} 'url' must be ASCII with no {refused} (http.client sends it as "
+            "ASCII); give an internationalized host in its IDNA form"
         )
     for name, value in headers.items():
+        proxy_named = is_proxy_credential_header_name(name)
+        if proxy_named and leave_proxy_credential_names:
+            continue
+        if not proxy_named and not _FIELD_NAME.fullmatch(name):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not a header name the engine "
+                "sends (RFC 9110 allows only tchar characters in one)"
+            )
         if _refusal_by_http_client(name, "") is not None:
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} is not a header name http.client "
@@ -1895,6 +1843,11 @@ def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, se
             raise ValueError(
                 f"{setting} header {_shown_header_key(name)} has a value http.client refuses to "
                 "send"
+            )
+        if _VALUE_CTL.search(value):
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} has a control character in its "
+                "value (RFC 9110 allows none but HTAB)"
             )
 
 
@@ -2824,7 +2777,8 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
     :data:`_ECH_SIDECAR_CREDENTIAL_USE` (BACKLOG #5528): urllib would dial ``user:pw@host`` as the
     host. It is refused here, not only at the egress gate, so a directly built connector refuses it.
     So, in fixed words that quote no part of the value, are at least a space or control character,
-    a ``?`` or ``#``, a non-ASCII character and a ``%`` in the host; the comments below say why each.
+    a ``?`` or ``#``, a non-ASCII character, a ``%`` in the host, a port that cannot be read and
+    port 0; the comments below say why each.
 
     Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
     endpoint does — demand-gated, ADR 0139)."""
@@ -2873,6 +2827,23 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
         raise ValueError(
             "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
             "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
+        )
+    # BACKLOG #5528: refused here, not only at the egress gate, so a directly built connector and
+    # every other reader of this resolver refuse them too. A port of more than 4300 digits, leading
+    # zeros and all, passes the credential screen's port check and breaks int(); urlsplit's own
+    # text is not let out, and the raise comes after the handler ends.
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if port == -1:
+        raise ValueError("ech_sidecar names a port that cannot be read as a number")
+    if port == 0:
+        # Not "not in the allowlist" at the gate: no entry can list port 0, so that would send the
+        # operator looking for an entry to add.
+        raise ValueError(
+            "ech_sidecar names port 0, which is not a port a sidecar can listen on and no "
+            "[egress].allowed_ech_sidecar entry can list; name the sidecar's own port"
         )
     return sidecar.rstrip("/")
 
@@ -2993,6 +2964,8 @@ class RestDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
+        # Read strictly and first, on every branch: bool("false") is True (vault BACKLOG #3234).
+        allow_expired = flag_from_settings(s, "tls_allow_expired")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError("REST destination requires a 'url' setting")
@@ -3082,6 +3055,25 @@ class RestDestination(DestinationConnector):
                 f"{hop_name_prefix(config.name)}ech_egress and HTTP Digest are mutually exclusive -- "
                 "the Digest handler cannot answer a challenge through the ECH sidecar (ADR 0139)"
             )
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, before
+        # the proxy route's hop gate, rather than every message at send time. The url is judged
+        # against urllib's direct send; the ECH and forward-proxy paths read the url differently.
+        self._headers = self._build_headers(s)
+        refuse_unsendable_static_request(
+            url,
+            self._headers,
+            setting="REST destination",
+            sent_as_is=True,
+            leave_proxy_credential_names=True,
+        )
+        if digest_selected and digest_password_unmatched(url):
+            # Every send would otherwise end in a 401 the Digest handler cannot answer.
+            raise ValueError(
+                "REST destination 'url' must not end in whitespace the Digest password lookup "
+                "keeps, such as a space, with HTTP Digest (the password is stored under the url "
+                "as written, and the request goes to the url without it, so no challenge would "
+                "find the password)"
+            )
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
         # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
         self._proxy: ProxyConfig | None = (
@@ -3098,7 +3090,6 @@ class RestDestination(DestinationConnector):
         )
         proxy_dest = self._proxy.for_host(self.url) if self._proxy is not None else None
         proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
-        self._headers = self._build_headers(s)
         if proxy_dest is not None:
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none). urllib moves it into the
             # CONNECT tunnel for an https destination, sends it to the proxy for an http one (ADR 0126).
@@ -3182,7 +3173,7 @@ class RestDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.url, trust_anchor_policy=config.trust_anchor_policy
             )
-            if bool(s.get("tls_allow_expired", False)):
+            if allow_expired:
                 self._opener = _expiry_relaxed_opener(
                     urllib.parse.urlsplit(self.url).hostname or "",
                     *proxy_handlers,
@@ -3253,7 +3244,6 @@ class RestDestination(DestinationConnector):
             #
             # Last in __init__, below every statement that builds or replaces `self._opener`, and no
             # opener with an ECH sidecar or tls_allow_expired: see refuse_unrevoked_verified_hop.
-            allow_expired = bool(s.get("tls_allow_expired", False))
             no_crl_evidence = self._ech_sidecar is not None or allow_expired
             refuse_unrevoked_verified_hop(
                 scheme,

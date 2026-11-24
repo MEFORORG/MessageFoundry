@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from messagefoundry.config.bool_numbers import NumbersRefuseBool
 from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
@@ -238,7 +239,8 @@ def require_flag(value: object, key: str) -> bool:
 
 
 def flag_from_settings(settings: Mapping[str, Any], key: str) -> bool:
-    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232).
+    """The one reader of a hop-policy flag out of a raw settings mapping (vault BACKLOG #2232), and
+    a strict read of another default-off boolean connector setting (vault BACKLOG #3234).
 
     Absent, or ``None``, means ``False``. A real ``bool`` is returned as is. Anything else raises
     :class:`ValueError` naming ``key`` (:func:`require_flag`), so a mapping that was written past
@@ -254,17 +256,22 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
     ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
     default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). ``bool("")`` does the same,
     so an empty string is unset too (vault BACKLOG #3533 item 11); for a default-off setting that
-    reads as it did. Any other value is read with ``bool()``, as before. A literal empty string on
-    a boolean setting is refused at load and at the builds ``config.wiring.refuse_bool_literals``
-    names, so there the empty-string rule serves only a mapping that reached this reader some
-    other way.
+    reads as it did. A literal empty string on a boolean setting is refused at load and at the
+    builds ``config.wiring.refuse_bool_literals`` names, so there the empty-string rule serves only
+    a mapping that reached this reader some other way.
+
+    Any other value must be a real ``bool``, and anything else raises :class:`ValueError` naming
+    ``key`` (:func:`require_flag`, vault BACKLOG #3234). ``bool()`` read ``0`` as off and
+    ``"false"`` as on, so a connector built directly from a ``Source`` or ``Destination``, which
+    passes neither refusal above, could turn a default-on check off. An unresolved ``env()``
+    reference is not a ``bool`` either: a reader that runs before resolution handles it first.
 
     Use it for a transport setting with a default, such as a TLS check, and read it the same way in
     every connector and every reader that reports on it, so the two cannot disagree. Use
-    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin),
-    which defaults off and must refuse a value that is not a real ``bool``."""
+    :func:`flag_from_settings` instead for a hop-policy flag (``tls_hop_attested`` and its kin), or
+    another setting that defaults off and must refuse an empty string too."""
     value = settings.get(key)
-    return default if value is None or value == "" else bool(value)
+    return default if value is None or value == "" else require_flag(value, key)
 
 
 def _check_flag_with_reason(
@@ -478,7 +485,7 @@ class Source(_InputHidingModel):
         return self
 
 
-class RetryPolicy(BaseModel):
+class RetryPolicy(NumbersRefuseBool):
     """Outbound delivery retry/backoff. ``max_attempts`` is the number of delivery attempts before a
     failure dead-letters.
 
@@ -533,13 +540,6 @@ class RetryPolicy(BaseModel):
             return self.max_backoff_seconds
 
 
-def _refuse_bool_threshold(value: object) -> object:
-    """Refuse a boolean alert threshold, which pydantic would otherwise read as 1 (BACKLOG #5778)."""
-    if isinstance(value, bool):
-        raise ValueError("an alert threshold must be a number or None, not a boolean")
-    return value
-
-
 def infinite_age_is_off(value: float | None) -> float | None:
     """An infinite alert age, which can never be crossed, is the TOML spelling of off, TOML having no
     null: read it as ``None`` so the runner skips the store read an off dimension needs no read for,
@@ -550,7 +550,7 @@ def infinite_age_is_off(value: float | None) -> float | None:
     return value
 
 
-class BuildupThreshold(BaseModel):
+class BuildupThreshold(NumbersRefuseBool):
     """When to raise a ``queue_buildup`` alert for a lane whose backlog is not draining. An outbound
     lane is the classic case: a head retrying its way toward :attr:`RetryPolicy.max_attempts`. The cap
     eventually unblocks the lane, but hours later and only by dead-lettering, so the alert is what an
@@ -571,18 +571,13 @@ class BuildupThreshold(BaseModel):
     max_depth: int | None = Field(default=None, ge=1)
     max_oldest_seconds: float | None = Field(default=300.0, gt=0)
 
-    @field_validator("max_depth", "max_oldest_seconds", mode="before")
-    @classmethod
-    def _refuse_bool(cls, value: object) -> object:
-        return _refuse_bool_threshold(value)
-
     @field_validator("max_oldest_seconds", mode="after")
     @classmethod
     def _inf_is_off(cls, value: float | None) -> float | None:
         return infinite_age_is_off(value)
 
 
-class StallThreshold(BaseModel):
+class StallThreshold(NumbersRefuseBool):
     """When to raise a ``message_stall`` alert for an outbound lane (Corepoint "Max Message Stall"):
     the lane's **oldest undelivered message** has been waiting too long. Modeled on
     :class:`BuildupThreshold` but a single age dimension — it reuses the same oldest-pending age
@@ -598,11 +593,6 @@ class StallThreshold(BaseModel):
     :class:`BuildupThreshold` gives (BACKLOG #5778). An infinite age loads as ``None``, off."""
 
     max_oldest_seconds: float | None = Field(default=None, gt=0)
-
-    @field_validator("max_oldest_seconds", mode="before")
-    @classmethod
-    def _refuse_bool(cls, value: object) -> object:
-        return _refuse_bool_threshold(value)
 
     @field_validator("max_oldest_seconds", mode="after")
     @classmethod
@@ -620,7 +610,7 @@ SATURATION_MIN_GROWTH_DEFAULT = 5
 SATURATION_MIN_GROWTH_MAX = 1_000_000
 
 
-class SaturationThreshold(BaseModel):
+class SaturationThreshold(NumbersRefuseBool):
     """When to raise a ``saturation`` alert for a lane (BACKLOG #93, ADR 0014 amendment): the lane is
     *becoming* overloaded — its pending backlog is **rising sustained** across the sampling window.
 
@@ -638,9 +628,8 @@ class SaturationThreshold(BaseModel):
     the ``[delivery]`` global default > built-in (off).
 
     ``min_growth`` is the rise, in messages, the alert needs before it fires (BACKLOG #5768,
-    :data:`SATURATION_MIN_GROWTH_DEFAULT`). The ``[delivery]`` key refuses a boolean, as every
-    numeric settings key does (BACKLOG #5509); this model takes what that key passes, or a
-    code-first int."""
+    :data:`SATURATION_MIN_GROWTH_DEFAULT`). A boolean on either field is refused rather than read as
+    1 or 0, by the guard the settings sections share (BACKLOG #5509)."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
     min_growth: int = Field(
@@ -648,7 +637,7 @@ class SaturationThreshold(BaseModel):
     )
 
 
-class ActiveWindow(BaseModel):
+class ActiveWindow(NumbersRefuseBool):
     """One **active window** in a per-connection schedule (BACKLOG #147, ADR 0095).
 
     The window is a recurring time-of-day span on a set of weekdays, evaluated in its own IANA
@@ -761,7 +750,7 @@ class Schedule(BaseModel):
         return (not inside) if self.invert else inside
 
 
-class BatchConfig(BaseModel):
+class BatchConfig(NumbersRefuseBool):
     """Opt-in per-outbound HL7 **batch aggregation** (BACKLOG #134 / ADR 0082): coalesce up to
     ``max_count`` consecutive outbound messages on this lane into ONE ``BHS``…``BTS`` envelope on a
     single send.
@@ -957,7 +946,7 @@ class WindowsCredential(_InputHidingModel):
         return cls.model_validate(data)
 
 
-class Destination(_InputHidingModel):
+class Destination(_InputHidingModel, NumbersRefuseBool):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others.
 
@@ -1048,7 +1037,7 @@ class Destination(_InputHidingModel):
         return self
 
 
-class Validation(BaseModel):
+class Validation(NumbersRefuseBool):
     """Parse/validate behaviour. Tolerant by default — non-conformant messages
     still route; ``strict`` runs full hl7apy structural validation and NACKs on failure.
 

@@ -11,6 +11,6 @@
   below an empty secret on a later line of its registry string. In those three forms, under such
   a name, at least a value holding key text beside other text, such as `Path=C:\x;<key>`, still
   ends the empty value. An empty secret set with
-  its equals sign on a string's first line still refuses with either of these on the line below
-  it, as it already did.
+  its equals sign on a string's first line still refuses when such a line follows it, as it
+  already did.
   (`BACKLOG #5394`)

@@ -3,11 +3,13 @@
 """The support-bundle help and ``docs/PHI.md`` stream 14 name every member the bundle writes
 (BACKLOG #5385, added item 1).
 
-The member list is derived from the code, not copied: every ``members["<name>"] = ...`` assignment
-in :func:`messagefoundry.support.bundle.build_bundle`, read off its AST. A live bundle with a log
-tail is the control that the AST reading finds what the function really writes. The help must also
-describe ``status.json`` the way the manifest's ``phi_contract`` does, "metadata-only", and must not
-call it "PHI-free", which the contract does not claim. Synthetic values only.
+The member list each test walks is derived from the code, not copied: every
+``members["<name>"] = ...`` assignment in :func:`messagefoundry.support.bundle.build_bundle`,
+read off its AST. ``_KNOWN_MEMBERS`` is a hand-copied floor that reading must reach. A live
+bundle with a log tail is the control that the AST reading finds what the function really
+writes. The help must also describe ``status.json`` the way the manifest's ``phi_contract``
+does, "metadata-only", and must not call it "PHI-free", which the contract does not claim.
+Synthetic values only.
 """
 
 from __future__ import annotations
@@ -26,6 +28,13 @@ from messagefoundry.support import build_bundle
 from messagefoundry.support import bundle as bundle_mod
 
 _REPO = Path(__file__).resolve().parents[1]
+
+#: The members build_bundle writes today when a log tail is written, copied by hand as a floor.
+#: The three member tests below check the AST reading holds at least these, so an empty or
+#: partial reading cannot pass them.
+_KNOWN_MEMBERS = frozenset(
+    {"version.txt", "config-summary.json", "status.json", "app-log.txt", "manifest.json"}
+)
 
 
 def _members_written_by_build_bundle() -> set[str]:
@@ -97,7 +106,7 @@ def test_the_ast_reading_finds_every_member_a_live_bundle_writes(tmp_path: Path)
     assert written == derived, (written, derived)
     # manifest.json is written after its own listing is taken, so it lists the others only.
     assert set(manifest["members"]) == derived - {"manifest.json"}
-    assert {"version.txt", "manifest.json"} <= derived
+    assert derived >= _KNOWN_MEMBERS, derived
 
 
 def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> None:
@@ -107,7 +116,9 @@ def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> 
     clause = re.search(r"Its members: (.*?)\. The tail's", help_text)
     assert clause is not None, help_text
     members = _members_written_by_build_bundle()
-    assert len(members) >= 5, members
+    assert members >= _KNOWN_MEMBERS, members
+    # The shape test_vacuous_absence_assert_lint reads as a guard; the line above is the check.
+    assert members
     missing = sorted(name for name in members if name not in clause.group(1))
     assert not missing, f"support-bundle --help does not name: {missing}"
 
@@ -115,7 +126,9 @@ def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> 
 def test_phi_md_stream_14_names_every_member() -> None:
     row = _stream_14_row()
     members = _members_written_by_build_bundle()
-    assert len(members) >= 5, members
+    assert members >= _KNOWN_MEMBERS, members
+    # The shape test_vacuous_absence_assert_lint reads as a guard; the line above is the check.
+    assert members
     missing = sorted(name for name in members if f"`{name}`" not in row)
     assert not missing, f"docs/PHI.md stream 14 does not name: {missing}"
 

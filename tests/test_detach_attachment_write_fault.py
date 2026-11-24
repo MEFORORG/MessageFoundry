@@ -5,11 +5,17 @@
 A streaming inbound detaches its large documents with ``put_attachment`` before the ingress commit.
 No fault from that write is classed as the document's (Manager decision d20261104T042552411-c23337,
 as amended): every one that is not already one of the detach's own refusals (at least
-``StreamingAttachmentsUnsupported`` is) propagates to the transport with no message row, so the
-input is kept for a resend, and the tests below pin what each source then does with it. A fault answered as a refusal
-would charge the refused-body allowance, and a body whose text no backend can encode would then fail
-the ``ERROR`` write as well, so each resend of it would drain the allowance for every other refused
-body on that inbound.
+``StreamingAttachmentsUnsupported`` is) propagates to the transport with no message row, so nothing
+records the body as finished. Whether the input survives for a resend is the source's to decide. The
+file and database sources leave it where it was read, and a TCP or MLLP inbound that sends no reply
+holds the frame and retries it until it is recorded or the inbound stops (BACKLOG #5022); the tests
+below pin those. A source that answers its sender keeps no copy: MLLP with replies NAKs or closes,
+and HTTP and DICOM receipt answer a failure, so the input survives only if the sender resends it
+(BACKLOG #1619 keeps the HTTP answer as an open item). A fault answered as a refusal
+would charge the refused-body allowance, so a fault the same body meets on every resend would drain
+the allowance for every other refused body on that inbound. A body whose decoded text holds a lone
+surrogate, which at least the SQLite store's write cannot encode, never reaches the detach: the
+decode refuses it and records it (BACKLOG #1619).
 
 What the detach does decide is the OBX-5.2 label, the one sender-controlled value a column could
 refuse: a label some backend's ``attachment.content_type`` cannot hold is stored as
@@ -37,6 +43,7 @@ from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, RefusedBodyPolicy
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, StreamingAttachmentsUnsupported
+from messagefoundry.store.base import ATTACHMENT_CONTENT_TYPE_MAX
 from messagefoundry.store.crypto import CipherError
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.receipt import RefusalKind
@@ -276,7 +283,7 @@ async def test_a_fault_on_a_later_document_propagates_and_leaves_the_first_unref
     assert runner._stream_inflight_bytes == 0
 
 
-# --- a real lone surrogate in OBX-5.5 propagates before any allowance charge ---------------------
+# --- a real lone surrogate in the body is refused at decode, before any detach --------------------
 
 
 #: A fixed clock, so the allowance never refills between the attempt and the read-back.
@@ -293,44 +300,41 @@ def _utf7_runner(
     return runner, ic, allowance
 
 
-async def test_a_lone_surrogate_document_propagates_with_no_allowance_charge(
+async def test_a_lone_surrogate_document_is_refused_at_decode_before_any_write(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # UTF-7 "+2D8-" decodes to the lone surrogate U+D83F, which no backend's driver can encode, so the
-    # real put_attachment fails on it. It propagates before the refused-body allowance is charged:
-    # recording it would charge the allowance and then fail the ERROR write on the same text, so
-    # each resend would drain the allowance for every other refused body on the inbound.
+    # UTF-7 "+2D8-" decodes to the lone surrogate U+D83F, which strict UTF-8 cannot encode, so the
+    # ingress write and put_attachment would both fail on it, on every resend. The decode refuses it
+    # instead (BACKLOG #1619): an ERROR row holding the bytes as received, an AR, and no detach.
     assert b"+2D8-".decode("utf-7") == "\ud83f"
-    runner, ic, allowance = _utf7_runner(store)
+    runner, ic, _allowance = _utf7_runner(store)
     b64 = base64.b64encode(b"P" * 2000).decode("ascii")
     body = _doc_hl7(b64=b64[:100] + "+2D8-" + b64[100:]).encode("ascii")
-    real = store.put_attachment
-    raised: list[BaseException] = []
+    calls: list[str] = []
 
     async def spy(chunks: Iterable[str], content_type: str) -> str:
-        try:
-            return await real(chunks, content_type)
-        except UnicodeEncodeError as exc:
-            raised.append(exc)
-            raise
+        calls.append(content_type)
+        raise AssertionError("put_attachment ran on a body the decode refuses")
 
     monkeypatch.setattr(store, "put_attachment", spy)
 
-    with pytest.raises(UnicodeEncodeError) as escaped:
-        await runner._handle_inbound(ic, body)
+    ack = await runner._handle_inbound(ic, body)
 
-    assert raised == [escaped.value], "the fault did not come from the real put_attachment"
-    assert await _rows(store) == []
+    assert _ack_code(ack) == "AR"
+    assert calls == []
+    (row,) = await _rows(store)
+    assert row["status"] == MessageStatus.ERROR.value
+    assert "surrogate code point at position" in row["error"]
+    assert row["raw"] == body.decode("ascii")  # the received bytes, not the decoded text
+    assert await _attachment_types(store) == []
     assert runner._stream_inflight_bytes == 0
-    # The whole allowance is still there: nothing was charged.
-    assert allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
 
 
 async def test_control_a_refused_body_on_that_inbound_charges_the_allowance(
     store: MessageStore,
 ) -> None:
-    # Anti-vacuity for the read-back above: an escaped document on the same inbound is refused and
-    # recorded, and its body is charged to the allowance, so the whole allowance no longer fits.
+    # An escaped document on a UTF-7 inbound is refused and recorded, and its body is charged to the
+    # allowance, so the whole allowance no longer fits.
     runner, ic, allowance = _utf7_runner(store)
     b64 = base64.b64encode(b"P" * 2000).decode("ascii")
     body = _doc_hl7(b64=b64[:100] + "\\X0D\\" + b64[100:]).encode("ascii")
@@ -382,33 +386,88 @@ def test_the_label_rule_names_what_no_backend_column_takes(label: str, fits: boo
     assert wiring_runner._label_fits_every_backend(label) is fits
 
 
-async def test_a_lone_surrogate_label_propagates_and_stores_nothing(store: MessageStore) -> None:
-    # A UTF-7 inbound decodes "+2D8-" in OBX-5.2 to a lone surrogate, which stays in the skeleton too,
-    # so the ingress write would fail on it whatever the label. The label is not downgraded, so the
-    # real put_attachment fails first and no unreferenced attachment is left behind.
-    runner, ic, allowance = _utf7_runner(store)
+async def test_a_lone_surrogate_label_is_refused_at_decode_and_stores_no_attachment(
+    store: MessageStore,
+) -> None:
+    # A UTF-7 inbound decodes "+2D8-" in OBX-5.2 to a lone surrogate. The decode refuses the body
+    # before the detach (BACKLOG #1619), so no attachment is written and the ERROR row is stored.
+    runner, ic, _allowance = _utf7_runner(store)
 
-    with pytest.raises(UnicodeEncodeError):
-        await runner._handle_inbound(ic, _doc_hl7(type_of_data="Ap+2D8-p").encode("ascii"))
+    ack = await runner._handle_inbound(ic, _doc_hl7(type_of_data="Ap+2D8-p").encode("ascii"))
 
-    assert await _rows(store) == []
+    assert _ack_code(ack) == "AR"
+    assert [r["status"] for r in await _rows(store)] == [MessageStatus.ERROR.value]
     assert await _attachment_types(store) == []
     assert runner._stream_inflight_bytes == 0
-    assert allowance.try_charge(ic.name, _ALLOWANCE.allowance_bytes)
 
 
 def test_the_content_type_bound_is_the_narrowest_backend_column() -> None:
-    # The bound copies the stores' DDL, so a change to any backend's column must move it too.
+    # SQL Server's column is built from the bound; the other backends' columns are unbounded TEXT,
+    # so a change to either of them must move the bound too.
     from messagefoundry.store import postgres, sqlserver
     from messagefoundry.store import store as sqlite_store
 
     def ddl(path: str) -> str:
         return Path(path).read_text(encoding="utf-8")
 
-    width = wiring_runner._ATTACHMENT_CONTENT_TYPE_MAX
-    assert f"content_type NVARCHAR({width}) NOT NULL" in ddl(sqlserver.__file__)
+    width = ATTACHMENT_CONTENT_TYPE_MAX
+    assert width == 256
+    assert any(f"content_type NVARCHAR({width}) NOT NULL" in stmt for stmt in sqlserver._SCHEMA)
     assert "content_type TEXT NOT NULL" in ddl(postgres.__file__)
     assert "content_type TEXT NOT NULL" in ddl(sqlite_store.__file__)
+
+
+def test_the_detach_and_the_download_route_share_the_store_bound() -> None:
+    # One width, owned by the store (BACKLOG #1619): the API once kept its own 255 beside it.
+    from messagefoundry.api import app as api_app
+
+    # Each module imports the store's own name and keeps no copy of the number. Read in the source,
+    # since an identity test cannot tell a copy of a small int from the original.
+    for module in (wiring_runner, api_app):
+        source = Path(module.__file__ or "").read_text(encoding="utf-8")
+        assert "    ATTACHMENT_CONTENT_TYPE_MAX,\n" in source  # in the store.base import
+        assert "ATTACHMENT_CONTENT_TYPE_MAX =" not in source
+        assert "_MAX_ATTACHMENT_MIME_LEN" not in source
+    widest = "application/" + "x" * (ATTACHMENT_CONTENT_TYPE_MAX - len("application/"))
+    assert wiring_runner._label_fits_every_backend(widest)
+    assert not wiring_runner._label_fits_every_backend(widest + "x")
+
+
+async def test_the_magic_byte_head_is_read_off_the_event_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The head's work grows with sender-controlled whitespace, so it runs in a thread, as the rest
+    # of the detach's body-scaled work does, and in the scan's own hop rather than one of its own,
+    # so a document costs no extra hop for it (BACKLOG #1619).
+    import asyncio
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: list[int] = []
+    real = vars(wiring_runner)["b64_head"]
+
+    def recording(b64: str, max_bytes: int = 32) -> bytes:
+        seen.append(threading.get_ident())
+        return real(b64, max_bytes)
+
+    hops: list[object] = []
+    real_to_thread = asyncio.to_thread
+
+    async def counting(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        hops.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "b64_head", recording)
+    monkeypatch.setattr(asyncio, "to_thread", counting)
+    runner, ic = _runner(store, ConnectorType.MLLP)
+
+    ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
+
+    assert _ack_code(ack) == "AA"
+    assert seen, "the head was never read"
+    assert loop_thread not in seen
+    assert hops, "no thread hop was counted, so this measured nothing"
+    assert recording not in hops
 
 
 # --- what each retrying source does with the propagated fault ------------------------------------
