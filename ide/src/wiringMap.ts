@@ -12,8 +12,9 @@
 // posted map payload, so config-supplied names are never string-interpolated into markup.
 import * as vscode from "vscode";
 import type { ElementKind } from "./graphModel";
-import { wiringMapPayload, type MapFocus } from "./wiringMapModel";
+import { graphOpenTarget, wiringMapPayload, type MapFocus } from "./wiringMapModel";
 import type { GraphProvider } from "./graphTree";
+import { workspaceDir } from "./cli";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import { wiringMapScript } from "./wiringMapWebview";
 
@@ -76,7 +77,15 @@ export class WiringMapPanel {
     } else if (m.command === "refresh") {
       await this.graph.refresh(); // fires onDidChangeTreeData -> post()
     } else if (m.command === "open") {
-      await vscode.commands.executeCommand("messagefoundry.openSource", m.file, m.line);
+      // A page script names the file, so open only a file the current graph reports (BACKLOG #4277).
+      const target = graphOpenTarget(this.graph.getGraph(), m.file, m.line, workspaceDir() ?? "");
+      if (!target) {
+        void vscode.window.showWarningMessage(
+          "MessageFoundry: the Wiring Map asked to open a file the wiring graph does not report; it was not opened. Refresh the map and try again.",
+        );
+        return;
+      }
+      await vscode.commands.executeCommand("messagefoundry.openSource", target.file, target.line);
     } else if (m.command === "reveal") {
       await vscode.commands.executeCommand("messagefoundry.revealElement", m.kind, m.name);
     }

@@ -10,6 +10,7 @@
 // incompleteness is visible, never a silently shorter map (AC-3). Tested node-side like graphModel.
 
 import { normalize, type ElementKind, type Graph, type NormalGraph } from "./graphModel";
+import { fileKey, IS_WIN32 } from "./pathIdentity";
 
 // The members live in a const so a webview page can be handed the same list its host is typed by
 // (ASVS 3.5.5, BACKLOG #1123). The type is derived from it, so the two cannot drift.
@@ -336,4 +337,34 @@ export function wiringMapPayload(g: Graph | undefined, focus: MapFocus | null): 
     }
   }
   return { type: "map", map, focus, names };
+}
+
+/**
+ * The source location a Wiring Map "open" request may open, or undefined to refuse it (ASVS 5.3.2,
+ * BACKLOG #4277). The page posts back a file it was sent, but a page script is not trusted to name
+ * one: the file must be one the current graph itself reports for an element, compared as fileKey
+ * resolved against `base` (the workspace root openSource resolves a relative path against). What
+ * comes back is the GRAPH's spelling of the file, never the page's, so openSource only ever sees a
+ * path the CLI printed. The line is only a cursor position; a value that is not a positive safe
+ * integer falls back to 1.
+ */
+export function graphOpenTarget(
+  g: Graph | undefined,
+  file: unknown,
+  line: unknown,
+  base: string,
+  win32: boolean = IS_WIN32,
+): { file: string; line: number } | undefined {
+  if (!g || typeof file !== "string" || file === "") {
+    return undefined;
+  }
+  const want = fileKey(base, file, win32);
+  const reported = [...g.inbound, ...g.routers, ...g.handlers, ...g.outbound]
+    .map((e) => e.file)
+    .find((f): f is string => typeof f === "string" && f !== "" && fileKey(base, f, win32) === want);
+  if (reported === undefined) {
+    return undefined;
+  }
+  const ln = typeof line === "number" && Number.isSafeInteger(line) && line >= 1 ? line : 1;
+  return { file: reported, line: ln };
 }
