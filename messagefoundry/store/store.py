@@ -9287,17 +9287,18 @@ def _secure_file(path: Path, *, keep_explicit_entries: bool = False) -> None:
     written, and ``icacls /grant:r`` kept each of them:
 
     - every deny, placed first;
-    - every OWNER RIGHTS object allow (``OA``), whatever its mask: on a file it grants the owner
-      nothing, yet it still turns off the owner's implicit access (measured);
-    - every plain OWNER RIGHTS allow that lacks READ_CONTROL or WRITE_DAC.
+    - the explicit OWNER RIGHTS entries, decided as a set: every one is carried, unless each is a
+      plain allow (``A``) holding both READ_CONTROL and WRITE_DAC, in which case the allows are all
+      dropped.
 
-    A plain OWNER RIGHTS allow holding both is dropped. Any OWNER RIGHTS entry turns off the
-    READ_CONTROL and WRITE_DAC Windows otherwise gives an owner beyond the list, so the owner ends
-    with what the carried OWNER RIGHTS entries grant, or, when none is carried, with those implicit
-    rights. A narrowing entry is carried because dropping it alone would hand the owner the
-    implicit rights back. Where a carried entry sits beside a dropped full one, the owner ends with
-    less than ``icacls /grant:r`` left it: a narrowing, not a loosening. A null DACL carries
-    nothing.
+    Any OWNER RIGHTS entry turns off the READ_CONTROL and WRITE_DAC Windows otherwise gives an
+    owner beyond the list, so the entries are decided together. Where one narrows the owner, a
+    deny, an allow lacking either right, or an object allow (``OA``; one that carries an
+    ObjectType GUID grants the owner nothing on a file yet still turns off the implicit rights,
+    measured), dropping any of them could hand the owner those implicit rights back or take away a
+    right ``icacls /grant:r`` left it, so the owner keeps what that rewrite left. Where none
+    narrows, dropping them all leaves the owner its implicit READ_CONTROL and WRITE_DAC, no more
+    than any one of them granted. A null DACL carries nothing.
 
     Where the current list cannot be read or parsed, or the write fails other than by access
     denied, the kept icacls rewrite below runs instead, and it keeps every explicit entry, other
@@ -9392,7 +9393,7 @@ _ERROR_ACCESS_DENIED = 5
 def _grants_owner_implicit_rights(rights: str) -> bool:
     """Does the upper-cased SDDL ``rights`` field include both READ_CONTROL and WRITE_DAC, the
     access Windows gives an owner when no OWNER RIGHTS entry applies? A field this cannot read
-    answers ``False``, so the entry is kept, as ``icacls /grant:r`` kept it."""
+    answers ``False``, so the OWNER RIGHTS entries are carried, as ``icacls /grant:r`` kept them."""
     if rights.startswith("0X"):
         try:
             mask = int(rights, 16)
@@ -9429,16 +9430,18 @@ def _entries_the_one_list_keeps(sddl: str) -> tuple[list[str], list[str]] | None
         return None
     denies: list[str] = []
     owner_rights: list[str] = []
+    narrowing = False
     for text, (kind, flags, rights, ace_sid) in zip(texts, dacl.aces, strict=True):
         if "ID" in _sddl_flag_set(flags):
             continue
+        is_owner_rights = ace_sid in _OWNER_RIGHTS
         if kind in _SDDL_DENY_TYPES:
             denies.append(f"({text})")
-        elif ace_sid in _OWNER_RIGHTS and (
-            kind == "OA" or (kind == "A" and not _grants_owner_implicit_rights(rights))
-        ):
+            narrowing = narrowing or is_owner_rights
+        elif is_owner_rights:
             owner_rights.append(f"({text})")
-    return denies, owner_rights
+            narrowing = narrowing or kind != "A" or not _grants_owner_implicit_rights(rights)
+    return denies, owner_rights if narrowing else []
 
 
 def _icacls_grant_keeping_explicit_entries(path: Path, sid: str) -> None:

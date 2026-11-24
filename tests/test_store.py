@@ -303,36 +303,76 @@ def test_secure_file_keeps_explicit_denies_and_a_restrictive_owner_rights_entry(
 
 
 @_windows_only
-def test_secure_file_carries_explicit_denies_first_and_drops_inherited_and_full_owner_rights(
+def test_secure_file_carries_explicit_denies_first_and_every_owner_rights_entry_together(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # What the one write carries over, read from the file's current list, per the rule in
-    # _secure_file's docstring: explicit denies (first), every OWNER RIGHTS object allow, and each
-    # plain OWNER RIGHTS allow lacking READ_CONTROL or WRITE_DAC. Dropped: every other allow, every
-    # inherited entry, and each plain OWNER RIGHTS allow holding both. With carried OWNER RIGHTS
-    # entries beside the dropped full ones, the owner ends with what the carried ones grant (FR and
-    # WD here), less than its implicit rights: a narrowing, not a loosening.
+    # _secure_file's docstring: explicit denies (first), and the explicit OWNER RIGHTS entries as a
+    # set. One of them (FR, WD or an object allow) narrows the owner, so every one is carried, the
+    # full ones too. Dropped: every other principal's allow and every inherited entry.
     from pathlib import Path
 
     import messagefoundry.store.store as store_mod
 
-    # An object allow (OA) for OWNER RIGHTS is kept whatever its rights: on a file it grants the
-    # owner nothing, yet it still removes the owner's implicit access (measured in review).
     oa_read = "(OA;;FR;00000000-0000-0000-0000-000000000001;;OW)"
     oa_full = "(OA;;FA;00000000-0000-0000-0000-000000000002;;OW)"
-    current = (
-        "O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG)(A;;FR;;;OW)(A;;0x1f01ff;;;OW)(A;;WD;;;OW)(A;;KA;;;OW)"
-        f"{oa_read}{oa_full}(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
-    )
+    owner_rights = f"(A;;FR;;;OW)(A;;0x1f01ff;;;OW)(A;;WD;;;OW)(A;;KA;;;OW){oa_read}{oa_full}"
+    current = f"O:BAD:PAI(A;;FA;;;WD)(D;;FW;;;BG){owner_rights}(A;ID;FA;;;SY)(D;ID;FA;;;BU)"
     captured = _capture_dacl_writes(monkeypatch, current=current)
     store_mod._secure_file(Path("store.db"))
-    assert captured == [
-        (
-            "store.db",
-            f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID})(A;;FR;;;OW)(A;;WD;;;OW){oa_read}{oa_full}",
-            True,
-        )
-    ]
+    assert captured == [("store.db", f"D:P(D;;FW;;;BG)(A;;FA;;;{_TOKEN_SID}){owner_rights}", True)]
+
+
+@_windows_only
+@pytest.mark.parametrize(
+    ("owner_rights", "carried"),
+    [
+        # A full entry beside a narrowing one: the owner kept FA under `icacls /grant:r`. RED before
+        # the set rule: FA was dropped and WD carried, so the owner was left WD alone.
+        pytest.param("(A;;FA;;;OW)(A;;WD;;;OW)", "(A;;FA;;;OW)(A;;WD;;;OW)", id="full-and-wd"),
+        # An OWNER RIGHTS deny is an OWNER RIGHTS entry too, so the full allow beside it stays.
+        # RED before: the deny was carried and the allow dropped, leaving the owner nothing.
+        pytest.param("(D;;FW;;;OW)(A;;FA;;;OW)", "(A;;FA;;;OW)", id="deny-and-full"),
+        # Every entry holds READ_CONTROL and WRITE_DAC: all are dropped together, and the owner is
+        # left its implicit READ_CONTROL and WRITE_DAC, no more than any of them granted.
+        pytest.param("(A;;FA;;;OW)(A;;0x1f01ff;;;OW)", "", id="all-full-dropped"),
+    ],
+)
+def test_secure_file_decides_the_owner_rights_entries_as_a_set(
+    monkeypatch: pytest.MonkeyPatch, owner_rights: str, carried: str
+) -> None:
+    from pathlib import Path
+
+    import messagefoundry.store.store as store_mod
+
+    captured = _capture_dacl_writes(monkeypatch, current=f"O:BAD:PAI(A;;FA;;;WD){owner_rights}")
+    store_mod._secure_file(Path("store.db"))
+    denies = "(D;;FW;;;OW)" if "(D;" in owner_rights else ""
+    assert captured == [("store.db", f"D:P{denies}(A;;FA;;;{_TOKEN_SID}){carried}", True)]
+
+
+@_windows_only
+def test_secure_file_keeps_a_full_owner_rights_entry_beside_a_narrowing_one(tmp_path) -> None:
+    # The real write. `icacls /grant:r` kept both OWNER RIGHTS entries, so the owner had FA. RED
+    # before the set rule: FA was dropped and WD carried, narrowing the owner to WD.
+    import messagefoundry.store.store as store_mod
+    from tests._win_acl import folder_granting, protected_entries
+
+    sid = store_mod._current_user_sid()
+    assert sid is not None
+    path = folder_granting(tmp_path / "store", sid) / "seeded.db"
+    path.write_bytes(b"x")
+    seeded = store_mod._set_security_from_sddl(
+        path, f"D:P(A;;FA;;;{sid})(A;;FA;;;OW)(A;;WD;;;OW)(A;;FR;;;WD)", protected=True
+    )
+    assert seeded.failure is None and seeded.dacl_status == 0, seeded
+    store_mod._secure_file(path)
+    sddl, _, entries = protected_entries(path)
+    assert entries == [
+        ("A", "", "FA", sid),
+        ("A", "", "FA", "S-1-3-4"),
+        ("A", "", "WD", "S-1-3-4"),
+    ], sddl
 
 
 @_windows_only
