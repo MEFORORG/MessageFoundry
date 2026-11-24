@@ -8949,10 +8949,13 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
       trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
       modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
       that name. ``MEFOR_*`` names are the engine's namespace, so a bare section name is refused
-      even though a tool outside the engine could choose one. Two census tests read the names
-      this repository's own code and deployment files spell; nothing checks the names a tool
-      outside the repository sets. Decided under the owner's delegation of 2026-11-23 (Manager
-      decision d20261123T172418598-d8ffd6, option (c));
+      even though a tool outside the engine could choose one. Two census tests in
+      ``tests/test_settings_env_keys.py`` read the names spelled out as whole string constants in
+      some of this repository's code trees and in its shipped deployment files; they miss a name
+      built at run time and files outside those trees, and no test checks in general the names a
+      tool outside the repository sets. The exact ``MEFOR_<SECTION>`` shape was decided under the
+      owner's delegation of 2026-11-23 (Manager decision d20261123T172418598-d8ffd6, option (c));
+      the trailing ``_`` forms and the every-section scope are this change's reading of it;
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
@@ -8965,7 +8968,9 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     * one that none of the three cases above matches because it names no modelled section
       (``MEFOR_ALLOW_INSECURE_TLS``, the escape honoured only at
       ``[security].enforcement = warn``; a harness variable; another tool's).
-      So a typo in the SECTION part of a name is not refused.
+      So a typo in the SECTION part of a name that leaves it naming no modelled section is not
+      refused; a typo that makes its leading parts another section's name (``MEFOR_AI_HOST`` for
+      ``MEFOR_API_HOST``) is read as that section and refused by the cases above.
       :func:`_unread_env_notes` writes a note, which :func:`load_settings` logs as a WARNING,
       for at least some of those, and the rest are dropped with no message;
     * one in :data:`_OUT_OF_BAND_ENV`, spelled exactly;

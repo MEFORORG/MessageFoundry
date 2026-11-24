@@ -54,13 +54,22 @@
 > tool owns. So it logs a WARNING, naming the variable and never its value, for at least this
 > shape, and the load goes on without the setting:
 >
-> - a name whose first part is close to a section and whose remainder is a real setting of that
->   section, such as `MEFOR_STOER_PATH`. The warning offers the name you probably meant. For a setting one string cannot fill, such
->   as a list of tables or a dict, it names the `[section].key` to set in the file instead.
+> - a name whose first part is close to a section and whose remainder is a real setting of the
+>   closest such section, such as `MEFOR_STOER_PATH`, or the rest of a documented variable read
+>   outside the settings model, such as `MEFOR_STOER_VAULT_ADDR`. The warning offers the name you
+>   probably meant. For a setting one string cannot fill, such as a list of tables or a dict, it
+>   names the `[section].key` to set in the file instead.
 >
-> At least these are still dropped with no message: a name close to no section, and a name with a
-> typo in both parts (`MEFOR_STOER_PATHH`). Nothing checks a key in the CLI layer of
+> At least these are still dropped with no message: a name close to no section, a name with a
+> typo in both parts (`MEFOR_STOER_PATHH`), and a name whose remainder is a setting of a section
+> other than the closest one (`MEFOR_SECURE_REQUIRE_MFA`, where `secure` is closest to
+> `[secrets]`). Nothing checks a key in the CLI layer of
 > `load_settings` either; the `messagefoundry` command builds that layer from its own flags.
+>
+> **A typo that makes the leading parts of a name another real section is read as that section.**
+> `MEFOR_SECRETS_ROTATION_WARN_DAYS`, typed for `MEFOR_SECRET_ROTATION_WARN_DAYS`, is refused as an
+> unknown `[secrets]` key, and the refusal does not point toward `[secret_rotation]`.
+> `MEFOR_AI_HOST`, typed for `MEFOR_API_HOST`, is refused as an unknown `[ai]` key.
 >
 > **A secret reference names a variable of your choosing, and that variable is spared.** Under
 > `[secrets].provider = "env"`, spelled exactly so, the value of a reference setting is the name

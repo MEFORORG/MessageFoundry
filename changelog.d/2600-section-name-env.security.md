@@ -4,10 +4,6 @@
   message at all. The refusal names the variable, never its value. For a section with an
   environment layer it says how a setting in that section is spelled (`MEFOR_STORE_<KEY>`); for a
   section with none, such as `[update_check]`, it says to set the section in the file. The WARNING
-  is still logged first, so a refused file key does not hide it. A name whose first part is close
-  to a section, and is no section itself, is not refused. It is warned about when the rest of the
-  name is a real setting of that section, such as `MEFOR_STOER_PATH`, or the rest of a documented
-  variable read outside the settings model, such as `MEFOR_STOER_VAULT_ADDR`; `MEFOR_STOER_PATHH`
-  and `MEFOR_STOER` are still dropped with no message. A name whose first part is itself a section
-  is read as that section, so `MEFOR_SECRETS_ROTATION_WARN_DAYS` is refused as an unknown
-  `[secrets]` key, and the refusal does not point toward `[secret_rotation]`. (`BACKLOG #2600`)
+  is still logged first, so a refused file key does not hide it. This change refuses no other new
+  name. Which names with a typo in the section part are warned about, refused as another section,
+  or dropped with no message is in `docs/CONFIGURATION.md`. (`BACKLOG #2600`)
