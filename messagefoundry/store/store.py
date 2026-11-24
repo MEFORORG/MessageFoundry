@@ -2199,35 +2199,14 @@ def _forced_outcome(
     left: str = "may still be open",
 ) -> str:
     """What a forced release left, for the log line that follows it (BACKLOG #5720). ``built``
-    names what was to be released, and ``left`` what follows when nothing released it."""
+    names what was to be released, and ``left`` what follows when nothing released it. A release
+    that ran is not said to have released everything: on SQL Server it only marks the pool
+    closing, and on SQLite a statement that ignores the interrupt keeps its worker running."""
     if released:
-        return f"{built} was released without waiting for it"
+        return f"a forced release of {built} ran without waiting for it"
     if force_release is None:
         return f"{built} {left}"
     return f"forcing its release failed, so {built} {left}"
-
-
-async def close_or_force(
-    close: Callable[[], Awaitable[None]], force_release: Callable[[], object], *, what: str
-) -> None:
-    """Await ``close``. When it ends by raising, a cancel included, call ``force_release`` without
-    waiting, then re-raise (BACKLOG #5720). A WARNING names ``what``, the class that cut the
-    close short, and whether ``force_release`` returned; a ``force_release`` that raises is logged
-    by class too. Neither line says that nothing stays open."""
-    try:
-        await close()
-    except BaseException as exc:
-        ran = _force_failed_open_release(force_release, after=what)
-        log.warning(
-            "%s (%s); %s",
-            what,
-            type(exc).__name__,
-            "a forced release ran without waiting for it"
-            if ran
-            else "the forced release raised or reported a failed step, so what it held may "
-            "still be open",
-        )
-        raise
 
 
 def _read_stop_outcome(future: asyncio.Future[Any]) -> None:

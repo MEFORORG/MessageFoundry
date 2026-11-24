@@ -2002,8 +2002,8 @@ async def test_a_cleanup_that_ends_cancelled_is_logged_as_released(caplog) -> No
     )
     assert "may not have been released" not in caplog.text
     assert (
-        "a failed store open's cleanup ended cancelled before it finished; what it had not "
-        "closed was released without waiting for it" in caplog.text
+        "a failed store open's cleanup ended cancelled before it finished; a forced release of "
+        "what it had not closed ran without waiting for it" in caplog.text
     )
     assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
@@ -2160,8 +2160,8 @@ async def test_a_cleanup_that_fails_is_still_logged_at_error(caplog) -> None:
         if r.levelname == "ERROR" and r.name == "messagefoundry.store.store"
     ]
     assert errors == [
-        "a failed store open's cleanup failed (OSError); what it had not closed was released "
-        "without waiting for it"
+        "a failed store open's cleanup failed (OSError); a forced release of what it had not "
+        "closed ran without waiting for it"
     ]
     assert "/secret/path" not in caplog.text
 

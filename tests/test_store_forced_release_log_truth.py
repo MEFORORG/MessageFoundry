@@ -57,7 +57,7 @@ async def test_a_bound_cleanup_whose_forced_release_failed_does_not_say_it_relea
                 await asyncio.sleep(0)
     assert "did not finish within 0.05 s of a cancel" in caplog.text
     assert "forcing the release after a failed store open also failed (OSError)" in caplog.text
-    assert "released without waiting" not in caplog.text
+    assert "ran without waiting" not in caplog.text
     assert "forcing its release failed" in caplog.text
 
 
@@ -74,7 +74,7 @@ async def test_a_failed_cleanup_whose_forced_release_failed_does_not_say_it_rele
             ValueError("open failed"), failing_release, _raising_force, cancels_before=0
         )
     assert "a failed store open's cleanup failed (RuntimeError)" in caplog.text
-    assert "released without waiting" not in caplog.text
+    assert "ran without waiting" not in caplog.text
     assert "forcing its release failed, so what it had not closed may still be open" in (
         caplog.text
     )
@@ -98,7 +98,8 @@ async def test_a_cleanup_whose_forced_release_worked_still_says_so(
             cancels_before=0,
         )
     assert released == ["forced"]
-    assert "what it had not closed was released without waiting for it" in caplog.text
+    assert "a forced release of what it had not closed ran without waiting for it" in caplog.text
+    assert "was released" not in caplog.text  # finding 5a: a release that ran is not "released"
 
 
 def _warnings_from_the_bound(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
