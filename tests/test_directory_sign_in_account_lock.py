@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import sqlite3
 import time
 import uuid
@@ -36,7 +37,11 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.store import sign_in_state_refused
+from messagefoundry.store.store import (
+    SESSION_MINT_BUSY,
+    SESSION_MINT_EPOCH_RAISED,
+    sign_in_state_refused,
+)
 
 OPS = "cn=mf-ops,dc=x"
 VIEW = "cn=mf-view,dc=x"
@@ -449,24 +454,107 @@ async def test_a_busy_begin_runs_the_insert_again(
     assert len(opened) == 3
 
 
-async def test_a_busy_that_outlasts_the_bound_refuses_the_sign_in(
+def _epoch_raised_on_every_seal(monkeypatch: pytest.MonkeyPatch, store: Any, user_id: str) -> None:
+    """Make a revoke raise the account's session epoch after every seal, so each of the insert's
+    bounded attempts finds the epoch it sealed over moved (BACKLOG #5653)."""
+    from messagefoundry.store import store as store_module
+    from messagefoundry.store.store import no_audit_row
+
+    real_seal = store_module.seal_session_async
+
+    async def seal_then_revoke(sealer: Any, record: Any) -> Any:
+        sealed = await real_seal(sealer, record)
+        await store.revoke_user_sessions(user_id, audit=no_audit_row)
+        return sealed
+
+    monkeypatch.setattr(store_module, "seal_session_async", seal_then_revoke)
+
+
+async def _failed_rows(engine: Engine) -> list[dict[str, Any]]:
+    return [
+        json.loads(r["detail"] or "{}")
+        for r in await engine.store.list_audit(action="auth.login_failed")
+    ]
+
+
+async def test_a_busy_that_outlasts_the_bound_is_contention_not_a_refusal(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Item B: a busy past the bound is a refused sign-in, not an ``OperationalError`` escaping
-    ``_complete_ad_login`` after its role and profile writes, and no session is minted."""
-    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS
+    """Item B, as the Manager decided it: a busy past the bound raises
+    :class:`SessionMintContended`, never ``False``, which would read as the account refusing the
+    session. RED on the head that returned ``False`` here."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS, SESSION_MINT_BUSY
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    opened = _busy_begin_immediate(monkeypatch, 10_000)
+    with pytest.raises(SessionMintContended) as contended:
+        await _mint(engine, user_id, eligible=True)
+    assert contended.value.cause == SESSION_MINT_BUSY
+    assert contended.value.attempts == SESSION_MINT_ATTEMPTS
+    assert len(opened) == SESSION_MINT_ATTEMPTS
+
+
+async def test_an_epoch_raised_on_every_attempt_is_contention_not_a_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The epoch half of the same decision, on SQLite, guarded or not. RED on the head that
+    returned ``False`` once the epoch retries ran out."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS, SESSION_MINT_EPOCH_RAISED
+
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    _epoch_raised_on_every_seal(monkeypatch, engine.store, user_id)
+    for eligible in (True, False):
+        with pytest.raises(SessionMintContended) as contended:
+            await _mint(engine, user_id, eligible=eligible)
+        assert contended.value.cause == SESSION_MINT_EPOCH_RAISED
+        assert contended.value.attempts == SESSION_MINT_ATTEMPTS
+    assert await _live_sessions(engine, user_id) == set()
+
+
+@pytest.mark.parametrize("cause", [SESSION_MINT_BUSY, SESSION_MINT_EPOCH_RAISED])
+async def test_a_contended_directory_insert_is_not_audited_as_a_binding_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, cause: str
+) -> None:
+    """A directory sign-in whose insert met contention on every attempt fails as a temporary
+    failure under its own audit reason. RED on the head that audited it as
+    ``federated_sign_in_required`` and answered ``invalid credentials``."""
+    from messagefoundry.auth.service import (
+        ACCOUNT_DELETED,
+        FEDERATED_SIGN_IN_REQUIRED,
+        SESSION_MINT_CONTENDED,
+    )
 
     service = await _service(engine)
     assert (await _sign_in(service, _principal())).ok
     user_id = await _user_id(engine)
     before = await _live_sessions(engine, user_id)
-    opened = _busy_begin_immediate(monkeypatch, 10_000)
-    assert await _mint(engine, user_id, eligible=True) is False
-    assert len(opened) == SESSION_MINT_ATTEMPTS
+    if cause == SESSION_MINT_BUSY:
+        _busy_begin_immediate(monkeypatch, 10_000)
+    else:
+        _epoch_raised_on_every_seal(monkeypatch, engine.store, user_id)
+
     out = await _sign_in(service, _principal())
-    assert not out.ok
-    assert out.token is None
+
+    assert not out.ok and out.token is None
+    assert out.reason == SESSION_MINT_CONTENDED
+    assert out.error != "invalid credentials"
     assert await _live_sessions(engine, user_id) <= before
+    rows = await _failed_rows(engine)
+    assert [r for r in rows if r.get("reason") == SESSION_MINT_CONTENDED] == [
+        {"provider": "ad", "reason": SESSION_MINT_CONTENDED, "contention": cause}
+    ]
+    assert not [
+        r
+        for r in rows
+        if r.get("reason")
+        in {FEDERATED_SIGN_IN_REQUIRED, "federated_subject_unbound", ACCOUNT_DELETED}
+    ]
 
 
 async def test_an_error_that_is_not_busy_is_raised_at_once(

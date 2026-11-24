@@ -2993,12 +2993,40 @@ class AdminGrant(StrEnum):
 _ADMIN_GRANT_BUSY_ATTEMPTS: Final = 5
 _ADMIN_GRANT_BUSY_BACKOFF_SECONDS: Final = 0.05
 
-#: How many times ``create_session`` runs on every backend before it refuses: once per seal over
+#: How many times ``create_session`` runs on every backend before it gives up: once per seal over
 #: the session epochs it read, made again when a revoke raised one before the insert's locked read,
 #: and on SQLite also once per busy ``BEGIN IMMEDIATE`` (BACKLOG #5653), which backs off as the
-#: first-administrator grant does. Both are rare, so a bound that is reached refuses the sign-in
-#: rather than spin.
+#: first-administrator grant does. Both are rare, so a bound that is reached raises
+#: :class:`SessionMintContended` rather than spin; it is not a refusal, so it is never ``False``.
 SESSION_MINT_ATTEMPTS: Final = _ADMIN_GRANT_BUSY_ATTEMPTS
+
+#: The ``cause`` of a :class:`SessionMintContended` when SQLite answered busy to every
+#: ``BEGIN IMMEDIATE`` the insert ran (BACKLOG #5653).
+SESSION_MINT_BUSY: Final = "busy"
+#: The ``cause`` of a :class:`SessionMintContended` when a revoke raised a session epoch the seal
+#: covers before every locked read the insert ran (BACKLOG #5653).
+SESSION_MINT_EPOCH_RAISED: Final = "session_epoch_raised"
+
+
+class SessionMintContended(RuntimeError):
+    """:meth:`~messagefoundry.store.base.AuthStore.create_session` ran its bounded attempts and
+    wrote nothing, because each one met contention rather than a refusal (BACKLOG #5653).
+    ``cause`` is :data:`SESSION_MINT_BUSY` or :data:`SESSION_MINT_EPOCH_RAISED`; ``attempts`` is
+    how many ran. Exported from :mod:`messagefoundry.store`.
+
+    **Raised, never returned as ``False``.** ``False`` means the account itself refused the
+    session (gone, disabled, locked, or its binding changed), and a caller renders it as that
+    refusal. Contention says nothing about the account, so a sign-in that meets it fails as a
+    temporary server-side failure and is audited under its own reason. The message is numeric and
+    PHI-free."""
+
+    def __init__(self, cause: str, attempts: int) -> None:
+        super().__init__(cause, attempts)
+        self.cause = cause
+        self.attempts = attempts
+
+    def __str__(self) -> str:
+        return f"session insert contended ({self.cause}) after {self.attempts} attempts"
 
 
 def _is_sqlite_busy(exc: sqlite3.OperationalError) -> bool:
@@ -22098,13 +22126,13 @@ class MessageStore:
                 if not require_sign_in_eligible or not _is_sqlite_busy(exc):
                     raise
                 if attempt == SESSION_MINT_ATTEMPTS:
-                    # A refusal, not an error: the directory sign-in that asked has already written
-                    # its roles and profile, and it reports a refused insert as a refused sign-in.
+                    # Contention, not a refusal: ``False`` would tell the caller the account refused
+                    # the session. The directory sign-in that asked has already written its roles
+                    # and profile, so it fails as a temporary failure rather than see this escape.
                     log.warning(
-                        "sqlite: a session insert met a busy database %d times; refusing it",
-                        attempt,
+                        "sqlite: a session insert met a busy database %d times; giving up", attempt
                     )
-                    return False
+                    raise SessionMintContended(SESSION_MINT_BUSY, attempt) from exc
                 log.info(
                     "sqlite: a session insert met a busy database (attempt %d of %d);"
                     " running it again",
@@ -22116,10 +22144,10 @@ class MessageStore:
             if inserted is not None:
                 return inserted
         log.warning(
-            "sqlite: a session insert found the session epochs raised %d times; refusing it",
+            "sqlite: a session insert found the session epochs raised %d times; giving up",
             SESSION_MINT_ATTEMPTS,
         )
-        return False
+        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
 
     async def _session_epochs_unlocked(self, user_id: str) -> tuple[int, int] | None:
         """The account's session epoch and the store's global one, read on a reader connection

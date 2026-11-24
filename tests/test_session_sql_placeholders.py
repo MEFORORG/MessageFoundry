@@ -655,3 +655,36 @@ async def test_create_session_seals_before_its_locked_read(
     )
     assert statements.count(_SEAL_MARK) == 1
     assert seal < locked < insert, statements
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "postgres"])
+@pytest.mark.parametrize("guarded", [False, True])
+async def test_create_session_raises_on_an_epoch_raised_on_every_attempt(
+    monkeypatch: pytest.MonkeyPatch, backend: str, guarded: bool
+) -> None:
+    """BACKLOG #5653: when every locked read finds a session epoch above the one the seal covers,
+    each server backend raises ``SessionMintContended``, never ``False``, which reads as the
+    account refusing the session, and writes no INSERT. The unlocked read is answered with an
+    epoch one below the locked read's, as a revoke between the two would leave it. RED on the head
+    that returned ``False``."""
+    from messagefoundry.store import SessionMintContended
+    from messagefoundry.store.store import SESSION_MINT_ATTEMPTS, SESSION_MINT_EPOCH_RAISED
+
+    monkeypatch.setitem(globals(), "_ACCOUNT_ROW", (None, None, 1, 0, None, None))
+    monkeypatch.setitem(globals(), "_epoch_row", lambda: (0, 0))
+    seen: list[tuple[str, tuple[Any, ...]]] = []
+    store = _mssql_store(seen) if backend == "sqlserver" else _pg_store(seen)
+    with pytest.raises(SessionMintContended) as contended:
+        await store.create_session(
+            token_hash=_HASH,
+            user_id="u",
+            expires_at=_NOW + 60,
+            now=_NOW,
+            auth_mechanism="kerberos",
+            require_federated_subject=(None, None) if guarded else None,
+            require_sign_in_eligible=guarded,
+        )
+    assert contended.value.cause == SESSION_MINT_EPOCH_RAISED
+    assert contended.value.attempts == SESSION_MINT_ATTEMPTS
+    assert not [sql for sql, _ in seen if sql.lstrip().startswith("INSERT INTO sessions")]
+    assert sum(sql.startswith(_EPOCH_READ) for sql, _ in seen) == SESSION_MINT_ATTEMPTS

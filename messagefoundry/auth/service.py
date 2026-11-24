@@ -217,6 +217,7 @@ from messagefoundry.store.store import (
     PendingFactorAnchor,
     RevokeResult,
     RoleRow,
+    SessionMintContended,
     SessionRecord,
     TotpState,
     UnknownRoleError,
@@ -1213,6 +1214,18 @@ DIRECTORY_LOCKED = "locked"
 #: this sign-in's directory-derived one (vault BACKLOG #3085). The sign-in is refused, not the role
 #: write: whatever the other writer left stands, and nothing is written over it.
 ROLE_SYNC_CONTENDED = "role_sync_contended"
+
+#: The closed-set reason a sign-in fails with when its session insert met contention on every
+#: bounded attempt, a busy SQLite database or a session epoch a revoke kept raising, and wrote
+#: nothing (BACKLOG #5653; :class:`~messagefoundry.store.SessionMintContended`). The account did
+#: not refuse it, so it is neither an invalid credential nor a binding or eligibility refusal:
+#: the credential was proved, and the caller may try again. The row's ``contention`` field names
+#: which cause. Absent from the browser layer's code map, so it shows as generic there.
+SESSION_MINT_CONTENDED = "session_mint_contended"
+
+#: ``LoginOutcome.error`` for a sign-in that failed on :data:`SESSION_MINT_CONTENDED`: a temporary
+#: server-side failure, never ``invalid credentials``.
+_SIGN_IN_UNAVAILABLE = "sign-in temporarily unavailable"
 
 #: The code that opens :class:`FederatedBindingChanged`'s message (BACKLOG #2026), so a caller can
 #: tell that refusal from the other 409 on the federated-identity routes without matching prose.
@@ -2529,12 +2542,15 @@ async def _write_through_cancellation(
     task.result()
 
 
-def _local_refusal_detail(reason: str, *, combined: bool) -> str:
+def _local_refusal_detail(
+    reason: str, *, combined: bool, extra: Mapping[str, object] | None = None
+) -> str:
     """The ``auth.login_failed`` detail of a refused local credential sign-in (BACKLOG #1131).
 
     The one builder for both the verified refusal and the refusal by a lock, so the row a reader
-    without ``users:manage`` sees cannot differ between them by a key, a value or their order."""
-    detail: dict[str, Any] = {"provider": "local", "reason": reason}
+    without ``users:manage`` sees cannot differ between them by a key, a value or their order.
+    ``extra`` adds fields only a contended insert writes (BACKLOG #5653); the others pass none."""
+    detail: dict[str, Any] = {**(extra or {}), "provider": "local", "reason": reason}
     if combined:
         detail["combined"] = True
     return _json(detail)
@@ -6539,6 +6555,24 @@ class AuthService:
             # minted. The answer, and its deferred row, are an unknown account's.
             await later(unknown_row)
             return LoginOutcome(ok=False, error="invalid credentials")
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt and wrote nothing. The
+            # password was right and the account is there, so this is neither an unknown account
+            # nor a wrong credential, and nothing is charged to the lockout.
+            cause = contended.cause
+
+            async def contended_row() -> None:
+                await self._audit(
+                    "auth.login_failed",
+                    actor=username,
+                    detail=_local_refusal_detail(
+                        SESSION_MINT_CONTENDED, combined=combined, extra={"contention": cause}
+                    ),
+                    client=client,
+                )
+
+            await later(contended_row)
+            return LoginOutcome(ok=False, error=_SIGN_IN_UNAVAILABLE, reason=SESSION_MINT_CONTENDED)
         await self._record_login_address(
             address, user, client=client, provider="local", mechanism=None
         )
@@ -8934,6 +8968,29 @@ class AuthService:
                 reason=reason,
                 roles_gained=roles_gained,
             )
+        except SessionMintContended as contended:
+            # BACKLOG #5653: the insert met contention on every attempt (a busy SQLite database, or
+            # a session epoch a revoke kept raising) and wrote nothing. That says nothing about the
+            # account or its binding, so it is audited under its own reason, never as a binding or
+            # eligibility refusal. The role and profile sync above already ran, as on a refusal.
+            contended_extra = {**(outcome_extra or {}), "contention": contended.cause}
+            if federated:
+                await self._directory_reject_audit(
+                    principal.username,
+                    "oidc",
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+                refused = LoginOutcome(ok=False, reason=SESSION_MINT_CONTENDED)
+            else:
+                refused = await self._refuse_directory_row(
+                    principal.username,
+                    SESSION_MINT_CONTENDED,
+                    client=client,
+                    extra=contended_extra,
+                )
+            return replace(refused, error=_SIGN_IN_UNAVAILABLE, roles_gained=roles_gained)
         # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
         # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
         # Only the federated path passes mech/evidence/outcome_extra, so it alone grows the row.
@@ -12474,7 +12531,10 @@ class AuthService:
         require_sign_in_eligible: bool = False,
     ) -> str:
         """Mint a session token and persist the row. Every caller must handle
-        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too.
+        :class:`_BindingChangedMidLogin`, raised for an account deleted under the sign-in too, and
+        :class:`~messagefoundry.store.SessionMintContended`, which the store raises when its insert
+        met contention on every attempt (BACKLOG #5653). That one is not a refusal: the caller
+        fails the sign-in as a temporary failure under :data:`SESSION_MINT_CONTENDED`.
 
         ``supersedes_hash`` names the session this sign-in REPLACES in the caller's browser (ASVS
         7.2.4, login side). It is ended after the new

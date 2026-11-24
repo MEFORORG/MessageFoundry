@@ -255,6 +255,7 @@ from messagefoundry.store.store import (
     REINGRESS_TARGET_PREFIX,
     REINGRESS_TOKEN_TAG_FAILED,
     SESSION_MINT_ATTEMPTS,
+    SESSION_MINT_EPOCH_RAISED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -320,6 +321,7 @@ from messagefoundry.store.store import (
     RoleGrant,
     RoleRow,
     SecretRotationMetaRow,
+    SessionMintContended,
     SessionRecord,
     SignCountAnswer,
     Stage,
@@ -12057,10 +12059,10 @@ class PostgresStore:
             if inserted is not None:
                 return inserted
         log.warning(
-            "postgres: a session insert found the session epochs raised %d times; refusing it",
+            "postgres: a session insert found the session epochs raised %d times; giving up",
             SESSION_MINT_ATTEMPTS,
         )
-        return False
+        raise SessionMintContended(SESSION_MINT_EPOCH_RAISED, SESSION_MINT_ATTEMPTS)
 
     async def _insert_sealed_session(
         self,
