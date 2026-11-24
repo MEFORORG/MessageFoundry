@@ -1939,6 +1939,21 @@ async def test_the_listing_scan_lstats_each_sidecar_once_before_its_open(
     assert len(calls) == (1 if uploads_mod._O_NOFOLLOW else 2), calls
 
 
+def test_a_refusal_before_open_survives_a_copy_and_a_pickle() -> None:
+    """BACKLOG #5552 item 8, review finding: the scan's refusal carries its reason, and a copy or
+    unpickle, which calls the class with ``args`` alone, must rebuild it rather than raise."""
+    import copy
+    import pickle
+
+    from messagefoundry.uploads import _RefusedBeforeOpen
+
+    exc = _RefusedBeforeOpen("x.meta is not a plain file", "it is not a regular file")
+    for again in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):
+        assert isinstance(again, _RefusedBeforeOpen)
+        assert again.reason == "it is not a regular file"
+        assert str(again) == str(exc)
+
+
 async def test_a_sidecar_that_is_not_read_is_logged_once_per_interval(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

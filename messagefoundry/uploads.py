@@ -287,9 +287,13 @@ class _OncePerInterval:
         return True
 
 
-#: Upload ids whose sidecar tag failure was reported (BACKLOG #5553). One memo for the process,
-#: whichever cipher instance reported.
+#: The ``"<part> <upload id>"`` keys of the sidecar and body tag failures reported (BACKLOG #5553,
+#: #5552 item 6 (a)), so one upload can hold two entries. One memo for the process, whichever
+#: cipher instance reported.
 _tag_reported = _OncePerInterval()
+
+#: The parts of an upload whose tag failure is reported, as the alert names them.
+_TaggedPart = Literal["sidecar", "body"]
 
 
 def _not_a_plain_file(path: Path) -> str | None:
@@ -392,10 +396,11 @@ class _NotPlainError(OSError):
 class _RefusedBeforeOpen(_NotPlainError):
     """A :class:`_NotPlainError` raised by :func:`_open_plain`'s own ``lstat``, before any open:
     ``reason`` is :func:`_plain_refusal`'s. The listing scan reads it rather than making that
-    ``lstat`` itself (BACKLOG #5552 item 8)."""
+    ``lstat`` itself (BACKLOG #5552 item 8). ``reason`` defaults, and lives in the instance dict,
+    so a copy or unpickle, which calls the class with ``args`` alone, rebuilds it."""
 
-    def __init__(self, path: Path, reason: str) -> None:
-        super().__init__(f"{path.name} is not a plain file")
+    def __init__(self, message: str, reason: str = "") -> None:
+        super().__init__(message)
         self.reason = reason
 
 
@@ -437,7 +442,7 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
     refused = _plain_refusal(before)
     if refused is not None:
-        raise _RefusedBeforeOpen(path, refused)
+        raise _RefusedBeforeOpen(f"{path.name} is not a plain file", refused)
     met: tuple[_Recheck, str] | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
@@ -969,7 +974,7 @@ def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
 
 def _refuse_unplain(file_id: str, part: str, path: Path) -> None:
     """Raise the damaged refusal when ``path`` is not a plain file (:func:`_not_a_plain_file`),
-    the check the listing scan makes (BACKLOG #5552), so a by-id read does not open a directory,
+    the test the listing scan meets through :func:`_open_plain`'s own ``lstat`` (BACKLOG #5552), so a by-id read does not open a directory,
     which answered a server error, or a FIFO, which blocked a worker thread for good, that is in
     place when it looks. It guards against what is on disk then, not against a writer racing it.
     The reads that follow open through :func:`_open_plain`, which refuses a file swapped in after
@@ -1913,8 +1918,9 @@ class UploadStore:
         **A sidecar that is a link, or is not a regular file, is not read (BACKLOG #5552).** It is
         skipped, and its log line is rate-limited per upload: a followed link read a file outside
         the root, or another upload's sidecar, and a FIFO would block the scan, and the
-        ``_quota_lock`` a save holds over it, for good. One swapped in between that check and the
-        open is refused at the open (:func:`_read_plain_text`), and no read takes more than
+        ``_quota_lock`` a save holds over it, for good. The check is the open's own ``lstat``
+        (:class:`_RefusedBeforeOpen`); one swapped in between it and the open is refused at the
+        open (:func:`_read_plain_text`) and logged as unreadable, and no read takes more than
         :data:`_SIDECAR_LIMIT` bytes, so a planted oversized sidecar cannot exhaust memory under
         that lock either; it is refused as malformed (BACKLOG #5387 added item 1)."""
         out: list[UploadedFileMeta] = []
@@ -1996,7 +2002,7 @@ class UploadStore:
         return out
 
     def _report_tag_failure(
-        self, fid: str, stored: str, exc: CipherError, part: str = "sidecar"
+        self, fid: str, stored: str, exc: CipherError, part: _TaggedPart = "sidecar"
     ) -> None:
         """Raise the cipher's tag-failure alert for upload ``fid``'s ``part``, its sidecar or its
         body, when ``exc`` is that part's AEAD tag failing under a key the cipher holds, once per
@@ -2005,8 +2011,9 @@ class UploadStore:
         ``_tag_failure_kind``, inlined because that module imports beyond this leaf's set: a verdict was given, a cipher that names
         its keys holds the one the marker names, and one that cannot (Vault Transit) declares that
         its refusal is the value's own tag. The reason names a prefix of the upload id, as
-        ``cell_tag`` names a row: the id is random and carries no PHI, and the WARNING the scan logs
-        beside it names the whole id."""
+        ``cell_tag`` names a row: the id is random and carries no PHI. For a sidecar, the WARNING
+        the scan logs beside it names the whole id; a body's refusal by :meth:`read_bytes` logs no
+        line of its own."""
         cipher = self._cipher
         report = getattr(cipher, "report_tag_failure", None)
         # A report with no hook armed goes nowhere, so it must not use up the upload's slot: a hook
@@ -3170,6 +3177,9 @@ class UploadStore:
             except (UnicodeError, binascii.Error) as exc:
                 # Not UTF-8, not ASCII, or not the strict base64 the body is stored as.
                 defect = codec_safe_str(exc)
+            # The refusal raised below holds this frame on its traceback, so the stored body is
+            # let go first.
+            stored = ""
             if unreached is not None:
                 raise _unreachable(file_id, unreached)
             raise _refusal(file_id, "body", defect, kind)
