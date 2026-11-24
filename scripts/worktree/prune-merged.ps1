@@ -655,20 +655,9 @@ function ConvertTo-OccupantRows([object[]]$Rows) {
         })
 }
 
-# Session records placed in $Path, or in a tree nested in it, whose state does not veto. Removing the
-# tree would strand them: their cwd would name a missing `<primary>-<slug>` checkout, which
-# Get-UnplaceableCwdReason faults whatever the record's liveness, and one fault refuses the whole run.
-function Get-StrandableRecords {
-    param([object]$Occupancy, [string]$Path)
-    $norm = ConvertTo-Norm $Path
-    return @($Occupancy.Sessions | Where-Object {
-            $wt = ConvertTo-Norm $_.WorktreePath
-            (-not (Test-OccupancyVeto $_.State)) -and ($wt -eq $norm -or $wt.StartsWith("$norm/"))
-        })
-}
-
+# Get-StrandableRecords, which finds these rows, is in worktree-gates.ps1, shared with hygiene-report.ps1.
 function Format-StrandableRecords([object[]]$Rows) {
-    $who = ($Rows | ForEach-Object { "$($_.Short) [$($_.State)] pid $($_.Pid) in $($_.Root)" }) -join ', '
+    $who = ($Rows | ForEach-Object { "$($_.Short) [$($_.State)] pid $($_.Pid) under $(Join-Path $_.Root 'sessions')" }) -join ', '
     return "holds $($Rows.Count) session record(s) that read as ended: $who -- removing this tree would leave a record the fence cannot place, and every later run would refuse. Nothing here can prove the session ended, so the record and the tree are both left for a person to check"
 }
 
@@ -1672,23 +1661,21 @@ if ($Apply -and $prunable.Count -gt 0) {
         # threw on an unreadable leftover, which ended the run after git had deregistered the tree.
         # No -Plain: a sibling may sit under a linked folder, as Get-LiveOrphans says.
         $endState = Get-EndStatePresence $d.Path -RequireParent
-        $dirExists = $endState -ne 'absent'
         $endUnknown = $endState.StartsWith('unknown: ')
         $ptrState = 'unreadable'
         if ($endState -eq 'present') {
             try { $ptrState = if (Test-PresentOrThrow (Join-Path $d.Path '.git') 'the .git pointer') { 'intact' } else { 'DELETED' } }
             catch { $ptrState = 'unreadable' }
         }
-        $ptrExists = $ptrState -eq 'intact'
         if ($endUnknown) {
-            $notGone = "the directory is not confirmed gone: $($endState.Substring('unknown: '.Length))"
+            $notGone = "the directory is not confirmed gone: $($endState -replace '^unknown: ')"
             $err = if ($err) { "$err; $notGone" } else { $notGone }
         }
         $stillRegistered = @(Get-RepoWorktrees $RepoRoot | Where-Object { (ConvertTo-Norm $_.Path) -eq (ConvertTo-Norm $d.Path) }).Count -gt 0
 
         # OUTCOME, NOT EXIT CODE. Exit 0 is git's claim; the directory being gone and deregistered is
         # the fact. Only the fact is counted as removed.
-        if ($removeExit -eq 0 -and -not $dirExists -and -not $stillRegistered) {
+        if ($removeExit -eq 0 -and $endState -eq 'absent' -and -not $stillRegistered) {
             $removed++
             $d.Outcome = 'removed'
             # Only here. This is the branch that has PROVEN the directory is gone and deregistered, so it
@@ -1737,7 +1724,7 @@ if ($Apply -and $prunable.Count -gt 0) {
             $d.BranchOutcome = 'kept'
             $d.BranchDetail = 'the removal could not be verified, so the branch was left alone'
             $branchesKept++
-            $d.OutcomeDetail = "git reported success but the directory $(if ($dirExists) { 'still exists' } else { 'is gone' }) and it is $(if ($stillRegistered) { 'STILL REGISTERED' } else { 'deregistered' }); branch '$($d.Branch)' was left alone"
+            $d.OutcomeDetail = "git reported success but the directory $(if ($endState -eq 'present') { 'still exists' } else { 'is gone' }) and it is $(if ($stillRegistered) { 'STILL REGISTERED' } else { 'deregistered' }); branch '$($d.Branch)' was left alone"
             Write-Note "  FAILED: $($d.OutcomeDetail)" 'Red'
         }
         else {
@@ -1756,13 +1743,13 @@ if ($Apply -and $prunable.Count -gt 0) {
             }
             $fileText = if ($endUnknown) { 'an unknown number of' } elseif ($fileCount -gt 500) { '500+' } else { "$fileCount" }
 
-            if (-not $dirExists) {
+            if ($endState -eq 'absent') {
                 $d.Outcome = 'failed'
                 $d.OutcomeDetail = "git exited $removeExit ($err) but the directory is gone; branch '$($d.Branch)' was left alone"
                 Write-Note "  FAILED (exit $removeExit): $err" 'Red'
                 Write-Note "  The directory is gone but git reported an error, so the branch was NOT deleted." 'Yellow'
             }
-            elseif (-not $ptrExists -or -not $stillRegistered) {
+            elseif ($ptrState -ne 'intact' -or -not $stillRegistered) {
                 $orphaned++
                 Set-Exit $EXIT_ORPHANED
                 $d.Outcome = 'orphaned'
@@ -1776,7 +1763,7 @@ if ($Apply -and $prunable.Count -gt 0) {
                 Write-Note "    .git pointer:   $(switch ($ptrState) { 'intact' { 'intact' } 'unreadable' { 'could not be read' } default { 'DELETED -- git no longer recognises this directory' } })" 'Red'
                 Write-Note "    registration:   $(if ($stillRegistered) { 'still listed by git worktree list' } else { 'DEREGISTERED' })" 'Red'
                 Write-Note "    Any session working there will now see 'fatal: not a git repository'." 'Red'
-                if ($ptrExists) {
+                if ($ptrState -eq 'intact') {
                     Write-Note "    Try 'git -C ""$RepoRoot"" worktree repair ""$($d.Path)""' FIRST -- the .git file survived, so" 'Red'
                     Write-Note "    the registration may be re-creatable in place. If that fails, use the move-aside recipe:" 'Red'
                 }

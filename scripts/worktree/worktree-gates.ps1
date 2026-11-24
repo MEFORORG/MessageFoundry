@@ -23,7 +23,7 @@
     them too), Get-FlaggedFiles,
     $CACHE_DATA_NAME_PATTERN, $MYPY_CACHE_DB_PATTERN, Test-MypyCacheFile, Get-NestedHazard,
     Get-InProgressOperation, Get-UnsafeIgnoredEntries, Test-PlainDirectory, Test-PlainDirectoryItem,
-    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Get-EndStatePresence, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
+    Get-ItemOrThrow, Test-ConfirmedGoneOrThrow, Get-EndStatePresence, Get-StrandableRecords, Test-PlainFile, Test-PlainFileItem, $GIT_REDIRECT_NAMES, Assert-NoGitRedirect,
     $GIT_CONFIG_CARRIER_PATTERN, Get-GitConfigCarriers, $SEAT_LOCAL_REL, $SCAN_TOKENS_REL and
     Test-SameAsPrimaryCopy.
 #>
@@ -520,6 +520,19 @@ function Get-EndStatePresence([string]$Path, [switch]$Plain, [switch]$RequirePar
         }
         Start-Sleep -Milliseconds $WaitMs
     }
+}
+
+# Session records placed in $Path, or in a tree nested in it, whose state does not veto. Removing a
+# `<primary>-<slug>` tree would strand them: their cwd would name a missing checkout, which
+# Get-UnplaceableCwdReason faults whatever the record's liveness, and one fault makes the fence
+# unavailable. The caller must have dot-sourced occupancy.ps1.
+function Get-StrandableRecords {
+    param([object]$Occupancy, [string]$Path)
+    $norm = ConvertTo-Norm $Path
+    return @($Occupancy.Sessions | Where-Object {
+            $wt = ConvertTo-Norm $_.WorktreePath
+            (-not (Test-OccupancyVeto $_.State)) -and ($wt -eq $norm -or $wt.StartsWith("$norm/"))
+        })
 }
 
 # Which worktrees hold a coordination claim, across every claims directory given. UNREADABLE IS NOT

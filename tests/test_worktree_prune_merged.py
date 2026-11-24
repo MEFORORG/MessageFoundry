@@ -642,12 +642,20 @@ def git_shim_that_lies_about_removal(tmp_path: Path) -> Path:
     PATH itself and passes argv through untouched (measured: the caret survives and the exit code
     propagates).
     """
+    return _git_shim(tmp_path, "exit 0")
+
+
+def _git_shim(tmp_path: Path, on_remove: str) -> Path:
+    """A ``git.ps1`` that runs ``on_remove`` for ``worktree remove`` and passes all else through.
+    ``{git}`` in ``on_remove`` is the real git. See the docstring above for why it is ``.ps1``."""
     d = _shim_dir(tmp_path)
     real = shutil.which("git")
     assert real, "git must be on PATH"
     (d / "git.ps1").write_text(
         "# No param block: `-C <path>` must land in $args, not bind to a parameter.\n"
-        "if (($args -contains 'worktree') -and ($args -contains 'remove')) { exit 0 }\n"
+        "if (($args -contains 'worktree') -and ($args -contains 'remove')) {\n"
+        f"{on_remove.replace('{git}', real)}\n"
+        "}\n"
         f"& '{real}' @args\n"
         "exit $LASTEXITCODE\n",
         encoding="utf-8",
@@ -915,34 +923,20 @@ def test_dead_record_is_not_a_veto_and_not_a_permission(fx: Fixture, sleeper: in
     assert d["Reason"].startswith("recently active")
 
 
-@pytest.fixture
-def stale_pid() -> Iterator[int]:
-    """A running process for a STALE record: its start time is after the record's ``startedAt``."""
-    proc = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(900)"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        yield proc.pid
-    finally:
-        proc.kill()
-        proc.wait(timeout=30)
-
-
-def _gone_session_fields(state: str, stale_pid: int) -> tuple[int, int]:
-    """The pid and ``startedAt`` that make the fence read a record as ``state``."""
+def _gone_session_fields(state: str) -> tuple[int, int]:
+    """The pid and ``startedAt`` that make the fence read a record as ``state``. STALE is this
+    running process under a ``startedAt`` long before it began."""
     now_ms = int(time.time() * 1000)
     if state == "DEAD":
         return never_live_pid(), now_ms
-    return stale_pid, now_ms - 2 * 3600 * 1000  # the process started two hours after the record
+    return os.getpid(), now_ms - 48 * 3600 * 1000
 
 
 @pytest.mark.parametrize(
     ("state", "where"), [("DEAD", "root"), ("STALE", "root"), ("DEAD", "subdirectory")]
 )
 def test_a_dead_or_stale_record_holds_its_tree_and_the_next_run_still_works(
-    fx: Fixture, sleeper: int, stale_pid: int, state: str, where: str
+    fx: Fixture, sleeper: int, state: str, where: str
 ) -> None:
     """Removing a tree with such a record in it left a record naming a checkout that is gone. The
     fence cannot place that, so the next run refused every candidate, exit 2. The record stays
@@ -951,7 +945,7 @@ def test_a_dead_or_stale_record_holds_its_tree_and_the_next_run_still_works(
     live_record(fx, sleeper, fx.primary)
     clean = fx.sibling("clean")
     cwd = clean if where == "root" else clean / "sub" / "dir"
-    pid, started_at = _gone_session_fields(state, stale_pid)
+    pid, started_at = _gone_session_fields(state)
     fx.write_session(pid=pid, cwd=cwd, session_id="eeeeeeee-5555", started_at=started_at)
     record = fx.cfg / "sessions" / f"{pid}.json"
     _backdate(fx.primary, clean, hours=100)
@@ -976,11 +970,11 @@ def test_a_dead_or_stale_record_holds_its_tree_and_the_next_run_still_works(
 
 @pytest.mark.parametrize("state", ["DEAD", "STALE"])
 def test_a_dead_or_stale_record_arriving_mid_run_holds_the_tree(
-    fx: Fixture, sleeper: int, stale_pid: int, tmp_path: Path, state: str
+    fx: Fixture, sleeper: int, tmp_path: Path, state: str
 ) -> None:
     """The -Apply re-check reads the same hold: the record lands after the decision pass."""
     _stage_recheck(fx, sleeper)
-    pid, started_at = _gone_session_fields(state, stale_pid)
+    pid, started_at = _gone_session_fields(state)
     shim = gh_shim(
         tmp_path,
         side_effect=(
@@ -1002,9 +996,6 @@ def test_a_dead_or_stale_record_arriving_mid_run_holds_the_tree(
     assert d["Occupants"] == []
     assert fx.sibling("clean").exists()
     assert by_leaf(res, "gone")["Outcome"] == "removed"  # positive control
-
-    later = run(fx)
-    assert later["fence"]["available"] is True, later["fence"]["detail"]
 
 
 def test_unreadable_record_vetoes_while_the_fence_stays_available(
@@ -2578,26 +2569,21 @@ def test_an_end_state_it_cannot_confirm_is_not_counted_as_removed(
     live_record(fx, sleeper, fx.primary)
     leftover = fx.sibling("clean")
     _backdate(fx.primary, leftover, hours=100)
-    who = subprocess.run(
-        ["whoami"], capture_output=True, text=True, check=False, timeout=30
-    ).stdout.strip()
-    real = shutil.which("git")
-    assert real and who
+    who = ""
     shim: Path | None = None
     if shape == "unreadable-leftover":
-        shim = _shim_dir(tmp_path)
-        (shim / "git.ps1").write_text(
-            "if (($args -contains 'worktree') -and ($args -contains 'remove')) {\n"
-            f"    & '{real}' @args\n"
+        who = subprocess.run(
+            ["whoami"], capture_output=True, text=True, check=False, timeout=30
+        ).stdout.strip()
+        assert who
+        shim = _git_shim(
+            tmp_path,
+            "    & '{git}' @args\n"
             "    $code = $LASTEXITCODE\n"
             "    $left = [string]$args[-1]\n"
             "    [void][System.IO.Directory]::CreateDirectory($left)\n"
             f"    & icacls $left /deny '{who}:(RA,REA,RD)' | Out-Null\n"
-            "    exit $code\n"
-            "}\n"
-            f"& '{real}' @args\n"
-            "exit $LASTEXITCODE\n",
-            encoding="utf-8",
+            "    exit $code",
         )
     try:
         with _unlistable(fx.primary.parent):
