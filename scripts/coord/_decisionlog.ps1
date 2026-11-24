@@ -94,15 +94,20 @@ function Get-DecisionIdDay([string]$Id) {
 }
 
 function Invoke-DecisionGh {
-    <# Runs gh, returning Code, Out and Err. Never throws: a missing gh is code 127. #>
+    <#
+      Runs gh, returning Code, Out and Err; a missing gh is code 127, and a gh failure is its own
+      code. A console that refuses the UTF-8 switch does not throw. A failure writing the --input
+      file, or a console error that is not a console-handle IOException, still throws.
+
+      The prompt variable is put back in the finally, because a caller dot-sources this file
+      (BACKLOG #7555); $null restores an unset variable by removing it. The console's UTF-8 output
+      is left set, as before: decision.ps1 and digest.ps1 set none of their own and print records
+      through it, so restoring it here would turn their non-ASCII output into the OEM code page.
+    #>
     param([string[]]$GhArgs, [string]$InputJson = '')
     $ErrorActionPreference = 'Continue'
     $tmp = $null
-    # Both are process-wide, and a caller dot-sources this file, so each is put back in the finally
-    # (BACKLOG #7555). $null restores an unset variable by removing it.
     $savedPrompt = $env:GH_PROMPT_DISABLED
-    $savedEncoding = $null
-    $switched = $false
     # PowerShell wraps a setter's exception (SetValueInvocationException), so the console-handle
     # IOException is looked for along the inner chain. Local, because afk-kill.ps1 runs this
     # function's body alone in another runspace.
@@ -122,13 +127,13 @@ function Invoke-DecisionGh {
         # gh writes UTF-8; the console's code page would mangle a non-ASCII field. A host with no
         # console handle refuses the setter with an IOException; gh still runs, and the refusal is
         # reported unless the page was UTF-8 already.
+        $before = $null
         try {
-            $savedEncoding = [Console]::OutputEncoding
+            $before = [Console]::OutputEncoding
             [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-            $switched = $true
         } catch {
             if (-not (& $isConsoleIO $_.Exception)) { throw }
-            if (-not $savedEncoding -or $savedEncoding.CodePage -ne 65001) {
+            if (-not $before -or $before.CodePage -ne 65001) {
                 $why = $_.Exception.Message
                 try { [Console]::Error.WriteLine("_decisionlog.ps1: WARNING -- gh's output could not be set to decode as UTF-8 ($why), so a non-ASCII field may come back mangled.") }
                 catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
@@ -142,9 +147,6 @@ function Invoke-DecisionGh {
     } catch [System.Management.Automation.CommandNotFoundException] {
         return [pscustomobject]@{ Code = 127; Out = ''; Err = 'gh is not on PATH' }
     } finally {
-        if ($switched) {
-            try { [Console]::OutputEncoding = $savedEncoding } catch { if (-not (& $isConsoleIO $_.Exception)) { throw } }
-        }
         $env:GH_PROMPT_DISABLED = $savedPrompt
         if ($tmp) { try { [System.IO.File]::Delete($tmp) } catch { $null = $_ } }
     }

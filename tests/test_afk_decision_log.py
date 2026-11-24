@@ -468,34 +468,43 @@ def test_an_outcome_record_refers_to_a_decision(sb: Sandbox) -> None:
     assert outcome["ref"] == did and outcome["outcome"] == "reversed"
 
 
-# BACKLOG #7555: Invoke-DecisionGh set $env:GH_PROMPT_DISABLED and [Console]::OutputEncoding and never
-# put them back, so a caller that dot-sources _decisionlog.ps1 kept both after every gh call; and on a
-# host with no console, whose OutputEncoding setter throws IOException, the "never throws" function
-# threw. A gh.ps1 stub first on PATH prints the prompt variable gh saw and exits 3, so the tests also
-# prove gh still ran under GH_PROMPT_DISABLED=1 and that its failure still comes back.
+# BACKLOG #7555: Invoke-DecisionGh set $env:GH_PROMPT_DISABLED and never put it back, so a caller
+# that dot-sources _decisionlog.ps1 kept it after every gh call; and on a host with no console, whose
+# OutputEncoding setter throws IOException, the "never throws" function threw. A gh.ps1 stub first on
+# PATH prints the prompt variable gh saw and exits 3, so the tests also prove gh still ran under
+# GH_PROMPT_DISABLED=1 and that its failure still comes back. The console encoding is deliberately
+# left at UTF-8 (the function's own comment says why), so no test sets or asserts a code page, and
+# none leaves the shared console changed.
 
 _DECISIONLOG = COORD / "_decisionlog.ps1"
 
-_THROWING_CONSOLE = r"""
-Add-Type -TypeDefinition @'
-public static class MeforDecisionThrowingConsole {
-    public static int SetAttempts;
-    public static System.Text.Encoding OutputEncoding {
-        get { return System.Console.OutputEncoding; }
-        set { SetAttempts++; throw new System.IO.IOException("The handle is invalid."); }
-    }
-    public static System.IO.TextWriter Out { get { return System.Console.Out; } }
-    public static System.IO.TextWriter Error { get { return System.Console.Error; } }
-}
-'@
-[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('Console', [MeforDecisionThrowingConsole])
-"""
 
-_LATIN1_CONSOLE = "[Console]::OutputEncoding = [System.Text.Encoding]::Latin1\n"
+def _throwing_console(exception: str) -> str:
+    """A pwsh prelude pointing the ``Console`` accelerator at a stub whose setter throws."""
+    return (
+        "Add-Type -TypeDefinition @'\n"
+        "public static class MeforDecisionThrowingConsole {\n"
+        "    public static int SetAttempts;\n"
+        "    public static System.Text.Encoding OutputEncoding {\n"
+        "        get { return System.Console.OutputEncoding; }\n"
+        f'        set {{ SetAttempts++; throw new {exception}("The handle is invalid."); }}\n'
+        "    }\n"
+        "    public static System.IO.TextWriter Out { get { return System.Console.Out; } }\n"
+        "    public static System.IO.TextWriter Error { get { return System.Console.Error; } }\n"
+        "}\n"
+        "'@\n"
+        "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')"
+        "::Add('Console', [MeforDecisionThrowingConsole])\n"
+    )
+
+
+_SET_ATTEMPTS = (
+    '[System.Console]::Out.WriteLine("SETS=$([MeforDecisionThrowingConsole]::SetAttempts)")\n'
+)
 
 
 def _run_decision_gh(
-    tmp_path: Path, prelude: str, epilogue: str = "", *, caller_prompt: bool = True
+    tmp_path: Path, prelude: str = "", epilogue: str = "", *, caller_prompt: bool = True
 ) -> dict[str, str]:
     """Dot-source the library, call Invoke-DecisionGh against the stub, and read KEY=value lines."""
     bin_dir = tmp_path / "bin"
@@ -509,13 +518,12 @@ def _run_decision_gh(
     script = (
         prelude
         + ("$env:GH_PROMPT_DISABLED = 'caller-value'\n" if caller_prompt else "")
-        + f'{out_line}("CPBEFORE=$([System.Console]::OutputEncoding.CodePage)")\n'
         + f". {lib}\n"
         + "try { $r = Invoke-DecisionGh @('api', 'x')\n"
         + f'  {out_line}("CODE=$($r.Code)"); {out_line}("GHOUT=$($r.Out)") }}\n'
         + f'catch {{ {out_line}("THREW=$($_.Exception.Message)") }}\n'
         + f'{out_line}("PROMPT=$env:GH_PROMPT_DISABLED")\n'
-        + f'{out_line}("CPAFTER=$([System.Console]::OutputEncoding.CodePage)")\n'
+        + f'{out_line}("EXISTS=$(Test-Path Env:GH_PROMPT_DISABLED)")\n'
         + epilogue
     )
     env = dict(os.environ)
@@ -528,7 +536,7 @@ def _run_decision_gh(
         errors="replace",
         cwd=tmp_path,
         env=env,
-        timeout=60,
+        timeout=GUARDED_TIMEOUT_S,
     )
     got: dict[str, str] = {"_raw": proc.stdout + proc.stderr}
     for line in proc.stdout.splitlines():
@@ -538,41 +546,39 @@ def _run_decision_gh(
     return got
 
 
-def test_invoke_decision_gh_restores_the_callers_prompt_variable_and_encoding(
-    tmp_path: Path,
-) -> None:
-    got = _run_decision_gh(tmp_path, _LATIN1_CONSOLE)
-    assert got.get("CODE") == "3", got["_raw"]
-    # gh itself ran with prompts disabled, and its output came back.
-    assert got.get("GHOUT") == "SAW=1", got["_raw"]
+def test_invoke_decision_gh_restores_the_callers_prompt_variable(tmp_path: Path) -> None:
+    got = _run_decision_gh(tmp_path)
+    # gh itself ran with prompts disabled, and its failure came back as its own code.
+    assert got.get("CODE") == "3" and got.get("GHOUT") == "SAW=1", got["_raw"]
     assert got.get("PROMPT") == "caller-value", got["_raw"]
-    # The control: the caller's page was not UTF-8, so a leak would read 65001 after the call.
-    assert got.get("CPBEFORE") == "28591", got["_raw"]
-    assert got.get("CPAFTER") == "28591", got["_raw"]
 
 
 def test_invoke_decision_gh_removes_a_prompt_variable_the_caller_never_set(
     tmp_path: Path,
 ) -> None:
     got = _run_decision_gh(
-        tmp_path,
-        _LATIN1_CONSOLE + "Remove-Item Env:GH_PROMPT_DISABLED -ErrorAction Ignore\n",
-        '[System.Console]::Out.WriteLine("EXISTS=$(Test-Path Env:GH_PROMPT_DISABLED)")\n',
-        caller_prompt=False,
+        tmp_path, "Remove-Item Env:GH_PROMPT_DISABLED -ErrorAction Ignore\n", caller_prompt=False
     )
     assert got.get("GHOUT") == "SAW=1", got["_raw"]
     assert got.get("EXISTS") == "False", got["_raw"]
 
 
-def test_invoke_decision_gh_does_not_throw_when_the_encoding_setter_does(tmp_path: Path) -> None:
-    got = _run_decision_gh(
-        tmp_path,
-        _THROWING_CONSOLE,
-        '[System.Console]::Out.WriteLine("SETS=$([MeforDecisionThrowingConsole]::SetAttempts)")\n',
-    )
+def test_invoke_decision_gh_does_not_throw_when_the_encoding_setter_refuses(
+    tmp_path: Path,
+) -> None:
+    got = _run_decision_gh(tmp_path, _throwing_console("System.IO.IOException"), _SET_ATTEMPTS)
     assert "THREW" not in got, got["_raw"]
     assert got.get("CODE") == "3" and got.get("GHOUT") == "SAW=1", got["_raw"]
     assert got.get("PROMPT") == "caller-value", got["_raw"]
-    # The control: the setter was reached, so the refusal path really ran. One call: an encoding
-    # that was never switched is not put back.
+    # The control: the setter was reached, so the refusal path really ran.
     assert got.get("SETS") == "1", got["_raw"]
+
+
+def test_invoke_decision_gh_still_throws_a_console_error_that_is_not_io(tmp_path: Path) -> None:
+    """The negative control: only the console-handle IOException is caught, and the prompt
+    variable is still put back on the way out."""
+    prelude = _throwing_console("System.InvalidOperationException")
+    got = _run_decision_gh(tmp_path, prelude, _SET_ATTEMPTS)
+    assert "THREW" in got and "CODE" not in got, got["_raw"]
+    assert got.get("SETS") == "1", got["_raw"]
+    assert got.get("PROMPT") == "caller-value", got["_raw"]
