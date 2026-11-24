@@ -199,7 +199,6 @@ SEARCH_RULES = (
     "size_rule",
     "module_rule",
     "word_rule",
-    "run_rule",
 )
 
 
