@@ -1717,7 +1717,7 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
 def _keyless_seal(fields: tuple[tuple[str, object], ...]) -> str:
     """The seal a store with no sealer writes over ``fields``: empty. A float in ``fields`` that is
     a NaN or an infinity raises ``ValueError``, for the reason :meth:`RowSealer.seal` refuses one
-    (BACKLOG #6717). Used by the builders whose sealed fields can hold a float."""
+    (BACKLOG #6717)."""
     if any(isinstance(v, float) and not math.isfinite(v) for _, v in fields):
         raise ValueError("a row write refuses a float that is not finite")
     return ""
