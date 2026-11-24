@@ -387,6 +387,12 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
     size = len(obj)
     limit = min(size, pos + _FILE_META_CAP)
     group_end: int | None = None
+
+    def past_limit() -> str:
+        # Past the cap, with no Group Length to end the group, the reader stopped short of the
+        # object and of the group; otherwise the object or the declared group ended.
+        return _META_TOO_LONG if group_end is None and limit < size else _META_OVERRUN
+
     while pos + 8 <= limit:
         group, element = struct.unpack_from("<HH", obj, pos)
         if group != 0x0002:
@@ -397,12 +403,12 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
             start = pos + 8
         else:
             if pos + 12 > limit:
-                return None, _META_OVERRUN
+                return None, past_limit()
             (length,) = struct.unpack_from("<I", obj, pos + 8)
             start = pos + 12
         end = start + length  # an undefined length (0xFFFFFFFF) runs past the limit, so is refused
         if end > limit:
-            return None, _META_OVERRUN
+            return None, past_limit()
         if element == 0x0000 and group_end is None and vr == b"UL" and length == 4:
             (group_length,) = struct.unpack_from("<I", obj, start)
             if group_length > _FILE_META_CAP:
@@ -420,17 +426,17 @@ def _sent_instance_uid(obj: bytes) -> tuple[str | None, str]:
             uid = raw.decode("ascii").rstrip("\0 ")
             return (uid, "") if _is_uid(uid) else (None, _META_NOT_A_UID)
         pos = end
-    # The walk ran to its limit. Past the cap, with no Group Length to end the group, the group is
-    # longer than the reader reads; otherwise the group or the object ended with no (0002,0003).
-    if group_end is None and limit < size:
-        return None, _META_TOO_LONG
+    # The walk ran to its limit. A partial element header left before it was cut off by the limit;
+    # with none, the cap stopped the walk, or the group or object ended with no (0002,0003).
+    if pos < limit or (group_end is None and limit < size):
+        return None, past_limit()
     return None, _META_NO_0003
 
 
 def _data_set_instance_uid(obj: bytes) -> str | None:
     """The data set's SOP Instance UID (``0008,0018``) of the object sent, read with the engine's
-    DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a bounded header read that
-    never materialises pixel data, behind its deflate guard), or ``None`` when none is read: the
+    DICOM codec (:class:`~messagefoundry.parsing.dicom.peek.DicomPeek`: a header read that never
+    materialises pixel data, behind its deflate guard, though not held to :data:`_FILE_META_CAP`), or ``None`` when none is read: the
     optional ``[dicom]`` extra is absent, the object does not parse, or it carries no UID in the
     grammar :func:`_is_uid` checks. A server builds its reply from this UID, so a 202 for an object
     whose File Meta was not rewritten after a re-UID still names it (BACKLOG #5914). Logged by
@@ -532,8 +538,8 @@ def _unconfirmed_202(referenced: list[Any], sent: bytes) -> tuple[str, str] | No
         return (
             "unconfirmed-202",
             f"no SOP Instance UID of the instance sent to compare: {cause}, and no data set SOP "
-            "Instance UID (0008,0018) read; replaying the same object cannot confirm it on a "
-            f"202; {_NOT_SENT}",
+            "Instance UID (0008,0018) read; a replay of the same object cannot confirm it on a "
+            f"202 unless the [dicom] extra then reads its data set UID; {_NOT_SENT}",
         )
     return "unconfirmed-202", f"no ReferencedSOPSequence confirming the instance sent; {_NOT_SENT}"
 

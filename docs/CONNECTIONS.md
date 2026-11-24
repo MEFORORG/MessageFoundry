@@ -4042,13 +4042,14 @@ to compare, and its reason names why the File Meta has none. At least these leav
 UID: no `DICM` magic after the 128-byte preamble, no `(0002,0003)` in the File Meta group, a
 `(0002,0003)` whose VR is not `UI`, any File Meta element up to it whose header or value runs past
 the end of the object or of the group its `(0002,0000)` Group Length declares, a value that is not
-ASCII or is not in the UID grammar once its padding is dropped, and a File Meta group longer than
-64 KiB, the most the reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
+ASCII or is not in the UID grammar once its padding is dropped, a `(0002,0000)` Group Length over
+64 KiB, and a `(0002,0003)` that does not lie within the first 64 KiB of the group, the most the
+reader reads (BACKLOG #5914, decisions of 2026-11-23). The File Meta group is
 read as Explicit VR Little Endian, as PS3.10 requires, without `pydicom`. The data set UID is read
 with the engine's DICOM codec, which needs the optional `[dicom]` extra; without it, or for an
-object the codec cannot parse, only the File Meta UID is compared. So an object whose data set was
-given a new SOP Instance UID without its File Meta being rewritten is confirmed by a 202 naming
-either UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
+object the codec cannot parse, only the File Meta UID is compared. So, with the extra installed, an
+object whose data set was given a new SOP Instance UID without its File Meta being rewritten is
+confirmed by a 202 naming either UID; without it, only by one naming the File Meta UID. A server that assigns a new UID of its own on a 202 names neither, and that object is
 dead-lettered on every 202 although the server may hold it. A ReferencedSOPSequence that is not an object, has a `Value` that
 is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
 checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not

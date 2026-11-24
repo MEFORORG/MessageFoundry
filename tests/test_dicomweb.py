@@ -4,10 +4,10 @@
 ``multipart/related; type="application/dicom"`` framing, the dicom+json FailedSOPSequence / HTTP-status
 classification (transient retry vs permanent dead-letter), response capture, and the egress arm.
 
-The opener is faked so nothing hits the network — and because the destination parses no data set (it
-reads the Part-10 File Meta group by hand, on a 202), these tests
-need **no** ``[dicom]`` extra and run on every CI leg. The one test that checks that reader against
-pydicom's own writer skips without it."""
+The opener is faked so nothing hits the network. On a 202 the destination reads the Part-10 File
+Meta group by hand, and reads the data set's SOP Instance UID with pydicom only when the ``[dicom]``
+extra is installed, so most of these tests need **no** extra and run on every CI leg. The tests that
+build an object with pydicom's own writer skip without it."""
 
 from __future__ import annotations
 
@@ -71,7 +71,7 @@ def _carried(obj: bytes) -> str:
 
 # The instance STORED_OK confirms (BACKLOG #5914: a 202 is compared with the File Meta UID).
 SENT_UID = "1.2.3.4.5"
-# A synthetic Part-10 object; the destination reads only its File Meta group, never the data set.
+# A synthetic Part-10 object whose opaque data set carries no SOP Instance UID pydicom can read.
 OBJECT = _part10(SENT_UID)
 PAYLOAD = RawMessage.from_bytes(
     OBJECT, "dicom"
@@ -735,7 +735,7 @@ def _with_group_length(obj: bytes, group_length: int) -> bytes:
 
 def _long_zero_length_run(count: int) -> bytes:
     """OBJECT with ``count`` zero-length (0002,0004) UI elements before (0002,0003), and a group
-    length that covers them all, so only a fixed cap stops a walk short of (0002,0003)."""
+    length that covers them all. Past the reader's cap, that group length is refused outright."""
     at = OBJECT.index(struct.pack("<HH", 0x0002, 0x0003))
     run = (struct.pack("<HH", 0x0002, 0x0004) + b"UI" + struct.pack("<H", 0)) * count
     obj = OBJECT[:at] + run + OBJECT[at:]
@@ -767,7 +767,8 @@ _NO_COMPARABLE_UID = [
     ),
     # Bounded by the (0002,0000) group length: a (0002,0003) after the group's end is not read.
     pytest.param(_with_group_length(OBJECT, _BEFORE_0003), _NO_0003, id="past-group-length"),
-    # Bounded by a fixed cap: a long run of zero-length group-2 elements is not walked.
+    # Bounded by a fixed cap: a group length over it, declaring a long run of zero-length group-2
+    # elements, is refused before the run is walked.
     pytest.param(_long_zero_length_run(_FILE_META_CAP // 8 + 1), _TOO_LONG, id="past-the-cap"),
 ]
 
@@ -818,7 +819,7 @@ async def test_dicomweb_202_with_no_comparable_sent_uid_is_unconfirmed(
     # Its own reason, naming the cause truthfully, with the replay advice, and naming no UID.
     text = str(exc.value)
     assert cause in text
-    assert "replaying the same object cannot confirm it on a 202" in text
+    assert "a replay of the same object cannot confirm it on a 202 unless" in text
     assert "refused again" not in text
     assert "before a replay" in text
     assert SENT_UID not in text
