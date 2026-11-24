@@ -994,8 +994,12 @@ _TAILS_IMPORT = "import re\nfrom messagefoundry.secretscrub import _KV_TAILS\n"
     ],
 )
 def test_an_imported_constant_the_file_also_binds_stays_unresolved(body: str) -> None:
-    """A name the file rebinds is read neither as the imported text nor as the other binding's
-    literal, so the pattern stays unresolved and pinned."""
+    """For the bindings planted here, a name the file rebinds is read neither as the imported text
+    nor as the other binding's string literal, so the pattern stays unresolved and pinned.
+
+    That does not hold for every rebinding. At least a rebinding to a list literal or a bytes
+    literal is read as that literal: ``def f(): _KV_TAILS = ['x']`` resolves to ``x``, because the
+    collection and bytes maps do not read ``shadowed``."""
     resolved, unresolved = _regex_scan(_TAILS_IMPORT + body)
     assert len(unresolved) == 1
     assert resolved == []
