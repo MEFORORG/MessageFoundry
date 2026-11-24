@@ -152,9 +152,11 @@ pwsh -NoProfile -File scripts\coord\mail.ps1 -List
 pwsh -NoProfile -File scripts\coord\mail.ps1 -Status
 ```
 
-- `-To <path>` -- the recipient **worktree** path. A path inside a worktree names that worktree's box,
-  and a path in no worktree is refused (see *Raised to the worktree root* below). Matched
-  case-insensitively and exactly. `all` broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
+- `-To <path>` -- the recipient **worktree** root. A path inside a worktree but not its root is
+  refused, naming the root: a session's drain keys its box on the cwd it runs in, normally the root,
+  so a box keyed on a subdirectory would go unread (BACKLOG #7581). A path in no worktree is still
+  accepted, for an `-AnchorRepo` session. Matched case-insensitively and exactly. `all`
+  broadcasts to the live roster from [`presence.ps1`](../scripts/coord/presence.ps1).
 - `-To <seat id>` -- a seat record's id, such as `autonomy-plan-62022e2c`, accepted when the seat
   registry holds a readable record for it that names a worktree. **Use this for a seat on another PC**: its worktree path
   does not exist here, so the path form cannot reach it. A seat id hashes the host as well as the
@@ -209,15 +211,6 @@ where the Desktop app records an **uppercase** one. The same physical worktree t
 spelled two ways, and a case-sensitive key splits it into two boxes that never see each other's mail.
 The normalisation also trims a trailing separator and folds forward slashes to back slashes, because
 some producers are git and some are Windows.
-
-**Raised to the worktree root first.** Every path a send or `-Status` addresses is first raised to the
-first directory at or above it that holds `.git`, by the drain's own rule (`Get-CcxWorktreeRoot` in
-[`scripts/hooks/_hookinput.ps1`](../scripts/hooks/_hookinput.ps1)); `seat.ps1` keys a seat on the same
-root. A path below the root hashed as given would mint a box beside the real one that no drain reads,
-under a `Queued` line (BACKLOG #7581). So `-Send -To` refuses a path in no worktree, and `-To all`
-skips a live peer whose cwd is in none and says how many it skipped. One consequence: `mail.ps1`
-cannot address an `-AnchorRepo` container session by path, though `-Status` run from one still reads
-its own box.
 
 **Matched EXACTLY, never by prefix.** Every worktree path in this repo is an extension of the primary
 checkout's path. A prefix match therefore resolves *any* peer to some arbitrary worktree -- most likely
