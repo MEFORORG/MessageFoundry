@@ -36,9 +36,9 @@ _DIGEST_SIZE = 16
 #: obviously-weak salt rather than emit guessable surrogates (fail closed, ADR 0030 §4).
 #:
 #: UTF-8 spends at least one byte on a character, so this also refuses every salt under 16 bytes.
-#: It is NOT a 128-bit floor, and BACKLOG #4652 names 128 bits as the floor the salt should meet:
+#: It is NOT a 128-bit floor, which is what ADR 0030 section 4 asks of the salt at generation:
 #: ``secrets.token_hex(8)`` is 16 characters carrying 64 bits and passes, and so does
-#: ``"abcdefghijklmnop"``. Nothing here enforces 128 bits; see the note above ``_GENERATE_ADVICE``.
+#: ``"abcdefghijklmnop"``. Nothing here enforces 128 bits.
 MIN_SALT_LEN = 16
 
 #: Floor on the salt's ESTIMATED entropy, in bits. Length alone is not strength: sixteen copies of
@@ -82,11 +82,15 @@ MIN_SALT_ENTROPY_BITS_PER_CHAR = 2.0
 #: generator and nothing else on purpose: a salt drawn at random from a narrow alphabet, such as
 #: decimal digits, can be refused, and the remedy is ``secrets.token_urlsafe(24)``, not another draw
 #: from the same alphabet. Sixteen random digits carry about 53 bits, under ADR 0030's 128.
+#: ``_GENERATE`` and ``_WITHHELD`` are its two ends, which the length and encoding refusals carry
+#: too, without the narrow-alphabet sentence that does not follow from their causes.
+_GENERATE = "Generate one with secrets.token_urlsafe(24) and supply it from the environment."
+_WITHHELD = "The salt itself is withheld from this message on purpose."
 _GENERATE_ADVICE = (
-    "Generate one with secrets.token_urlsafe(24) and supply it from the environment. A random salt "
+    f"{_GENERATE} A random salt "
     "from a narrow alphabet, such as decimal digits, can be refused; replace it with one from "
-    "secrets.token_urlsafe(24), not another draw from the same alphabet. The salt itself is "
-    "withheld from this message on purpose."
+    "secrets.token_urlsafe(24), not another draw from the same alphabet. "
+    f"{_WITHHELD}"
 )
 
 #: Ceiling on the salt's UTF-8 length in BYTES, set by BLAKE2b's keyed mode
@@ -170,13 +174,16 @@ class Keyer:
         if len(salt) < MIN_SALT_LEN:
             raise ValueError(
                 f"anonymizer salt must be a secret of at least {MIN_SALT_LEN} characters "
-                "(ADR 0030 §4: pinned-per-dataset secret, env-supplied, never committed)"
+                "(ADR 0030 §4: pinned-per-dataset secret, env-supplied, never committed). "
+                f"{_GENERATE} {_WITHHELD}"
             )
         # The codec's own error keeps the WHOLE salt on its ``.object`` and quotes the character it
-        # could not encode in its message; on POSIX that character is a byte of the salt, since
-        # os.environ maps an undecodable byte to a lone surrogate. So the refusal is raised OUTSIDE
-        # the handler: raised inside it, even ``from None`` would keep the codec error, and the salt
-        # with it, as ``__context__`` (BACKLOG #4652; tests/test_from_none_is_not_redaction.py).
+        # could not encode in its message. That character is part of the salt: os.environ maps an
+        # undecodable byte to a lone surrogate on POSIX, and Windows can hold an unpaired one. So
+        # the refusal is raised OUTSIDE the handler: raised inside it, even ``from None`` would keep
+        # the codec error, and the salt with it, as ``__context__`` (BACKLOG #4652;
+        # tests/test_from_none_is_not_redaction.py). This clears the message and the exception
+        # chain only: the frame's locals, which a traceback carries, still hold ``salt``.
         encoded: bytes | None
         try:
             encoded = salt.encode("utf-8")
@@ -184,9 +191,8 @@ class Keyer:
             encoded = None
         if encoded is None:
             raise ValueError(
-                "anonymizer salt holds a character UTF-8 cannot encode, such as a byte the "
-                "environment could not decode. Generate one with secrets.token_urlsafe(24) and "
-                "supply it from the environment. The salt itself is withheld from this message."
+                "anonymizer salt holds a character UTF-8 cannot encode, such as an undecodable "
+                f"byte or an unpaired surrogate in the environment. {_GENERATE} {_WITHHELD}"
             )
         if len(encoded) > MAX_SALT_BYTES:
             raise ValueError(

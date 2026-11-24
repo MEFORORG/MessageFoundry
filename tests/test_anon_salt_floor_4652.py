@@ -15,22 +15,24 @@ renderer that captures locals would print it.
 from __future__ import annotations
 
 import importlib
-import os
 from types import ModuleType
 
 import pytest
 
 from tee.__main__ import main as tee_main
-from tests._tee_seed import SYNTHETIC_ADT
-from tests._tee_seed import seed_capture as _seed_capture
 
 #: Fifteen and sixteen characters of one random-looking ASCII draw: one byte each, and varied enough
 #: that only the length floor decides. Synthetic, generated for this test, guarding nothing.
 _SALT_16 = "Q7xZ9vK2mP4wR8tN"
 _SALT_15 = _SALT_16[:15]
 
-#: What os.environ makes of an undecodable 0xFF byte on POSIX (surrogateescape).
+#: What os.environ makes of an undecodable 0xFF byte on POSIX (surrogateescape); Windows can hold
+#: the same unpaired surrogate in its UTF-16 environment.
 _UNDECODABLE = "\udcff"
+
+#: Ways a message could spell that byte. A lone surrogate itself cannot reach captured stderr:
+#: writing one raises before any assertion could see it.
+_BYTE_FORMS = ("dcff", "\\xff", "\xff", "0xff", "0xFF")
 
 
 @pytest.fixture(params=["messagefoundry_toolkit.anon.keying", "tee.anon.keying"])
@@ -66,37 +68,26 @@ def test_an_unencodable_salt_is_refused_with_an_empty_chain(keying: ModuleType) 
     assert exc.value.__context__ is None
     assert exc.value.__cause__ is None
     text = str(exc.value)
-    assert _UNDECODABLE not in text and "dcff" not in text
+    for form in (_UNDECODABLE, *_BYTE_FORMS):
+        assert form not in text
     _no_run_of(_SALT_16, text)
 
 
+@pytest.mark.parametrize("salt", [_SALT_15, _SALT_16 + _UNDECODABLE], ids=["short", "undecodable"])
+@pytest.mark.parametrize("variable", ["MEFOR_ANON_SALT", "SITE_DATASET_SALT_4652"])
 def test_the_tee_refusal_names_the_setting_and_withholds_the_salt(
-    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str]
+    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str], salt: str, variable: str
 ) -> None:
-    db = str(tmp_path / "tee.db")
-    _seed_capture(db, SYNTHETIC_ADT.encode("latin-1"))
-    monkeypatch.setenv("MEFOR_ANON_SALT", _SALT_15)
-    out = tmp_path / "ds.jsonl"
-    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 1
+    # The salt is checked before the store is read, so no capture is seeded. The real environment
+    # carries the lone surrogate on both platforms: surrogateescape on POSIX, UTF-16 on Windows.
+    monkeypatch.setenv(variable, salt)
+    argv = ["anonymize-captures", "--db", str(tmp_path / "tee.db"), "--out", str(tmp_path / "o")]
+    if variable != "MEFOR_ANON_SALT":
+        argv += ["--salt-env", variable]
+    assert tee_main(argv) == 1
     err = capsys.readouterr().err
-    assert "MEFOR_ANON_SALT" in err
-    _no_run_of(_SALT_15, err)
-    assert not out.exists()
-
-
-def test_the_tee_refuses_an_undecodable_salt_without_quoting_it(
-    tmp_path, monkeypatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    # A plain dict stands in for os.environ: Windows cannot hold a lone surrogate in its
-    # environment, and this is the value POSIX would hand the tee for a stray 0xFF byte.
-    db = str(tmp_path / "tee.db")
-    _seed_capture(db, SYNTHETIC_ADT.encode("latin-1"))
-    salt = _SALT_16 + _UNDECODABLE
-    monkeypatch.setattr(os, "environ", {**os.environ, "MEFOR_ANON_SALT": salt})
-    out = tmp_path / "ds.jsonl"
-    assert tee_main(["anonymize-captures", "--db", db, "--out", str(out)]) == 1
-    err = capsys.readouterr().err
-    assert "MEFOR_ANON_SALT" in err
-    assert _UNDECODABLE not in err and "dcff" not in err
-    _no_run_of(_SALT_16, err)
-    assert not out.exists()
+    assert f"error: {variable}: " in err
+    for form in _BYTE_FORMS:
+        assert form not in err
+    _no_run_of(salt.rstrip(_UNDECODABLE), err)
+    assert not (tmp_path / "o").exists()
