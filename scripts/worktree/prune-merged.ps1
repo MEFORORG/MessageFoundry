@@ -26,7 +26,8 @@
                         ignored entry that is not a regenerable cache, a nested checkout or link, or an
                         inherited git redirect variable (worktree-gates.ps1 Test-WorktreeClean),
       (c) unlocked   -- `git worktree lock` is git's own "in use" flag and this script honours it,
-      (d) unoccupied -- no live Claude session is sitting in it OR in a worktree nested inside it, its
+      (d) unoccupied -- no live Claude session is sitting in it OR in a worktree nested inside it, no
+                        DEAD or STALE session record is placed there (signal 1 says why), its
                         git metadata and working tree (its top level and cache files, below) have
                         not been written within -IdleHours, and it does not contain another
                         registered worktree.
@@ -76,8 +77,8 @@
          This is the signal that does NOT depend on a recorded cwd, and it is what covers the fence's
          biggest blind spot -- so it is not a nicety, it is the load-bearing one for the class of
          worktree this tool actually prunes. If it cannot be read, that is a veto too. Confirm a
-         specific worktree past this veto with -Name <slug>; -Name never overrides signal 1, a nested
-         worktree, or a lock.
+         specific worktree past this veto with -Name <slug>; -Name never overrides signal 1, the DEAD
+         or STALE record hold, a nested worktree, or a lock.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
@@ -284,7 +285,8 @@ param(
     # apply's blast radius.
     [switch]$Fetch,
     # Restrict to these worktrees (slug `<repo>-<name>` or bare `<name>`), and confirm them past the
-    # recent-activity veto. Never overrides the liveness fence, a nested worktree, or a worktree lock.
+    # recent-activity veto. Never overrides the liveness fence, the DEAD or STALE record hold, a nested
+    # worktree, or a worktree lock.
     [string[]]$Name,
     # Don't ask gh about merged PRs (offline, or no gh).
     [switch]$SkipGh,
