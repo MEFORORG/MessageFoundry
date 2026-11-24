@@ -3,10 +3,10 @@
 """BACKLOG #6687: a DR copy loop reads a ``None`` read as "no data yet", never as end of stream.
 
 A non-blocking source answers ``None`` when it has nothing ready. A copy loop that stops on
-``if not buf: break`` ends the copy short there and the run goes on as if it were complete. Three of
-the copy loops in ``pipeline/dr_backup.py`` now share :func:`dr_backup._read_chunks`, and these tests
-drive each of the three; the loops in ``_extract_member`` and ``_restore_blocking`` are not changed
-here. The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
+``if not buf: break`` ends the copy short there. Three copy loops in ``pipeline/dr_backup.py`` now
+share :func:`dr_backup._read_chunks`, and these tests drive each of the three. Reads in that module
+this branch does not change include at least ``_extract_member``, the plaintext branch of
+``_restore_blocking``, the ``shutil.copyfileobj`` in ``_place_restored_store`` and ``_sha256_file``. The sources are synthetic: a store with one made-up row, and a tar of made-up config bytes."""
 
 from __future__ import annotations
 
@@ -73,39 +73,65 @@ class _Stalling:
 # --- the shared loop itself -------------------------------------------------------------------
 
 
-def test_a_none_read_is_waited_out_not_read_as_end_of_stream(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr(time, "sleep", waits.append)
+class _FakeClock:
+    """Stands in for ``dr_backup``'s own ``time`` module: ``sleep`` records the wait and moves a
+    fake ``monotonic`` on by it, so no test here sleeps or races a real clock. Every other
+    attribute is the real ``time`` module's."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.waits: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.waits.append(seconds)
+        self.now += seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    fake = _FakeClock()
+    monkeypatch.setattr(dr, "time", fake)
+    return fake
+
+
+def test_a_none_read_is_waited_out_not_read_as_end_of_stream(clock: _FakeClock) -> None:
     src = _Scripted([None, b"ab", None, None, b"cd", b""])
     assert list(dr._read_chunks(src)) == [b"ab", b"cd"]
     assert src.reads == 6
     # Each None read sleeps the documented wait, rather than spinning on the source.
-    assert waits == [dr._NO_DATA_YET_WAIT_SECONDS] * 3
+    assert clock.waits == [dr._NO_DATA_YET_WAIT_SECONDS] * 3
 
 
-def test_a_source_that_only_answers_none_is_refused_after_the_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(dr, "_NO_DATA_YET_LIMIT_SECONDS", 0.05)
-    src = _Scripted([b"ab"] + [None] * 10_000)
+def test_a_source_that_only_answers_none_is_refused_at_the_limit(clock: _FakeClock) -> None:
+    wait, limit = dr._NO_DATA_YET_WAIT_SECONDS, dr._NO_DATA_YET_LIMIT_SECONDS
+    # Enough None reads to reach the limit and several more; _Scripted raises AssertionError on a
+    # read past its script, which pytest.raises(TimeoutError) would not catch.
+    stall = round(limit / wait) + 5
+    src = _Scripted([b"ab"] + [None] * stall)
     chunks = dr._read_chunks(src)
     assert next(chunks) == b"ab"
     with pytest.raises(TimeoutError, match="no data ready"):
         next(chunks)
-    assert src.reads < 10_001
+    assert limit <= clock.now < limit + 2 * wait
 
 
-def test_a_byte_arriving_restarts_the_no_data_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Each stall here is shorter than the limit, so the copy finishes even though the stalls add up
-    # to more than it.
-    monkeypatch.setattr(dr, "_NO_DATA_YET_LIMIT_SECONDS", 0.2)
+def test_a_byte_arriving_restarts_the_no_data_limit(clock: _FakeClock) -> None:
+    # Each stall is shorter than the limit, and together they are longer than it, so the copy
+    # finishes only if a byte arriving starts the limit again.
+    wait, limit = dr._NO_DATA_YET_WAIT_SECONDS, dr._NO_DATA_YET_LIMIT_SECONDS
+    per_stall = round(limit / wait) // 2
     script: list[bytes | None] = []
-    for _ in range(6):
-        script += [None] * 4 + [b"x"]
+    for _ in range(4):
+        script += [None] * per_stall + [b"x"]
     src = _Scripted([*script, b""])
-    assert b"".join(dr._read_chunks(src)) == b"xxxxxx"
+    assert b"".join(dr._read_chunks(src)) == b"xxxx"
+    assert clock.now > limit
 
 
 def test_an_empty_read_ends_the_stream_and_nothing_reads_past_it() -> None:

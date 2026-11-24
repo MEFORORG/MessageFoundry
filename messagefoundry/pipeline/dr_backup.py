@@ -438,7 +438,7 @@ class _HashingReader:
         self._raw = raw
         self.digest = hashlib.sha256()
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int = -1) -> bytes | None:
         data = self._raw.read(size)
         # A read that is not bytes-like (None from a non-blocking source with nothing ready, or a
         # str) passes through unhashed. On the keyed branch the codec's own refusal then names it,
@@ -471,10 +471,11 @@ def _read_chunks(src: _ChunkSource) -> Iterator[bytes]:
     A ``None`` read is not the end of the stream: a non-blocking source answers ``None`` when it has
     no data ready YET. Stopping there, as a bare ``if not buf: break`` loop does, would finish a copy
     short and report it as complete. So the loop sleeps :data:`_NO_DATA_YET_WAIT_SECONDS` and reads
-    again. Once ``None`` has been the only answer for :data:`_NO_DATA_YET_LIMIT_SECONDS` it raises
-    :class:`TimeoutError`, an ``OSError``, so a source that stalls ends the copy as a failure rather
-    than holding the worker thread. A blocking source does not answer ``None``, so for one this
-    yields the same reads the old loops wrote (BACKLOG #6687)."""
+    again. A run of ``None`` reads with no byte between them that lasts
+    :data:`_NO_DATA_YET_LIMIT_SECONDS` raises :class:`TimeoutError`, an ``OSError``. Any read that
+    returns bytes starts that limit again, so it bounds one stall, not the whole copy: a source that
+    sends a byte inside each limit is read for as long as it keeps doing so. A blocking source does
+    not answer ``None``, so for one this yields the same reads the old loops wrote (BACKLOG #6687)."""
     stalled_since: float | None = None
     while True:
         buf = src.read(_COPY_CHUNK_BYTES)
