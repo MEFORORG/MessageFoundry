@@ -286,7 +286,7 @@ def test_anon_files_do_not_self_trip_the_publish_guard() -> None:
 
 
 def test_golden_corpus_engine_output_equals_tee_output() -> None:
-    salt = "golden-salt-0123456789abcdef"
+    salt = "golden-salt-0123456789abcdef-0123456789"
     checked = 0
     for code in _core.message_codes():
         for trigger in _core.triggers_for(code):

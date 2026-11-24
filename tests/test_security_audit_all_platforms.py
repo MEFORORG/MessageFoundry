@@ -13,6 +13,7 @@ pip-audit). ``tests/test_audit_all_platforms.py`` pins the engine's workflows to
 from __future__ import annotations
 
 import codecs
+import errno
 import io
 import locale
 import os
@@ -21,6 +22,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -1042,6 +1044,172 @@ def test_a_lock_character_stdout_cannot_encode_does_not_raise(
     out.flush()
     assert f"foo==1 ; sys_platform == '{_HAN}'" in raw.getvalue().decode("utf-8")
     assert len(ran) == 2
+
+
+def _closed_pipe() -> int:
+    """The write end of a pipe whose reader has already gone."""
+    read_end, write_end = os.pipe()
+    os.close(read_end)
+    return write_end
+
+
+def test_a_closed_stdout_pipe_exits_2_before_the_audit_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """R5: a reader that closed the pipe made the summary raise (OSError errno 22 on Windows,
+    BrokenPipeError elsewhere) as a traceback. ``main`` refuses with exit 2 instead, and runs
+    neither pip nor pip-audit. The guard covers the summary's write: a reader that leaves after
+    it is not caught here."""
+    out = io.TextIOWrapper(open(_closed_pipe(), "wb"), encoding="utf-8")  # noqa: SIM115 -- closed in the finally below
+    monkeypatch.setattr(sys, "stdout", out)
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    try:
+        assert main([str(src)], run=run) == 2
+    finally:
+        audit_module._flush_or_discard(out)
+        out.close()
+    assert ran == []
+    err = capsys.readouterr().err
+    assert f"::error::{src}: the summary could not be written to stdout (" in err
+    assert "Traceback" not in err
+
+
+class _Gone(io.TextIOBase):
+    """A stdout whose reader went away, with no descriptor to point at devnull."""
+
+    def write(self, s: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("fileno")
+
+    def close(self) -> None:
+        """Collected without the flush ``IOBase.close`` would raise from."""
+
+
+@pytest.mark.parametrize("stdout", [_Gone, lambda: None], ids=["broken-pipe-no-fileno", "none"])
+def test_a_stdout_that_cannot_take_the_summary_exits_2(
+    stdout: Callable[[], object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """R5: a stream with no descriptor, and no stream at all (``None`` under pythonw), end in
+    the same exit 2 refusal, before pip or pip-audit runs."""
+    monkeypatch.setattr(sys, "stdout", stdout())
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    ran, run = _recorder(0)
+    assert main([str(src)], run=run) == 2
+    assert ran == []
+    err = capsys.readouterr().err
+    assert err.startswith(f"::error::{src}: ")
+    assert err.rstrip().endswith("the audit did not run")
+
+
+def _cli_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int) -> None:
+    """Point ``cli`` at a clean lock, the pip check answering 0 and pip-audit ``status``."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["audit_all_platforms", str(src)])
+    # The pip check answers 0, so the status cli returns is pip-audit's own.
+    monkeypatch.setattr(
+        audit_module, "_run", lambda cmd, pass_environment: status if "pip_audit" in cmd else 0
+    )
+
+
+@pytest.mark.parametrize("status", [0, 1])
+def test_cli_passes_the_audit_status_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    _cli_on(tmp_path, monkeypatch, status)
+    assert audit_module.cli() == status
+
+
+def test_an_unrelated_oserror_from_main_still_raises_through_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a refusal's own stream write is held to exit 2. Any other OSError keeps its
+    traceback, one with errno EINVAL included: Windows gives that errno to every Win32 error it
+    has no other mapping for, such as WinError 123 from a bad RUNNER_TEMP."""
+    _cli_on(tmp_path, monkeypatch, 0)
+
+    def bad_temp(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError(errno.EINVAL, "Invalid argument", "C:\\bad<dir", 123)
+
+    monkeypatch.setattr("tempfile.TemporaryDirectory", bad_temp)
+    with pytest.raises(OSError, match="Invalid argument"):
+        audit_module.cli()
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["stdout", "stdout-and-stderr"])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        ["-m", "messagefoundry.security.audit_all_platforms"],
+        ["scripts/security/audit_all_platforms.py"],
+    ],
+    ids=["module", "script"],
+)
+def test_a_closed_stdout_pipe_leaves_exit_2_at_interpreter_exit(
+    tmp_path: Path, entry: list[str], shared: bool
+) -> None:
+    """R5, as a process: what stayed buffered is flushed again at exit, so without the descriptor
+    pointed at devnull that flush raised once more and the exit code was 120. With ``2>&1`` into
+    the same closed pipe, stderr's own unwritten ::error:: line did the same."""
+    src = tmp_path / "x.lock"
+    src.write_text(LOCK, encoding="utf-8")
+    write_end = _closed_pipe()
+    try:
+        proc = subprocess.run(
+            [sys.executable, *entry, str(src)],
+            cwd=ROOT,
+            stdout=write_end,
+            stderr=write_end if shared else subprocess.PIPE,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+    err = "" if shared else proc.stderr.decode("utf-8", "replace")
+    assert proc.returncode == 2, err
+    if not shared:
+        assert f"::error::{src}: the summary could not be written to stdout (" in err
+        assert "Traceback" not in err
+        assert "Exception ignored" not in err
+
+
+@pytest.mark.parametrize(
+    ("lock", "argv"),
+    [("", ["x.lock"]), (None, [])],
+    ids=["empty-lock-refusal", "usage-error"],
+)
+def test_a_refusal_into_a_closed_pipe_still_exits_2(
+    tmp_path: Path, lock: str | None, argv: list[str]
+) -> None:
+    """R5: with ``2>&1`` into a closed pipe, a refusal's own ``::error::`` line (stderr is line
+    buffered) raised out of ``main``, and argparse's usage error left text to fail at exit."""
+    if lock is not None:
+        (tmp_path / "x.lock").write_text(lock, encoding="utf-8")
+    write_end = _closed_pipe()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "messagefoundry.security.audit_all_platforms", *argv],
+            cwd=tmp_path,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+            stdout=write_end,
+            stderr=write_end,
+            timeout=120,
+            check=False,
+        )
+    finally:
+        os.close(write_end)
+    assert proc.returncode == 2
 
 
 def _seen_by(

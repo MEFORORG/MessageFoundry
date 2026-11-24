@@ -47,6 +47,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination, bool_setting
+from messagefoundry.config.tls_policy import refuse_chain_check_on_os_roots
 from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import json_loads_or_refusal, refuse_repeated_keys
 from messagefoundry.transports.base import (
@@ -75,9 +76,8 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _insecure_opener,
     _latin1_refusal_position,
-    _no_redirect_opener,
     _redact_url,
-    _shared_no_redirect_opener,
+    _verifying_opener,
     assert_probe_hop,
     auth_challenge_refused,
     egress_route_from_settings,
@@ -524,10 +524,14 @@ class DicomWebDestination(DestinationConnector):
             anchor = http_family_trust_anchor(
                 s, url=self.base_url, trust_anchor_policy=config.trust_anchor_policy
             )
-            self._opener: urllib.request.OpenerDirector = (
-                _no_redirect_opener(*proxy_handlers, trust_anchor=anchor)
-                if proxy_handlers or anchor.narrows
-                else _shared_no_redirect_opener()
+            if scheme == "http":
+                # The same refusal for an http url, worded so it does not say the hop verifies its
+                # server: the opener makes no TLS connection to the partner (vault BACKLOG #5511).
+                refuse_chain_check_on_os_roots(
+                    anchor, cleartext=True, connection_kind="DICOMweb connection"
+                )
+            self._opener: urllib.request.OpenerDirector = _verifying_opener(
+                *proxy_handlers, trust_anchor=anchor
             )
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
             # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI

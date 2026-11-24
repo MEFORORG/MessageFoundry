@@ -807,8 +807,12 @@ if ((Get-Folded $j.provenance) -eq "UNVERIFIED") {
 # A FLOOR, WHATEVER ITS VERDICT, AND SO DOES A STALE READING CRITICAL BY A PROJECTED RUN-OUT. Each is a
 # stale number, and the verdict can be CRITICAL, so testing UNKNOWN alone would leave a session the gate
 # has halted with no word of why, or that nothing it does can refresh the file.
+# NOT A FRESH READING WHOSE RATE THE READER REFUSED (BACKLOG #5494): usage.ps1 sets rate_refused only on
+# a fresh one, so its UNKNOWN is no unconfirmed number, unless the wiring is what made it UNKNOWN; an
+# explicit -StateDir is exempt from the wiring, as it is in usage.ps1.
 $staleAge = $j.seven_day.reading_age_min -as [double]
-$unconfirmed = $state -eq "UNKNOWN" -or $null -ne $j.seven_day.level_floor -or
+$freshRefusal = $j.seven_day.rate_refused -and ($StateDir -or (Get-Folded $j.statusline_state 60) -in @("WIRED_HERE", "WIRED_POWERSHELL_SOURCE"))
+$unconfirmed = ($state -eq "UNKNOWN" -and -not $freshRefusal) -or $null -ne $j.seven_day.level_floor -or
     ($null -ne $j.seven_day.reading_age_min -and $staleAge -gt $MaxAgeMinutes)
 if ($unconfirmed) {
     $lines += @(Get-CauseNote $j)

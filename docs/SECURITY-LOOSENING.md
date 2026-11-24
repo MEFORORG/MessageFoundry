@@ -1632,10 +1632,10 @@ count is above `0` (vault BACKLOG #2613).
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
   endpoint is not loopback. `messagefoundry serve` hands its app that section. A direct
-  `create_app` (the embedded path) holds none unless its embedder sets `app.state.tls_settings`
-  to a `TlsSettings`.
+  `create_app` (the embedded path) holds none unless its embedder passes a `TlsSettings` as
+  `tls_settings` or sets `app.state.tls_settings` to one.
   So at least these check no CRL, whatever `[tls].crl_file` says: a loopback endpoint, and an app
-  the `[tls]` section never reached, such as a direct `create_app` whose embedder did not set it.
+  the `[tls]` section never reached, such as a direct `create_app` whose embedder did neither.
   Without such a CRL, an `[ai].endpoint` whose host is not loopback is refused under
   `[security].enforcement = enforce`, and wherever a broker is built without a known posture,
   which counts as enforcing. The broker is built for each `POST /ai/chat` request, so the refusal
@@ -2459,7 +2459,8 @@ count is above `0` (vault BACKLOG #2613).
   start has passed its remote-debugging gate, so a fleet refused at an earlier gate logs none.
   Where that gate refuses, `serve` and `supervise` log `remote_debug_unguarded` if the hook did not
   answer, and nothing for `remote_debug_enabled`. `supervise` logs the line a second time once its off-box log forwarder is installed, so the collector's
-  copy has it. No API reports that process afterwards. The engine's Python children start with the interface
+  copy has it. Where the gate refuses, `supervise` writes its `remote_debug_unguarded` line to
+  standard output, before the refusal, which goes to standard error. No API reports that process afterwards. The engine's Python children start with the interface
   off (`messagefoundry/childenv.py`), so an engine shard reports nothing.
   `messagefoundry security show` is a separate process, so it reports neither entry, and its scope
   line says so. Other commands, such as `rotate-key`, `backup` and `restore`, install the hook

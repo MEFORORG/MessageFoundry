@@ -37,7 +37,9 @@ KeyProvider's no-oracle contract and PHI.md never-log rules).
 from __future__ import annotations
 
 import importlib
+import logging
 import os
+import re
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -117,6 +119,29 @@ _EXTERNAL_PROVIDERS: dict[str, str] = {
 #: Every accepted ``[secrets].provider`` value (``none`` + built-in + external), for validation + errors.
 KNOWN_PROVIDERS: tuple[str, ...] = ("none", *_BUILTIN_PROVIDERS, *tuple(_EXTERNAL_PROVIDERS))
 
+_log = logging.getLogger(__name__)
+
+#: A dotted module name, the only part of an ``ImportError`` this module logs besides its class.
+_MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,199}")
+
+
+def log_import_failure(label: str, exc: BaseException) -> None:
+    """Log at WARNING that an import behind ``label`` failed, by the error's class (vault BACKLOG
+    #6709). The refusal the caller raises drops the error, so this line is what is left to
+    diagnose from. The error's text is not logged: neither the engine's PHI redaction nor its
+    credential scrub removes a filesystem path, and an import error's text can carry one, or a
+    source line. An ``ImportError``'s module name is logged when it is a plain dotted name."""
+    module = getattr(exc, "name", None) if isinstance(exc, ImportError) else None
+    named = (
+        f", module {module!r}" if isinstance(module, str) and _MODULE_NAME.fullmatch(module) else ""
+    )
+    _log.warning(
+        "%s: an import failed (%s%s); its text is not logged, as it can carry a filesystem path",
+        label,
+        type(exc).__name__,
+        named,
+    )
+
 
 def _load_external_provider(
     name: str, settings: SecretsSettings, posture: HopPosture | None
@@ -125,8 +150,12 @@ def _load_external_provider(
 
     The seam: a per-provider module ``messagefoundry/config/secretprovider_<name>.py`` exposes
     ``build_provider(settings, *, posture) -> SecretProvider`` behind an optional extra; this
-    dispatch imports it by name with **no edit here**. A missing provider module or a missing
-    backend SDK **fails closed** naming the extra — the base install pulls **zero** external SDK.
+    dispatch imports it by name with **no edit here**. A missing provider module, a missing backend
+    SDK, or a provider module that is present but whose import raises an ``Exception``, **fails
+    closed** with :class:`SecretProviderError`; the last two name the extra. The base install pulls
+    **zero** external SDK. A provider that imports its SDK lazily, as ``vault`` does, refuses a
+    failed SDK import itself, at its first read rather than here
+    (``secretprovider_vault._import_hvac``).
 
     ``posture`` is handed to every external provider, because each one dials a network hop that a
     posture-keyed guard may judge (vault BACKLOG #2983). A provider must read ``None`` as
@@ -146,8 +175,23 @@ def _load_external_provider(
             f"[secrets].provider={name!r} could not load its backend ({exc.name!r} is missing) — "
             f"install the optional {extra!r} extra ('messagefoundry[{extra}]')."
         ) from exc
-    provider: SecretProvider = module.build_provider(settings, posture=posture)
-    return provider
+    except Exception as exc:  # noqa: BLE001 -- an import runs top-level code that may raise any class; refused below, logged by class
+        # Present but broken: a C extension that fails to load, a name the SDK no longer has, or
+        # any other error from the module's top-level code, such as an OSError, an AttributeError
+        # or a SyntaxError in a truncated file (vault BACKLOG #6709). The text names the provider
+        # and the error's class only: an import error's own text can carry a filesystem path or a
+        # source line, and this text reaches operator output. The refusal is raised outside this
+        # handler with no chain, so a rendered traceback does not carry the error's text either.
+        failed = type(exc).__name__
+        log_import_failure(f"[secrets].provider={name!r}", exc)
+    else:
+        provider: SecretProvider = module.build_provider(settings, posture=posture)
+        return provider
+    raise SecretProviderError(
+        f"[secrets].provider={name!r} could not load its provider module or backend (an import "
+        f"failed: {failed}) — reinstall MessageFoundry with the optional {extra!r} extra "
+        f"('messagefoundry[{extra}]')."
+    )
 
 
 def resolve_secret_provider(

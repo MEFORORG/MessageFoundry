@@ -963,6 +963,18 @@ def _value_labels(value: ast.expr | None, m: ParsedModule) -> list[str]:
         return [f" {value.value}"]
     if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Invert):
         return [f" ~{inner.strip()}" if inner else "" for inner in _value_labels(value.operand, m)]
+    if (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "int"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        # ``~int(FLAG)`` clears FLAG alone where ``~FLAG`` also clears every bit the IntFlag does
+        # not name (vault BACKLOG #5511), so the two keep distinct tokens, each naming the flag.
+        return [
+            f" int({inner.strip()})" if inner else "" for inner in _value_labels(value.args[0], m)
+        ]
     labels = [f" {q.rpartition('.')[2]}" for q in m.resolve(value)]
     return list(dict.fromkeys(labels)) or [""]
 

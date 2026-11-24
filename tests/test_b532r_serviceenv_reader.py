@@ -25,6 +25,7 @@ from messagefoundry.serviceenv import (
     read_service_env_posture,
     service_env_refusal,
 )
+from tests._serviceenv_remedy import CREATE, REMOVE, RUNS_ON
 
 #: A store-key-shaped stand-in: 32 bytes of ASCII, so 44 base64 characters ending in one ``=``.
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
@@ -135,7 +136,7 @@ def test_the_refusal_says_to_remove_the_strings_a_value_runs_on_into() -> None:
     assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert "runs on into the strings after it in the same registry value" in refusal
+    assert RUNS_ON in refusal
     one_line = _read([f"{key}={_KEY_B64}"])
     assert not one_line.value_runs_on
     assert "runs on into" not in str(service_env_refusal(one_line))
@@ -330,7 +331,6 @@ def test_the_module_names_no_branch_or_head_as_its_baseline() -> None:
 #: A secret whose base64 carries exactly one ``=`` of padding: 17 bytes make 24 characters.
 _ONE_PAD = base64.b64encode(b"synthetic-tok-017").decode()
 _KEY_RUN = "A" * 43
-_RUNS_ON = "runs on into the strings after it in the same registry value"
 
 
 def test_the_one_pad_stand_in_has_one_padding_character() -> None:
@@ -412,13 +412,13 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     posture = _read(posture_items)
     assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
-    # Without the directory item, the same refusal says the lists set none: the control.
+    # Without the directory item, the same refusal says no entry names it: the control.
     secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"
     refusal = service_env_refusal(_read([*posture_items, secret]))
     assert refusal is not None
-    assert "The service's lists set no" not in refusal
+    assert CREATE not in refusal
     control = service_env_refusal(_read(["MEFOR_STORE_PASSWORD=", secret]))
-    assert control is not None and "The service's lists set no" in control
+    assert control is not None and CREATE in control
 
 
 @pytest.mark.parametrize(
@@ -434,13 +434,15 @@ def test_a_directory_item_set_to_nothing_on_its_first_line_is_taken_into_an_empt
 ) -> None:
     """With its path on a later line, the directory item's first line sets it to nothing, which
     is not positively a variable of its own, so the empty password above takes it and refuses
-    (vault BACKLOG #5394). The remedy then says the directory string was read into it, past any
-    item of equals signs alone between them, and does not say the lists set no directory."""
+    (vault BACKLOG #5394), past any item of equals signs alone between them. The remedy says to
+    remove what the value runs on into and, since no entry is read as naming the directory, how
+    one is created where none exists."""
     posture = _read([*items, "MEFOR_VALUE_A=1"])
     assert "MEFOR_STORE_PASSWORD" in posture.listed
-    assert posture.value_runs_on and posture.directory_joined
+    assert posture.value_runs_on
     refusal = service_env_refusal(posture)
-    assert refusal is not None and "The service's lists set no" not in refusal
+    assert refusal is not None
+    assert REMOVE in refusal and RUNS_ON in refusal and CREATE in refusal
 
 
 #: A base64url secret with two ``=`` of padding and both ``-`` and ``_`` in it.
@@ -512,7 +514,7 @@ def test_an_empty_pem_key_that_runs_on_into_a_path_refuses_with_the_run_on_step(
     assert posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert _RUNS_ON in refusal
+    assert RUNS_ON in refusal
 
 
 def test_no_runs_on_step_when_only_a_variable_that_did_not_run_on_is_refused() -> None:
@@ -524,7 +526,7 @@ def test_no_runs_on_step_when_only_a_variable_that_did_not_run_on_is_refused() -
     assert not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert _RUNS_ON not in refusal
+    assert RUNS_ON not in refusal
 
 
 def test_a_broken_value_name_whose_value_is_the_next_item_says_to_remove_it() -> None:
@@ -534,7 +536,7 @@ def test_a_broken_value_name_whose_value_is_the_next_item_says_to_remove_it() ->
     assert posture.listed_value_names == ("MEFOR_VALUE_A",)
     assert posture.empty_value_names == ()
     assert posture.value_runs_on
-    assert _RUNS_ON in str(service_env_refusal(posture))
+    assert RUNS_ON in str(service_env_refusal(posture))
 
 
 def test_a_broken_name_is_not_counted_away_by_a_name_in_the_next_item() -> None:

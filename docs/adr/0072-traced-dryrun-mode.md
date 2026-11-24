@@ -1,6 +1,6 @@
 # ADR 0072 — Traced dry-run mode: `dryrun --trace json` for the interactive live-debug loop
 
-**Status:** Accepted (2026-07-06). Ratified by the owner — the engine lane (MULTISESSION-PLAN-7 **L5**) may build. The traced mode is **additive + opt-in**; nothing here changes the shipped `dryrun` default. The §6 test gates are the acceptance criteria (byte-identical run · live-lookup identical · coverage-intact · redacted-by-default). **Amended 2026-08-04 (BACKLOG #341)** — gate 1 stated a single byte-identical equality; the repo reads it at two levels (message-level and per-invocation), and widening `_partition` to fan out any non-`str` iterable made a **generator Handler** deliver where it previously delivered nothing, which the per-invocation mirror cannot observe. Gate 1 in §6 is split by level and given an explicit generator carve-out, and §3 gains the `lazy_result` field that declares it. The message-level guarantee — the one the ADR exists to make — is **unchanged and still absolute**.
+**Status:** Accepted (2026-07-06). Ratified by the owner — the engine lane (MULTISESSION-PLAN-7 **L5**) may build. The traced mode is **additive + opt-in**; nothing here changes the shipped `dryrun` default. The §6 test gates are the acceptance criteria (byte-identical run · live-lookup identical · coverage-intact · redacted-by-default). **Amended 2026-11-24 (BACKLOG #6823)** — on the Handler half, `lazy_result` now marks any iterable return whose exact type is not `list`/`tuple`/`set`/`frozenset` (except `str`/`bytes`/`bytearray`), which reports no per-invocation sends; see the amendment at the end, which supersedes §3 and gate 1b there. **Amended 2026-08-04 (BACKLOG #341)** — gate 1 stated a single byte-identical equality; the repo reads it at two levels (message-level and per-invocation), and widening `_partition` to fan out any non-`str` iterable made a **generator Handler** deliver where it previously delivered nothing, which the per-invocation mirror cannot observe. Gate 1 in §6 is split by level and given an explicit generator carve-out, and §3 gains the `lazy_result` field that declares it. The message-level guarantee — the one the ADR exists to make — is **unchanged and still absolute**.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#92** (interactive live-debug loop — the primary consumer, v2), BACKLOG **#84** (Test Bench profiling/coverage — the second consumer), BACKLOG **#48** (Insert Element palette — sibling DX lane), ADR 0004 (payload-agnostic ingress — `RawMessage` vs `Message` in a handler), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned non-pure reads that raise in dry-run), CLAUDE.md §9 (PHI handling — `dryrun` output can contain full bodies). Plan: `docs/releases/MULTISESSION-PLAN-7.md` (L5 builds this; L6/L7 consume it).
 **Code references** are `origin/main @ 0f0ba08`; line numbers are approximate — locate exactly at implementation time.
@@ -97,6 +97,22 @@ The sanctioned non-pure reads (ADR 0010/0043) are **unavailable in dry-run and r
 - **`debugpy` / DAP (already shipped for step-through).** Interactive breakpoints require a live debug session and user-driven stepping; it does not yield a passive, deterministic per-statement value stream on every save. Kept for its purpose (Test Bench "Debug"); not the #92 data source.
 - **AST instrumentation / bytecode rewriting.** Could attribute values to sub-expressions more precisely, but it rewrites author code, is fragile across Python versions, and risks diverging behavior from the real run (violating the byte-identical guarantee). Rejected for v1; a bounded AST-assisted *value-timing* refinement is a possible v2.
 - **Enrich the existing `--json` with per-handler attribution only** (add a `handler` tag to `DeliveryPreview`). Cheap, and it would let #92 **v1** show accurate multi-handler summaries — but it yields **no per-statement data**, so it cannot drive #92 v2 or #84 profiling/coverage. Noted as the **owner option** in MULTISESSION-PLAN-7 §H for v1 only; insufficient as the v2 contract.
+
+## Amendment 2026-11-24 (BACKLOG #6823) — `lazy_result` on the Handler half
+
+The §3 `lazy_result` text and the gate 1b carve-out above are kept as accepted text, and this
+amendment supersedes them for the Handler half where they differ. Gate 1b names "the `_sends_from` iterator guard". That guard tested
+`isinstance(result, Iterator)`, and it was not enough: an object whose `__iter__` returns a stored
+generator is single-pass but not an `Iterator`, so the tracer walked it, `_partition` then found it
+empty, and a traced run read `FILTERED` with zero deliveries where the untraced run delivered —
+a gate 1a break. The guard is removed. The tracer now walks a Handler return only when its exact
+type is `list`, `tuple`, `set` or `frozenset` (checked by identity). For any other iterable Handler
+return except `str`/`bytes`/`bytearray`, the invocation reports `sends: []` and carries
+`"lazy_result": true`. On the Handler half, `lazy_result` therefore means: *the return was such an
+iterable, so the trace reports no per-invocation sends*. It no longer implies the body was not
+traced: only a generator Handler also has no line events. Gate 1a is unchanged and still absolute.
+→ `tests/test_dryrun_trace.py::test_gate_1a_a_single_pass_iterable_handler_traces_byte_identically`,
+`tests/test_dryrun_trace.py::test_gate_1a_a_single_pass_container_subclass_handler_is_not_drained`.
 
 ---
 

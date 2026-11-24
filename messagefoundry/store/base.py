@@ -2652,10 +2652,11 @@ class AuthStore(Protocol):
     ) -> None: ...
 
     # ``email`` here is the account's PROFILE address, and on an AD/OIDC account the directory's
-    # mirror: ``_upsert_ad_user`` calls this on every directory login and the write is unconditional,
-    # so whatever the directory's ``mail`` attribute says wins. IT IS NOT THE NOTIFICATION TARGET, and
-    # this method must never gain that column (BACKLOG #1139) -- handing the directory sync the
-    # notification address back is the whole defect the split removes.
+    # mirror: ``_upsert_ad_user`` calls this on every directory login whose profile values differ
+    # from the row's (BACKLOG #5653 item 1), so whatever the directory's ``mail`` attribute says
+    # wins. IT IS NOT THE NOTIFICATION TARGET, and this method must never gain that column (BACKLOG
+    # #1139) -- handing the directory sync the notification address back is the whole defect the
+    # split removes.
     async def update_user_profile(
         self,
         user_id: str,
@@ -3418,8 +3419,22 @@ class AuthStore(Protocol):
         auth_mechanism: str | None = None,
         idp_auth_time: float | None = None,
         mfa_verified: bool = False,
+        require_sign_in_eligible: bool = False,
     ) -> bool:
         """Insert a session row. Returns ``True`` when one was written.
+
+        **``False`` is a refusal by the account, and has at least these causes**, with nothing
+        written: no row for ``user_id``; under ``require_federated_subject``, a binding other than
+        the one named; under ``require_sign_in_eligible``, a row disabled or holding either lock
+        live. Each is described below.
+
+        **Contention is not a refusal and is RAISED** as
+        :class:`~messagefoundry.store.SessionMintContended`, with nothing written (BACKLOG
+        #5653), once every bounded attempt met it: a revoke raised a session epoch the seal covers
+        before the attempt's locked read (``cause`` ``session_epoch_raised``, every backend), or
+        SQLite answered busy to its ``BEGIN IMMEDIATE`` (``cause`` ``busy``, SQLite under
+        ``require_sign_in_eligible`` only). A SQLite run whose attempts met both names
+        ``busy_and_session_epoch_raised``. Any other store error is raised as it arose.
 
         ``auth_mechanism`` records how the session was minted (``password``, ``kerberos`` or
         ``oidc``; ADR 0184 item (iv)). It is written once here and never updated, and
@@ -3459,6 +3474,14 @@ class AuthStore(Protocol):
         :meth:`mark_session_mfa_verified` afterwards, a second transaction that wrote nothing on a
         row revoked in between and said nothing, so the sign-in went on to supersede the caller's
         prior session and return a dead token as a success.
+
+        ``require_sign_in_eligible`` also refuses, with ``False`` and nothing written, an account
+        that is disabled or holds either lock live at ``now`` (BACKLOG #5653), read in the same
+        locked transaction as the binding. A caller's own check of those states before the call
+        leaves a disable or a lockout free to commit between that check and the INSERT, and a
+        disable's session sweep cannot see a session that does not exist yet. The directory sign-in
+        passes it. The password sign-in does not, since a combined sign-in may complete on an
+        account under the sign-in lock (ADR 0197).
         """
         ...
 
@@ -5231,7 +5254,7 @@ async def _close_quietly(store: Store, exc: BaseException, cancels_before: int) 
     ``exc``. The close runs through :func:`~messagefoundry.store.store.cleanup_failed_open`, so a
     cancel cannot cut it short (BACKLOG #5720); that raises a cancel that landed meanwhile when
     ``exc`` is an ``Exception``. The ``Store`` protocol names no synchronous release, so past the
-    cancel's bound the close is left to finish on its own, and that is logged."""
+    cancel's bound the close is left to finish, if it does, and that is logged."""
     from messagefoundry.store.store import cleanup_failed_open
 
     await cleanup_failed_open(
