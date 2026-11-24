@@ -18,12 +18,14 @@ import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.pipeline import intake_bound
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.intake_bound import DISK_REASON, IntakeBoundMonitor
 from messagefoundry.pipeline.retention import DiskFloorReading
 from messagefoundry.store import Store
@@ -107,6 +109,23 @@ class _Clock:
 
     def __call__(self) -> float:
         return self.now
+
+
+class _Sink(LoggingAlertSink):
+    """Counts the pause alerts. Every other event logs."""
+
+    def __init__(self) -> None:
+        self.paused = 0
+
+    def intake_paused(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        self.paused += 1
+
+    def intake_resumed(
+        self, name: str, *, reason: str, value: int, limit: int, store_kind: str
+    ) -> None:
+        pass
 
 
 class _Store:
@@ -292,6 +311,109 @@ async def test_probing_resumes_once_a_stuck_thread_exits_at_the_cap(
             clock.now += _PAST_STUCK_LIMIT
     assert len([r for r in caplog.records if "stopped starting" in r.getMessage()]) == 1
     await probe.finish_hung(monitor)
+
+
+async def _reach_cap(
+    monitor: IntakeBoundMonitor,
+    probe: _Probe,
+    clock: _Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe.hang = True
+    expected = probe.started + CAP
+    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", 0.02)
+    for _ in range(CAP * 3):
+        await monitor.check_once()
+        clock.now += _PAST_STUCK_LIMIT
+    await probe.wait_started(expected)
+    monkeypatch.setattr(intake_bound, "PROBE_TIMEOUT_SECONDS", _HEALTHY_TIMEOUT)
+
+
+async def test_running_again_is_logged_only_after_the_replacement_started(
+    tmp_path: Path,
+    probe: _Probe,
+    clock: _Clock,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(_: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    await _reach_cap(monitor, probe, clock, monkeypatch)
+    await probe.finish_hung(monitor)
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        with monkeypatch.context() as patch:
+            patch.setattr(threading.Thread, "start", refuse)
+            await monitor.check_once()
+        assert not [r for r in caplog.records if "running again" in r.getMessage()]
+        await monitor.check_once()
+    assert len([r for r in caplog.records if "running again" in r.getMessage()]) == 1
+
+
+async def test_a_finalizer_failure_leaves_no_unowned_thread(
+    tmp_path: Path, probe: _Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*_: object) -> None:
+        raise MemoryError("no finalizer")
+
+    before = set(threading.enumerate())
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    with monkeypatch.context() as patch:
+        patch.setattr(intake_bound, "weakref", SimpleNamespace(finalize=refuse))
+        await monitor.check_once()  # must not raise
+    started = [t for t in set(threading.enumerate()) - before if t.name == "intake-disk-probe"]
+    assert not started, "a probe thread started with nothing owning it"
+    assert probe.started == 0
+
+
+async def test_a_dead_worker_drops_its_finalizer(tmp_path: Path, probe: _Probe) -> None:
+    monitor = _disk_monitor(tmp_path, IntakeGate())
+    await monitor.check_once()
+    dead = cast(Any, monitor)._probe_worker
+    dead.inbox.put(None)
+    await asyncio.to_thread(dead.thread.join, 10.0)
+    assert not dead.thread.is_alive(), "control: the worker died"
+    assert dead.close.alive, "control: its finalizer is still registered"
+    await monitor.check_once()
+    assert not dead.close.alive, "a dead worker's finalizer stayed registered"
+    assert probe.started == 2, "a replacement worker measured"
+    await monitor.stop()
+
+
+async def test_at_the_cap_a_held_pause_keeps_reminding_and_an_open_gate_claims_no_pause(
+    tmp_path: Path, probe: _Probe, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``intake_paused`` is the only disk alert, and it says intake IS paused. With the gate open
+    that would be false, so the cap raises none; a held pause keeps its reminders."""
+
+    def monitor_on(gate: IntakeGate, sink: _Sink) -> IntakeBoundMonitor:
+        return IntakeBoundMonitor(
+            cast(Store, _Store(tmp_path / "s.db")),
+            gate,
+            min_free_disk_mb=FLOOR_MIB,
+            alert_sink=sink,
+        )
+
+    open_sink = _Sink()
+    open_monitor = monitor_on(IntakeGate(), open_sink)
+    await _reach_cap(open_monitor, probe, clock, monkeypatch)
+    assert open_sink.paused == 0, "an open gate must not report a pause"
+    await probe.finish_hung(open_monitor)
+
+    held_sink = _Sink()
+    gate = IntakeGate()
+    held = monitor_on(gate, held_sink)
+    probe.free_mib = LOW_MIB
+    await held.check_once()
+    assert gate.reasons == {DISK_REASON} and held_sink.paused == 1, "control: the pause is held"
+    await _reach_cap(held, probe, clock, monkeypatch)
+    at_cap = held_sink.paused
+    assert at_cap > 1, "control: reminders ran on the way to the cap"
+    clock.now += _PAST_STUCK_LIMIT
+    await held.check_once()
+    assert held_sink.paused == at_cap + 1, "a held pause must keep reminding at the cap"
+    await probe.finish_hung(held)
 
 
 async def test_healthy_ticks_reuse_one_thread(tmp_path: Path, probe: _Probe) -> None:

@@ -213,10 +213,14 @@ class _DiskProbeWorker:
 
     __slots__ = ("busy_since", "close", "inbox", "thread")
 
-    def __init__(self) -> None:
+    def __init__(self, owner: object) -> None:
         self.inbox: queue.SimpleQueue[_DiskRequest | None] = queue.SimpleQueue()
         self.busy_since: float | None = None
-        self.close: Callable[[], object] | None = None
+        # Built before the thread starts, so no running thread can lack it. It holds the queue only,
+        # so an owner dropped without stop() still ends its idle thread.
+        closer = weakref.finalize(owner, self.inbox.put, None)
+        closer.atexit = False
+        self.close: Callable[[], object] = closer
         self.thread = threading.Thread(
             target=_serve_disk_probes,
             args=(self.inbox,),
@@ -244,8 +248,12 @@ def _serve_disk_probes(inbox: queue.SimpleQueue[_DiskRequest | None]) -> None:
             outcome = (None, exc)
         try:
             request.loop.call_soon_threadsafe(_finish_disk_probe, request, outcome)
-        except RuntimeError:  # the loop closed while this call was blocked
-            log.debug("an intake disk probe outlived its loop", exc_info=outcome[1])
+        except RuntimeError as exc:  # the loop closed while this call was blocked
+            log.debug(
+                "an intake disk probe could not reach its loop (%s); its outcome (%s) is dropped",
+                type(exc).__name__,
+                type(outcome[1]).__name__ if outcome[1] is not None else "a reading",
+            )
 
 
 def _finish_disk_probe(request: _DiskRequest, outcome: _DiskOutcome) -> None:
@@ -674,11 +682,12 @@ class IntakeBoundMonitor:
         :data:`PROBE_STUCK_SECONDS` is abandoned and replaced, so one wedged call does not end
         measuring, and at most :data:`MAX_ABANDONED_DISK_PROBES` abandoned threads may be alive. At
         that cap no probe starts until one of them returns, so calls wedged for good leave the bound
-        unmeasured until a restart, which can itself block while the volume is still hung. Only the
-        tick that started a probe uses its result."""
+        unmeasured until a restart; ``[retention].min_free_disk_mb`` in ``docs/CONFIGURATION.md``
+        says when one can work. Only the tick that started a probe uses its result."""
         self._abandoned_probes = [t for t in self._abandoned_probes if t.is_alive()]
         worker = self._probe_worker
         if worker is not None and not worker.thread.is_alive():
+            worker.close()  # a dead worker reads no sentinel; this drops its finalizer
             worker = self._probe_worker = None
         if worker is not None and worker.busy_since is not None:
             if _monotonic() - worker.busy_since < PROBE_STUCK_SECONDS:
@@ -691,25 +700,25 @@ class IntakeBoundMonitor:
                 log.warning(
                     "intake pause: %d disk probes are stuck on the SQLite store's volume, so the "
                     "engine stopped starting new ones. The disk pause state cannot change until "
-                    "one of them returns and a new probe succeeds. A restart also clears this, but "
-                    "only once the volume answers: a start on a hung volume can block",
+                    "one of them returns and a new probe succeeds. Before restarting the engine, "
+                    "read [retention].min_free_disk_mb in docs/CONFIGURATION.md: a restart can "
+                    "block or be refused",
                     len(self._abandoned_probes),
                 )
             return None, None
+        if worker is None:
+            new_worker: _DiskProbeWorker | None = None
+            try:
+                new_worker = _DiskProbeWorker(self)
+                new_worker.thread.start()
+            except Exception as exc:  # advisory: an unmeasured tick, never a dead monitor
+                if new_worker is not None:
+                    new_worker.close()  # never started: drop its finalizer
+                return None, exc
+            worker = self._probe_worker = new_worker
         if self._probe_cap_logged:
             self._probe_cap_logged = False
             log.info("intake pause: a stuck disk probe returned; disk probes are running again")
-        if worker is None:
-            try:
-                worker = _DiskProbeWorker()
-                worker.thread.start()
-            except Exception as exc:  # advisory: an unmeasured tick, never a dead monitor
-                return None, exc
-            # Holds the queue only, so a monitor dropped without stop() still ends its idle thread.
-            closer = weakref.finalize(self, worker.inbox.put, None)
-            closer.atexit = False
-            worker.close = closer
-            self._probe_worker = worker
         loop = asyncio.get_running_loop()
         waiter: asyncio.Future[_DiskOutcome] = loop.create_future()
         worker.busy_since = _monotonic()
@@ -724,8 +733,7 @@ class IntakeBoundMonitor:
         is idle; until then it counts against the cap."""
         worker, self._probe_worker = self._probe_worker, None
         if worker is not None:
-            if worker.close is not None:
-                worker.close()  # sends the stop sentinel once and drops the finalizer
+            worker.close()  # sends the stop sentinel once and drops the finalizer
             self._abandoned_probes.append(worker.thread)
 
     def _sync_alert(self, reason: str, *, value: int, limit: int) -> None:
