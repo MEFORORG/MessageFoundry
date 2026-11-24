@@ -16,10 +16,13 @@ The mechanical invariants, at least these:
    during an incident.
 2. **The ``serverdb`` change-detection alternation admits every file the server-DB steps run.**
    ``ci.yml``'s ``changes`` job decides whether the SQL Server / PostgreSQL legs run on a PR at all.
-   A file a leg runs but the alternation does not match is covered only by the nightly cron: editing
-   it does not pull the leg that proves it. The regex's own comment already demands this
+   A file a leg runs but the alternation does not match does not pull the leg on its pull request:
+   the leg first runs on it in the merge queue (``merge_group``) or on the nightly cron, after
+   review rather than beside it. The regex's own comment already demands this
    ("Keep this in sync with those steps"); nothing enforced it.
-3. **It also admits every engine SOURCE those suites import** (BACKLOG #1322). Invariant 2 binds the
+3. **It also admits the engine SOURCES those suites import** (BACKLOG #1322), as far as a
+   static read of the suites' own import statements finds them; the scan's docstring names at
+   least four routes it does not follow. Invariant 2 binds the
    ASSERTING file and not the ASSERTED-ON file, so it is structurally blind to a source change that
    breaks a server-DB assertion. That is not hypothetical: a PR added a key to the ``summary_access``
    audit detail built in ``messagefoundry/api/app.py``, touched ``api/`` only, so ``serverdb`` was
@@ -41,6 +44,7 @@ Pure text/AST analysis of the repo: no database, no network, and no gate of its 
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -177,7 +181,8 @@ def test_serverdb_path_gate_admits_every_file_those_legs_run() -> None:
     assert not unmatched, (
         f"{len(unmatched)} test file(s) run by a SQL Server / PostgreSQL step are not matched by "
         "the `serverdb` change-detection alternation in .github/workflows/ci.yml, so editing one "
-        "does NOT pull the leg that proves it — it is covered only by the nightly cron:\n  "
+        "does NOT pull the leg that proves it on the PR — it first runs in the merge queue or on "
+        "the nightly cron:\n  "
         + "\n  ".join(unmatched)
         + "\n\nExtend the `tests/test_(...)` alternation to cover them."
     )
@@ -201,33 +206,196 @@ def _serverdb_full_pattern() -> re.Pattern[str]:
     )
 
 
-def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
-    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path.
+def _module_path(module: str) -> str | None:
+    """The repo-relative file a dotted ``messagefoundry*`` module name resolves to, if any.
 
     A PACKAGE maps to ``pkg/__init__.py``, never ``pkg.py``. Getting that wrong reports a package as
     unmatched while the directory arm plainly admits it -- a FALSE ALARM, which is the failure that
     trains readers to discount this test. The first draft of this measurement made exactly that
-    mistake and over-reported the hole.
+    mistake and over-reported the hole. The package is tried first, as Python's import system
+    does when both exist.
+
+    Matched against a listing rather than probed with ``is_file()``: on a case-insensitive
+    filesystem ``from messagefoundry.pipeline import Engine`` would probe ``pipeline/Engine.py`` and
+    find ``pipeline/engine.py``, recording a path no regex arm spells.
     """
+    base = module.replace(".", "/")
+    for candidate in (f"{base}/__init__.py", f"{base}.py"):
+        if candidate in _repo_package_sources():
+            return candidate
+    return None
+
+
+@functools.cache
+def _repo_package_sources() -> frozenset[str]:
+    """Every source under a ``messagefoundry*`` package, repo-relative, case as the tree spells it."""
+    return frozenset(
+        p.relative_to(REPO_ROOT).as_posix()
+        for top in REPO_ROOT.glob("messagefoundry*")
+        if (top / "__init__.py").is_file()
+        for p in top.rglob("*.py")
+    )
+
+
+def test_module_path_is_case_exact() -> None:
+    """A name that differs from a file only in case resolves to nothing, on every filesystem.
+
+    An ``is_file()`` probe on Windows or macOS resolved ``messagefoundry.pipeline.Engine`` (the
+    class) to ``pipeline/Engine.py``, a path the tree does not spell and no regex arm matches.
+    """
+    assert _module_path("messagefoundry.pipeline.engine") == "messagefoundry/pipeline/engine.py"
+    assert _module_path("messagefoundry.pipeline.Engine") is None
+
+
+def _engine_modules_imported_by(text: str) -> dict[str, str]:
+    """Each ``messagefoundry*`` module one source's imports reach, mapped to its repo-relative path.
+
+    ``import a.b.c`` records ``a.b.c``. ``from pkg import name`` records ``pkg``'s own file, which
+    Python runs for that statement (for the top-level package, its ``__getattr__`` is consulted for
+    ``name`` too), and also ``pkg.name`` when that is itself a module, as in
+    ``from messagefoundry import sqlserver_roles``. So that spelling reaches
+    ``messagefoundry/__init__.py`` as well as the submodule, and the gate reds while the ``serverdb``
+    regex does not admit that init.
+
+    Not recorded, by at least these routes, though Python runs or reaches the source: the ancestor
+    packages' ``__init__`` files above the one a statement names, which run for every spelling; the
+    modules an imported engine module itself imports; a re-exported attribute's defining module; the
+    helper modules a suite imports from ``tests/``; and ``importlib.import_module``. Measured
+    2026-11-23: ``messagefoundry/__init__.py``, ``messagefoundry/auth/__init__.py`` and
+    ``messagefoundry/config/__init__.py`` run in server-DB suites by the first route, and the
+    ``serverdb`` regex admits none of them. Closing that is a ``ci.yml`` edit, not made here.
+    """
+    modules: list[str] = []
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom):
+            if node.level or not (node.module or "").startswith("messagefoundry"):
+                continue
+            package = str(node.module)
+            modules.append(package)
+            modules += [f"{package}.{alias.name}" for alias in node.names]
+        elif isinstance(node, ast.Import):
+            modules += [a.name for a in node.names if a.name.startswith("messagefoundry")]
+    return {module: path for module in modules if (path := _module_path(module)) is not None}
+
+
+def _engine_modules_imported_by_server_db_suites() -> dict[str, str]:
+    """Each ``messagefoundry`` module those suites import, mapped to its repo-relative path."""
     paths: dict[str, str] = {}
     for name in sorted(_files_run_by_server_db_steps()):
         source = REPO_ROOT / "tests" / f"{name}.py"
-        if not source.is_file():
-            continue
-        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
-            if isinstance(node, ast.ImportFrom):
-                names = [node.module] if (node.module or "").startswith("messagefoundry") else []
-            elif isinstance(node, ast.Import):
-                names = [a.name for a in node.names if a.name.startswith("messagefoundry")]
-            else:
-                continue
-            for module in names:
-                base = str(module).replace(".", "/")
-                for candidate in (f"{base}.py", f"{base}/__init__.py"):
-                    if (REPO_ROOT / candidate).is_file():
-                        paths[str(module)] = candidate
-                        break
+        if source.is_file():
+            paths.update(_engine_modules_imported_by(source.read_text(encoding="utf-8")))
     return paths
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        # A submodule named through its package: the package's init, which runs, and the submodule.
+        (
+            "from messagefoundry import sqlserver_roles",
+            {
+                "messagefoundry": "messagefoundry/__init__.py",
+                "messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py",
+            },
+        ),
+        (
+            "from messagefoundry.store import postgres as pg, sqlserver",
+            {
+                "messagefoundry.store": "messagefoundry/store/__init__.py",
+                "messagefoundry.store.postgres": "messagefoundry/store/postgres.py",
+                "messagefoundry.store.sqlserver": "messagefoundry/store/sqlserver.py",
+            },
+        ),
+        (
+            "from messagefoundry import __main__ as cli",
+            {
+                "messagefoundry": "messagefoundry/__init__.py",
+                "messagefoundry.__main__": "messagefoundry/__main__.py",
+            },
+        ),
+        # An attribute of a module or package: that module or package's own file.
+        (
+            "from messagefoundry.sqlserver_roles import probed_grant",
+            {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
+        ),
+        (
+            "from messagefoundry import Message",
+            {"messagefoundry": "messagefoundry/__init__.py"},
+        ),
+        # A class whose name matches a submodule's but for case is an attribute, on every OS.
+        (
+            "from messagefoundry.pipeline import Engine",
+            {"messagefoundry.pipeline": "messagefoundry/pipeline/__init__.py"},
+        ),
+        # Both on one line: each name resolves on its own, beside the package.
+        (
+            "from messagefoundry import sqlserver_roles, Message",
+            {
+                "messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py",
+                "messagefoundry": "messagefoundry/__init__.py",
+            },
+        ),
+        # The forms that already resolved stay resolved.
+        (
+            "import messagefoundry.sqlserver_roles as sqlserver_roles",
+            {"messagefoundry.sqlserver_roles": "messagefoundry/sqlserver_roles.py"},
+        ),
+        # Other packages named messagefoundry* resolve by the same rule.
+        (
+            "from messagefoundry_toolkit import anon",
+            {
+                "messagefoundry_toolkit": "messagefoundry_toolkit/__init__.py",
+                "messagefoundry_toolkit.anon": "messagefoundry_toolkit/anon/__init__.py",
+            },
+        ),
+        ("from messagefoundry import *", {"messagefoundry": "messagefoundry/__init__.py"}),
+        # A relative import is never an engine import, whatever it names.
+        ("from .messagefoundry import sqlserver_roles", {}),
+        ("import os; from pathlib import Path", {}),
+    ],
+)
+def test_import_scan_resolves_from_imports_to_the_module_path(
+    source: str, expected: dict[str, str]
+) -> None:
+    """A ``from`` import records the package it names, and also each name that is a submodule."""
+    assert _engine_modules_imported_by(source) == expected
+
+
+def _package_only_paths(text: str) -> set[str]:
+    """The scan origin/main ran before 2026-11-23: ``from pkg import ...`` recorded ``pkg`` alone."""
+    paths: set[str] = set()
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node, ast.ImportFrom) and not node.level:
+            names = [node.module] if (node.module or "").startswith("messagefoundry") else []
+        elif isinstance(node, ast.Import):
+            names = [a.name for a in node.names if a.name.startswith("messagefoundry")]
+        else:
+            continue
+        paths.update(path for m in names if (path := _module_path(str(m))) is not None)
+    return paths
+
+
+def test_the_scan_records_at_least_what_the_package_only_scan_did() -> None:
+    """Resolving submodules may only ADD sources to the gate, never drop one.
+
+    The 62 is a floor: the count both scans recorded on 2026-11-23, not a property of the gate. A
+    drop below it means either the scan or the step parsing that feeds it lost sources, or a suite
+    legitimately stopped importing a module it alone imported. In the second case, lower the floor
+    to the new count in the same change.
+    """
+    recorded = set(_engine_modules_imported_by_server_db_suites().values())
+    before: set[str] = set()
+    for name in _files_run_by_server_db_steps():
+        source = REPO_ROOT / "tests" / f"{name}.py"
+        if source.is_file():
+            before |= _package_only_paths(source.read_text(encoding="utf-8"))
+    assert before <= recorded, f"dropped: {sorted(before - recorded)}"
+    assert len(recorded) >= 62, (
+        f"the scan recorded {len(recorded)} engine sources, below the floor of 62 measured on "
+        "2026-11-23. If a server-DB suite legitimately stopped importing a module, lower the floor "
+        "to the new count in the same change; otherwise the scan or the step parsing lost sources."
+    )
 
 
 def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
@@ -239,9 +407,12 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
     never ran on that PR, and it merged green leaving both server-DB store suites asserting the old
     shape.
 
-    IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST", and a deliberately WIDE one. It is what a
-    machine can check without running anything, and being wider than the true assertion set costs
-    extra leg-runs rather than missed coverage -- the safe direction for a merge gate.
+    IMPORT-REACHABILITY IS A PROXY FOR "ASSERTS AGAINST". It is what a machine can check without
+    running anything. It is wider than the assertion set in some ways, for example a module a suite
+    imports and asserts nothing about, which costs extra leg-runs. It is NARROWER in others: it
+    reads only the static import statements in the suites themselves, and
+    ``_engine_modules_imported_by`` names at least four routes to a source it does not record. A
+    green here does not show that every source a server-DB leg exercises pulls that leg.
     """
     pattern = _serverdb_full_pattern()
     imported = _engine_modules_imported_by_server_db_suites()
@@ -257,8 +428,8 @@ def test_serverdb_path_gate_admits_every_source_those_suites_import() -> None:
     assert not unmatched, (
         f"{len(unmatched)} engine source(s) imported by a SQL Server / PostgreSQL suite are not "
         "matched by the `serverdb` change-detection regex in .github/workflows/ci.yml, so editing "
-        "one does NOT pull the leg that would catch a regression in it — it is covered only by the "
-        "nightly cron, which reports after the fact and cannot stop the merge:\n  "
+        "one does NOT pull the leg that would catch a regression in it on the PR — the leg first "
+        "runs on it in the merge queue or on the nightly cron:\n  "
         + "\n  ".join(unmatched)
         + "\n\nExtend the SOURCE arms of that regex to cover them."
     )
@@ -280,10 +451,7 @@ def test_the_serverdb_gate_still_refuses_unrelated_paths() -> None:
 
     # And SOME engine source must still be refused. Derived rather than hard-coded, so this keeps
     # working as the tree grows: a named file could legitimately become imported one day.
-    engine = {
-        str(p.relative_to(REPO_ROOT)).replace("\\", "/")
-        for p in (REPO_ROOT / "messagefoundry").rglob("*.py")
-    }
+    engine = {path for path in _repo_package_sources() if path.startswith("messagefoundry/")}
     assert engine, "found no engine sources — the rglob has drifted"
     assert any(not pattern.match(path) for path in engine), (
         "the `serverdb` regex admits EVERY file under messagefoundry/, so it selects nothing and "

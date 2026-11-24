@@ -21,7 +21,12 @@ import pytest
 import yaml
 
 import scripts.security.audit_all_platforms as wrapper
-from messagefoundry.security.audit_all_platforms import main, requirement_lines, strip_markers
+from messagefoundry.security.audit_all_platforms import (
+    cli,
+    main,
+    requirement_lines,
+    strip_markers,
+)
 from tests._workflow_contexts import ROOT, WORKFLOWS, step_script
 
 #: The locks the required audit step reads, in both jobs that carry it.
@@ -36,6 +41,7 @@ _AUDITED = (
 _SUBSET_LOCKS = (
     "docker/locks/requirements-core.lock",
     "docker/locks/requirements-sqlserver.lock",
+    "docker/locks/requirements-postgres.lock",
     "security/locks/requirements-harness.lock",
 )
 _TREE_LOCKS = (*_AUDITED, *_SUBSET_LOCKS)
@@ -45,7 +51,8 @@ _SCRIPT = "scripts/security/audit_all_platforms.py"
 
 def test_the_wrapper_runs_the_packaged_implementation() -> None:
     """One implementation: the workflows' entry point is the module the adopter's job runs."""
-    assert (wrapper.main, wrapper.strip_markers, wrapper.requirement_lines) == (
+    assert (wrapper.cli, wrapper.main, wrapper.strip_markers, wrapper.requirement_lines) == (
+        cli,
         main,
         strip_markers,
         requirement_lines,

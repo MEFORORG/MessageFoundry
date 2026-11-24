@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Pure ASC X12 EDI codec (ADR 0012) — a tolerant routing peek, an interchange splitter/assembler, and
+"""ASC X12 EDI codec (ADR 0012) — a tolerant routing peek, an interchange splitter/assembler, and
 a mutable message model, mirroring the HL7 :mod:`messagefoundry.parsing` library.
 
-It is **pure and side-effect-free** (no I/O, no engine state) and imports nothing from
-``messagefoundry.config`` / ``pipeline`` / ``store`` / ``transports`` — so the console may import it,
-and a code-first Router/Handler calls it **on demand** against a
-:class:`~messagefoundry.parsing.message.RawMessage` (``content_type="x12"``, ADR 0004): X12 is **not**
-pushed through the engine pipeline as a bespoke object. The X12 content type is referred to by the
-literal string ``"x12"`` (never imported from ``config``) to keep this purity.
+The tolerant tier is **pure and side-effect-free** (no I/O, no engine state). The opt-in strict
+:func:`~messagefoundry.parsing.x12.validate.validate` path has no engine state, database or network
+access either, but it is not pure: it reads at least pyx12's bundled package files, keeps the
+segment ids it reads from them in process-wide state, and mutes the ``pyx12`` logger tree.
+
+Neither tier imports anything from ``messagefoundry.config`` / ``pipeline`` / ``store`` /
+``transports`` — so the console may import it, and a code-first Router/Handler calls it **on demand**
+against a :class:`~messagefoundry.parsing.message.RawMessage` (``content_type="x12"``, ADR 0004): X12
+is **not** pushed through the engine pipeline as a bespoke object. The X12 content type is referred
+to by the literal string ``"x12"`` (never imported from ``config``) to keep that import boundary.
 
 Two tiers, mirroring HL7 v2's built-in tolerant parser / hl7apy (strict):
 

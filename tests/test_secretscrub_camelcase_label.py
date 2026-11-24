@@ -589,7 +589,9 @@ def test_the_differential_finds_the_trade_without_the_union(
     """THE POSITIVE CONTROL: with the shipped patterns applied alone, as this change's earlier head
     did, the same corpus prints atoms the reading before hid, so the green above is the union's."""
     monkeypatch.setattr(
-        secretscrub, "_union", lambda text, ph, folded: secretscrub._run(text, ph, folded)
+        secretscrub,
+        "_union",
+        lambda text, ph, folded, _read=None, sub=None: secretscrub._run(text, ph, folded, sub),
     )
     newly, _hidden = _newly_printed(monkeypatch, _dense_lines(2000, 5545))
     assert newly

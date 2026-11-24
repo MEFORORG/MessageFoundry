@@ -139,8 +139,8 @@ class MessageSearchRequest(RequestModel):
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(default=50, ge=1, le=500)
     # StrictInt: a lax int would take JSON ``true`` as 1 and ``"7"`` as 7 (BACKLOG #6700).
+    limit: StrictInt = Field(default=50, ge=1, le=500)
     scan_limit: StrictInt | None = Field(default=None, ge=1)
 
 
@@ -150,7 +150,7 @@ class MessageExportRequest(MessageSearchRequest):
     to the export route's own ceiling."""
 
     ids: list[ResourceId] = Field(default_factory=list, max_length=MAX_EXPORT_IDS)
-    limit: int = Field(default=1000, ge=1, le=100_000)
+    limit: StrictInt = Field(default=1000, ge=1, le=100_000)
 
 
 class UploadedMessageSearchRequest(RequestModel):
@@ -164,8 +164,8 @@ class UploadedMessageSearchRequest(RequestModel):
     target: Literal["raw", "summary", "both"] = "both"
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(default=50, ge=1, le=500)
-    offset: int = Field(default=0, ge=0)
+    limit: StrictInt = Field(default=50, ge=1, le=500)
+    offset: StrictInt = Field(default=0, ge=0)
 
 
 class OutboxInfo(PhiGatedModel):
@@ -2028,7 +2028,7 @@ class SearchPresetCriteria(RequestModel):
     status: StatusFilter | None = None
     message_type: MessageTypeFilter | None = None
     control_id: ControlIdFilter | None = None
-    limit: int = Field(default=50, ge=1, le=500)
+    limit: StrictInt = Field(default=50, ge=1, le=500)
 
 
 class SearchPresetInfo(BaseModel):

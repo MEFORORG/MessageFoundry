@@ -403,11 +403,11 @@ function Get-RootUnavailability {
     # written rather than blanked, because a hand-edited marker saying "last Tuesday" should show what
     # it says instead of vanishing.
     $mk = ConvertTo-UtcDateTime $doc.marked_at
-    $o.marked_at = if ($mk) { $mk.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { [string]$doc.marked_at }
+    $o.marked_at = if ($mk) { $mk.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture) } else { [string]$doc.marked_at }
     $o.marked_by = [string]$doc.marked_by
     $eff = ConvertTo-UtcDateTime $doc.effective_from
     if ($eff) {
-        $o.effective_from = $eff.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        $o.effective_from = $eff.ToString('yyyy-MM-ddTHH:mm:ssZ', [cultureinfo]::InvariantCulture)
         if ($eff -gt (Get-Date).ToUniversalTime()) {
             $o.state = 'PENDING'
             return $o

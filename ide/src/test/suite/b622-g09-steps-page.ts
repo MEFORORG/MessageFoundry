@@ -145,6 +145,37 @@ export function withControls(): Fixture {
   };
 }
 
+/** One Handler whose body holds an if (line 2) / elif (line 4) / else (line 6) chain, then a send. */
+export function withElif(): Fixture {
+  const ctrl = (control: "if" | "elif" | "else", line: number): LensRow => ({
+    kind: "control",
+    control,
+    line_start: line,
+    line_end: line,
+    nesting: 0,
+    suite: "1",
+    test_src: control === "else" ? null : "x",
+    recognized: true,
+  });
+  return {
+    parse: {
+      module: "m",
+      handlers: [
+        handlerOf("h", 1, [
+          ctrl("if", 2),
+          setField(3, "2", 1),
+          ctrl("elif", 4),
+          setField(5, "4", 1),
+          ctrl("else", 6),
+          setField(7, "6", 1),
+          send(8, "1"),
+        ]),
+      ],
+    },
+    source: sourceOf(8),
+  };
+}
+
 /** The model's drop contexts for every row of every handler, each carrying its own handler name. */
 export function dropRows(f: Fixture): RowDropContext[] {
   return buildHandlerViewModels(f.parse, f.source).flatMap((h) =>

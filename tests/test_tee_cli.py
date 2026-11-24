@@ -346,7 +346,7 @@ def test_compare_out_that_cannot_be_written_is_an_error_line(
 
 # --- anonymize-captures --out and export --out (vault BACKLOG #3166) ------------------------------
 
-_ANON_SALT = "tee-cli-salt-0123456789abcdef"
+_ANON_SALT = "tee-cli-salt-0123456789abcdef-0123456789"
 
 
 def _anonymize_to(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, out: Path | str) -> int:

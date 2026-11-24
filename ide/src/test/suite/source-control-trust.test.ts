@@ -248,3 +248,19 @@ trustSuite("Set Up Version Control & Checks needs a trusted workspace (vault BAC
     );
   });
 });
+
+trustSuite("sameDir folds ASCII case only on Windows (BACKLOG #5832)", () => {
+  // Folders that do not exist, so sameDir compares spellings, the reading `win32` chooses; that
+  // pins the Windows fold on any runner.
+  const absent = path.join(os.tmpdir(), `mf-samedir-absent-${process.pid}`);
+
+  test("an ASCII case twin is one folder under win32, and a KELVIN SIGN twin is another", async () => {
+    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "KIT"), true), true);
+    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "\u212Ait"), true), false);
+  });
+
+  test("elsewhere spellings are compared exactly", async () => {
+    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "kit"), false), true);
+    assert.strictEqual(await sc.sameDir(path.join(absent, "kit"), path.join(absent, "KIT"), false), false);
+  });
+});

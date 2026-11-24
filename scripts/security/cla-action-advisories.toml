@@ -9,8 +9,9 @@
 # reviewed pull request, with a comment above the entry saying who triaged it and what they found.
 # The script prints what to check first.
 #
-# AN ENTRY WITH NO TRIAGE COMMENT ABOVE IT HAS NOT BEEN TRIAGED. The first 35 are the whole result
-# of the first audit, run 2026-09-29 with npm 11.5.2, recorded as found. Listing an entry here is
+# AN ENTRY WITH NO TRIAGE COMMENT ABOVE IT HAS NOT BEEN TRIAGED. The first audit, run 2026-09-29
+# with npm 11.5.2, recorded 35 entries as found; commit 1dabae7123b holds that list. Lodash
+# GHSA-f23m-r3pf-42rh, one of them, was removed on 2026-11-23. Listing an entry here is
 # not a judgement of whether it is reachable in the bundle's runtime path; only a triage comment
 # above it is. Some affect packages the lockfile marks `dev` only (the @babel packages, for
 # example). Others do not: lodash, lodash.set and js-yaml are among the packages the lockfile does
@@ -28,7 +29,33 @@
 # reinstates either one, the gate reds on it as a NEW ADVISORY. Triage it again, starting from PR
 # 2112's reasoning.
 #
-# A BUNDLE MEASUREMENT FROM THAT TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
+# THREE MORE ENTRIES WERE REMOVED ON 2026-11-23: lodash GHSA-f23m-r3pf-42rh, minimatch
+# GHSA-g3hv-75wg-m249 and deepmerge GHSA-gcqx-w48m-w2h4. Scheduled Security runs reported
+# GHSA-f23m-r3pf-42rh as a STALE BASELINE ENTRY from run 41841556576 (2026-11-04),
+# GHSA-g3hv-75wg-m249 from run 42040981435 (2026-11-05), and GHSA-gcqx-w48m-w2h4 from run
+# 44115255276 (2026-11-17). Claude, an AI agent working as a Builder subagent, read `gh api
+# advisories/<id>` for each on 2026-11-23. GitHub withdrew GHSA-gcqx-w48m-w2h4 at
+# 2026-11-16T18:55:38Z. It has not withdrawn the other two; it narrowed their affected ranges so
+# they no longer cover the locked versions. GHSA-f23m-r3pf-42rh's lodash range now reads "= 4.17.23"
+# (updated 2026-11-03), and the lockfile holds lodash 4.17.21. GHSA-g3hv-75wg-m249's range now reads
+# ">= 7.0.0, < 11.0.1" (updated 2026-11-04), and the lockfile holds minimatch 3.1.2. THE LOCKED
+# LODASH IS STILL COVERED BY A PROTOTYPE POLLUTION ADVISORY IN THE SAME FUNCTIONS:
+# GHSA-xxjr-mmjv-4gpg, still baselined below, names `_.unset`, `_.omit` and now `_.pullAt`, and its
+# range, ">=4.0.0 <=4.17.22", covers 4.17.21. The same audit reports it under a new npm source id
+# (1244531, was 1120370). GitHub added `_.pullAt` to GHSA-f23m-r3pf-42rh's summary too. THE AUDIT
+# STILL SEES BOTH PACKAGES: a live `npm audit` on 2026-11-23, with npm 11.19.0, counted 561
+# dependencies against the lockfile's 561 entries and still reported lodash GHSA-r5fr-rjxr-66jc and
+# GHSA-xxjr-mmjv-4gpg and minimatch's three other entries. Its report is
+# tests/fixtures/cla_action_audit/npm-audit-2026-11-23.json. The minimatch triage comment at the end
+# of this file is kept because other comments here cite its bundle readings; the deepmerge one is
+# kept as the starting point for a fresh triage if GitHub reinstates the advisory, as the 2026-10-24
+# paragraph above does with PR 2112's reasoning, and the gate test re-runs two of its probes so that
+# starting point stays true of the bundle. NEITHER NOW SITS ABOVE AN ENTRY, AND NEITHER ACCEPTANCE
+# CARRIES OVER: if GitHub reinstates or widens any of the three, the gate reds on it as a NEW
+# ADVISORY, and a re-added entry needs a fresh triage and acceptance in a new comment of its own, on
+# the advisory as it then reads.
+#
+# A BUNDLE MEASUREMENT FROM PR 2112'S TRIAGE IS KEPT. It bears on the js-yaml entries and on braces
 # GHSA-grv7-fg5c-xmjg. That advisory sits on braces 3.0.2, the node the withdrawn GHSA-vfj7-8cjw-p6xm
 # was also reported against. NONE OF THOSE ENTRIES WAS TRIAGED ON THIS MEASUREMENT ALONE. The
 # 2026-11-05 triage below took it again and triaged those entries. It showed sprintf,
@@ -303,12 +330,9 @@ package = "js-yaml"
 id = "GHSA-mh29-5h37-fv8m"
 package = "js-yaml"
 
-# NOT TRIAGED. The three lodash entries and the lodash.set entry below are recorded as found. The
-# 2026-11-05 triage did not cover them (BACKLOG #2492).
-
-[[advisory]]
-id = "GHSA-f23m-r3pf-42rh"
-package = "lodash"
+# NOT TRIAGED. The two lodash entries and the lodash.set entry below are recorded as found. The
+# 2026-11-05 triage did not cover them (BACKLOG #2492). A third lodash entry, GHSA-f23m-r3pf-42rh,
+# was removed on 2026-11-23; the header says why.
 
 [[advisory]]
 id = "GHSA-r5fr-rjxr-66jc"
@@ -339,7 +363,7 @@ package = "micromatch"
 # these three minimatch entries. NOT DEV-ONLY; ABSENT FROM THE BUNDLE, on the reading the separate
 # minimatch GHSA-g3hv-75wg-m249 triage at the end of this file records for the same node, minimatch
 # 3.1.2, and the same chain to actions-toolkit; this comment does not cover GHSA-g3hv-75wg-m249,
-# which that triage covers. That reading was taken again for this triage: every
+# which that triage covered until its entry was removed on 2026-11-23. That reading was taken again for this triage: every
 # identifier it lists returned 0 in the bundle, and the control 2. Its probes' discrimination at
 # the upstream tags is recorded there and is not repeated here. The gate test already re-runs some
 # of them. GHSA-3ppc-4f35-3m26 and GHSA-7r86-cg39-jmmj are ReDoS through repeated wildcards and
@@ -429,6 +453,10 @@ package = "brace-expansion"
 id = "GHSA-qhr7-859c-m2p7"
 package = "brace-expansion"
 
+# ENTRY REMOVED 2026-11-23: GitHub withdrew GHSA-gcqx-w48m-w2h4 at 2026-11-16T18:55:38Z; the
+# header says more. This comment is kept as the record of the deepmerge bundle reading, which
+# tests/test_cla_action_advisory_gate.py still re-runs. It reads as written on 2026-10-28. Its
+# acknowledgement covered the removed entry only and does not carry to a re-added one.
 # TRIAGED 2026-10-28 by Claude, an AI agent in the Manager seat, on issue 2618 (scheduled
 # Security run 40685626928, job cla-action-audit). deepmerge GHSA-gcqx-w48m-w2h4, GitHub
 # severity low (its CVSS 3.1 vector scores 5.3, which CVSS rates medium): mergeObject() allows
@@ -446,10 +474,12 @@ package = "brace-expansion"
 # deepmerge defines, so a re-vendored bundle that carries unminified deepmerge 4.x reds there. It
 # does NOT see deepmerge code arriving minified or renamed inside another package's pre-built file.
 
-[[advisory]]
-id = "GHSA-gcqx-w48m-w2h4"
-package = "deepmerge"
-
+# ENTRY REMOVED 2026-11-23: GitHub narrowed GHSA-g3hv-75wg-m249's range to ">= 7.0.0, < 11.0.1",
+# which no longer covers the locked minimatch 3.1.2; the header says more. This comment is kept as
+# the record of the minimatch, glob, rimraf and actions-toolkit bundle readings, which other
+# comments here and tests/test_cla_action_advisory_gate.py cite. It reads as written on 2026-10-31,
+# when GitHub's range covered 3.1.2. Its acceptance covered the removed entry only and does not
+# carry to a re-added one.
 # TRIAGED 2026-10-31 by Claude, an AI agent working as a Builder subagent of the Lander, on issue
 # 2695 (scheduled Security run 41198026900, job cla-action-audit). minimatch GHSA-g3hv-75wg-m249,
 # GitHub severity medium, npm moderate, no CVSS score: a glob pattern an attacker supplies can
@@ -486,7 +516,8 @@ package = "deepmerge"
 # Lander's chat, as the Lander relayed
 # it to the Builder writing this. Asked: "Accept minimatch in the CLA action's baseline (PR 2697)".
 # Answer: "accept".
-
-[[advisory]]
-id = "GHSA-g3hv-75wg-m249"
-package = "minimatch"
+#
+# NO ENTRY FOLLOWS. The two comments above, deepmerge's and minimatch's GHSA-g3hv-75wg-m249,
+# cover no [[advisory]] entry since 2026-11-23, and their acknowledgement and acceptance do not
+# carry to one. Put a new or re-added entry above the "ENTRY REMOVED 2026-11-23" deepmerge
+# comment, with a triage comment of its own, never below this line.

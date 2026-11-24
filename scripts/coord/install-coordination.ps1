@@ -261,9 +261,16 @@ function New-AnnounceShimCommand {
 #
 # The wiki write prompt needs the same shape for the same reason, so one builder serves any row that
 # sets Shim = "notice" and carries its own Notice text.
+#
+# WHY THE NOTICE IS {"systemMessage": ...} JSON AND NOT PLAIN TEXT (BACKLOG #7575). Every row that uses
+# this shim is a Stop hook (tests/test_announce_wiring.py pins that). Plain exit-0 stdout reaches context only on SessionStart, UserPromptSubmit
+# and a few other events (scripts/hooks/precompact-reprime.ps1 records the list); on Stop it goes to
+# the debug log and nobody sees it, so a plain-text notice was as silent as the std shim it replaced.
+# systemMessage is a field every hook event accepts and the user is shown; it neither blocks the Stop
+# nor adds to context -- the same form install-gate.ps1's fail-open notice uses.
 function New-NoticeShimCommand([string]$RelativeScript, [string]$Marker, [string]$Notice) {
-    # The notice sits inside a single-quoted literal, so double any single quote it carries.
-    $Notice = $Notice.Replace("'", "''")
+    # The JSON sits inside a single-quoted literal, so double any single quote it carries.
+    $json = ([ordered]@{ systemMessage = $Notice } | ConvertTo-Json -Compress).Replace("'", "''")
     return (
         "# $Marker`n" +
         '$c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null); ' +
@@ -274,7 +281,7 @@ function New-NoticeShimCommand([string]$RelativeScript, [string]$Marker, [string
         'if (Test-Path -LiteralPath (Join-Path $b ''scripts/coord/presence.ps1'')) { $mf = $true } ' +
         "`$s = Join-Path `$b '$RelativeScript'; " +
         'if (Test-Path -LiteralPath $s) { & $s; $hit = $true; break } } ' +
-        'if (-not $hit -and $mf) { Write-Output ' + "'$Notice'" + ' } }'
+        'if (-not $hit -and $mf) { Write-Output ' + "'$json'" + ' } }'
     )
 }
 
