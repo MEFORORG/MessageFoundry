@@ -71,6 +71,7 @@ self-test) or, with ``--strict``, when any term could not be priced.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
@@ -97,7 +98,7 @@ _TOKEN_PATTERN = (
     r"(?<![\w$.])(?P<hook>" + "|".join(_HOOKS) + r")\s*\("
     r"|(?<![\w$.])(?P<from>Array\s*\.\s*from)\s*\("
     r"|\.\s*(?P<fan>" + "|".join(_FAN_METHODS) + r")\s*\("
-    r"|(?<![\w$.])(?P<loop>" + "|".join(_LOOPS) + r")\b"
+    r"|(?<![\w$.])(?P<loop>" + "|".join(_LOOPS) + r")(?![\w$])"
 )
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 _OF_RE = re.compile(r"\b(?:of|in)\b")
@@ -1209,6 +1210,7 @@ class _LoopSpan(NamedTuple):
     body_end: int
     resume: int  # where the scan goes on: past the body, and past a `do`'s `while (...)` tail
     settled: bool
+    tail: tuple[int, int] | None = None  # a `do`'s condition, which runs every iteration too
 
 
 # A brace-less body opening with one of these is a statement whose end ASI cannot be read from
@@ -1229,27 +1231,31 @@ def _loop_head(ctx: _Ctx, after_kw: int, keyword: str) -> _LoopSpan:
     """
     masked = ctx.masked
     n = len(masked)
-    i = _skip_space(masked, after_kw)
+    # Skipped over the RAW text: a body that is a string statement is code, not masked space.
+    i = _skip_space(ctx.code, after_kw)
     if keyword == "for" and _AWAIT_RE.match(masked, i):
-        i = _skip_space(masked, i + len("await"))
+        i = _skip_space(ctx.code, i + len("await"))
     subject: tuple[int, int] | None = None
     if keyword != "do" and i < n and masked[i] == "(":
         close = _match_bracket(masked, i)
         if close == -1:
             return _LoopSpan(None, after_kw, after_kw, n, False)
-        head = _OF_RE.search(masked, i + 1, close)
+        # Only a `for` head iterates: `while (k in R)` tests membership and has no width.
+        head = _OF_RE.search(masked, i + 1, close) if keyword == "for" else None
         if head:
             subject = (head.end(), close)
-        i = _skip_space(masked, close + 1)
+        i = _skip_space(ctx.code, close + 1)
     body_start, body_end, resume, settled = _loop_body(ctx, i)
+    cond: tuple[int, int] | None = None
     if keyword == "do":
         tail = _WHILE_RE.match(masked, resume)
         close = _match_bracket(masked, tail.end()) if tail else -1
         if close == -1:
             settled = False
         else:
+            cond = (tail.end() + 1, close) if tail else None
             resume = close + 1
-    return _LoopSpan(subject, body_start, body_end, resume, settled)
+    return _LoopSpan(subject, body_start, body_end, resume, settled, cond)
 
 
 def _loop_body(ctx: _Ctx, i: int) -> tuple[int, int, int, bool]:
@@ -1457,8 +1463,10 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
     in the unpriced list, which trains a reader to skim the list that matters most.
     """
     keyword = m.group("loop")
-    subject, body_start, body_end, _, settled = _loop_head(ctx, m.end(), keyword)
+    subject, body_start, body_end, _, settled, cond = _loop_head(ctx, m.end(), keyword)
     inner = _price(ctx, body_start, body_end)
+    if cond is not None:
+        inner = inner + _price(ctx, cond[0], cond[1])
     if not inner.agents and not inner.unknowns:
         return Cost()
 
@@ -1474,7 +1482,11 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
             Unknown(
                 kind="loop",
                 line=line,
-                form=f"{keyword} loop, repetitions unknown",
+                form=(
+                    f"{keyword} loop, repetitions unknown"
+                    if settled
+                    else f"{keyword} loop, body extent not read, so no width is trusted"
+                ),
                 per_unit=inner.agents,
             ),
         )
@@ -1854,13 +1866,23 @@ def main(argv: list[str] | None = None) -> int:
     # Bytes, decoded as UTF-8 on both routes (BACKLOG #7601): `sys.stdin.read()` decoded in the
     # locale encoding, cp1252 on Windows, so one file priced from two different texts. Undecodable
     # input is a broken instrument, reported, never a traceback or a guess at the text. Line ends
-    # are translated as the text-mode reads both routes made before did.
+    # are translated as the text-mode reads both routes made before did, and a BOM is dropped: the
+    # lexer reads U+FEFF as a token, so a BOM'd copy of a file would price differently.
     try:
-        data = sys.stdin.buffer.read() if args.stdin else Path(args.script).read_bytes()
-        source = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-    except (OSError, UnicodeDecodeError) as exc:
+        if not args.stdin:
+            data = Path(args.script).read_bytes()
+        elif hasattr(sys.stdin, "buffer"):
+            data = sys.stdin.buffer.read()
+        else:  # a text stream an embedding caller set: its text is already decoded
+            data = sys.stdin.read().encode("utf-8")
+        source = data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, UnicodeError, AttributeError) as exc:  # AttributeError: no stdin at all
         print(f"cannot read {label}: {exc}", file=sys.stderr)
         return 1
+    # A snippet of UTF-8 source can hold a character the console encoding (cp1252) cannot print;
+    # escape it rather than end the report in a traceback.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(errors="backslashreplace")
 
     cost = price_script(source)
     if args.json:

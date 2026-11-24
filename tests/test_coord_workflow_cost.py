@@ -1550,3 +1550,74 @@ def test_undecodable_input_is_reported_not_raised(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "cannot read" in captured.err and "utf-8" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("source", "agents", "exact"),
+    [
+        # `while (k in R)` tests membership: it has no width, whatever R's length
+        ("const R = [1, 2, 3]\nwhile ('k' in R) await agent('a')\n", 0, False),
+        # a string statement is the body; the next line runs once
+        ("for (const r of [1, 2]) 'x'\nawait agent('b')\n", 1, True),
+        # `for$` is a name, not the keyword
+        ("const r = for$(await agent('a'))\n", 1, True),
+    ],
+)
+def test_a_loop_keyword_is_read_only_where_it_is_one(
+    mod: ModuleType, source: str, agents: int, exact: bool
+) -> None:
+    cost = mod.price_script(source)
+    assert (cost.agents, cost.exact) == (agents, exact), cost.unknowns
+
+
+def test_a_do_while_condition_is_priced_per_iteration(mod: ModuleType) -> None:
+    cost = mod.price_script("do { await agent('a') } while (await agent('c'))\n")
+    assert [(u.kind, u.per_unit) for u in cost.unknowns] == [("loop", 2)]
+
+
+def test_an_unsettled_body_says_why_it_has_no_width(mod: ModuleType) -> None:
+    cost = mod.price_script("for (const x of [1, 2]) if (x) await agent('a')\n")
+    assert [u.form for u in cost.unknowns] == [
+        "for loop, body extent not read, so no width is trusted"
+    ]
+
+
+def test_a_bom_does_not_change_the_price(
+    mod: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text = (
+        "function review(r) { return agent(r) }\nconst ROWS = [1, 2, 3]\n"
+        "await parallel(ROWS.map(r => () => review(r)))\n"
+    )
+    plain, bom = tmp_path / "plain.js", tmp_path / "bom.js"
+    plain.write_bytes(text.encode())
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode())
+    payloads = []
+    for path in (plain, bom):
+        assert mod.main([str(path), "--json"]) == 0
+        payloads.append(json.loads(capsys.readouterr().out))
+    assert [(p["agents"], p["exact"]) for p in payloads] == [(3, True), (3, True)]
+
+
+def test_a_text_stdin_without_a_buffer_still_reads(
+    mod: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(sys, "stdin", io.StringIO("await agent('a')\n"))
+    assert mod.main(["--stdin", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["agents"] == 1
+    monkeypatch.setattr(sys, "stdin", None)
+    assert mod.main(["--stdin"]) == 1
+    assert "cannot read <stdin>" in capsys.readouterr().err
+
+
+def test_a_snippet_the_console_cannot_encode_is_escaped(
+    mod: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "arrow.js"
+    path.write_bytes("const q = rows.map(agent) // → report\n".encode())
+    sink = io.BytesIO()
+    console = io.TextIOWrapper(sink, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", console)
+    assert mod.main([str(path)]) == 0
+    console.flush()
+    assert b"\\u2192" in sink.getvalue()
