@@ -90,6 +90,8 @@ def test_every_root_file_the_engine_build_reads_trips_the_gate() -> None:
         "scripts/release/forbidden_members.py",
         "ci/python-version",
         ".github/workflows/release.yml",
+        "hatch.toml",
+        ".gitignore",
     ],
 )
 def test_the_existing_arms_still_trip_the_gate(path: str) -> None:

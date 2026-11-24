@@ -3324,7 +3324,10 @@ jobs:
           # It must also FAIL LOUDLY on a base that is empty or unreachable, because a silent empty
           # diff degrades a path gate into skipping everything while still reading as path-gated,
           # which is the defect this comment exists to stop hiding.
-          changed=$(git diff --name-only "$BASE_SHA...HEAD")
+          # --no-renames: with rename detection on, a rename lists only its NEW path, so `git mv
+          # LICENSE LICENSE.md` would match no `LICENSE$` arm below. Listing both sides of a rename
+          # can only make an arm fire more often, never less (BACKLOG #5472).
+          changed=$(git diff --name-only --no-renames "$BASE_SHA...HEAD")
           # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
           # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
@@ -3456,14 +3459,16 @@ jobs:
           # tests/test_packaged_tree_denylist.py -- so a file ADDED to a packaged tree is caught
           # there without a build.
           # ci/python-version is listed because it is the interpreter the build runs on.
-          # ci/locks/release-tools.lock is listed because the build installs its backend from it,
-          # so a lock-only bump changes the hatchling that builds (BACKLOG #5472). README.md,
-          # CHANGELOG.md, LICENSE and NOTICE are the root files the engine build reads by name: the
-          # sdist's `only-include`, `readme` and `license-files` in pyproject.toml, so a rename or a
-          # removal of one breaks the build or drops a licence file from it. They rarely change, so
-          # listing them costs little. tests/test_ci_packaging_gate.py reads those inputs out of
-          # pyproject.toml and this job, and fails if one stops tripping this arm.
-          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE)$|\.github/workflows/(ci|release)\.yml)'; then
+          # ci/locks/release-tools.lock is listed because the job installs `build`, the frontend it
+          # runs, from it (BACKLOG #5472); the hatchling backend comes from pyproject.toml's
+          # [build-system], which is listed already. README.md, CHANGELOG.md, LICENSE and NOTICE are
+          # the root files the engine build reads by name: the sdist's `only-include`, `readme` and
+          # `license-files` in pyproject.toml, so a rename or a removal of one breaks the build or
+          # drops a licence file from it. hatch.toml merges over pyproject's [tool.hatch], and
+          # hatchling applies .gitignore as build exclusions. They rarely change, so listing them
+          # costs little. tests/test_ci_packaging_gate.py reads the pyproject inputs and the job's
+          # locks, and fails if one stops tripping this arm.
+          if echo "$changed" | grep -qE '^(pyproject\.toml|packaging/|scripts/release/|ci/python-version|ci/locks/release-tools\.lock$|(README\.md|CHANGELOG\.md|LICENSE|NOTICE|hatch\.toml|\.gitignore)$|\.github/workflows/(ci|release)\.yml)'; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -5879,12 +5884,13 @@ jobs:
           # the always-TLS change does not touch it. The /messages read below IS an API call and does;
           # it pins the same minted certificate as the previous step.
           #
-          # THE READ IS SIGNED IN (vault BACKLOG #2719). `rigadmin get` first checks that the service
-          # refuses /messages to a request with no session, then signs in ONCE as the Administrator the
-          # install step provisioned and asks again until a message shows, for up to 10 seconds. One
-          # sign-in, because the engine paces sign-ins per client address. It prints the count. It
-          # exits 1 when the count never reached 1, and 4 when the rig could not sign in or the
-          # service answered /messages with no session.
+          # THE READ IS SIGNED IN (vault BACKLOG #2719). Each `rigadmin get` first checks that the
+          # service refuses /messages to a request with no session, then signs in as the
+          # Administrator the install step provisioned and asks again until the count reaches 1 or
+          # its timeout ends. It prints the count. It exits 1 when the count never reached 1 and also
+          # when the API answered non-200 (then it prints no count), and 4 when the rig could not
+          # sign in or the service answered /messages with no session. The engine paces sign-ins
+          # per client address, so the reads below are at most three.
           #
           # THE SEND AND THE DISPOSITION ARE BOTH CHECKED (BACKLOG #5473). This step used to run
           # send_mllp.py with no exit check and count `/messages` total, so a failed send passed on
@@ -5892,13 +5898,13 @@ jobs:
           # non-zero exit does not stop a pwsh step unless $PSNativeCommandUseErrorActionPreference
           # is on, so the exit is read explicitly. send_mllp.py exits 0 on a NAK, so the ACK's
           # MSA-1 is read too. The count is then taken only for this listener, IB_Test_ADT, and only
-          # in a disposition the router reached: PROCESSED, or ROUTED with its delivery still
-          # pending. ROUTED is accepted because the sample graph archives to a relative ./out/adt,
-          # and on the virtual-account legs the service's working folder is the administrator-only
-          # install root, where the same graph's relative inbound folders are refused at start, so
-          # delivery may still be retrying when the step reads. RECEIVED, ERROR, UNROUTED and
-          # FILTERED all fail. The reads go routed, then processed, after the processed wait, so a
-          # message that moves forward between two reads is still counted.
+          # at PROCESSED, or, on the legs that cannot deliver, at ROUTED with the delivery pending.
+          # Anything else fails. The sample graph archives to a relative ./out/adt, and the
+          # service's working folder is the administrator-only install root: the same graph's
+          # relative inbound folders are refused there at start on the virtual-account legs, so
+          # their delivery may still be retrying when the step reads. The localsystem leg can write
+          # there and must reach PROCESSED. Reads go routed, then processed, after the processed
+          # wait, so a message that moves forward between two reads is still counted.
           $cert = "C:\ProgramData\MessageFoundry\api-generated-cert.pem"
           $ack = @(& python samples\send_mllp.py samples\messages\adt_a01.hl7)
           $sent = $LASTEXITCODE
@@ -5906,15 +5912,17 @@ jobs:
           if ($sent -ne 0) { throw "send_mllp.py exited $sent, so the MLLP send failed" }
           if (-not @($ack | Where-Object { $_ -match '^MSA\|AA\|' })) { throw "the listener did not accept the message: its ACK carries no MSA|AA" }
           $base = "/messages?channel_id=IB_Test_ADT"
+          # Assigned in each branch: an `if` used as a value unrolls the one-read list into its items.
+          if ($env:SMOKE_ACCOUNT -eq "localsystem") { $reads = @(, @("processed", 30)) } else { $reads = @(@("processed", 10), @("routed", 10), @("processed", 0)) }
           $found = $null
-          foreach ($read in @(@("processed", 10), @("routed", 10), @("processed", 0))) {
+          foreach ($read in $reads) {
             $count = & python -m harness.load.rigadmin get --engine https://127.0.0.1:8765 --cacert $cert --field total --at-least 1 --timeout $read[1] "$base&status=$($read[0])"
             $rc = $LASTEXITCODE
             if ($rc -eq 4) { throw "the rig could not sign in to the service, or the service answered /messages with no session" }
             if ($rc -eq 0) { $found = $read[0]; break }
-            if ($rc -ne 1) { throw "rigadmin exited $rc reading $base&status=$($read[0])" }
+            if ($rc -ne 1 -or "$count" -notmatch '^\d+$') { throw "rigadmin exited $rc reading $base&status=$($read[0]) with no count: the API refused the read, its own line above says how" }
           }
-          if (-not $found) { throw "the message from IB_Test_ADT never reached ROUTED or PROCESSED: it is stuck at RECEIVED, or it went to ERROR, UNROUTED or FILTERED" }
+          if (-not $found) { throw "the message from IB_Test_ADT did not reach $(($reads | ForEach-Object { $_[0] } | Select-Object -Unique) -join ' or ') ($env:SMOKE_ACCOUNT leg)" }
           "IB_Test_ADT messages $found = $count"
 
       # vault BACKLOG #2701, #2700: install-service.ps1 registers the engine as the Python
