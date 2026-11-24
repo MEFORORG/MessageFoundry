@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import sqlite3
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -320,6 +321,66 @@ async def test_the_store_refuses_an_ineligible_row_only_when_asked(
 
     assert await mint(True) is False
     assert await mint(False) is True
+
+
+async def _mint(engine: Engine, user_id: str, *, eligible: bool) -> bool:
+    return await engine.store.create_session(
+        token_hash=hash_token(uuid.uuid4().hex),
+        user_id=user_id,
+        expires_at=time.time() + 3600,
+        seed_reauth=False,
+        auth_mechanism="kerberos",
+        require_sign_in_eligible=eligible,
+    )
+
+
+@pytest.mark.parametrize("eligible", [True, False])
+async def test_the_eligible_insert_reads_under_begin_immediate_on_sqlite(
+    engine: Engine, eligible: bool
+) -> None:
+    """The eligibility read and the INSERT share one ``BEGIN IMMEDIATE``, so SQLite's write lock
+    is held before the read. The insert without the guard keeps the deferred ``BEGIN`` (control)."""
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    db: Any = engine.store._db  # type: ignore[attr-defined]
+    traced: list[str] = []
+    await db.set_trace_callback(traced.append)
+    try:
+        assert await _mint(engine, user_id, eligible=eligible) is True
+    finally:
+        off: Any = None  # sqlite3 clears the trace on None; aiosqlite's stub types only a callable
+        await db.set_trace_callback(off)
+    select = next(i for i, s in enumerate(traced) if s.startswith("SELECT oidc_issuer"))
+    begin = max(i for i, s in enumerate(traced[:select]) if s.startswith("BEGIN"))
+    assert traced[begin] == ("BEGIN IMMEDIATE" if eligible else "BEGIN")
+    assert any(s.startswith("INSERT INTO sessions") for s in traced[select:])
+
+
+async def test_a_disable_committed_by_another_connection_is_refused_at_the_insert(
+    engine: Engine, tmp_path: Path
+) -> None:
+    """Another connection to the same file stands in for another engine shard. It holds SQLite's
+    write lock with a disable uncommitted while the insert starts; the insert waits at its
+    ``BEGIN IMMEDIATE``, reads the committed disable, and refuses. Measured with the deferred
+    ``BEGIN``: the insert read the row before the commit and its INSERT failed at once with
+    ``database is locked``, so this test fails without the fix."""
+    service = await _service(engine)
+    assert (await _sign_in(service, _principal())).ok
+    user_id = await _user_id(engine)
+    before = await _live_sessions(engine, user_id)
+    other = sqlite3.connect(tmp_path / "directory_sign_in_lock.db", isolation_level=None, timeout=5)
+    try:
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("UPDATE users SET disabled=1 WHERE id=?", (user_id,))
+        mint = asyncio.ensure_future(_mint(engine, user_id, eligible=True))
+        await asyncio.sleep(0.3)
+        assert not mint.done()  # waiting on the other connection's write lock
+        other.execute("COMMIT")
+    finally:
+        other.close()
+    assert await mint is False
+    assert await _live_sessions(engine, user_id) <= before
 
 
 def test_sign_in_state_refused_reads_each_backends_column_shapes() -> None:

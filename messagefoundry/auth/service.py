@@ -1987,7 +1987,10 @@ class _BindingChangedMidLogin(Exception):
     "returns the token". The store's one ``False`` does not say which cause it was, so
     :meth:`AuthService._issue_session` reads the account once more to tell them apart. An id that
     names no row then was deleted: no later write brings it back. An id that names a row was refused
-    for its binding, because the guarded insert refuses a present row only on its pair.
+    for its binding, or, on an insert that also passed ``require_sign_in_eligible`` (the directory
+    leg, BACKLOG #5653), because the row was disabled or locked at the insert. ``account_deleted``
+    is ``False`` for both; :meth:`AuthService._complete_ad_login` reads the row once more to name
+    which.
     """
 
     def __init__(self, account_deleted: bool = False) -> None:
@@ -2712,6 +2715,20 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
     The slugs are literals from a closed set, never directory- or IdP-supplied text, because they are
     stored on the audit row and read by the browser layer.
     """
+    state = _directory_sign_in_state_refusal(user, now)
+    if state is not None:
+        return state
+    # Last, so a disabled or locked row keeps the reason an operator already acts on.
+    if not federated and _holds_federated_binding(user):
+        return FEDERATED_SIGN_IN_REQUIRED
+    return None
+
+
+def _directory_sign_in_state_refusal(user: UserRecord, now: float) -> str | None:
+    """The disabled and lock half of :func:`_directory_login_refusal`, with no binding check.
+
+    BACKLOG #5653: the reason a directory session insert refused under ``require_sign_in_eligible``
+    is named from these states alone, since the binding there is the insert's own guard."""
     if user.disabled:
         return "disabled"
     # ADR 0197 AC-5: EITHER lock refuses a directory sign-in. The sign-in lock is read first, so a
@@ -2720,9 +2737,6 @@ def _directory_login_refusal(user: UserRecord, now: float, *, federated: bool) -
         return DIRECTORY_LOCKED
     if user.second_step_locked_until is not None and now < user.second_step_locked_until:
         return DIRECTORY_LOCKED
-    # Last, so a disabled or locked row keeps the reason an operator already acts on.
-    if not federated and _holds_federated_binding(user):
-        return FEDERATED_SIGN_IN_REQUIRED
     return None
 
 
@@ -2748,7 +2762,8 @@ def _in_directory_sign_in_queue[**P](
 
     **WHAT THE QUEUE DOES NOT ORDER.** At least an administrator's disable or role change, a lock a
     re-proof or a second-step check sets, a directory reconciler pass, and a sign-in on another
-    engine shard take no part in it: it is per API process, keyed by name. A reconciler pass or a
+    engine shard take no part in it: it is per API process, keyed by the account's directory
+    object id (by name only for a principal that carries none). A reconciler pass or a
     sign-in on another shard that moves the roles can still end this sign-in's new session.
 
     The key is the account's directory object id. A decorator rather than a wrapper method so
@@ -4488,7 +4503,8 @@ class AuthService:
         # same caveat as the re-proof table above: engine shards serving their own API ports each
         # keep their own table, so the bound holds per process, not across them.
         self._credential_locks: dict[str, _KeyedLock] = {}
-        # BACKLOG #5653: one directory sign-in per account name at a time
+        # BACKLOG #5653: one directory sign-in per account at a time, keyed by its directory
+        # object id, by name only where the principal carries none
         # (:func:`_in_directory_sign_in_queue`). Its own table, not the credential queue above:
         # a password attempt holds that one across its padded failure window, so sharing it would
         # let anyone who knows a directory name stall that user's Windows SSO and OIDC sign-ins.
@@ -8899,9 +8915,9 @@ class AuthService:
                     )
                     again = None
                 if again is not None:
-                    # ``federated=True`` asks only the disabled and lock states: a binding change
-                    # keeps the reason chosen below.
-                    now_ineligible = _directory_login_refusal(again, time.time(), federated=True)
+                    # The disabled and lock states only: a binding change keeps the reason chosen
+                    # below.
+                    now_ineligible = _directory_sign_in_state_refusal(again, time.time())
             if changed.account_deleted:
                 reason = ACCOUNT_DELETED
             elif now_ineligible is not None:
@@ -12528,10 +12544,12 @@ class AuthService:
         )
         if not issued:
             # An unbind or a bind revoked this account's sessions while this login was in flight,
-            # so issuing now would hand back a token the revocation could never have seen; or the
-            # account was deleted under it (BACKLOG #2733). Nothing was written, so there is
-            # nothing to undo. One more read tells the two apart (BACKLOG #5624).
-            # An unguarded insert is refused only for a missing row, so it needs no read.
+            # so issuing now would hand back a token the revocation could never have seen; or,
+            # under ``require_sign_in_eligible``, the row was disabled or locked at the insert
+            # (BACKLOG #5653); or the account was deleted under it (BACKLOG #2733). Nothing was
+            # written, so there is nothing to undo. One more read tells a deleted row from a
+            # present one (BACKLOG #5624); a present row's cause is the caller's to name.
+            # An insert with neither guard is refused only for a missing row, so it needs no read.
             deleted = (
                 require_federated_subject is None and not require_sign_in_eligible
             ) or not await self._user_id_held(user_id)

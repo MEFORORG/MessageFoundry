@@ -22056,8 +22056,12 @@ class MessageStore:
         # path's binding check; BACKLOG #5653 for the eligibility check). The lock alone is what
         # makes the read and the INSERT atomic against clear_user_federated_subject, a disable, a
         # lockout and every whole-account revoke, which take the same lock.
+        # That lock is this process's only. Under ``require_sign_in_eligible`` the transaction is
+        # BEGIN IMMEDIATE, so SQLite's write lock is held before the read and a disable or lockout
+        # committed by another engine shard on the same store cannot land between the read and the
+        # INSERT (BACKLOG #5653, as BACKLOG #3078 F5 does for the first-administrator grant).
         # The refusal below rolls back itself, as that helper's contract requires (ADR 0159).
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=require_sign_in_eligible):
             cur = await self._db.execute(
                 "SELECT oidc_issuer, oidc_subject, session_epoch, disabled, locked_until,"
                 " second_step_locked_until,"
