@@ -649,12 +649,17 @@ function Get-Floor {
     #
     # WHAT THIS DOES NOT CATCH: a torn prefix ("10" left of "1032") is a whole number and reads as one.
     # The temp-and-rename write below is what keeps this script from leaving one.
-    $ratchetRemedy = "Do not delete it to get past this: that drops the ratchet, and the numbers it holds are ones no ref here still shows. Restore the value it held from a backup or log if one has it; otherwise write a number no lower than the highest $Kind number issued anywhere in the fleet, which is at least the $computed this sweep found. Then re-run."
+    # TWO REMEDIES, because the two failures need opposite acts. A read that failed says nothing about
+    # the content, so it must not invite a rewrite. A bad value has lost its number, and any value at or
+    # below $computed is the same as deleting the file: holes are free and collisions are not, so the
+    # repair asks for a value ABOVE it.
+    $readRemedy = "Do not rewrite or delete it: its content may be valid. Retry when the share answers, or fix access to the file, then re-run."
+    $ratchetRemedy = "Do not delete it to get past this: that drops the ratchet, and the numbers it held are ones no ref here still shows. Restore the value it held from a backup if one has it. Otherwise this needs the owner: a value at or below the $computed this sweep found is the same as deleting the file, so write one comfortably above it. Then re-run."
     $raw = $null
     $absent = $false
     try { $raw = Read-CoordText $watermark }
     catch [System.IO.FileNotFoundException] { $absent = $true }
-    catch { throw "alloc.ps1: $refusal -- the high-water file $watermark could not be read ($(ConvertTo-Safe $_.Exception.Message)), so the floor it protects cannot be known and nothing was read as a floor or allocated. $ratchetRemedy" }
+    catch { throw "alloc.ps1: $refusal -- the high-water file $watermark could not be read ($(ConvertTo-Safe $_.Exception.Message)), so the floor it protects cannot be known and nothing was read as a floor or allocated. $readRemedy" }
     if (-not $absent) {
         if (-not [int]::TryParse("$raw".Trim(), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$previous)) {
             throw "alloc.ps1: $refusal -- the high-water file $watermark does not hold a whole number, so the floor it protects cannot be known and nothing was read as a floor or allocated. $ratchetRemedy"

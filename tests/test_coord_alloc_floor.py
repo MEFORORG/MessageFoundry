@@ -19,8 +19,9 @@ cases at the end of this file pin that fetch in both directions, pin the no-orig
 refusal on a fetch that cannot succeed, and pin ``-List`` staying offline. They are the ones that
 break if the fetch is deleted as dead weight.
 
-``-ShowFloor`` is used throughout: allocation is a one-way door and a test that allocated would leave
-permanent holes in a shared registry.
+``-ShowFloor`` is the default here: allocation is a one-way door and a test that allocated into a
+shared registry would leave permanent holes in it. The few cases that do allocate (the dead-origin
+case and the BACKLOG #7560 cases) allocate only into the throwaway fixture's own ``.git``.
 """
 
 from __future__ import annotations
@@ -544,7 +545,7 @@ def test_a_fetch_that_cannot_succeed_refuses_and_allocates_nothing(tmp_path: Pat
     was already in the script when #1546 collided, so restoring it would reinstall a control that
     cannot reach the case. That is worth a case of its own.
 
-    This one really ALLOCATES, unlike every other case in the file, because "there is no partial
+    This one really ALLOCATES, unlike most cases in the file, because "there is no partial
     state" is half the claim and only a real allocation can leave any. It is safe here: the registry
     lives under the throwaway fixture's own ``.git``.
 
@@ -617,7 +618,7 @@ def test_the_allocator_does_not_speak_the_work_claim_register() -> None:
     Non-vacuity is carried by the second assertion, and it pins the DATA rather than the label:
     deleting the line outright would otherwise pass this test silently. The wording stays free.
 
-    Reads the source. It does not allocate -- see this module's docstring for why nothing here may.
+    Reads the source. It does not allocate -- see this module's docstring for why cases default not to.
     """
     src = (_ROOT / "scripts" / "coord" / "alloc.ps1").read_text(encoding="utf-8")
 
@@ -868,15 +869,18 @@ def test_an_unreadable_high_water_file_refuses_instead_of_lowering_the_floor(
 
 
 def test_a_high_water_path_that_cannot_be_read_refuses(tmp_path: Path) -> None:
-    """Only a MISSING high-water file reads as absent. A path that exists but cannot be read (here a
-    directory in its place) refuses; a ``Test-Path`` probe would also answer ``$false`` for an
-    unreachable share and read the ratchet as 0."""
+    """A high-water path that exists but cannot be read (here a directory in its place) refuses, and
+    the refusal does not invite a rewrite. NOT A CONTROL for the removed ``Test-Path`` probe: it
+    answers ``$true`` for a directory, so restoring it passes this too. The case that would trip it,
+    an unreachable share, has no offline fixture here."""
     repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
     reg = _registry(repo)
     (reg / ".floor-highwater").mkdir()
     shown = _run(repo, "-ShowFloor", "-Kind", "adr")
-    assert shown.returncode != 0, shown.stdout + shown.stderr
-    assert "REFUSING TO REPORT A FLOOR" in shown.stdout + shown.stderr
+    combined = shown.stdout + shown.stderr
+    assert shown.returncode != 0, combined
+    assert "REFUSING TO REPORT A FLOOR" in combined
+    assert "Do not rewrite or delete it" in combined, combined
 
 
 def test_the_high_water_write_leaves_the_floor_and_no_temp(tmp_path: Path) -> None:
