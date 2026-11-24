@@ -161,9 +161,9 @@ def test_a_real_field_still_loads_from_the_environment() -> None:
     ],
 )
 def test_a_name_that_is_a_section_and_no_setting_refuses_the_load(name: str, how: str) -> None:
-    """The exact ``MEFOR_<SECTION>`` shape (vault BACKLOG #2600, Manager decision
-    d20261123T172418598-d8ffd6, option (c)): nothing reads it, and nothing else owns the name of
-    a config section, so it is refused rather than warned about. Named, never its value."""
+    """The exact ``MEFOR_<SECTION>`` shape (vault BACKLOG #2600): nothing reads it, and
+    ``MEFOR_*`` names are the engine's namespace, so it is refused. It is also noted, as a
+    WARNING logged before the refusals. Named, never its value."""
     message = _refusal({name: _SENTINEL})
     section = name[len("MEFOR_") :].lower().rstrip("_")
     assert f"{name} (names the [{section}] section and no setting; {how})" in message

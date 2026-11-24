@@ -8948,9 +8948,10 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     * the name is a modelled section's name and nothing else, ``MEFOR_<SECTION>`` with or without
       trailing ``_`` (``MEFOR_STORE``, ``MEFOR_STORE_``, ``MEFOR_UPDATE_CHECK``), for every
       modelled section, ``[security]`` included (:func:`_section_named_alone`). No setting has
-      that name, and the name of a config section is the engine's, so a refusal here does not
-      guess at another tool's variable. Manager decision d20261123T172418598-d8ffd6, option (c), under the owner's
-      delegation of 2026-11-23;
+      that name. ``MEFOR_*`` names are the engine's namespace, so a bare section name is refused
+      even though a tool outside the engine could choose one; nothing checks that none does.
+      Decided under the owner's instruction of 2026-11-23 (Manager decision
+      d20261123T172418598-d8ffd6, option (c));
     * the section part is in :data:`_SECTIONS`, the list :func:`_env_overrides` reads, and the key
       is not a field of that section;
     * the name starts ``MEFOR_<SECTION>_`` for a modelled section that has NO env layer
@@ -8986,7 +8987,6 @@ def _reject_unknown_env_keys(environ: Mapping[str, str], data: Mapping[str, Any]
     for name, rest in _unspared_env_names(environ, referenced):
         alone = _section_named_alone(rest, models)
         if alone is not None:
-            # Manager decision d20261123T172418598-d8ffd6, option (c).
             offenders.append(
                 f"{_printable(name)} (names the [{alone}] section and no setting; "
                 f"{_how_to_set_in(alone)})"
