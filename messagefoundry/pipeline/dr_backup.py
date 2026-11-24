@@ -57,7 +57,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Literal, NamedTuple, cast
+from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, cast
 
 from messagefoundry import file_lock
 from messagefoundry.config import atomic_edit
@@ -448,6 +448,38 @@ class _HashingReader:
         if isinstance(data, (bytes, bytearray, memoryview)):
             self.digest.update(data)
         return data
+
+
+class _ChunkSource(Protocol):
+    """What :func:`_read_chunks` reads from: a binary ``read(n)`` that may answer ``None``."""
+
+    def read(self, size: int, /) -> bytes | None: ...
+
+
+#: The read size of :func:`_read_chunks`, the 1 MiB the copy loops it replaced read.
+_COPY_CHUNK_BYTES = 1024 * 1024
+#: How long :func:`_read_chunks` waits after a ``None`` read before it reads again (BACKLOG #6687).
+_NO_DATA_YET_WAIT_SECONDS = 0.01
+
+
+def _read_chunks(src: _ChunkSource) -> Iterator[bytes]:
+    """Yield ``src``'s bytes, one ``read`` of up to :data:`_COPY_CHUNK_BYTES` at a time, until an
+    empty read, which is the end of the stream.
+
+    A ``None`` read is not the end of the stream: a non-blocking source answers ``None`` when it has
+    no data ready YET. Stopping there, as a bare ``if not buf: break`` loop does, would finish a copy
+    short and report it as complete. So the loop waits :data:`_NO_DATA_YET_WAIT_SECONDS` and reads
+    again. The wait is not bounded, the same as a blocking read that never returns. A blocking source
+    does not answer ``None``, so for one this yields the same reads the old loops wrote (BACKLOG
+    #6687)."""
+    while True:
+        buf = src.read(_COPY_CHUNK_BYTES)
+        if buf is None:
+            time.sleep(_NO_DATA_YET_WAIT_SECONDS)
+            continue
+        if not buf:
+            return
+        yield buf
 
 
 def _manifest_time(manifest: dict[str, object]) -> float | None:
@@ -1285,10 +1317,7 @@ class BackupRunner:
             else:
                 # No key + allow_unencrypted: write the plaintext tar verbatim. It can hold PHI: no
                 # instance is synthetic since BACKLOG #1279 (ADR 0186).
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src):
                     dst.write(buf)
             dst.flush()
             os.fsync(dst.fileno())
@@ -4413,10 +4442,7 @@ def _verify_in_staging(
             # teardown discards the partial tar on the way out.
             decrypt_stream(src, dst, match_key, max_plaintext_bytes=_MAX_RESTORE_PLAINTEXT_BYTES)
         else:
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            for buf in _read_chunks(src):
                 dst.write(buf)
     manifest = _read_manifest_from_tar(tar_path)
     if manifest.get("config_only"):
@@ -7121,10 +7147,7 @@ def _extract_config_members(
                 # secrets (connections.toml), and securing it after the stream would leave the write
                 # under the directory's inherited ACL on Windows for as long as the write takes.
                 _secure_file(out)
-                while True:
-                    buf = src.read(1024 * 1024)
-                    if not buf:
-                        break
+                for buf in _read_chunks(src):
                     # Counting the streamed bytes IS the cap enforcement here (a lying header declares a
                     # small size and streams an unbounded one), so this loop cannot become copyfileobj.
                     streamed += len(buf)
