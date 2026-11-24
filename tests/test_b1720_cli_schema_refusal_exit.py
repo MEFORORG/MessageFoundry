@@ -175,7 +175,9 @@ def test_provision_admin_refuses_at_the_write_open_too(
     monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("getpass.getpass", lambda *_a, **_k: _PASSWORD)
     monkeypatch.setattr(
-        cli, "_enrol_totp_at_terminal", lambda **_k: ("JBSWY3DPEHPK3PXP", "123456", 0.0)
+        cli,
+        "_enrol_totp_at_terminal",
+        lambda **_k: ("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP", "123456", 0.0),
     )
     code = main(_argv("provision-admin", shell))
     captured = capsys.readouterr()

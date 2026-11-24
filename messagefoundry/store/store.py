@@ -4491,10 +4491,11 @@ def discoverable_way_past(
 
 
 #: What a TOTP judgement found (BACKLOG #3422). ``"usable"``: the engine can compute codes with it.
-#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses. ``"unknown"``: it
-#: could not be judged (the cell did not open, a cipher service did not answer, or the value could
-#: not be computed with). Only a KNOWN refusal moves any decision away from the plain
-#: ``totp_enabled`` rule; an unknown answer is treated exactly as that rule treats it.
+#: ``"refused"``: a KNOWN no, an enrolment whose marker this release refuses or whose key is too
+#: short to compute with (BACKLOG #5340), or no secret at all. ``"unknown"``: it could not be judged
+#: (the cell did not open, a cipher service did not answer, or the value is not base32). Only a
+#: KNOWN refusal moves any decision away from the plain ``totp_enabled`` rule; an unknown answer is
+#: treated exactly as that rule treats it.
 TotpState = Literal["usable", "refused", "unknown"]
 
 #: The caller's rule for what an OPENED TOTP secret is (:data:`TotpState`): the auth service's

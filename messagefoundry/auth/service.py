@@ -3049,8 +3049,11 @@ class LockableAccountCensus:
     no_way_past: tuple[str, ...] = ()
     undecryptable_totp: tuple[str, ...] = ()
     #: The accounts in ``undecryptable_totp`` whose TOTP could not be JUDGED (the cell did not open,
-    #: or the value would not compute), as opposed to a KNOWN refusal. Every gate counts such a TOTP
-    #: as the plain enabled-TOTP rule does; this names them as unknown (BACKLOG #3422).
+    #: or the opened value is not base32), as opposed to a KNOWN refusal: a refused enrolment
+    #: marker (a value holding a colon reads as a refused marker, a known refusal), a key too short
+    #: to compute with (BACKLOG #5340) or an empty secret is a known refusal and is not named here.
+    #: Every gate counts such a TOTP as the plain enabled-TOTP rule does; this names them as
+    #: unknown (BACKLOG #3422).
     unknown_totp: tuple[str, ...] = ()
     passkey_only: tuple[str, ...] = ()
     #: The covered accounts in ``unknown_totp`` that also hold a discoverable passkey, which a
@@ -3159,11 +3162,24 @@ def _log_totp_undecryptable(username: str) -> None:
 
 
 def _log_totp_refused(username: str) -> None:
-    """Log an account whose TOTP cell opens but names parameters this release does not compile in
-    (BACKLOG #3422). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    """Log an account whose TOTP cell opens to an enrolment this release refuses
+    (:class:`totp.RefusedEnrolment` raised directly, BACKLOG #3422, #5340): a malformed marker, one
+    naming parameters it does not compile in, or an accepted marker followed by an empty secret. No
+    code matches it, so the cure is a fresh enrolment, not the store key."""
     _log.warning(
-        "the TOTP enrolment of account %r names parameters this release does not compute with; no "
-        "code matches it until the account enrols again",
+        "the TOTP enrolment of account %r is refused by this release (a malformed marker, "
+        "parameters it does not compute with, or no secret after the marker); no code matches it "
+        "until the account enrols again",
+        username,
+    )
+
+
+def _log_totp_short_key(username: str) -> None:
+    """Log an account whose TOTP cell opens to a key shorter than this release computes with
+    (BACKLOG #5340). No code matches it, so the cure is a fresh enrolment, not the store key."""
+    _log.warning(
+        "the TOTP secret of account %r is shorter than this release computes with; no code matches "
+        "it until the account enrols again",
         username,
     )
 
@@ -3261,14 +3277,17 @@ class CensusNeedsTheStoreKey(RuntimeError):
 async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
     """What ``user``'s enabled TOTP secret is (:data:`~messagefoundry.store.store.TotpState`):
     ``"usable"``, ``"refused"`` (a KNOWN no: its enrolment marker names parameters this release
-    refuses, or the row holds no secret) or ``"unknown"`` (it could not be judged: the cell did not
-    open, or the value could not be computed with).
+    refuses, its key is too short to compute with, or the row holds no secret) or ``"unknown"``
+    (it could not be judged: the cell did not open, or the value is not base32; a value holding a colon reads as a refused marker, a known refusal).
 
     At least these ways to fail. The cipher refuses the cell (:class:`CipherError`), which is logged, naming
-    the account and never the value. A keyless open hands the stored ciphertext through unchanged,
-    which is not base32, so computing a code from it fails. Or the cell opens but its enrolment
-    marker is refused (:class:`totp.RefusedEnrolment`, BACKLOG #3422), logged with its own cause
-    since the store key is healthy and the cure is a re-enrolment. Any other store error propagates: it
+    the account and never the value. A keyless open hands the stored ciphertext through
+    unchanged; the census does not judge that cell but raises :class:`CensusNeedsTheStoreKey`,
+    reading the fault as the shell's key. Or the cell opens but its enrolment marker is refused
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422), its key is short
+    (:class:`totp.RefusedTotpSecret`, BACKLOG #5340) or it is not base32
+    (:class:`totp.UndecodableTotpSecret`), each logged with its own cause since the store key is
+    healthy. Any other store error propagates: it
     says nothing about this secret, and filing it as "undecryptable" would send an operator to reset
     a healthy account."""
     try:
@@ -3284,45 +3303,68 @@ async def _totp_secret_state(store: AdminStore, user: UserRecord) -> TotpState:
             "written under. Set the service's store key here and run again."
         )
     reason = _totp_unusable_reason(secret)
-    if reason == "refused":
-        _log_totp_refused(user.username)
-        return "refused"
-    if reason == "malformed":
-        _log_totp_malformed(user.username)
-        return "unknown"
-    return "usable"
+    if reason is not None:
+        _log_totp_unusable(user.username, reason)
+    return _totp_state_for(reason)
 
 
-def _totp_unusable_reason(secret: str) -> Literal["refused", "malformed"] | None:
+_TotpUnusable = Literal["refused", "short_key", "malformed"]
+
+
+def _totp_state_for(reason: _TotpUnusable | None) -> TotpState:
+    """The :data:`TotpState` of an opened secret whose :func:`_totp_unusable_reason` is ``reason``:
+    the one mapping the census and the gates share. A refused marker or a short key is a KNOWN
+    refusal; a value that is not base32 cannot be judged."""
+    if reason is None:
+        return "usable"
+    return "unknown" if reason == "malformed" else "refused"
+
+
+def _totp_unusable_reason(secret: str) -> _TotpUnusable | None:
     """Why an OPENED TOTP secret is no key the engine can compute codes with, or ``None`` when it
     is one. ``"refused"``: its enrolment marker names parameters this release refuses
-    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"malformed"``: not base32, so no key. The one
+    (:class:`totp.RefusedEnrolment`, BACKLOG #3422). ``"short_key"``: its key is too short to
+    compute with (:class:`totp.RefusedTotpSecret`, BACKLOG #5340). Both are a KNOWN refusal.
+    ``"malformed"``: not base32 (:class:`totp.UndecodableTotpSecret`), so no key to judge. The one
     statement of the rule: :func:`_totp_secret_state` (the census) and :func:`_opened_totp_state`
     (every way-past gate) both ask it, so they cannot disagree about one account."""
     try:
         totp.totp(secret)
+    except totp.UndecodableTotpSecret:
+        return "malformed"
+    except totp.RefusedTotpSecret:
+        return "short_key"
     except totp.RefusedEnrolment:
         return "refused"
-    except ValueError:  # binascii.Error is a ValueError: not base32, so no key
+    except ValueError:  # no other is raised today; one that is cannot be judged, never a 500
         return "malformed"
     return None
+
+
+def _log_totp_unusable(username: str, reason: _TotpUnusable) -> None:
+    """Log ``reason`` (:func:`_totp_unusable_reason`) for ``username``'s opened TOTP secret, by its
+    own cause and never the value."""
+    if reason == "refused":
+        _log_totp_refused(username)
+    elif reason == "short_key":
+        _log_totp_short_key(username)
+    else:
+        _log_totp_malformed(username)
 
 
 def _opened_totp_state(secret: str | None) -> TotpState:
     """What an OPENED TOTP secret is (BACKLOG #3422): ``"usable"`` when the engine can compute
     codes with it (:func:`_totp_unusable_reason`), ``"refused"`` when it KNOWS it cannot (an
-    enrolment marker this release refuses, or no secret at all), and ``"unknown"`` when it cannot
-    tell (ciphertext a keyless open passed through, or a value that will not compute). The service's
+    enrolment marker this release refuses, a key too short to compute with, or no secret at all),
+    and ``"unknown"`` when it cannot tell (ciphertext a keyless open passed through, or a value
+    that is not base32). The service's
     gates ask it, and pass it to the store's writes as their TOTP rule. Only ``"refused"`` moves any
     decision away from the plain ``totp_enabled`` rule."""
     if not secret:
         return "refused"
     if secret.startswith(MARKER_PREFIX):
         return "unknown"
-    reason = _totp_unusable_reason(secret)
-    if reason == "refused":
-        return "refused"
-    return "usable" if reason is None else "unknown"
+    return _totp_state_for(_totp_unusable_reason(secret))
 
 
 def _passkey_counts_nothing(cred: WebAuthnCredential) -> bool:
@@ -6607,9 +6649,10 @@ class AuthService:
         # name the account as enrolled to anyone who knows the username. The secret comes from the
         # checked record, so no driver runs here since BACKLOG #3510, and the open runs off the
         # loop (:meth:`_open_totp_cell`, BACKLOG #3929). At least the shipped ciphers, Transit
-        # included, refuse a cell as ``CipherError``, and a value that opens but is not base32
-        # raises ``ValueError`` from the verify; each is logged by the census's own one-line logger
-        # (BACKLOG #5335). Anything else is a defect, but raising it would be that unpadded 500, so
+        # included, refuse a cell as ``CipherError``, logged by the census's own one-line logger
+        # (BACKLOG #5335). A value that opens but no code is computed from, short or not base32,
+        # matches no code in the verify, and :meth:`_totp_secret` logged its cause (BACKLOG
+        # #5340). Anything else is a defect, but raising it would be that unpadded 500, so
         # it too is a wrong code, logged at ERROR by its type name and the account id alone, with
         # no traceback. Every arm fails CLOSED. ``consume_totp_step`` below is outside the catch,
         # reached only once a code matched.
@@ -6630,8 +6673,6 @@ class AuthService:
                     window=self._settings.totp_skew_steps,
                     now=arrived,
                 )
-            except ValueError:  # binascii.Error is a ValueError: opened, but not base32
-                _log_totp_malformed(user.username)
             except Exception as exc:  # noqa: BLE001 -- as above
                 _log_combined_totp_defect(user.id, exc)
         # The store is asked only once the code matched a step (ASVS 11.2.4, BACKLOG #1167: kept on
@@ -13716,17 +13757,16 @@ class AuthService:
     async def _totp_secret(self, user: VerifiedUser) -> str | None:
         """``user``'s TOTP secret, decrypted from the record its seal covered (BACKLOG #3510), or
         ``None``. Never a second read of the store: a secret swapped in after the checked load would
-        be checked against no seal, and its codes would sign in. A secret whose enrolment marker
-        is refused is logged here (BACKLOG #3422): every code check then reads it as a wrong code,
-        so this line is what names the cause."""
+        be checked against no seal, and its codes would sign in. A secret no code is computed from,
+        a refused enrolment marker (BACKLOG #3422) or a key that is short or not base32 (BACKLOG
+        #5340), is logged here by its cause: every code check then reads it as a wrong code, so this
+        line is what names the cause."""
         secret = await self._open_totp_cell(user)
         # A keyless open hands ciphertext through; that is a store-key fault, not a refused marker.
-        if (
-            secret is not None
-            and not secret.startswith(MARKER_PREFIX)
-            and _totp_unusable_reason(secret) == "refused"
-        ):
-            _log_totp_refused(user.username)
+        if secret is not None and not secret.startswith(MARKER_PREFIX):
+            reason = _totp_unusable_reason(secret)
+            if reason is not None:
+                _log_totp_unusable(user.username, reason)
         return secret
 
     async def _opened_totp_enrolment(self, user: VerifiedUser) -> _OpenedTotp | None:
@@ -17145,8 +17185,9 @@ class AuthService:
     async def _totp_state(self, user: VerifiedUser) -> TotpState | None:
         """What ``user``'s TOTP is (:func:`_opened_totp_state`, the census rule), or ``None`` when
         it is not enabled. The engine judges it ``"usable"`` when it can compute codes with it. An
-        enrolment whose marker this release refuses matches no code, so its combined sign-in can
-        never pass a lock, and it is no way past (BACKLOG #3422). The cell is the one the checked
+        enrolment whose marker this release refuses (BACKLOG #3422), or whose key is too short to
+        compute with (BACKLOG #5340), matches no code, so its combined sign-in can never pass a
+        lock, and it is no way past. The cell is the one the checked
         record's seal covered, judged by the store's :func:`judge_totp_cell`, off the event loop:
         the same judgement the store's conditional writes and the lock escalation make on the cell
         they lock (BACKLOG #3948 finding 17). The service's way-past decisions ask this: at least
@@ -17360,11 +17401,12 @@ class AuthService:
         if census.unknown_totp:
             _log.warning(
                 "ADR 0197: %d of those could not be checked at all (the cell did not open, or the "
-                "value would not compute): %s. Until they can be, every gate treats each as an "
-                "enabled TOTP, and its holder cannot remove it while no discoverable passkey "
+                "value it holds is not base32, where a value holding a colon reads as a refused marker "
+                "and is not counted here): %s. Until they can be, every gate treats each as "
+                "an enabled TOTP, and its holder cannot remove it while no discoverable passkey "
                 "remains. For a cell that does not open, check the store key and the cipher "
                 "service before resetting anything, since a reset destroys a healthy enrolment; a "
-                "value that opens and will not compute is cleared by an administrator's factor "
+                "value that opens and is not base32 is cleared by an administrator's factor "
                 "reset (POST /users/{id}/reset-mfa).",
                 len(census.unknown_totp),
                 ", ".join(census.unknown_totp),
@@ -19318,8 +19360,9 @@ class AuthService:
         reenrol = False
         # The cell is opened only when this release compiles in a set other than its default, the
         # only way an ACCEPTED enrolment can differ from it, so a status read costs no decrypt
-        # otherwise. A refused marker is not reported here: the census names it at startup and in
-        # verify, and _totp_secret logs it at every code check.
+        # otherwise. A refused marker, or a secret no code is computed from, sets the flag here only
+        # then (totp.needs_reenrolment); the census names it at startup and in verify, and
+        # _totp_secret logs it at every open.
         if user.totp_enabled and totp.reenrolment_possible():
             try:
                 secret = await self._totp_secret(user)
