@@ -528,6 +528,7 @@ from messagefoundry.service_status import query_service_state
 from messagefoundry.serviceenv import (
     ServiceEnvironmentRefused,
     ServiceEnvPosture,
+    service_env_enforced_refusal,
     service_env_posture,
     service_env_refusal,
 )
@@ -4752,13 +4753,17 @@ _FASTAPI_TELEMETRY_OFF: TelemetryConfig = {
 }
 
 
-def _refuse_a_secret_in_the_service_environment(caller: str) -> None:
+def _refuse_a_secret_in_the_service_environment(caller: str, *, enforcing: bool) -> None:
     """Raise where ``serve`` would refuse to start on its own Windows service environment.
 
-    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, so an app built here
-    without either of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
+    The rule is ``serve``'s and ``supervise``'s, :func:`service_env_refusal`, and under
+    ``enforcing`` :func:`service_env_enforced_refusal` too, so an app built here without either
+    of them refuses on the same finding (vault BACKLOG #2595, #8212 item 1).
     ``service_env_posture`` says what the reading covers, and when it cannot read the lists."""
-    refused = service_env_refusal(service_env_posture())
+    posture = service_env_posture()
+    refused = service_env_refusal(posture)
+    if refused is None and enforcing:
+        refused = service_env_enforced_refusal(posture)
     if refused is not None:
         raise ServiceEnvironmentRefused(f"{caller}: refusing to start: {refused}")
 
@@ -4812,7 +4817,11 @@ def create_app(
     # messagefoundry/remotedebug.py says what the hook does, and why a repeat call adds no copy and
     # no second unraisable-hook wrapper (the Lander's finding 2 on engine PR 2573).
     install_remote_debug_guard()
-    _refuse_a_secret_in_the_service_environment("create_app")
+    _refuse_a_secret_in_the_service_environment(
+        "create_app",
+        enforcing=(security_settings or SecuritySettings()).enforcement
+        is SecurityEnforcement.ENFORCE,
+    )
     # The open mode is the opt-in with no service, and nothing else (vault BACKLOG #2825). Beside a
     # service the opt-in would leave a live open-mode flag on a signed-in app, so it is refused.
     if allow_no_auth and auth is not None:
@@ -13093,7 +13102,11 @@ def create_managed_app(
     """
     # The remote-debugging guard goes in before the reading, as create_app installs it.
     install_remote_debug_guard()
-    _refuse_a_secret_in_the_service_environment("create_managed_app")
+    _refuse_a_secret_in_the_service_environment(
+        "create_managed_app",
+        enforcing=(security_enforcement or (security_settings or SecuritySettings()).enforcement)
+        is SecurityEnforcement.ENFORCE,
+    )
     if store_settings is None:
         if db_path is None:
             raise ValueError("create_managed_app requires either store_settings or db_path")

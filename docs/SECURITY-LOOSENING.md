@@ -2635,9 +2635,9 @@ count is above `0` (vault BACKLOG #2613).
   credential in the secrets directory under the setting it stands for, or else to use
   `[secrets].provider = "vault"`, which applies engine-wide. It says to delete an empty entry, or
   the bare name `MEFOR_VALUE_`, rather than move it. They also
-  refuse a store key in their own environment when they found their service but could not read
-  its lists, since the key most likely came from there; another secret in their own environment is
-  not refused then.
+  refuse a store key or another engine secret in their own environment when they found their
+  service but could not read its lists, since it most likely came from there; a `MEFOR_VALUE_*`
+  variable in their own environment is not read then (vault BACKLOG #2595).
 - **`secret_in_service_environment`: what `serve` and `supervise` refuse, read where no refusal
   ran.** An application that builds the API without them, with `create_app` or
   `create_managed_app`, refuses on the same finding: the factory raises as it is built. The entry
@@ -2681,11 +2681,18 @@ count is above `0` (vault BACKLOG #2613).
   it names, NSSM's list or the service's own `Environment` value, and from the machine-wide
   environment. Keep the
   store key in a DPAPI-protected key file. Let NSSM start the interpreter directly.
+- **`secret_from_outside_service_lists`: another engine secret reaches the service from outside
+  its lists.** An engine secret other than a store key is in the engine's own environment, the
+  engine read its service's lists, and they do not set it, so it came from somewhere else, such
+  as the machine-wide environment. Under `[security].enforcement = "enforce"`, `serve`,
+  `supervise` and both API app factories refuse to start on it; under `"warn"` the engine starts
+  and names it here. The owner's 2026-10-01 ruling refuses a secret in the environment under
+  `enforce`, and always only in a Windows service's NSSM environment. Move it to the secrets
+  directory and remove it from where it is set (vault BACKLOG #2595).
 - **Not covered**, at least: a service host other than NSSM, an `nssm.exe` under another name,
   a variable named by a `[secrets].provider = "env"` reference, whose name only your config
-  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable or a secret
-  other than a store key that reaches the engine from the machine-wide environment, which is
-  neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
+  knows, unless that name starts with `MEFOR_VALUE_`, and a `MEFOR_VALUE_*` variable that
+  reaches the engine from the machine-wide environment, which is neither refused nor named. A `MEFOR_VALUE_*` variable in the service's own lists is covered,
   as *What is refused* says, whatever reads it: an `env()` value or a `[secrets].provider = "env"`
   reference.
 

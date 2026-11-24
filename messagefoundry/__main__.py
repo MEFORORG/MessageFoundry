@@ -3398,10 +3398,18 @@ def _serve(args: argparse.Namespace) -> int:
     # keeps in a registry key any local user can read. Refused under EVERY enforcement setting
     # (owner rulings 2026-10-01 and 2026-11-14).
     # messagefoundry/serviceenv.py says what the reading covers.
-    from messagefoundry.serviceenv import service_env_posture, service_env_refusal
+    # Another engine secret reaching the service from outside those lists, such as from the
+    # machine-wide environment, is refused under enforce only, and named under warn.
+    from messagefoundry.serviceenv import (
+        service_env_enforced_refusal,
+        service_env_posture,
+        service_env_refusal,
+    )
 
     service_env = service_env_posture()
     service_env_refused = service_env_refusal(service_env)
+    if service_env_refused is None and enforcing:
+        service_env_refused = service_env_enforced_refusal(service_env)
     if service_env_refused is not None:
         print(f"error: refusing to start: {service_env_refused}.", file=sys.stderr)
         return 2
@@ -6067,7 +6075,9 @@ def _supervise(args: argparse.Namespace) -> int:
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
     # both, so every shard would refuse on what `serve` refuses there: an engine secret, or (vault
     # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
+    # Under enforce, also a secret reaching the service from outside its lists, as in `serve`.
     from messagefoundry.serviceenv import (
+        service_env_enforced_refusal,
         service_env_loosenings,
         service_env_posture,
         service_env_refusal,
@@ -6075,6 +6085,8 @@ def _supervise(args: argparse.Namespace) -> int:
 
     service_env = service_env_posture()
     service_env_refused = service_env_refusal(service_env)
+    if service_env_refused is None and enforcing:
+        service_env_refused = service_env_enforced_refusal(service_env)
     if service_env_refused is not None:
         print(
             f"error: {service_env_refused}. Every engine shard would refuse to start; refusing to "
