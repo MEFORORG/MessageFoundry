@@ -58,7 +58,9 @@
     later install REFUSES when the installed gate's content differs from that hash, when the receipt
     cannot be read or records no hash, or when a gate is installed with no receipt at all: each means
     something other than this installer may have written the machine-global gate, and overwriting it
-    would erase the only evidence. Nothing on the box changes on a refusal. Find out who wrote it, then
+    would erase the only evidence. A receipt-mismatch refusal runs before any write, so nothing on the box
+    changes. The changed-during-install refusal is later: it throws after the allowlist write, so that
+    file (and its .bak) is already written when it fires and the gate itself is not. Find out who wrote it, then
     pass -OverwriteUnexplained; the new receipt records the hash that was overwritten, and its bytes
     are kept as worktree_gate.ps1.unexplained-<sha12>, which no later install reuses. A box with no
     installed gate installs as before. -Status reports the same check. -Uninstall does not run it.
@@ -305,8 +307,10 @@ function Get-UnexplainedGate([string]$Path) {
     $receiptPath = "$Path.receipt.json"
     $recordedSha = $null
     $unreadable = $false
+    $noReceipt = $false
     $problem = $null
     if (-not (Test-Path -LiteralPath $receiptPath)) {
+        $noReceipt = $true
         $problem = "it has no receipt at $receiptPath, so nothing records that this installer wrote it"
     } else {
         try {
@@ -332,6 +336,7 @@ function Get-UnexplainedGate([string]$Path) {
         InstalledSha = $installedSha
         ReceiptSha   = $recordedSha
         Unreadable   = $unreadable
+        NoReceipt    = $noReceipt
         Problem      = $problem
     }
 }
@@ -1134,7 +1139,7 @@ $resolved = foreach ($r in $Repo) {
 # from THIS checkout into a machine-global file every session runs. A checkout behind -UpstreamRef
 # would ship an old gate to every config dir, and -Status run from the same checkout would then find
 # nothing wrong. So compare against the ref first, and refuse unless the operator says they mean it.
-# It sits above the allowlist write so a refusal leaves the box exactly as it was.
+# It sits above the allowlist write so a receipt-mismatch refusal leaves the box exactly as it was.
 $sourceGate = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
 $checkedSha = Get-GateHash $sourceGate
 $upstream = Get-UpstreamGate -RepoRoot $RepoRoot -Ref $UpstreamRef
@@ -1168,7 +1173,8 @@ if ($dispatchRefusal) {
 New-Item -ItemType Directory -Force -Path $HooksDir | Out-Null
 
 # REFUSE TO OVERWRITE A GATE THAT DOES NOT MATCH ITS OWN RECEIPT (BACKLOG #1247), before the allowlist
-# write, so a refusal leaves the box as it was. An unexplained write to this machine-global file was
+# write, so a receipt-mismatch refusal leaves the box as it was (the changed-during-install refusal
+# further down is later, after the allowlist write). An unexplained write to this machine-global file was
 # once overwritten in silence, and the .bak was the only evidence left afterwards.
 $unexplained = Get-UnexplainedGate $GateDst
 # What the guard saw, so a write between here and the copy below cannot pass as explained.
@@ -1176,7 +1182,7 @@ $guardSha = Get-GateHash $GateDst
 if ($unexplained) {
     # Detail on Write-Host, not in the throw: the error view re-wraps a thrown message and joins its
     # lines, which put the two hashes on one run-on line.
-    $recorded = if ($unexplained.ReceiptSha) { $unexplained.ReceiptSha } elseif ($unexplained.Unreadable) { '(unreadable)' } else { '(no hash)' }
+    $recorded = if ($unexplained.ReceiptSha) { $unexplained.ReceiptSha } elseif ($unexplained.Unreadable) { '(unreadable)' } elseif ($unexplained.NoReceipt) { '(no receipt)' } else { '(no hash)' }
     $color = if ($OverwriteUnexplained) { 'Yellow' } else { 'Red' }
     Write-Host "The installed gate at $($unexplained.Path) does not match its receipt: $($unexplained.Problem)." -ForegroundColor $color
     Write-Host "  installed gate sha256 : $($unexplained.InstalledSha)" -ForegroundColor $color
@@ -1220,7 +1226,7 @@ $GateSrc = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
 $gateBak = $null
 $replacedSha = Get-GateHash $GateDst
 if ($replacedSha -ne $guardSha) {
-    throw "Refusing to overwrite the installed gate at ${GateDst}: it changed during this install (guard saw $guardSha, now $replacedSha). Re-run."
+    throw "Refusing to overwrite the installed gate at ${GateDst}: it changed during this install (guard saw $guardSha, now $replacedSha). Re-run. The allowlist has already been written by then; the gate has not."
 }
 if (Test-Path -LiteralPath $GateDst) {
     $gateBak = "$GateDst.bak"

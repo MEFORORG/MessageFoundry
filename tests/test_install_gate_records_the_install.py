@@ -217,8 +217,8 @@ def test_the_installed_gate_reports_when_it_was_INSTALLED_not_when_its_source_wa
 def test_the_install_leaves_a_receipt_whose_hash_matches_what_was_installed(tmp_path: Path) -> None:
     """A LIMIT OF THIS TEST, STATED RATHER THAN LEFT FOR SOMEBODY TO DISCOVER.
 
-    Mutating the source to read `Get-GateHash $GateSrc` instead of `$GateDst` leaves all four tests
-    GREEN, and no fixture can change that: immediately after `Copy-Item` the two files are
+    Mutating the source to read `Get-GateHash $GateSrc` instead of `$GateDst` leaves every test in
+    this file GREEN, and no fixture can change that: immediately after `Copy-Item` the two files are
     byte-identical, so hashing either gives the same digest. The rule "the receipt describes what
     was INSTALLED" is untestable at this point by construction, not by oversight.
 
@@ -307,13 +307,13 @@ def test_an_unreadable_receipt_refuses(tmp_path: Path) -> None:
 
 def test_a_receipt_with_no_hash_refuses(tmp_path: Path) -> None:
     both = _refused(_run(tmp_path, receipt="nohash", expect_ok=False))
-    assert "records no gate hash" in both, both
+    assert "records no gate hash" in both and "(no hash)" in both, both
 
 
 def test_a_gate_with_no_receipt_refuses(tmp_path: Path) -> None:
     """The receipt is not protected by gate rule 1a, so deleting it must not silence the check."""
     both = _refused(_run(tmp_path, receipt="none", expect_ok=False))
-    assert "has no receipt" in both, both
+    assert "has no receipt" in both and "(no receipt)" in both, both
 
 
 def test_the_override_installs_and_records_what_it_overwrote(tmp_path: Path) -> None:
