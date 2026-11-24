@@ -1079,6 +1079,28 @@ def test_sessions_rehome_merges_only_a_title_stub_at_the_destination(
         assert bak.read_text(encoding="utf-8") == existing
 
 
+def test_sessions_rehome_starts_the_stub_on_its_own_line_and_names_a_stranded_sidecar(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #7623. A transcript cut off mid-record had the stub's first record glued onto its last
+    line, and a sidecar dir already at the destination left the source's behind with no word. The
+    stub now starts on its own line, and the stranded sidecar is named."""
+    paths = _relocated_session(tmp_path)
+    with paths["source"].open("a", encoding="utf-8") as f:
+        f.write('{"type":"assistant","partial":')
+    old = time.time() - 3600
+    os.utime(paths["source"], (old, old))
+    paths["dest"].write_text(_STUB + "\n", encoding="utf-8")
+    (paths["source"].parent / _REHOME_SID / "subagents").mkdir(parents=True)
+    (paths["dest"].parent / _REHOME_SID).mkdir()
+    proc = _rehome(paths)
+    assert proc.returncode == 0 and "Rehomed session" in proc.stdout, proc.stdout + proc.stderr
+    lines = paths["dest"].read_text(encoding="utf-8-sig").splitlines()
+    assert lines[-1].lstrip("﻿") == _STUB, lines
+    assert "was NOT moved" in proc.stdout + proc.stderr
+    assert (paths["source"].parent / _REHOME_SID / "subagents").is_dir()
+
+
 def test_sessions_reads_a_profile_whose_name_holds_a_bracket(tmp_path: Path) -> None:
     """Vault BACKLOG #2985, added item 2. sessions.ps1 listed USERPROFILE as a pattern, so a profile
     named home[1] matched only a folder named home1, found no config root and no transcript. Red

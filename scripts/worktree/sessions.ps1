@@ -253,10 +253,12 @@ if ($Rehome) {
     # (no heartbeat, and registry writes are event-driven), so only the positive answer is trustworthy.
     # A negative from one signal must never by itself authorise a destructive move.
     . "$PSScriptRoot\..\coord\session-registry.ps1"
-    # Listed BEFORE the fence reads the registry, as box-activity.ps1 does: a record half-written at
-    # this read and complete by the fence's is then seen by one check or the other (BACKLOG #7622).
+    # Listed both BEFORE and AFTER the fence reads the registry: a record that is half-written at either
+    # neighbouring read is then seen by one check or the other, whichever way it changes (BACKLOG #7622).
     $unparsed = @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable -and -not $_.Directory })
     $reg = Get-SessionLiveness -SessionId $s.Id -Worktree $s.BornCwd
+    $unparsed += @(Get-SessionRecords -IncludeUnreadable | Where-Object { $_.Unreadable -and -not $_.Directory })
+    $unparsed = @($unparsed | Sort-Object File -Unique)
     # UNREADABLE vetoes too: the fence could not be evaluated, or a record naming no session may be
     # this one (session-registry.ps1's header). Such a record used to throw here, which stopped the
     # move; reading UNREADABLE must stop it the same way (BACKLOG #5491).
@@ -279,10 +281,11 @@ if ($Rehome) {
     # A registry file that does not parse names no session anyone can read, so Get-SessionLiveness never
     # sees it, and it may be this session's own record caught mid-write (BACKLOG #7622). It vetoes while
     # its file was written in the last 24 hours (the anonymous records' default bound), or when that
-    # file has vanished or carries a future write time; it has no cwd anyone can read, so it cannot be
-    # scoped to a tree and vetoes wherever it is. An older one does not veto, or a file that never
-    # becomes readable would block every rehome until someone deleted it. A directory named *.json is
-    # not a record being written, so it is left out above.
+    # file has vanished or carries a future write time (so a skewed stamp vetoes until -Force); it has no
+    # cwd anyone can read, so it cannot be scoped to a tree and vetoes for every session in every login
+    # the registry is read from. An older one does not veto, or a file that never becomes readable would
+    # block every rehome until someone deleted it. A directory named *.json is not a record being
+    # written, so it is left out above.
     $wall = [DateTime]::UtcNow
     $unreadable = @($unparsed | Where-Object {
         $item = Get-Item -LiteralPath $_.File -Force -EA SilentlyContinue
@@ -351,9 +354,12 @@ if ($Rehome) {
                 if ($stubLines.Count -eq 0) { $why = "it holds no title record" }
                 foreach ($line in $stubLines) {
                     $o = $null
-                    # -NoEnumerate keeps a one-element array an array; the name and value compare
-                    # case-sensitively, as the transcript reader does.
-                    try { $o = ConvertFrom-Json -InputObject $line -NoEnumerate -EA Stop } catch { }
+                    # Only a JSON object can be a title record: ConvertFrom-Json unwraps a one-element
+                    # array, and -NoEnumerate is not in Windows PowerShell 5.1. The name and value
+                    # compare case-sensitively, so only the exact spelling a stub carries passes.
+                    if ($line.TrimStart().StartsWith('{')) {
+                        try { $o = ConvertFrom-Json -InputObject $line -EA Stop } catch { }
+                    }
                     $p = if ($o -is [pscustomobject]) { $o.PSObject.Properties | Where-Object { $_.Name -ceq 'type' } | Select-Object -First 1 }
                     $type = if ($p) { [string]$p.Value } else { '' }
                     if ($type -cnotin @('custom-title', 'ai-title')) {
@@ -390,15 +396,27 @@ if ($Rehome) {
         Remove-Item -LiteralPath $dest -Force
     }
 
-    Move-Item -LiteralPath $s.File -Destination $dest -Force
-    if ($stubLines.Count -gt 0) { Add-Content -LiteralPath $dest -Value $stubLines -Encoding utf8 }
+    # No -Force: a file that appeared at $dest since the backup refuses the move rather than being replaced.
+    Move-Item -LiteralPath $s.File -Destination $dest
+    if ($stubLines.Count -gt 0) {
+        # A crashed session's transcript can end mid-record. Start the stub on its own line, or its first
+        # record is glued onto that partial one and both are lost (BACKLOG #7623).
+        $fs = [System.IO.File]::OpenRead($dest)
+        try { $last = if ($fs.Length -gt 0) { [void]$fs.Seek(-1, [System.IO.SeekOrigin]::End); $fs.ReadByte() } else { 10 } }
+        finally { $fs.Dispose() }
+        if ($last -ne 10) { Add-Content -LiteralPath $dest -Value '' -Encoding utf8 }
+        Add-Content -LiteralPath $dest -Value $stubLines -Encoding utf8
+    }
 
     # Move the sidecar directory too, if one exists and is not already at the destination.
     $movedSidecar = $false
+    $strandedSidecar = $false
     if ($haveSidecar -and ((Get-NormPath $srcSidecar) -ine (Get-NormPath $destSidecar))) {
         if (-not (Test-Path -LiteralPath $destSidecar)) {
             Move-Item -LiteralPath $srcSidecar -Destination $destSidecar -Force
             $movedSidecar = $true
+        } else {
+            $strandedSidecar = $true
         }
     }
 
@@ -409,6 +427,8 @@ if ($Rehome) {
     Write-Host "  login: $($s.Login)"
     if ($stubLines.Count -gt 0) { Write-Host "  kept : the title stub's $($stubLines.Count) record(s) (backup: $dest.stub.bak)" }
     if ($movedSidecar) { Write-Host "  moved: the session's sidecar dir ($($s.Id)\)" }
+    # Merging two sidecar trees is not attempted; say so rather than leave it silently behind.
+    if ($strandedSidecar) { Write-Warning "A sidecar dir already exists at $destSidecar, so $srcSidecar was NOT moved. Merge it by hand." }
     Write-Host ""
     Write-Host "It is back in that folder's session list. Open a Claude Code window on $destCwd and it will"
     Write-Host "be there; or resume it directly:"
