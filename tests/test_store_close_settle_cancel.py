@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5720: a cancel landing in a store close's AES-GCM settle skipped every close step after
-it, so the pool (PostgreSQL) or the pool and its executor (SQL Server) were left open. SQLite is
-not covered: a forced stop there followed by a later close() can hang aiosqlite.
+it, so the PostgreSQL pool was left open. SQL Server and SQLite are unchanged here: a forced
+release there leaves things open or can hang a later close.
 
 The settle is a database write on a keyed store, so a cancel can land there; each test stands a
 settle that blocks in for it. No real PostgreSQL or SQL Server is involved. Synthetic data only.
@@ -11,13 +11,13 @@ settle that blocks in for it. No real PostgreSQL or SQL Server is involved. Synt
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.settings import StoreBackend, StoreSettings
 from messagefoundry.store.postgres import PostgresStore
-from messagefoundry.store.sqlserver import SqlServerStore
 
 
 async def _cancel_close_in_its_settle(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,9 +57,11 @@ async def test_postgres_close_cancelled_in_its_settle_terminates_the_pool(
         backend=StoreBackend.POSTGRES, server="localhost", database="mefor_test", username="mefor"
     )
     store = PostgresStore(pool, settings)
-    await _cancel_close_in_its_settle(store, monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.store"):
+        await _cancel_close_in_its_settle(store, monkeypatch)
     assert pool.terminated == 1
     assert "a store close cut short in its settle (CancelledError)" in caplog.text
+    assert "a forced release ran without waiting for it" in caplog.text
 
 
 async def test_a_settle_that_finishes_forces_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,39 +81,3 @@ async def test_a_settle_that_finishes_forces_nothing(monkeypatch: pytest.MonkeyP
     )
     await PostgresStore(pool, settings).close()
     assert (pool.closed, pool.terminated) == (1, 0)
-
-
-class _OdbcPool:
-    def __init__(self) -> None:
-        self.closed = 0
-
-    def close(self) -> None:
-        self.closed += 1
-
-    async def wait_closed(self) -> None:
-        raise AssertionError("the pool's wait is not reached after the cancel")
-
-
-class _Executor:
-    def __init__(self) -> None:
-        self.shutdown_calls: list[bool] = []
-
-    def shutdown(self, wait: bool = True) -> None:
-        self.shutdown_calls.append(wait)
-
-
-async def test_sqlserver_close_cancelled_in_its_settle_releases_pool_and_executor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Red before the fix: neither the pool nor the executor is released."""
-    pool = _OdbcPool()
-    executor = _Executor()
-    settings = StoreSettings(
-        backend=StoreBackend.SQLSERVER, server="localhost", database="mefor_test", username="sa"
-    )
-    store = SqlServerStore(pool, settings)
-    store._pool_executor = executor  # type: ignore[assignment]
-    await _cancel_close_in_its_settle(store, monkeypatch)
-    assert pool.closed == 1
-    assert executor.shutdown_calls == [False]
-    assert store._pool_executor is None

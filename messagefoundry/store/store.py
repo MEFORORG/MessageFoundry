@@ -2210,19 +2210,23 @@ def _forced_outcome(
 async def close_or_force(
     close: Callable[[], Awaitable[None]], force_release: Callable[[], object], *, what: str
 ) -> None:
-    """Await ``close``. When it ends by raising, a cancel included, call ``force_release``, so
-    what the close had not reached is dropped without waiting, then re-raise (BACKLOG #5720).
-    ``what`` names the close in the WARNING written either way, whether the release ran or failed.
-    """
+    """Await ``close``. When it ends by raising, a cancel included, call ``force_release`` without
+    waiting, then re-raise (BACKLOG #5720). A WARNING names ``what`` and the class that cut the
+    close short; a ``force_release`` that raises is logged by class too. The WARNING says the
+    release ran, not that nothing stays open: a backend's release may leave things open, and its
+    caller says what."""
     try:
         await close()
     except BaseException as exc:
-        if _force_failed_open_release(force_release, after=what):
-            log.warning(
-                "%s (%s); what it held was released without waiting for it",
-                what,
-                type(exc).__name__,
-            )
+        ran = _force_failed_open_release(force_release, after=what)
+        log.warning(
+            "%s (%s); %s",
+            what,
+            type(exc).__name__,
+            "a forced release ran without waiting for it"
+            if ran
+            else "the forced release did not run to its end, so what it held may still be open",
+        )
         raise
 
 
