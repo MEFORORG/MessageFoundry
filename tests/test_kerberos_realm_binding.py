@@ -21,7 +21,6 @@ the filter sent, not by a domain controller answering it. Synthetic names only.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -29,10 +28,10 @@ import pytest
 import spnego
 
 from messagefoundry.auth import ldap as ldap_mod
-from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, LdapError
+from messagefoundry.auth.ldap import DirectoryAnswer, LdapAuthenticator, LdapError, _Lookup
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import AuthSettings, EgressSettings
-from messagefoundry.pipeline import Engine
+from messagefoundry.config.settings import AuthSettings
+from messagefoundry.store.store import MessageStore
 
 
 class _Attr:
@@ -74,7 +73,10 @@ _CHILD_ALICE = _Entry("alice", "CN=Alice Child,OU=Staff,DC=child,DC=corp,DC=exam
 _UPN_ONLY = _Entry("asmith", "CN=A Smith,OU=Staff,DC=corp,DC=example")
 
 
-def _authenticator(realm: str | None = "CORP.EXAMPLE") -> LdapAuthenticator:
+_REALM = "CORP.EXAMPLE"
+
+
+def _authenticator() -> LdapAuthenticator:
     return LdapAuthenticator(
         AuthSettings(
             ad_enabled=True,
@@ -83,9 +85,12 @@ def _authenticator(realm: str | None = "CORP.EXAMPLE") -> LdapAuthenticator:
             ad_bind_dn="CN=svc,DC=corp,DC=example",
             ad_bind_password="synthetic",
             ad_domain="corp.example",
-            kerberos_realm=realm,
         )
     )
+
+
+def _kerberos(conn: _Conn, name: str, realm: str = _REALM) -> _Lookup:
+    return _authenticator()._lookup_by_name(conn, name, kerberos_realm=realm)
 
 
 @pytest.fixture(autouse=True)
@@ -102,10 +107,17 @@ def _fresh_warning_latch(monkeypatch: pytest.MonkeyPatch) -> None:
         ("CN=a,OU=Staff,DC=child,DC=corp,DC=example", "child.corp.example"),
         ("cn=a,dc=CORP,dc=Example", "corp.example"),
         ("CN=a, DC=corp , DC=example", "corp.example"),
+        # The type spelled as its name or its OID reads the same, and does not end the run.
+        ("CN=a,domainComponent=corp,DC=example", "corp.example"),
+        ("CN=a,0.9.2342.19200300.100.1.25=child,DC=corp,DC=example", "child.corp.example"),
         # Only the trailing run counts: a DC= above an OU adds nothing.
         ("CN=a,DC=evil,OU=x,DC=corp,DC=example", "corp.example"),
         # A multi-valued RDN ends the run.
         ("CN=a,DC=evil+OU=x,DC=corp,DC=example", "corp.example"),
+        # A label holding a dot, escaped or not, is not the RDNs a domain is written as.
+        ("CN=a,DC=corp.example", None),
+        ("CN=a,DC=corp\\2Eexample", None),
+        ("CN=a,DC=child.corp,DC=example", None),
         ("CN=a,OU=Staff,O=example", None),
         ("CN=a,DC=corp,OU=Staff", None),
         ("not a dn", None),
@@ -132,9 +144,7 @@ def test_the_group_dn_form_is_unchanged_by_the_shared_parser() -> None:
 
 
 def test_a_root_ticket_resolves_to_the_root_account_under_a_forest_wide_base() -> None:
-    found = _authenticator()._lookup_by_name(
-        _Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice", kerberos=True
-    )
+    found = _kerberos(_Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice")
     assert found.answer is DirectoryAnswer.FOUND
     assert found.info is not None and found.info["dn"] == _ROOT_ALICE.entry_dn
 
@@ -143,40 +153,35 @@ def test_a_root_ticket_never_resolves_to_a_child_account_alone() -> None:
     """The finding's probe: before the fix this answered the CHILD alice."""
     conn = _Conn([_CHILD_ALICE])
     assert _authenticator()._lookup_by_name(conn, "alice").answer is DirectoryAnswer.FOUND
-    found = _authenticator()._lookup_by_name(conn, "alice", kerberos=True)
+    found = _kerberos(conn, "alice")
     assert found.answer is DirectoryAnswer.NOT_FOUND and found.info is None
 
 
 def test_a_child_realm_resolves_to_the_child_account() -> None:
-    found = _authenticator("CHILD.CORP.EXAMPLE")._lookup_by_name(
-        _Conn([_ROOT_ALICE, _CHILD_ALICE]), "alice", kerberos=True
-    )
+    found = _kerberos(_Conn([_ROOT_ALICE, _CHILD_ALICE]), "alice", "CHILD.CORP.EXAMPLE")
     assert found.info is not None and found.info["dn"] == _CHILD_ALICE.entry_dn
 
 
 def test_the_realm_compare_ignores_ascii_case_as_the_ticket_compare_does() -> None:
-    found = _authenticator("corp.EXAMPLE")._lookup_by_name(
-        _Conn([_ROOT_ALICE]), "alice", kerberos=True
-    )
-    assert found.answer is DirectoryAnswer.FOUND
+    assert _kerberos(_Conn([_ROOT_ALICE]), "alice", "corp.EXAMPLE").answer is DirectoryAnswer.FOUND
 
 
 def test_the_name_lookup_the_other_callers_keep_still_refuses_the_pair() -> None:
-    """Control: without ``kerberos`` the two same-named entries are still ambiguous."""
+    """Control: without ``kerberos_realm`` the two same-named entries are still ambiguous."""
     found = _authenticator()._lookup_by_name(_Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice")
     assert found.answer is DirectoryAnswer.AMBIGUOUS
 
 
 def test_a_dropped_entry_is_logged_by_label_and_count(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING", logger="messagefoundry.auth.ldap"):
-        _authenticator()._lookup_by_name(_Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice", kerberos=True)
+        _kerberos(_Conn([_CHILD_ALICE, _ROOT_ALICE]), "alice")
     messages = [
         r.getMessage()
         for r in caplog.records
         if r.name == "messagefoundry.auth.ldap" and r.getMessage().startswith("Kerberos lookup")
     ]
     assert len(messages) == 1 and "kept 1 of 2" in messages[0]
-    assert "alice" not in messages[0].lower().replace("kerberos", "")
+    assert "alice" not in messages[0].lower()
     assert "child" not in messages[0].lower()
 
 
@@ -187,64 +192,59 @@ def test_a_ticket_never_resolves_to_an_entry_holding_only_the_upn() -> None:
     conn = _Conn([_UPN_ONLY])
     # Control: the password path's lookup still takes the single UPN match, as it did.
     assert _authenticator()._lookup_by_name(conn, "alice").answer is DirectoryAnswer.FOUND
-    found = _authenticator()._lookup_by_name(conn, "alice", kerberos=True)
-    assert found.answer is DirectoryAnswer.NOT_FOUND
+    assert _kerberos(conn, "alice").answer is DirectoryAnswer.NOT_FOUND
 
 
 def test_an_entry_with_no_readable_name_is_not_the_holder() -> None:
-    found = _authenticator()._lookup_by_name(
-        _Conn([_Entry(None, "CN=x,DC=corp,DC=example")]), "alice", kerberos=True
-    )
+    found = _kerberos(_Conn([_Entry(None, "CN=x,DC=corp,DC=example")]), "alice")
     assert found.answer is DirectoryAnswer.NOT_FOUND
 
 
 def test_the_kerberos_filter_asks_for_a_person_by_sam_account_name_only() -> None:
     conn = _Conn([_ROOT_ALICE])
-    _authenticator()._lookup_by_name(conn, "al*ce", kerberos=True)
+    _kerberos(conn, "al*ce")
     assert conn.filters == ["(&(objectCategory=person)(objectClass=user)(sAMAccountName=al\\2ace))"]
     assert "userPrincipalName" not in conn.filters[0]
 
 
-# --- machine and trust accounts -----------------------------------------------------------------
+# --- machine and trust accounts, and the realm, before any session -------------------------------
+
+
+class _NoSession(LdapAuthenticator):
+    """Fails the test if a session is opened: these refusals need no directory."""
+
+    def _service_session(self) -> Any:
+        raise AssertionError("a directory session was opened")
+
+
+def _no_session() -> _NoSession:
+    return _NoSession(_authenticator()._s)
 
 
 @pytest.mark.parametrize("name", ["WS01$", "CHILD$", "$"])
-def test_a_dollar_name_is_not_found_without_a_search(name: str) -> None:
-    conn = _Conn([_Entry(name, "CN=WS01,OU=Computers,DC=corp,DC=example")])
-    # Control: the name lookup the other callers keep still searches and finds it.
-    assert _authenticator()._lookup_by_name(conn, name).answer is DirectoryAnswer.FOUND
-    conn.filters.clear()
-    found = _authenticator()._lookup_by_name(conn, name, kerberos=True)
-    assert found.answer is DirectoryAnswer.NOT_FOUND and conn.filters == []
+def test_a_dollar_name_is_not_found_without_a_session(name: str) -> None:
+    probe = _no_session().probe_principal(name, kerberos_realm=_REALM)
+    assert probe.answer is DirectoryAnswer.NOT_FOUND and probe.principal is None
 
 
-# --- fail closed ----------------------------------------------------------------------------------
+def test_the_name_lookup_the_other_callers_keep_still_searches_a_dollar_name() -> None:
+    """Control: without ``kerberos_realm`` a ``$`` name is searched and found as before."""
+    conn = _Conn([_Entry("WS01$", "CN=WS01,OU=Computers,DC=corp,DC=example")])
+    assert _authenticator()._lookup_by_name(conn, "WS01$").answer is DirectoryAnswer.FOUND
 
 
-def test_an_unset_realm_raises_rather_than_dropping_the_check() -> None:
-    conn = _Conn([_ROOT_ALICE])
-    with pytest.raises(LdapError, match="kerberos_realm is not set"):
-        _authenticator(realm=None)._lookup_by_name(conn, "alice", kerberos=True)
-    assert conn.filters == []
+@pytest.mark.parametrize("realm", ["", "CORP EXAMPLE", "alice@CORP.EXAMPLE"])
+def test_an_empty_or_malformed_realm_raises_rather_than_dropping_the_check(realm: str) -> None:
+    with pytest.raises(LdapError, match="kerberos_realm must be"):
+        _no_session().probe_principal("alice", kerberos_realm=realm)
 
 
 def test_kerberos_with_an_object_id_is_a_programming_error() -> None:
-    with pytest.raises(ValueError, match="object_id or kerberos"):
-        _authenticator().probe_principal("alice", object_id="x", kerberos=True)
+    with pytest.raises(ValueError, match="object_id or kerberos_realm"):
+        _no_session().probe_principal("alice", object_id="x", kerberos_realm=_REALM)
 
 
 # --- the service --------------------------------------------------------------------------------
-
-
-@pytest.fixture
-async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
-    eng = await Engine.create(
-        tmp_path / "kerberos_realm_binding.db",
-        poll_interval=0.02,
-        egress_settings=EgressSettings(deny_by_default=False),
-    )
-    yield eng
-    await eng.stop()
 
 
 class _RecordingDirectory:
@@ -256,14 +256,14 @@ class _RecordingDirectory:
         return None
 
 
-async def test_the_kerberos_sign_in_asks_the_narrow_lookup(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
+async def test_the_kerberos_sign_in_asks_the_narrow_lookup_in_the_checked_realm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     async def no_sleep(_deadline: float) -> None:
         return None
 
     class _Server:
-        client_principal = "alice@CORP.EXAMPLE"
+        client_principal = "alice@corp.example"
         complete = True
 
         def step(self, _token: bytes) -> None:
@@ -280,12 +280,17 @@ async def test_the_kerberos_sign_in_asks_the_narrow_lookup(
         ad_bind_dn="CN=svc,DC=corp,DC=example",
         ad_bind_password="synthetic",
         kerberos_enabled=True,
-        kerberos_realm="CORP.EXAMPLE",
+        kerberos_realm=_REALM,
         login_rate_limit_enabled=False,
         require_mfa=False,
     )
-    service = AuthService(engine.store, settings, ldap=directory)  # type: ignore[arg-type]
-    await service.initialize()
-    outcome = await service.authenticate_kerberos(b"token", client="192.0.2.7")
+    store = await MessageStore.open(tmp_path / "kerberos_realm_binding.db")
+    try:
+        service = AuthService(store, settings, ldap=directory)  # type: ignore[arg-type]
+        await service.initialize()
+        outcome = await service.authenticate_kerberos(b"token", client="192.0.2.7")
+    finally:
+        await store.close()
     assert not outcome.ok
-    assert directory.calls == [("alice", {"tie_break_object_id": None, "kerberos": True})]
+    # The realm handed over is the configured one the ticket was checked against.
+    assert directory.calls == [("alice", {"tie_break_object_id": None, "kerberos_realm": _REALM})]

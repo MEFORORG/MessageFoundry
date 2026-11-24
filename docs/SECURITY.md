@@ -5439,9 +5439,12 @@ Both kinds of user share one identity model (`users.auth_provider` is `local` or
   the name only as its UPN answers no ticket; and a machine's ticket (`WS01$`) finds nothing. A
   name ending in `$` is never looked up, which also covers an interdomain trust account, a
   person-category `user`. The binding assumes Active Directory's rule that a domain's realm is its
-  DNS name and its naming context that name's `DC=` RDNs; a realm whose users sit under other DNs
-  matches no entry, and the sign-in is refused as `not_in_directory`. The password sign-in and the
-  other name-keyed lookups are unchanged.
+  DNS name and its naming context that name's `DC=` RDNs. An entry whose DN does not end in the
+  realm's `DC=` RDNs, one label each, matches nothing, and the sign-in is refused as
+  `not_in_directory`. So does a ticket naming the account by an implicit UPN rather than its
+  `sAMAccountName`, which a client that does not ask the KDC to canonicalize the name may present;
+  that is unverified against a real KDC. The password sign-in and the other name-keyed lookups,
+  `create_directory_account`'s among them, are unchanged.
 
 ### AD-group → role mapping
 

@@ -7078,7 +7078,9 @@ class AuthService:
                 self._ldap.resolve_principal,
                 username,
                 tie_break_object_id=await self._stored_directory_object_id(username),
-                kerberos=True,  # only what the ticket proves (BACKLOG #4846)
+                # Only what the ticket proves, in the realm kerberos_principal checked it against
+                # (BACKLOG #4846). That call refused an unset realm already; "" would fail closed.
+                kerberos_realm=self._settings.kerberos_realm or "",
             )
         except KerberosTokenRefused as exc:
             # BACKLOG #3196: audited as a failed sign-in, not a directory outage. An acceptor key
