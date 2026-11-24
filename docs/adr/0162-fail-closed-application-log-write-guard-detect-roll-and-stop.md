@@ -166,12 +166,10 @@ stay halted, as do the connections a per-connection restart does not name. *(Not
 under the pooled claim mode a router, transform or response lane that is STOPPED at a
 per-connection restart of its inbound is re-armed by it, except a lane that could claim past
 claimed rows it holds in flight, which stays STOPPED with a WARNING; section 7 says which. The
-inbound's hold is released by this pooled lift only when the restart re-armed one of its lanes
-and none of them was STOPPED holding claimed rows in flight, recorded or not. A recorded lane the
-lift re-arms therefore keeps the hold, but unlike before it is no longer STOPPED, so a later
-broadcast, which releases only for a lane it finds STOPPED, does not release it either: the hold
-stays until a teardown, and the schedule leaves the inbound stopped at its next window open
-(BACKLOG #5704, open). The per_lane respawn releases the hold by its own rule.)*
+inbound's hold is released by this pooled lift when the restart re-armed one of its lanes and,
+after it, none of them is left STOPPED holding claimed rows in flight: a kept lane keeps the hold,
+and a recorded lane the lift re-arms releases it, as the broadcast that re-armed such a lane did
+before. The per_lane respawn releases the hold by its own rule.)*
 The outbound **pause is
 operator-owned in both cases** (#115/#233: a reload never resumes a lane an operator has not looked
 at), so delivery needs an explicit `start_outbound` or a service restart either way. Stated the other

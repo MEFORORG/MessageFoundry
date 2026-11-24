@@ -6092,9 +6092,8 @@ class RegistryRunner:
         :meth:`outbound_stop_held`; during a log halt it keeps an inbound record a sibling stage
         still needs), a pooled resume of a PAUSED or STOPPED lane
         (:meth:`_resume_pooled_lane`), the pooled lift of a log halt at an inbound's restart
-        (:meth:`_lift_log_halt`, which keeps the inbound record while a lane holds claimed rows
-        in flight, even one it re-arms, which then leaves the record to a teardown), and a full
-        teardown. An operator start that re-arms nothing,
+        (:meth:`_lift_log_halt`, which keeps the inbound record while a lane it leaves STOPPED
+        holds claimed rows in flight), and a full teardown. An operator start that re-arms nothing,
         such as ``start_outbound`` on a pooled lane still finishing the episode its STOP ends,
         leaves the hold in place."""
         key = (kind, name)
@@ -6590,10 +6589,10 @@ class RegistryRunner:
         (:meth:`StageDispatcher.release_gated`), and then each internal lane is resumed with
         ``resume_lane``, which re-arms a PAUSED or STOPPED one. That covers at least a lane the
         halt's hand-back STOPPED at T17 or on leadership loss. The inbound's hold is lifted when
-        a resume re-armed a lane and no lane was STOPPED holding claimed rows in flight
-        (:meth:`StageDispatcher.stopped_holding_rows`), whether or not they are recorded, so a
-        recorded lane re-armed here leaves the hold with no STOPPED lane to clear it (ADR 0162
-        section 6 note). A lane STOPPED with claimed rows still in flight is re-armed too when
+        a resume re-armed a lane and, after the resumes, no lane is left STOPPED holding claimed
+        rows in flight (:meth:`StageDispatcher.stopped_holding_rows`): a kept lane keeps it, and
+        a recorded lane re-armed here releases it, as the broadcast that re-armed such a lane
+        before this lift did. A lane STOPPED with claimed rows still in flight is re-armed too when
         its next chunk assembly would re-pend them before it claims (BACKLOG #5744), and is not
         re-armed here when it would not
         (:meth:`StageDispatcher.stopped_past_unrecorded_rows` says when), because a re-arm would
@@ -6612,9 +6611,6 @@ class RegistryRunner:
             if (d := self._dispatchers.get(stage)) is not None
         ]
         kept = [stage for stage, d in lanes if d.stopped_past_unrecorded_rows(name)]
-        # The release rule for the shared hold, read before the resumes change the phases; the
-        # docstring states it.
-        hold_kept = any(d.stopped_holding_rows(name) for _stage, d in lanes)
         for stage in kept:
             log.warning(
                 "%s pooled lane %r kept STOPPED: it holds claimed rows whose return to the queue "
@@ -6629,7 +6625,8 @@ class RegistryRunner:
             d.release_gated([name])
             if stage not in kept:
                 rearmed = d.resume_lane(name) or rearmed
-        if rearmed and not hold_kept:
+        # The shared hold's release rule, read after the resumes; the docstring states it.
+        if rearmed and not any(d.stopped_holding_rows(name) for _stage, d in lanes):
             self._release_operator_hold(name, "inbound")
 
     def _wake_log_gated(self) -> None:

@@ -4278,7 +4278,7 @@ def test_an_inbounds_lift_re_arms_its_stopped_pooled_lane_unless_rows_are_in_fli
     # BACKLOG #5704 (ledger items 2 and 8): the lift at an inbound's restart re-arms its STOPPED
     # pooled internal lane and lifts the hold, except a lane whose STOP left claimed rows in
     # flight that no stranded record covers, which a re-arm would claim past. A lane whose record
-    # would re-pend them first is re-armed but keeps the hold: the test after the next one.
+    # would re-pend them first is re-armed and releases the hold: the test after the next one.
     # MEASURED on main: the lift left every STOPPED lane STOPPED.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
@@ -4336,8 +4336,8 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     # or whose record the re-pend would drop unwritten because the lease moved since, would be
     # claimed past, so that lane stays STOPPED; so does one whose ownership or lease read raises.
     # A node that does not lead now keeps the record, so its lane is re-armed and waits to re-pend
-    # rather than claim. Every case holds rows in flight, so the lift keeps the hold, as main's
-    # lift did; where the lane is re-armed, nothing later releases it (an open finding).
+    # rather than claim. The hold goes with the re-arm: kept while the lane stays STOPPED holding
+    # rows in flight, released once the lift re-armed it.
     # MEASURED on main: the lift kept the recorded lane STOPPED too, and nothing drained it.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
@@ -4381,7 +4381,7 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
     runner._lift_log_halt(INBOUND)
 
     assert dispatcher.stopped(INBOUND) is not recorded
-    assert ("inbound", INBOUND) in runner._stop_held
+    assert (("inbound", INBOUND) in runner._stop_held) is not recorded
     claimed: str | None = None
     for _ in range(5):
         lanes = dispatcher._assemble_chunk(dispatcher._owning_claimer(INBOUND))
@@ -4406,19 +4406,18 @@ async def test_an_inbounds_lift_re_arms_a_lane_whose_rows_in_flight_it_re_pends_
 
 
 @pytest.mark.parametrize(
-    ("case", "released"), [("recorded_rows", False), ("no_rows", True), ("stale_entry", True)]
+    ("case", "released"), [("recorded_rows", True), ("no_rows", True), ("stale_entry", True)]
 )
-def test_an_inbounds_lift_releases_the_shared_hold_exactly_as_main_does(
+def test_an_inbounds_lift_releases_the_shared_hold_as_main_or_its_next_broadcast_did(
     store: MessageStore, case: str, released: bool
 ) -> None:
-    # BACKLOG #5704: the lift now re-arms a lane whose rows in flight a stranded record covers, but
-    # the shared ("inbound", name) hold is released in exactly the cases main's lift released it:
-    # only when a resume re-armed a lane and no lane was STOPPED holding rows in flight, recorded
-    # or not. "released" is main's outcome for each case. "recorded_rows": main kept the INGRESS
-    # lane STOPPED, so it kept the hold. "stale_entry": ROUTED is listed as a recording stage but
-    # is PROCESSING an ordinary episode; main released.
-    # MEASURED: "recorded_rows" and "stale_entry" fail on 6c1f02f21bc, which released in the
-    # first and kept in the second.
+    # BACKLOG #5704: the shared ("inbound", name) hold is released when a resume re-armed a lane
+    # and no lane is left STOPPED holding rows in flight. "no_rows" and "stale_entry" are main's
+    # lift outcome (ROUTED is listed as a recording stage but is PROCESSING an ordinary episode).
+    # "recorded_rows" is main's next broadcast's outcome: main's lift kept that lane STOPPED with
+    # the hold, and the broadcast that re-armed it released the hold; the lift is that re-arm now.
+    # MEASURED: "stale_entry" fails on 6c1f02f21bc, which kept the hold; "recorded_rows" fails on
+    # ad4db2a36f1, which kept it with no STOPPED lane left to clear it.
     runner, _source = _graph(store, _RecordingSink())
     runner._claim_mode = "pooled"
     phase = stage_dispatcher._LanePhase
@@ -4442,6 +4441,35 @@ def test_an_inbounds_lift_releases_the_shared_hold_exactly_as_main_does(
 
     assert not runner._dispatchers[Stage.INGRESS].stopped(INBOUND), "the lane was not re-armed"
     assert (("inbound", INBOUND) not in runner._stop_held) is released
+
+
+def test_a_recorded_lane_the_lift_re_arms_releases_the_hold_for_the_next_window_open(
+    store: MessageStore,
+) -> None:
+    # BACKLOG #5704: the lift re-arms a lane whose rows in flight a stranded record covers. On
+    # main that lane stayed STOPPED with the hold, and the next broadcast re-armed it and released
+    # the hold. The lift is now that re-arm, so it releases the hold too, and the schedule accepts
+    # the inbound's next window-open start.
+    # MEASURED: fails on ad4db2a36f1, which kept the hold with no STOPPED lane left to clear it.
+    runner, _source = _graph(store, _RecordingSink())
+    runner._claim_mode = "pooled"
+    d = runner._make_dispatcher(Stage.INGRESS)
+    runner._dispatchers[Stage.INGRESS] = d
+    d.mark_ready(INBOUND)
+    st = d._states[INBOUND]
+    st.phase = stage_dispatcher._LanePhase.STOPPED
+    st.unlanded = True
+    st.stranded = stage_dispatcher._Stranded(
+        None, ("row-id",), stage_dispatcher.RependFence.capture(lambda: True, lambda: None)
+    )
+    runner._hold_for_operator(INBOUND, "inbound", Stage.INGRESS)
+    runner._log_halted.add(INBOUND)
+
+    runner._lift_log_halt(INBOUND)
+
+    assert not d.stopped(INBOUND)
+    assert ("inbound", INBOUND) not in runner._stop_held
+    assert not runner._schedule_holds(INBOUND, "inbound"), "the window-open start is refused"
 
 
 async def test_a_per_lane_hand_back_whose_release_fails_re_pends_the_batch_and_goes_on(
