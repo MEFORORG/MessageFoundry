@@ -511,8 +511,9 @@ class _Shape(NamedTuple):
     at least three of them are quadratic. The test that guards these patterns,
     ``test_no_warning_filter_nests_an_unbounded_scan_inside_a_leading_one``, reads the pattern's
     characters, not its structure: it flags one that starts with the two characters ``.*`` and
-    holds another ``*`` after them, so it misses a leading run spelled ``(?s:.*)`` and a second
-    run spelled ``+`` or ``{n,}``, and nothing checks the one-run rule as a whole.
+    holds another ``*`` after them. It misses at least a leading run spelled ``.+``, ``.{0,}``,
+    ``(?s).*``, ``(?s:.*)`` or ``[\\s\\S]*``, and a second run spelled ``+`` or ``{n,}``, and it
+    does not check the one-run rule as a whole.
     CORRECTED 2026-11-23 (BACKLOG #8348 item 8): this read "Each is matched from the start of the
     warning with at most one such run, so its cost stays linear in the text", which named neither
     the ``re.match`` it rests on nor how little the test checks."""

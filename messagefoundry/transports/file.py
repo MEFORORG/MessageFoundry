@@ -1026,8 +1026,9 @@ class FileSource(SourceConnector):
         # Encoding _emit decodes a file with to split it, and re-encodes each split message with.
         # A single (non-batch) message is handed off as parsing.split.one_message_bytes says,
         # which re-encodes it with this where a byte order mark or an FHS/BHS header leads it.
-        # CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a single message "is handed off
-        # verbatim, so its bytes never round-trip through this". The name rule is the one the runner decodes by (BACKLOG #2431).
+        # The name rule is the one the runner decodes by (BACKLOG #2431).
+        # CORRECTED 2026-11-23 (BACKLOG #8357 item 5): this said a single message went verbatim;
+        # the _emit docstring holds the retraction.
         self.encoding: str = declared_encoding(s.get("encoding"))
         self.max_file_bytes: int | None = positive_cap(
             s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES),
@@ -2004,8 +2005,7 @@ class FileSource(SourceConnector):
         )  # str in → no UTF-8 re-decode (normalize only fixes line endings)
         if len(messages) == 1:
             # A lone message goes as one_message_bytes says (ADR 0206, BACKLOG #5806). CORRECTED
-            # 2026-11-23 (BACKLOG #8357 item 5): this said such a file "behaves as before the split
-            # was introduced", which the trailer-line cut made untrue.
+            # 2026-11-23 (BACKLOG #8357 item 5): the docstring above holds the retraction.
             await self._handler(one_message_bytes(raw, text, messages[0], self.encoding))
             return True
         for message in messages:
