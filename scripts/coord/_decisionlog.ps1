@@ -906,6 +906,10 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
       so a leftover "5-hour" key throws. A missing file keeps the defaults. A file that cannot be read,
       or is malformed in a way watch.py would also refuse, throws: the gate then fails closed rather
       than grade against a guess.
+
+      AN OUT-OF-ORDER TRIPLE CANNOT LIFT THE RUNG (BACKLOG #5178). HOLD is the triple's lowest level
+      and longest lead time, which in watch.py's order is the first number, so a hand edit such as
+      [97, 94, 90] cannot put HOLD at 97. Refusing the triple would answer UNKNOWN even at the ceiling.
     #>
     $holdAt = 90.0
     $holdMin = 60.0
@@ -925,12 +929,12 @@ function Get-DecisionRungLevels([string]$ThresholdsFile) {
         if ($levels -isnot [System.Management.Automation.PSCustomObject]) { throw "$ThresholdsFile levels is not an object" }
         foreach ($p in $levels.PSObject.Properties) {
             if ($p.Name -cne 'weekly') { throw "$ThresholdsFile names unknown window '$($p.Name)'" }
-            $holdAt = (Get-Triple $p.Value 'levels[weekly]')[0]
+            $holdAt = (Get-Triple $p.Value 'levels[weekly]' | Measure-Object -Minimum).Minimum
             $source = $ThresholdsFile
         }
     }
     $minutes = Get-DecisionJsonValue $doc 'minutes'
-    if ($null -ne $minutes) { $holdMin = (Get-Triple $minutes 'minutes')[0]; $source = $ThresholdsFile }
+    if ($null -ne $minutes) { $holdMin = (Get-Triple $minutes 'minutes' | Measure-Object -Maximum).Maximum; $source = $ThresholdsFile }
     return [pscustomobject]@{ HoldAt = $holdAt; HoldMin = $holdMin; Source = $source }
 }
 

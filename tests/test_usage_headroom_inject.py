@@ -25,6 +25,7 @@ re-implementation of a PowerShell rule only proves the re-implementation agrees 
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -1341,10 +1342,14 @@ def test_a_repeat_prints_one_short_line_and_a_change_prints_the_block(tmp_path: 
     # which the collector takes as a new window. That once let a falling number land here unnoticed,
     # and kept a burn rate out of the verdict. The rate is not under test here, so its rows go.
     reset = int(time.time()) + 200000
+    # A LIVE SESSION, calling the API between fires: a lower number on a new reset is taken only from
+    # one (BACKLOG #5178).
+    api_ms = itertools.count(1000, 1000)
 
     def fire(pct: float, resets_at: int = reset) -> None:
         seven = {"used_percentage": pct, "resets_at": resets_at}
-        collect(state, {"session_id": "fixture", "rate_limits": {"seven_day": seven}})
+        cost = {"total_api_duration_ms": next(api_ms)}
+        collect(state, {"session_id": "fixture", "cost": cost, "rate_limits": {"seven_day": seven}})
         (state / "history.jsonl").unlink(missing_ok=True)
 
     fire(42.0)

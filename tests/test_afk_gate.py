@@ -478,6 +478,41 @@ def test_the_thresholds_file_moves_the_minutes_clause(sb: Sandbox) -> None:
 
 
 @pytest.mark.parametrize(
+    "weekly",
+    [[97, 94, 90], [94, 97, 90], [90, 97, 94]],
+    ids=["descending", "middle-first", "hold-lowest-first"],
+)
+def test_out_of_order_weekly_levels_never_lift_the_rung(sb: Sandbox, weekly: list[int]) -> None:
+    """BACKLOG #5178 item 3. [97, 94, 90] took 97 as HOLD, so 92 read below the rung. The lowest
+    number now holds, so no ordering of a triple puts the rung above any level the triple names."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(_usage_path(sb), usage(92.0))
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": [93, 96, 98]}}), encoding="utf-8")
+    assert gate(sb)[0] == NO_REVIEW, "control: 92 is below an in-order rung of 93"
+    _thresholds(sb).write_text(json.dumps({"levels": {"weekly": weekly}}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == HALT, why(doc)
+
+
+def test_out_of_order_minutes_never_shorten_the_lead_time(sb: Sandbox) -> None:
+    """BACKLOG #5178 item 3, the minutes triple: written ascending, [5, 10, 20] took 5 as HOLD, so a
+    run-out 15 minutes away read as no hit. The largest number now holds."""
+    seed_vault(sb, calibrated("manager"))
+    write_fake_usage(
+        _usage_path(sb),
+        usage(
+            50.0, state="CRITICAL", rate_pct_per_hr=50.0, minutes_to_empty=15, minutes_to_reset=90
+        ),
+    )
+    _thresholds(sb).write_text(json.dumps({"minutes": [10, 8, 5]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == REVIEW and "does not reach the rung" in why(doc), "control: " + why(doc)
+    _thresholds(sb).write_text(json.dumps({"minutes": [5, 10, 20]}), encoding="utf-8")
+    code, doc = gate(sb)
+    assert code == HALT, why(doc)
+
+
+@pytest.mark.parametrize(
     "body",
     [
         pytest.param("{not json", id="unreadable"),

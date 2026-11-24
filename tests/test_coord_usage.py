@@ -305,10 +305,14 @@ def test_a_lower_reading_in_one_reset_period_replaces_nothing(tmp_path: Path) ->
 
 
 def test_a_new_reset_period_replaces_the_old_value_in_either_direction(tmp_path: Path) -> None:
+    """From a session calling the API on every fire: a lower number on a new reset needs one
+    (BACKLOG #5178), and an idle one is refused, as the moved-reset tests above pin."""
     epoch = int(time.time()) + 3600
-    for resets_at, pct in ((epoch, 91.0), (epoch + 7 * 86400, 2.0), (epoch + 14 * 86400, 50.0)):
+    for api_ms, (resets_at, pct) in enumerate(
+        ((epoch, 91.0), (epoch + 7 * 86400, 2.0), (epoch + 14 * 86400, 50.0)), start=1
+    ):
         seven = {"used_percentage": pct, "resets_at": resets_at}
-        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        _session_fire(tmp_path, seven, "A", api_ms * 1000)
         assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(pct)
     assert [r["seven_day"] for r in history(tmp_path)] == [91.0, 2.0, 50.0]
 
@@ -326,13 +330,67 @@ def test_a_reading_from_an_earlier_reset_period_replaces_nothing(tmp_path: Path)
 
 
 def test_a_later_reading_with_an_earlier_reset_ahead_of_now_is_a_new_window(tmp_path: Path) -> None:
-    """A re-login or a moved reset. Only a reset already passed marks a window as gone."""
+    """A re-login or a moved reset. Only a reset already passed marks a window as gone. The lower
+    number comes from a session that has just called the API (BACKLOG #5178): its first fire sets
+    its mark, and the second, after a call, is live."""
     now = int(time.time())
     first = {"used_percentage": 95.0, "resets_at": now + 500000}
     collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": first}})
     moved = {"used_percentage": 3.0, "resets_at": now + 100000}
-    collect(tmp_path, {"session_id": "B", "rate_limits": {"seven_day": moved}})
+    _session_fire(tmp_path, moved, "B", 1000)
+    _session_fire(tmp_path, moved, "B", 2000)
     assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(3.0)
+
+
+def test_idle_sessions_on_moved_resets_do_not_trade_the_window_on_every_fire(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5178 item 1. Two idle sessions holding different resets, after a re-login or a moved
+    reset, used to replace each other on every fire: 80, 5, 80, 5 made four history rows, and the
+    gate graded whichever fired last. A lower reading on another reset now opens a new window only
+    from a session that has just called the API."""
+    now = int(time.time())
+    high = {"used_percentage": 80.0, "resets_at": now + 500000}
+    low = {"used_percentage": 5.0, "resets_at": now + 100000}
+    for seven, session in ((high, "I"), (low, "J"), (high, "I"), (low, "J")):
+        _session_fire(tmp_path, seven, session=session, api_ms=1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(80.0)
+    assert [r["seven_day"] for r in history(tmp_path)] == [80.0]
+
+
+def test_a_frozen_lower_number_on_a_moved_reset_cannot_replace_a_spent_pool(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5178 item 1: a frozen 5 replaced a published 100, and the rung read that fresh 5."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 100.0, "resets_at": now + 500000}, "live", 1000)
+    spent = captured_at(tmp_path)
+    frozen = {"used_percentage": 5.0, "resets_at": now + 100000}
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    _session_fire(tmp_path, frozen, "idle", 1000)
+    kept = latest(tmp_path)["seven_day"]
+    assert kept["used_percentage"] == pytest.approx(100.0), kept
+    assert captured_at(tmp_path) == spent, "a refused reading must not refresh the age"
+    assert len(history(tmp_path)) == 1
+    code, _ = read(tmp_path)
+    assert code == CRITICAL, "control: the spent pool still reads at the ceiling"
+
+    # CONTROL. The same reading from a session that has just called the API is a new window, so the
+    # guard did not freeze the window.
+    _session_fire(tmp_path, frozen, "idle", 2000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(5.0)
+    assert len(history(tmp_path)) == 2
+
+
+def test_a_higher_number_on_a_moved_reset_still_replaces_from_an_idle_session(
+    tmp_path: Path,
+) -> None:
+    """The guard refuses only a reading at or below the published one. A higher number on another
+    reset is taken from any session, because refusing it could clear a stop."""
+    now = int(time.time())
+    _session_fire(tmp_path, {"used_percentage": 5.0, "resets_at": now + 100000}, "live", 1000)
+    _session_fire(tmp_path, {"used_percentage": 80.0, "resets_at": now + 500000}, "idle", 1000)
+    assert latest(tmp_path)["seven_day"]["used_percentage"] == pytest.approx(80.0)
 
 
 def test_a_higher_reading_with_no_reset_is_refused_and_the_floor_stays_armed(
@@ -393,7 +451,11 @@ def test_a_lower_reading_with_no_reset_cannot_disarm_the_floor(tmp_path: Path) -
     assert kept["resets_at_epoch"] == seven["resets_at"], kept
 
 
-@pytest.mark.parametrize("stamp", ["own-root", "unset", None], ids=["own", "unset", "absent"])
+@pytest.mark.parametrize(
+    "stamp",
+    ["own-root", "own-root-respelled", "unset", None],
+    ids=["own", "own-respelled", "unset", "absent"],
+)
 def test_a_differently_stamped_session_on_this_root_still_meets_the_floor(
     tmp_path: Path, stamp: str | None
 ) -> None:
@@ -405,7 +467,13 @@ def test_a_differently_stamped_session_on_this_root_still_meets_the_floor(
         del doc["seven_day"]["config_root_env"]
     else:
         own = str(tmp_path.parent)
-        doc["seven_day"]["config_root_env"] = own if stamp == "own-root" else stamp
+        # BACKLOG #5178 item 2: another spelling of this root, as a hand copy or an older collector
+        # writes it, was compared raw and counted as foreign, so a lower reading replaced a live 99.
+        respelled = own.replace("\\", "/") + "/"
+        doc["seven_day"]["config_root_env"] = {
+            "own-root": own,
+            "own-root-respelled": respelled,
+        }.get(stamp, stamp)
     (tmp_path / "latest.json").write_text(json.dumps(doc), encoding="utf-8")
 
     idle = {**seven, "used_percentage": 60.0}
@@ -448,9 +516,9 @@ def test_the_first_reading_of_a_new_reset_period_gets_a_row_at_the_same_percent(
 ) -> None:
     """A row for the new period is what the rate counts from, whatever the number happens to be."""
     epoch = int(time.time()) + 3600
-    for resets_at in (epoch, epoch + 7 * 86400):
+    for api_ms, resets_at in enumerate((epoch, epoch + 7 * 86400), start=1):
         seven = {"used_percentage": 0.0, "resets_at": resets_at}
-        collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+        _session_fire(tmp_path, seven, "A", api_ms * 1000)
     assert [r["seven_reset"] for r in history(tmp_path)] == [epoch, epoch + 7 * 86400]
 
 
@@ -1770,6 +1838,19 @@ def test_a_foreign_last_row_does_not_suppress_this_roots_row(tmp_path: Path) -> 
     )
     rows = history(tmp_path)
     assert len(rows) == 2 and rows[-1]["config_root_env"] == "unset", rows
+
+
+def test_a_last_row_in_another_spelling_of_this_root_is_this_roots_row(tmp_path: Path) -> None:
+    """BACKLOG #5178 item 2, on the history side. The reader counts a row stamped with another
+    spelling of this root as its own, so the collector must too, or a flat repeat appends a row."""
+    epoch = int(time.time()) + 280000
+    row = {"at": _minutes_ago(5), "seven_day": 86.0, "seven_reset": epoch}
+    row["config_root_env"] = str(tmp_path.parent).replace("\\", "/") + "/"
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "history.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+    seven = {"used_percentage": 86.0, "resets_at": epoch}
+    collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": seven}})
+    assert len(history(tmp_path)) == 1, history(tmp_path)
 
 
 def test_history_rows_from_another_root_do_not_enter_the_rate(tmp_path: Path) -> None:

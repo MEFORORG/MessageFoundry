@@ -540,6 +540,12 @@ roster alias of the Lander.
 >   way, and the rung then reads that fresh 5. The code before this amendment did this too, and more
 >   widely: measured 2026-11-01, its `five_hour` window read OK at 5 after a spent 100, with the same or an
 >   earlier reset. The same-reset case is what this amendment closes.
+>   **Narrowed 2026-11-24 (BACKLOG #5178):** a reading at or below the published one, on another reset,
+>   now counts as a new window only from a session that has just called the API. Two idle sessions'
+>   80, 5, 80, 5 now leaves one history row, and a frozen 5 no longer replaces a published 100. A higher
+>   reading is still taken from any session, so a live lower session and an idle higher one can still
+>   trade the window. The lower number then rests on the API-duration counter, whose behaviour on an
+>   unpinned session or a failed call is not measured.
 > - It applies only against this root's own window. A window stamped with another root is no floor.
 > - The read and the write are not locked, so a concurrent publisher can still land a lower number, and
 >   the gate can clear on it. The next live reading corrects it.

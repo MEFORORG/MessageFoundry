@@ -101,6 +101,15 @@ function Get-RootLabel([string]$Path) {
     try { return ([System.IO.Path]::GetFullPath($Path)).TrimEnd('\', '/') } catch { return $Path }
 }
 
+# IS A STAMP THIS ROOT'S, by the reader's test (usage.ps1, Test-WindowFromRoot): unstamped, unset, or
+# the same root by Test-SameRoot. A raw -ieq called another spelling of this root foreign (BACKLOG
+# #5178). Without config-roots.ps1 both sides go through Get-RootLabel's fallback, the same normal form.
+function Test-OwnStamp([string]$Stamp, [string]$Root) {
+    if (-not $Stamp -or $Stamp -eq "unset") { return $true }
+    if ($HaveConfigRoots) { return [bool](Test-SameRoot $Stamp $Root) }
+    return (Get-RootLabel $Stamp) -ieq (Get-RootLabel $Root)
+}
+
 $ConfigRootEnv = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { $null }
 if (-not $StateDir) {
     $root = $null
@@ -351,6 +360,12 @@ try {
     # live reading could lower until that reset. With no published reset ahead there is nothing to hold
     # on to: the reading is taken, and the rule does not apply until a reading brings a reset.
     #
+    # A LOWER OR EQUAL READING ON ANOTHER RESET OPENS A NEW WINDOW ONLY FROM A LIVE SESSION (BACKLOG
+    # #5178). After a moved reset, sessions can hold different resets still ahead, and an idle one's
+    # frozen number replaced the published one on every fire. So it needs a session that has just
+    # called the API. A higher reading is taken from anyone, because refusing it could clear a stop. A
+    # first fire is never live, so after a real reset the gone window (UNKNOWN) stands until one is.
+    #
     # ONLY AGAINST THIS ROOT'S OWN WINDOW, by the reader's own test: a window stamped with another root
     # is another pool, and as a floor it would shut this root's readings out until the reset. An unset
     # or absent stamp counts as ours, because sessions on one root can differ in having the pin at all.
@@ -362,7 +377,8 @@ try {
     $confirmed = $false
     $publishedRoot = if ($published) { [string]$published.config_root_env } else { "" }
     $ownRoot = Get-RootLabel (Split-Path $StateDir -Parent)
-    if ($seven -and $published -and (-not $publishedRoot -or $publishedRoot -eq "unset" -or $publishedRoot -ieq $ownRoot)) {
+    $stampOwn = Test-OwnStamp $stampEnv $ownRoot
+    if ($seven -and $published -and (Test-OwnStamp $publishedRoot $ownRoot)) {
         $nowEpoch = [System.DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         $seenEpoch = $seven.resets_at_epoch -as [long]
         $publishedEpoch = $published.resets_at_epoch -as [long]
@@ -370,10 +386,11 @@ try {
         $publishedPct = Get-Percentage $published.used_percentage
         $notHigher = $null -ne $publishedPct -and $seven.used_percentage -le $publishedPct
         $keepPublished = if ($seenEpoch -and $publishedEpoch) {
-            ($seenEpoch -eq $publishedEpoch -and $notHigher) -or ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
+            ($notHigher -and ($seenEpoch -eq $publishedEpoch -or -not $calledApi)) -or
+            ($seenEpoch -lt $publishedEpoch -and $seenEpoch -le $nowEpoch)
         }
         else { $publishedEpoch -gt $nowEpoch }
-        $confirmed = $calledApi -and ($stampEnv -eq "unset" -or $stampEnv -ieq $ownRoot) -and
+        $confirmed = $calledApi -and $stampOwn -and
             $seenEpoch -and $seenEpoch -eq $publishedEpoch -and $seenEpoch -gt $nowEpoch -and
             $seven.used_percentage -eq $publishedPct
     }
@@ -453,9 +470,8 @@ try {
         # count. Otherwise a flat repeat adds nothing, since a timed row would read as a measured rate of
         # zero: so a collector pinned to another root, whose rows the reader skips, appends once rather
         # than on every fire, and an unset and a pinned collector of this root do not both append.
-        $prevEnv = [string]$prev.config_root_env
-        $prevCounted = -not $prevEnv -or $prevEnv -eq "unset" -or $prevEnv -ieq $ownRoot
-        $rowCounted = $stampEnv -eq "unset" -or $stampEnv -ieq $ownRoot
+        $prevCounted = Test-OwnStamp ([string]$prev.config_root_env) $ownRoot
+        $rowCounted = $stampOwn
         $prevForeign = $rowCounted -and -not $prevCounted
         if (-not $prev -or $prev.seven_day -ne $freshSeven -or $prev.seven_reset -ne $seven.resets_at_epoch -or $prevForeign) {
             # STAMPED WITH THE ROOT THAT OBSERVED IT, as the window is, so usage.ps1's rate can skip a row
