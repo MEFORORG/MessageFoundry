@@ -1480,12 +1480,12 @@ _OUTBOUND_CA_SETTINGS = (
 )
 
 #: The no-partner-TLS case of an outbound whole-chain refusal (vault BACKLOG #5511): a connection
-#: whose url is http, or a REST connection with an ech_sidecar, makes no TLS connection of the
-#: engine's own to the partner, yet the engine still builds an https handler for it from its trust
+#: whose url is http, or a REST connection with ech_egress, sending through its ech_sidecar, makes
+#: no TLS connection of the engine's own to the partner, yet the engine still builds an https handler for it from its trust
 #: anchor, so the same rules apply. This refusal and the rooted-CA refusals in tls_policy carry it.
 OUTBOUND_NO_PARTNER_TLS_CASE = (
-    "A connection with an http url, or a REST connection with an ech_sidecar, makes no TLS "
-    "connection of the engine's own to the partner, so no CRL is checked against the partner "
+    "A connection with an http url, or a REST connection with ech_egress, sending through its "
+    "ech_sidecar, makes no TLS connection of the engine's own to the partner, so no CRL is checked against the partner "
     "there, but the engine still builds an https handler for that connection from its trust "
     "anchor, and these rules apply to it"
 )
