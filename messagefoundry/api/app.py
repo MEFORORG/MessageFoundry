@@ -1781,11 +1781,7 @@ def _managed_teardown_steps(
         # #3191).
         steps.append(
             _TeardownStep(
-                "the security notifier's close",
-                0.25,
-                # Part of the bound, so the close cuts its own drain and starts recording the
-                # notices it left before the step is cut (BACKLOG #6832).
-                lambda b: security_notifier.aclose(b * _INNER_SHARE),
+                "the security notifier's close", 0.25, lambda _b: security_notifier.aclose()
             )
         )
     # This takes the observers off. An unpinned cluster node's posture inverse is not raised here,

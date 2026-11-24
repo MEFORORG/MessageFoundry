@@ -618,6 +618,70 @@ def _blocking_send(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, th
     return started, release
 
 
+async def _cut_close(notifier: SecurityEventNotifier) -> None:
+    """Close the notifier and cut the close as the teardown does at its step's bound: a cancel."""
+    closing = asyncio.create_task(notifier.aclose())
+    await asyncio.sleep(0.05)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(closing, 5.0)
+
+
+async def test_a_backlog_the_teardown_step_lets_drain_is_all_sent(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6832, Lander hold on PR 3260. The managed teardown's close step must let the
+    drain run to the step's own bound, as main did: a backlog that drains inside that bound is
+    mailed, never recorded abandoned. The inner share is shrunk only to widen the margins of a
+    close that cuts its own drain early, which is the defect this test catches."""
+    from types import SimpleNamespace
+
+    import messagefoundry.api.app as app_module
+
+    monkeypatch.setattr(app_module, "_INNER_SHARE", 0.1)
+    sent: list[list[str]] = []
+    release = threading.Event()
+
+    def slow(**kw: Any) -> None:
+        release.wait(5.0)
+        sent.append(kw["recipients"])
+
+    monkeypatch.setattr(_SEND, slow)
+    notifier = _notifier(store)
+    notifier.start()
+    for name in ("amy", "ben", "cat"):
+        await notifier.notify(
+            SecurityEvent(PASSWORD_CHANGED, username=name, email=f"{name}@x.test")
+        )
+    # Stand-ins for the other steps' parts: building the list calls none of them.
+    part: Any = object()
+    state = SimpleNamespace(
+        outliving_operations=part, upload_store=part, approval_gate=part, connscale_executor=None
+    )
+    steps = app_module._managed_teardown_steps(
+        cast(Any, SimpleNamespace(state=state)),
+        part,
+        part,
+        part,
+        background=[],
+        upload_retention_runner=None,
+        security_notifier=notifier,
+        remove_security_signals=lambda: None,
+        notifier=None,
+    )
+    [step] = [s for s in steps if s.label == "the security notifier's close"]
+    bound = 1.0
+    work = asyncio.ensure_future(step.run(bound))
+    try:
+        await asyncio.sleep(0.4)  # past 0.1 of the bound, well inside the bound itself
+        release.set()
+        assert await app_module._await_step(work, bound, step.label)
+    finally:
+        release.set()
+    assert sorted(sent) == [["amy@x.test"], ["ben@x.test"], ["cat@x.test"]]
+    assert await _undelivered(store) == []
+
+
 async def test_a_cut_close_records_every_notice_it_left_unsent(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -787,30 +851,6 @@ async def test_a_cut_close_with_no_audit_sink_still_logs_the_queued_count(
     assert not [r for r in caplog.records if "could not be recorded" in r.getMessage()]
 
 
-async def test_a_close_timeout_cuts_the_drain_and_records_before_returning(
-    store: MessageStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #6832, review round two. The shutdown hands the close part of its bound, so the
-    close cuts its own drain and records, then returns without raising."""
-    started, release = _blocking_send(monkeypatch)
-    notifier = _notifier(store)
-    notifier.start()
-    drain = notifier._task
-    assert drain is not None
-    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
-    await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
-    try:
-        assert await asyncio.to_thread(started.wait, 5.0)
-        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
-        assert drain.done()
-        assert sorted((actor, d["reason"]) for _, actor, d in await _undelivered(store)) == [
-            ("amy", "interrupted"),
-            ("ben", "abandoned"),
-        ]
-    finally:
-        release.set()
-
-
 async def test_a_cut_of_the_close_while_it_records_stops_only_its_wait(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -853,9 +893,11 @@ async def test_a_cut_of_the_close_while_it_records_stops_only_its_wait(
         )
     try:
         assert await asyncio.to_thread(started.wait, 5.0)
-        closing = asyncio.create_task(notifier.aclose(0.05))
+        closing = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
+        closing.cancel()  # the step's cut, which starts the records
         await asyncio.wait_for(entered.wait(), 5.0)
-        closing.cancel()  # the step's own cut, mid-record
+        closing.cancel()  # a second cancel, mid-record
         with pytest.raises(asyncio.CancelledError):
             await closing
     finally:
@@ -914,9 +956,14 @@ async def test_a_second_close_beside_a_cut_one_returns_cleanly(
     try:
         assert await asyncio.to_thread(started.wait, 5.0)
         await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="ben", email="ben@x.test"))
-        first = asyncio.create_task(notifier.aclose(0.05))
+        first = asyncio.create_task(notifier.aclose())
+        await asyncio.sleep(0.05)
         second = asyncio.create_task(notifier.aclose())
-        await asyncio.wait_for(asyncio.gather(first, second), 5.0)
+        await asyncio.sleep(0.05)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(first, 5.0)
+        await asyncio.wait_for(second, 5.0)
     finally:
         release.set()
     assert notifier._queue.qsize() == 0
@@ -947,7 +994,7 @@ async def test_a_send_still_waiting_for_a_thread_at_the_cut_never_mails(
     try:
         await notifier.notify(SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test"))
         await asyncio.sleep(0.05)  # the drain is now waiting on the queued send
-        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
+        await _cut_close(notifier)
     finally:
         busy.set()
     await occupied
@@ -958,12 +1005,12 @@ async def test_a_send_still_waiting_for_a_thread_at_the_cut_never_mails(
     ]
 
 
-async def test_a_timeout_cut_logs_a_warning_naming_the_queued_count(
+async def test_a_cut_close_logs_a_warning_naming_the_queued_count(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #6832, Manager repair (c). A close cut by its own timeout ends inside the step's
-    bound, so the teardown's cut line no longer fires; the close logs one of its own, on every
-    timeout cut, with a count that leaves lock notices out (BACKLOG #1131)."""
+    """BACKLOG #6832, Lander hold on PR 3260. A close the teardown cuts logs one WARNING line
+    counting the notices it left queued, before their writes, and the count leaves lock notices
+    out (BACKLOG #1131). The teardown's own cut line is the only ERROR the cut adds."""
     started, release = _blocking_send(monkeypatch)
     notifier = _notifier(store)
     notifier.start()
@@ -972,14 +1019,17 @@ async def test_a_timeout_cut_logs_a_warning_naming_the_queued_count(
     await notifier.notify(SecurityEvent(ACCOUNT_LOCKED, username="lock-c", email="c@x.test"))
     try:
         assert await asyncio.to_thread(started.wait, 5.0)
-        await asyncio.wait_for(notifier.aclose(0.05), 5.0)
+        await _cut_close(notifier)
     finally:
         release.set()
-    lines = [r for r in caplog.records if "did not drain" in r.getMessage()]
-    assert [(r.levelname, r.getMessage()) for r in lines] == [
+    notifier_lines = [
+        (r.levelname, r.getMessage())
+        for r in caplog.records
+        if r.name == "messagefoundry.pipeline.security_notify"
+    ]
+    assert notifier_lines == [
         (
-            "ERROR",
-            "SecurityEventNotifier did not drain within 0.05s; cut it with 1 security notice(s) "
-            "still queued, never sent",
+            "WARNING",
+            "SecurityEventNotifier closed with 1 security notice(s) still queued, never sent",
         )
     ]

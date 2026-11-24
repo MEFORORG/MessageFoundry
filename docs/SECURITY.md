@@ -7983,18 +7983,21 @@ come before the provision row in the chain, because the notice is sent while the
 again for the row, and only when a send failed. **Still open, at least:**
 
 - At shutdown the notifier closes while the store is still open (BACKLOG #3191), so a send that
-  fails in its final drain is recorded. That close is one bounded step of the shutdown. The close
-  stops waiting for its drain at part of that step's bound, or when the step is cut, then cancels
-  the drain and records the send it cut with `reason: interrupted` and each notice still queued
-  with `reason: abandoned` (BACKLOG #6832). A send still waiting for a worker thread at the cut
-  is skipped, so it never mails, and is recorded `abandoned` too; one that ended just before the
-  cut is recorded as it ended. A cut send whose thread began runs on to its own timeout, so that
-  notice may still go out. Those writes run one at a time and are not bounded. The shutdown
-  stops waiting for them at the step's bound plus its cut grace; the rest go on beside
-  `engine.stop()`, competing with its writes, until the store closes, and those still to run then
-  fail. Under a full queue that can be most of them. A WARNING line counting the queued notices
-  comes before their writes, and one counting the writes that failed comes after; it does not
-  count the writes a cancel stopped before they ran. Neither line counts a lock notice. A lock
+  fails in its final drain is recorded. That close is one bounded step of the shutdown, and it
+  sets no bound of its own, so the drain mails for the whole of the step's bound. When the step
+  is cut, the close cancels the drain and records the send it cut with `reason: interrupted` and
+  each notice still queued with `reason: abandoned` (BACKLOG #6832). A send still waiting for a
+  worker thread at the cut is skipped, so it never mails, and is recorded `abandoned` too. A send
+  that ended just before the cut reached the drain is read as it ended: a sent notice gets no
+  row, and a failed one gets `reason: send_failed`. A cut send whose thread began runs on to its
+  own timeout, so that notice may still go out. Those writes run one at a time and are not
+  bounded. The shutdown stops waiting for them at the step's bound plus its cut grace; the rest
+  go on beside `engine.stop()`, competing with its writes, until the store closes, and those still
+  to run then fail. Under a full queue that can be most of them. Beside the teardown's ERROR line
+  for the cut, the close logs a WARNING line counting the queued notices before their writes,
+  only when some are queued, and one counting the writes that failed after them; that one does
+  not count the writes a cancel stopped before they ran. Neither line counts a lock notice, and
+  the first does not count the cut send. A lock
   notice among them keeps its `auth.lock_notice` row
   reading `mailed: true`, so the throttle holds back that account's next lock notice of the kind
   for the rest of its 24 hours.

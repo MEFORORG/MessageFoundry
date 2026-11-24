@@ -842,50 +842,43 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         task.add_done_callback(self._recording.discard)
 
     def start(self) -> None:
-        # Never again once closed (vault BACKLOG #3120). The close has stopped the drain, emptied the
-        # queue and refuses new events (BACKLOG #6832), so a drain started again would sit on a queue
-        # nothing fills while notify() answers False. The engine builds a new notifier for each
-        # lifespan rather than restart one.
+        # Never again once closed (vault BACKLOG #3120). From the moment aclose() begins, notify()
+        # refuses every event, so a drain started again would serve a queue nothing fills while the
+        # notices it was meant to send were already recorded or sent. The engine builds a new
+        # notifier for each lifespan rather than restart one.
         if self._closing:
             raise RuntimeError(f"{type(self).__name__} has been closed and cannot be started again")
         super().start()
 
-    async def aclose(self, timeout: float | None = None) -> None:
-        """Drain the queue and stop. A close cut short cancels the drain and starts recording, with a
-        sink, the send it cut and each notice still queued (BACKLOG #6832). It waits for those
-        writes unless it is cancelled again, which stops only the wait. ``timeout`` cuts the
-        wait for the drain from inside, so the shutdown hands this close part of its step's bound
-        and the records start before the step itself is cut; a cancel of the caller cuts it the same
-        way. The writes are not bounded: past the step's bound the shutdown stops waiting for them,
-        and they go on, beside engine.stop(), until the store closes, which fails the rest. The
-        count of queued notices is logged before any of them is written. A second call waits for
-        the first to finish or be cut, and closes nothing itself."""
+    async def aclose(self) -> None:
+        """Drain the queue and stop. The close sets no bound of its own: the shutdown's step bound
+        cuts it, so every notice the drain mails inside that bound goes out. A close cut short
+        cancels the drain and starts recording, with a sink, the send it cut and each notice still
+        queued (BACKLOG #6832). It waits for those writes unless it is cancelled again, which stops
+        only the wait. The writes are not bounded: past the step's cut grace the shutdown stops
+        waiting for them, and they go on, beside engine.stop(), until the store closes, which fails
+        the rest. The count of queued notices is logged before any of them is written. A second
+        call waits for the first to finish or be cut, and closes nothing itself."""
         if self._closing:
             await self._closed.wait()
             return
         self._closing = True  # before the sentinel goes in, so nothing is queued behind it
         try:
-            await self._close(timeout)
+            await self._close()
         finally:
             self._closed.set()
 
-    async def _close(self, timeout: float | None) -> None:
+    async def _close(self) -> None:
         drain = self._task
-        deadline = asyncio.timeout(timeout)
-        cut = timed_out = False
+        cut = False
         try:
-            async with deadline:
-                await super().aclose()
-        except TimeoutError:
-            if not deadline.expired():
-                raise
-            cut = timed_out = True
+            await super().aclose()
         except asyncio.CancelledError:
             cut = True
             raise
         finally:
             # Taken and logged before any await, so a second cancel cannot leave them untold.
-            left = self._take_queued(timeout if timed_out else None)
+            left = self._take_queued()
             try:
                 if drain is not None:
                     # Cut while the sentinel waited on a full queue, the drain still runs; cut while
@@ -905,28 +898,16 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
                 # Each one swallows its own failure, so this only waits.
                 await asyncio.shield(asyncio.gather(*self._recording, return_exceptions=True))
 
-    def _take_queued(self, timed_out: float | None) -> list[SecurityEvent]:
+    def _take_queued(self) -> list[SecurityEvent]:
         """Empty the queue, stop sentinel included, and log how many notices it held. At least a
-        cut close, and the close of a notifier never started, leave some. ``timed_out`` is the
-        timeout that cut the close, if one did."""
+        cut close, and the close of a notifier never started, leave some."""
         left: list[SecurityEvent] = []
         while not self._queue.empty():
             if (event := self._queue.get_nowait()) is not None:
                 left.append(event)
         # A count, never one that includes a lock notice (BACKLOG #1131).
         shown = sum(event.event_type not in LOG_SILENT_EVENT_TYPES for event in left)
-        if timed_out is not None:
-            # On every timeout cut, whatever kinds were in flight, so neither its presence nor its
-            # absence says a lock landed. It stands in for the teardown's own cut line, which a
-            # close cut inside its bound no longer reaches, and at that line's level.
-            log.error(
-                "%s did not drain within %.2fs; cut it with %d security notice(s) still queued, "
-                "never sent",
-                type(self).__name__,
-                timed_out,
-                shown,
-            )
-        elif shown:
+        if shown:
             log.warning(
                 "%s closed with %d security notice(s) still queued, never sent",
                 type(self).__name__,
