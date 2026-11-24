@@ -1141,7 +1141,7 @@ def test_a_function_value_or_array_this_read_cannot_trace_is_a_floor(
             "const R = [1, 2, 3]\nconst f = r => `${agent(r)}`\n"
             "await parallel(R.map(r => () => f(r)))\n",
             3,
-            {2, 3},
+            {2},
             id="helper-fanned",
         ),
         pytest.param("const t = [...agent(1)]\n", 1, {1}, id="bare-spread"),
@@ -1152,14 +1152,14 @@ def test_an_agent_inside_a_template_interpolation_is_never_an_exact_low_count(
 ) -> None:
     """BACKLOG #7599: the mask blanks a template whole, ``${...}`` included, so no pricer sees a
     call there. Before PR 2982 the plain cases priced 0 agents as EXACT, and before this change
-    the spread and helper-fanned ones still did. Each case states its true agent count, so a
-    lexer that prices interpolation code exactly passes too; until one does, the agent or the
-    helper call is an ``unattributed`` term on each line in ``flagged``. At least these shapes are
-    pinned; the residue's guarantee is the reach of its word pattern, not this list."""
+    the three spread cases still priced EXACT and low. Each case states its true agent count, so
+    a lexer that prices interpolation code exactly passes too; until one does, the unattributed
+    terms fall on exactly the lines in ``flagged``. At least these shapes are pinned; the
+    residue's guarantee is the reach of its word pattern, not this list."""
     cost = mod.price_script(script)
     assert cost.agents >= agents or not cost.exact, script
     if not cost.exact:
-        assert flagged <= {u.line for u in cost.unknowns if u.kind == "unattributed"}, script
+        assert flagged == {u.line for u in cost.unknowns if u.kind == "unattributed"}, script
 
 
 def test_a_helper_that_is_never_called_is_reported_not_priced(mod: ModuleType) -> None:

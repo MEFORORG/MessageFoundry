@@ -74,6 +74,7 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -1523,57 +1524,37 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
     pattern at all; this is what catches it, and ``ROWS.map(review)`` over a helper likewise.
     """
 
-    # The helpers that can reach an agent, through any chain of helpers. A helper that starts
-    # nothing may be passed around freely; flagging it would bury the terms that matter.
     # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
     # pricer. Read the raw text there, for the reach as for the references (BACKLOG #7599); an
     # `agent` in a string inside one reads as a false hit, which costs a floor label rather than a
     # silent under-count.
-    def found(word: re.Pattern[str], lo: int, hi: int) -> list[re.Match[str]]:
-        hits = list(word.finditer(ctx.masked, lo, hi))
+    def found(word: re.Pattern[str], lo: int, hi: int) -> Iterator[re.Match[str]]:
+        yield from word.finditer(ctx.masked, lo, hi)
         for a, b in ctx.interps:
             if a < hi and b > lo:
-                hits += word.finditer(ctx.raw, max(a, lo), min(b, hi))
-        return hits
+                yield from word.finditer(ctx.raw, max(a, lo), min(b, hi))
 
+    # The helpers that can reach an agent, through any chain of helpers. A helper that starts
+    # nothing may be passed around freely; flagging it would bury the terms that matter.
     reach = {"agent", "workflow"}
     while True:
         word = _word_re(*reach)
         grown = {
             n
             for n, h in ctx.helpers.items()
-            if n not in reach and found(word, h.body_start, h.body_end)
+            if n not in reach and next(found(word, h.body_start, h.body_end), None)
         }
         if not grown:
             break
         reach |= grown
-    refs = sorted(
-        (
-            m
-            for m in found(word, 0, len(ctx.raw))
-            if m.start() not in ctx.def_names
-            and m.start() not in ctx.method_heads  # names a method, wherever the scan reached
-            and not _is_declared_at(ctx, m.start())
-        ),
-        key=lambda m: m.start(),
-    )
-    flagged = {m.start() for m in refs if m.start() not in ctx.attributed}
-    # A helper whose body holds an unattributed reference was priced short at every call, and a
-    # fan over it multiplies that shortfall, so its attributed calls are residue too: the report
-    # then names the line that carries the width, not only the body.
-    while True:
-        short = {
-            n
-            for n, h in ctx.helpers.items()
-            if any(h.body_start <= i < h.body_end for i in flagged)
-        }
-        calls = {m.start() for m in refs if m.group() in short} - flagged
-        if not calls:
-            break
-        flagged |= calls
     out: list[Unknown] = []
-    for m in refs:
-        if m.start() not in flagged:
+    for m in sorted(found(word, 0, len(ctx.raw)), key=lambda m: m.start()):
+        if (
+            m.start() in ctx.attributed
+            or m.start() in ctx.def_names
+            or m.start() in ctx.method_heads  # names a method, wherever the scan reached
+            or _is_declared_at(ctx, m.start())
+        ):
             continue
         line_end = ctx.raw.find("\n", m.start())
         out.append(
