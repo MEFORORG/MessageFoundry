@@ -13880,8 +13880,9 @@ def create_managed_app(
             app.state.secret_provider = secret_provider
             # #323 layer 3: the [tls] trust-anchor policy POST /alerts/test-email and POST /ai/chat
             # read, stashed at start from the argument the live notifier and the connections read,
-            # so a stash written before start cannot split the two. The one writer on this path:
-            # create_app below is not handed it (BACKLOG #5527 item 8).
+            # so a stash written before start cannot split the two. create_app below is not
+            # handed it, so it writes None at build and this overwrites that at start (BACKLOG
+            # #5527 item 8).
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
             app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail

@@ -533,7 +533,8 @@ def _no_redirect_opener(
     ``narrows``; see :func:`~messagefoundry.config.tls_policy.build_anchored_https_handler`.
     :func:`_verifying_opener` makes that choice for the hops that call it.
 
-    ``connector`` is the hop label a refusal raised while the context is built or asserted names.
+    ``connector`` is the hop label an opener-build refusal names, such as a cipher-assertion or
+    handler-context refusal. A CA or CRL load refusal names the ``[tls]`` setting instead.
     The AI broker's anchored opener passes its own (BACKLOG #5527 item 9); the shared opener is
     built once, with the default."""
     return build_strict_opener(
