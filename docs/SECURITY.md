@@ -6418,8 +6418,10 @@ engine bounds its own sessions with short caps, and the reconciler carries direc
   default), a Kerberos session can give that step-up only by password. So a Kerberos session on a
   passwordless or smartcard-only account cannot end its other sessions this way. Under
   `[security].require_mfa` a Kerberos session that has proven no engine factor is MFA-pending,
-  and `DELETE /me/sessions` refuses it whatever it proves until it enrols one, which for a
-  directory account needs an administrator-issued enrolment code (ADR 0207, BACKLOG #1149). Until
+  and `DELETE /me/sessions` refuses it whatever password it proves. On an account that holds an
+  engine factor it proves that factor at `POST /auth/mfa-verify` first; on one with no factor it
+  enrols one, which for a directory account needs an administrator-issued enrolment code
+  (ADR 0207, BACKLOG #1149). Until
   then an administrator ends those sessions with `DELETE /users/{user_id}/sessions`;
 - end sessions in bulk with `DELETE /sessions`, which keeps the caller's current session only when
   the revoke re-stamps it and otherwise ends it too, or from the host with
@@ -6465,8 +6467,9 @@ factor, which `[security].require_mfa` covers, is refused the same way (BACKLOG 
 no step-up mints it a `session_terminate`, `save_ends_own_sessions` or `revoke_all_sessions` grant,
 the JSON terminate routes answer `403` + `X-MFA-Required` with a detail that names enrolment, and
 the console twins send it to `/ui/account?m=enroll_first`, as does `/ui/reauth` when asked to
-re-prove for a terminate. It may still reach at least enrolment and sign-out; `_MFA_EXEMPT_ROUTES`
-in `api/security.py` holds the JSON routes a pending session reaches. This refusal adds a step,
+re-prove for a terminate. It may still reach at least enrolment and sign-out. On the JSON plane
+a pending session reaches at least the routes in `_MFA_EXEMPT_ROUTES` in `api/security.py` and
+the routes whose gate passes `mfa_gate=False`; enrolment is one of the latter. This refusal adds a step,
 not a bar, against a holder of a local account's password alone: that holder may enrol a factor of
 its own first, which satisfies the session, and then end sessions. A directory account's first
 enrolment needs an administrator-issued enrolment code (ADR 0207), so there it holds.

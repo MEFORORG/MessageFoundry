@@ -1647,10 +1647,11 @@ async def _pending_holds_no_factor(auth: AuthService, token: str | None) -> bool
     keeps the verify wording. A session satisfied between the gate's read and this one also reads
     True, a wording slip on a refusal already decided.
 
-    The read only picks the wording, and the gate has already refused, so a store, seal or Transit
-    fault (at least the sealed-read set and ``TransitSealUnavailableError``) keeps the
-    403 and its ``X-MFA-Required`` with the verify wording rather than becoming a 500, as
-    :func:`_step_up_refusal`'s wording read does (vault BACKLOG #3145 item 6)."""
+    The read only picks the wording, and the gate has already refused, so the faults caught here
+    (the sealed-read set and ``TransitSealUnavailableError``) keep the 403 and its
+    ``X-MFA-Required`` with the verify wording rather than becoming a 500, the rule
+    :func:`_step_up_refusal`'s wording read follows for store faults (vault BACKLOG #3145 item 6).
+    ``TransitSealUnverifiableError`` is not in the set."""
     faults: tuple[type[Exception], ...] = (*sealed_read_errors(), TransitSealUnavailableError)
     try:
         return not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL)
