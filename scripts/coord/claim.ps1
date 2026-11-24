@@ -1101,6 +1101,25 @@ if ($List) { Show-List; exit 0 }
 $safe = ConvertTo-KeyFile $Take
 $file = Join-Path $claims "$safe.json"
 
+# The record is built BEFORE the CreateNew below, never between it and the write (BACKLOG #7565). From
+# CreateNew until the handle closes the name exists at 0 bytes, and a failure or a kill in that span
+# leaves an empty claim file: no reader can name its holder, and the key stays blocked until someone
+# runs -Release -Force on it. With everything that can throw done first, the span holds only the Write
+# and its flush. A kill inside that span can still leave the empty file; the exclusion stays on
+# CreateNew, the primitive alloc.ps1 shares, rather than moving to a rename.
+$claim = [ordered]@{
+    key      = $Take
+    note     = if ($Note) { $Note } else { "(no note)" }
+    branch   = $branch
+    worktree = $holder
+    # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
+    host     = $thisHost
+    claimed  = (Get-Date).ToString("o")
+} | ConvertTo-Json -Compress
+# UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes
+# json.loads raise -- which would be swallowed into "not claimed" and silently disable the gate.
+$bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
+
 try {
     # ATOMIC test-and-set -- identical to alloc.ps1. 'CreateNew' + FileShare::None throws IOException if a
     # sibling session got here first, and that throw IS the mutual exclusion.
@@ -1258,19 +1277,10 @@ try {
     exit 1
 }
 try {
-    $claim = [ordered]@{
-        key      = $Take
-        note     = if ($Note) { $Note } else { "(no note)" }
-        branch   = $branch
-        worktree = $holder
-        # docs/COORD-SHARED-ROOT.md: a reader on another PC must be able to tell this path is not its own.
-        host     = $thisHost
-        claimed  = (Get-Date).ToString("o")
-    } | ConvertTo-Json -Compress
-    # UTF8 WITHOUT a BOM: the python-side gate reads this with encoding="utf-8", and a BOM makes
-    # json.loads raise -- which would be swallowed into "not claimed" and silently disable the gate.
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($claim)
     $fs.Write($bytes, 0, $bytes.Length)
+    # Through to the disk before the handle closes, so a power loss after CLAIMED is printed does not
+    # leave the name with no bytes behind it.
+    $fs.Flush($true)
 } finally {
     $fs.Dispose()
 }

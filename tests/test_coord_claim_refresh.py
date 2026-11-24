@@ -289,3 +289,74 @@ def test_take_on_a_delete_pending_claim_file_is_contended_not_a_crash(
     assert out["rc"] == 1, out
     assert "CLAIMED" not in out["out"], out
     assert "BLOCKED" in out["out"] and "Retry in a moment" in out["out"], out
+
+
+def _take_with_failing_record_build(repo: Path, key: str) -> subprocess.CompletedProcess[str]:
+    """Run ``-Take`` with ``ConvertTo-Json`` shadowed by a function that throws.
+
+    A global function outranks the cmdlet inside the script, so this fails the record build wherever
+    the script does it. Only the record build of a FIRST take calls it on this path.
+    """
+    script = str(repo / "scripts" / "coord" / "claim.ps1").replace("'", "''")
+    command = (
+        "function global:ConvertTo-Json { throw 'injected record-build failure' }; "
+        f"& '{script}' -Take '{key}' -Note 'n'"
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
+def test_a_first_take_that_fails_before_writing_leaves_no_empty_claim_file(repo: Path) -> None:
+    """BACKLOG #7565: the record is built before ``CreateNew``, so a failure there creates nothing.
+
+    The record used to be built after ``CreateNew`` had made the name at 0 bytes, so a failure in
+    between left an empty claim file: ``-Take`` then printed a blank holder for the key, and only
+    ``-Release -Force`` cleared it.
+    """
+    proc = _take_with_failing_record_build(repo, "k")
+    assert proc.returncode != 0, (proc.stdout, proc.stderr)
+    # The control: the injected failure is what stopped it, not something earlier.
+    assert "injected record-build failure" in proc.stderr + proc.stdout, (proc.stdout, proc.stderr)
+    assert "CLAIMED" not in proc.stdout
+    path = claim_file(repo, "k")
+    assert not path.exists(), f"a failed first take left a {path.stat().st_size}-byte claim file"
+    # And the key is still free for an ordinary take.
+    ok = claim(repo, "-Take", "k", "-Note", "after")
+    assert ok.returncode == 0, (ok.stdout, ok.stderr)
+    assert read_claim(repo, "k")["note"] == "after"
+
+
+def test_concurrent_first_takes_from_different_worktrees_have_exactly_one_winner(
+    repo: Path, tmp_path: Path
+) -> None:
+    """Building the record before ``CreateNew`` must not move the exclusion off it (BACKLOG #7565)."""
+    trees = []
+    for i in range(4):
+        wt = tmp_path / f"wt{i}"
+        git(repo, "worktree", "add", "-q", "-b", f"b{i}", str(wt))
+        trees.append(wt)
+    procs = [
+        subprocess.Popen(
+            [
+                "pwsh", "-NoProfile", "-NonInteractive", "-File",
+                str(wt / "scripts" / "coord" / "claim.ps1"), "-Take", "k", "-Note", wt.name,
+            ],
+            cwd=str(wt),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for wt in trees
+    ]  # fmt: skip
+    results = [(p.returncode, out) for p in procs for out, _ in [p.communicate(timeout=TIMEOUT)]]
+    winners = [out for rc, out in results if rc == 0 and "CLAIMED" in out]
+    assert len(winners) == 1, results
+    assert all(rc == 1 for rc, out in results if out not in winners), results
+    # The file holds the winner's whole record, never an empty or a second taker's one.
+    assert read_claim(repo, "k")["note"] in winners[0]
