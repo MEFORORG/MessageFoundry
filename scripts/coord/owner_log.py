@@ -53,7 +53,8 @@ USAGE
     python scripts/coord/owner_log.py declined  --item cap --actor liaison \\
         --ruling "absorbed as context into 340; not worth a turn"
 
-    python scripts/coord/owner_log.py check --stale-minutes 45   # EXIT 1 if anything stalled
+    python scripts/coord/owner_log.py check --stale-minutes 45   # EXIT 1 if stalled, unreadable
+                                                                 # stamp, or misdelivered
     python scripts/coord/owner_log.py status                     # every item and its legs
 
 DESIGN NOTES, each one paid for on 2026-08-26:
@@ -193,9 +194,26 @@ def ensure(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    if not os.path.isfile(path):
-        with open(path, "wb") as fh:
-            fh.write(("\n".join(HEADER) + "\n").encode())
+    if os.path.isfile(path):
+        return  # the common case; the exclusive create below is what never truncates
+    # Exclusive create: ensure() never truncates an existing ledger. The ledger is shared across
+    # sessions and PCs, and a writer that lost a check-then-"wb" race wiped the rows the winner had
+    # just appended. O_APPEND is set as well, so on POSIX a row another writer appends between this
+    # create and the header write is not overwritten; read() skips header lines anywhere. On
+    # Windows, O_APPEND is a seek-to-end and then a write, so a truly simultaneous append and header
+    # write can still interleave and lose a row. BACKLOG #7584 carries that remaining work.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags, 0o666)
+    except FileExistsError:
+        # Another writer won. Not re-checked with isfile(): an SMB client may answer that from a
+        # stale not-found cache and would turn a won race into a lost row. A directory is the one
+        # holder append() could not write to, so name it here rather than fail obscurely there.
+        if os.path.isdir(path):
+            raise
+        return
+    with os.fdopen(fd, "ab") as fh:
+        fh.write(("\n".join(HEADER) + "\n").encode())
 
 
 def append(path: str, rec: dict[str, str]) -> None:
@@ -246,12 +264,23 @@ def by_item(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
     return items
 
 
-def age_minutes(ts: str) -> float:
+#: How far in the future a stamp may sit and still count as clock skew between PCs.
+FUTURE_SKEW_MINUTES = 5.0
+
+
+def age_minutes(ts: str) -> float | None:
+    """Minutes since ``ts``, or None when the age cannot be read: the stamp does not parse, or it
+    lies further in the future than clock skew explains. A sentinel number here once compared
+    below every stale threshold, so a hand-appended row with an odd stamp read as fresh and its
+    item was never flagged; a far-future stamp would read as fresh the same way."""
     try:
         t = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
     except ValueError:
-        return -1.0
-    return (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
+        return None
+    mins = (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
+    if mins < -FUTURE_SKEW_MINUTES:
+        return None
+    return max(mins, 0.0)  # within skew: treat as just written, never as a negative age
 
 
 def cmd_event(a: argparse.Namespace) -> int:
@@ -287,6 +316,7 @@ def cmd_check(a: argparse.Namespace) -> int:
     stale = []
     waiting = []
     misdelivered = []
+    unreadable = []
     for item, evs in sorted(items.items()):
         seen = {r.get("event") for r in evs}
         if seen & TERMINAL:
@@ -313,6 +343,10 @@ def cmd_check(a: argparse.Namespace) -> int:
             continue
         lastev = [r for r in evs if r.get("event") == last][-1]
         mins = age_minutes(lastev.get("ts", ""))
+        if mins is None:
+            # An open item whose age cannot be read cannot be shown NOT stalled, so it needs a look.
+            unreadable.append((item, last, lastev))
+            continue
         if last == "presented":
             # Waiting on a person who may be asleep. Only alarm if it has been far too long.
             if mins >= PRESENTED_STALE_HOURS * 60:
@@ -342,8 +376,19 @@ def cmd_check(a: argparse.Namespace) -> int:
         for item, mins, ev in sorted(waiting, key=lambda r: -r[1]):
             print(f"      {item}  ({mins / 60:.1f}h)  {(ev.get('summary') or '')[:70]}")
         print("")
+    if unreadable:
+        print(f"  *** {len(unreadable)} OPEN ITEM(S) WITH AN UNREADABLE TIMESTAMP ***")
+        print("  Their age cannot be computed, so they cannot be shown not stalled. The stamp does")
+        print("  not parse as e.g. 2026-01-31T09:05:00Z, or lies in the future (check the writing")
+        print("  PC's clock). Logging the item's next leg, or `withdrawn`, clears it.")
+        print("")
+        for item, last, ev in unreadable:
+            print(f"  {item}")
+            print(f"      last leg   : {last}  (ts {ev.get('ts')!a}, by {ev.get('actor')})")
+            print(f"      meaning    : {MEANING.get(last, '?')}")
+            print("")
     if not stale:
-        if misdelivered:
+        if misdelivered or unreadable:
             return 1
         print(f"  {len(items)} item(s). NO GAPS older than {a.stale_minutes:g} min. Exit 0.")
         return 0
@@ -422,7 +467,13 @@ def main() -> int:
             ),
         )
         s.set_defaults(func=cmd_event, event=ev)
-    c = sub.add_parser("check", help="find items stalled between legs (EXIT 1 if any)")
+    c = sub.add_parser(
+        "check",
+        help=(
+            "find open items stalled between legs, with an unreadable or future timestamp, or "
+            "closed by the wrong seat (EXIT 1 if any)"
+        ),
+    )
     c.add_argument("--stale-minutes", type=float, default=45.0)
     c.set_defaults(func=cmd_check)
     st = sub.add_parser("status", help="every item and its legs")
