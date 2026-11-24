@@ -400,8 +400,9 @@ class RetentionRunner:
         self._clock = clock
         # A monotonic clock for the #121 between-phase duration cap and the WAL truncate cadence
         # (BACKLOG #6526) — SEPARATE from `clock` (which is the wall clock feeding the retention
-        # *window* cutoffs and is often frozen in tests). Measuring elapsed time against a frozen or
-        # stepped window clock would stall or run backward; monotonic can't go backwards.
+        # *window* cutoffs and is often frozen in tests). Elapsed time measured on a frozen window
+        # clock never advances, and on a wall clock stepped backward it goes negative and holds the
+        # truncate past its cadence; monotonic can't go backwards.
         self._monotonic = monotonic
         # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
         # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
@@ -410,8 +411,8 @@ class RetentionRunner:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         # Maintenance cadence state (loop-driven; only read/written on the single task). The WAL
-        # marker is a `monotonic` reading, None until the first truncate, so a wall-clock step
-        # backward cannot hold the truncate past its cadence (BACKLOG #6526).
+        # marker is a `monotonic` reading. It starts as None, not 0.0, so the first pass truncates
+        # whatever the monotonic clock reads, which can be under the cadence just after boot.
         self._last_wal: float | None = None
         self._last_vacuum_day: str | None = None
 
@@ -524,6 +525,8 @@ class RetentionRunner:
         """Run a full retention pass for ``now`` (default: the injected clock): purge bodies past the
         configured windows, checkpoint the WAL / VACUUM if due, check the size threshold, and write a
         single ``audit_log`` entry when the pass did real work. Returns a :class:`RetentionPass`.
+        ``now`` does not decide whether the WAL truncate is due: that cadence reads the injected
+        ``monotonic`` clock (BACKLOG #6526).
 
         Leader-gated (Track B Step 4): a non-leader node returns a did-nothing pass without touching the
         store, so in a cluster exactly one node purges. The loop keeps ticking on followers
@@ -780,30 +783,29 @@ class RetentionRunner:
         # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
         wal_left_untruncated = False
-        # The cadence reads the monotonic clock, not `now`: `now` is the wall clock (or a caller's
-        # window instant), and a backward step there would hold the truncate past its cadence.
-        wal_at = self._monotonic() if not _deadline_hit() and self._wal_truncate_applies() else None
-        if wal_at is not None and (
-            self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds
-        ):
-            # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies` skips.
-            wal_left_untruncated = await self._store.wal_checkpoint() is False
-            # The marker advances either way, so a reader that pins the WAL costs writers one busy
-            # timeout per cadence rather than one per pass.
-            self._last_wal = wal_at
-            wal_checkpointed = True
-            if wal_left_untruncated:
-                # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the file
-                # and the cause only; no message content reaches this line.
-                log.warning(
-                    "retention: the WAL truncate did not finish -- another connection (one of the "
-                    "engine's own reads, a DR snapshot copy, or another process on this store) "
-                    "still held %s-wal, so frames written before this pass, purged bodies among "
-                    "them, stay in that file until a later truncate (the first retention pass at "
-                    "least %gs from now)",
-                    self._floor_path,
-                    s.wal_checkpoint_seconds,
-                )
+        # The cadence reads `self._monotonic`, not `now` (see __init__).
+        if not _deadline_hit() and self._wal_truncate_applies():
+            wal_at = self._monotonic()
+            if self._last_wal is None or wal_at - self._last_wal >= s.wal_checkpoint_seconds:
+                # `is False`: None is a backend with no -wal file, which `_wal_truncate_applies`
+                # skips.
+                wal_left_untruncated = await self._store.wal_checkpoint() is False
+                # The marker advances either way, so a reader that pins the WAL costs writers one
+                # busy timeout per cadence rather than one per pass.
+                self._last_wal = wal_at
+                wal_checkpointed = True
+                if wal_left_untruncated:
+                    # Vault BACKLOG #2619: a purged body can still sit in the -wal frames. Names the
+                    # file and the cause only; no message content reaches this line.
+                    log.warning(
+                        "retention: the WAL truncate did not finish -- another connection (one of "
+                        "the engine's own reads, a DR snapshot copy, or another process on this "
+                        "store) still held %s-wal, so frames written before this pass, purged "
+                        "bodies among them, stay in that file until a later truncate (the first "
+                        "retention pass at least %gs from now)",
+                        self._floor_path,
+                        s.wal_checkpoint_seconds,
+                    )
 
         vacuumed = False
         if not _deadline_hit() and self._vacuum_due(now):
