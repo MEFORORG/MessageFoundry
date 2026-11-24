@@ -795,3 +795,92 @@ def test_a_number_on_a_non_ascii_branch_still_raises_the_floor(tmp_path: Path) -
     _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
     _git("checkout", "-q", "main", cwd=repo)
     assert _floor(repo, env=_quoting_git_env()) == 90
+
+
+# --- BACKLOG #7560: one bad registry file must not crash -List or lower the floor -----------------
+
+
+def _registry(repo: Path) -> Path:
+    """The fixture's own ADR registry, under its throwaway ``.git``, never the shared coord root."""
+    path = repo / ".git" / "mefor-coord" / "alloc" / "adr"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_list_names_an_unreadable_record_and_still_lists_the_good_one(tmp_path: Path) -> None:
+    """MUST TRIP on a ``-List`` that parses each record with no guard: the malformed record throws
+    under ``$ErrorActionPreference = "Stop"`` and the whole listing dies. The good record is the
+    control -- it must still be listed, so the case cannot pass by listing nothing."""
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    reg = _registry(repo)
+    top = _git("rev-parse", "--path-format=absolute", "--show-toplevel", cwd=repo).strip()
+    (reg / "0007.json").write_text(
+        '{"number":"0007","kind":"adr","title":"good","branch":"main","worktree":"' + top + '"}',
+        encoding="utf-8",
+    )
+    (reg / "0008.json").write_text("{not json", encoding="utf-8")
+    (reg / "0009.json").write_text("", encoding="utf-8")
+    (reg / "0010.json").write_text("[1, 2]", encoding="utf-8")
+
+    listed = _run(repo, "-List")
+    combined = listed.stdout + listed.stderr
+    assert listed.returncode == 0, combined
+    assert re.search(r"^adr allocated to this worktree: 0007$", listed.stdout, re.MULTILINE), (
+        combined
+    )
+    for bad in ("0008.json", "0009.json", "0010.json"):
+        assert bad in listed.stderr, f"-List did not name the unreadable record {bad}:\n{combined}"
+    assert "0007.json" not in listed.stderr, combined
+
+
+@pytest.mark.parametrize("body", ["", "not a number", "-5", "12abc"])
+def test_an_unreadable_high_water_file_refuses_instead_of_lowering_the_floor(
+    tmp_path: Path, body: str
+) -> None:
+    """MUST TRIP on a read that falls back to 0: a garbled ``.floor-highwater`` then let the floor
+    drop to whatever the refs show and the next allocation overwrote the ratchet with that lower
+    value. Both the inspector and an allocation must refuse, name the file, and allocate nothing."""
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    reg = _registry(repo)
+    watermark = reg / ".floor-highwater"
+    watermark.write_text(body, encoding="ascii")
+
+    shown = _run(repo, "-ShowFloor", "-Kind", "adr")
+    assert shown.returncode != 0, shown.stdout + shown.stderr
+    assert "REFUSING TO REPORT A FLOOR" in shown.stdout + shown.stderr
+    assert ".floor-highwater" in shown.stdout + shown.stderr
+
+    allocated = _run(repo, "-Kind", "adr", "-Title", "probe", "-NoFetch")
+    combined = allocated.stdout + allocated.stderr
+    assert allocated.returncode != 0, combined
+    assert "REFUSING TO ALLOCATE" in combined, combined
+    assert sorted(p.name for p in reg.glob("*.json")) == [], combined
+    assert watermark.read_text(encoding="ascii") == body, "the refusal rewrote the high-water file"
+
+
+def test_the_high_water_file_is_replaced_whole_and_leaves_no_temp(tmp_path: Path) -> None:
+    """The ratchet write goes through a temp file and one rename. The control is the read-back: the
+    value an allocation leaves is the floor it allocated above, and no temp file is left behind."""
+    repo = _checkout(tmp_path / "repo", {"0042-first.md": "# First\n"})
+    reg = _registry(repo)
+    (reg / ".floor-highwater").write_text("40\n", encoding="ascii")
+
+    allocated = _run(repo, "-Kind", "adr", "-Title", "probe", "-NoFetch")
+    assert allocated.returncode == 0, allocated.stdout + allocated.stderr
+    assert "ALLOCATED ADR 0043" in allocated.stdout
+    assert (reg / ".floor-highwater").read_text(encoding="ascii").strip() == "42"
+    assert [p.name for p in reg.iterdir() if p.name.endswith(".tmp")] == []
+
+
+def test_a_wildcard_character_in_the_registry_path_keeps_the_ratchet(tmp_path: Path) -> None:
+    """MUST TRIP on ``Test-Path`` / ``Get-ChildItem`` without ``-LiteralPath``: a ``[`` in the path
+    is a wildcard there, the high-water file and the registry's own numbers read as absent, and the
+    floor falls to what the refs show. The fixture's refs show 1; the registry holds 0050 and a
+    high-water of 60, so only a literal read reports 60, and then 50 once the high-water is gone."""
+    repo = _checkout(tmp_path / "wild[1]" / "repo", {"0001-first.md": "# First\n"})
+    reg = _registry(repo)
+    (reg / "0050.json").write_text('{"number":"0050"}', encoding="utf-8")
+    (reg / ".floor-highwater").write_text("60\n", encoding="ascii")
+    assert _floor(repo) == 60
+    (reg / ".floor-highwater").unlink()
+    assert _floor(repo) == 50
