@@ -530,7 +530,8 @@ def _names_expired_timestamp(body: str) -> bool:
     span = _code_element_span(body, fault)
     if span is not None:
         # Text content only: comments and processing instructions out (_scan_markup), then every
-        # tag, its attributes with it, so neither decides the read.
+        # tag, its attributes with it, so neither decides whether the element names a WS-Security
+        # code. Where it names none, the range search below still reads them.
         text = _TAG_RE.sub(" ", _scan_markup(body[span[0] : span[1]])[0])
         if _WSSE_FAULT_RE.search(text) is not None:
             return _WSSE_EXPIRED_RE.search(text) is not None
@@ -1471,7 +1472,8 @@ class SoapDestination(DestinationConnector):
         # so signing over these bytes covers exactly what the partner receives.
         data = encode_wire_body(payload, self.encoding, transport="SOAP")
         # #65: the provider's bearer per request, acquired off-loop past the queue boundary. It is
-        # the cached token until it nears expiry or a 401 invalidates it, then a fresh mint.
+        # the cached token until it nears expiry or something invalidates it (at least a 401 and
+        # the send-time length gate do), then a fresh mint.
         headers = self._send_headers()
         if self._signer is not None:
             # ASVS 4.1.5 (ADR 0018): detached JWS over the envelope, minted off-loop past the queue

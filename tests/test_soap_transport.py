@@ -529,7 +529,7 @@ async def test_another_status_or_no_answer_between_leaves_the_ws_security_401_ru
     or no answer at all leaves the run open, so the next WS-Security 401 is the second in a row:
     a credential fault. So does a 2xx carrying a WS-Security fault (BACKLOG #5798 added item 2).
     Mutation: reset the flag in the 401 arm for any other status, or in a transport-failure arm,
-    or on any 2xx in _post_and_classify (red: "2xx-ws-security-fault"). Red: the second
+    or drop the restore in _post_and_classify (red: "2xx-ws-security-fault"). Red: the second
     WS-Security 401 is retried again."""
     dest, _ = _oauth2_dest()
     await _ws_security_401_then(dest, kind)
