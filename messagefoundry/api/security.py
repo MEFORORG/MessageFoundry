@@ -1642,8 +1642,9 @@ async def _pending_holds_no_factor(auth: AuthService, token: str | None) -> bool
 
     Asks the ``mfa_enroll`` factor-binding refusal, which is True for a pending session exactly
     when its account holds a factor, and fails closed (True) on a session or account it cannot
-    find. So a False here means a found, pending session with no factor; the unknown case keeps
-    the verify wording.
+    find. So this returns True only for a found, pending session with no factor; the unknown case
+    keeps the verify wording. A session satisfied between the gate's read and this one also reads
+    True, a wording slip on a refusal already decided.
 
     The read only picks the wording, and the gate has already refused, so a store fault keeps the
     403 and its ``X-MFA-Required`` with the verify wording rather than becoming a 500, as

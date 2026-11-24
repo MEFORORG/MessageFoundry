@@ -59,7 +59,9 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
     # through the GRANT minted below, which _grant_action_step_up deadlines at
     # now + step_up_max_age_seconds, i.e. already expired. The mint is the CONTROL, not setup: drop
     # it and the POST bounces for want of ANY grant, which it does under any window (BACKLOG #1851).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off: under it this no-factor session is MFA-pending and is sent to enrol before
+    # any window is read (BACKLOG #1149), so the window would not be what refuses.
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     other = await service.login("op", PW)  # the target 2nd session
@@ -90,7 +92,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
     # The revoke-others twin of the per-session test above, and the same correction applies: the
     # negative window bites through the ADR 0077 GRANT's TTL, not through has_recent_step_up, so the
     # _mint_action below is what puts the window under test (BACKLOG #1851). Reasoning: that twin.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off, for the reason the twin above gives (BACKLOG #1149).
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     await service.login("op", PW)  # a 2nd session

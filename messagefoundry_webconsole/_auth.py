@@ -34,7 +34,11 @@ from messagefoundry.api.security import (
     record_ws_gate,
 )
 from messagefoundry.auth import Identity, Permission
-from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_SESSION_TERMINATE,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.auth.webauthn import configured_rp_id
 
@@ -2150,6 +2154,12 @@ async def spend_ui_action_step_up(
     return spend
 
 
+#: The reauth-only actions that end sessions, the one place a pending session with no factor is
+#: refused on this gate and so sent to enrol (BACKLOG #1149). The other reauth-only actions bind a
+#: factor, and an account with no factor may take them.
+_SESSION_ENDING_UI_ACTIONS = frozenset({STEP_UP_ACTION_SESSION_TERMINATE})
+
+
 def require_ui_reauth_only_action(
     action: str,
     *permissions: Permission,
@@ -2188,7 +2198,9 @@ def require_ui_reauth_only_action(
         # NO factor too. It has nothing to give /ui/reauth, which would mint it nothing, so it is
         # sent to enrol. The mfa_enroll refusal is True exactly when the account holds a factor (and
         # on an unknown session), the JSON plane's _pending_holds_no_factor reading.
-        if not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_ENROLL):
+        if action in _SESSION_ENDING_UI_ACTIONS and not await auth.factor_binding_is_blocked(
+            token, STEP_UP_ACTION_MFA_ENROLL
+        ):
             return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": ENROL_FIRST_PAGE})
         return _reauth_redirect(request, continuation(request))
 

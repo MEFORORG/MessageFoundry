@@ -16477,9 +16477,10 @@ class AuthService:
     )
 
     #: The step-up actions a pending session may NOT be granted once its account HAS a factor (and,
-    #: for the session-ending ones above, even when it has none). Every
-    #: one of them rides a ``*_reauth_only_action`` gate (``mfa_gate=False``), which exists so an
-    #: account with no factor is not locked out of enrolment. For an account that already has one:
+    #: for the session-ending ones above, even when it has none). At least the enrolment actions
+    #: and ``session_terminate`` ride a ``*_reauth_only_action`` gate (``mfa_gate=False``), which
+    #: exists so an account with no factor is not locked out of enrolment. For an account that
+    #: already has one:
     #:
     #: - binding a new factor (``mfa_enroll``, ``mfa_confirm``, ``webauthn_enroll``) is a promotion
     #:   path, because both ceremonies mark the session MFA-satisfied on success;
