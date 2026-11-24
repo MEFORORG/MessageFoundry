@@ -193,16 +193,19 @@ def ensure(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
-    if os.path.isfile(path):
-        return
     # Exclusive create, never truncate: the ledger is shared across sessions and PCs, and a writer
-    # that loses the race between the check above and a plain "wb" open would wipe the rows the
-    # winner just appended. The check above only saves a syscall; "xb" is what is safe.
+    # that lost a check-then-"wb" race wiped the rows the winner had just appended. O_APPEND as
+    # well, because another writer may append a row between this create and the header write; the
+    # header then lands after that row instead of over it, and read() skips header lines anywhere.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | getattr(os, "O_BINARY", 0)
     try:
-        with open(path, "xb") as fh:
-            fh.write(("\n".join(HEADER) + "\n").encode())
+        fd = os.open(path, flags, 0o666)
     except FileExistsError:
-        pass  # another writer created it first; its header and rows stand
+        if os.path.isfile(path):
+            return  # already present; its header and rows stand
+        raise  # something that is not a ledger file, such as a dangling link, holds the name
+    with os.fdopen(fd, "ab") as fh:
+        fh.write(("\n".join(HEADER) + "\n").encode())
 
 
 def append(path: str, rec: dict[str, str]) -> None:
@@ -253,15 +256,21 @@ def by_item(rows: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
     return items
 
 
+#: How far in the future a stamp may sit and still count as clock skew between PCs.
+FUTURE_SKEW_MINUTES = 5.0
+
+
 def age_minutes(ts: str) -> float | None:
-    """Minutes since ``ts``, or None when it is not the stamp now() writes. A sentinel number here
-    once compared below every stale threshold, so a hand-appended row with an odd stamp read as
-    fresh and its item was never flagged."""
+    """Minutes since ``ts``, or None when the age cannot be read: the stamp does not parse, or it
+    lies further in the future than clock skew explains. A sentinel number here once compared
+    below every stale threshold, so a hand-appended row with an odd stamp read as fresh and its
+    item was never flagged; a far-future stamp would read as fresh the same way."""
     try:
         t = datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.UTC)
     except ValueError:
         return None
-    return (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
+    mins = (datetime.datetime.now(datetime.UTC) - t).total_seconds() / 60.0
+    return None if mins < -FUTURE_SKEW_MINUTES else mins
 
 
 def cmd_event(a: argparse.Namespace) -> int:
@@ -359,12 +368,15 @@ def cmd_check(a: argparse.Namespace) -> int:
         print("")
     if unreadable:
         print(f"  *** {len(unreadable)} OPEN ITEM(S) WITH AN UNREADABLE TIMESTAMP ***")
-        print("  Their age cannot be computed, so they cannot be shown not stalled. Expected a")
-        print("  stamp like 2026-01-31T09:05:00Z; fix it by appending a corrected event.")
+        print(
+            "  Their age cannot be computed, so they cannot be shown not stalled. Expected a past"
+        )
+        print("  stamp like 2026-01-31T09:05:00Z. Append the item's next leg or `withdrawn` to")
+        print("  clear it; re-logging the same leg does not, as rows sort by their raw stamp.")
         print("")
         for item, last, ev in unreadable:
             print(f"  {item}")
-            print(f"      last leg   : {last}  (ts {ev.get('ts')!r}, by {ev.get('actor')})")
+            print(f"      last leg   : {last}  (ts {ev.get('ts')!a}, by {ev.get('actor')})")
             print(f"      meaning    : {MEANING.get(last, '?')}")
             print("")
     if not stale:

@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
+from typing import IO, Any
 
 import pytest
 
@@ -49,17 +51,33 @@ def _rec(item: str, event: str, ts: str) -> dict[str, str]:
     }
 
 
-def test_ensure_never_truncates_a_ledger_that_appeared_after_the_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The lost race, made deterministic: the existence check says absent, but another writer has
-    already created the file and appended a row. ensure() must leave that row in place."""
+def test_ensure_never_truncates_an_existing_ledger(tmp_path: Path) -> None:
     ledger = tmp_path / "OWNER-ITEMS.md"
     ol.append(str(ledger), _rec("1", "request_sent", "2026-11-24T10:00:00Z"))
     before = ledger.read_bytes()
-    monkeypatch.setattr(ol.os.path, "isfile", lambda _p: False)
     ol.ensure(str(ledger))
     assert ledger.read_bytes() == before
+
+
+def test_a_row_appended_between_create_and_header_survives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The second race window, made deterministic: another writer appends its row after ensure()
+    has created the file but before the header is written. The header must not overwrite it."""
+    ledger = tmp_path / "OWNER-ITEMS.md"
+    real_fdopen = os.fdopen
+
+    def fdopen_then_race(fd: int, mode: str) -> IO[Any]:
+        fh = real_fdopen(fd, mode)
+        with open(ledger, "ab") as other:
+            other.write(b"| 2026-11-24T10:00:00Z | race | request_sent | b | - | s | - | - | - |\n")
+        return fh
+
+    monkeypatch.setattr(ol.os, "fdopen", fdopen_then_race)
+    ol.ensure(str(ledger))
+    monkeypatch.undo()
+    assert [r["item"] for r in ol.read(str(ledger))] == ["race"]
+    assert "\n".join(ol.HEADER) in ledger.read_text(encoding="utf-8")
 
 
 def test_ensure_writes_the_header_once_on_a_new_ledger(tmp_path: Path) -> None:
@@ -74,6 +92,7 @@ def test_age_minutes_reads_a_good_stamp_and_refuses_a_bad_one() -> None:
     assert good is not None and good > 0
     assert ol.age_minutes("2026-11-24 10:00") is None
     assert ol.age_minutes("") is None
+    assert ol.age_minutes("2999-01-01T00:00:00Z") is None, "a far-future stamp is not fresh"
 
 
 @pytest.fixture
