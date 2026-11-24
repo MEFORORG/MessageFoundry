@@ -968,10 +968,12 @@ function Get-ScanRawIndexMap($Seg) {
 # between, and the walk reads it as code; its note says what that excludes. So `GIT reset --hard`
 # and `GIT config core.hooksPath /nope` from the primary, ALLOWED under the PowerShell tool on
 # Windows on 2026-11-18, are refused, and `if true; then GIT reset --hard; fi` is not rewritten,
-# nor is a `GIT` after `do`, `!`, `time`, `env` or `exec`. On Linux it is not rewritten (a macOS
-# volume formatted case-sensitive gets the rewrite all the same, which costs only a false deny).
-# Also, at least: any line
-# after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
+# nor is a `GIT` after `do`, `!`, `time`, `env` or `exec`. Under the PowerShell tool a backtick is
+# the escape character, so a `GIT` after one is not rewritten, and neither is one after the dot-source
+# `.`: `` `GIT reset --hard `` and `. GIT reset --hard` are ALLOWED from the primary, as on origin/main
+# (Lander hold of 2026-11-23). On Linux it is not rewritten (a macOS volume formatted case-sensitive
+# gets the rewrite all the same, which costs only a false deny). Also, at least: any line after an
+# earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
 # tool `(Set-Location <p>)` DOES move the shell, so `(Set-Location <p>)` then `git -C . reset
@@ -1195,8 +1197,10 @@ function Test-TrueSeparatorIn([string]$Text) {
 #     `C:/x/git.exe`, and on Windows and macOS `GIT` or `git.EXE`, are rewritten to `git` (`\git -C '<p>'
 #     -c user.name=$(git log -1) config <key>`; `cd <p> && git -C <o> log $(\git reset --hard)`) only
 #     where two things hold. The word follows the line start, a separator, an opener, `$(` or a
-#     backtick, with only blanks and plain `NAME=value` assignments between. A value holding a blank,
-#     even a quoted one, `=`, a parenthesis, `;`, `&` or `|` is not plain, so `X=$(pwd) GIT reset --hard`
+#     posix backtick, with only blanks and plain `NAME=value` assignments between; under PowerShell a
+#     backtick escapes the next character, so `` `GIT `` is not rewritten there, nor is `. GIT`. A
+#     value holding a blank, even a quoted one, `=`, a parenthesis, `;`, `&` or `|` is not plain, so
+#     `X=$(pwd) GIT reset --hard`
 #     and `X=a=b GIT reset --hard` keep `GIT`, and so does the outer reading's `X=_ GIT reset --hard`,
 #     which is not respelled. After a keyword or a prefix command, at least `then`, `do`, `!`, `time`,
 #     `env` and `exec`, it is not rewritten (`if true; then GIT reset --hard; fi`). And the walk reads
@@ -1220,27 +1224,22 @@ function Test-TrueSeparatorIn([string]$Text) {
 #
 # COST: each string is a full pass of the four rules, and a command can yield up to eleven (the
 # command, the rewrite, eight hoists, the outer reading). A hoist carries the text before its cut, so a
-# pass re-reads that text and re-asks git about the invocations in it. Invoke-GitRead answers a
-# repeated question from its cache, except a failed one in the given pass; its note says why. A hoist
-# is not cut down to its own
-# segment: the text before it carries the chdir and the assignments the hoist exists to read (`cd <p>
-# && echo $(date); git -C <o> log $(git reset --hard)`). Before the cache, the Lander measured 7.8 s,
-# 1.7 s and 1.5 s commands taking 26.3 s, 19.9 s and 11.8 s (review of 2026-11-23). With it, on one
-# loaded Windows box the same day, the slowest of the five TIMED shapes in
-# tests/test_worktree_gate_added_command_readings.py, whose `-C` paths name no directory, took 9.9 s in
-# one run and 17.7 s in a later one, against 2.2 s and 3.2 s at its BASELINE commit 1983d8eb79a and
-# 18.5 s and 19.5 s before the cache. After Invoke-GitRead stopped keeping a failure (the same day),
-# a run took 16.5 s and 12.1 s for the two shapes whose `-C` paths name no directory, against 1.8 s
-# and 1.3 s at BASELINE and 19.2 s and 11.4 s before the cache: every git question on those paths
-# fails, and Invoke-GitRead's note says what a failure costs. The other three shapes took 2.1 s to
-# 3.1 s, against 32.9 s to 45.6 s before the cache. Review round 2c9e3d7a9b then timed nine lines whose
-# `-C` paths name no directory at 44.1 s, each hoist re-asking the failing questions of the lines
-# before it, against 9.9 s at BASELINE. Since the rewritten pass replays a failure (later the same
-# day), one run of the TIMED shapes took 5.1 s for that nine-line shape, against 9.0 s at BASELINE
-# and 39.3 s before the cache; 5.1 s and 12.1 s for the two one-line shapes whose paths name no
-# directory, against 2.6 s and 3.7 s; and 2.7 s to 3.5 s for the other three, against 1.6 s to
-# 12.9 s. Each hoist also re-reads the whole text before its cut. Under the 60 s timeout a slow run blocks the command rather
-# than letting it through (install-gate.ps1 installs `onFailure = block`).
+# pass re-reads that text and re-asks git about the invocations in it; Invoke-GitRead's note says
+# which answers it keeps. A hoist is not cut down to its own segment: the text before it carries the
+# chdir and the assignments the hoist exists to read (`cd <p> && echo $(date); git -C <o> log $(git
+# reset --hard)`). Before the cache, the Lander measured 7.8 s, 1.7 s and 1.5 s commands taking 26.3 s,
+# 19.9 s and 11.8 s (review of 2026-11-23). With the cache as it now stands, one run of the six TIMED
+# shapes in tests/test_worktree_gate_added_command_readings.py on a loaded Windows box the same day,
+# against the BASELINE commit 1983d8eb79a and against cf790ecc157 before the cache: 6.5 s (1.1 s,
+# 12.4 s) and 7.4 s (2.4 s, 11.0 s) for the two one-line nine-hoist shapes, whose `-C` paths name no
+# directory; 1.7 s (3.2 s, 31.6 s) for nine lines whose `-C` paths name no directory, which review
+# round 2c9e3d7a9b had timed at 44.1 s when no failure was kept; and 2.5 s to 2.9 s (2.9 s to
+# 12.4 s, 31.4 s to 50.4 s) for the other three. The one-line shapes stay slower than BASELINE: each
+# hoist names a repository no earlier pass named, so it costs its own git calls and a pass of the rules
+# over the text before its cut. These are single runs on one box, not bounds.
+# A run past the shell entry's 20 s proof wait makes the entry start its own gate run, so the wait
+# and that run share the 60 s timeout, and past it a slow run blocks the command rather than letting
+# it through (install-gate.ps1 installs `onFailure = block`).
 #
 # A REWRITE IS TEXT, NOT A PARSE. Get-QuoteStateMap marks what the shell takes literally -- single
 # quotes, posix `$'...'`, an escaped character, a posix `#` comment, a quoted-delimiter posix heredoc
@@ -3286,8 +3285,6 @@ retry is blocked too, STOP and tell the user. Do not route around this.
 # it judges has run yet; another process could still change the repository during the run, as it
 # could between two uncached calls.
 $gitReadCache = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
-# Which of the shell rules' two passes is running: 'given' or 'rewritten'. Set by the pass loop.
-$script:gitReadPass = 'given'
 function Invoke-GitRead([object[]]$GitArgs) {
     # A $null argument is dropped, as `& git -C $null ...` drops it; a [string[]] parameter would turn it
     # into an empty argument, which git reads differently.
@@ -3302,25 +3299,30 @@ function Invoke-GitRead([object[]]$GitArgs) {
         }
     }
     $key = $keyArgs -join [char]0
-    # A SUCCESS IS KEPT FOR THE RUN: an exit code of 0 with at least one output line, which may be
-    # blank. Any other answer is kept too, but replayed only in the rewritten pass. In the given pass,
-    # the only pass origin/main made, it is asked again on every ask that reaches here, as it was with
-    # no cache, so a spawn that failed under load does not stand for a later ask that could read the
-    # answer and deny. The rewritten pass replays the last answer the given pass got, or the first it
-    # got itself: that pass runs only once the command as given is allowed, and can only add a refusal,
-    # so a kept failure there removes no deny origin/main made, and a question that cannot succeed (a
-    # `-C` that names no directory) is not asked once per hoist (Manager decisions of 2026-11-23 under
-    # the owner's instruction to take the strictly safer option). A kept success is replayed where an
-    # uncached ask could have failed instead.
+    # WHAT IS KEPT. A success, an exit code of 0 with at least one output line (which may be blank),
+    # is kept for the run. A failure is kept only where the first `-C` is a rooted path that names no
+    # directory: git cannot answer there, and the command that might create it has not run. Any other
+    # failure, or an answer with no line, is asked again on every ask, as with no cache, so one spawn
+    # that failed under load does not stand for a later ask that could read the answer and deny
+    # (Manager decisions of 2026-11-23 under the owner's instruction to take the strictly safer option,
+    # and the Lander's hold of the same day). A kept success is replayed where an uncached ask could
+    # have failed instead.
     $hit = $null
-    if ($gitReadCache.TryGetValue($key, [ref]$hit) -and
-        (($hit.Code -eq 0 -and $hit.Out.Count -gt 0) -or $script:gitReadPass -eq 'rewritten')) {
+    if ($gitReadCache.TryGetValue($key, [ref]$hit)) {
         $global:LASTEXITCODE = $hit.Code
         return $hit.Out
     }
     $out = @(& git @GitArgs 2>$null)
     $code = $LASTEXITCODE
-    $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code }
+    $keep = $code -eq 0 -and $out.Count -gt 0
+    if (-not $keep -and $code -ne 0) {
+        $c = [Array]::IndexOf($GitArgs, '-C')
+        if ($c -ge 0 -and $c + 1 -lt $GitArgs.Count) {
+            $dir = $GitArgs[$c + 1]
+            $keep = [System.IO.Path]::IsPathRooted($dir) -and -not [System.IO.Directory]::Exists($dir)
+        }
+    }
+    if ($keep) { $gitReadCache[$key] = [pscustomobject]@{ Out = $out; Code = $code } }
     $global:LASTEXITCODE = $code
     $out
 }
@@ -3596,8 +3598,8 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # candidate has answered, since Get-GovernedRootForCommon takes a root any form names; and, under
 # -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
 # kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
-# Invoke-GitRead's own note says which pass re-spawns git. The comparable forms are built in the path
-# form current at the call.
+# Neither re-ask runs in the call that made the first ask. Invoke-GitRead's own note says when git is
+# spawned again. The comparable forms are built in the path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Read-CommonDirFromGit([string]$CandRaw) {
     $common = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--git-common-dir'))".Trim()
@@ -3607,13 +3609,17 @@ function Read-CommonDirFromGit([string]$CandRaw) {
     [pscustomobject]@{ Common = $common; Absolute = $absolute }
 }
 function Get-CommonDirAnswer([string]$CandRaw, [switch]$Reask) {
-    if (-not $commonDirAnswers.ContainsKey($CandRaw)) { $commonDirAnswers[$CandRaw] = Read-CommonDirFromGit $CandRaw }
+    # A call that has just asked does not ask again at once.
+    $fresh = -not $commonDirAnswers.ContainsKey($CandRaw)
+    if ($fresh) { $commonDirAnswers[$CandRaw] = Read-CommonDirFromGit $CandRaw }
     $answer = $commonDirAnswers[$CandRaw]
-    if ($null -eq $answer) {
-        if ($Reask) { $answer = Read-CommonDirFromGit $CandRaw }
-    } elseif (-not $answer.Absolute) {
-        $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
-        if ($LASTEXITCODE -eq 0 -and $absolute) { $answer.Absolute = $absolute }
+    if (-not $fresh) {
+        if ($null -eq $answer) {
+            if ($Reask) { $answer = Read-CommonDirFromGit $CandRaw }
+        } elseif (-not $answer.Absolute) {
+            $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()
+            if ($LASTEXITCODE -eq 0 -and $absolute) { $answer.Absolute = $absolute }
+        }
     }
     if ($null -eq $answer) { return $null }
     $forms = [System.Collections.Generic.List[string]]::new()
@@ -4348,7 +4354,6 @@ if ($tool -in @("Bash", "PowerShell")) {
     # are computed only once the command as given is allowed. The body keeps its pre-#5655 indent so
     # this change does not rewrite every line of it.
     foreach ($pass in @('given', 'rewritten')) {
-    $script:gitReadPass = $pass
     $passCmds = $(if ($pass -eq 'given') { , $givenCmd } else {
             @(Get-AddedCommandReadings $givenCmd (Get-HostConvention $tool) | Select-Object -Skip 1) })
     foreach ($cmd in @($passCmds)) { . {

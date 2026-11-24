@@ -333,8 +333,9 @@ def test_each_git_question_is_asked_once_across_the_passes(
     starts, with its argument list, so a repeated question shows as a repeated line. At
     PRE_CACHE_HEAD a command of this shape, with one `-C` on every line, made 108 git calls, one of
     them 90 times (measured 2026-11-23). Each line here names its own directory, so each hoist has a
-    question of its own. The directories exist, so every question succeeds: a question git cannot
-    answer is asked again on every ask by design, and this test does not bound how often.
+    question of its own. The directories exist, so every question succeeds. A failed question is
+    asked again unless its `-C` names no directory (Invoke-GitRead's note), and this test does not
+    bound how often.
     """
     trace = tmp_path / "trace2.log"
     for i in range(9):
@@ -385,7 +386,8 @@ def test_a_failed_git_answer_is_asked_again(
     Rule 3b decides `git -C <wt> checkout <b>` from `worktree list`, which origin/main asked once per
     spelling and path form, four times here. Its cache once kept a failure after two asks, so with two
     or three failed asks that head allowed the hijack origin/main refused (Manager decision of
-    2026-11-23: only a success is kept). The stub fails the first ``fails`` `worktree list` asks.
+    2026-11-23: a failure is asked again where the directory exists). The stub fails the first
+    ``fails`` `worktree list` asks.
     """
     real = shutil.which("git")
     assert real is not None
@@ -407,7 +409,8 @@ def test_a_failed_git_answer_is_asked_again(
 _FILLER = "abcdefghij " * 2700
 _NINE = range(9)
 #: (shape, template, cwd, tool): the shapes of the Lander's timing probes on 2026-11-23, nine judged
-#: substitutions each, all but the first behind about 30 KB of text. Every one is allowed.
+#: substitutions each, and one from review round 2c9e3d7a9b. Each has 30 KB of text before its
+#: substitutions except the first and the missing-directory one. Every one is allowed.
 TIMED: list[tuple[str, str, str, str]] = [
     (
         "one line, nine hoists, short",
