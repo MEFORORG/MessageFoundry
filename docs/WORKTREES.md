@@ -2008,6 +2008,14 @@ pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Rehome <prefix>          # 
 it never moves anything — and `-Rehome` refuses on a session that still looks live (written within
 `-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
+It also refuses at least these cases (BACKLOG #7622, #7623). A session registry file that does not
+parse and was written in the last 24h, has vanished, or carries a future stamp: it may be this session's
+own record mid-write. `-Force` overrides this one. A file at the destination that is not a title stub,
+meaning not only `custom-title`/`ai-title` records: it may be a real transcript, and `-Force` does not
+override it. An existing `<id>.jsonl.stub.bak`, which is never overwritten. If a sidecar dir already
+exists at the destination, the transcript still moves, the source sidecar stays where it is, and a
+warning names it.
+
 **It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
 the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
 path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
