@@ -53,7 +53,8 @@ USAGE
     python scripts/coord/owner_log.py declined  --item cap --actor liaison \\
         --ruling "absorbed as context into 340; not worth a turn"
 
-    python scripts/coord/owner_log.py check --stale-minutes 45   # EXIT 1 if anything stalled
+    python scripts/coord/owner_log.py check --stale-minutes 45   # EXIT 1 if stalled, unreadable
+                                                                 # stamp, or misdelivered
     python scripts/coord/owner_log.py status                     # every item and its legs
 
 DESIGN NOTES, each one paid for on 2026-08-26:
@@ -194,11 +195,13 @@ def ensure(path: str) -> None:
     if d and not os.path.isdir(d):
         os.makedirs(d, exist_ok=True)
     if os.path.isfile(path):
-        return  # the common case, in one round trip; the create below is what is race-safe
-    # Exclusive create, never truncate: the ledger is shared across sessions and PCs, and a writer
-    # that lost a check-then-"wb" race wiped the rows the winner had just appended. O_APPEND as
-    # well, because another writer may append a row between this create and the header write; the
-    # header then lands after that row instead of over it, and read() skips header lines anywhere.
+        return  # the common case; the exclusive create below is what never truncates
+    # Exclusive create: ensure() never truncates an existing ledger. The ledger is shared across
+    # sessions and PCs, and a writer that lost a check-then-"wb" race wiped the rows the winner had
+    # just appended. O_APPEND is set as well, so on POSIX a row another writer appends between this
+    # create and the header write is not overwritten; read() skips header lines anywhere. On
+    # Windows, O_APPEND is a seek-to-end and then a write, so a truly simultaneous append and header
+    # write can still interleave and lose a row. BACKLOG #7584 carries that remaining work.
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags, 0o666)
@@ -464,7 +467,13 @@ def main() -> int:
             ),
         )
         s.set_defaults(func=cmd_event, event=ev)
-    c = sub.add_parser("check", help="find items stalled between legs (EXIT 1 if any)")
+    c = sub.add_parser(
+        "check",
+        help=(
+            "find open items stalled between legs, with an unreadable or future timestamp, or "
+            "closed by the wrong seat (EXIT 1 if any)"
+        ),
+    )
     c.add_argument("--stale-minutes", type=float, default=45.0)
     c.set_defaults(func=cmd_check)
     st = sub.add_parser("status", help="every item and its legs")
