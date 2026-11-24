@@ -6,5 +6,7 @@
   cipher can still send values one at a time in some cases; `TransitCipher.encrypt_many` states
   when. A chunk cut after it starts sending every value alone holds one value, so that value's row
   is written before the next request.
-  All three stores now write each batch's rows before encrypting the next. The seal's transaction,
+  All three stores now write each batch's rows before encrypting the next. An in-process cipher,
+  such as AES-GCM, keeps each store's shape from before: SQLite writes a page per call, and the
+  server stores write each value before encrypting the next. The seal's transaction,
   marker and rollback are unchanged. (vault `BACKLOG #6706`)

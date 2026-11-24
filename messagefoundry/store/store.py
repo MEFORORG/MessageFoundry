@@ -13012,7 +13012,13 @@ class MessageStore:
                 if not rows:
                     break
                 async for chunk, sealed_values in seal_chunks(
-                    self._cipher, table, column, rows, aad_cols=aad_cols, aad_of=aad_of
+                    self._cipher,
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=True,
                 ):
                     await self._update_every_row(
                         f"UPDATE {table} SET {column}=? WHERE {where_keys}",

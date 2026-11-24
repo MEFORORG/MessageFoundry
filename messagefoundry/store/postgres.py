@@ -3970,7 +3970,13 @@ class PostgresStore:
                 if not rows:
                     break
                 async for chunk, sealed_values in seal_chunks(
-                    self._cipher, table, column, rows, aad_cols=aad_cols, aad_of=aad_of
+                    self._cipher,
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=False,
                 ):
                     for value, r in zip(sealed_values, chunk, strict=True):
                         await conn.execute(

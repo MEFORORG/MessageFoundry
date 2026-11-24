@@ -232,6 +232,8 @@ async def test_the_sqlserver_seal_seals_many_cells_per_transit_request(
 class _CountingBatchCipher:
     """A batch cipher recording how many values each ``encrypt_many`` call carries."""
 
+    batches_now = True
+
     def __init__(self) -> None:
         self.calls: list[int] = []
 
@@ -249,11 +251,18 @@ class _CountingBatchCipher:
         return [f"mfenc:{plaintext}" for plaintext, _aad in items]
 
 
-async def _chunks(cipher: Any, rows: list[dict[str, Any]]) -> list[tuple[int, list[str]]]:
+async def _chunks(
+    cipher: Any, rows: list[dict[str, Any]], *, whole_page: bool = False
+) -> list[tuple[int, list[str]]]:
     return [
         (len(chunk), sealed)
         async for chunk, sealed in seal_chunks(
-            cipher, "state", "value", rows, aad_cols=("namespace", "key")
+            cipher,
+            "state",
+            "value",
+            rows,
+            aad_cols=("namespace", "key"),
+            local_whole_page=whole_page,
         )
     ]
 
@@ -353,9 +362,9 @@ async def test_an_aes_gcm_page_makes_no_sizing_copy(monkeypatch: pytest.MonkeyPa
         monkeypatch.setattr(row_seal, name, counted)
     cipher = AesGcmCipher(bytearray(os.urandom(32)), write_v2=True)
     rows = _pending(_legacy_rows(), _ROWS)
-    chunks = await _chunks(cipher, rows)
+    chunks = await _chunks(cipher, rows, whole_page=True)
     assert sized == []
-    assert [n for n, _ in chunks] == [BATCH_MAX_ITEMS, _ROWS - BATCH_MAX_ITEMS]
+    assert [n for n, _ in chunks] == [_ROWS]
     # Control: a batch cipher's page is sized through the same patched names.
     await _chunks(_cipher(_BatchTransit()), rows)
     assert len(sized) >= _ROWS
@@ -398,11 +407,46 @@ async def test_a_vault_400_leaves_batching_on_and_chunks_batched() -> None:
     assert transit.encrypt_requests == 2 + _ROWS
 
 
-async def test_the_sqlite_seal_writes_many_rows_per_update_under_aes_gcm(
+class _LoggedAesGcm(AesGcmCipher):
+    log: list[str]
+
+    def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        self.log.append("encrypt")
+        return super().encrypt(plaintext, aad=aad)
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+async def test_a_server_seal_under_aes_gcm_writes_after_each_encrypt(
+    backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An in-process cipher keeps the server stores' shape from before batching: one value per
+    chunk, its write awaited before the next encrypt, so one sealed value is held at a time."""
+
+    async def no_reservation(*args: Any) -> None:
+        return None  # the bound's persisted total needs a real database; this test has none
+
+    monkeypatch.setattr(f"messagefoundry.store.{backend}.reserve_invocations_ahead", no_reservation)
+    log: list[str] = []
+    store: PostgresStore | SqlServerStore
+    if backend == "postgres":
+        conn = _LoggedPgConn(_legacy_rows(), log)
+        store = _pg_store(conn, _BatchTransit())
+    else:
+        cur = _LoggedMssqlCursor(_legacy_rows(), log)
+        store = _mssql_store(cur, _BatchTransit())
+    cipher = _LoggedAesGcm(bytearray(os.urandom(32)), write_v2=True)
+    cipher.log = log
+    store._cipher = cipher
+    sealed = await store._seal_surface("state", "value", _LIKE, aad_cols=("namespace", "key"))
+    assert sealed == _ROWS
+    assert log == ["encrypt", "write"] * _ROWS
+
+
+async def test_the_sqlite_seal_writes_a_whole_page_per_update_under_aes_gcm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An in-process cipher is cut by count, so the SQLite seal writes up to ``BATCH_MAX_ITEMS``
-    rows per ``_update_every_row`` call, not one."""
+    """An in-process cipher keeps SQLite's shape from before batching: the whole page of up to
+    500 rows in one ``_update_every_row`` call."""
     db = tmp_path / "store.db"
     await _write_messages(db, _ROWS)  # keyless: legacy plaintext the keyed open seals
     sizes: list[int] = []
@@ -416,4 +460,4 @@ async def test_the_sqlite_seal_writes_many_rows_per_update_under_aes_gcm(
     store = await MessageStore.open(db, cipher=AesGcmCipher(bytearray(os.urandom(32))))
     await store.close()
     assert sizes
-    assert max(sizes) == BATCH_MAX_ITEMS
+    assert max(sizes) == _ROWS  # 200 messages: one page per surface
