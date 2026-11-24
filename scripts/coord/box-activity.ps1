@@ -101,6 +101,22 @@ function ConvertTo-TranscriptSlug {
     return ($Path -replace '[:\\/.]', '-')
 }
 
+function Get-PinnedTranscriptRoot {
+    <#
+    .SYNOPSIS
+        $env:CLAUDE_CONFIG_DIR when it is a fully qualified, existing directory not already in -Roots;
+        $null otherwise.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyCollection()][string[]]$Roots = @())
+    $p = $env:CLAUDE_CONFIG_DIR
+    if (-not $p -or -not [System.IO.Path]::IsPathFullyQualified($p)) { return $null }
+    if (-not (Test-Path -LiteralPath $p -PathType Container)) { return $null }
+    $norm = $p.TrimEnd('\', '/')
+    if (@($Roots | Where-Object { $_ -and $_.TrimEnd('\', '/') -ieq $norm }).Count) { return $null }
+    return $p
+}
+
 function Get-TranscriptAgeHours {
     <#
     .SYNOPSIS
@@ -115,7 +131,8 @@ function Get-TranscriptAgeHours {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$WorktreePath,
         [string[]]$ConfigRoot,
-        [datetime]$Now = [datetime]::UtcNow
+        [datetime]$Now = [datetime]::UtcNow,
+        [switch]$ExcludePinnedRoot
     )
     $slug = ConvertTo-TranscriptSlug -Path $WorktreePath
     if (-not $slug) { return $null }
@@ -124,19 +141,22 @@ function Get-TranscriptAgeHours {
     # right question for the liveness fence and the wrong one here. A root can hold transcripts and no
     # session registry, and dropping it would turn an evaluable signal into a missing one.
     # Read the profile as Get-ClaudeConfigRoots does; its comment in session-registry.ps1 says why.
-    # CLAUDE_CONFIG_DIR is added too (BACKLOG #7561): a root pinned outside the profile holds this
-    # session's transcripts, and missing one would miss a fresh-transcript veto. Adding a root can
-    # only find a newer transcript, never hide one.
     $roots = if ($ConfigRoot) { @($ConfigRoot | Where-Object { Test-Path -LiteralPath $_ }) }
+             elseif (-not $env:USERPROFILE) { @() }
              else {
-                 @(if ($env:USERPROFILE) {
-                       Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
-                           ForEach-Object { $_.FullName }
-                   }
-                   if ($env:CLAUDE_CONFIG_DIR -and (Test-Path -LiteralPath $env:CLAUDE_CONFIG_DIR -PathType Container)) {
-                       $env:CLAUDE_CONFIG_DIR
-                   })
+                 @(Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter '.claude*' -Force -EA SilentlyContinue |
+                       ForEach-Object { $_.FullName })
              }
+    # BACKLOG #7561: the CALLER's CLAUDE_CONFIG_DIR, read too when it is pinned outside the profile, so
+    # a fresh transcript there still vetoes. It is the caller's pin only, not the observed seat's. A
+    # relative pin is skipped: it would resolve against whatever the current directory is now.
+    # Get-BoxActivity reads with -ExcludePinnedRoot to count signals, because the liveness fence does
+    # not read this root, and a transcript found only here must veto without making a box evaluable.
+    # @(): an if-statement's output is unrolled, so a single root arrives as a bare string and += on
+    # it would concatenate rather than append.
+    $roots = @($roots)
+    $pin = Get-PinnedTranscriptRoot -Roots $roots
+    if (-not $ConfigRoot -and -not $ExcludePinnedRoot -and $pin) { $roots += $pin }
     foreach ($r in $roots) {
         $dir = Join-Path (Join-Path $r 'projects') $slug
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
@@ -275,8 +295,11 @@ function Get-BoxActivity {
     }
 
     $transcriptH = Get-TranscriptAgeHours -WorktreePath $WorktreePath -ConfigRoot $ConfigRoot -Now $Now
+    # Counted only when found where the fence also looks (BACKLOG #7561); the pinned root vetoes only.
+    $countedH = if ($ConfigRoot -or $null -eq $transcriptH) { $transcriptH }
+                else { Get-TranscriptAgeHours -WorktreePath $WorktreePath -Now $Now -ExcludePinnedRoot }
     if ($null -ne $transcriptH) {
-        if ($here) { $signals++ }
+        if ($here -and $null -ne $countedH) { $signals++ }
         # RULE 1. Stated as its own branch rather than folded in with the heartbeat, because the whole
         # reason this signal was added is that it must win when the two disagree.
         if ($transcriptH -lt $FreshHours) { $why += "transcript ${transcriptH}h (independent of seat.ps1)" }
