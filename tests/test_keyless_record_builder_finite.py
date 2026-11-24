@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """A keyless SQLite store refuses a NEW NaN or infinity in a sealed field (BACKLOG #6717 item 9).
 
-A keyed store's sealer refuses one; a keyless store wrote it, and SQLite stores a NaN as ``NULL``.
+The local row sealer refuses one; a keyless store wrote it, and SQLite stores a NaN as ``NULL``.
 The refusal covers only a value the write brings in: a non-finite value already in the stored row,
 put there outside the store, is carried forward as before, so a sign-in on such a row still works.
 Synthetic accounts only.
@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.config.settings import AuthSettings
@@ -136,5 +137,35 @@ async def test_a_stored_infinity_is_carried_forward_and_sign_in_still_works(
         assert good.ok
         user = await store.get_user(admin.user_id)
         assert user is not None and user.created_at == math.inf
+    finally:
+        await store.close()
+
+
+async def test_stored_infinities_on_two_role_grants_are_carried_forward(tmp_path: Path) -> None:
+    """A user's seal fields repeat ``assigned_at`` once per grant, so a carried value is matched
+    against every grant, not the last: a failed sign-in still records, as on main."""
+    path = tmp_path / "k.db"
+    store = await MessageStore.open(path)
+    try:
+        service = AuthService(store, AuthSettings())
+        admin = await create_admin(service)
+        await store.set_user_roles(
+            admin.user_id,
+            [Role.ADMINISTRATOR.value, Role.VIEWER.value],
+            assigned_by="test",
+            audits=(),
+        )
+        for role_id, value in (
+            (Role.ADMINISTRATOR.value, math.inf),
+            (Role.VIEWER.value, -math.inf),
+        ):
+            _raw(
+                path,
+                "UPDATE user_roles SET assigned_at=? WHERE user_id=? AND role_id=?",
+                (value, admin.user_id, role_id),
+            )
+        await store.record_login_failure(admin.user_id, failed_attempts=1, locked_until=None)
+        user = await store.get_user(admin.user_id)
+        assert user is not None and user.failed_attempts == 1
     finally:
         await store.close()

@@ -5,7 +5,7 @@
 ``RoleRow``, ``ApprovalRow`` and ``UserRow`` read their seal with ``str(... or "")``; the session
 reader passed the cell through, so a seal cell SQLite hands back as a BLOB, after an edit outside
 the store, left a ``SessionRecord.seal`` that is not a ``str``. The compare-and-set still binds the
-cell as read, so such a row is written through as before. Synthetic values only.
+cell as read, so on a keyless store such a row is written through as before. Synthetic values only.
 """
 
 from __future__ import annotations
@@ -93,5 +93,30 @@ async def test_a_blob_seal_row_still_writes_through_on_a_keyless_store(tmp_path:
         new_hash = hash_token(mint_token())
         assert await store.rotate_session(token_hash, new_token_hash=new_hash, now=12347.0)
         assert await store.get_session(new_hash) is not None
+    finally:
+        await store.close()
+
+
+async def test_an_empty_blob_seal_row_is_not_written_on_a_keyless_store(tmp_path: Path) -> None:
+    """As on main: an empty BLOB seal reads as ``""``, and the compare binds text, which does not
+    match the BLOB, so the rewrite lands nothing."""
+    path = tmp_path / "k.db"
+    store = await MessageStore.open(path)
+    try:
+        await store.create_user(
+            user_id="u-6718",
+            username="u-6718",
+            auth_provider="local",
+            password_generated=False,
+            audits=(),
+        )
+        token_hash = hash_token(mint_token())
+        assert await store.create_session(
+            token_hash=token_hash, user_id="u-6718", expires_at=time.time() + 3600
+        )
+        _raw(path, "UPDATE sessions SET seal=? WHERE token_hash=?", (b"", token_hash))
+        new_hash = hash_token(mint_token())
+        assert not await store.rotate_session(token_hash, new_token_hash=new_hash, now=1.0)
+        assert await store.get_session(new_hash) is None
     finally:
         await store.close()

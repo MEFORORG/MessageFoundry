@@ -1715,22 +1715,30 @@ def session_insert_params(record: SessionRecord) -> tuple[object, ...]:
     )
 
 
+def _non_finite_kind(value: object) -> str | None:
+    """``"nan"``, ``"inf"`` or ``"-inf"`` for a float that is not finite, else ``None``."""
+    if not isinstance(value, float) or math.isfinite(value):
+        return None
+    return "nan" if math.isnan(value) else repr(value)
+
+
 def _refuse_new_non_finite(
-    sealer: object, fields: Iterable[tuple[str, object]], prior: Iterable[tuple[str, object]] = ()
+    sealer: AnyRowSealer | None,
+    fields: Iterable[tuple[str, object]],
+    prior: Iterable[tuple[str, object]] = (),
 ) -> None:
     """On a store with no sealer, raise ``ValueError`` for a NaN or an infinity in ``fields`` that
-    ``prior``, the row as it was read, does not already hold under that name (BACKLOG #6717). A
-    keyed store's sealer refuses one, for the reason :meth:`RowSealer.seal` gives; a keyless
-    SQLite store would write it unchecked. A value carried forward from the stored row is written
-    as before, so only a new value is refused."""
+    ``prior``, the row as it was read, does not already hold under that name (BACKLOG #6717), for
+    the reason :meth:`RowSealer.seal` refuses one. A value carried forward from the stored row is
+    written as before, so only a new value is refused. A name may repeat (a user's role grants),
+    so a value counts as held when any field of that name in ``prior`` holds the same kind."""
     if sealer is not None:
         return
-    held = {n: v for n, v in prior if isinstance(v, float) and not math.isfinite(v)}
+    held = {(n, k) for n, v in prior if (k := _non_finite_kind(v)) is not None}
     for name, value in fields:
-        if isinstance(value, float) and not math.isfinite(value):
-            was = held.get(name)
-            if was is None or not (was == value or (math.isnan(was) and math.isnan(value))):
-                raise ValueError("a row write refuses a float that is not finite")
+        kind = _non_finite_kind(value)
+        if kind is not None and (name, kind) not in held:
+            raise ValueError("a row write refuses a float that is not finite")
 
 
 def seal_session(sealer: RowSealer | None, record: SessionRecord) -> SessionRecord:
@@ -3663,10 +3671,11 @@ class SessionRecord:
         """The session ``d`` holds; a cell that does not parse raises :class:`RowSealError`, as
         :func:`decode_or_refuse` says, and a missing column still raises ``KeyError``."""
         record = decode_or_refuse(SESSION_KIND, _cell_text(d, "token_hash"), lambda: cls._decode(d))
-        if isinstance(d["seal"], bytes):
-            # ``seal`` reads the BLOB as text, and fails a seal check as malformed, as the raw
-            # cell did; the compare-and-set binds the cell itself (:func:`session_reseal_params`),
-            # so the write still matches the row it read (BACKLOG #6718).
+        if isinstance(d["seal"], bytes) and d["seal"]:
+            # ``seal`` reads a non-empty BLOB as text, which fails a seal check as malformed; the
+            # compare-and-set binds the cell itself (:func:`session_reseal_params`), so a keyless
+            # write still matches the row it read, as on main. An empty BLOB reads as ``""`` and
+            # binds as text, which does not match it, as on main (BACKLOG #6718).
             object.__setattr__(record, "_seal_cell", d["seal"])
         return record
 
