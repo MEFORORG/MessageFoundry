@@ -2102,9 +2102,9 @@ class RegistryRunner:
         self._outbound_plan: _OutboundPlan | None = None
         self._sandbox_graph_shape: tuple[Registry, GraphShape] | None = None
         # Sessions read that cache from their worker threads. Two building it at once would each
-        # get their own object, and the refusal alert's gate in ``_off_loop_sandboxed`` matches a
-        # refusal's graph to the served one by identity, so it would drop the alert for a refusal
-        # against the graph still being served (vault BACKLOG #2724, BACKLOG #6830).
+        # get their own object. Both the sessions' refusal cache and the alert gate in
+        # ``_off_loop_sandboxed`` compare by value (BACKLOG #6830), so this is no longer what keeps
+        # an alert; it keeps one shape per registry, not one per session (vault BACKLOG #2724).
         self._sandbox_graph_shape_lock = threading.Lock()
         # ADR 0013 Increment 2: the loop-prevention cap for re-ingress. A re-ingressed message at this
         # correlation depth still routes; the next hop (depth+1) dead-letters its work-row and ERRORs the
@@ -7485,7 +7485,10 @@ class RegistryRunner:
             # is the remedy, so the alert would stay open with nothing left to fix. The graph the
             # worker was compared with is checked, not ``registry``: a reload that swapped and
             # then rolled back leaves ``registry`` served though the comparison used the other.
-            if exc.first and (exc.graph is None or exc.graph is self._engine_graph_shape()):
+            # Compared by value, as the session's refusal cache is (BACKLOG #6830): a swap to an
+            # equal graph leaves the refusal standing, and the session's later hits are not
+            # ``first``, so dropping this one would lose the alert for the session's life.
+            if exc.first and (exc.graph is None or exc.graph == self._engine_graph_shape()):
                 # The whole refusal, once: what differs and both digests. A dead-lettered message
                 # keeps only the first 200 characters of it. Config names and digests, no message.
                 log.warning("inbound %r: %s", name, exc)

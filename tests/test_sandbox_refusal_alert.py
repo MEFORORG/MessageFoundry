@@ -141,6 +141,39 @@ async def test_the_first_refusal_alerts_once_and_later_messages_do_not(
     assert "the worker loaded" in line and _BODY_MARKER not in line
 
 
+async def test_a_swap_to_an_equal_registry_keeps_one_alert_and_no_more(
+    edited_config: Path, tmp_path: Path
+) -> None:
+    """The session's refusal cache and the runner's alert gate together (BACKLOG #6830): the first
+    refusal alerts once; a swap to an equal but new registry, with the session kept, is the same
+    graph to both, so the later messages are refused from the cache and raise no second alert."""
+    registry = _loaded_then_sent_edited(edited_config)
+    sink = _Recorder()
+    store = await MessageStore.open(tmp_path / "swap.db")
+    try:
+        runner = _runner(registry, store, edited_config, cast(Any, sink))
+        try:
+            session = runner._sandbox_for("IB_PARITY")
+            assert session is not None
+            for swap in (False, True, False):
+                if swap:
+                    before = runner._engine_graph_shape()
+                    runner.registry = copy.copy(registry)
+                    assert runner._engine_graph_shape() == before
+                    assert runner._engine_graph_shape() is not before
+                with pytest.raises(SandboxWorkerRefused):
+                    await runner._off_loop_sandboxed(
+                        "IB_PARITY", transform_one, registry, "h_0", RAW, run_context=RunContext()
+                    )
+            assert runner._sandbox_for("IB_PARITY") is session
+            assert session._generation == 1  # one worker, refused once; the rest were cache hits
+            assert sink.refused == [("IB_PARITY", True)]
+        finally:
+            await runner._close_sandbox_sessions()
+    finally:
+        await store.close()
+
+
 async def test_a_refusal_reached_through_the_closed_session_retry_alerts(tmp_path: Path) -> None:
     """The retry after a reload closed the session mid-dispatch is inside the alerting arm too."""
     registry = Registry(code_digest=_SOME_DIGEST)
@@ -182,10 +215,18 @@ async def test_a_refusal_against_a_replaced_graph_does_not_alert(tmp_path: Path)
     try:
         runner = _runner(registry, store, tmp_path, cast(Any, sink))
         try:
-            compared.append(graph_shape(registry))  # equal, but not the object being served
+            compared.append(graph_shape(Registry(code_digest="1" * 64)))  # not the served graph
             with pytest.raises(SandboxWorkerRefused):
                 await runner._off_loop_sandboxed("IB_X", dispatch, registry)
             assert sink.refused == []
+            # An equal graph is the same graph (BACKLOG #6830): the refusal still stands, so it
+            # alerts, as the session's by-value cache will not raise another first refusal.
+            compared[0] = graph_shape(registry)
+            assert compared[0] is not runner._engine_graph_shape()
+            with pytest.raises(SandboxWorkerRefused):
+                await runner._off_loop_sandboxed("IB_X", dispatch, registry)
+            assert sink.refused == [("IB_X", True)]
+            sink.refused.clear()
             # CONTROL: the same refusal against the graph being served does alert.
             compared[0] = runner._engine_graph_shape()
             with pytest.raises(SandboxWorkerRefused):
