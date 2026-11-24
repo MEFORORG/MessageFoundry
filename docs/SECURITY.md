@@ -1462,10 +1462,12 @@ apply. What each **adds** over plain `require()`:
 
 `optional_identity` (2 routes) never raises, so a tokenless client is answered.
 
-Each 403 + `X-Step-Up-Required: 1` above also carries `X-Step-Up-Reason`: `new-address` when the
-session was last verified from another host, `reverify` for any other cause, such as a lapsed
-window or a missing action proof (ADR 0215 section 2). The refusal is the same either way, and a
-step-up clears both; the reason only tells a client where to resume.
+Each 403 + `X-Step-Up-Required: 1` above also carries `X-Step-Up-Reason` (ADR 0215 section 2):
+`new-address` when the session was last verified from another host, `reverify` for any other
+cause. At least a lapsed window, a missing or spent action proof, and a factor-binding refusal give
+`reverify`. A step-up from the caller's host clears a new-address refusal, a lapsed window and a
+missing proof. It does not clear a factor-binding refusal, which proving the session's existing
+factor at `POST /auth/mfa-verify` clears. The header names a cause and decides nothing.
 
 The one WebSocket route, `/ws/stats`, runs up to two gates in turn, all **before** `accept()`:
 
@@ -1654,8 +1656,8 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
-| `GET` | `/auth/check` | `require` | gate-only: answers 200 once the ladder admits the session, and reads nothing else (ADR 0215 section 2). **Not** exempt from the `must_change_password` confinement, the factor gate or the address gate |
-| `GET` | `/me/step-up` | `require` | whether the session's step-up window is live and, with `?action=`, whether that action's gate would accept the caller's proof, read **without spending it** (ADR 0215 section 2). It does not ask the new-address question, so the action's own gate can still refuse; a hint for a page, never an authorization. `action` is capped at 64 characters (422) |
+| `GET` | `/auth/check` | `require` | gate-only: answers 200 once the ladder admits the session, and reads nothing else (ADR 0215 section 2). **Not** exempt from the `must_change_password` confinement, the factor gate or the notification-address gate. Like every bare `require()` route, it does not ask the new-client-IP question and writes no grant row |
+| `GET` | `/me/step-up` | `require` | whether the session's step-up window is live and, with `?action=`, whether that action's gate would accept the caller's proof, read **without spending it** (ADR 0215 section 2). A hint for a page, never an authorization: the action's own gate can still refuse, at least from a host the session has not verified from (this read does not ask that question), and on a `proof_in_route` route that admits a repeat on a live window alone. An `action` no gate names reads `false` while action binding is on and the window's state under the opt-out. `action` is capped at 64 characters (422) and is not echoed back |
 | `POST` | `/me/password` | `require` | Per-**actor** credential-ceremony limiter. Refused (400) for an AD identity. Exempt from the `must_change_password` confinement. MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers gets 403 `enrol an authenticator app first` when it holds no factor with a way past (ADR 0197 Amendment A). That is asked before its current password is read. An account deleted, or whose record fails its integrity seal, while the current password is checked gets at least the wrong-password 403 `current password is incorrect`, audited `auth.password_change_failed` with `reason=bad_password`, or 401 `session ended; sign in again`, audited `reason=session_gone`, where a deletion has already removed the session when the check reads it. Once the current password is checked, the change answers at least these refusals (BACKLOG #5902). An unusable bundled breach corpus gets 503 `password screening is unavailable; ask an administrator to repair it`. An account the change finds gone, when it reads the record before the write or re-reads it after a write that matched no row, gets 401 `session ended; sign in again`, with no `auth.password_changed` row. One deleted after that re-read can get the 409 below instead. A record that fails its integrity seal, or that Vault transit cannot verify, gets 423 and sets nothing. A Vault transit Outage on that record gets 503 and sets nothing. A write that lost to a concurrent change of the account sets nothing. It gets the enrolment 403 where a covered account no longer holds a factor with a way past, and 409 otherwise. Once the write commits, a deletion, or a store refusal of its `auth.password_changed` row, still reports the change. A session revoke that fails past its retries still fails the request, although the change has already committed, so the new password is in effect |
 | `POST` | `/me/notify-email` | `require_paced` | fills a **missing** notification address only (409 when one is set, 400 when blank); the way out of the address confinement, and **not** MFA-exempt, so a session owing its factor gets 403 + `X-MFA-Required` (BACKLOG #1139). Paced, and refused from a host the session has not verified from, like its console twin `POST /ui/account/notify-address` (vault BACKLOG #3052) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given; refuses an `oidc` session with 403 naming `/ui/reauth`, before any verify and charging nothing to the lockout (that session steps up at the IdP) |
@@ -1673,11 +1675,13 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else. A web console page that shows no engine data of its own will
-ask one before it renders, so the JSON gate authorizes it as it would a bearer client. A caller
-learns nothing it cannot read from its own `GET /auth/me`, and a named permission writes the grant
-row any `require(p)` route writes. The [Permission catalogue](#permission-catalogue-29) counts
-these apart.
+the caller and reads nothing else. They are built for the web console's later ADR 0215 slices to
+sub-request before a page that shows no engine data of its own renders; no console page calls one
+yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes the grant row
+a `require(p)` route writes for its permission, which means none for the two PHI-view permissions,
+`messages:view_raw` and `messages:view_summary`: their grants are left to the PHI-access audit row,
+and a check route writes none. The [Permission catalogue](#permission-catalogue-29) counts these
+apart.
 
 | Method | Path | Permission | Gate |
 |---|---|---|---|

@@ -50,6 +50,7 @@ from messagefoundry.api.auth_models import (
     STEP_UP_VIA_HEADER,
     STEP_UP_VIA_IDP,
     CredentialReply,
+    StepUpStatusReply,
 )
 from messagefoundry.api.tls_client_cert import (
     MF_CLIENT_PEERCERT_STATE_KEY,
@@ -610,24 +611,26 @@ def _password_change_required(deadline: float | None, *, suffix: str = "") -> st
 async def _password_change_next(auth: AuthService, token: str | None, *, enrol_first: bool) -> str:
     """The step a must-change session takes next, for its refusal's :data:`MUST_CHANGE_NEXT_HEADER`.
 
-    ADR 0215 section 2. In the web console's ``must_change_target`` order: a factor the session
-    owes first, since ``POST /me/password`` refuses it until then (BACKLOG #1954); then enrolment,
-    when the account must enrol before it rotates (ADR 0197 Amendment A); otherwise the password
-    change. Asked on the refusal path only, so an admitted request pays nothing for it. The header
-    only names where to go; the gate has already refused, and each destination route keeps its own
-    checks.
+    ADR 0215 section 2, in the order the web console's ``must_change_target`` asks: a factor the
+    session owes first (BACKLOG #1954), then enrolment (ADR 0197 Amendment A), otherwise the
+    password change. Asked on the refusal path only, so an admitted request pays nothing for it.
+    It names where to go and decides nothing: the gate has already refused.
 
-    A store fault on the factor read keeps the 403 rather than turning it into a 500, as
-    :func:`_step_up_refusal` does for its wording read, and names the password change, the
-    destination the web console picks for a state it cannot read."""
+    ``password_change_owes_factor`` answers True for a session or user that no longer exists, so a
+    True counts only while the token still resolves, the console's BACKLOG #1974 rule. A store
+    fault on either read keeps the 403 rather than turning it into a 500, as :func:`_step_up_refusal`
+    does for its wording read, and is taken as owing no factor; the enrolment and password
+    answers then follow as for any other session."""
     try:
-        owes_factor = await auth.password_change_owes_factor(token)
+        owes_factor = await auth.password_change_owes_factor(token) and (
+            await auth.identity_for_token(token, activity=False) is not None
+        )
     except AUDIT_WRITE_DEFECTS:
         raise
     except store_call_errors() as exc:
         log.warning(
-            "a must-change refusal could not read whether the session owes a factor (%s); it"
-            " names the password change",
+            "a must-change refusal could not read whether the session owes a factor (%s); it is"
+            " answered as owing none",
             type(exc).__name__,
             exc_info=True,
         )
@@ -2299,35 +2302,26 @@ async def step_up_window_live(request: Request) -> bool:
     return await auth.has_recent_step_up(bearer_token(request))
 
 
-@dataclass(frozen=True, slots=True)
-class StepUpStatus:
-    """What :func:`step_up_status` read: the session window and, when asked, one action's proof."""
+async def step_up_status(request: Request, action: str | None) -> StepUpStatusReply:
+    """``GET /me/step-up``: whether the caller's step-up is fresh, read without spending anything
+    (ADR 0215 section 2).
 
-    window_live: bool
-    action_proof_live: bool | None
-
-
-async def step_up_status(request: Request, action: str | None) -> StepUpStatus:
-    """Whether the caller's step-up is fresh, read without spending anything (ADR 0215 section 2).
-
-    ``window_live`` is :func:`step_up_window_live`. With ``action`` it also answers whether the
-    action's own gate would accept the caller's proof: the factor-binding refusal, then a held
-    single-use grant bound to ``action`` while action binding is on, otherwise the session window,
-    the decision :func:`_action_step_up_ok` makes, with the grant left unspent. It does not ask the
-    new-address question, because that question writes an audit row and a notice; an action from
-    a host the session has not verified from is still refused by its own gate. So a True here
-    is a hint for a page that would lose an operator's input to a re-authentication, never an
-    authorization: the action's gate decides. With no auth service attached every answer is True,
-    as the gates then check nothing."""
+    ``window_live`` is :func:`step_up_window_live`. With ``action``, ``action_proof_live`` is the
+    decision :func:`_action_step_up_ok` makes, with the grant left unspent. It does not ask the
+    new-address question, because that question writes an audit row and a notice, and it does not
+    know which ids a gate names. docs/SECURITY.md's route row says what follows for a caller. With
+    no auth service attached every answer is True, as the gates then check nothing."""
     auth = get_auth(request)
     if auth is None:
-        return StepUpStatus(window_live=True, action_proof_live=None if action is None else True)
+        return StepUpStatusReply(
+            window_live=True, action_proof_live=None if action is None else True
+        )
     token = bearer_token(request)
     window_live = await auth.has_recent_step_up(token)
     if action is None:
-        return StepUpStatus(window_live=window_live, action_proof_live=None)
+        return StepUpStatusReply(window_live=window_live, action_proof_live=None)
     proof_live = await _action_step_up_ok(auth, token, action, spend=False)
-    return StepUpStatus(window_live=window_live, action_proof_live=proof_live)
+    return StepUpStatusReply(window_live=window_live, action_proof_live=proof_live)
 
 
 async def refuse_unless_step_up_window_live(request: Request) -> None:

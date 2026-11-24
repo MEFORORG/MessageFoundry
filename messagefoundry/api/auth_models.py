@@ -53,20 +53,14 @@ STEP_UP_ACTION_MAX = 64
 STEP_UP_VIA_HEADER = "X-Step-Up-Via"
 STEP_UP_VIA_IDP = "idp"
 
-#: The response header every JSON step-up refusal carries, naming why the gate asked (ADR 0215
-#: section 2): :data:`STEP_UP_REASON_NEW_ADDRESS` when the session was last verified from another
-#: host, :data:`STEP_UP_REASON_REVERIFY` for any other cause, at least a lapsed window, a missing
-#: or spent action proof, or a factor-binding refusal. Both are cleared by a step-up; the reason
-#: only lets a client choose where to resume. It decides nothing.
+#: The step-up refusal's reason header and its two values (ADR 0215 section 2). What each value
+#: means is stated once, in docs/SECURITY.md beneath the gate-wrapper table.
 STEP_UP_REASON_HEADER = "X-Step-Up-Reason"
 STEP_UP_REASON_NEW_ADDRESS = "new-address"
 STEP_UP_REASON_REVERIFY = "reverify"
 
-#: The response header a must-change session's 403 carries, naming the step the session takes next
-#: (ADR 0215 section 2): :data:`MUST_CHANGE_NEXT_VERIFY_FACTOR` while it owes a factor it has
-#: enrolled, :data:`MUST_CHANGE_NEXT_ENROL_FACTOR` while its account must enrol a factor before it
-#: rotates (ADR 0197 Amendment A), otherwise :data:`MUST_CHANGE_NEXT_ROTATE`. The detail
-#: string is unchanged, so a client that matches it still does.
+#: The must-change refusal's next-step header and its three values (ADR 0215 section 2). What each
+#: value means is stated once, in docs/SECURITY.md under the ``require*()`` ladder.
 MUST_CHANGE_NEXT_HEADER = "X-Password-Change-Next"
 MUST_CHANGE_NEXT_VERIFY_FACTOR = "verify-factor"
 MUST_CHANGE_NEXT_ENROL_FACTOR = "enrol-factor"
@@ -799,13 +793,11 @@ class SimpleMessage(BaseModel):
 
 
 class StepUpStatusReply(BaseModel):
-    """``GET /me/step-up`` (ADR 0215 section 2): whether the caller's step-up is fresh, read
-    without spending it. ``action_proof_live`` is ``None`` when no ``action`` was asked. Neither
-    field authorizes anything: the action's own gate decides, and it also asks whether the request
-    comes from a host the session has not verified from, which this read does not."""
+    """``GET /me/step-up`` (ADR 0215 section 2), read without spending anything.
+    ``action_proof_live`` is ``None`` when no ``action`` was asked. The action is not echoed back:
+    the caller already holds it. docs/SECURITY.md's route row says what neither field decides."""
 
     window_live: bool
-    action: str | None = None
     action_proof_live: bool | None = None
 
 

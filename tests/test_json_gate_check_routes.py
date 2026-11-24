@@ -221,6 +221,50 @@ async def test_a_new_address_refusal_names_the_new_address(engine: Engine) -> No
         assert r.headers.get(STEP_UP_REASON_HEADER) == STEP_UP_REASON_NEW_ADDRESS
 
 
+async def test_a_paced_route_new_address_refusal_names_the_new_address(engine: Engine) -> None:
+    """The require_paced path reaches the same refusal through refuse_from_new_address."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service, peer=("10.1.1.1", 4000)) as c:
+        tok = await _login(c, "boss")
+    async with _client(engine, service, peer=("10.2.2.2", 4000)) as c:
+        r = await c.post("/connections/IB_NONE/start", headers=_auth(tok))
+        assert r.status_code == 403 and r.headers.get("X-Step-Up-Required") == "1", r.text
+        assert r.headers.get(STEP_UP_REASON_HEADER) == STEP_UP_REASON_NEW_ADDRESS
+
+
+async def test_a_store_fault_on_the_factor_read_keeps_the_must_change_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fault on the refusal-only read keeps the 403, answered as owing no factor."""
+    service = await _service(engine)
+    admin = await create_admin(service)
+
+    async def _fault(_token: str | None) -> bool:
+        raise OSError("synthetic store fault")
+
+    async with _client(engine, service) as c:
+        tok = await _login(c, admin.username, admin.password)
+        monkeypatch.setattr(service, "password_change_owes_factor", _fault)
+        r = await c.get("/users", headers=_auth(tok))
+        assert r.status_code == 403, r.text
+        assert r.headers.get(MUST_CHANGE_NEXT_HEADER) == MUST_CHANGE_NEXT_ROTATE
+
+
+async def test_a_phi_view_check_route_writes_no_grant_row(engine: Engine) -> None:
+    """Pins the documented state (docs/SECURITY.md, Gate-only check routes): a PHI-view grant is
+    left to the PHI-access audit row, and a check route writes none. A change here is deliberate."""
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        tok = await _login(c, "boss")
+        for permission in ("messages:view_raw", "messages:view_summary"):
+            r = await c.get(f"/auth/check/{permission}", headers=_auth(tok))
+            assert r.status_code == 200, r.text
+    rows = await engine.store.list_audit(limit=200)
+    assert not [row for row in rows if "/auth/check/messages:view_" in str(row["detail"])]
+
+
 # --- GET /me/step-up ------------------------------------------------------------------------------
 
 
@@ -232,7 +276,12 @@ async def test_step_up_status_reports_the_window_without_moving_it(engine: Engin
         tok = await _login(c, "vic")
         r = await c.get("/me/step-up", headers=_auth(tok))
         assert r.status_code == 200, r.text
-        assert r.json() == {"window_live": True, "action": None, "action_proof_live": None}
+        assert r.json() == {"window_live": True, "action_proof_live": None}
+        # The read moves nothing: the session's step-up stamp is where the login left it.
+        before = await service.store.get_session(hash_token(tok))
+        await c.get("/me/step-up", headers=_auth(tok))
+        after = await service.store.get_session(hash_token(tok))
+        assert before is not None and after is not None and before.reauth_at == after.reauth_at
         await service.store.mark_session_reauthed(hash_token(tok), now=0.0)
         r = await c.get("/me/step-up", headers=_auth(tok))
         assert r.json()["window_live"] is False
@@ -246,7 +295,7 @@ async def test_step_up_status_reads_an_action_proof_without_spending_it(engine: 
     async with _client(engine, service) as c:
         tok = await _login(c, "boss")
         r = await c.get("/me/step-up", params={"action": action}, headers=_auth(tok))
-        assert r.json() == {"window_live": True, "action": action, "action_proof_live": False}
+        assert r.json() == {"window_live": True, "action_proof_live": False}
         r = await c.post("/me/reauth", json={"password": PW, "purpose": action}, headers=_auth(tok))
         assert r.status_code == 200, r.text
         tok = str(r.json()["token"])
