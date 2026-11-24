@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""BACKLOG #5757: the server stores open a ``vault_transit`` store's cells off the event loop.
+"""BACKLOG #5757: three server store paths open a ``vault_transit`` store's cells off the loop.
 
-Under the ``vault_transit`` cipher every cell decrypt is a Transit HTTP round trip. On SQL Server the
-reference read, the state cache load and the claim decode once made those calls inline on the loop,
-so a large reference set or a claim sweep held it for one round trip per row. These tests drive each
-path through a real :class:`TransitCipher` over a fake Transit client that blocks every call, with
-the database reads faked, and check that the loop kept serving and that no call ran on its thread.
-``tests/test_store_transit_off_loop.py`` covers the SQLite store the same way (BACKLOG #3929).
+Under the ``vault_transit`` cipher every cell decrypt is a Transit HTTP round trip. Before BACKLOG
+#3929 the Postgres and SQL Server reference read and state cache load, and the SQL Server claim
+decode, made those calls inline on the event loop, so a large reference set or a claim sweep held it
+for one round trip per row. These tests pin those paths only, not every decrypt in either store.
+Each drives its path through a real :class:`TransitCipher` over a fake Transit client that blocks
+every call, with the database reads faked, and checks that no Transit call ran on the loop's thread
+and that the loop kept ticking. ``tests/test_store_transit_off_loop.py`` covers the SQLite store.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import threading
 import time
@@ -23,26 +23,28 @@ from typing import Any
 
 import pytest
 
-pytest.importorskip("hvac", reason="the Transit cipher tests need the [vault] extra")
-
-from messagefoundry.store.crypto import cell_aad  # noqa: E402
-from messagefoundry.store.crypto_transit import TransitCipher  # noqa: E402
-from messagefoundry.store.queue_tag import queue_row_aad  # noqa: E402
-from tests.test_crypto_transit import _FakeClient, _FakeTransit  # noqa: E402
+from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.crypto_transit import TransitCipher
+from messagefoundry.store.postgres import PostgresStore
+from messagefoundry.store.queue_tag import queue_row_aad
+from messagefoundry.store.sqlserver import SqlServerStore
+from tests.test_crypto_transit import _FakeClient, _FakeTransit
 
 _KEY = "mefor-store"
-#: How long each Transit call holds its thread once armed: long against a loop tick.
-_BLOCK = 0.2
+#: How long each Transit call holds its thread once armed: long against a loop tick. A call made
+#: inline stalls the loop for at least this long, so a gap under it is the pass bound, which leaves
+#: the whole of it as headroom for a slow runner.
+_BLOCK = 0.3
 #: Synthetic rows only, never PHI. Two of each, so a per-row hop and a one-call hop both count.
 _KEYS = ("k1", "k2")
 _RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\r"
-_BACKENDS = ["postgres", "sqlserver"]
+_BACKENDS = [PostgresStore, SqlServerStore]
 
 
 class _RecordingTransit(_FakeTransit):
-    """A fake Transit that records the thread of each encrypt and decrypt, and blocks each once
-    armed. Its own copy rather than the SQLite test's, so this file imports on a tree that predates
-    BACKLOG #3929 and its failing run there can be shown."""
+    """A fake Transit that records the thread of each call, and blocks each once armed. Its own copy
+    rather than the SQLite test's, which imports a name BACKLOG #3929 added, so this file still
+    imports on the tree before that fix and its failing run there can be shown again."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -62,19 +64,27 @@ class _RecordingTransit(_FakeTransit):
         self._note()
         return super().decrypt_data(**kw)
 
+    def generate_hmac(self, **kw: Any) -> dict[str, Any]:
+        self._note()
+        return super().generate_hmac(**kw)
 
-def _bare_store(backend: str, cipher: TransitCipher) -> Any:
+    def verify_signed_data(self, **kw: Any) -> dict[str, Any]:
+        self._note()
+        return super().verify_signed_data(**kw)
+
+
+def _bare_store(cls: type[Any], cipher: TransitCipher) -> Any:
     """A store object with no connection: each test fakes the reads its path makes."""
-    module = importlib.import_module(f"messagefoundry.store.{backend}")
-    cls = module.PostgresStore if backend == "postgres" else module.SqlServerStore
     store = object.__new__(cls)
     store._cipher = cipher
     return store
 
 
-async def _measure(transit: _RecordingTransit, call: Callable[[], Awaitable[Any]]) -> Any:
-    """Run ``call`` with every Transit call blocking, and check the loop kept serving meanwhile and
-    that no Transit call ran on the loop's thread."""
+async def _measure(
+    transit: _RecordingTransit, call: Callable[[], Awaitable[Any]], *, calls: int
+) -> Any:
+    """Run ``call`` with every Transit call blocking, and check that it made at least ``calls``
+    Transit calls, that none ran on the loop's thread, and that the loop kept ticking meanwhile."""
     loop_thread = threading.get_ident()
     transit.threads.clear()
     transit.block = _BLOCK
@@ -90,6 +100,7 @@ async def _measure(transit: _RecordingTransit, call: Callable[[], Awaitable[Any]
             last = now
 
     task = asyncio.create_task(ticker())
+    await asyncio.sleep(0)  # the ticker takes its baseline before the path runs
     try:
         result = await call()
     finally:
@@ -97,16 +108,15 @@ async def _measure(transit: _RecordingTransit, call: Callable[[], Awaitable[Any]
         await task
         transit.block = 0.0
     # Controls: the path made the blocking calls this test exists to place.
-    assert len(transit.threads) >= len(_KEYS), (
-        "the path made no Transit call, so nothing was measured"
-    )
+    assert len(transit.threads) >= calls, "the path made too few Transit calls to measure"
     assert loop_thread not in transit.threads, "a Transit call ran on the event loop's thread"
-    assert gaps and max(gaps) < _BLOCK / 2, f"the loop stalled for {max(gaps):.3f}s"
+    assert gaps, "the loop never ticked while the path ran"
+    assert max(gaps) < _BLOCK, f"the loop stalled for {max(gaps):.3f}s"
     return result
 
 
-@pytest.mark.parametrize("backend", _BACKENDS)
-async def test_the_reference_read_decrypts_off_the_loop(backend: str) -> None:
+@pytest.mark.parametrize("cls", _BACKENDS)
+async def test_the_reference_read_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit = _RecordingTransit()
     cipher = TransitCipher(_FakeClient(transit), _KEY)
     rows = [
@@ -120,19 +130,19 @@ async def test_the_reference_read_decrypts_off_the_loop(backend: str) -> None:
         }
         for key in _KEYS
     ]
-    store = _bare_store(backend, cipher)
+    store = _bare_store(cls, cipher)
 
     async def fetchall(*_: Any, **__: Any) -> list[dict[str, Any]]:
         return rows
 
     store._fetchall = fetchall
-    await _measure(transit, store._load_reference_cache)
+    await _measure(transit, store._load_reference_cache, calls=len(rows))
     assert dict(store._reference_cache["codes"]) == {key: f"value-{key}" for key in _KEYS}
     assert store._reference_versions == {"codes": "v1"}
 
 
-@pytest.mark.parametrize("backend", _BACKENDS)
-async def test_the_state_cache_load_decrypts_off_the_loop(backend: str) -> None:
+@pytest.mark.parametrize("cls", _BACKENDS)
+async def test_the_state_cache_load_decrypts_off_the_loop(cls: type[Any]) -> None:
     transit = _RecordingTransit()
     cipher = TransitCipher(_FakeClient(transit), _KEY)
     rows = [
@@ -145,15 +155,17 @@ async def test_the_state_cache_load_decrypts_off_the_loop(backend: str) -> None:
         }
         for key in _KEYS
     ]
-    store = _bare_store(backend, cipher)
+    store = _bare_store(cls, cipher)
 
     async def fetchall(sql: str, *_: Any, **__: Any) -> list[dict[str, Any]]:
         # Postgres reads the namespace versions first, then the rows; SQL Server reads the rows.
         return [{"namespace": "ns", "version": 1}] if "state_version" in sql else rows
 
     store._fetchall = fetchall
-    await _measure(transit, store._load_state_cache)
+    await _measure(transit, store._load_state_cache, calls=len(rows))
     assert dict(store._state_cache) == {("ns", key): {"n": key} for key in _KEYS}
+    if cls is PostgresStore:
+        assert store._state_versions == {"ns": 1}
 
 
 async def test_a_sql_server_claim_opens_its_rows_off_the_loop() -> None:
@@ -170,7 +182,7 @@ async def test_a_sql_server_claim_opens_its_rows_off_the_loop() -> None:
     ]
     stage = "outbound"
     rows = []
-    for n in range(len(_KEYS)):
+    for n in range(2):
         row = {
             "id": f"row{n}",
             "message_id": f"msg{n}",
@@ -181,8 +193,7 @@ async def test_a_sql_server_claim_opens_its_rows_off_the_loop() -> None:
         }
         aad = queue_row_aad({**row, "stage": stage, "body_ref": None})
         rows.append(tuple({**row, "payload": cipher.encrypt(_RAW, aad=aad)}[c] for c in columns))
-    store = _bare_store("sqlserver", cipher)
-    store._leader_epoch = None
+    store = _bare_store(SqlServerStore, cipher)
 
     class _Cursor:
         description = [(c,) for c in columns]
@@ -211,5 +222,7 @@ async def test_a_sql_server_claim_opens_its_rows_off_the_loop() -> None:
     store._acquire = acquire
     store._cursor = cursor
     store._commit = commit
-    items = await _measure(transit, lambda: store.claim_ready(limit=10, stage=stage))
-    assert [item.payload for item in items] == [_RAW] * len(_KEYS)
+    items = await _measure(
+        transit, lambda: store.claim_ready(limit=10, stage=stage), calls=len(rows)
+    )
+    assert [item.payload for item in items] == [_RAW] * len(rows)
