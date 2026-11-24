@@ -1212,16 +1212,26 @@ def _attempt_ratio(scan: Callable[[str], object], small: str, large: str) -> flo
 
 
 def _scaling_ratios(
-    scan: Callable[[str], object], make: Callable[[int], str], k: int
+    scan: Callable[[str], object],
+    make: Callable[[int], str],
+    k: int,
+    *,
+    until_over: bool = False,
 ) -> list[float]:
-    """Time on a ``4 * k`` reply over time on a ``k`` one, re-measured up to three times while a
-    reading is at or over the line, so one preemption cannot fake a curve. The lowest is the
-    verdict for both the linear checks and the control."""
+    """Time on a ``4 * k`` reply over time on a ``k`` one, re-measured up to three times while
+    the latest reading is on the side its check fails, so one preemption cannot decide a verdict.
+
+    The linear checks (the default) re-measure while a reading is at or over the line, and take
+    the lowest. The control passes ``until_over``, re-measures while a reading is under the line,
+    and takes the highest: one slow-enough reading proves the old patterns are not linear, and a
+    noisy fast reading proves nothing. Taking the lowest there failed merge-group runs on one
+    noisy reading of 7.98x or 7.61x, beside others of 14x, although the old patterns really are
+    quadratic."""
     small, large = make(k), make(4 * k)
     readings: list[float] = []
     for _ in range(3):
         readings.append(_attempt_ratio(scan, small, large))
-        if readings[-1] < _MAX_LINEAR_RATIO:
+        if (readings[-1] >= _MAX_LINEAR_RATIO) == until_over:
             break
     return readings
 
@@ -1265,8 +1275,8 @@ def test_the_linear_check_fails_the_old_patterns(
     workstation (2026-11-03): 13.8x to 15.8x and 12.9x to 15.9x. The ``(.*?)</`` tail is the
     costlier one, so its ``k`` is smaller; at 4,000 it read once at 9.6x and took 1.6 s a run."""
     monkeypatch.setattr(soap, "_fault_code", _old_fault_code)
-    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], k)
-    ratio = min(readings)
+    readings = _scaling_ratios(_classify_2xx, _PATHOLOGICAL_REPLIES[shape], k, until_over=True)
+    ratio = max(readings)
     assert ratio >= _MAX_LINEAR_RATIO, (
         f"the old patterns scaled by only {ratio:.2f}x ({_attempts(readings)})"
     )
