@@ -945,6 +945,24 @@ async def test_a_send_settled_before_the_cut_reached_the_drain_is_read_as_it_end
     )
 
 
+async def test_a_skipped_send_that_settled_before_its_record_is_still_recorded(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #6832, final review round. The cut close skips a send still waiting for a thread,
+    and the thread may then run and return False before the record task reads the send. That
+    notice was never mailed, so it must still read abandoned, not vanish."""
+    notifier = _notifier(store)
+    send: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    send.set_result(False)  # what the skipped send's thread returns
+    amy = SecurityEvent(PASSWORD_CHANGED, username="amy", email="amy@x.test")
+    gate = _SendGate()
+    assert gate.skip()  # the close's skip, before the thread began
+    await notifier._record_cut([], (amy, send, gate, lambda: None), True)
+    assert [(actor, d["reason"]) for _, actor, d in await _undelivered(store)] == [
+        ("amy", "abandoned")
+    ]
+
+
 async def test_a_second_close_beside_a_cut_one_returns_cleanly(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

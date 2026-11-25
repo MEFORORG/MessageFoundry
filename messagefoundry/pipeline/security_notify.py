@@ -858,7 +858,8 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         only the wait. The writes are not bounded: past the step's cut grace the shutdown stops
         waiting for them, and they go on, beside engine.stop(), until the store closes, which fails
         the rest. The count of queued notices is logged before any of them is written. A second
-        call waits for the first, its record writes included, and closes nothing itself."""
+        call waits until the first ends, and closes nothing itself: once its record writes end,
+        or sooner if a second cancel stops its wait."""
         if self._closing:
             await self._closed.wait()
             return
@@ -929,15 +930,19 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         ``skipped`` says the close stopped that send before its thread began."""
         records: list[tuple[SecurityEvent, str]] = []
         if pending is not None:
-            event, send, gate, delivered = pending
-            if not send.done() or send.cancelled():
-                # A send still waiting for a worker thread is skipped, so it never mails after the
-                # close: "abandoned", like a queued one. One whose thread began runs on to its own
-                # timeout, so the notice may still go out: "interrupted" says its delivery is
-                # unknown. No line for it: a cut that leaves notices queued nearly always has a send
-                # in flight, so a line skipped for a lock notice would say a lock landed (BACKLOG
-                # #1131).
-                records.append((event, "abandoned" if skipped else "interrupted"))
+            event, send, _gate, delivered = pending
+            if skipped:
+                # Read first: a skipped send whose thread then ran returns False, and would
+                # otherwise read as a send that ended with nothing to record.
+                records.append((event, "abandoned"))
+            elif not send.done() or send.cancelled():
+                # A send still waiting for a worker thread was skipped above, so it never mails
+                # after the close: "abandoned", like a queued one. One whose thread began runs on
+                # to its own timeout, so the notice may still go out: "interrupted" says its
+                # delivery is unknown. No line for it: a cut that leaves notices queued nearly
+                # always has a send in flight, so a line skipped for a lock notice would say a lock
+                # landed (BACKLOG #1131).
+                records.append((event, "interrupted"))
             elif (exc := send.exception()) is not None:
                 # It ended before the cut reached the drain, so its outcome is known.
                 self._log_send_failed(event, exc)

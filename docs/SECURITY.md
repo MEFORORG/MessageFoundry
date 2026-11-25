@@ -7995,7 +7995,8 @@ again for the row, and only when a send failed. **Still open, at least:**
   go on beside `engine.stop()`, competing with its writes, until the store closes, and those still
   to run then fail. Under a full queue that can be most of them. A cut logs at least the
   teardown's ERROR line for the cut and, from the close, a WARNING line counting the queued
-  notices before their writes, only when some are queued, and, when any of those writes fail,
+  notices before their writes, only when a notice other than a lock notice is queued, and,
+  when any of those writes fail,
   one counting them after; that one does not count the writes a cancel stopped before they ran.
   Neither count includes a lock notice, and the first does not count the cut send. A lock
   notice among them keeps its `auth.lock_notice` row
