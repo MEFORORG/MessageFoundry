@@ -488,8 +488,10 @@ def verify(
     whose key cannot be read fails with :data:`UNREADABLE_SIGNING_KEY` (BACKLOG #1166).
 
     **Not callable in a sandbox worker.** Under ``[sandbox].mode`` ``subprocess`` or ``isolated`` it
-    raises ``SandboxError``: it imports ``cryptography``, which the worker's forbidden-import guard
-    blocks, so the import fails closed (vault BACKLOG #6812; ``docs/CONFIGURATION.md`` ``[sandbox]``).
+    raises at least ``SandboxError`` once it reaches its ``cryptography`` import, which the worker's
+    forbidden-import guard blocks, so the import fails closed; another error, such as the
+    ``ValueError`` for a missing trust anchor, can come first (vault BACKLOG #6812;
+    ``docs/CONFIGURATION.md`` ``[sandbox]``).
 
     **Only a signature over everything outside its own ``ds:Signature`` element verifies** (vault
     BACKLOG #2315), as exclusive C14N with comments reads that content. A document holding content
