@@ -7803,7 +7803,7 @@ Read the two together: the table above is the operator-surface half, and that se
 picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-**The limiters' floors refuse a negative value, not a weak one.**
+**The rate limiters' floors refuse a negative value, not a weak one.**
 Every count among the fifteen `*_rate_limit_*` fields must be `0` or more: the sign-in and PHI-read
 counts (BACKLOG #5318), `admin_write_rate_limit_per_actor` (BACKLOG #3293) and the two
 monitoring-read counts (vault BACKLOG #1191). The sign-in and PHI-read windows must be `0` or more,
