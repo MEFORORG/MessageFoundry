@@ -2653,6 +2653,13 @@ def new_session_record(
     )
 
 
+def _reanchored(stored: str | None, client: str | None) -> str | None:
+    """A session's address after a proof from ``client``: ``client``, or the stored one when it is
+    ``None`` (WP-L3-13). The one rule both :func:`reauth_stamp` and :func:`mfa_stamp` move the
+    anchor by (vault BACKLOG #2964 item 30)."""
+    return stored if client is None else client
+
+
 def reauth_stamp(
     now: float, client: str | None, idp_auth_time: float | None
 ) -> Callable[[SessionRecord], SessionRecord]:
@@ -2671,7 +2678,7 @@ def reauth_stamp(
         return replace(
             s,
             reauth_at=when,
-            client=s.client if client is None else client,
+            client=_reanchored(s.client, client),
             idp_auth_time=forward,
         )
 
@@ -2707,7 +2714,7 @@ class _MfaStamp:
         return replace(
             s,
             mfa_verified_at=self._when,
-            client=s.client if anchor.client is None else anchor.client,
+            client=_reanchored(s.client, anchor.client),
             reauth_at=self._when if anchor.open_window else None,
         )
 
@@ -22636,9 +22643,14 @@ class MessageStore:
         ``anchor`` on any session but an OIDC one. Session issuance does not call this;
         :meth:`AuthStore.create_session` says how its ``mfa_verified`` stamps the row in the INSERT
         (BACKLOG #5624). See :meth:`AuthStore.mark_session_mfa_verified` for ``anchor`` and the
-        answer."""
+        answer.
+
+        ``BEGIN IMMEDIATE`` (vault BACKLOG #2964 item 23): the stamp reads the row before it writes,
+        and under a deferred ``BEGIN`` a writer in another process that committed after that read
+        failed the write busy at once, so a factor just proved read as a store error. Taking the
+        lock at the ``BEGIN`` waits that writer out under ``busy_timeout`` instead."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
-        async with _writer_txn(self._db, self._lock):
+        async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_session(token_hash, stamp)
             await self._commit()
         return written is not None and stamp.anchored
