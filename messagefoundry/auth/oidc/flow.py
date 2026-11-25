@@ -23,7 +23,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import math
 import secrets
 import time
 import urllib.error
@@ -44,6 +43,13 @@ _NONCE_BYTES = 32
 _FLOW_ID_BYTES = 32
 
 DEFAULT_FLOW_TTL_SECONDS = 300.0
+#: The bounds :class:`FlowCache` holds its TTL to (BACKLOG #6902). They guard the mechanism, not
+#: the operator's choice, which ``[auth].oidc_flow_ttl_seconds`` bounds more tightly. The floor is
+#: far above the float spacing of any clock reading this engine will see, so every deadline moves
+#: past the instant it is stamped at. The ceiling is a judgment: past a day, one abandoned flow
+#: holds its cap slot for as good as ever.
+_MIN_FLOW_TTL_SECONDS = 1.0
+_MAX_FLOW_TTL_SECONDS = 86_400.0
 DEFAULT_FLOW_CACHE_MAX = 512
 DEFAULT_PER_IP_CAP = 16
 # The token-endpoint response is small; a larger body is refused unread.
@@ -188,13 +194,19 @@ class FlowCache:
         per_ip_cap: int = DEFAULT_PER_IP_CAP,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        # The TTL alone sets every deadline, so a bad one would never expire a flow (NaN, inf) or
-        # expire each one as it is staged (0 or below).
-        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0:
+        # The TTL alone sets every deadline, so a bad one would never expire a flow or expire each
+        # one as it is staged. It is read by the rule ``transports.base.float_setting`` holds, which
+        # also keeps the value out of the message; imported lazily, as ``exchange_code`` imports
+        # transports, so this package takes no module-scope transports import.
+        from messagefoundry.transports.base import positive_seconds  # noqa: PLC0415
+
+        ttl = positive_seconds(ttl_seconds, knob="ttl_seconds", transport="FlowCache")
+        if not _MIN_FLOW_TTL_SECONDS <= ttl <= _MAX_FLOW_TTL_SECONDS:
             raise ValueError(
-                f"FlowCache ttl_seconds must be finite and positive, got {ttl_seconds!r}"
+                f"FlowCache ttl_seconds must be between {_MIN_FLOW_TTL_SECONDS:g} and "
+                f"{_MAX_FLOW_TTL_SECONDS:g} seconds (value withheld)"
             )
-        self._ttl = ttl_seconds
+        self._ttl = ttl
         self._global_cap = global_cap
         self._per_ip_cap = per_ip_cap
         self._clock = clock

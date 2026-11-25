@@ -18,6 +18,8 @@ import traceback
 import urllib.error
 import uuid
 from collections.abc import Callable, Mapping
+from decimal import Decimal
+from fractions import Fraction
 from types import SimpleNamespace
 from typing import Any
 
@@ -800,13 +802,66 @@ def test_put_replaces_a_deadline_set_before_staging() -> None:
     assert cache.peek("flow-1") is None
 
 
-@pytest.mark.parametrize("ttl", [0.0, -5.0, float("nan"), float("inf"), float("-inf")])
-def test_a_flow_cache_refuses_a_ttl_that_is_not_finite_and_positive(ttl: float) -> None:
-    """BACKLOG #6902. The cache's TTL alone sets every deadline, so NaN or infinity would keep each
-    flow, holding its cap slot for good, and 0 or below would expire each flow as it is staged."""
-    oidc.FlowCache(ttl_seconds=0.001)  # the control: a small positive TTL is accepted
-    with pytest.raises(ValueError, match="finite and positive"):
+#: TTLs the cache must refuse, each with the reason it is wrong. The cache's TTL alone sets every
+#: deadline, so each of these would keep a flow, holding its cap slot for good, or expire it as it
+#: is staged (BACKLOG #6902).
+_BAD_FLOW_TTLS: dict[str, object] = {
+    "zero": 0.0,
+    "negative": -5.0,
+    "nan": float("nan"),
+    "inf": float("inf"),
+    "-inf": float("-inf"),
+    # A bool is not a number of seconds; True would have built a one-second TTL.
+    "true": True,
+    "false": False,
+    # Positive, yet too small to move a clock reading of 1e9: the deadline equals the stamp.
+    "too-small-to-move-the-clock": 1e-300,
+    "below-the-floor": 0.5,
+    # Finite, yet past any deadline that ever arrives.
+    "huge-finite": 1e300,
+    "above-the-ceiling": 86_400.5,
+    # math.isfinite raised OverflowError on this rather than a ValueError.
+    "int-too-large-for-a-float": 10**400,
+    "decimal-nan": Decimal("NaN"),
+    "decimal-signalling-nan": Decimal("sNaN"),
+    "decimal-that-rounds-to-zero": Decimal("1e-400"),
+    "not-a-number": [300],
+}
+
+
+@pytest.mark.parametrize("ttl", list(_BAD_FLOW_TTLS.values()), ids=list(_BAD_FLOW_TTLS))
+def test_a_flow_cache_refuses_a_ttl_outside_its_bounds(ttl: Any) -> None:
+    """BACKLOG #6902. RED when: the cache builds with this TTL, or the refusal is not a
+    ValueError."""
+    with pytest.raises(ValueError, match="FlowCache ttl_seconds") as raised:
         oidc.FlowCache(ttl_seconds=ttl)
+    assert "value withheld" in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "ttl", [1.0, 7, 300.0, 86_400.0, Decimal("300"), Fraction(601, 2)], ids=str
+)
+def test_a_flow_cache_reads_a_ttl_inside_its_bounds_as_a_float(ttl: Any) -> None:
+    """BACKLOG #6902. The control for the refusals above, at both bounds. A Decimal TTL used to be
+    kept as one, so ``put`` then raised TypeError adding it to a float clock reading."""
+    clock = [1e9]
+    cache = oidc.FlowCache(ttl_seconds=ttl, clock=lambda: clock[0])
+    flow = oidc.PendingFlow(
+        state="st", nonce="n", code_verifier="v", return_to="/ui", client_ip="10.0.0.1"
+    )
+    staged = cache.put("flow-1", flow)
+    assert staged.deadline == 1e9 + float(ttl) and staged.deadline > staged.started
+
+
+@pytest.mark.parametrize("ttl", [86_400.5 + 0.123456789, 0.987654321, 1e300])
+def test_a_flow_cache_ttl_refusal_withholds_the_value(ttl: float) -> None:
+    """BACKLOG #6902, docs/REVIEW-STANDARDS.md R12. The refusal names the key and the bounds, never
+    the value, as the transport setting readers do; nor does anything it chains."""
+    with pytest.raises(ValueError) as raised:
+        oidc.FlowCache(ttl_seconds=ttl)
+    chain = "".join(traceback.format_exception(raised.value))
+    for spelling in (repr(ttl), str(ttl), f"{ttl:g}"):
+        assert spelling not in chain, spelling
 
 
 def test_flow_cache_rejects_when_full_never_evicts() -> None:
