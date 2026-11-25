@@ -2333,11 +2333,14 @@ the same permission set on the same method reds CI until it is listed here.
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
 > `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
 > of its own inbounds only, and no per-destination or latency series, for the same shared-outbound
-> reason. Its label-less aggregates stay global, like the counters above. A scraper that needs the whole
+> reason. Its aggregates that carry no connection or destination label stay global, like the
+> counters above. A scraper that needs the whole
 > estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
 > with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
 > `auth.channel_denied` row: a log line names no single channel, and the owner's answer for the
-> audit trail was to narrow or refuse such a reader.
+> audit trail was to narrow or refuse such a reader. So a built-in Auditor, or an Operator reading
+> the log, needs the all-channels grant. `tests/test_scoped_caller_metrics_logs_audit.py` executes
+> these refusals on the JSON routes; the two `/ui` routes call the same handlers.
 > This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
 > route above against a scoped caller with an all-channels caller as the control, and reds if the
 > prose and the app disagree.
@@ -2411,11 +2414,10 @@ the same permission set on the same method reds CI until it is listed here.
 > `audit_all_authorization_decisions`, every JSON request already writes a grant row, so this
 > adds at most one row per request. With that switch off, this row is the only one such a read
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
-> that polled would need the row coalesced. The counts are a disclosure in their own right. A
-> scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> lie outside its scope. A `logs:view` holder reads them in the ERROR line a lost row leaves.
-> Without either, one extra write's latency can show that some rule was withheld. It cannot show
-> which rules or how many. Why it is not
+> that polled would need the row coalesced. The counts are a disclosure in their own right, but
+> not to the scoped caller itself: `GET /audit` and `GET /logs/tail`, where they are written,
+> refuse a channel-scoped caller (BACKLOG #4346). One extra write's latency can show it that
+> some rule was withheld. It cannot show which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
 > `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.

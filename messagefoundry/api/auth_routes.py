@@ -2608,7 +2608,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         The caller is resolved again from ``token`` before each page is sent (BACKLOG #1154). A
         failed standing stops the stream. So does a caller who may now read fewer rows than the
-        export started with. A stop records ``audit.export.stopped`` and raises
+        export started with, and one that is now channel-scoped (BACKLOG #4346). A stop records ``audit.export.stopped`` and raises
         :class:`ExportStopped`, which reaches the client as a failed download (BACKLOG #3907); see that class. The JSON route
         reads ``token`` from the bearer, and the console's ``/ui/audit/export`` passes its cookie
         session."""
@@ -2687,7 +2687,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # A scope edit ends the account's sessions, which the line above catches; this covers a
             # standing that resolves narrowed with its session still live.
             if current.allowed_channels is not None:
-                return "scope_changed"
+                return "channel_scoped"
             # The pages are read with the starting identity's exclusion. If the caller may now
             # read fewer rows, as after losing users:manage, the export stops. If it may read the
             # same rows or more, it goes on: the start already hid at least as much.

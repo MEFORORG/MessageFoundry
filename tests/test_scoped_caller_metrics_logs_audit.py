@@ -7,7 +7,8 @@ Each of these answered a caller limited to some channels with data from every ch
 
 * ``GET /metrics`` NARROWS: a scoped caller reads only its own inbounds' series. Every
   per-destination series and the latency histogram are dropped, as the dashboard drops a shared
-  outbound for that caller. The label-less aggregates stay, as on ``GET /stats``.
+  outbound for that caller. The aggregates with no connection or destination label stay, as on
+  ``GET /stats``.
 * ``GET /logs/tail`` REFUSES a scoped caller: a log line is not attributable to one channel, so
   there is nothing to narrow it by.
 * ``GET /audit``, ``GET /audit/export`` and their ``/ui`` twins REFUSE a scoped caller. The owner's
@@ -32,13 +33,19 @@ import httpx
 import pytest
 
 from messagefoundry.api import auth_routes, create_app
-from messagefoundry.api.metrics import _render_snapshot, gather_snapshot, scoped_snapshot
+from messagefoundry.api.metrics import (
+    DEFAULT_LATENCY_BUCKETS,
+    _render_snapshot,
+    gather_snapshot,
+    scoped_snapshot,
+)
 from messagefoundry.api.security import ExportStopped, recheck_standing
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import ALL_CHANNELS, Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import LatencyHistogram
 from tests._admin_account import create_local_user_chosen
 
 # The seeded estate the monitoring-plane probe stands on: inbounds IB_A and IB_B, shared outbound
@@ -108,7 +115,7 @@ async def test_metrics_narrows_to_the_callers_inbounds(engine: Engine) -> None: 
     assert "IB_B" not in scoped
     assert "OB_X" not in scoped
     assert "destination=" not in scoped
-    # The label-less aggregates stay, as on GET /stats.
+    # The aggregates with no connection or destination label stay, as on GET /stats.
     assert any(line.startswith("messagefoundry_in_pipeline ") for line in scoped.splitlines())
     assert "messagefoundry_outbox_status{" in scoped
 
@@ -116,8 +123,14 @@ async def test_metrics_narrows_to_the_callers_inbounds(engine: Engine) -> None: 
 async def test_scoped_snapshot_keeps_the_aggregates_and_drops_every_destination(
     engine: Engine,  # noqa: F811
 ) -> None:
-    snap = await gather_snapshot(engine)
-    assert snap.destinations and snap.latency is not None  # the fixture has deliveries
+    # The fixture has queued deliveries but none done, so it has no latency histogram. One is
+    # planted, on the in-scope inbound, so the drop is measured rather than read off an empty list.
+    snap = replace(
+        await gather_snapshot(engine),
+        latency=[LatencyHistogram("IB_A", "OB_X", (1,) * len(DEFAULT_LATENCY_BUCKETS), 0.5, 1)],
+    )
+    assert snap.destinations
+    assert 'destination="OB_X"' in _render_snapshot(snap).decode()
     narrowed = scoped_snapshot(snap, lambda name: name == "IB_A")
     assert set(narrowed.inbound) == {"IB_A"}
     assert narrowed.destinations == {}
@@ -210,4 +223,4 @@ async def test_audit_export_stops_when_the_caller_becomes_scoped(
                 async for _line in r.aiter_lines():
                     pass
     stops = await engine.store.list_audit(limit=10, action="audit.export.stopped", actor="wide")
-    assert [json.loads(row["detail"])["reason"] for row in stops] == ["scope_changed"]
+    assert [json.loads(row["detail"])["reason"] for row in stops] == ["channel_scoped"]
