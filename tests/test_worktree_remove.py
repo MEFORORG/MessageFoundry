@@ -1207,6 +1207,28 @@ def test_a_linked_copy_through_a_junction_of_its_parent_refuses_with_its_sibling
     assert target.exists() and fx.is_registered(target)
 
 
+@pytest.mark.parametrize("extra", ["​", "­"])
+def test_a_linked_copy_differing_from_the_primary_by_an_ignorable_character_refuses(
+    fx: Fixture, extra: str
+) -> None:
+    """Red at 5648f0f8 (BACKLOG #1894 review round 6): the spelling guard compared with PowerShell's
+    culture-aware ``-ne``, which ignores a zero-width space or soft hyphen, so a linked worktree at
+    ``repo`` plus one such character read as the primary and removed ``repo-foo``. origin/main
+    targeted ``repo<char>-foo``, absent here, and threw."""
+    target = fx.add("foo")
+    host = fx.primary.parent / f"{fx.primary.name}{extra}"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host", str(host))
+    copy_real_scripts(host)
+
+    proc = run(
+        fx, "-Name", "foo", script=host / "scripts" / "worktree" / "remove.ps1", repo_root=""
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+
 def test_a_copy_below_the_primarys_top_refuses_name(fx: Fixture) -> None:
     """A copy at ``<primary>/sub/scripts/worktree`` used to search ``<primary>/sub-<Name>`` and throw
     "No such worktree". Re-anchored on the primary it would reach ``<primary>-<Name>``, a tree it

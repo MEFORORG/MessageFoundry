@@ -386,8 +386,12 @@ if ($gitCarriers.Count -gt 0) {
 # checkout's top, one reached through a junction, subst or 8.3 alias, one inside a .git directory,
 # and a primary whose .git is a gitfile all differ. Earlier rounds tested stand-ins for this (is the
 # old target registered, is the copy linked), and every case a stand-in missed widened the reach.
-# Spellings are compared, not directories, so an alias that does name the same tree refuses too:
-# fail closed. So on this route -Name reaches the pre-#1894 target spelled the same way, or refuses.
+# So -Name keeps this copy's root, origin/main's literal spelling, and runs only when that root is
+# ORDINALLY equal to git's primary entry. Ordinal, not -ne on normalised text: the culture
+# comparison folds case and ignores a zero-width character or soft hyphen, so a linked worktree at
+# `<primary>` plus one such character would pass (BACKLOG #1894 review round 6). An alias, or a
+# spelling differing only in case, that does name the primary refuses too: fail closed. On this
+# route -Name therefore builds exactly the target the pre-#1894 script built, or refuses.
 $anchorList = @()
 if ($anchorOnPrimary) {
     $anchorList = @(Get-RepoWorktrees $RepoRoot)
@@ -395,19 +399,16 @@ if ($anchorOnPrimary) {
         throw "Could not list the registered worktrees of '$RepoRoot', so the primary checkout is unknown. Nothing was removed."
     }
     $primaryOfClone = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
-    if (-not ($byPath -or $listing)) {
-        $copyRoot = [System.IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
-        $oldTarget = Join-Path (Split-Path $copyRoot -Parent) "$(Split-Path $copyRoot -Leaf)-$Name"
-        $newTarget = Join-Path (Split-Path $primaryOfClone -Parent) "$(Split-Path $primaryOfClone -Leaf)-$Name"
-        if ((ConvertTo-Norm $oldTarget) -ne (ConvertTo-Norm $newTarget)) {
-            Write-Host "REFUSED: -Name $Name from the copy in '$copyRoot' could mean two trees." -ForegroundColor Red
-            Write-Host "  Before BACKLOG #1894 this copy reached: $oldTarget" -ForegroundColor Red
-            Write-Host "  The primary's sibling is:              $newTarget" -ForegroundColor Red
-            Write-Host "Name the checkout: add -RepoRoot `"$copyRoot`" for the first, or -RepoRoot `"$primaryOfClone`" for the second." -ForegroundColor Red
-            throw "-Name from this copy needs -RepoRoot. Nothing was removed."
-        }
+    if ($byPath -or $listing) { $RepoRoot = $primaryOfClone }
+    elseif (-not [string]::Equals($RepoRoot, $primaryOfClone, [System.StringComparison]::Ordinal)) {
+        $primarySibling = Join-Path (Split-Path $primaryOfClone -Parent) "$(Split-Path $primaryOfClone -Leaf)-$Name"
+        Write-Host "REFUSED: -Name $Name from the copy in '$RepoRoot' could mean two trees." -ForegroundColor Red
+        Write-Host "  Before BACKLOG #1894 this copy reached: $(Join-Path (Split-Path $RepoRoot -Parent) "$(Split-Path $RepoRoot -Leaf)-$Name")" -ForegroundColor Red
+        Write-Host "  The primary's sibling is:              $primarySibling" -ForegroundColor Red
+        Write-Host ("Name the checkout: -RepoRoot `"$primaryOfClone`" for the second, or for the first -RepoRoot " +
+            "naming the checkout top that copy sits in, as git spells it.") -ForegroundColor Red
+        throw "-Name from this copy needs -RepoRoot. Nothing was removed."
     }
-    $RepoRoot = $primaryOfClone
 }
 elseif (-not ($byPath -or $listing)) {
     # -Name builds its target from this spelling, so it must BE a checkout's top. A subdirectory, or a
