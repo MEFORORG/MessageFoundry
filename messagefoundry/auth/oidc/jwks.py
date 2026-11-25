@@ -421,23 +421,35 @@ class JwksCache:
             return None
         return state.keys.get(kid)
 
+    def _read_without_gate(self, kid: str) -> _BoundKey | None:
+        """``kid``'s key from the published snapshot, if it is within the TTL and
+        :meth:`_may_skip_gate` allows, else ``None``. The snapshot must still be the published one
+        after the skip check: a refresh that publishes and clears ``_refresh_started`` between the
+        two reads would otherwise let a snapshot older than that refresh be served (BACKLOG #6905).
+        """
+        state = self._state
+        bound = self._fresh(state, kid, self._clock())
+        if bound is None or not self._may_skip_gate() or self._state is not state:
+            return None
+        return bound
+
     def _lookup(self, kid: str) -> _BoundKey:
         """The cached or refetched key for ``kid``. A key within the TTL is read without the gate
         while :meth:`_may_skip_gate` allows; every other lookup runs under it, as ``__init__``
         describes."""
-        bound = self._fresh(self._state, kid, self._clock())
-        if bound is not None and self._may_skip_gate():
+        bound = self._read_without_gate(kid)
+        if bound is not None:
             return bound
 
         if not self._gate.acquire(timeout=self._gate_wait):
             # The refresh may have published the kid as the wait ran out; one gate-free read of
             # what it published, never a key past the TTL, and on the same terms as the first read.
-            bound = self._fresh(self._state, kid, self._clock())
-            if bound is not None and self._may_skip_gate():
+            bound = self._read_without_gate(kid)
+            if bound is not None:
                 return bound
             raise JwksRefreshBusy(
-                f"no key for kid {kid!r}; waited {self._gate_wait:g}s for a JWKS refresh in "
-                "progress to release the cache"
+                f"kid {kid!r} could not be confirmed current; waited {self._gate_wait:g}s for a "
+                "JWKS refresh in progress to release the cache"
             )
         try:
             return self._lookup_holding_gate(kid)

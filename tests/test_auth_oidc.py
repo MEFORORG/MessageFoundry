@@ -18,8 +18,9 @@ import traceback
 import urllib.error
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from decimal import Decimal
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1610,6 +1611,48 @@ def test_a_cached_kid_waits_once_the_refresh_in_flight_is_as_old_as_the_gate_wai
         stalled.join(timeout=10)
     refused = results["cached"]
     assert isinstance(refused, JwksRefreshBusy), f"k1 was served past the bound: {refused!r}"
+
+
+@pytest.mark.parametrize("site", ["first-read", "re-read-after-the-wait"])
+def test_a_snapshot_a_refresh_replaces_during_the_skip_check_is_not_served(
+    rsa_key: rsa.RSAPrivateKey, monkeypatch: pytest.MonkeyPatch, site: str
+) -> None:
+    """BACKLOG #6905. A stalled refresh that publishes, and clears the time it started, between a
+    lookup's read of the snapshot and its skip check makes that check pass, although the snapshot
+    read is older than the refresh. The stub skip check performs that publish itself, withdrawing
+    ``k1``, so the interleaving happens on every run, at either gate-free read.
+
+    REDS when the skip check is not followed by a check that the snapshot is still the published
+    one: the withdrawn ``k1`` is then served from the old snapshot."""
+    state = _Warm(rsa_key, b"", at=100.0, gate_wait=0.2)
+    cache = state.cache
+    publish_on = 1 if site == "first-read" else 2
+    calls: list[None] = []
+
+    def skip_check_that_a_publish_overtakes() -> bool:
+        calls.append(None)
+        if len(calls) < publish_on:
+            return False  # a refresh older than the gate wait is in flight
+        if len(calls) == publish_on:
+            published = cache._state
+            assert published is not None
+            cache._state = replace(published, keys=MappingProxyType({}))
+        return True
+
+    monkeypatch.setattr(cache, "_may_skip_gate", skip_check_that_a_publish_overtakes)
+    if site == "first-read":
+        with pytest.raises(oidc.JwksError) as refused:
+            cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        assert not isinstance(refused.value, JwksRefreshBusy), refused.value
+    else:
+        # The test holds the gate, standing in for the refresh, so the lookup's wait runs out.
+        assert cache._gate.acquire(timeout=10)
+        try:
+            with pytest.raises(JwksRefreshBusy, match="could not be confirmed current"):
+                cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        finally:
+            cache._gate.release()
+    assert len(calls) == publish_on
 
 
 @pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
