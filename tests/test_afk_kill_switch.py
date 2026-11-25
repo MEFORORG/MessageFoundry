@@ -9,6 +9,7 @@ Only a read that returns exactly ``off`` is OFF. The tests drive the real script
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -424,8 +425,11 @@ def test_a_foreign_cwd_reads_korus_seat_against_the_cwd_roster_too(sb: Sandbox) 
     assert proc.stdout == "" and NOT_OURS in proc.stderr, (proc.stdout, proc.stderr)
     assert "no skill instruction" not in proc.stderr, proc.stderr  # read as Special, not a fault
     assert VETO not in proc.stderr, proc.stderr  # KORUS_SEAT silenced it, not the marker
-    # The control: the same setup with a non-Special KORUS_SEAT prints the instruction.
+    # The controls: the same setup with a non-Special KORUS_SEAT prints the instruction, and so
+    # does 'special9' once the cwd's roster stops mapping it, so that roster is what silenced it.
     _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="builder"))
+    roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")
+    _undeclared(_seat_run(sb, "off", "builder", cwd=foreign / "src", KORUS_SEAT="special9"))
 
 
 @pytest.mark.parametrize("label", ["marker", "korus_seat"])
@@ -444,10 +448,11 @@ def test_an_unreadable_foreign_roster_gives_no_instruction(sb: Sandbox, label: s
     proc = _seat_run(sb, "off", "builder", cwd=foreign / "src", **env)
     assert proc.stdout == "", (proc.stdout, proc.stderr)
     assert VETO not in proc.stderr, proc.stderr
-    # The fault names the roster it could not read: the JSON error alone names no file.
+    # The fault names the roster it could not read, the cwd's and not this script's: the JSON error
+    # alone names no file, and the sandbox's own roster path holds 'foreign' through tmp_path.
     fault = [line for line in proc.stderr.splitlines() if "no skill instruction" in line]
     assert len(fault) == 1, proc.stderr
-    assert "foreign" in fault[0] and "seats.json" in fault[0], fault[0]
+    assert re.search(r"[\\/]foreign[\\/]docs[\\/]roles[\\/]seats\.json", fault[0]), fault[0]
     # The control: the same setup with a readable roster prints the instruction, so the roster's
     # content is what silenced it above.
     roster.write_text(json.dumps({"aliases": {}}), encoding="utf-8")

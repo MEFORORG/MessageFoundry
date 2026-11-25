@@ -33,9 +33,9 @@
     seat; for a `cwd` in another repository's checkout, or one whose common dir cannot be read, the
     seat comes from $env:KORUS_SEAT, read against this script's roster and that checkout's, else
     it is undeclared. That checkout's marker cannot name the seat, but one naming Special, or an
-    alias of Special in either roster, still vetoes the instruction. A fault on this path prints no instruction, so it
-    fails toward no instruction rather than a wrong one. It never runs while the
-    switch reads ON.
+    alias of Special in either roster, still vetoes the instruction. A fault on this path prints
+    no instruction, so it fails toward no instruction rather than a wrong one. It never runs while
+    the switch reads ON.
 
     It writes nothing. Of local state it reads at least the seat marker, the roster and the `.git`
     entries above the hook input's `cwd`, and no coordination state, so it runs in a cloud session
@@ -160,7 +160,7 @@ function Get-SkillInstructionSource {
         # repository check. The cwd's roster only adds vetoes here, for the marker and for
         # $env:KORUS_SEAT alike, so a fault reading it, like one reading this script's roster or
         # the marker, throws, and no instruction is printed.
-        # Like the marker it vetoes as, it outranks $env:KORUS_SEAT. The cost is accepted: a stale
+        # A marker veto, like the marker, outranks $env:KORUS_SEAT. The cost is accepted: a stale
         # Special marker in a shared foreign checkout silences a non-Special seat there too.
         $anyLabel = -not ([string]::IsNullOrWhiteSpace($raw) -and [string]::IsNullOrWhiteSpace($env:KORUS_SEAT))
         if ($anyLabel -and (Test-Path -LiteralPath $theirSeats -PathType Leaf)) {
