@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``store/metadata.py`` JSON hardening: no bare NaN/Infinity token from the reference sink (BACKLOG
-#6711), and deeply nested JSON never escapes the three decoders as json's ``RecursionError`` (BACKLOG
-#6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and ``user_metadata``
-raise ``MetadataTooDeepError``."""
+#6711), and deeply nested JSON does not escape the decoders tested here as json's ``RecursionError``
+(BACKLOG #6712): the header decoder reads it as malformed, while ``merge_user_metadata`` and
+``user_metadata`` raise ``MetadataTooDeepError``. ``intake_of`` is another reader of the same cell and
+is not covered here."""
 
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from messagefoundry.config.settings import EgressSettings, ReferenceSettings
 from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
-from messagefoundry.store import OutboxStatus, Stage
+from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store import metadata as metadata_module
 from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.metadata import (
@@ -33,7 +34,12 @@ from messagefoundry.store.metadata import (
     user_metadata,
 )
 from messagefoundry.store.store import MessageStore
-from tests.test_delivery_fault_classification import DEST, _hl7, _Sender
+from tests.test_delivery_fault_classification import (
+    DEST,
+    _hl7,
+    _last_error_and_attempts,
+    _Sender,
+)
 from tests.test_delivery_fault_classification import _runner as _fault_runner
 from tests.test_delivery_fault_classification import _status as _outbox_status
 from tests.test_metadata_bag import _to_routed
@@ -314,7 +320,14 @@ async def test_the_delivery_worker_takes_a_too_deep_bag_on_its_internal_error_ar
 
         assert got is outcome and retry_until is None
         assert await _outbox_status(store, mid) == status.value
+        assert await _outbox_status(store, ctl) == OutboxStatus.DONE.value
         assert len(sender.sent) == 1  # only the control was sent
+        # The refusal itself took the arm, not some other fault on the same row.
+        last_error, _ = await _last_error_and_attempts(store, mid)
+        assert "MetadataTooDeepError" in last_error
+        if policy is None:
+            msg = await store.get_message(mid)
+            assert msg is not None and msg["status"] == MessageStatus.ERROR.value
     finally:
         await store.close()
 
