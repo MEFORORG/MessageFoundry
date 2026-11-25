@@ -509,6 +509,10 @@ def exchange_code(
     except urllib.error.HTTPError as exc:
         # Read the RFC 6749 error code only; never the body verbatim (may echo request params).
         # HTTPError is an OSError, so this arm must stay above the transport arm.
+        # Close the unread reply, and its socket with it, here rather than when the last reference
+        # goes (BACKLOG #6903). CPython frees it at this arm's end today; the close keeps that true
+        # if a later edit holds the error past the arm.
+        exc.close()
         status = exc.code
         refusal = f"token endpoint returned HTTP {exc.code}"
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
