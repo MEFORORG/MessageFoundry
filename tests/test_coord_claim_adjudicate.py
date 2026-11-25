@@ -969,7 +969,17 @@ def test_a_stale_local_branch_does_not_hide_unmerged_commits_on_origin(
     git(repo, "branch", "-f", "seat", "main")
     write_claim(repo, "68", tmp_path / "gone", "seat")
     why = rows(repo)["68"]["why"]
-    assert "'seat' carries 1 commit(s)" in why, why
+    assert "1 commit(s) origin/main lacks at refs/remotes/origin/seat" in why, why
+    assert "0 commit(s) origin/main lacks at refs/heads/seat" in why, why
+
+
+def test_a_local_only_branch_is_counted_without_an_origin_copy(repo: Path, tmp_path: Path) -> None:
+    """The positive arm: with no origin copy the probe of the missing ref must not fail the run."""
+    backlog(repo, f"## 71. Open\n\n> {PRIORITIZED} open\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "71", tmp_path / "gone", "seat")
+    why = rows(repo)["71"]["why"]
+    assert "'seat' carries 1 commit(s) origin/main lacks --" in why, why
 
 
 def test_claims_with_no_branch_are_not_rolled_up_as_one_branch_decision(
@@ -988,10 +998,39 @@ def test_claims_with_no_branch_are_not_rolled_up_as_one_branch_decision(
     assert "records no branch" in proc.stdout, proc.stdout
 
 
-def test_the_release_command_quotes_the_script_path(repo: Path, tmp_path: Path) -> None:
+def test_the_printed_release_command_runs_as_pasted_from_an_awkward_path(
+    repo: Path, tmp_path: Path
+) -> None:
     """MUST TRIP on origin/main (BACKLOG #7563 part 4): the path was printed bare, so a checkout
-    under a directory holding a space printed a command that does not run as pasted."""
+    under a directory holding a space printed a command that does not run as pasted. The sandbox is
+    moved under a name holding a space and an apostrophe, and the printed line is then run."""
     backlog(repo, f"## 22. A thing\n\n> {SHIPPED} shipped\n\nbody\n")
     write_claim(repo, "22", tmp_path / "gone", "seat")
-    out = adjudicate(repo).stdout
-    assert re.search(r"-File '[^']+claim\.ps1' -Release 22 -Force", out), out
+    moved = tmp_path / "o'brien dir" / "repo"
+    shutil.copytree(repo, moved)
+    proc = adjudicate(moved)
+    assert proc.returncode == 0, proc.stderr
+    line = next((ln.strip() for ln in proc.stdout.splitlines() if "-Release 22 -Force" in ln), "")
+    assert line.startswith("pwsh -NoProfile -File '"), proc.stdout
+    ran = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", line],
+        cwd=str(moved),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=TIMEOUT,
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert not (moved / ".git" / "mefor-coord" / "claims" / "22.json").exists(), ran.stdout
+
+
+def _ps_function(path: Path, name: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"function {name}(")
+    return text[start : text.index("\n}\n", start) + 2]
+
+
+def test_the_key_file_fold_is_claim_ps1s_own() -> None:
+    """The copy here must fold a -Key exactly as claim.ps1 names the file, or -Key drops the key's
+    own unreadable claim."""
+    assert _ps_function(ADJUDICATE, "ConvertTo-KeyFile") == _ps_function(CLAIM, "ConvertTo-KeyFile")

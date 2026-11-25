@@ -410,8 +410,17 @@ foreach ($line in (& git -C $repo worktree list --porcelain)) {
 }
 
 $rows = @()
-# claim.ps1's ConvertTo-KeyFile, restated: the file name a key is written under.
-$keyFile = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
+# A COPY of claim.ps1's ConvertTo-KeyFile, which cannot be dot-sourced because it runs on load.
+# tests/test_coord_claim_adjudicate.py holds the two bodies equal. It names the file a -Key is
+# written under, which is all an unreadable claim leaves to filter on.
+function ConvertTo-KeyFile([string]$Key) {
+    $safe = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
+    if (-not $safe) { throw "Key '$Key' reduces to nothing usable -- pick something with letters or digits." }
+    $safe
+}
+# A -Key that folds to nothing names no file, so no unreadable claim matches it.
+$keyFile = ""
+if ($Key) { try { $keyFile = ConvertTo-KeyFile $Key } catch { $keyFile = "" } }
 $files = @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)
 foreach ($f in $files) {
     $k = $f.BaseName
@@ -511,19 +520,25 @@ foreach ($f in $files) {
     else {
         # BOTH copies of the branch, spelled in full (BACKLOG #7563). Probing the local branch first and
         # alone let a stale local copy at main read "no commit" while origin held the unmerged work,
-        # and a bare name resolves to a tag of that name first. The count is the UNION of the two
-        # against main, so a diverged pair is not under-counted either.
-        $ahead = $null
+        # and a bare name resolves to a tag of that name first. Each copy is counted on its own, so a
+        # rebased pair is neither under- nor double-counted. for-each-ref lists the refs that exist
+        # and exits 0 either way, so a missing copy is not a native-command failure; it also matches
+        # under a `/` boundary, hence the exact compare.
+        $counts = [ordered]@{}
         if ($branch) {
-            $refs = @(foreach ($cand in @("refs/heads/$branch", "refs/remotes/origin/$branch")) {
-                    if (& git -C $repo rev-parse --verify --quiet "$cand^{commit}") { $cand }
-                })
-            if ($refs.Count) { $ahead = [int](& git -C $repo rev-list --count "^$mainSha" @refs) }
+            $want = @("refs/heads/$branch", "refs/remotes/origin/$branch")
+            foreach ($ref in @(& git -C $repo for-each-ref --format='%(refname)' @want)) {
+                if ($want -ccontains $ref) { $counts[$ref] = [int](& git -C $repo rev-list --count "$mainSha..$ref") }
+            }
         }
+        $distinct = @($counts.Values | Select-Object -Unique)
         $aheadTxt = if (-not $branch) { "the claim records no branch" }
-                    elseif ($null -eq $ahead) { "branch '$branch' is on neither this clone nor origin" }
-                    elseif ($ahead -eq 0) { "'$branch' carries no commit $mainRef lacks" }
-                    else { "'$branch' carries $ahead commit(s) $mainRef lacks" }
+                    elseif (-not $counts.Count) { "branch '$branch' is on neither this clone nor origin" }
+                    elseif ($distinct.Count -gt 1) {
+                        "'$branch' carries " + ((@($counts.Keys) | ForEach-Object { "$($counts[$_]) commit(s) $mainRef lacks at $_" }) -join ' and ')
+                    }
+                    elseif ($distinct[0] -eq 0) { "'$branch' carries no commit $mainRef lacks" }
+                    else { "'$branch' carries $($distinct[0]) commit(s) $mainRef lacks" }
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = $block.File; banner = $bannerState; citations = $cites; verdict = "BLOCKING"
             why = "item reads $bannerState on $ledgerAt and $aheadTxt -- so the key is unclaimable by any future session while nothing on $ledgerAt protects it" }
@@ -599,7 +614,8 @@ if ($sup.Count) {
         Write-Host ("  {0,-18} {1}   [{2}]" -f $r.key, $r.banner, $r.item) -ForegroundColor Green
         Write-Host ("  {0,-18} {1}" -f "", $r.why)
         # Single-quoted, so a path holding a space, `$` or a backtick pastes as one literal argument.
-        Write-Host ("  {0,-18} pwsh -NoProfile -File '{1}' -Release {2} -Force" -f "", ($claimTool -replace "'", "''"), $r.key) -ForegroundColor Cyan
+        # Every character PowerShell reads as a single quote is doubled, the curly ones included.
+        Write-Host ("  {0,-18} pwsh -NoProfile -File '{1}' -Release {2} -Force" -f "", ($claimTool -replace "['‘’‚‛]", '$0$0'), $r.key) -ForegroundColor Cyan
         Write-Host ""
     }
 }
