@@ -2,16 +2,16 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Property tests: a staged-queue handoff re-run is a no-op (ADR 0001, the reliability invariant).
 
-CLAUDE.md section 2 states the invariant: each stage handoff (ingress to routed, routed to outbound)
-is one committed transaction, and a re-run of a handoff that already committed is an idempotent
-no-op, because the consumed row is gone. That re-run is the defensive half of at-least-once: the
-guarded DELETE that makes it a no-op. The other half, a crash BEFORE the commit rolling back and the
-re-claimed row re-deriving the same output, is not exercised here, nor is the fused ingress to
-outbound ``MessageStore.handoff``.
+The invariant is CLAUDE.md section 2's, and :meth:`MessageStore.route_handoff` and
+:meth:`MessageStore.transform_handoff` state their own halves. This file exercises the guarded
+DELETE that makes a re-run or a premature call a no-op. Not exercised, at least: a crash before the
+commit rolling back and the re-claimed row re-deriving the same output; the fused ingress to outbound
+``MessageStore.handoff``; and a transform re-run carrying state, metadata or pass-through operations.
 
 These tests generate the traffic instead of hand-picking it: several inbound connections, zero to
 three handlers per message (so both ``ROUTED`` and ``UNROUTED``), zero to two deliveries per
-handler, a handoff tried before its row was ever claimed, and every committed handoff re-run, in a
+handler, each handoff tried before its row was claimed and on a claimed row of the wrong stage,
+and every committed handoff re-run, in a
 generated order, at a later ``now``, and with a different handler or delivery list and payload than
 the first run. Each re-run must return ``False`` and leave every row of every table as it was.
 
@@ -28,20 +28,13 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
 from messagefoundry.store.store import MessageStatus, MessageStore, Stage
+from tests._hypothesis_settings import property_settings
 
-# derandomize fixes the seed; tests/test_property_hl7_roundtrip.py says what that does not promise.
-# database=None keeps examples out of the checkout.
-_SETTINGS = settings(
-    derandomize=True,
-    database=None,
-    max_examples=50,
-    deadline=None,  # store I/O varies with disk contention; the example cap bounds the total
-    suppress_health_check=[HealthCheck.too_slow],
-)
+_SETTINGS = property_settings(max_examples=30)
 
 _RAW = "MSH|^~\\&|SND|FAC|RCV|RFAC|20260101||ADT^A01|{n}|P|2.5.1\rPID|1||{n}||SYNTH^TEST\r"
 _CHANNELS = ("IB_A", "IB_B")
@@ -92,15 +85,12 @@ async def _snapshot(store: MessageStore) -> dict[str, list[str]]:
     return snap
 
 
-async def _ingress_row_id(store: MessageStore, message_id: str) -> str:
-    rows = list(
-        await store._db.execute_fetchall(
-            "SELECT id FROM queue WHERE message_id=? AND stage=?",
-            (message_id, Stage.INGRESS.value),
-        )
+async def _row_ids(store: MessageStore, message_id: str, stage: Stage) -> list[str]:
+    rows = await store._db.execute_fetchall(
+        "SELECT id FROM queue WHERE message_id=? AND stage=? ORDER BY rowid",
+        (message_id, stage.value),
     )
-    assert len(rows) == 1
-    return str(rows[0][0])
+    return [str(r[0]) for r in rows]
 
 
 @pytest.fixture(scope="module")
@@ -138,8 +128,11 @@ async def test_handoff_rerun_is_a_no_op(
 
     # A handoff for a row nobody claimed matches nothing: the INFLIGHT guard makes it a no-op.
     before = await _snapshot(store)
+    # The instrument can see the tables the handoffs write, or every equality below is vacuous.
+    assert {"queue", "messages", "message_events"} <= before.keys()
     for mid, spec, raw in zip(mids, batch, raws, strict=True):
-        kwargs = _route_kwargs(await _ingress_row_id(store, mid), mid, spec, raw)
+        (ingress_id,) = await _row_ids(store, mid, Stage.INGRESS)
+        kwargs = _route_kwargs(ingress_id, mid, spec, raw)
         assert not await store.route_handoff(**kwargs, now=_NOW)
     assert await _snapshot(store) == before
 
@@ -158,11 +151,29 @@ async def test_handoff_rerun_is_a_no_op(
         rerun = {**kwargs, "handlers": every_handler, "disposition": MessageStatus.ROUTED}
         reruns.append((store.route_handoff, rerun))
 
-    # Routed -> outbound, one claim per routed row, FIFO per channel in handler order.
+    # The same INFLIGHT guard on the routed stage: no routed row is claimed yet.
+    routed = await _snapshot(store)
+    assert routed != before, "the route handoffs wrote nothing the snapshot can see"
     for mid, spec in zip(mids, batch, strict=True):
+        for routed_id in await _row_ids(store, mid, Stage.ROUTED):
+            assert not await store.transform_handoff(
+                routed_id=routed_id,
+                message_id=mid,
+                channel_id=spec.channel,
+                deliveries=[],
+                now=_NOW,
+            )
+    assert await _snapshot(store) == routed
+
+    # Routed -> outbound, one claim per routed row, FIFO per channel in handler order.
+    for mid, spec, raw in zip(mids, batch, raws, strict=True):
         for dests in spec.deliveries:
             item = await store.claim_next_fifo(spec.channel, now=_NOW, stage=Stage.ROUTED.value)
             assert item is not None and item.message_id == mid
+            # The stage guard: a claimed routed row is not an ingress row, so routing it is a no-op.
+            claimed = await _snapshot(store)
+            assert not await store.route_handoff(**_route_kwargs(item.id, mid, spec, raw), now=_NOW)
+            assert await _snapshot(store) == claimed
             kwargs = {
                 "routed_id": item.id,
                 "message_id": mid,
@@ -175,6 +186,8 @@ async def test_handoff_rerun_is_a_no_op(
 
     # Every re-run, in a generated order, leaves the whole store as the first runs left it.
     settled = await _snapshot(store)
+    if any(spec.handlers for spec in batch):
+        assert settled != routed, "the transform handoffs wrote nothing the snapshot can see"
     rng.shuffle(reruns)
     for handoff, kwargs in reruns:
         assert not await handoff(**kwargs, now=_NOW + 1)

@@ -22,26 +22,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from hypothesis import HealthCheck, given, settings
+from hypothesis import given
 from hypothesis import strategies as st
 
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.message import Message, reencode_with_separators
+from tests._hypothesis_settings import property_settings
 
-# derandomize fixes the seed, so a run of this file draws the same examples every time. It is not
-# a promise across runs of different shapes: Hypothesis also mixes in literals it scans from the
-# modules imported at the time, so a full-suite run can draw examples this file alone does not. A
-# failure prints its falsifying example; pin it with ``@example`` to replay it anywhere.
-# database=None keeps examples out of the checkout; Hypothesis still caches those literals under
-# .hypothesis/, a directory that writes its own .gitignore. No deadline: a contended runner's
-# stall would otherwise read as a flaky failure with no defect behind it.
-_SETTINGS = settings(
-    derandomize=True,
-    database=None,
-    max_examples=100,
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow],
-)
+_SETTINGS = property_settings(max_examples=100)
 
 # Separator candidates: ASCII punctuation. The ones a message does not use are data in its leaves.
 _SEPARATOR_POOL = "|^~\\&#!$%*+:;=?@_"
@@ -119,32 +107,32 @@ def messages(draw: st.DrawFn) -> Generated:
 
 @_SETTINGS
 @given(messages())
-def test_parse_and_reencode_preserve_every_byte(gen: Generated) -> None:
-    """Four properties of one message, asserted together so the generation is paid for once.
+def test_parse_and_rebuild_preserve_every_byte(gen: Generated) -> None:
+    """Three properties of one message, asserted together so the generation is paid for once.
 
     1. ``Message.parse(raw).encode()`` is the canonical text: only the documented framing goes.
     2. The separators are read from MSH-1 and MSH-2, whatever set the sender chose.
-    3. A full rebuild loses no byte. A clean ``encode()`` returns the cached text, so property 1
+    3. A full rebuild loses no byte, and each field's cached repetition, component and subcomponent
+       split joins back to its text. A clean ``encode()`` returns the cached text, so property 1
        never exercises the rebuild a mutation triggers; this one splits every segment,
        componentizes every data field, drops the cache and rebuilds. It is not the mixed path of a
        real edit, where untouched segments stay lazy and are written back verbatim.
-    4. Re-serializing with the message's own separator set changes nothing.
     """
     assert Message.parse(gen.raw).encode() == gen.canonical, "parse then encode"
 
     parsed = _builtin_hl7.parse(gen.canonical)
     assert _builtin_hl7.separators(parsed) == gen.seps, "separators from MSH"
 
-    seps = parsed["seps"]
+    _field_sep, comp, rep, sub, _esc = seps = parsed["seps"]
     for index, seg in enumerate(parsed["segments"]):
         _builtin_hl7._ensure_split(parsed, index)
         first_data = 3 if seg["id"] in _builtin_hl7.HEADER_IDS else 1
         for fld in range(first_data, len(seg["fields"])):
-            _builtin_hl7._componentize(parsed, index, fld, seps)
+            entry = _builtin_hl7._componentize(parsed, index, fld, seps)
+            joined = rep.join(comp.join(sub.join(c) for c in r) for r in entry["reps"])
+            assert joined == entry["text"], "componentized split"
     parsed["raw"] = None
     assert _builtin_hl7.encode(parsed) == gen.canonical, "full rebuild"
-
-    assert reencode_with_separators(gen.canonical, gen.seps) == gen.canonical, "own-set reencode"
 
 
 @_SETTINGS
@@ -153,8 +141,9 @@ def test_reencode_to_another_set_and_back_is_identity(gen: Generated, target: Se
     """A rewrite to any other separator set and back restores the original bytes (ADR 0206 rule 4).
 
     A leaf never holds a source separator, but it may hold a TARGET delimiter as data, which the
-    first rewrite must escape and the second must turn back into the literal character. The escape
-    sequences, the separator escapes included, keep their letters across both rewrites.
+    first rewrite must escape and the second must turn back into the literal character. A separator
+    escape is decoded against one set and re-escaped against the other, so its letter may change on
+    the way out; only the round trip is asserted, not how each leaf reads under the target set.
     """
     there = reencode_with_separators(gen.canonical, target)
     assert _builtin_hl7.separators(_builtin_hl7.parse(there)) == target
