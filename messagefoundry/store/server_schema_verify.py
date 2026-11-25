@@ -53,8 +53,8 @@ Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFA
 or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
 ``/*`` inside a block comment, even a balanced one, since both servers nest them, and a line
 comment holding a NUL, or a CR or other line break that is not part of a run of CRs reaching the
-LF or the end of the batch that closes the comment. A unit test reads each shipped batch, so a new
-form fails there before it reaches an open.
+LF that closes the comment or the end of the comment's entry in the batch. A unit test reads each
+shipped batch, so a new form fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
 before it, is read as reaching every store, and one with anything before it, even a statement a
@@ -72,12 +72,13 @@ variable holds is read as run by an ``EXEC`` of that variable whatever the text 
 to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; the comment
 reader ends a ``[`` at its first ``]`` on both servers, so after a SQL Server ``]]`` escape a
 ``--``, or a ``/*`` that a later ``*/`` closes, is read as a comment and hides the DDL after it,
-a ``"`` there opens a quote that can hide a real comment, so DDL the server skips is read as run,
-and a ``'`` there opens a string the server does not see, which hides no comment, since a marker
-inside one raises, but pairs the ``'`` of a later real literal as its close, so a ``--`` inside that
-literal is read as a comment and hides the DDL after it, and on PostgreSQL a comment inside an
-``ARRAY[...]`` or subscript is read as part of a name and the DDL it comments out as run; and a
-``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
+and a ``"`` or ``'`` there opens a quote the server does not see, which raises as unterminated
+unless a second unpaired quote of the same kind follows, and given one, a ``"`` can hide a real
+comment, so DDL the server skips is read as run, and a ``'``, which hides no comment, since a
+marker inside one raises, can pair the ``'`` of a later real literal as its close, so a ``--``
+inside that literal is read as a comment and hides the DDL after it, and on PostgreSQL a comment
+inside an ``ARRAY[...]`` or subscript is read as part of a name and the DDL it comments out as
+run; and a ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
 ``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
 a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
 
@@ -239,10 +240,10 @@ _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "t
 _DDL_OBJECT = re.compile(
     r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
 )
-#: Characters that may end a ``--`` comment on some server, or cut a batch, where the reader ends
-#: one at LF alone. PostgreSQL ends one at CR as well, and SQL Server's reading of a CR is not
-#: relied on; the rest are refused for the same reason
-#: ``transports/database.py`` refuses them.
+#: Characters a ``--`` comment may not hold, because the reader ends one at LF alone and a server
+#: may end it sooner. PostgreSQL ends one at CR as well, and SQL Server's reading of a CR is not
+#: relied on; the rest are refused for the same reason ``transports/database.py`` refuses them.
+#: They are refused only inside a ``--`` comment, not elsewhere in the batch.
 _OTHER_LINE_BREAKS: Final = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
 
