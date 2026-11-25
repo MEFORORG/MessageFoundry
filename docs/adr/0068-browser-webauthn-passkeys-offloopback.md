@@ -795,10 +795,10 @@ counter and re-keys the session, and once the re-key succeeds it records the req
 the account's known-address record, under the conditions `_mark_login_address_known` states (vault
 BACKLOG #2145). It moves no anchor and no window. So, unlike a TOTP code on any session but an
 `oidc` one, a passkey never renews a window once the factor is met. `POST /ui/mfa` no longer re-renders the gate for a session that has
-already met its factor: a refused code there lands on `/ui`, as the page's GET does, with a
-notice that the session needed no code (vault BACKLOG #2964 item 21). Not every such session gets
-the notice: at least an `oidc` session on an account with TOTP enrolled, whose code is within the
-form's length bound, is refused unread and lands on a bare `/ui` without it (ADR 0142 Amendment F).
+already met its factor: a refused code there lands on `/ui`, as the page's GET does. It carries a
+notice that the session needed no code (vault BACKLOG #2964 item 21), except at least on an `oidc`
+session on an account with TOTP enrolled: a code there within the form's length bound is refused
+unread and lands on a bare `/ui` without it (ADR 0142 Amendment F).
 
 Unchanged: enrolment, TOTP confirm and passkey registration alike, does not re-anchor, since ADR
 0197 Amendment A lets a holder of the password alone enrol. The combined password-and-passkey

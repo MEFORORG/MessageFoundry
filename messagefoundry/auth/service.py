@@ -18338,7 +18338,8 @@ class AuthService:
         #2142, ADR 0142 Amendment F). It still marks a pending factor met and rotates the session,
         but it neither stamps ``reauth_at`` nor re-anchors the session's address: that session steps
         up, and moves its anchor, only at the IdP (:meth:`complete_oidc_step_up`). On such a session
-        that has already met its factor the code would do nothing, so it is refused unread with
+        that has already met its factor, on an account with TOTP on (the ``totp_enabled`` check
+        comes first), the code would do nothing, so it is refused unread with
         ``idp_step_up_required`` (:meth:`_code_owes_nothing_to_oidc_session`). Every other
         session's code opens the window as before.
 

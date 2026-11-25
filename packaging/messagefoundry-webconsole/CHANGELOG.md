@@ -303,8 +303,9 @@ this line.**
 
 ### Fixed
 
-- **A refused code on a verified session no longer lands as a success does, except at least on an
-  `oidc` session with TOTP enrolled (vault BACKLOG #2964 item 21).**
+- **A refused code on a verified session no longer lands as a success does, except at least for a
+  code within the length bound on an `oidc` session with TOTP enrolled (vault BACKLOG #2964 item
+  21).**
   `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
   the same landing a success gets, so the refusal showed nothing. It now lands on
   `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not

@@ -2022,8 +2022,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
         # The submitted code is NOT echoed back — it is a bearer credential. verify_mfa has audited
-        # the failure of a code within the bound, except at least on an account with TOTP off,
-        # for example a passkey-only one, where it returns before any audit. Generic copy: the
+        # the failure of a code within the bound, except at least on an account it found with TOTP
+        # off at its first read, for example a passkey-only one, where it returned before any
+        # audit. Generic copy: the
         # form cannot say whether the code was wrong or expired without narrowing a guess. A
         # directory refusal narrows nothing, because the code was never checked (BACKLOG #2023),
         # so it says what did happen.
