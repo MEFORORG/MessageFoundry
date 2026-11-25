@@ -271,7 +271,14 @@ def _drop_redundant_archive(
     claim = f"{dest}.{os.getpid()}-{time.monotonic_ns()}{_CLAIM_SUFFIX}"
     try:
         os.rename(dest, claim)
-    except OSError:
+    except OSError as exc:
+        if isinstance(exc, FileNotFoundError) and not os.path.lexists(dest):
+            # Gone since it was validated (a peer's `app_log_days` sweep, say), so nothing is kept.
+            # False, as for an archive already gone at the read above: no claim was taken, and a peer
+            # compressor holding it under its own claim may yet put it back. `lexists` because Windows
+            # also maps a too-long claim path or a lost share to FileNotFoundError, `dest` still there.
+            log.debug("app-log %r: the archive %r was already gone", name, os.path.basename(dest))
+            return False
         log.warning(
             "app-log %r: the redundant archive %r could not be claimed for removal; it is kept",
             name,
@@ -306,7 +313,8 @@ def _drop_redundant_archive(
     except OSError:
         log.warning(
             "app-log %r: the source or the claimed archive changed while the archive was being "
-            "removed, and the archive could not be put back; it is KEPT as %r for an operator",
+            "removed, and the archive could not be put back; it is KEPT as %r until an operator acts "
+            "or, where app_log_days is set, its sweep ages it out",
             name,
             os.path.basename(claim),
         )
@@ -319,7 +327,7 @@ def _drop_redundant_archive(
     except OSError:
         log.warning(
             "app-log %r: the claimed archive %r was linked back but could not be removed; it is KEPT "
-            "for an operator",
+            "until an operator acts or, where app_log_days is set, its sweep ages it out",
             name,
             os.path.basename(claim),
         )
@@ -1663,8 +1671,8 @@ class RetentionRunner:
                 return None
             log.warning(
                 "app-log %r: the source %s after its archive was placed; the source path is left "
-                "alone and NOT counted as compressed. %r, or a claim name logged above, holds the "
-                "bytes read before that, unless a WARNING above says the claim is gone.",
+                "alone and NOT counted as compressed. The bytes read before that may remain in the "
+                "source, at %r, or under a claim name logged above.",
                 name,
                 change,
                 os.path.basename(dest),

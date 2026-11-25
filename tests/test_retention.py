@@ -2234,6 +2234,86 @@ def test_drop_redundant_archive_counts_a_claim_a_peer_already_removed(
     assert "could not be removed" not in caplog.text
 
 
+@pytest.mark.parametrize("dest_gone", [True, False])
+def test_drop_redundant_archive_reports_an_archive_gone_before_its_claim(
+    tmp_path, monkeypatch, caplog, dest_gone: bool
+) -> None:
+    """An archive removed (by a peer engine shard's ``app_log_days`` sweep, say) after it was
+    validated and before it could be claimed is reported as already gone, never as kept: no file
+    remains to keep. A FileNotFoundError with the archive still there (Windows raises it for a claim
+    path too long, say) is still reported as kept (BACKLOG #6805)."""
+    source, dest, read_st, data = _claim_fixture(tmp_path)
+    real_rename = os.rename
+
+    def peer_sweeps_then_rename(src, dst, *args, **kwargs):
+        if str(src) == str(dest):
+            if not dest_gone:
+                raise FileNotFoundError("the claim path is too long")
+            dest.unlink()  # the peer wins the race; the rename below raises FileNotFoundError
+        real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", peer_sweeps_then_rename)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        assert_capture_sees(caplog, retention_mod.__name__)
+        dropped = retention_mod._drop_redundant_archive(
+            str(source), read_st, data, str(dest), name="old.log"
+        )
+
+    assert dropped is False
+    assert not list(tmp_path.glob("*.mfclaim"))
+    gone_line = "the archive 'old.log.gz' was already gone"
+    if dest_gone:
+        assert not dest.exists()
+        assert gone_line in caplog.text
+        assert "it is kept" not in caplog.text and "could not be claimed" not in caplog.text
+    else:
+        assert gzip.decompress(dest.read_bytes()) == data
+        assert gone_line not in caplog.text
+        assert "could not be claimed for removal; it is kept" in caplog.text
+
+
+async def test_app_log_compression_does_not_say_a_gone_archive_holds_the_bytes(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """When the source changed after its archive was placed and the archive is gone (a peer engine
+    shard's ``app_log_days`` sweep, say) before the redundant-archive removal reads it, the WARNING
+    must not say the archive holds the bytes read: nothing is there, and the kept source holds them
+    (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    archive = logs / "old.log.gz"
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate_then_sweep(path, original, *, name):
+        if not path.endswith(".mftmp") and expected and archive.exists():
+            archive.unlink()  # the peer's sweep, before the removal's first read of `dest`
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            expected.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate_then_sweep)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]  # the source is kept
+    assert not archive.exists() and not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+    assert "changed after its archive was placed" in caplog.text
+    assert "holds the bytes" not in caplog.text
+    assert "may remain in the source" in caplog.text
+
+
 def test_drop_redundant_archive_reports_a_claim_gone_before_its_put_back(
     tmp_path, monkeypatch, caplog
 ) -> None:
