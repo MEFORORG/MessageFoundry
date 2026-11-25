@@ -74,6 +74,7 @@ tests/test_ci_tooling_gate.py
 tests/test_ci_venv_pinning.py
 tests/test_ci_windows_smoke_mllp_read.py
 tests/test_cla_action_advisory_gate.py
+tests/test_cla_action_patches.py
 tests/test_cla_action_provenance.py
 tests/test_claim_check.py
 tests/test_claim_shared_registry.py

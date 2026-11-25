@@ -109,9 +109,9 @@ def _record_secured(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     secured: list[Path] = []
     real_secure = store_mod._secure_file
 
-    def secure(path: Path) -> None:
+    def secure(path: Path, **kw: bool) -> None:
         secured.append(Path(path))
-        real_secure(path)
+        real_secure(path, **kw)
 
     monkeypatch.setattr(store_mod, "_secure_file", secure)
     return secured

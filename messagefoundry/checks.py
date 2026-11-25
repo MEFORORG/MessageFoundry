@@ -1943,7 +1943,12 @@ def _check_dryrun(
 ) -> CheckResult:
     from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
-    from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_message_sets
+    from messagefoundry.pipeline.dryrun import (
+        dry_run,
+        dry_run_reference_view,
+        fixture_cap,
+        read_message_sets,
+    )
     from messagefoundry.redaction import safe_error
     from messagefoundry.store import MessageStatus
 
@@ -2026,6 +2031,20 @@ def _check_dryrun(
     asserted = (
         0  # runs checked against a declared .expect disposition (executable acceptance criteria)
     )
+    # Built once for the whole run, so each file-backed reference set is read once rather than once
+    # per fixture per inbound (BACKLOG #6820). Every fixture reads the same snapshot, and each read
+    # of a value decodes its own copy, as a read of the live engine's cache does. A loader fault the
+    # builder does not turn into a skipped set fails this leg, naming its type alone, rather than
+    # ending the report: per fixture it was an ERROR, through dry_run's own guard.
+    try:
+        reference_view = dry_run_reference_view(reg)
+    except Exception as exc:  # noqa: BLE001 - the type alone reaches the detail
+        return CheckResult(
+            "dryrun",
+            ok=False,
+            required=True,
+            detail=f"reference sets did not load for the preview ({type(exc).__name__})",
+        )
     for label, path, raw, target in message_sets:
         try:
             expected = _expected_disposition(path, cap=cap)
@@ -2037,7 +2056,13 @@ def _check_dryrun(
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
+            result = dry_run(
+                reg,
+                raw,
+                inbound=ic_name,
+                snapshot_on_send=snapshot_on_send,
+                reference_view=reference_view,
+            )
             # A Router/Handler's own `raise` can quote field values, so its text goes through
             # `safe_error` before it enters the detail string (BACKLOG #1668). **No `show_phi=` keyword,
             # and this surface must never grow one:** `check` is the commit/CI gate, its stdout lands in

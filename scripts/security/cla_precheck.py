@@ -3,10 +3,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Refuse a pull request whose CLA verdict the vendored action would get wrong (BACKLOG #5644, #5645).
 
-WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/dist/index.js``:
+WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/dist/index.js``. That
+bundle is a PATCHED FORK of upstream v2.6.1 since 2026-11-23 (owner ruling "Fork, patch,
+re-provenance"; BACKLOG #5644 item 2, #5645 item 2). The action's README lists the patches; the two bullets marked PATCHED
+below are them, and the other two describe upstream behaviour the fork keeps:
 
-  * ``getCommitters`` asks GraphQL for ``commits(first: 100)`` ONCE, with an empty cursor, and never
-    reads ``hasNextPage``, so a commit past the hundredth is never looked at.
+  * ``getCommitters`` asks GraphQL for ``commits(first: 100)`` and, PATCHED, follows ``hasNextPage``
+    to the end of the list. Upstream read one page with an empty cursor and never followed it.
+    GitHub's list stops at 250 commits (see the measurement below), so neither the action nor this
+    script checks an author first seen past commit 250.
   * ``extractUserFromCommit`` attributes each commit to ``author.user || committer.user || author ||
     committer``. A commit whose author email links to no account is therefore attributed to its
     COMMITTER's account when that one is linked, and to the raw git ``author.name`` only when
@@ -16,12 +21,13 @@ WHAT THE VENDORED ACTION DOES, read from ``.github/actions/cla-assistant-lite/di
     and drops id ``41898282``. That id is ``github-actions[bot]``, NOT ``web-flow`` (19864447,
     which ``tests/fixtures/branch_main.json`` records).
   * ``checkAllowList`` drops every committer whose ``name`` matches an allowlist entry, by string
-    equality or, for an entry holding ``*``, an UNANCHORED regular expression. For a commit nobody
+    equality or, for an entry holding ``*``, a regular expression that is, PATCHED, anchored to the
+    whole name (upstream's was unanchored, so ``bot*`` matched ``evilbot-x``). For a commit nobody
     is linked to, that name is free text the pull request's author chose.
 
 So a commit authored and committed under unlinked emails, with the git name set to an allowlisted
 login, is dropped as allowlisted and never needs a signature. This script applies two rules to
-EVERY commit, paging on ``hasNextPage``:
+EVERY commit it can read, paging on ``hasNextPage``:
 
   1. A commit whose AUTHOR is linked to no GitHub account is refused, whatever its committer or
      git name. The CLA binds the author, and an unlinked author can never be shown to have signed
@@ -29,9 +35,15 @@ EVERY commit, paging on ``hasNextPage``:
      2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
      author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
      either that is neither null nor an object, is a reply in the wrong shape and a fault.
-  2. A linked author first seen past the action's one page is refused only when absent from the
-     signature file the action keeps (below). The action's list is built as the action builds it,
-     from the FIRST PAGE only, first commit seen under each key.
+  2. A linked author first seen past the first page (as many commits as GitHub returned
+     first, at most 100) is refused only when
+     absent from the signature file the action keeps (below). The first page's keys are built as
+     the action builds its list, first commit seen under each key. Rule 2 was written for the
+     upstream action, which read that page only. The patched action now lists such an author
+     itself and asks them to sign, so rule 2 duplicates the action's own demand there rather than
+     adding to it; it is kept. It clears once the signature file holds the author's id. This
+     pre-check runs before the action step that writes that id, so the run on which the author
+     signs still refuses, and a later run (a recheck comment or a push) clears.
 
 It faults in at least these cases: the pull request's head moved while it read, it read fewer
 distinct commits than GitHub's ``totalCount``, or a commit's author or committer it needs could
@@ -63,8 +75,9 @@ does, so a GitHub outage, bad input or a bug in this script cannot wedge every p
 revert included. Exit 2 is NOT a fault: it is what the interpreter returns when it cannot open the
 script, so a renamed or deleted script fails the check instead of switching it off. The runner runs
 this with its system ``python3``, so the script keeps to Python 3.12 syntax;
-tests/test_cla_precheck.py parses it at that grammar. It does not patch the vendored bundle; the
-provenance gate forbids that.
+tests/test_cla_precheck.py parses it at that grammar. It does not itself change the vendored
+bundle. The bundle's patches are recorded in ``scripts/security/build_cla_action_provenance.py``,
+whose gate refuses any change to the bundle outside them.
 
 THE SIGNATURE FILE (rule 2) holds ``signedContributors`` ids, read over REST from the base
 repository's signature branch. A file GitHub answers 404 for holds no signatures, as the action
@@ -74,11 +87,15 @@ It CANNOT see a spoofed AUTHOR email. GitHub links a commit to an account by its
 author email set to an allowlisted account's address reads as that account, here and in the action
 alike. Only commit signature verification separates the two, and neither checks it.
 
-UNMEASURED: whether GitHub caps a pull request's commit connection (its REST listing stops at 250)
-and, if it does, whether ``totalCount`` reports the capped or the real count. Until it is measured a
-read short of ``totalCount`` is a FAULT (owner ruling 2026-11-13) and warns and passes. If
-``totalCount`` reports the CAPPED count, the read is not short, so commits past the cap go unchecked
-and the count check gives no warning.
+MEASURED 2026-11-23 (first by the patched-fork change's code review, then repeated by its Builder), with ``gh api graphql`` against a
+public pull request of 4096 commits (home-assistant/core 189294): the GraphQL commit connection
+returned 100, 100 and 50 commits, then ``hasNextPage`` false, while ``totalCount`` reported 4096 on
+every page. So GitHub stops the list at 250 and ``totalCount`` reports the real count. One pull
+request was read, so this is a reading, not a documented contract. A read short of ``totalCount``
+stays a FAULT that warns and passes (owner rulings 2026-11-13, "Wire, fail-open on fault", and
+2026-11-23 on BACKLOG #5645 item 1, "Warn and pass"). SO AN AUTHOR FIRST SEEN PAST COMMIT 250 IS NOT
+CHECKED, by this script or by the action: on such a pull request the ``cla`` check warns and can
+pass for an author who never signed.
 
 UNMEASURED: whether GitHub's GraphQL ``headRefOid`` or commit list trails the push event, and by
 how long. The waits in ``HEAD_RETRY_DELAYS`` are a guess. A ``headRefOid`` that still shows another
@@ -153,8 +170,9 @@ HEAD_RETRY_DELAYS = (5.0, 10.0)
 # Where a commit node sits in the reply, as a GraphQL error ``path`` names it.
 _NODES_PATH = ("repository", "pullRequest", "commits", "nodes")
 
-# The cursor is nullable: GitHub reads a null `after` as "from the start". The action's empty-string
-# cursor works only because it never asks for a second page.
+# The cursor is nullable: GitHub reads a null `after` as "from the start". The action declares its
+# cursor non-null and passes an empty string for the first page, which GitHub also reads as the
+# start (the 2026-11-23 measurement in the module docstring used that form).
 QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
   repository(owner: $owner, name: $name) {
@@ -214,7 +232,7 @@ class PullRequestRead:
     commits: list[Mapping[str, Any]]
     total: int
     head: str
-    #: How many commits the first page held. The action reads that page and no other.
+    #: How many commits the first page held. Rule 2 keys that page, first commit seen per key.
     first_page: int
     #: Indexes into ``commits`` that a GraphQL error points inside. They are not judged.
     tainted: frozenset[int] = frozenset()
@@ -256,8 +274,9 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
 
     A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
     chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
-    null person there would throw in the action: that is a fault here, and the commit keys nothing
-    in the action's view.
+    null person there would throw in the action. A null committer there is a fault here; the commit
+    keys nothing among the first page's keys. ``evaluate`` never calls this for a null author:
+    rule 1 refuses that commit first, and it is not also a fault.
     """
     author = _person(commit, "author")
     if author is None:
@@ -307,14 +326,19 @@ def _rule_one(commit: Mapping[str, Any]) -> str | None:
 
 
 def matches_allowlist(name: str, patterns: Iterable[str]) -> bool:
-    """Mirror ``isUserNotInAllowList``: equality, or an UNANCHORED regex for an entry with ``*``.
+    """Mirror ``isUserNotInAllowList``: equality, or for an entry with ``*`` a regex anchored to the
+    whole name, as the patched action anchors it (BACKLOG #5644 item 2).
 
     An empty entry is kept, as the action keeps it, so a doubled comma matches an empty name.
+    ``fullmatch`` stands for JavaScript's ``^...$`` without the ``m`` flag: neither lets a match
+    end before a trailing newline, which Python's ``$`` alone would.
     """
     for raw in patterns:
         pattern = raw.strip()  # the action trims each entry here, so the mirror does too
         if "*" in pattern:
-            if re.search(_JS_DOT_STAR.join(re.escape(part) for part in pattern.split("*")), name):
+            if re.fullmatch(
+                _JS_DOT_STAR.join(re.escape(part) for part in pattern.split("*")), name
+            ):
                 return True
         elif pattern == name:
             return True
@@ -506,15 +530,16 @@ def evaluate(
         oid = str(commit.get("oid", ""))
         oids.add(f"slot {index}" if index in read.tainted and not _SHA.fullmatch(oid) else oid)
     distinct = len(oids)
-    # A FAULT, not a refusal, until GitHub's commit cap is measured (owner ruling 2026-11-13): if
-    # GitHub stops the connection short of totalCount, refusing would fail every large PR closed.
+    # A FAULT, not a refusal (owner rulings 2026-11-13 and 2026-11-23): GitHub stops the connection
+    # at 250 commits while totalCount reports them all (measured; module docstring), so refusing
+    # would fail every larger PR closed. The commits past the stop are not checked.
     if complete and distinct != read.total:
         faults.append(
             f"read {distinct} distinct commits where the pull request has {read.total}; the "
             "unread commits are not checked"
         )
     # One slot per commit, None for a malformed one, so the first-page slice below never shifts a
-    # second-page commit into the action's view.
+    # second-page commit among the first page's keys.
     slots: list[Attribution | None] = []
     for index, commit in enumerate(read.commits):
         oid = commit.get("oid", "")
@@ -533,7 +558,7 @@ def evaluate(
         if refusal is not None:
             # Judged before the key below, so a commit whose committer cannot be read is refused.
             rule_one.append(refusal)
-            # Past the action's view, rule 2 judges linked authors only, so no rule reads this
+            # Past the first page, rule 2 judges linked authors only, so no rule reads this
             # commit's key, and an unreadable committer here is not a fault. A null author, which
             # the schema allows, has no key anywhere: the action would throw on it.
             if index >= read.first_page or commit["author"] is None:
@@ -542,14 +567,14 @@ def evaluate(
         try:
             slots.append(attribute(commit))
         except PrecheckFault as exc:
-            # Only an unlinked author on the action's page gets here, so its key, the committer's
-            # account the action would file it under, is then missing from the action's view.
-            faults.append(f"commit {oid}: {exc}; its key is missing from the action's view")
+            # Only an unlinked author on the first page gets here, so its key, the committer's
+            # account the action would file it under, is then missing from the first page's keys.
+            faults.append(f"commit {oid}: {exc}; its key is missing from the first page's keys")
             slots.append(None)
-    # The action's committer list: the FIRST page only, one key per `login || name`. A linked
+    # The first page's keys this read could form, one per `login || name`. A linked
     # author is attributed to their own account, so only the key set matters for rule 2.
     first_slots = slots[: read.first_page]
-    seen_by_action = {slot.name for slot in first_slots if slot is not None}
+    first_page_keys = {slot.name for slot in first_slots if slot is not None}
     # A first-page commit this read could not key (an error inside it, a malformed author or
     # committer) has an unknown key, and a null-author one, on which the action throws, has
     # none. A refusal below still holds, since an unsigned author owes a signature wherever the
@@ -570,21 +595,22 @@ def evaluate(
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
             continue  # rule 1 judged it above
-        if who.name in seen_by_action or who.database_id in checked:
+        if who.name in first_page_keys or who.database_id in checked:
             continue
         if who.database_id is None:
             # Linked, but with no integer id: the signature file cannot be checked for it, so
             # rule 2 cannot be judged, and skipping it in silence would read as a pass.
             faults.append(f"commit {who.oid}: its linked author has no integer databaseId")
             continue
-        # Rule 2: a linked author the action never reads, unless it would skip them anyway.
+        # Rule 2: a linked author first seen past the first page, unless the action would skip
+        # them anyway.
         checked.add(who.database_id)
         skipped = who.database_id == ACTIONS_BOT_ID or matches_allowlist(who.name, allowlist)
         if not skipped and has_signed(who) is False:
             rule_two.append(
-                f"commit {who.oid} is past the {read.first_page} commits the action reads, "
-                f"{where} its author's key {who.name!r} (the login, or else the git name, the "
-                f"action files a commit under), and {unsigned}"
+                f"commit {who.oid} is past the first {read.first_page} commits of this pull "
+                f"request, {where} its author's key {who.name!r} (the login, or else the git name, "
+                f"the action files a commit under), and {unsigned}"
             )
     # Interleaved, so the first annotations GitHub shows carry both rules' reasons, not one rule's.
     refusals = [

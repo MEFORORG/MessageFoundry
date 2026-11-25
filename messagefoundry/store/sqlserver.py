@@ -212,6 +212,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -3658,21 +3659,6 @@ def _any_grant(answers: str) -> str:
     )
 
 
-def _probed_grant(value: Any) -> bool | None:
-    """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
-    read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
-
-    ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` each return **NULL** — not 0 —
-    when the name they are asked about does not resolve *for this caller*: an unknown or renamed role,
-    a principal the caller cannot see, a permission name this server version does not carry. Folding
-    that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
-    clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
-    :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
-    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
-    return probed_grant(value)
-
-
 class SqlServerStore(ServerCipherWalk):
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -4893,23 +4879,20 @@ class SqlServerStore(ServerCipherWalk):
                     rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
                     if not rows:
                         break
-                    for r in rows:
-                        await cur.execute(
-                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
-                            (
-                                (
-                                    await self._aencrypt(
-                                        r["v"],
-                                        aad=(
-                                            aad_of(r)
-                                            if aad_of is not None
-                                            else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                        ),
-                                    )
-                                ),
-                                *(r[c] for c in keys),
-                            ),
-                        )
+                    async for chunk, sealed_values in seal_chunks(
+                        self._cipher,
+                        table,
+                        column,
+                        rows,
+                        aad_cols=aad_cols,
+                        aad_of=aad_of,
+                        local_whole_page=False,
+                    ):
+                        for value, r in zip(sealed_values, chunk, strict=True):
+                            await cur.execute(
+                                f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                                (value, *(r[c] for c in keys)),
+                            )
                     sealed += len(rows)
                 await self._commit(conn)
             except BaseException:
@@ -5298,15 +5281,25 @@ class SqlServerStore(ServerCipherWalk):
         SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
         than by role membership is still seen.
 
-        **A NULL column is NOT READ, and a read that is not complete is never ``OBSERVED``** (BACKLOG
-        #1234). All three built-ins answer NULL when the name does not resolve for the caller, so the
-        argument above — *an empty enumeration must not render as a clean bill of health* — was
-        defeated by its own replacement until this arm distinguished the three states. Any probed
-        grant that reads NULL makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named
-        grant by grant in the detail, because the documented grant is then genuinely UNVERIFIED: a
-        role that was never read is not a role the principal does not hold. Grants that DID read as
-        held are still reported, since a partial read can only understate an over-grant, never invent
-        one."""
+        **A NULL column is NOT READ, and so is any answer but 0 or 1** (BACKLOG #1234, #6015, by
+        :func:`~messagefoundry.sqlserver_roles.probed_grant`). All three built-ins answer NULL when
+        the name does not resolve for the caller, so the argument above — *an empty enumeration must
+        not render as a clean bill of health* — was defeated by its own replacement until this arm
+        distinguished the three states. A fixed role, ``CONTROL SERVER`` or database ``CONTROL``
+        that is not read is named grant by grant in the detail and in ``unread``: a role that was
+        never read is not a role the principal does not hold. With no over-grant read, that makes
+        the report :attr:`StorePrivilegeStatus.UNOBSERVABLE` (#1234). With one read, such as
+        ``sysadmin``, ``db_owner`` or a ``CONTROL``, the report stays ``OBSERVED`` with it in the
+        excess, so under enforce with no accepted opt-out the start refuses (owner ruling
+        2026-11-23 on #6015 item 1). A partial read can only understate an over-grant, never
+        invent one.
+
+        The grants that count only under ``external`` (``CREATE TABLE``, ``ALTER`` on the default
+        schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
+        weighed after the excess (#6714): unread with nothing else found, the report is
+        ``UNOBSERVABLE``; unread beside an over-grant that WAS read, it stays ``OBSERVED`` and names
+        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the
+        over-grant is weighed as one (under enforce with no accepted opt-out, the start refuses)."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
@@ -5326,7 +5319,9 @@ class SqlServerStore(ServerCipherWalk):
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # QUOTENAME (#6015 item 4), as the VIEW DEFINITION columns below and the proc-deploy
+            # guard pass their schema, so the schema probes quote one way.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema,"
             # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
             # provision-admin needs it, so under external the runtime login holding it is excess.
             " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
@@ -5342,27 +5337,27 @@ class SqlServerStore(ServerCipherWalk):
                 detail="the privilege query returned no row",
             )
         database = str(row["db_name"] or self._settings.database or "")
-        # Three-way, never two: held / not held / NOT READ. See _probed_grant for why a NULL folded to
+        # Three-way, never two: held / not held / NOT READ. See probed_grant for why a NULL folded to
         # False is a false-clean rather than a rounding error.
         unread: list[str] = []
         held_server: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
-            grant = _probed_grant(row[f"srv_{i}"])
+            grant = probed_grant(row[f"srv_{i}"])
             if grant is None:
                 unread.append(f"server role {name}")
             elif grant:
                 held_server.append(name)
         held_database: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
-            grant = _probed_grant(row[f"dbr_{i}"])
+            grant = probed_grant(row[f"dbr_{i}"])
             if grant is None:
                 unread.append(f"database role {name}")
             elif grant:
                 held_database.append(name)
-        control_server = _probed_grant(row["control_server"])
+        control_server = probed_grant(row["control_server"])
         if control_server is None:
             unread.append("control server")
-        control_database = _probed_grant(row["control_db"])
+        control_database = probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -5370,19 +5365,19 @@ class SqlServerStore(ServerCipherWalk):
         # unread one never turns an over-grant that WAS read into an unobserved report: it is
         # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
         external_unread: list[str] = []
-        create_table = _probed_grant(row["create_table"])
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
+        create_table = probed_grant(row["create_table"])
         if create_table is None:
             external_unread.append(f"create table on database {database}")
-        alter_schema = _probed_grant(row["alter_schema"])
+        alter_schema = probed_grant(row["alter_schema"])
         if alter_schema is None:
-            external_unread.append("ALTER on the default schema")
+            external_unread.append(f"ALTER on schema {default_schema}")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
-        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
         for schema, column in view_def_columns.items():
-            grant = _probed_grant(row[column])
+            grant = probed_grant(row[column])
             if grant is None:
                 external_unread.append(view_definition_grant(schema))
             elif grant:
@@ -5395,25 +5390,59 @@ class SqlServerStore(ServerCipherWalk):
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            # A read CONTROL is an over-grant this report may refuse on, so it is named as read.
+            if control_server:
+                held_labels.append("control server")
+            if control_database:
+                held_labels.append(f"CONTROL on database {database}")
             also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
+                if create_table:
+                    held_labels.append(f"create table on database {database}")
+                if alter_schema:
+                    held_labels.append(f"ALTER on schema {default_schema}")
                 held_labels += list(audit_writes)
                 if view_definition:
                     held_labels.append(view_definition_grant(*view_definition))
                 if external_unread:
                     also_unread = f"; also not read: {', '.join(external_unread)}"
-            # The catalog enumeration below is skipped deliberately: it is additive only, and widening
-            # a report already saying the read was incomplete buys nothing an operator can act on.
+            # Owner ruling 2026-11-23 on #6015 item 1 ("Refuse when read"): an over-grant that WAS
+            # read keeps the report OBSERVED with it in the excess, so it is weighed as one (under
+            # enforce it refuses) rather than demoted to an unobserved warning by a neighbouring
+            # unread column. Unread reads as not held here, which can only understate the excess.
+            read_excess = sqlserver_excess(
+                server_roles=server_roles,
+                database_roles=database_roles,
+                control_server=control_server is True,
+                control_database=control_database is True,
+                database=database,
+                external=external,
+                create_table=create_table is True,
+                alter_schema=(default_schema if alter_schema else None),
+                audit_writes=audit_writes,
+                view_definition=tuple(view_definition),
+            )
+            # The catalog enumeration below is skipped on this path, so a user-defined role is not
+            # weighed here: with no fixed-role over-grant read, a login whose only over-grant is a
+            # user-defined role reads unobserved, which under enforce warns unless
+            # [store].require_least_privilege is declared.
             return StorePrivilegeReport(
                 backend=self.backend,
-                status=StorePrivilegeStatus.UNOBSERVABLE,
+                status=(
+                    StorePrivilegeStatus.OBSERVED
+                    if read_excess
+                    else StorePrivilegeStatus.UNOBSERVABLE
+                ),
                 principal=str(row["login_name"] or ""),
                 database=database,
                 server_roles=server_roles,
                 database_roles=database_roles,
+                excess=read_excess,
+                unread=tuple(unread + (external_unread if external else [])),
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
-                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" {len(unread)} of the {probed} role and CONTROL grant(s) probed, so they were"
+                    " not read and must not"
                     f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
@@ -5450,7 +5479,8 @@ class SqlServerStore(ServerCipherWalk):
             database=database,
             external=external,
             create_table=bool(create_table),
-            alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
+            # The unresolved label, never "": an empty name would read as no grant (a false clean).
+            alter_schema=(default_schema if alter_schema else None),
             audit_writes=audit_writes,
             view_definition=tuple(view_definition),
         )
@@ -5471,6 +5501,7 @@ class SqlServerStore(ServerCipherWalk):
                     database=database,
                     server_roles=server_roles,
                     database_roles=database_roles,
+                    unread=tuple(external_unread),
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
                         " SELECT only on audit_log, no schema DDL right and no view definition on"
@@ -5485,6 +5516,8 @@ class SqlServerStore(ServerCipherWalk):
             server_roles=server_roles,
             database_roles=database_roles,
             excess=excess,
+            # #6015 item 2: an unread external grant beside a read over-grant reaches the summary.
+            unread=tuple(external_unread) if external else (),
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (

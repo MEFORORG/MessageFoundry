@@ -22,8 +22,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
 1. A **read-only ACL preflight**: a group-/world-**writable** anchor (anyone who can write the file can
    substitute the anchor and defeat the TLS check that trusts it) is **refused** at ``[security].enforcement = enforce``
-   and **warned + audited** at ``warn``. It reuses ``_secure_file``'s ``icacls`` DACL mechanism as a
-   *verify-only* companion — it inspects the DACL and never changes it. Readability is deliberately not
+   and **warned + audited** at ``warn``. It reads the DACL with ``icacls`` as a *verify-only*
+   check — it inspects the DACL and never changes it. Readability is deliberately not
    the threat (a CA certificate is public); tamperability is. The verdict is **tri-state**: a DACL the
    engine could not read is ``acl_indeterminate``, audited, and never reported as owner-only (BACKLOG
    #1142). Item 6 says when it refuses.
@@ -991,7 +991,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     return text
 
 
-# --- read-only DACL inspection (mirrors _secure_file's icacls mechanism, verify-only) -----------
+# --- read-only DACL inspection (icacls, verify-only) ---------------------------------------------
 
 #: Group/world principals whose members are not the file owner — a WRITE grant to any of them means a
 #: non-owner can substitute the anchor. SYSTEM and Administrators are deliberately absent: they are
@@ -1299,7 +1299,7 @@ _ICACLS_TIMEOUT_S = 30.0
 def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     """Whether the anchor is writable only by its owner (+ the always-trusted SYSTEM/Administrators),
     i.e. no group/world principal can modify it. READ-ONLY: it never changes the file's ACL (unlike
-    ``_secure_file``, whose ``icacls`` mechanism it mirrors). ``None`` when the DACL cannot be
+    ``_secure_file``). ``None`` when the DACL cannot be
     determined. An inconclusive read is not a pass: under ``enforce``, :func:`_enforce_verdict`
     refuses the anchor unless a configured SHA-256 pin matches the bytes read, and under ``warn`` it
     warns and loads.
@@ -1318,7 +1318,7 @@ def dacl_is_owner_only(path: str | os.PathLike[str]) -> bool | None:
     if os.name == "nt":
         try:
             # icacls is pinned to its absolute System32 path and invoked without a shell; the path is
-            # a single argv token, never a shell word (matches _secure_file's low-27/STORE-5 note).
+            # a single argv token, never a shell word (low-27/STORE-5).
             # No modifying flags. The pin is what makes "fixed system tool" true: CreateProcess
             # resolves an unqualified name through a search path that reaches the caller's working
             # directory, and this call's OUTPUT is what decides the verdict below, so a planted
