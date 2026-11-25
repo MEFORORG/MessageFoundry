@@ -3660,8 +3660,9 @@ def _stored_cell_refused_detail(
     slug and the label, never the refusal text, which can quote the key. The verify writes
     ``stored_key_refused`` for a stored key it cannot use, which never signs in again. The
     assertion begin leg writes ``stored_id_unreadable`` for a stored id it cannot list: that
-    ceremony cannot offer the passkey, but the combined sign-in, which names no credential, can
-    still use it, so the key's reason would overstate it."""
+    ceremony cannot offer the passkey, but it may still sign in through the combined sign-in if it
+    is a discoverable passkey on a local account, and otherwise cannot, so the key's reason would
+    overstate it."""
     return _json({"reason": reason, "label": _passkey_label(cred.label)})
 
 
@@ -19886,11 +19887,12 @@ class AuthService:
                 ids.append(self._b64url_decode(cred.credential_id))
             except (ValueError, TypeError):  # binascii.Error is a ValueError
                 if self._seal_failures_reported.due(f"passkey-id:{leg}:{cred.credential_id_hash}"):
-                    # Not "must be registered again": the combined sign-in names no credential
-                    # and finds the passkey by the id the browser sends, so it can still use it.
+                    # Not "must be registered again": it may still sign in through the combined
+                    # sign-in if it is a discoverable passkey on a local account, and otherwise
+                    # cannot.
                     _log.warning(
-                        "passkey %r of %s has a stored credential id that cannot be decoded; it is "
-                        "left out of this ceremony's %s, and the combined sign-in can still use it",
+                        "passkey %r of %s has a stored credential id that cannot be decoded, so "
+                        "it is not listed in this leg's %s",
                         cred.label,
                         username,
                         "allow list" if leg == "assert" else "exclude list",
@@ -20409,10 +20411,11 @@ class AuthService:
         )
         for cred in due:
             # BACKLOG #6886: a passkey whose stored id does not decode cannot be listed, so this
-            # ceremony cannot offer it, and the row says so with its own reason. The combined
-            # sign-in, which lists no credential, can still use it, so the finish leg's
-            # ``stored_key_refused`` would overstate it. The row is throttled with the WARNING,
-            # because the web console begins a ceremony on every render.
+            # ceremony cannot offer it, and the row says so with its own reason. It may still sign
+            # in through the combined sign-in if it is a discoverable passkey on a local account,
+            # and otherwise cannot, so the finish leg's ``stored_key_refused`` would overstate it.
+            # The row is throttled with the WARNING, because the web console begins a ceremony on
+            # every render.
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,

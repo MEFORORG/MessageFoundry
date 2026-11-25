@@ -575,7 +575,7 @@ async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
                     await service.begin_webauthn_assertion(token, rp_id=RP)
         warned = _undecodable_id_warnings(caplog)
         assert len(warned) == 1 and "'test key'" in warned[0], warned
-        assert "allow list" in warned[0] and "combined sign-in can still use it" in warned[0]
+        assert "is not listed in this leg's allow list" in warned[0], warned
         assert "registered again" not in warned[0], warned
         assert _as_text(stored) not in caplog.text
         events = await service.security_events_for(identity.username)
