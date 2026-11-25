@@ -19,9 +19,10 @@ word inside ``echo findings``, a Windows path spelled ``C:\find\notes.txt``, and
 switched off, and a guard that is switched off protects nothing.
 
 Each test drives the real hook as a subprocess with a real PreToolUse payload on stdin, so the
-contract under test is the one Claude Code actually invokes. The scaling checks are the exception:
-they call the hook script in-process to time it, and ``_TIMING_DRIVER`` says why and what holds
-that reading to the real one.
+contract under test is the one Claude Code actually invokes. The scaling checks that use
+``_TimingDriver`` are the exception: they call the hook script in-process to time it, and
+``_TIMING_DRIVER`` says why and what holds that reading to the real one. The other timing checks
+still time whole hook processes on the wall clock.
 """
 
 from __future__ import annotations
@@ -1167,19 +1168,22 @@ _REQUEST_TIMEOUT_SECONDS = 100
 
 #: The ceiling on one `((` site's CPU cost, in calls of `_REFERENCE_SCRIPT`, which `_site_cost`
 #: reads. THE RATIO CANNOT SEE A GUARD THAT IS SLOWER BY A CONSTANT FACTOR; the test it replaced
-#: caught one only through `run_guard`'s 60 s cap at 6,000 sites. Measured locally on 2026-11-25:
-#: the guard read 0.0139 to 0.0274 unloaded and 0.0118 to 0.0281 under 32 spinning processes, over
-#: 25 readings, and a copy given a constant cost per site, about 17 times its own, read 0.345.
+#: caught one only through `run_guard`'s 60 s cap at 6,000 sites. Measured locally on 2026-11-25,
+#: on `_arithmetic_command`'s shape: the guard read 0.0157 to 0.0480 unloaded over 8 readings and
+#: 0.0231 to 0.0311 under 32 spinning processes over 20, and a copy given a constant cost per site
+#: read 0.352 under load, about 15 times the guard's median.
 #:
-#: WHAT IT DOES: the ceiling is five times the highest reading, so it fails a guard about five
-#: times or more over the cost measured here, and passes one under that.
+#: WHAT IT DOES: the ceiling is five times the highest reading, 0.0480, so it fails a guard about
+#: five times or more over the highest cost measured here, about ten times its median, and passes
+#: one under that. It is not the check for a reader that grows faster than linearly: on the small
+#: input such a reader costs little more a site, and the ratio is what fails it.
 #:
 #: WHAT IT DOES NOT DO: guarantee the hook's budget. The 75 s timeout in .claude/settings.json
 #: belongs to scripts/hooks/shell-guard-dispatch.ps1, shared by the five guards it runs in turn,
 #: and the largest command block-blanket-git-stage.ps1 lets through is 65,536 characters, about
-#: 7,280 sites. At the ceiling, about 5 ms a site on that machine, that is about 36 s for this
-#: guard alone, and a slower machine takes longer.
-_MAX_SITE_COST = 0.14
+#: 7,280 sites. On that machine a reference call took about 20 ms, so the ceiling is about 5 ms a
+#: site, about 35 s for this guard alone at 7,280 sites, and a slower machine takes longer.
+_MAX_SITE_COST = 0.24
 
 #: The most requests one test sends: `_site_cost` sends two, and three attempts one each.
 _MOST_REQUESTS = 5
@@ -1197,21 +1201,23 @@ _MOST_REQUESTS = 5
 #: and a minute more, which also lets the watchdog fire first on a hung request.
 _TIMING_TEST_TIMEOUT_SECONDS = _MOST_REQUESTS * _REQUEST_TIMEOUT_SECONDS + 60
 
-#: Ends every timed command. Only the refined view denies it, and that view is built last, over
-#: the whole command, so a timed call that denies has read every `((` site through that view.
-#: `test_the_timing_driver_reads_a_command_as_the_hook_does` asserts the "only".
-_REFINED_ONLY_WALK = 'echo "$((find /proc) )"'
+#: Ends every timed command. Only the guard's per-site pass, `Add-SiteBounds`, denies it: every
+#: earlier view, the refined one included, reads it and allows. That pass runs only once every
+#: earlier bound has been judged and allowed, and reads the whole command through `Get-SiteTexts`
+#: first, so a timed call that denies has run every pass over every `((` site.
+#: `test_the_timing_driver_reads_a_command_as_the_hook_does` checks the "only" at the timed sizes.
+_SITE_PASS_ONLY_WALK = 'echo "$(( $((find /proc) ) + 1 ))"'
 
 #: The line in the guard that lets `Add-RefinedBounds` build the refined view.
 _REFINED_VIEW_GATE = "        if (-not $refinedPending.Value) { return $false }"
 
-#: The line in the guard that lets `Add-SiteBounds` read the per-site texts, which run after the
-#: refined view and would otherwise deny the timed shape once that view is switched off.
+#: The line in the guard that lets `Add-SiteBounds` read the per-site texts, the pass that
+#: decides the timed shape.
 _SITE_PASS_GATE = "        if (-not $sitePending.Value) { return $false }"
 
 
 def _arithmetic_command(sites: int) -> str:
-    return 'echo "find"; ' + "(( 1 )); " * sites + _REFINED_ONLY_WALK
+    return 'echo "find"; ' + "(( 1 )); " * sites + _SITE_PASS_ONLY_WALK
 
 
 def _arithmetic_run(sites: int) -> str:
@@ -1425,12 +1431,22 @@ def _scaling_ratios(
 # 2026-11-24 and 2026-11-25, on a loaded 32-core machine, with this module's sizes and sampling, on
 # the calling thread's cycle clock. A reading is the lowest attempt of a run.
 #
+# On the timed shape `_SITE_PASS_ONLY_WALK` ends, which every pass reads:
+# - The guard: 15.41x to 17.58x over three unloaded runs, each passing on its first attempt.
+# - Mutants under load, each a forward scan from every `((` to the end of the text put into a copy
+#   of the guard:
+#   - in the refined view's frame, a paren count per character: 66.56x, one run;
+#   - in `Get-SiteTexts`, at a word-start `((` site, a compare per character: 52.22x and 56.71x
+#     over two runs, 1.6x the line or more. Its cost per site on the small input, 0.0283 and
+#     0.0343, is under `_MAX_SITE_COST`, which is not the check for it.
+#
+# On the earlier shape, whose walk the refined view denied before the per-site pass ran:
 # - The guard: 16.38x to 20.05x over three runs, each passing on its first attempt.
-# - The control's stand-in: 135.56x to 186.82x over three runs, every attempt over the line.
-# - Mutants, each a forward scan from every `((` to the end of the text put back into the guard at
-#   that frame:
+# - The control's stand-in: 135.56x to 186.82x over three runs, every attempt over the line. It
+#   was not re-read on the current shape apart from the control test's own runs.
+# - Mutants in the refined view's frame:
 #   - a bare compare per character: 38.37x and 39.45x, so it failed both runs, 1.2x the line;
-#   - a paren count per character: 56.35x to 69.68x over four runs, 1.76x the line or more;
+#   - a paren count per character: 56.35x to 75.17x over nine runs, 1.76x the line or more;
 #   - a one-character substring at every fifth character: 110.96x at 225 sites.
 # At 225 sites the paren count's lowest attempt read 39.86x, and at 150 sites 34.08x, too near the
 # line, which is why the size is 300. The old `3 * half + 3` bound at 3,000 and 6,000 sites passed
@@ -1442,7 +1458,8 @@ def test_many_arithmetic_commands_are_read_in_linear_time(timing_driver: _Timing
     """`_GROWTH` times the `(( 1 ))` sites must take under `_MAX_LINEAR_RATIO` times as long.
 
     Every site takes the refined view's `((` frame, because the quote in `"find"` sends the command
-    through the masker. An earlier cut scanned forward from every `((`, and a long run took about
+    through the masker, and then the per-site pass, which `_SITE_PASS_ONLY_WALK` says why. An
+    earlier cut scanned forward from every `((`, and a long run took about
     98 seconds, past the hook timeout, and a timed-out hook lets the command run. The ratio is of
     in-process CPU times, as `_TIMING_DRIVER` and `_attempt_ratio` say why; `_SITES` and the
     MEASURED SCALING comment say which forward scans it catches. A ratio cannot see a guard that
@@ -1572,29 +1589,35 @@ def test_the_timing_driver_reads_a_command_as_the_hook_does(
     timing_driver: _TimingDriver,
 ) -> None:
     """The in-process path is a shortcut, so it is held to the real one, each row also run as its
-    own hook process: the timed shape, from the same builder, and an allow. The timed shape must
-    also ALLOW once the guard's refined view is switched off, or its deny would not prove that
-    every timed call went through that view."""
+    own hook process: the timed shape, from the same builder, and an allow. Then which pass decides
+    the timed shape, at every size the scaling checks time: with the per-site pass switched off it
+    must ALLOW, so no earlier view denies it and a timed deny means every pass ran; with the refined
+    view switched off it must still deny, so that view is not what decides it."""
     rows = [_arithmetic_command(3), 'echo "find"; ' + "(( 1 )); " * 3]
     payloads = [json.dumps(bash(row)) for row in rows]
+    sized = [json.dumps(bash(_arithmetic_command(k))) for k in (3, _SITES, _GROWTH * _SITES)]
     source = GUARD.read_text(encoding="utf-8")
     assert source.count(_REFINED_VIEW_GATE) == 1, "the refined view's gate moved; re-anchor it"
     assert source.count(_SITE_PASS_GATE) == 1, "the per-site pass's gate moved; re-anchor it"
     with tempfile.TemporaryDirectory() as tmp:
-        unrefined = Path(tmp) / "unrefined.ps1"
-        unrefined.write_text(
-            source.replace(_REFINED_VIEW_GATE, "        return $false").replace(
-                _SITE_PASS_GATE, "        return $false"
-            ),
-            encoding="utf-8",
-        )
+        no_site = Path(tmp) / "no_site.ps1"
+        no_site.write_text(source.replace(_SITE_PASS_GATE, "        return $false"), "utf-8")
+        no_refined = Path(tmp) / "no_refined.ps1"
+        no_refined.write_text(source.replace(_REFINED_VIEW_GATE, "        return $false"), "utf-8")
         real = timing_driver.run(GUARD, payloads, [0, 1], warm=(), floor=0)
-        without = timing_driver.run(unrefined, payloads[:1], [0], warm=(), floor=0)
+        without_site = timing_driver.run(no_site, sized, [0, 1, 2], warm=(), floor=0)
+        without_refined = timing_driver.run(no_refined, sized[:1], [0], warm=(), floor=0)
     for row, reading in zip(rows, real, strict=True):
         out = reading["outputs"][0]
         assert (json.loads(out) if out.strip() else None) == run_guard(bash(row)), row
     assert _denies(real[0]["outputs"][0]), "the timed shape did not deny in-process"
-    assert not without[0]["outputs"][0].strip(), "a view other than the refined one denied it"
+    for reading in without_site:
+        assert not reading["outputs"][0].strip(), (
+            f"a view before the per-site pass denied the timed shape (payload {reading['index']})"
+        )
+    assert _denies(without_refined[0]["outputs"][0]), (
+        "the timed shape needs the refined view to deny"
+    )
 
 
 def test_deeply_nested_arithmetic_is_read_in_bounded_time() -> None:
@@ -1605,7 +1628,8 @@ def test_nested_subshell_substitutions_are_read_in_linear_time() -> None:
     """Doubling the nested `$(( ... ) )` sites must not quadruple the time, and both are denied.
 
     Every site is a subshell. The refined view gave up on its budget at these depths and allowed the
-    walk, so the verdict is checked too. The bound allows for pwsh's fixed start cost, as above.
+    walk, so the verdict is checked too. The `+ 3` allows for pwsh's fixed start cost, which both
+    runs pay.
     """
     started = time.monotonic()
     assert_denied(run_guard(bash(_nested_subshell_substitutions(2000))))
