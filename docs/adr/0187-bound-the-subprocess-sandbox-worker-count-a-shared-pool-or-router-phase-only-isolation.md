@@ -377,6 +377,13 @@ from one added pointer to this amendment, at the end of its paragraph on what a 
   own, at least those [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[sandbox]` lists for a worker
   already reaped or a process group that could not be signalled, so one kill is not always one line.
 
+  *Note, 2026-11-24 (BACKLOG #6830):* the runner's gate is narrower than the bullet above says. A
+  refusal overtaken by a reload or its rollback, from a session the reload discarded, gets neither
+  the alert nor the runner's line even when the reload re-applies the same registry, so the graph
+  was not replaced: the message runs again, and the rerun's refusal, if the cause stands, raises the
+  alert. [`docs/CONFIGURATION.md`](../CONFIGURATION.md) `[sandbox]` states the current rule and
+  when the message does not run again.
+
 The kill is still the only cancellation primitive for a running dispatch, so the blast-radius
 argument above stands for every fault that does kill.
 

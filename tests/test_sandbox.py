@@ -2017,6 +2017,10 @@ def test_the_relay_survives_hostile_bytes_and_a_dead_pipe(
         def read(self, _n: int) -> bytes:
             raise OSError("pipe died with the worker")
 
+        def close(self) -> None:
+            # The relay closes the stream it drained (BACKLOG #6831); this one fails that too.
+            raise OSError("pipe died with the worker")
+
     _StderrRelay("IB_U", 1, 1).run(_Exploding())  # type: ignore[arg-type]
 
 
