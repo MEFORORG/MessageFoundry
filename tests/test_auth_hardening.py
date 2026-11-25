@@ -1486,6 +1486,9 @@ async def test_login_with_an_unencodable_password_is_refused_at_the_boundary(
     async with _client(engine, service) as c:
         r = await c.post("/auth/login", content=body, headers={"Content-Type": "application/json"})
         assert r.status_code == 422
+        # The one refusal is the password field's own unicode check, not some other field's rule.
+        errors = [(e["loc"], e["type"]) for e in r.json()["detail"]]
+        assert errors == [(["body", "password"], "string_unicode")]
         assert verified == []  # refused before any verify ran
         assert (await _login(c, "dave")).status_code == 200  # the account still signs in
         assert verified == [PW]  # the probe sees a real sign-in, so the empty read above is real

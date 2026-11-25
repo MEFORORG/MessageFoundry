@@ -271,9 +271,9 @@ def _refused_inputs(refusal: str) -> tuple[str, str, str]:
 def test_verify_password_refusals_still_pay_one_argon2_verify(
     refusal: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The recovery-code walk keeps constant work per slot (ADR 0170) only if a refused slot costs
-    # what a checked one does, so each refusal must still run exactly one real argon2id verify, and
-    # only the first refusal in a process may also pay the one hash that makes the fixed hash.
+    # A refused verify costs one argon2id verify, like an ordinary mismatch: each refusal runs
+    # exactly one real argon2id verify, and only the first refusal in a process may also pay the
+    # one hash that makes the fixed hash.
     h, stored, password = _refused_inputs(refusal)
     passwords._constant_work_hash.cache_clear()  # this test owns its precondition
     spy = _HasherSpy(passwords._hasher)
