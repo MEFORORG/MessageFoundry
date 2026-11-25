@@ -7817,7 +7817,9 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
+        # The stored username, as every other refusal after the read names it (vault BACKLOG
+        # #5067 added item A): a case-insensitive server collation can find it under another case.
+        return _emit_error(f"{_seal_refusal(named[0], 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
             # What the open may have changed before it, as for a keyless-chain refusal (#5067).
@@ -11878,8 +11880,19 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
                 # keeps exit 1. The command has written nothing yet, but the open may have, so the
                 # text names it (BACKLOG #5067).
+                # The class only, never the text: a driver's message can quote a stored value
+                # (ASVS 16.5.4), as admin-unlock renders a refusal (vault BACKLOG #5067 added item
+                # B). The text and traceback go to DEBUG, so the cause can still be found.
+                log = logging.getLogger(__name__)
+                log.warning(
+                    "admin-set-notify-email: the store refused the audit row for %r (%s)",
+                    user.username,
+                    type(exc).__name__,
+                )
+                log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-                return ("audit-refused", user.username, f"{_sentence(str(exc))} {left}")
+                refused = f"the store refused the audit row ({type(exc).__name__})"
+                return ("audit-refused", user.username, f"{refused}. {left}")
             try:
                 await store.set_user_notify_email(user.id, email=address)
             except BaseException as exc:
@@ -12264,7 +12277,9 @@ def _admin_reset_totp(args: argparse.Namespace) -> int:
                 )
             return _ResetTarget(user.id, user.username, user.totp_enrolled_at, pin.digest)
         finally:
-            await store.close()
+            # A close that fails warns and never replaces the check's result (vault BACKLOG #5067
+            # added item C), as admin-unlock closes.
+            await _close_store_quietly(store)
 
     try:
         checked = run_guarded(check())
@@ -15600,7 +15615,8 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 async def _close_store_quietly(store: Store) -> None:
     """Close ``store`` once a command has its result, at least ``audit-verify``,
     ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
-    ``store withdraw-transit-bound``, ``provision-admin`` and ``admin-set-notify-email``. A close that fails prints a warning naming its
+    ``store withdraw-transit-bound``, ``provision-admin``, ``admin-set-notify-email`` and
+    ``admin-reset-totp``'s pre-write check. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()
