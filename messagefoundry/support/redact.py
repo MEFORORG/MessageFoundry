@@ -840,7 +840,12 @@ def key_body_mask_from(lines: list[str], start: int) -> int:
 
     The list may be cut short at the end too, as ``GET /logs/tail`` cuts it at its page's end: a
     body line is masked the same whatever follows it, since the pattern reads the end of the text
-    where it reads a line break, and the mask writes each line from that line alone."""
+    where it reads a line break, and the mask writes each line from that line alone.
+
+    The equivalence holds for ``lines`` as :func:`split_log_lines` returns them, where no element
+    holds a "\\n". An element before the returned index that holds one breaks it: over the whole
+    list :func:`mask_key_body_lines` then returns every line unchanged, while from the returned
+    index it may still mask a block, so the cut list errs toward masking more, not less."""
     index = min(start, len(lines))
     while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
         index -= 1
