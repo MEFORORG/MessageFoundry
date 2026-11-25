@@ -230,9 +230,10 @@ param(
 
     # Remove even when this worktree OWNS a ledger number whose item is not yet on origin/main
     # (BACKLOG #1293). DELIBERATELY NOT -Force: that one means "I accept losing uncommitted changes",
-    # and one consent must not silently cover an unrelated risk. An allocation cannot be re-keyed --
-    # ownership is non-transferable -- so once the path is gone the number rests on the recorded
-    # branch alone (BACKLOG #1282), and without that branch the PR carrying it is unlandable.
+    # and one consent must not silently cover an unrelated, IRREVERSIBLE risk. An allocation cannot
+    # be re-keyed -- ownership is non-transferable -- so once the path is gone the number rests on
+    # the recorded branch name alone (BACKLOG #1282). Without one, only a worktree recreated at this
+    # path can commit it (docs/LEDGER-GATE.md).
     [Parameter(ParameterSetName = 'ByName')]
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$AllowOrphanedAllocations,
@@ -1204,17 +1205,16 @@ else {
 # --- BACKLOG #1293: refuse to strand a ledger number ---------------------------
 #
 # `Checker.owns` (scripts/hooks/ledger_check.py) decides ownership by CASEFOLDED PATH-STRING
-# EQUALITY against the worktree recorded at allocation time. When that worktree no longer exists it
-# falls back to the RECORDED BRANCH (BACKLOG #1282): a commit from a worktree on that branch name
-# is still entitled. Without that branch name to stand on, for example a record made before the
-# branch field existed, `owns()` returns false for EVERY session, the number is burned, and any PR
-# that must re-introduce its heading is unlandable by anybody. PR #397 was stranded exactly this
+# EQUALITY against the worktree recorded at allocation time. When the committing tree's path misses
+# it falls back to the RECORDED BRANCH NAME (BACKLOG #1282): a commit from a worktree on that branch
+# name is entitled. Without a branch name to stand on, for example a record made before the branch
+# field existed, `owns()` returns false for EVERY session once this directory is gone, and only a
+# worktree recreated at the recorded path can commit the number. PR #397 was stranded exactly this
 # way, before the fallback.
 #
-# THE GATE IS NOT WRONG AND THIS DOES NOT WIDEN IT. It fails closed and is behaving correctly; the
-# defect is that there is no route back. Recovery for ALREADY-stranded numbers is an open route
-# decision (three candidates, none obviously right -- see the item). PREVENTION needs no such
-# decision, which is why it is here and the recovery is not.
+# THE GATE IS NOT WRONG AND THIS DOES NOT WIDEN IT. It fails closed and is behaving correctly. The
+# recoveries for a refused number are in docs/LEDGER-GATE.md (the branch, or the owner-ruled
+# recreate of the path); PREVENTION is here because it costs less than either.
 #
 # WHY IT REFUSES RATHER THAN WARNS. A claim can be released after the fact; an allocation CANNOT be
 # re-keyed, because ownership is documented non-transferable. The branch fallback is a second key,
@@ -1278,9 +1278,10 @@ if (Test-RegistryDirPresent $allocDirRoot 'the allocation directory') {
         }
         $lines += ""
         $lines += "Removing it can BURN those numbers. Ownership is a path-string comparison against this"
-        $lines += "directory and is NON-TRANSFERABLE. Once it is gone, ledger_check.owns() accepts only a"
-        $lines += "commit from a worktree on the branch each allocation recorded (BACKLOG #1282); a record"
-        $lines += "with no branch, or a branch nobody can stand on, leaves the heading unlandable BY ANYONE."
+        $lines += "directory and is NON-TRANSFERABLE. Once it is gone, ledger_check.owns() accepts a commit"
+        $lines += "from a worktree on the branch name each allocation recorded (BACKLOG #1282). A record with"
+        $lines += "no branch, or whose branch is deleted (-DeleteBranch on this run deletes it), can then be"
+        $lines += "committed only from a worktree recreated at this path (docs/LEDGER-GATE.md)."
         $lines += ""
         $lines += "Do this instead:"
         $lines += "  land the item(s) first, so the heading is on origin/main and ownership stops mattering;"
