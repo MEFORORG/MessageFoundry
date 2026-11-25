@@ -14,6 +14,7 @@ in for the other process. Synthetic accounts only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 
@@ -31,6 +32,7 @@ async def test_the_mfa_stamp_waits_for_another_processs_writer(tmp_path: Path) -
     path = tmp_path / "stamp.db"
     store = await MessageStore.open(path)
     other: aiosqlite.Connection | None = None
+    stamp: asyncio.Task[bool] | None = None
     try:
         await store.create_user(
             user_id="u", username="u", auth_provider="local", password_generated=False, audits=()
@@ -59,6 +61,11 @@ async def test_the_mfa_stamp_waits_for_another_processs_writer(tmp_path: Path) -
         row = await store.get_session(token_hash)
         assert row is not None and row.mfa_verified_at is not None
     finally:
+        if stamp is not None and not stamp.done():
+            stamp.cancel()
         if other is not None:
             await other.close()
+        if stamp is not None:
+            with contextlib.suppress(BaseException):
+                await stamp
         await store.close()
