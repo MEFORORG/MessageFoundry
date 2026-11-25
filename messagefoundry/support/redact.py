@@ -806,8 +806,48 @@ def redact_log_record(line: str) -> str:
 
 
 def redact_log_text(text: str) -> str:
-    """Redact every line of a multi-line block (the log tail), preserving line breaks."""
-    return "\n".join(redact_log_record(ln) for ln in split_log_lines(text))
+    """Redact every line of a multi-line block (the log tail), preserving line breaks.
+
+    A PRIVATE KEY block whose lines are separate log lines is masked across them first
+    (:func:`_mask_key_body_lines`), since no single line holds the whole block."""
+    lines = _mask_key_body_lines(split_log_lines(text))
+    return "\n".join(redact_log_record(ln) for ln in lines)
+
+
+def _mask_key_body_lines(lines: list[str]) -> list[str]:
+    """``lines`` with each line that a PRIVATE KEY block's body covers whole written as
+    secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
+
+    :func:`redact_log_line` masks a block inside one line, and so one whose line breaks are escaped,
+    but here a block with real line breaks reaches it one line at a time, where no line holds its
+    BEGIN marker and its body together. A body line of 24 or more base64 characters fell to the
+    long-base64 sweep, and a shorter one, such as a block's padded last line, printed. So the block is
+    found over the joined lines, and only the lines its body covers from their first character to
+    their last are replaced. The marker lines, and a line the body covers only in part, such as the
+    BEGIN line's trailing blanks, stay as they were, so every other line reads exactly as before. The
+    mask keeps a ``Proc-Type:`` or ``DEK-Info:`` header as it is."""
+    if not any("-----" in line for line in lines):
+        return lines
+    joined = "\n".join(lines)
+    out = lines
+    for block in _PRIVATE_KEY_BLOCK.finditer(joined):
+        start = block.start("key_body")
+        body = block.group("key_body")
+        if "\n" not in body:
+            continue  # every line break in it is escaped, so it sits on one line, masked there
+        masked = _braced_tail(block)  # the body masked, one character for one
+        # The first real line break in the body ends a line the body covers only in part, the
+        # BEGIN line. Each later piece is a whole line, except that the last can end at an escaped
+        # line break inside its line, as in ``<body>\n-----END ...``; that line is left as it was.
+        first = joined.count("\n", 0, start) + 1
+        offset = body.index("\n") + 1
+        for index, piece in enumerate(body[offset:].split("\n"), start=first):
+            if len(lines[index]) == len(piece):
+                if out is lines:
+                    out = list(lines)
+                out[index] = masked[offset : offset + len(piece)]
+            offset += len(piece) + 1
+    return out
 
 
 def _keep_label(m: re.Match[str]) -> str:

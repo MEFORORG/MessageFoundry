@@ -1201,19 +1201,17 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # parameter, an absolute uri or trailing punctuation, and every shape the comparison falls back on.
 # A quoted scheme token after an EARLIER label's plain value, as in
 # ``MEFOR_X=a;authorization:"Basic x=="``, prints too: the earlier value runs on over the label and
-# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail or a
-# key body prints as before in a text the camelCase union returns its reading before for, whole: a
-# text where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
+# no tail follows it. ``_BEARER`` still takes no braced value (BACKLOG #2966 step 3). A tail
+# prints as before in a text the camelCase union returns its reading before for, whole: a text
+# where the shipped reading hid a member key's ";", as in ``userPwd='a;PWD=b' password=b'v w'``,
 # and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
-# reading, so in such a text none of them runs. The fallback covers the whole text, not one line:
-# through :func:`scrub_credentials` alone, a line where the camelCase reading hides a member key's
-# ";" (``userPwd='a;PWD=b'``) leaves at least a PEM body on another line of that text unmasked,
-# before that line or after it. A plain member key (``Server=x;PWD=b``) does not trigger it.
-# :func:`mask_private_key_blocks_then` over :func:`scrub_credentials` masked the body on both
-# orders when measured, since its key-block mask runs before this pass. Not so
-# ``support.redact.redact_log_text``: it splits the text at line breaks first, so the key-block
-# mask cannot match a block with real line breaks there, and a body line too short for its
-# long-base64 sweep prints, with or without the member key.
+# reading, so in such a text no tail runs, on any line of it. A key body there is masked all the
+# same: :func:`scrub_credentials` runs the key-block mask once more over the reading it keeps,
+# which writes characters as "x" and nothing else (BACKLOG #5550 added items 14 and 26).
+# ``support.redact.redact_log_text`` splits the text at line breaks, so it masks a block's whole
+# body lines across them first (``_mask_key_body_lines``). ``GET /logs/tail`` reads its lines
+# through ``redact_log_record`` one at a time and does not, so there a body line too short for the
+# long-base64 sweep still prints.
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
@@ -2543,7 +2541,13 @@ def _scrub_credentials(
     if not _could_take_a_tail(folded):
         return tailed
     before = _one_reading(text, placeholder, folded, _without_tails, _without_tails_sub)
-    return tailed if _mask_only(before, tailed) else before
+    out = tailed if _mask_only(before, tailed) else before
+    # The key-block mask once more, over the reading kept (BACKLOG #5550 added items 14 and 26).
+    # Where that reading is one the key-block pass did not run in, the reading before the tails or
+    # a text the camelCase union returned its reading before for, whole, a key body printed. The
+    # mask writes characters as "x" and nothing else, so the result is the kept reading with
+    # characters written as "x", and a body the first pass masked reads the same again.
+    return mask_private_key_blocks(out) if _admits(folded, _KEY_BLOCK_HINT) else out
 
 
 def _one_reading(
