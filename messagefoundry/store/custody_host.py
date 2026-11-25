@@ -8,7 +8,8 @@ part B3b; the key custody ADR draft, rules 1 to 4, 3b and 13).
   once to the person at the terminal, who enters it back; nothing is written until that entry has
   opened the recovery wrap, so every blob written here records its recovery key as proved.
 * **Where the blob goes.** A fixed name in the custody directory (:func:`custody_directory`): the
-  directory ``MEFOR_SECRETS_DIRECTORY`` names, or else a SQLite store's own data directory.
+  directory ``MEFOR_CUSTODY_DIRECTORY`` names, else the one ``MEFOR_SECRETS_DIRECTORY`` names, or
+  else a SQLite store's own data directory.
   :data:`HOST_FILE_NAME` is the host blob in the engine account's own scope, written by an account
   minting for itself; :data:`HANDOFF_FILE_NAME` is the machine-scope handoff an administrator writes
   for the service account (Windows only). A second mint over either is ``FileExistsError``.
@@ -21,7 +22,8 @@ part B3b; the key custody ADR draft, rules 1 to 4, 3b and 13).
   (:class:`~messagefoundry.store.store.StorePin`): a new store's genesis record is written with
   the current id, and an existing store's must name one the blob names.
 * **Precedence.** A host blob is never read beside another store key source, and a host blob or a
-  handoff in the custody directory refuses every other key provider (rules 2 and 13).
+  handoff in a directory :func:`_key_file_directories` names refuses every other key provider
+  (rules 2 and 13; :func:`foreign_custody_refusal`).
 * **The account.** SYSTEM, LOCAL SERVICE and NETWORK SERVICE are refused always, and on Linux root
   and nobody (the custody primitives refuse them). An account that is not local to this host, at
   least a domain user or a group managed service account, is refused under ``enforce`` and named as
@@ -57,6 +59,7 @@ from messagefoundry.custody_posture import (
     record_key_custody,
 )
 from messagefoundry.engine_secrets import (
+    CUSTODY_DIRECTORY_VARIABLE,
     CUSTODY_FILE_NAMES,
     KEY_CLASS_NAMES,
     SECRETS_DIRECTORY_VARIABLE,
@@ -150,27 +153,154 @@ def custody_directory(
 ) -> Path | None:
     """The directory the host blob and the handoff live in, or ``None`` when there is none.
 
-    The directory ``MEFOR_SECRETS_DIRECTORY`` names when it is set (an absolute path, or
+    The directory ``MEFOR_CUSTODY_DIRECTORY`` names when it is set, else the one
+    ``MEFOR_SECRETS_DIRECTORY`` names when that is set (either an absolute path, or
     :class:`HostCustodyRefused`); otherwise a SQLite store's data directory, the one that holds the
     database file. A server store, or an in-memory one, has no data directory."""
     from messagefoundry.config.settings import StoreBackend
 
     environ = os.environ if environ is None else environ
-    raw = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
-    if raw:
-        path = Path(raw)
+    variable = _directory_variable(environ)
+    if variable is not None:
+        path = Path(environ[variable].strip())
         if not path.is_absolute():
-            raise _recorded_as(
-                HostCustodyRefused, f"{SECRETS_DIRECTORY_VARIABLE} must be an absolute path"
+            # Named as a literal: this text reaches stderr (keep_the_key_step says why).
+            name = (
+                "MEFOR_CUSTODY_DIRECTORY"
+                if variable == CUSTODY_DIRECTORY_VARIABLE
+                else "MEFOR_SECRETS_DIRECTORY"
             )
+            raise _recorded_as(HostCustodyRefused, f"{name} must be an absolute path")
         return path
     if settings.backend is StoreBackend.SQLITE and settings.path != ":memory:":
         return Path(settings.path).resolve().parent
     return None
 
 
+def _directory_variable(environ: Mapping[str, str]) -> str | None:
+    """The variable that names the custody directory, or ``None`` when neither is set."""
+    for variable in (CUSTODY_DIRECTORY_VARIABLE, SECRETS_DIRECTORY_VARIABLE):
+        if environ.get(variable, "").strip():
+            return variable
+    return None
+
+
+def _own_directory_refusal(environ: Mapping[str, str]) -> str | None:
+    """Why the custody directory ``MEFOR_CUSTODY_DIRECTORY`` names must not be used, or ``None``
+    when that variable is unset, names a path with nothing there yet, or names a directory that
+    passes. It is judged by the check a secrets directory gets
+    (:func:`~messagefoundry.restricted_file.broad_access_problem` with ``directory``), so a known
+    broad group's right to read it, add a file to it or delete one in it is refused, as is a
+    link, and the folder that holds it is read by the holder rule. It reads known broad groups
+    only, so an entry for one account, the service's or another's, is not refused. A directory
+    ``MEFOR_SECRETS_DIRECTORY`` names is judged where the settings load reads it, and a SQLite
+    store's data directory is not judged here.
+
+    Refused first, whether or not it exists: a custody directory that is, holds or sits inside
+    the directory ``MEFOR_SECRETS_DIRECTORY`` names, compared where each resolves to
+    (:func:`_overlaps`), so at least a link, or a spelling in another case where the platform
+    folds case, does not pass. A UNC spelling of a local path, such as ``\\\\localhost\\C$\\...``,
+    is not read as that path, so it is not caught. The
+    service may add files to its custody directory, and a service that may add a file to the
+    secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment), so the
+    two must stay apart. Neither the installer nor the engine guarantees the service read only on
+    the secrets directory: docs/SERVICE.md, 'The custody directory under the host key provider',
+    says which grants survive."""
+    raw = environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip()
+    secrets = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+    if (
+        raw
+        and secrets
+        and os.path.isabs(raw)
+        and os.path.isabs(secrets)
+        and _overlaps(raw, secrets)
+    ):
+        # The variables are named as literals: this text reaches stderr (keep_the_key_step says
+        # why).
+        return (
+            "the custody directory MEFOR_CUSTODY_DIRECTORY names is, holds or sits inside the "
+            "secrets directory MEFOR_SECRETS_DIRECTORY names. The service may add files to its "
+            "custody directory, and a service that may add a file to the secrets directory may "
+            "supply a secret-class setting, so the two are kept apart. A right to add a file there "
+            "that a documented route gives the service, at least the Vault Agent sink route "
+            "docs/CONFIGURATION.md describes, may stay, but the key files go elsewhere: set "
+            "MEFOR_CUSTODY_DIRECTORY, here and in the service's environment, to a directory of its "
+            "own outside it"
+        )
+    if not raw or not os.path.lexists(raw):
+        # Nothing there: a read finds no file, and a mint refuses the missing directory itself.
+        return None
+    from messagefoundry.restricted_file import broad_access_problem
+
+    problem = broad_access_problem(Path(raw), directory=True)
+    if problem is None:
+        return None
+    remedy = (
+        "Restrict it to SYSTEM and Administrators, with the account the engine runs as allowed to "
+        "read it and add a file to it, as docs/SERVICE.md shows"
+        if sys.platform == "win32"
+        else "Make it owned by the account the engine runs as, mode 0700, in a folder only that "
+        "account or root may write"
+    )
+    return f"the custody directory MEFOR_CUSTODY_DIRECTORY names is not restricted: {problem}. {remedy}"
+
+
+def _overlaps(first: str, second: str) -> bool:
+    """Whether the directory ``first`` is, holds or sits inside ``second``, each compared where it
+    resolves to: links followed as far as the path exists (:func:`os.path.realpath`, which on
+    Windows also reads a short 8.3 name as the long one for the part that exists), then
+    case-folded where the platform folds case (:func:`os.path.normcase`). Two paths on different
+    drives do not overlap, and a UNC spelling of a local path reads as a different drive."""
+    own, shared = (_resolved(p) for p in (first, second))
+    try:
+        return os.path.commonpath([own, shared]) in (own, shared)
+    except ValueError:  # different drives
+        return False
+
+
+def _resolved(path: str) -> str:
+    """Where ``path`` resolves to, case-folded where the platform folds case (:func:`_overlaps`)."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _same_directory(first: str, second: str) -> bool:
+    """Whether ``first`` and ``second`` name one directory, each compared where it resolves to, as
+    :func:`_overlaps` compares them."""
+    return _resolved(first) == _resolved(second)
+
+
 def _custody_paths(directory: Path) -> tuple[Path, Path]:
     return directory / HOST_FILE_NAME, directory / HANDOFF_FILE_NAME
+
+
+def _key_file_directories(settings: StoreSettings, environ: Mapping[str, str]) -> list[Path]:
+    """At least these directories a ``host`` mint could have written a host file or handoff for
+    this store in: the ones ``MEFOR_CUSTODY_DIRECTORY`` and ``MEFOR_SECRETS_DIRECTORY`` name, and a
+    SQLite store's data directory, where a mint run with neither variable writes, whatever is set
+    here. Not named, at least: a custody directory an earlier setting named. A variable that is not
+    an absolute path counts as unset here; :func:`custody_directory` refuses it."""
+    found: list[Path] = []
+    for variable in (CUSTODY_DIRECTORY_VARIABLE, SECRETS_DIRECTORY_VARIABLE):
+        raw = environ.get(variable, "").strip()
+        if raw and Path(raw).is_absolute():
+            found.append(Path(raw))
+    beside = custody_directory(settings, environ={})
+    if beside is not None:
+        found.append(beside)
+    return list(dict.fromkeys(found))
+
+
+def _key_files_outside(
+    settings: StoreSettings, directory: Path | None, environ: Mapping[str, str]
+) -> list[Path]:
+    """The host files and handoffs in :func:`_key_file_directories` other than ``directory``."""
+    return [
+        p
+        for other in _key_file_directories(settings, environ)
+        if other != directory
+        for p in _custody_paths(other)
+        if os.path.lexists(p)
+    ]
 
 
 def _key_sources_beside(settings: StoreSettings, environ: Mapping[str, str]) -> list[str]:
@@ -209,29 +339,52 @@ def foreign_custody_refusal(
     settings: StoreSettings, *, environ: Mapping[str, str] | None = None
 ) -> str | None:
     """Why a store under any key provider but ``host`` must not open, or ``None``: a host blob or a
-    handoff sits in its custody directory, so the store's key would be taken from somewhere other
-    than the blob minted for it. An unusable directory setting is left for the reader of that
-    setting to refuse."""
+    handoff sits in a directory where a ``host`` mint may have written it
+    (:func:`_key_file_directories`), so the store's key would be taken from somewhere other than
+    the blob minted for it. A directory setting that is not an absolute path is passed over here,
+    and the directories the other setting names are still looked in.
+
+    The way on deletes no file it found and moves none itself (PR 2804 fifth hold; Manager ruling
+    2026-11-22): after the settings change for a blob that holds this store's key,
+    :data:`_LEAVE_KEY_FILES_STEP`."""
     environ = os.environ if environ is None else environ
-    try:
-        directory = custody_directory(settings, environ=environ)
-    except HostCustodyRefused:
-        return None
-    if directory is None:
-        return None
-    found = [p.name for p in _custody_paths(directory) if os.path.lexists(p)]
+    found = _key_files_outside(settings, None, environ)
+    if settings.encryption_key_file:
+        # The store's own key file, whatever it is named, is not a host blob: the directory beside
+        # the store is read whatever is set, and a key file named master.key may sit there.
+        own = Path(settings.encryption_key_file).resolve()
+        found = [p for p in found if p.resolve() != own]
     if not found:
         return None
+    # One clause per file, so two files in two directories each name their own.
+    named = "; ".join(f"{p.name} in {p.parent}" for p in found)
     return (
-        f"{' and '.join(found)} is in {directory}, but [store].key_provider is "
+        f"host custody found ({named}), but [store].key_provider is "
         f"{settings.key_provider!r}. A store with a host blob takes its key from that blob only: "
         "if it holds this store's key, keep a copy of each key setting's value first, somewhere "
         "as protected as where it is now, since it may be the only copy of a store key, and then "
         "set [store].key_provider = 'host' and remove every other store key setting, with "
         "[store].cipher_provider = 'aesgcm', which that provider needs. The engine cannot tell "
-        "whether the blob holds this store's key, so it "
-        f"leaves the file in place. {keep_the_key_step(settings, new_store=False)}"
+        "whether the blob holds this store's key, so it leaves the file in place. "
+        f"{_LEAVE_KEY_FILES_STEP}"
     )
+
+
+#: The section of docs/SERVICE.md that holds the one procedure for going on past a refusal that
+#: names a key file (Manager design rule 2026-11-22 on vault BACKLOG #3411). The engine's texts
+#: name it and state no file procedure of their own; tests check the heading is there.
+_SERVICE_PROCEDURE_TITLE = "When a refusal names master.key or handoff.key"
+
+#: The way on from a refusal that found a key file it cannot tie to this store
+#: (:func:`foreign_custody_refusal`, :func:`_left_outside_the_custody_directory`). It deletes no
+#: file and moves none itself, since each may be another store's only key: the procedure it names
+#: says when a file may move, whether or not it is this store's, and covers a host without the
+#: install scripts too.
+_LEAVE_KEY_FILES_STEP = (
+    "Leave each key file named here where it is, and delete nothing: each may be the only copy of "
+    "a store's key on this host. To go on, whether or not it is this store's, follow "
+    f"docs/SERVICE.md, '{_SERVICE_PROCEDURE_TITLE}', and change a key file only as it says"
+)
 
 
 # --- the account ----------------------------------------------------------------------------------
@@ -369,8 +522,9 @@ def custody_refusal_at_open(exc: BaseException) -> HostCustodyRefused:
     chain and then flushes the replaced class's log line (BACKLOG #4882)."""
     return _read_refusal(
         "the store's key custody could not be read or checked at the open: check "
-        f"[store].key_provider, the custody directory ({SECRETS_DIRECTORY_VARIABLE}, or else a "
-        "SQLite store's data directory) and the host file and handoff in it",
+        "[store].key_provider, the custody directory (MEFOR_CUSTODY_DIRECTORY, else "
+        "MEFOR_SECRETS_DIRECTORY, else a SQLite store's data directory) and the host file and "
+        "handoff in it",
         exc,
     )
 
@@ -580,6 +734,37 @@ def _left_behind(done: str, handoff: Path) -> HostCustodyRefused:
     )
 
 
+def _left_outside_the_custody_directory(
+    settings: StoreSettings, directory: Path, environ: Mapping[str, str] | None
+) -> str | None:
+    """Why a read or a mint that found neither file in ``directory``, the custody directory
+    ``MEFOR_CUSTODY_DIRECTORY`` names, must not go on as if no key was minted, or ``None``: a host
+    file or a handoff sits in another directory :func:`_key_file_directories` names, where a mint
+    run with other variables set wrote it. A second key would not open a store the first one made.
+
+    Read only while ``MEFOR_CUSTODY_DIRECTORY`` is set. With only ``MEFOR_SECRETS_DIRECTORY`` set,
+    a file beside the store is not read here, as the PR 2804 fifth hold's way on (item 4), a new
+    secrets directory and a new SQLite path beside the key file it left in place, needed.
+    :func:`keep_the_key_step`'s way on now sets ``MEFOR_CUSTODY_DIRECTORY``, so it names a new
+    secrets directory and a new SQLite path in a directory of its own wherever the key file it
+    leaves in place sits in either (PR 3168 hold, item 1)."""
+    environ = os.environ if environ is None else environ
+    if _directory_variable(environ) != CUSTODY_DIRECTORY_VARIABLE:
+        return None
+    found = _key_files_outside(settings, directory, environ)
+    if not found:
+        return None
+    named = "; ".join(f"{p.name} in {p.parent}" for p in found)
+    # The variable is named as a literal: this text reaches stderr (keep_the_key_step says why).
+    return (
+        f"no host blob or handoff is in the custody directory {directory}, which "
+        "MEFOR_CUSTODY_DIRECTORY names, but host custody was found elsewhere "
+        f"({named}), where a mint run with other variables writes it. A key minted now would not "
+        "open a store that key made, so none is read or minted here. "
+        f"{_LEAVE_KEY_FILES_STEP}"
+    )
+
+
 def _missing(host: Path, handoff: Path) -> HostCustodyMissing:
     """Neither ``host`` nor ``handoff`` is there."""
     return _recorded_as(
@@ -593,7 +778,8 @@ def check_host_custody_settings(
     settings: StoreSettings, *, environ: Mapping[str, str] | None = None
 ) -> tuple[Path, Path]:
     """The host blob's and the handoff's paths, once the settings pass: no other store key source
-    beside the blob, the ``aesgcm`` cipher, and a custody directory. Raises
+    beside the blob, the ``aesgcm`` cipher, a custody directory, and one ``MEFOR_CUSTODY_DIRECTORY``
+    names passing :func:`_own_directory_refusal`. Raises
     :class:`HostCustodyRefused` otherwise. A blob a minting command passes in is held to the same
     settings a read is."""
     environ = os.environ if environ is None else environ
@@ -604,9 +790,14 @@ def check_host_custody_settings(
     if directory is None:
         raise _recorded_as(
             HostCustodyRefused,
-            "[store].key_provider = 'host' needs a directory for the host blob: set "
-            f"{SECRETS_DIRECTORY_VARIABLE}, since this store has no data directory of its own",
+            "[store].key_provider = 'host' needs a directory for the host blob, since this store "
+            "has no data directory of its own: give it a custody directory of its own, named by "
+            "MEFOR_CUSTODY_DIRECTORY, as docs/SERVICE.md, "
+            f"'{_SERVICE_PROCEDURE_TITLE}', says",
         )
+    refusal = _own_directory_refusal(environ)
+    if refusal is not None:
+        raise _recorded_as(HostCustodyRefused, refusal)
     return _custody_paths(directory)
 
 
@@ -675,6 +866,9 @@ def load_host_custody(
     if not (os.path.lexists(host) or os.path.lexists(handoff)):
         # Before the account is judged: no key is here for any account, and a command that mints
         # one for another account (provision-admin --service-account) must learn that first.
+        stray = _left_outside_the_custody_directory(settings, host.parent, environ)
+        if stray is not None:
+            raise _recorded_as(HostCustodyRefused, stray)
         raise _missing(host, handoff)
     try:
         try:
@@ -749,29 +943,78 @@ async def store_holds_data(store: Store) -> bool:
 
 
 def keep_the_key_step(
-    settings: StoreSettings, *, new_store: bool, service_account: str | None = None
+    settings: StoreSettings,
+    *,
+    new_store: bool,
+    service_account: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    key_file_left: bool = True,
 ) -> str:
     """A fallback way on, after a caller's own remedy, at least for the paths that meet a key file
     or store they cannot tie to this store (PR 2804 fifth and sixth holds). It advises changing no
     existing file, key, blob or store: it asks for a new custody directory, and with ``new_store`` a
-    new store location, which changes the settings that name them. Names no path and no key."""
+    new store location, which changes the settings that name them. Names no path and no key.
+
+    ``key_file_left`` says a key file is left in place in the custody directory these settings and
+    ``environ`` name, as at least every caller but provision-admin's missing-key refusal has. The
+    step reaches a mint from there (PR 3168 hold, item 1): once ``MEFOR_CUSTODY_DIRECTORY`` is set,
+    :func:`_left_outside_the_custody_directory` refuses a mint while a key file sits in the
+    directory ``MEFOR_SECRETS_DIRECTORY`` names or in a SQLite store's data directory. So where
+    that custody directory, or any directory :func:`_key_file_directories` names that holds a key
+    file, is the secrets directory, the step also asks for a new secrets directory, and where it is
+    the store's data directory, for a new store location, whatever ``new_store`` says. A new SQLite
+    path always goes in a directory with neither key file in it."""
     from messagefoundry.config.settings import SchemaManagement, StoreBackend
 
     server = settings.backend is not StoreBackend.SQLITE
-    # The variable is named here as a literal, not through SECRETS_DIRECTORY_VARIABLE: this text
+    environ = os.environ if environ is None else environ
+    # Every directory the left-behind check reads that holds a key file, the custody directory in
+    # use among them when a key file is left there.
+    held = {p.parent for p in _key_files_outside(settings, None, environ)}
+    if key_file_left:
+        try:
+            kept = custody_directory(settings, environ=environ)
+        except HostCustodyRefused:
+            kept = None
+        if kept is not None:
+            held.add(kept)
+    secrets = environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
+    in_secrets = os.path.isabs(secrets) and any(_same_directory(str(d), secrets) for d in held)
+    data_directory = custody_directory(settings, environ={})
+    if data_directory is not None and any(
+        _same_directory(str(d), str(data_directory)) for d in held
+    ):
+        # A key file sits beside the store, and stays there.
+        new_store = True
+    # The variables are named here as literals, not through SECRETS_DIRECTORY_VARIABLE: this text
     # can reach stderr, and CodeQL's name heuristic reads that constant as a secret (alert 315).
+    # It offers no secrets directory as the custody directory: a service that may add a file there
+    # may supply a secret-class setting (ADR 0214's 2026-11-22 amendment), so the one procedure in
+    # docs/SERVICE.md says how to get a custody directory.
     text = (
-        "To go on without it, give this store a custody directory of its own: a new directory, "
-        "restricted and writable by the service as a secrets directory must be, which the engine "
-        "checks at start, named by MEFOR_SECRETS_DIRECTORY here and in this store's own service "
-        "environment, never in one that another store's service also reads, since that store "
-        "would then look for its key there. Copy into it every secret file the current secrets "
-        f"directory holds other than {HOST_FILE_NAME} and {HANDOFF_FILE_NAME}, if one is set, "
-        "since the service reads its other secrets from there too"
+        "To go on without it, give this store a custody directory of its own, named by "
+        "MEFOR_CUSTODY_DIRECTORY here and in this store's own service environment, never one that "
+        "another store's service also reads, since that store would then look for its key there: "
+        f"docs/SERVICE.md, '{_SERVICE_PROCEDURE_TITLE}', says how, and the engine checks that "
+        "directory at start"
     )
+    if in_secrets:
+        text += (
+            ". Give it a new secrets directory, named by MEFOR_SECRETS_DIRECTORY in both places, "
+            f"holding this service's other secret files but no {HOST_FILE_NAME} and no "
+            f"{HANDOFF_FILE_NAME}, as that procedure says: while either file is in the secrets "
+            "directory MEFOR_SECRETS_DIRECTORY names, the engine mints no key in a custody "
+            "directory"
+        )
     if new_store:
         text += ". Point [store] at a store location of its own: " + (
-            "a new database" if server else "a new SQLite path"
+            "a new database"
+            if server
+            else (
+                f"a new SQLite path in a directory with no {HOST_FILE_NAME} and no "
+                f"{HANDOFF_FILE_NAME} in it (with install-service.ps1, the default path in a new "
+                "-DataDir, which it creates and restricts, as that procedure says)"
+            )
         )
         if server and settings.resolved_schema_management() is SchemaManagement.EXTERNAL:
             text += (
@@ -825,7 +1068,7 @@ def keep_the_key_step(
     else:
         text += ". Then run the command again"
     if new_store:
-        text += ". The new store starts empty: nothing in the one left in place is carried over"
+        text += ". The new store starts empty: nothing in a store left in place is carried over"
     if host:
         text += (
             ". The recovery key shown when an existing key file was minted goes with that file, "
@@ -856,8 +1099,14 @@ def mint_target(
                 f"{path} already exists, so a store key was already minted here; a second mint "
                 "is never made over it. The engine cannot tell whose key it holds, so it leaves "
                 "it in place. "
-                f"{keep_the_key_step(settings, new_store=False, service_account=service_account)}"
+                + keep_the_key_step(
+                    settings, new_store=False, service_account=service_account, environ=environ
+                )
             )
+    # A key file a mint without MEFOR_CUSTODY_DIRECTORY left elsewhere stops a second one too.
+    stray = _left_outside_the_custody_directory(settings, host.parent, environ)
+    if stray is not None:
+        raise _recorded_as(HostCustodyRefused, stray)
     if service_account is None:
         # What the write refuses for this account, asked now: the shared and non-local accounts
         # (and on Linux root and nobody).
@@ -886,21 +1135,21 @@ def mint_target(
     _refuse_an_unusable_directory(
         target.parent,
         service_account=service_account,
-        named=bool(environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()),
+        named=_directory_variable(environ),
     )
     return target
 
 
 def _refuse_an_unusable_directory(
-    directory: Path, *, service_account: str | None, named: bool
+    directory: Path, *, service_account: str | None, named: str | None
 ) -> None:
     """Refuse, before any recovery key is shown, a custody directory the key file's write would
     refuse only after the ceremony, at least: one that is missing or not a directory, one this account
     cannot add a file to (PR 2804 twelfth hold, item 4), and one whose volume fails
     :func:`~messagefoundry.restricted_file.write_restricted_file`'s local-volume rule, asked through
-    that rule's own check (PR 2804 eleventh hold). ``named`` is whether ``MEFOR_SECRETS_DIRECTORY``
-    names the directory, rather than a SQLite store's own data directory, so each refusal names
-    the setting that moves it."""
+    that rule's own check (PR 2804 eleventh hold). ``named`` is the variable that names the
+    directory, ``None`` for a SQLite store's own data directory, so each refusal names the setting
+    that moves it."""
     from messagefoundry.restricted_file import can_add_a_file, key_directory_volume_problem
 
     none_shown = "so no store key was minted and no recovery key was shown"
@@ -911,20 +1160,27 @@ def _refuse_an_unusable_directory(
     writers = "this account" + (
         "" if service_account is None else f' and the service account "{service_account}"'
     )
-    secrets_directory = "restricted as a secrets directory must be and writable by " + writers
+    # The secrets directory is not offered as the custody directory: a service that may add a file
+    # there may supply a secret-class setting (ADR 0214's 2026-11-22 amendment). The one procedure
+    # in docs/SERVICE.md says how to get a custody directory.
+    own_custody = (
+        f"a custody directory of its own, got as docs/SERVICE.md, '{_SERVICE_PROCEDURE_TITLE}', "
+        f"says, which {writers} can add a file to"
+    )
 
-    def move_on(to: str) -> str:
+    def move_on(*, local: bool = False) -> str:
         # The variable is named as a literal: this text reaches stderr (keep_the_key_step says
         # why).
+        on = ", on a local file system" if local else ""
         variable = (
-            "set MEFOR_SECRETS_DIRECTORY, here and in the service's own environment, to "
-            f"{to}, and copy into it every other secret file the current secrets directory "
-            "holds, if one is set, since the service reads its other secrets from there too"
+            "set MEFOR_CUSTODY_DIRECTORY, here and in the service's own environment, to "
+            f"{own_custody}{on}"
         )
         if named:
             return variable
+        where = "a new data directory" + on
         return (
-            f"point --db at a SQLite path in {to}, by its absolute path, here and wherever the "
+            f"point --db at a SQLite path in {where}, by its absolute path, here and wherever the "
             "service passes --db, since the store key sits beside the store file, or "
             f"{variable}"
         )
@@ -933,14 +1189,18 @@ def _refuse_an_unusable_directory(
         if os.path.lexists(directory):
             raise HostCustodyRefused(
                 f"the custody directory {directory} is not a directory this account can read, "
-                f"{none_shown}. To go on, {move_on('a directory ' + secrets_directory)}, and run "
+                f"{none_shown}. To go on, {move_on()}, and run "
                 "the command again"
             )
-        # A directory behind a parent this account cannot search reads as absent here too.
+        # A directory behind a parent this account cannot search reads as absent here too. None
+        # is offered for making by hand: the install script makes and restricts each one
+        # (docs/SERVICE.md's procedure, step 4). Its Get-CustodyDirProblem refuses an existing
+        # custody directory the service does not name, and one it names whose owner is neither
+        # Administrators nor SYSTEM; one made by hand in an elevated shell can pass that.
         raise HostCustodyRefused(
             f"the custody directory {directory} is missing, or a directory above it is one this "
-            f"account cannot search, {none_shown}. Create it, {secrets_directory}, or let this "
-            "account search the directories above it, and run the command again"
+            f"account cannot search, {none_shown}. To go on, {move_on()}, "
+            "or let this account search the directories above it, and run the command again"
         )
     can_add = can_add_a_file(directory)
     if can_add is None:
@@ -951,10 +1211,15 @@ def _refuse_an_unusable_directory(
             directory,
         )
     if can_add is False:
+        # Not offered for the secrets directory, for the reason own_custody gives.
+        let_add = (
+            "To go on, "
+            if named == SECRETS_DIRECTORY_VARIABLE
+            else "Let this account add files there, or "
+        )
         raise HostCustodyRefused(
             f"this account cannot add a file to the custody directory {directory}, {none_shown}. "
-            f"Let this account add files there, or {move_on('a directory ' + secrets_directory)}, "
-            "and run the command again"
+            f"{let_add}{move_on()}, and run the command again"
         )
     try:
         volume = key_directory_volume_problem(directory)
@@ -963,13 +1228,13 @@ def _refuse_an_unusable_directory(
             f"the file system of the custody directory {directory} could not be checked, since "
             f"this account could not open the directory ({exc.strerror or type(exc).__name__}), "
             f"{none_shown}. Let this account open it, or "
-            f"{move_on('a directory ' + secrets_directory)}, and run the command again"
+            f"{move_on()}, and run the command again"
         ) from exc
     if volume is not None:
         raise HostCustodyRefused(
             f"the custody directory {directory} cannot hold a store key: {volume}. No store key "
             "was minted and no recovery key was shown. To go on, "
-            f"{move_on('a directory on a local file system, ' + secrets_directory)}, and run the "
+            f"{move_on(local=True)}, and run the "
             "command again"
         )
 

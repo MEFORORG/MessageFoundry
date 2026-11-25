@@ -23,7 +23,10 @@
 
     Two of them can be taken back on request, because both need elevation an operator may not have
     later: -RemoveLogonRight drops the "Log on as a service" right, and -RemoveAccountAces drops
-    the run-as account's entry from the data and config directories.
+    the run-as account's entry from the data and config directories, from the secrets directory
+    the service names (vault BACKLOG #2595 slice C), and from the custody directory it names
+    (vault BACKLOG #3411). On the custody directory that is the directory's own entry: a key file
+    there keeps its own list, which names the account.
 
     The service SID type and the privilege list the installer sets are part of the registration,
     so they go with it. The script looks for the service's registry key after the removal, and the
@@ -54,7 +57,8 @@ param(
     # installer's default per-service virtual account, whose SID belongs to this service alone.
     [switch]$RemoveLogonRight,
     # Opt-in: remove the run-as account's access-control entry from the data directory and the
-    # config directory. The account is gone once the registration is, so the entry is orphaned -
+    # config directory, and from the secrets and custody directories the registration names. The
+    # account is gone once the registration is, so the entry is orphaned -
     # but removing it is still a permission change on directories that may outlive this service.
     [switch]$RemoveAccountAces
 )
@@ -279,6 +283,14 @@ function Get-UninstallResidueNotice {
         # The secrets directory read off the registration's MEFOR_SECRETS_DIRECTORY (vault BACKLOG
         # #2595 slice C). The installer grants the run-as account read there, with inheritance off.
         [string]$SecretsDir,
+        # The custody directory read off MEFOR_CUSTODY_DIRECTORY (vault BACKLOG #3411). The installer
+        # grants the run-as account read and add-file there, under the host key provider only.
+        [string]$CustodyDir,
+        # The key files found in it, master.key or handoff.key, read before the notice.
+        [string[]]$CustodyFiles = @(),
+        # The directory could not be read as there, so $CustodyFiles may be missing a key file: at
+        # least a drive that is offline, which reads as absent without an error.
+        [switch]$CustodyUnconfirmed,
         # Measured from the config dir's own ACL, not assumed from a switch this script never saw.
         [switch]$ConfigInheritanceStripped,
         # Path of the nssm.exe the registration starts, only when it is actually on disk.
@@ -297,6 +309,7 @@ function Get-UninstallResidueNotice {
         [switch]$DataAceRemoved,
         [switch]$ConfigAceRemoved,
         [switch]$SecretsAceRemoved,
+        [switch]$CustodyAceRemoved,
         # Read AFTER the removal: the service's registry key is still there. Windows has only marked
         # the service for deletion, and the key holds the SID type and the privilege list the
         # installer set (vault BACKLOG #2702).
@@ -343,7 +356,31 @@ function Get-UninstallResidueNotice {
         $lines += "  Secrets dir      $SecretsDir"
         $lines += "                   The secrets directory the service read: any file in it holds"
         $lines += "                   a secret in plain text. This script leaves it and its files."
-        $lines += "                   Delete them once nothing needs them."
+        $lines += "                   Delete them once nothing needs them, except master.key and"
+        $lines += "                   handoff.key: either may be a store's only key on this host,"
+        $lines += "                   so never delete either. See docs/SERVICE.md 'When a refusal"
+        $lines += "                   names master.key or handoff.key'."
+    }
+
+    if ($CustodyDir) {
+        $lines += "  Custody dir      $CustodyDir"
+        $lines += "                   The custody directory the service read under the host key"
+        $lines += "                   provider. This script leaves it and everything in it."
+        $who = if ($ServiceAccount) { "'$ServiceAccount'" } else { "the account the service ran as" }
+        foreach ($file in @($CustodyFiles)) {
+            $lines += "                   $file holds the store's key, and may be its only copy on"
+            $lines += "                   this host: never delete it. It keeps its own entry for $who,"
+            $lines += "                   which -RemoveAccountAces does not take off the file."
+        }
+        if ($CustodyUnconfirmed) {
+            # A drive that is offline reads as absent, so not finding a file proves nothing.
+            $lines += "                   This script could not confirm what it holds. It may still"
+            $lines += "                   hold master.key or handoff.key, the store's key and maybe"
+            $lines += "                   its only copy on this host: never delete either."
+        }
+        $lines += "                   A reinstall refuses this directory while the new service does"
+        $lines += "                   not name it: see docs/SERVICE.md 'When a refusal names"
+        $lines += "                   master.key or handoff.key'."
     }
 
     if ($CachedNssm) {
@@ -379,6 +416,16 @@ function Get-UninstallResidueNotice {
                 $lines += "  Secrets entry    '$ServiceAccount' still has an entry on $SecretsDir."
                 $lines += "                   Remove it with:"
                 $lines += "                     icacls `"$SecretsDir`" /remove:g `"$acePrincipal`""
+            }
+        }
+
+        if ($CustodyDir) {
+            if ($CustodyAceRemoved) {
+                $lines += "  Custody entry    REMOVED - '$ServiceAccount' no longer has an entry on $CustodyDir."
+            } else {
+                $lines += "  Custody entry    '$ServiceAccount' still has an entry on $CustodyDir."
+                $lines += "                   Remove it with:"
+                $lines += "                     icacls `"$CustodyDir`" /remove:g `"$acePrincipal`""
             }
         }
 
@@ -744,6 +791,7 @@ $appParameters = ""
 $appExe = ""
 $appStdout = ""
 $secretsDir = ""
+$custodyDir = ""
 $svcKey = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
 try {
     $objectName = [string](Get-ItemProperty -LiteralPath $svcKey -Name ObjectName -ErrorAction Stop).ObjectName
@@ -763,6 +811,12 @@ try {
             $_ -and ([string]$_).StartsWith("MEFOR_SECRETS_DIRECTORY=", [StringComparison]::OrdinalIgnoreCase) }) |
         Select-Object -Last 1
     if ($secretsEntry) { $secretsDir = $secretsEntry.Substring("MEFOR_SECRETS_DIRECTORY=".Length) }
+    # The custody directory it names under the host key provider (vault BACKLOG #3411), the same way.
+    $custodyEntry = @($params.AppEnvironmentExtra | Where-Object {
+            $_ -and ([string]$_).StartsWith("MEFOR_CUSTODY_DIRECTORY=", [StringComparison]::OrdinalIgnoreCase) }) |
+        Select-Object -Last 1
+    # Trimmed, as the engine strips it before reading it.
+    if ($custodyEntry) { $custodyDir = $custodyEntry.Substring("MEFOR_CUSTODY_DIRECTORY=".Length).Trim() }
 } catch {
     $unreadable += ("the registered command line of '$ServiceName' ($($_.Exception.Message)) - so " +
         "the config directory and the data directory below could not be checked against it")
@@ -934,6 +988,24 @@ $script:LogonRightUnproven = $false
 $dataAceRemoved = $false
 $configAceRemoved = $false
 $secretsAceRemoved = $false
+$custodyAceRemoved = $false
+# Which key files the custody directory holds, so the notice names only those (vault BACKLOG #3411).
+# A read that fails, such as a drive that is gone, must not stop the uninstall before its notice.
+$custodyFiles = @()
+# Test-Path reads an offline drive, or a folder this account cannot see, as absent without an
+# error, so the notice keeps its warning unless the directory itself is read as there.
+$custodyUnconfirmed = $false
+if ($custodyDir) {
+    try {
+        $custodyUnconfirmed = -not (Test-Path -LiteralPath $custodyDir -PathType Container)
+        $custodyFiles = @(foreach ($name in @("master.key", "handoff.key")) {
+                if (Test-Path -LiteralPath ([IO.Path]::Combine($custodyDir, $name))) { $name } })
+    } catch {
+        $custodyUnconfirmed = $true
+        $unreadable += ("the key files in the custody directory '$custodyDir' ($($_.Exception.Message)) " +
+            "- check it for master.key and handoff.key, and do not delete either")
+    }
+}
 
 if ($RemoveLogonRight) {
     if (-not $hasAccount) {
@@ -969,6 +1041,9 @@ if ($RemoveAccountAces) {
         if ($secretsDir) {
             $secretsAceRemoved = Remove-AccountAce -Path $secretsDir -Principal $acePrincipal -What "secrets directory"
         }
+        if ($custodyDir) {
+            $custodyAceRemoved = Remove-AccountAce -Path $custodyDir -Principal $acePrincipal -What "custody directory"
+        }
     }
 }
 
@@ -979,6 +1054,9 @@ Get-UninstallResidueNotice `
     -ServiceAccountSid $accountSid `
     -ConfigDir $configDir `
     -SecretsDir $secretsDir `
+    -CustodyDir $custodyDir `
+    -CustodyFiles $custodyFiles `
+    -CustodyUnconfirmed:$custodyUnconfirmed `
     -ConfigInheritanceStripped:$configProtected `
     -CachedNssm $cachedNssm `
     -WerImages $werImages `
@@ -988,6 +1066,7 @@ Get-UninstallResidueNotice `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
     -SecretsAceRemoved:$secretsAceRemoved `
+    -CustodyAceRemoved:$custodyAceRemoved `
     -RegistrationPending:$registrationPending `
     -Unreadable $unreadable |
     ForEach-Object { Write-Host $_ }

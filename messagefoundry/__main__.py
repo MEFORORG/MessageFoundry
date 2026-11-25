@@ -10947,13 +10947,17 @@ def _provision_admin(args: argparse.Namespace) -> int:
                 # On a server the probe refused only a store with a genesis record or with data.
                 held = "exists" if settings.store.backend is StoreBackend.SQLITE else "holds data"
                 step = keep_the_key_step(
-                    settings.store, new_store=True, service_account=args.service_account
+                    settings.store,
+                    new_store=True,
+                    service_account=args.service_account,
+                    key_file_left=False,
                 )
                 raise HostCustodyRefused(
                     f"the store already {held}, and {missing}. A new key cannot open a store "
                     "another key made: run with the custody directory that holds the store's host "
-                    "blob, MEFOR_SECRETS_DIRECTORY set as the store's service has it, or unset for "
-                    "a SQLite store whose blob sits beside its file. If that blob is lost, the "
+                    "blob, MEFOR_CUSTODY_DIRECTORY and MEFOR_SECRETS_DIRECTORY set as the store's "
+                    "service has them, or both unset for a SQLite store whose blob sits beside "
+                    "its file. If that blob is lost, the "
                     f"store stays in place. {step}"
                 ) from missing
             absent, exists = True, None
@@ -11360,13 +11364,23 @@ def _provision_admin(args: argparse.Namespace) -> int:
         # named as a literal: this text reaches stderr (keep_the_key_step says why).
         import os
 
-        from messagefoundry.engine_secrets import SECRETS_DIRECTORY_VARIABLE
-
-        where = (
-            f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}"
-            if os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip()
-            else "MEFOR_SECRETS_DIRECTORY unset, so that it looks beside the SQLite store file"
+        from messagefoundry.engine_secrets import (
+            CUSTODY_DIRECTORY_VARIABLE,
+            SECRETS_DIRECTORY_VARIABLE,
         )
+
+        if os.environ.get(CUSTODY_DIRECTORY_VARIABLE, "").strip():
+            where = f"MEFOR_CUSTODY_DIRECTORY set to {minted.path.parent}"
+        elif os.environ.get(SECRETS_DIRECTORY_VARIABLE, "").strip():
+            where = (
+                f"MEFOR_SECRETS_DIRECTORY set to {minted.path.parent}, with "
+                "MEFOR_CUSTODY_DIRECTORY unset"
+            )
+        else:
+            where = (
+                "MEFOR_CUSTODY_DIRECTORY and MEFOR_SECRETS_DIRECTORY unset, so that it looks "
+                "beside the SQLite store file"
+            )
         print(
             f"The store key was written to {minted.path}. The service looks for it in the custody "
             f"directory its own environment names; here that came from {where}. A service whose "

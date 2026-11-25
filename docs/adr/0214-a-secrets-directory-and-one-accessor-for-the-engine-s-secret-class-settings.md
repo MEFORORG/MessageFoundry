@@ -153,6 +153,29 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
 
 ## Amendments
 
+- **2026-11-22, the host key provider's files get a custody directory of their own (vault
+  BACKLOG #3411).** Under `[store].key_provider = 'host'` the service's first start writes its own
+  key file, `master.key`, beside the `handoff.key` an administrator's `provision-admin
+  --service-account` left. Neither the installer nor the engine guarantees the service read only
+  on this directory ([SERVICE.md, The custody directory under the host key
+  provider](../SERVICE.md#the-custody-directory-under-the-host-key-provider) says which grants
+  survive a rerun); decision 4's check passes a directory one named account may write. A service right to add a
+  file here would let it supply a secret-class setting. So those two files move to a directory of their own when
+  `MEFOR_CUSTODY_DIRECTORY` names one, an absolute path, which wins over `MEFOR_SECRETS_DIRECTORY`
+  for them; unset, they stay where they were, in this directory or beside a SQLite store. Before
+  a read or a mint, the engine applies decision 4's check to the directory that variable names,
+  `broad_access_problem` with `directory`, at every enforcement setting; like decision 4's check,
+  it reads known broad groups only, so it refuses no entry for one account, the service's add-file
+  right included. While the variable is set and neither file is in that directory, a host file or
+  handoff in this directory or beside a SQLite store refuses a read and a mint, so one made
+  without the variable is not taken for no key; and the check that refuses another key provider
+  beside a host file or handoff looks in at least the custody directory, this directory and the
+  place beside a SQLite store, whatever is set. Its refusal deletes no file it finds and moves
+  none, and points at the one procedure in docs/SERVICE.md that says when a key file may move.
+  `install-service.ps1` makes the custody directory only when it reads that provider, and names
+  it to the service as `MEFOR_CUSTODY_DIRECTORY`. docs/SERVICE.md, *The custody directory under
+  the host key provider*, states its location, its access list and the rest, and is the record
+  of them.
 - **2026-11-17, the Windows holder is read where the path resolves to (vault BACKLOG #5657).**
   This replaces parts of the 2026-11-13 amendment below. `_windows_surroundings_problem` still
   walks `full.parent`, except for a drive root such as `S:\`, whose own path it walks, so a
