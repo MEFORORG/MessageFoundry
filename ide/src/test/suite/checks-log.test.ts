@@ -324,7 +324,7 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       assert.ok(commit > 1, `no commit ran: ${JSON.stringify(runs)}`);
       // The stub's ls-files lists nothing, so no `rm --cached` runs between the two.
       assert.deepStrictEqual(runs[commit - 2], ["add", "-A", "--", "."]);
-      assert.deepStrictEqual(runs[commit - 1].slice(0, 5), ["ls-files", "-z", "--cached", "--ignored", "-x"]);
+      assert.deepStrictEqual(runs[commit - 1].slice(0, 5), ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"]);
       assert.strictEqual(runs.filter(isStageAll).length, 1, JSON.stringify(runs));
     }
   });
@@ -380,10 +380,13 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     fs.writeFileSync(path.join(ws, ".mefor", "messagefoundry.db"), "synthetic\n");
     fs.writeFileSync(path.join(ws, "route.py"), "# synthetic\n");
     // The user's own ignore rule, with a file they force-added under it: setup leaves that one staged.
-    fs.writeFileSync(path.join(ws, ".gitignore"), "*.local\n");
+    // And a `!` negation that re-includes a file one of setup's entries (`.env.*`) matches: it stays.
+    fs.writeFileSync(path.join(ws, ".gitignore"), "*.local\n.env.*\n!.env.example\n");
     fs.writeFileSync(path.join(ws, "team.local"), "synthetic\n");
+    fs.writeFileSync(path.join(ws, ".env.example"), "SYNTHETIC=1\n");
+    fs.writeFileSync(path.join(ws, ".env.prod"), "SYNTHETIC=1\n");
     g("add", "-A");
-    g("add", "-f", "team.local");
+    g("add", "-f", "team.local", ".env.prod");
     childProcess.execFile = ((
       file: string,
       args: string[],
@@ -408,12 +411,17 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     assert.ok(!committed.includes(".mefor/messagefoundry.db"), `the store was committed: ${JSON.stringify(committed)}`);
     // Only setup's own entries are applied: the file the user force-added under their rule stays.
     assert.ok(committed.includes("team.local"), JSON.stringify(committed));
+    assert.ok(committed.includes(".env.example"), JSON.stringify(committed));
+    assert.ok(!committed.includes(".env.prod"), `the env file was committed: ${JSON.stringify(committed)}`);
     // The file stays on disk, and the channel counts it by top-level entry, never by full path below one.
     assert.ok(fs.existsSync(path.join(ws, "api-generated-key.pem")));
     const written = lines();
     assert.ok(written.some((l) => l.endsWith("  api-generated-key.pem")), JSON.stringify(written));
     assert.ok(written.some((l) => l.endsWith("  keys/ (1 file)")), JSON.stringify(written));
     assert.ok(!written.some((l) => l.includes("handoff.key")), JSON.stringify(written));
+    // `.env.prod` matches a wildcard entry, so it is counted, not named.
+    assert.ok(!written.some((l) => l.includes(".env.prod")), JSON.stringify(written));
+    assert.ok(written.some((l) => l.endsWith("  1 other file(s) at the top level")), JSON.stringify(written));
   }
 
   test("a repository that already has a commit is offered no baseline and nothing is staged", async () => {

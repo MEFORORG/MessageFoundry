@@ -641,41 +641,71 @@ function unstageBatches(paths: readonly string[]): string[][] {
   return batches;
 }
 
-/** The Checks-channel summary of the paths left out: a count per top-level entry, never a full path,
- *  since a name below `captures/` or `out/` can hold message content. Control characters in a
- *  top-level name are shown escaped, so a name cannot forge a channel line. */
+/** The exact names among setup's gitignore entries, with no wildcard or folder slash. */
+const LITERAL_ENTRIES = new Set(GITIGNORE_ENTRIES.filter((e) => !/[*?[\]/]/.test(e)));
+
+/** The Checks-channel summary of the paths left out: a count per top-level folder, and a top-level
+ *  file by name only when its name is one of setup's exact entries (such as the minted key), so no
+ *  name that could hold message content is printed. */
 function unstagedSummary(paths: readonly string[]): string[] {
   const counts = new Map<string, number>();
+  let otherFiles = 0;
   for (const p of paths) {
     const slash = p.indexOf("/");
-    const head = slash < 0 ? p : `${p.slice(0, slash)}/`;
-    counts.set(head, (counts.get(head) ?? 0) + 1);
+    if (slash >= 0) {
+      const head = `${p.slice(0, slash)}/`;
+      counts.set(head, (counts.get(head) ?? 0) + 1);
+    } else if (LITERAL_ENTRIES.has(p)) {
+      counts.set(p, 1);
+    } else {
+      otherFiles += 1;
+    }
   }
-  return [...counts].map(([head, n]) => {
-    const shown = JSON.stringify(head).slice(1, -1);
+  const lines = [...counts].map(([head, n]) => {
+    // A folder name is shown only when it is printable ASCII, so it cannot forge or reorder a line.
+    const shown = /^[\x20-\x7e]+$/.test(head) ? head : "(a folder with an unprintable name)";
     return head.endsWith("/") ? `  ${shown} (${n} file${n === 1 ? "" : "s"})` : `  ${shown}`;
   });
+  if (otherFiles > 0) {
+    lines.push(`  ${otherFiles} other file(s) at the top level`);
+  }
+  return lines;
+}
+
+/** The paths `ls-files` printed with `-z`, or undefined after its failure is shown. Only the exit
+ *  code is logged: its output names paths, which can hold message content. */
+async function lsFiles(bin: string, ws: string, args: readonly string[]): Promise<Set<string> | undefined> {
+  const res = await git(bin, ["ls-files", "-z", "--cached", "--ignored", ...args, "--", "."], ws);
+  if (res.code !== 0) {
+    logChecks(`--- listing ignored staged files failed: git exit code ${res.code} ---`);
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not check the baseline for ignored files (git exit code ${res.code}).`,
+    );
+    return undefined;
+  }
+  return new Set(res.stdout.split("\0").filter((p) => p !== ""));
 }
 
 // `git add -A` never removes a path that is already in the index, so a file the user staged before
 // setup wrote the gitignore, such as the minted TLS key, would still go into the baseline (BACKLOG
-// #5413, #8237 item 2). So the staged paths that setup's own gitignore entries (GITIGNORE_ENTRIES)
-// match are taken back out of the index; the user's other ignore rules are not applied, so a file
-// they force-added under one of their own rules stays staged. The file on disk is kept. Since the
-// path is ignored, a later `git add -A` does not add it back either: it stays out of every commit
-// until someone runs `git add -f`. The Checks channel says how many left, by top-level entry, before
-// any is unstaged, so a failure partway still leaves the record. A failure refuses the commit.
+// #5413, #8237 item 2). So a staged path is taken back out of the index when both hold: the
+// repository's own ignore rules ignore it (`--exclude-standard`, so a `!` negation that re-includes
+// it, and each .gitignore's own base folder, are honoured), and one of setup's entries
+// (GITIGNORE_ENTRIES) matches it, so a file the user force-added under one of their own rules stays
+// staged. The file on disk is kept. Since the path is ignored, a later `git add -A` does not add it
+// back either: it stays out of every commit until someone runs `git add -f`. The Checks channel says
+// how many left before any is unstaged. A failure refuses the commit; the tree then stays staged, as
+// a failed commit already leaves it (#8237 item 4).
 async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
-  const patterns = GITIGNORE_ENTRIES.flatMap((p) => ["-x", p]);
-  const listed = await git(bin, ["ls-files", "-z", "--cached", "--ignored", ...patterns, "--", "."], ws);
-  if (listed.code !== 0) {
-    logResult(`--- listing ignored staged files failed: git exit code ${listed.code} ---`, listed);
-    void vscode.window.showErrorMessage(
-      `MessageFoundry: could not check the baseline for ignored files — ${listed.stderr.trim()}`,
-    );
+  const byRules = await lsFiles(bin, ws, ["--exclude-standard"]);
+  if (byRules === undefined) {
     return false;
   }
-  const ignored = listed.stdout.split("\0").filter((p) => p !== "");
+  const bySetup = byRules.size === 0 ? new Set<string>() : await lsFiles(bin, ws, GITIGNORE_ENTRIES.flatMap((p) => ["-x", p]));
+  if (bySetup === undefined) {
+    return false;
+  }
+  const ignored = [...byRules].filter((p) => bySetup.has(p));
   if (ignored.length === 0) {
     return true;
   }
@@ -693,9 +723,10 @@ async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
     // or store; --cached keeps the removal to the index, so the file itself is never touched.
     const rm = await git(bin, ["--literal-pathspecs", "rm", "--cached", "-f", "-q", "--", ...batch], ws);
     if (rm.code !== 0) {
-      logResult(`--- unstaging ignored files failed: git exit code ${rm.code} ---`, rm);
+      // Only the exit code: git's message names the path it refused.
+      logChecks(`--- unstaging ignored files failed: git exit code ${rm.code} ---`);
       void vscode.window.showErrorMessage(
-        `MessageFoundry: could not take ignored files out of the baseline — ${rm.stderr.trim()}`,
+        `MessageFoundry: could not take ignored files out of the baseline (git exit code ${rm.code}).`,
       );
       return false;
     }
