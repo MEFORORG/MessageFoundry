@@ -1963,6 +1963,15 @@ def test_gh_json_field_list_is_one_argv_entry() -> None:
     assert "--json number, " not in src
 
 
+def test_the_fetch_passes_no_auto_maintenance() -> None:
+    """BACKLOG #7614, pinned in the source too: the behavioural test skips on a git whose fetch does
+    not prune worktrees, and there it could not see the flag go missing."""
+    src = SCRIPT.read_text(encoding="utf-8")
+    fetches = [ln for ln in src.splitlines() if re.search(r"&\s*git\b.*\bfetch\b", ln)]
+    assert fetches, "no fetch call found, so this check sees nothing"
+    assert all("--no-auto-maintenance" in ln for ln in fetches), fetches
+
+
 # --------------------------------------------------------------------------------------------------
 # The -Apply re-check: the window between reading a candidate and deleting it
 #
@@ -2247,7 +2256,7 @@ def test_a_pr_merged_at_an_OLDER_tip_is_not_a_merge_signal(
     res = run(fx, skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "ahead")
     assert d["Decision"] == "SKIP"
-    assert any("the branch moved on after that merge" in n for n in d["Notes"])
+    assert any("the branch moved on after that merge" in n for n in d["Notes"]), d["Notes"]
 
 
 def test_a_failing_gh_probe_is_reported_not_claimed(
@@ -2273,13 +2282,16 @@ def test_a_failing_gh_probe_is_reported_not_claimed(
     assert any("probe FAILED for this branch" in n for n in by_leaf(res, "ahead")["Notes"])
 
 
-@pytest.mark.parametrize("payload", ["not json at all", "", "null", '{"number": 1}'])
+@pytest.mark.parametrize(
+    "payload", ["not json at all", "", "null", '{"number": 1}', '[{"": 1}]', '[{"a": 1, "A": 2}]']
+)
 def test_a_gh_answer_that_is_not_a_json_array_is_a_failed_probe(
     fx: Fixture, sleeper: int, tmp_path: Path, payload: str
 ) -> None:
-    """BACKLOG #7615 review. Exit 0 with no JSON array used to read as an empty answer and count as
-    a successful probe; now that an answered ``no`` demotes a gone upstream, it must not answer at
-    all. It is a failed probe, so the gone upstream reads as it does with no probe."""
+    """BACKLOG #7615 review. On origin/main, exit 0 with malformed text read as an empty answer
+    counted as a successful probe, and a JSON value that is not an array crashed the run. Now it is
+    a failed probe in the receipt, but gh did exit 0, so the gone upstream is not re-enabled: the
+    crash removed nothing, and this must not remove more."""
     live_record(fx, sleeper, fx.primary)
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("gone"), hours=100)
@@ -2289,7 +2301,7 @@ def test_a_gh_answer_that_is_not_a_json_array_is_a_failed_probe(
     assert res["ghProbes"]["failed"] == res["ghProbes"]["attempted"] > 0, res["ghProbes"]
     d = by_leaf(res, "gone")
     assert any("without a JSON array" in n for n in d["Notes"]), d["Notes"]
-    assert d["Decision"] == "PRUNE" and "is gone" in d["Reason"], d
+    assert d["Decision"] == "SKIP", d
 
 
 def _pr(number: int, oid: str, *, base: str = "main", fork: bool = False) -> dict[str, Any]:
@@ -2331,6 +2343,8 @@ def test_a_pr_merged_at_this_tip_but_not_into_main_from_this_repo_is_not_a_merge
     [
         pytest.param("[]", "SKIP", id="no-merged-pr"),
         pytest.param("older", "SKIP", id="merged-at-an-older-tip"),
+        pytest.param("other-base", "SKIP", id="merged-at-this-tip-into-another-base"),
+        pytest.param("fork", "SKIP", id="merged-at-this-tip-from-a-fork"),
         pytest.param("tip", "PRUNE", id="control-merged-at-this-tip"),
     ],
 )
@@ -2348,6 +2362,8 @@ def test_a_gone_upstream_is_not_a_merge_signal_when_the_pr_probe_answered_no(
         "[]": "[]",
         "older": json.dumps([_pr(5, "deadbeef" * 5)]),
         "tip": json.dumps([_pr(6, tip)]),
+        "other-base": json.dumps([_pr(6, tip, base="release/1")]),
+        "fork": json.dumps([_pr(6, tip, fork=True)]),
     }[payload]
     shim = gh_shim(tmp_path, payload=body)
 

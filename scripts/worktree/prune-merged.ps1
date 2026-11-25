@@ -531,9 +531,11 @@ function Test-Merged {
     #    a PR into $mainBase from this repository counts (BACKLOG #7615). A row that does not say fails
     #    closed. No `--base` on the call: it would change which PRs fill `--limit`, and could then find
     #    a match the unfiltered query never saw, widening what this removes.
-    #    $answeredNo: gh exited 0 with a JSON array holding no such PR. Step 3 reads it. Anything else
-    #    gh says is a FAILED probe: it used to read as an empty answer and was counted as a success.
-    $answeredNo = $false
+    #    $probeRan: gh exited 0, so whatever it printed is the answer, and it held no such PR. Step 3
+    #    reads it. An exit-0 answer that is not a JSON array is counted as a FAILED probe in the receipt
+    #    but still sets $probeRan, so it never re-enables the gone upstream: origin/main crashed on a
+    #    non-array answer and removed nothing, and this must not remove more.
+    $probeRan = $false
     if ($hasGh) {
         $script:ghAttempts++
         $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
@@ -542,17 +544,19 @@ function Test-Merged {
         $ghText = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
         $prs = $null
         if ($ghExit -eq 0) {
-            try { $prs = ConvertFrom-Json -InputObject $ghText -NoEnumerate } catch [System.ArgumentException] { $prs = $null }
+            $probeRan = $true
+            # ConvertFrom-Json throws ArgumentException on malformed text and InvalidOperationException
+            # on an empty or case-colliding key (measured, pwsh 7.6).
+            try { $prs = ConvertFrom-Json -InputObject $ghText -NoEnumerate } catch [System.ArgumentException], [System.InvalidOperationException] { $prs = $null }
         }
         if ($prs -isnot [array]) {
             $script:ghFailures++
             $what = if ($ghExit -ne 0) { "gh exited $ghExit" } else { 'gh exited 0 without a JSON array' }
-            $why = if ($ghExit -ne 0) { (@($raw) -join ' ').Trim() } else { '' }
+            $why = if ($ghExit -ne 0) { (@($raw) -join ' ').Trim() } elseif ($ghText) { "${what}: $($ghText.Substring(0, [Math]::Min(200, $ghText.Length)))" } else { '' }
             if (-not $script:ghFirstError) { $script:ghFirstError = if ($why) { $why } else { $what } }
             $notes += "the merged-PR probe FAILED for this branch ($what), so only the local merge signals were available"
         }
         else {
-            $answeredNo = $true
             $atTip = @($prs | Where-Object { $_.headRefOid -eq $tip })
             $exact = @($atTip | Where-Object { $_.baseRefName -ceq $mainBase -and $_.isCrossRepository -eq $false })
             if ($exact.Count -gt 0) {
@@ -566,7 +570,7 @@ function Test-Merged {
             }
             if ($prs.Count -gt 0 -and $atTip.Count -eq 0) {
                 $head = [string]$prs[0].headRefOid
-                $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($head.Substring(0, [Math]::Min(8, $head.Length))) and this branch is at $($tip.Substring(0,8)) -- the branch moved on after that merge"
+                $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($head.Substring(0, [Math]::Min(8, $head.Length))) and this branch is at $($tip.Substring(0,8)) -- the two differ (the branch moved on after that merge, or the PR head gained commits this branch lacks)"
             }
         }
     }
@@ -593,11 +597,12 @@ function Test-Merged {
         $upTrack = if ($parts.Count -gt 1) { $parts[1] } else { '' }
         $upRemote = if ($parts.Count -gt 2) { $parts[2] } else { '' }
         if ($upTrack -match 'gone') {
-            # A gone upstream is no proof once the probe ANSWERED that no PR merged into $mainBase at
-            # this tip: a closed PR, or a branch that moved on after its merge, leaves the same shape
-            # (BACKLOG #7615). With no answer (-SkipGh, no gh, a failed probe) it still reads as merged.
+            # A gone upstream is no proof once gh ANSWERED with no PR merged into $mainBase at this
+            # tip: a closed PR, or a branch that moved on after its merge, leaves the same shape
+            # (BACKLOG #7615). With no answer it still reads as merged, as on origin/main; at least
+            # -SkipGh, no gh, an origin that is not GitHub and a gh that exited non-zero leave none.
             if ($upShort -eq "$upRemote/$Branch") {
-                if (-not $answeredNo) {
+                if (-not $probeRan) {
                     return @{
                         Merged = $true
                         Reason = "upstream $upShort is gone (squash-merged + remote-deleted); the branch is KEPT because $uniq commit(s) are not on $MainRef"
@@ -1562,10 +1567,10 @@ function Get-LiveOrphans([object[]]$Ledger) {
         if ($txt -notmatch 'gitdir:\s*(.+)') { continue }
         # Resolved against the directory holding the pointer: git writes it relative under
         # worktree.useRelativePaths, and the raw text then never matched (BACKLOG #7616).
+        # GetFullPath with a base leaves a fully qualified pointer as it is and resolves a relative or
+        # drive-relative one; IsPathRooted would have passed `\foo` and `C:foo` through unresolved.
         $ptr = $Matches[1].Trim()
-        if (-not [IO.Path]::IsPathRooted($ptr)) {
-            try { $ptr = [IO.Path]::GetFullPath($ptr, $dir.FullName) } catch [System.ArgumentException], [System.NotSupportedException], [System.IO.PathTooLongException] { continue }
-        }
+        try { $ptr = [IO.Path]::GetFullPath($ptr, $dir.FullName) } catch [System.ArgumentException], [System.NotSupportedException], [System.IO.PathTooLongException] { continue }
         $target = ConvertTo-Norm $ptr
         if (-not $gitCommonDir -or -not $target.StartsWith((ConvertTo-Norm $gitCommonDir) + '/')) { continue }
         $seen[$n] = $true
