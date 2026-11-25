@@ -102,10 +102,11 @@ def missing_eol_style(raw: str) -> str | None:
 
 
 #: A ``BHS`` or ``FHS`` batch header after leading whitespace: the segment id, a field separator
-#: that is not a word or space character, up to five non-space encoding characters, and the same
-#: separator again. Stricter than ``starts_with_msh``, so prose that opens with the letters, such
-#: as ``FHS: 140 bpm``, is not read as a batch.
-_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)([^\w\s])\S{0,5}?\1")
+#: that is not a word or space character, one to five encoding characters of the same kind, then
+#: the separator again, a line break or the end, so ``BHS|^~\&`` with nothing after it counts.
+#: Stricter than ``starts_with_msh``: prose such as ``FHS: 140 bpm`` or ``FHS:140:bpm`` is not read
+#: as a batch, though prose shaped like a header, punctuation only, still is.
+_LEADS_WITH_BATCH_HEADER = re.compile(r"\s*(?:BHS|FHS)([^\w\s])[^\w\s]{1,5}?(?:\1|[\r\n]|\Z)")
 
 
 def restore_eol(raw: str, eol: str) -> str | None:

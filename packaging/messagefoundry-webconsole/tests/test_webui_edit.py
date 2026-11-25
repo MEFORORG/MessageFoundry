@@ -504,6 +504,9 @@ def test_a_batch_with_no_terminator_field_goes_out_cr(head: str) -> None:
     assert restore_eol(submitted, "cr") == submitted.replace("\r\n", "\r")
     # Round-1 review: prose that opens with the letters is no batch header, and keeps its breaks.
     assert missing_eol_style("FHS: 140 bpm\r\nnext line\r\n") is None
+    # Round-2 review: a repeated punctuation mark is no header either, and a minimal one counts.
+    assert missing_eol_style("FHS:140:bpm\r\nnext line\r\n") is None
+    assert missing_eol_style("BHS|^~\\&\r\nMSH|^~\\&|S\r\nBTS|1\r\n") == "cr"
 
 
 def test_terminator_style_chosen_for_each_original() -> None:

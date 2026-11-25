@@ -306,7 +306,9 @@ this line.**
 - **An edited batch resubmitted with no line-ending field keeps HL7's CR.** The edit-and-resubmit
   route restores CR for a submitted HL7 body whose form carried no `eol` field, but read only an
   `MSH`-led body as HL7, so a batch led by `BHS` or `FHS` went out with the browser's CRLF. It
-  now takes CR too. The seam digest moves, since the route hashes this rule. (BACKLOG #5930)
+  now takes CR too when the header has its separator shape. The seam digest moved with the
+  function body; the header pattern it reads is a module constant the digest does not hash.
+  (BACKLOG #5930)
 
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
