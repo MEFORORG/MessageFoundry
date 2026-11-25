@@ -4478,7 +4478,9 @@ async def _probe_db(
 ) -> None:
     """Open the pool and run ``SELECT 1`` — a no-data, no-write reachability probe shared by the
     DATABASE source and destination's ``test_connection``. A driver error is mapped via
-    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); any
+    :func:`_classify_db_error` (transient vs permanent, through :func:`_connect` at connect); a
+    connection the call gate cannot wrap is the permanent ``config_fault`` :func:`_connect` makes
+    of it (BACKLOG #2394); any
     other non-driver failure (e.g. an unreachable host before any SQLSTATE) becomes a transient
     :class:`DeliveryError`. Triggers the connector's lazy pool;
     the caller closes it with ``aclose()``."""
