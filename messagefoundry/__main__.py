@@ -15703,13 +15703,25 @@ def _is_transient_driver_error(exc: BaseException) -> bool:
 
 def _write_outcome_unknown(exc: BaseException) -> bool:
     """Whether a failed write may still have committed: a lost connection (OSError, or SQLSTATE
-    class 08), or 40003, "statement completion unknown" (BACKLOG #2337)."""
+    class 08), or 40003, "statement completion unknown" (BACKLOG #2337).
+
+    The chain is followed through ``__cause__``, or ``__context__`` where no cause was set and
+    the context is not suppressed, as :func:`_engine_refusal_text` follows it (BACKLOG #5093): a
+    backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost link to
+    the rollback's own error on a dead connection, which then carries it only as its context."""
     from messagefoundry.store.base import driver_sqlstate
 
-    if isinstance(exc, OSError):
-        return True
-    state = driver_sqlstate(exc)
-    return state is not None and (state.startswith("08") or state == "40003")
+    link: BaseException | None = exc
+    seen: set[int] = set()
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        if isinstance(link, OSError):
+            return True
+        state = driver_sqlstate(link)
+        if state is not None and (state.startswith("08") or state == "40003"):
+            return True
+        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+    return False
 
 
 def _emit_store_open_error(

@@ -246,7 +246,10 @@ async def test_a_caller_session_the_revoke_declines_is_ended_and_said_to_be(
         r = await c.delete("/sessions", headers=_auth(root))
         assert r.status_code == 200, r.text
         assert live and live[0] >= 2  # the caller's row and ops', both unrevoked at the revoke
-        assert r.json()["detail"] == f"revoked {live[0]} session(s); this session was ended too"
+        assert r.json()["detail"] == (
+            f"ended {live[0]} unrevoked session row(s), expired ones included; "
+            "this session was ended too"
+        )
         # Read before anything presents the token: the gate would end a live one it refuses.
         assert await _revoked(store, root)  # ended by the revoke itself
         assert not await _alive(c, root)
@@ -423,6 +426,64 @@ def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
         "outcome": "unknown",
     }
     assert str(audits[0]["actor"]).startswith("cli:")
+
+
+@pytest.mark.parametrize("cause", [False, True], ids=["context", "cause"])
+def test_a_rollback_error_that_masks_a_lost_commit_reads_as_unknown(
+    cause: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost
+    link to the rollback's own error on the dead connection, which carries it only in its chain.
+    That is still an unknown outcome, never "nothing was revoked"; the sessions did end here."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    revoke = MessageStore.revoke_all_sessions
+
+    async def masked(self: MessageStore, **kwargs: object) -> RevokeResult:
+        await revoke(self)
+        try:
+            raise _LinkLost()  # the COMMIT's lost link
+        except _LinkLost as lost:
+            rollback = sqlite3.OperationalError("cannot rollback: the connection is closed")
+            if cause:
+                raise rollback from lost
+            raise rollback  # noqa: B904 -- the implicit context is the case under test
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", masked)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "nothing was revoked" not in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [True, True] and len(audits) == 1
+
+
+def test_a_suppressed_context_is_not_read_as_a_lost_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a refusal raised ``from None`` names its context irrelevant, so a lost link
+    there does not make the outcome unknown."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def suppressed(self: MessageStore, **kwargs: object) -> RevokeResult:
+        try:
+            raise _LinkLost()
+        except _LinkLost:
+            raise sqlite3.OperationalError("database is locked") from None
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", suppressed)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: "), error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
 
 
 def test_an_unknown_outcome_whose_row_is_refused_says_so(

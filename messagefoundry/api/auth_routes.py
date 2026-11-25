@@ -1794,7 +1794,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             client=client_ip(request),
         )
         outcome = "this session was kept" if kept else "this session was ended too"
-        return SimpleMessage(detail=f"revoked {revoked} session(s); {outcome}")
+        # The count is every unrevoked row the sweep ended, an expired one never purged among
+        # them, as admin-revoke-sessions words it (BACKLOG #5095).
+        return SimpleMessage(
+            detail=f"ended {revoked} unrevoked session row(s), expired ones included; {outcome}"
+        )
 
     @app.put("/users/{user_id}/roles", response_model=SimpleMessage)
     async def set_user_roles(

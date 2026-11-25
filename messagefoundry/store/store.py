@@ -9228,7 +9228,10 @@ def write_restore_marker(
     needs no key: so no path that honours a session without consuming the marker, such as an
     older build started on the file, gets the archive's sessions back. The first start still
     revokes as :meth:`MessageStore.revoke_all_sessions` does, raising the global session epoch
-    and each account's, the second of which needs the key, and adds this count to its own.
+    and each account's, the second of which needs the key, and adds this count to its own. An
+    account goes without its own raise where :func:`raise_account_epoch` says, at least on a seal
+    refusal and after a Vault Transit outage trips the revoke; the global epoch still ends its
+    sessions.
 
     It is proven in the main file as :func:`forget_store_salt`'s drop is, through
     :func:`_write_closed_store`: a non-empty ``-wal`` beside it, or a re-read that finds no row
