@@ -7,9 +7,9 @@ WHAT IT READS, at least: the private vault at its ``origin/main`` (never its wor
 may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
 JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance, in
 the git checkout ``--engine-repo`` names (default: the checkout this script sits in); and, from the
-tree THIS script sits in, ``scripts/asvs/scorecard.py``, which it runs. That tree need not be a git checkout: the scheduled refresh runs a
-``git archive`` copy, and passes ``--archive-ref`` with the commit it archived, because the
-scorecard tool then stamps ``engine=NO-GIT``. It also reads the ``Batch queue`` tab of the
+tree THIS script sits in, ``scripts/asvs/scorecard.py``, which it runs. That tree need not be a
+git checkout: the scheduled refresh runs a ``git archive`` copy, and passes ``--archive-ref`` with
+the commit it archived, because the scorecard tool then stamps ``engine=NO-GIT``. It also reads the ``Batch queue`` tab of the
 ``/batch`` runbook workbook (``--runbook``, else ``MEFOR_RUNBOOK``, else
 ``%USERPROFILE%/OneDrive/Desktop/MEFOR/MEFOR-backlog-runbook.xlsx``), parsed with the engine's
 vendored defusedxml loaded by path.
@@ -47,8 +47,8 @@ WHAT IT WRITES outside ``--out``, at least: unless ``--no-fetch``, two
 ``git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main``, one in the vault and one
 in the engine checkout. Each moves only ``refs/remotes/origin/main``, and also writes
 ``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
-is created; the release tag is resolved with ``git ls-remote``. Vault files and downloads go to a fresh
-``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
+is created; the release tag is resolved with ``git ls-remote``. Vault files and downloads go
+to a fresh ``mf-metrics-*`` directory under ``--work-dir`` (default: Python's temporary directory), removed at
 exit; a removal that fails is an error, and such directories older than two hours are swept at the
 start of the next run, since a run killed by a time limit skips its cleanup.
 
@@ -706,7 +706,6 @@ class Context:
     runbook: Path | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
     gh_backoff: float = GH_BACKOFF_SECONDS
-    merged_cache: dict[str, list[dict[str, Any]] | CollectError] = field(default_factory=dict)
     _vault: VaultRead | CollectError | None = None
 
     @property
@@ -948,24 +947,12 @@ def list_per_week(
 
 
 def merged_prs(ctx: Context, repo: str) -> list[dict[str, Any]]:
-    """Every PR merged in the window, cached per repo so two metrics share one read.
-
-    A failure is cached too, like the vault read: a second metric would only repeat it, slower.
-    """
-    if repo not in ctx.merged_cache:
-        try:
-            ctx.merged_cache[repo] = list_per_week(
-                ctx,
-                ["pr", "list", "-R", repo, "--state", "merged"]
-                + ["--json", "number,createdAt,mergedAt"],
-                lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
-            )
-        except CollectError as exc:
-            ctx.merged_cache[repo] = exc
-    cached = ctx.merged_cache[repo]
-    if isinstance(cached, CollectError):
-        raise cached
-    return cached
+    """Every PR merged in the window in ``repo``."""
+    return list_per_week(
+        ctx,
+        ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,mergedAt"],
+        lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
+    )
 
 
 def c_prs_merged(ctx: Context, m: Metric) -> None:
@@ -1543,7 +1530,7 @@ SPECS: tuple[Spec, ...] = (
         "PRs merged",
         "How many pull requests merged per week across engine, vault and korus?",
         "PRs per week",
-        "gh pr list -R <repo> --state merged --search merged:<week> --json number,createdAt,mergedAt, "
+        "gh pr list -R <repo> --state merged --search merged:<week> --json number,mergedAt, "
         f"for {', '.join(MERGED_REPOS)}",
         c_prs_merged,
     ),

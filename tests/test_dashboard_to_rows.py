@@ -545,10 +545,18 @@ def test_unscored_label_matches_the_census_driver() -> None:
     assert f'UNSCORED = "{tr.UNSCORED_LABEL}"' in source
 
 
-def test_estimate_label_matches_the_census_driver() -> None:
-    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
-    assert f'ESTIMATE = "{tr.ESTIMATE_LABEL}"' in source
-    assert f"|{tr.DEMAND_GATE})" in source
+def test_estimate_and_demand_gate_labels_match_the_census_driver() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "dashboard_vault_census_labels", _PATH.parent / "_vault_census.py"
+    )
+    assert spec is not None and spec.loader is not None
+    vc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vc)
+    assert vc.ESTIMATE == tr.ESTIMATE_LABEL
+    # What the driver returns for a DEMAND-GATE row, not a substring of its source.
+    item = type("Item", (), {"line": 1, "body_line": 3, "section_lines": []})()
+    lines = ["## 1. Title", "> **Re-scored 2026-11-25 -> DEMAND-GATE.** Value **5/10**", "body"]
+    assert vc.row_priority(item, lines) == tr.DEMAND_GATE
 
 
 def test_priority_rows_order_tiers_then_demand_gate_estimates_and_unscored() -> None:

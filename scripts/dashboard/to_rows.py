@@ -512,6 +512,8 @@ UNSCORED_LABEL = "unscored"
 ESTIMATE_LABEL = "estimate only"
 #: The measured tier a scoring pass gives a row it holds for demand, a bucket of its own.
 DEMAND_GATE = "DEMAND-GATE"
+#: The priority table's display name for a bucket; a tier (P1, DEMAND-GATE) shows as it is.
+PRIORITY_LABELS = {UNSCORED_LABEL: "Unscored", ESTIMATE_LABEL: "Estimate only"}
 
 #: The priority table's columns, in order: the open statuses, then the closed kinds.
 PRIORITY_STATUSES = (*cm.OPEN_STATUSES, "closed", "declined", "superseded")

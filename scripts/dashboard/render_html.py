@@ -548,7 +548,7 @@ def priority_table(rows: Sequence[Mapping[str, Any]]) -> str:
     body = []
     for p in priorities:
         values = [cell.get((p, s)) for s in statuses]
-        label = {tr.UNSCORED_LABEL: "Unscored", tr.ESTIMATE_LABEL: "Estimate only"}.get(p, p)
+        label = tr.PRIORITY_LABELS.get(p, p)
         body.append(
             f"<tr><th>{esc(label)}</th>"
             + "".join(f"<td>{fmt(v)}</td>" for v in values)

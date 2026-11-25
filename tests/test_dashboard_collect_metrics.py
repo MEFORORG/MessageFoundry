@@ -1116,20 +1116,6 @@ def test_ci_red_failure_degrades_only_that_count(tmp_path: Path) -> None:
     assert m.detail["partial_error"].startswith("ci-red count:")
 
 
-def test_a_merged_pr_failure_is_read_once(tmp_path: Path) -> None:
-    calls: list[str] = []
-
-    def run(argv: Sequence[str], cwd: Path | None) -> str:
-        calls.append(" ".join(argv))
-        raise cm.CollectError("gh pr list exited 1: HTTP 403: Forbidden")
-
-    ctx = _ctx(tmp_path, run, weeks=2)
-    for _ in range(2):
-        with pytest.raises(cm.CollectError, match="403"):
-            cm.merged_prs(ctx, cm.ENGINE_REPO)
-    assert len(calls) == 1
-
-
 def test_the_driver_counts_its_clip_calls() -> None:
     import types
 
@@ -1625,15 +1611,18 @@ _ESTIMATE_LINE = "> **Filed 2026-11-20.** Value **4/10** . Difficulty **2/10**"
     [
         # A banner tier beats the Cluster priority, in either arrow form.
         ([_SCORED.format(arrow="->", tier="P2")], _CLUSTER_P3, "P2"),
-        ([_SCORED.format(arrow="→", tier="P1")], _CLUSTER_P3, "P1"),
+        ([_SCORED.format(arrow="\u2192", tier="P1")], _CLUSTER_P3, "P1"),
         ([_SCORED.format(arrow="->", tier="DEMAND-GATE")], None, "DEMAND-GATE"),
         # Only the FIRST score line counts: a later tier does not override an untiered first one.
         ([_ESTIMATE_LINE, _SCORED.format(arrow="->", tier="P1")], None, "estimate only"),
         # An untiered estimate: the Cluster priority wins, else the estimate bucket.
         ([_ESTIMATE_LINE], _CLUSTER_P3, "P3"),
         ([_ESTIMATE_LINE], None, "estimate only"),
-        # A tier quoted on a line with no score is prose, not the row's tier.
+        # A tier quoted on a line with no score, or after the score, is prose, not the row's tier.
         (["> O filed; see the row re-scored -> P1. elsewhere"], None, "unscored"),
+        ([_ESTIMATE_LINE + ". Same cause as a row moved -> P1."], None, "estimate only"),
+        # The vault's own score form, which needs no bold markers.
+        (["> _(was DEMAND-GATE . value 4/10 . Difficulty 3/10.)_"], None, "estimate only"),
         (["> O filed"], None, "unscored"),
     ],
 )
