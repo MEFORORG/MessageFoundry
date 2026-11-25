@@ -1469,8 +1469,8 @@ async def test_login_with_an_unencodable_password_is_refused_at_the_boundary(
 ) -> None:
     # BACKLOG #6880: a JSON body's \ud800 escape decodes to a lone surrogate, which argon2-cffi's
     # UTF-8 encode would refuse. The request model's ``str`` field refuses it first, so sign-in
-    # answers 422 and never reaches ``verify_password``; that function's own catch is defence in
-    # depth for any caller that skips the model. The raw body is sent by hand because httpx's own
+    # answers 422 and never reaches ``verify_password``; that function's own surrogate pre-check is
+    # defence in depth for any caller that skips the model. The raw body is sent by hand because httpx's own
     # JSON encoder would refuse the surrogate before the request left.
     monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
     service = await _service(engine)

@@ -17,7 +17,7 @@ import functools
 import logging
 
 from argon2 import PasswordHasher
-from argon2.exceptions import InvalidHashError, VerificationError
+from argon2.exceptions import Argon2Error, InvalidHashError, VerificationError
 
 from messagefoundry.controlchars import has_lone_surrogate
 
@@ -79,19 +79,34 @@ def _constant_work_hash() -> str:
 
 
 def _spend_one_verify() -> None:
-    """One argon2id verify at the pinned cost, its answer discarded.
+    """One argon2id verify at the pinned cost, its answer discarded, for the two refusals in
+    :func:`verify_password`.
 
-    Callers equalize timing on the premise that each ``verify_password`` call costs one verify: at
-    least the recovery-code walk, which runs every slot so the attempt's cost does not reveal which
-    slot matched (ADR 0170). An input refused before the hasher runs would break that premise per
-    refused slot, so the refusal pays the same work here."""
-    _hasher.verify(_constant_work_hash(), _CONSTANT_WORK_INPUT)
+    The recovery-code walk runs every slot so an attempt's cost does not reveal which slot matched
+    (ADR 0170). That holds per slot only while each slot costs one verify, and a slot refused before
+    the hasher runs would otherwise cost almost nothing. This does not raise: if argon2 itself fails
+    here, the failure is logged without content, and the refusal then costs whatever was spent."""
+    failure: str | None = None
+    try:
+        _hasher.verify(_constant_work_hash(), _CONSTANT_WORK_INPUT)
+    except (
+        Argon2Error,
+        InvalidHashError,
+    ) as exc:  # InvalidHashError is a ValueError, not Argon2Error
+        failure = type(exc).__name__
+    if failure is not None:
+        _log.warning("constant-work argon2 verify failed (%s); the refusal stands", failure)
 
 
 def verify_password(stored_hash: str, password: str) -> bool:
     """True iff ``password`` matches ``stored_hash``. Never raises on a bad password or malformed hash.
 
-    Every call does one argon2id verify's work, including the two refusals below (BACKLOG #6880)."""
+    What a call costs (BACKLOG #6880): a refusal of a non-ASCII stored hash, or of a password holding
+    a surrogate code point, pays one argon2id verify at the pinned parameters against a fixed hash;
+    the first such refusal in a process also pays one hash to make that fixed hash. A well-formed
+    stored hash at the pinned parameters costs one verify. Other stored hashes cost what argon2-cffi
+    spends on them: at least a malformed ASCII hash is refused before any hashing and costs almost
+    nothing, and a hash at other parameters costs its own verify."""
     # argon2-cffi encodes the hash as ASCII and the password as UTF-8 before argon2 sees either, and
     # neither encode failure becomes one of its own exception types. Both inputs are therefore
     # screened first, so no ``UnicodeEncodeError`` is ever raised here: that exception carries the

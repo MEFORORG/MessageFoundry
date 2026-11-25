@@ -13,6 +13,7 @@ from types import ModuleType
 
 import pytest
 from argon2 import PasswordHasher
+from argon2.exceptions import HashingError, InvalidHashError, VerificationError
 
 from messagefoundry.auth import (
     AuthProvider,
@@ -225,14 +226,27 @@ def test_verify_password_unencodable_password_is_a_quiet_non_match(
         assert form not in text
 
 
-class _VerifySpy:
-    """Stands in for the module's slotted ``PasswordHasher``: records each verify, then delegates."""
+class _HasherSpy:
+    """Stands in for the module's slotted ``PasswordHasher``: records each hash and verify, then
+    delegates, or raises the planted failure instead."""
 
-    def __init__(self, real: PasswordHasher) -> None:
+    def __init__(
+        self,
+        real: PasswordHasher,
+        *,
+        hash_fails: Exception | None = None,
+        verify_fails: Exception | None = None,
+    ) -> None:
         self.real = real
+        self.hashed = 0
         self.verified: list[str] = []
+        self.hash_fails = hash_fails
+        self.verify_fails = verify_fails
 
     def hash(self, password: str) -> str:
+        self.hashed += 1
+        if self.hash_fails is not None:
+            raise self.hash_fails
         return self.real.hash(password)
 
     def check_needs_rehash(self, stored_hash: str) -> bool:
@@ -240,7 +254,17 @@ class _VerifySpy:
 
     def verify(self, stored_hash: str, password: str) -> bool:
         self.verified.append(stored_hash)
+        if self.verify_fails is not None:
+            raise self.verify_fails
         return self.real.verify(stored_hash, password)
+
+
+def _refused_inputs(refusal: str) -> tuple[str, str, str]:
+    """(the real hash, the stored hash, the password) for one of the two refusals."""
+    h = hash_password("Str0ng!Passphrase")
+    if refusal == "non-ASCII hash":
+        return h, h[:-1] + SECRET_CHAR, "Str0ng!Passphrase"
+    return h, h, "Str0ng!\ud800Passphrase"
 
 
 @pytest.mark.parametrize("refusal", ["non-ASCII hash", "unencodable password"])
@@ -248,23 +272,59 @@ def test_verify_password_refusals_still_pay_one_argon2_verify(
     refusal: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The recovery-code walk keeps constant work per slot (ADR 0170) only if a refused slot costs
-    # what a checked one does, so each refusal must still run exactly one real argon2id verify.
-    h = hash_password("Str0ng!Passphrase")
-    stored, password = (
-        (h[:-1] + SECRET_CHAR, "Str0ng!Passphrase")
-        if refusal == "non-ASCII hash"
-        else (h, "Str0ng!\ud800Passphrase")
-    )
-    spy = _VerifySpy(passwords._hasher)
+    # what a checked one does, so each refusal must still run exactly one real argon2id verify, and
+    # only the first refusal in a process may also pay the one hash that makes the fixed hash.
+    h, stored, password = _refused_inputs(refusal)
+    passwords._constant_work_hash.cache_clear()  # this test owns its precondition
+    spy = _HasherSpy(passwords._hasher)
     monkeypatch.setattr(passwords, "_hasher", spy)
-    assert verify_password(stored, password) is False
-    assert len(spy.verified) == 1
-    worked_on = spy.verified[0]
-    assert worked_on not in (stored, h)  # the constant-work hash, never the refused input
-    assert needs_rehash(worked_on) is False  # at the pinned parameters, so the same cost
-    # Control: an ordinary mismatch goes through the same spy once, on the stored hash itself.
-    assert verify_password(h, "wrong") is False
-    assert spy.verified[1:] == [h]
+    try:
+        assert verify_password(stored, password) is False
+        assert (spy.hashed, len(spy.verified)) == (1, 1)  # first refusal: make the hash, verify it
+        assert verify_password(stored, password) is False
+        assert (spy.hashed, len(spy.verified)) == (1, 2)  # later refusals: one verify, no hash
+        worked_on = spy.verified[0]
+        assert spy.verified == [worked_on, worked_on]
+        assert worked_on not in (stored, h)  # the constant-work hash, never the refused input
+        assert needs_rehash(worked_on) is False  # at the pinned parameters, so the same cost
+        # Control: an ordinary mismatch goes through the same spy once, on the stored hash itself.
+        assert verify_password(h, "wrong") is False
+        assert spy.verified[2:] == [h] and spy.hashed == 1
+    finally:
+        passwords._constant_work_hash.cache_clear()  # drop the hash made through the spy
+
+
+@pytest.mark.parametrize("refusal", ["non-ASCII hash", "unencodable password"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param({"hash_fails": HashingError("planted")}, id="hash-fails"),
+        pytest.param({"verify_fails": VerificationError("planted")}, id="verify-fails"),
+        pytest.param({"verify_fails": InvalidHashError("planted")}, id="invalid-hash"),
+    ],
+)
+def test_verify_password_refusal_never_raises_when_the_constant_work_fails(
+    refusal: str,
+    failure: dict[str, Exception],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # "Never raises" covers the constant-work verify too: argon2 failing there (for example a memory
+    # allocation failure) leaves the refusal standing, logged without content.
+    h, stored, password = _refused_inputs(refusal)
+    passwords._constant_work_hash.cache_clear()
+    spy = _HasherSpy(passwords._hasher, **failure)
+    monkeypatch.setattr(passwords, "_hasher", spy)
+    try:
+        with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+            assert verify_password(stored, password) is False
+    finally:
+        passwords._constant_work_hash.cache_clear()
+    records = _password_log_records(caplog)
+    failed = [r for r in records if "constant-work" in r.getMessage()]
+    assert [r.levelname for r in failed] == ["WARNING"]
+    text = "\n".join(r.getMessage() for r in records)
+    assert "planted" not in text and h[:-1] not in text and "Str0ng!" not in text
 
 
 def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:
