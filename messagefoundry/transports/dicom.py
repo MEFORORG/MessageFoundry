@@ -9,8 +9,8 @@ asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread �
 
 * starts/stops the AE server **off the event loop**, in the default executor
   (:func:`~messagefoundry.threadhop.to_thread_or_loop`), so binding/shutdown does not stall other
-  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own, and
-  on the loop only when no thread can start;
+  listeners/workers/API calls; a hop the default executor refuses runs on a thread of its own
+  (docs/SECURITY.md says what happens when no thread can start: a start then fails);
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on
@@ -2228,7 +2228,8 @@ class DicomScpSource(SourceConnector):
         _redact_flagged_peer_values()  # again: warnings filters can be put back after the import
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
         # A default executor that refuses the hop binds it on a thread of its own, so a
-        # reload's rollback still brings the listener back up (BACKLOG #5755, item 3).
+        # reload's rollback can still bring the listener back up (BACKLOG #5755, item 3). When no
+        # thread can start at all, the start fails here: its accept loop needs one.
         await to_thread_or_loop("DICOM listener start", self._start_server)
 
     def _start_server(self) -> None:

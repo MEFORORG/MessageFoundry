@@ -2952,7 +2952,7 @@ carries the error's text. A connector build or build check that the executor ref
 before a worker took it, or cancelled or failed before it began, runs on the event loop instead,
 with a WARNING in the engine log, so that hop does not fail; a bad config is still refused. So do
 at least these hops (BACKLOG #5755), except that each runs on a thread of its own rather than on
-the loop: the trust-anchor reads (at least a lane's anchor check, the settings preflight and the
+the loop: some trust-anchor reads (at least a lane's anchor check, the settings preflight and the
 registry anchor preflight), a reload's target check, its content snapshot and its reload snapshot
 of the config directory, its approval check, a DICOM listener's start and stop, and the sandbox
 session closes. Only when no thread can be started does it run on the event loop, which then
@@ -2960,15 +2960,18 @@ blocks while it runs: an anchor on a stalled share for as long as the read takes
 or sandbox close that waits on the loop itself until that wait times out, failing an in-flight
 C-STORE or brokered lookup. A DICOM listener's start still fails there, because it starts its
 accept loop on a thread of its own. Work still queued behind a busy or hung pool waits for it and
-is not run on the loop.
-Other worker-thread hops have no such fallback, at least the config load and the environment value
-read, which run author or embedder code, the bundle fingerprint, which also reads the config
-directory, and a connector's own startup check, such as a remote-file listing. So a pool that stays
-broken still fails the reload at the first of these it meets. Nor does a rollback on such a pool
-bring every inbound back. It restarts, one at a time, the inbounds that were listening when the
-reload began, so one whose start meets such a hop is recorded `failed`, with an alert, and stays
-down after the rollback, while the rollback still tries to restart the rest. The row
-does not claim the old graph is still serving: at least a
+is not run on the loop. Other worker-thread hops have no such fallback, at least the config load,
+which runs author code, the environment value read, the bundle fingerprint, which also reads the
+config directory, a connector's own startup check, such as a remote-file listing, and some
+trust-anchor reads, at least the SMTP alert CA check and the SQL Server store's certificate pin
+checks. So a pool that stays broken still fails an operator reload at the first of these it meets.
+A DR activation's reload instead records a lane leaving the park whose startup check meets one as
+failed, and goes on. Nor does a rollback on such a pool bring every inbound back. It restarts, one
+at a time, the inbounds that were listening when the runner took its reload lock, which is after
+the engine has loaded and checked the new config, so an inbound stopped or started in between is
+not put back as it was when the reload was asked for. One whose start meets such a hop is
+recorded `failed`, with an alert, and stays down after the rollback, while the rollback still
+tries to restart the rest. The row does not claim the old graph is still serving: at least a
 fault raised after the swap committed leaves the new one live, and `GET /config/provenance` says
 which is. At least these write no such row: a DR activation's reload, and a row whose own write
 fails, which is logged. A cluster convergence reload records such a fault with reason

@@ -4,9 +4,10 @@
 them: on a thread of their own, or on the loop only when no thread can start (BACKLOG #5755, items
 3 to 5). Other reload hops have no such fallback; docs/SECURITY.md names at least some.
 
-A test that needs a refusal shuts the loop's default executor down, the realistic refusal: ``run_in_executor``
-then raises ``RuntimeError`` at submit, as ``asyncio.to_thread`` did at every one of these hops
-before the fix."""
+Most tests that need a refusal shut the loop's default executor down, the realistic refusal:
+``run_in_executor`` then raises ``RuntimeError`` at submit, as ``asyncio.to_thread`` did at every
+one of these hops before the fix. One instead cancels work already queued on a live pool with
+``shutdown(cancel_futures=True)``."""
 
 from __future__ import annotations
 
