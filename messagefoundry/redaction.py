@@ -2921,7 +2921,19 @@ def safe_exc(
     A different exception that HOLDS one, as ``RuntimeError(exc)`` or ``ValueError("bad", exc)``,
     prints the Unicode error's own ``str()`` or ``repr()`` as its message. It renders as its class
     and a fixed note, never its other arguments (vault BACKLOG #3295;
-    :func:`prints_a_codec_error`)."""
+    :func:`prints_a_codec_error`).
+
+    A database driver's own error (:func:`raised_by_a_driver`) renders as its class and the line
+    :func:`safe_traceback` prints for it (:func:`_driver_line`), its SQLSTATE or SQLite's
+    result-code name and never its message (vault BACKLOG #8153, item 23). Its message can quote
+    a value the statement carried in a shape no pattern catches, as asyncpg's client-side
+    ``DataError`` quotes the argument it could not encode. That costs the message's diagnostic,
+    such as SQLite's ``database is locked``, at every caller. The bound is the class test's: a
+    driver's error raised as a builtin type, or wrapped in another library's, is rendered as
+    any other exception is."""
+    driver = _driver_line(exc, under=False)
+    if driver is not None:
+        return f"{type(exc).__name__}: {driver}"
     if isinstance(exc, UnicodeError):
         return safe_text(_unicode_error_text(exc), limit=limit)
     name = type(exc).__name__
@@ -3138,19 +3150,39 @@ type ExcInfo = tuple[type[BaseException] | None, BaseException | None, Traceback
 _NON_DBAPI_DRIVERS = frozenset({"asyncpg"})
 
 
+#: The package whose own error classes are the engine's, not a driver's, whatever driver class one
+#: inherits: ``store.schema_verify.SchemaMismatchError`` inherits ``sqlite3.DatabaseError`` so a
+#: store-open handler catches it, and its message is the engine's own remedy (vault BACKLOG #8153,
+#: item 17).
+_ENGINE_PACKAGE = "messagefoundry"
+
+
 def raised_by_a_driver(exc: BaseException) -> bool:
     """Whether ``exc``'s class, or a class it inherits, is a database driver's: from a module, or
     a package above it, that declares the DB-API 2.0 ``apilevel`` (pyodbc, sqlite3, psycopg and
-    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. A
-    builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
+    ``mysql.connector``, at least), or from a package named in :data:`_NON_DBAPI_DRIVERS`. The
+    class chain is read in order, and a class from :data:`_ENGINE_PACKAGE` met before any
+    driver's ends it with ``False``, so an engine error that subclasses a driver's does not count.
+    A builtin exception a driver raises does not count, though :func:`safe_traceback` withholds it
     under a driver error that holds it (vault BACKLOG #1661). A class whose ``__module__`` is not
     text is not a driver's. This runs on every link of a logged traceback, so it must not raise:
     a class or module that raises when read answers ``True``, so its message is withheld rather
     than printed on a guess that no driver raised it."""
     try:
-        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+        return _a_driver_class_first(exc)
     except Exception:  # noqa: BLE001 - fail closed: see the docstring
         return True
+
+
+def _a_driver_class_first(exc: BaseException) -> bool:
+    """:func:`raised_by_a_driver`'s class-chain read, which raises where a class cannot be read."""
+    for kind in type(exc).__mro__:
+        name = kind.__module__
+        if isinstance(name, str) and name.split(".")[0] == _ENGINE_PACKAGE:
+            return False
+        if _a_driver_class(kind):
+            return True
+    return False
 
 
 def _a_driver_class(kind: type) -> bool:
@@ -3207,7 +3239,7 @@ def known_driver_error(exc: BaseException) -> bool:
     For a caller that would NAME something a driver's error carries, where the safe answer for a
     class that cannot be classed is no (engine PR 3150, finding 1)."""
     try:
-        return any(_a_driver_class(kind) for kind in type(exc).__mro__)
+        return _a_driver_class_first(exc)
     except Exception:  # noqa: BLE001 - fail closed for naming: an unclassable error names nothing
         return False
 
@@ -3288,6 +3320,11 @@ def sqlite_errorname_of(exc: BaseException) -> str | None:
     return name if isinstance(name, str) and _SQLITE_ERRORNAME.fullmatch(name) else None
 
 
+#: The line of a link withheld because a traceback prints it under a driver error, when the link
+#: is no driver's own error (:func:`_driver_line`).
+UNDER_A_DRIVER_ERROR = "[message withheld under a driver error]"
+
+
 def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     """What a traceback prints after the class name for a database driver's error
     (:func:`raised_by_a_driver`), or for any link a traceback prints under one; None for any other
@@ -3297,19 +3334,18 @@ def _driver_line(exc: BaseException, *, under: bool) -> str | None:
     that is for which drivers; a SQLite error keeps only its result-code name, since its
     ``args[0]`` is its message. A
     link under a driver error is withheld whole, since a driver can raise its error from the
-    builtin one its codec raised, whose text can quote the value too. An attribute that raises
-    when read leaves the bare withheld line, since this runs on every link of a logged traceback."""
-    driver = raised_by_a_driver(exc)
-    if not (driver or under):
-        return None
-    if driver:
-        try:
-            code = _driver_code(exc)
-        except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
-            code = None
-        if code is not None:
-            return code
-    return "[driver message withheld]"
+    builtin one its codec raised, whose text can quote the value too. Such a link that is no
+    driver's own is labelled :data:`UNDER_A_DRIVER_ERROR`, not as a driver's message, since it may
+    be an unrelated error the driver error was raised while handling (vault BACKLOG #8153, item
+    21). An attribute that raises when read leaves the bare withheld line, since this runs on
+    every link of a logged traceback."""
+    if not raised_by_a_driver(exc):
+        return UNDER_A_DRIVER_ERROR if under else None
+    try:
+        code = _driver_code(exc)
+    except Exception:  # noqa: BLE001 - the message stays withheld; only the code is lost
+        code = None
+    return code if code is not None else "[driver message withheld]"
 
 
 def _driver_code(exc: BaseException) -> str | None:
@@ -3368,10 +3404,7 @@ def safe_traceback(ei: ExcInfo) -> str:
             # The instance's own attribute, so a class-level default cannot pass; and getattr, so a
             # __slots__ class with no __dict__ fails closed rather than raising.
             if "_str" not in getattr(node, "__dict__", {}):  # renamed: fail closed, no traceback
-                if value is None:
-                    return ""
-                root = _driver_line(value, under=False)
-                return f"{type(value).__name__}: {root}" if root is not None else safe_exc(value)
+                return "" if value is None else safe_exc(value)
             node._str = line  # the stdlib's private name: see docstring
             if isinstance(exc, SyntaxError):  # printed from these four, never from _str
                 node.msg, node.text, node.filename, node.lineno = line, None, None, None

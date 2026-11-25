@@ -14,11 +14,12 @@ import logging
 import sys
 import types
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from messagefoundry.redaction import raised_by_a_driver, safe_traceback
+from messagefoundry.redaction import raised_by_a_driver, safe_exc, safe_traceback
 from messagefoundry.transports import database
 from messagefoundry.transports.base import NegativeAckError
 from tests._fake_dbapi_driver import DriverError
@@ -158,7 +159,8 @@ def test_the_log_chain_withholds_every_link_under_a_driver_error() -> None:
     except _DriverError as caught:
         text = _rendered(caught)
     assert _SYNTHETIC_ID not in text
-    assert "ValueError: [driver message withheld]" in text
+    # The cause is no driver's own, so its label does not call it one (vault BACKLOG #8153, 21).
+    assert "ValueError: [message withheld under a driver error]" in text
     assert "_DriverError: [driver message withheld]" in text
 
 
@@ -355,3 +357,93 @@ async def test_finish_stop_logs_no_driver_value(caplog: pytest.LogCaptureFixture
     assert "poll task failed" in caplog.text
     assert "pool close failed" in caplog.text
     assert _SYNTHETIC_ID not in caplog.text
+
+
+# --- Vault BACKLOG #8153, items 23 and 17: safe_exc and the engine's own driver subclasses ------
+
+
+class _AsyncpgDataError(Exception):
+    """asyncpg's client-side ``DataError`` shape: no ``sqlstate``, and a message quoting the
+    argument it could not encode, in no shape a redaction pattern catches."""
+
+    __module__ = "asyncpg.exceptions._base"
+
+
+_QUOTED_ARGUMENT = f"invalid input for query argument $1: 'synthetic{_SYNTHETIC_ID}' (str expected)"
+
+
+@pytest.mark.usefixtures("_dbapi_driver")
+def test_safe_exc_withholds_a_driver_message() -> None:
+    """Item 23. Red on the previous head: ``safe_exc`` printed a driver error's message through
+    the patterns alone, and the quoted argument matched none of them."""
+    assert _SYNTHETIC_ID in safe_exc(ValueError(_QUOTED_ARGUMENT))  # the control: not a pattern's
+    assert safe_exc(_AsyncpgDataError(_QUOTED_ARGUMENT)) == (
+        "_AsyncpgDataError: [driver message withheld]"
+    )
+    assert safe_exc(_DriverError("23000", _DUPLICATE)) == (
+        "_DriverError: [23000] [driver message withheld]"
+    )
+
+
+async def test_a_failed_build_records_no_driver_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Item 23 at a call site outside the DATABASE connector (closing step 3): the runner's record
+    of a connection that failed to build, the reason a ``connection_stopped`` alert carries. Red on
+    the previous head: the reason quoted the argument."""
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.alerts import LoggingAlertSink
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.store import MessageStore
+
+    store = await MessageStore.open(tmp_path / "build-failure.db")
+    try:
+        runner = RegistryRunner(
+            Registry(),
+            store,
+            env_values={},
+            alert_sink=LoggingAlertSink(),
+            egress=EgressSettings(deny_by_default=False),
+        )
+        with caplog.at_level(logging.ERROR):
+            failure = _AsyncpgDataError(_QUOTED_ARGUMENT)
+            runner._record_failed("OB_SYNTHETIC", failure, kind="outbound")
+        reason = runner.outbound_failed("OB_SYNTHETIC")
+    finally:
+        await store.close()
+    assert reason == "_AsyncpgDataError: [driver message withheld]"
+    # The message only: caplog's handler prints the raw traceback, which the configured log
+    # chain renders through safe_traceback (test_the_log_chain_withholds_a_driver_message).
+    (line,) = [r.getMessage() for r in caplog.records if "failed to start" in r.getMessage()]
+    assert "[driver message withheld]" in line
+    assert _SYNTHETIC_ID not in line
+
+
+def test_an_engine_subclass_of_a_driver_error_is_not_a_drivers() -> None:
+    """Item 17. Red on the previous head: the class walk met ``sqlite3.DatabaseError`` in
+    ``SchemaMismatchError``'s chain and counted the engine's own error as a driver's, so its
+    remedy would have been withheld. A subclass of the engine class, as a test may write, stays
+    the engine's too."""
+    from messagefoundry.store.schema_verify import SchemaMismatchError
+
+    exc = SchemaMismatchError("the store lacks synthetic_table; run the migration")
+
+    class _Narrower(SchemaMismatchError):
+        pass
+
+    assert raised_by_a_driver(exc) is False
+    assert raised_by_a_driver(_Narrower("synthetic")) is False
+    assert (
+        safe_exc(exc) == "SchemaMismatchError: the store lacks synthetic_table; run the migration"
+    )
+
+
+def test_a_subclass_of_a_driver_error_outside_the_engine_is_still_a_drivers() -> None:
+    """The control for item 17: only a class from the engine's own packages ends the walk."""
+    import sqlite3
+
+    class _Elsewhere(sqlite3.IntegrityError):
+        pass
+
+    assert raised_by_a_driver(_Elsewhere(f"UNIQUE constraint failed: MRN{_SYNTHETIC_ID}")) is True

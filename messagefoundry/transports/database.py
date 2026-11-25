@@ -124,6 +124,7 @@ from messagefoundry.odbc_call_gate import (
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
 from messagefoundry.redaction import (
+    UNDER_A_DRIVER_ERROR,
     args_hold_a_message,
     is_a_sqlite_error,
     known_driver_error,
@@ -2938,15 +2939,17 @@ _raised_by_a_driver = raised_by_a_driver
 
 
 def _withheld(exc: BaseException) -> str:
-    """``<type> [driver message withheld]``, for a driver error with no SQLSTATE or a link held
-    under one, with SQLite's result-code name inside the brackets when it has one, since SQLite has
-    no SQLSTATE and that name is its only PHI-free diagnostic."""
+    """``<type> [driver message withheld]``, for a driver error with no SQLSTATE, with SQLite's
+    result-code name inside the brackets when it has one, since SQLite has no SQLSTATE and that
+    name is its only PHI-free diagnostic."""
     name = sqlite_errorname_of(exc)
     code = f" {name}" if name is not None else ""
     return f"{type(exc).__name__} [driver message withheld{code}]"
 
 
-def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
+def _safe_db_error(
+    exc: BaseException, *, withhold: bool = False, driver: bool | None = None
+) -> str:
     """A PHI-free rendering of a failure for a LOG line, the log-side twin of
     :func:`_classify_db_error` (BACKLOG #1661).
 
@@ -2960,8 +2963,11 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     the argument it could not encode, renders as ``<type> [driver message withheld]``, with SQLite's
     result-code name inside the brackets when it has one (:func:`_withheld`; engine PR 2658, finding
     4). Under ``withhold``, which says ``exc`` is held by a driver error as a link of its chain
-    (:func:`_redacted_copy`), an error no driver raised renders as ``<type> [driver message
-    withheld]`` before any state is read. Otherwise, an error whose state :func:`_shown_state`
+    (:func:`_redacted_copy`), an error no driver raised renders as ``<type>
+    [message withheld under a driver error]`` before any state is read, a label that does not call
+    its text a driver's (vault BACKLOG #8153, item 21). ``driver`` is
+    :func:`_raised_by_a_driver`'s answer for ``exc`` where the caller already holds it.
+    Otherwise, an error whose state :func:`_shown_state`
     does not name renders as ``<type> [message withheld]``: at least an error that is no known
     driver's own, a class whose driver test raises, and an asyncpg error whose state was read from
     its message; and anything else with no SQLSTATE keeps the ``safe_exc``
@@ -2974,15 +2980,16 @@ def _safe_db_error(exc: BaseException, *, withhold: bool = False) -> str:
     letters or digits on any other error may be a value.
 
     A Unicode error, or a non-driver exception holding one, takes ``safe_exc`` or, under
-    ``withhold``, ``<type> [driver message withheld]``, so this never prints a codec error's text;
+    ``withhold``, the withheld label, so this never prints a codec error's text;
     ``tests/test_unicode_error_log_paths.py`` counts it among the safe renderers for that reason.
 
     It never raises. Its callers are error arms and helpers documented never to raise, and an
     exception whose ``__str__`` raises renders as its type and a fixed note instead."""
     try:
-        driver = _raised_by_a_driver(exc)
+        if driver is None:
+            driver = _raised_by_a_driver(exc)
         if withhold and not driver:
-            return _withheld(exc)
+            return f"{type(exc).__name__} {UNDER_A_DRIVER_ERROR}"
         state = _log_sqlstate(exc)
         if state is None:
             return _withheld(exc) if driver else safe_exc(exc)
@@ -3037,30 +3044,36 @@ def _safe_db_exc_info(exc: BaseException) -> RedactedDbError:
 
 
 def _redacted_copy(
-    exc: BaseException, made: dict[int, RedactedDbError], *, under: bool = False
+    exc: BaseException, made: dict[tuple[int, bool], RedactedDbError], *, under: bool = False
 ) -> RedactedDbError:
     """``exc`` and its chain as :class:`RedactedDbError` copies. ``made`` closes a cycle.
 
     Every link under a driver error (:func:`_raised_by_a_driver`) is withheld as one, since a
     driver raises its own error from the builtin one its codec raised, as asyncpg's client-side
     ``DataError`` does, and that builtin's message can quote the value too. ``under`` carries that
-    down the chain. A link reached first from outside a driver error keeps that rendering."""
-    found = made.get(id(exc))
+    down the chain, ``__context__`` included, which errs on withholding (vault BACKLOG #8153, item
+    21). ``made`` is keyed by the link and ``under`` together, so a link reached both from outside
+    a driver error and from under one gets a copy for each, and the one under it is withheld
+    (item 8). ``under`` only ever turns on down a chain, so a link is copied at most twice and a
+    cycle still closes."""
+    key = (id(exc), under)
+    found = made.get(key)
     if found is not None:
         return found
-    line = _poll_log_line(exc, under=under)
-    below = under or _raised_by_a_driver(exc)
+    driver = _raised_by_a_driver(exc)
+    line = _poll_log_line(exc, under=under, driver=driver)
+    below = under or driver
     members = exc.exceptions if isinstance(exc, BaseExceptionGroup) else ()
     if members:
         # A group's members exist before the group does, so a member whose chain leads back to the
         # group meets this stand-in, which closes the cycle with the group's line and frames.
-        made[id(exc)] = RedactedDbError(line).with_traceback(exc.__traceback__)
+        made[key] = RedactedDbError(line).with_traceback(exc.__traceback__)
         copies = [_redacted_copy(member, made, under=below) for member in members]
         copy: RedactedDbError = RedactedDbErrorGroup(line, copies)
     else:
         copy = RedactedDbError(line)
     copy = copy.with_traceback(exc.__traceback__)
-    made[id(exc)] = copy
+    made[key] = copy
     if exc.__cause__ is not None:
         copy.__cause__ = _redacted_copy(exc.__cause__, made, under=below)
     if exc.__context__ is not None:
@@ -3069,7 +3082,7 @@ def _redacted_copy(
     return copy
 
 
-def _poll_log_line(exc: BaseException, *, under: bool) -> str:
+def _poll_log_line(exc: BaseException, *, under: bool, driver: bool | None = None) -> str:
     """One link's line in the poll-failure traceback: :func:`_safe_db_error`'s, except that a link
     with no SQLSTATE is named by its type alone, unless it is one of :data:`_ENGINE_FIXED_TEXT` (a
     ``NegativeAckError`` included), the missing-extra error, an ``ImportError`` or a
@@ -3086,11 +3099,14 @@ def _poll_log_line(exc: BaseException, *, under: bool) -> str:
     reason, never its text. What this costs is the text of any other error with no SQLSTATE, a
     bug's message included; the frames still locate it, and their source lines still print. An
     error with no arguments has no text to
-    withhold and is named by its type alone. It never raises: a link whose classification raises
-    is named by its type and a fixed note."""
+    withhold and is named by its type alone. ``driver`` is :func:`_raised_by_a_driver`'s answer
+    for ``exc`` where the caller already holds it. It never raises: a link whose classification
+    raises is named by its type and a fixed note."""
     try:
-        if under or _raised_by_a_driver(exc):
-            return _safe_db_error(exc, withhold=under)
+        if driver is None:
+            driver = _raised_by_a_driver(exc)
+        if under or driver:
+            return _safe_db_error(exc, withhold=under, driver=driver)
         if isinstance(exc, _ENGINE_FIXED_TEXT):
             return safe_exc(exc, limit=_ENGINE_TEXT_LIMIT)  # the call-gate remedy is its tail
         if isinstance(exc, (_DriverMissingError, ImportError, UnicodeError)):

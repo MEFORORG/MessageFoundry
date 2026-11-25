@@ -820,7 +820,9 @@ async def test_AC3_restore_refuses_rather_than_place_a_store_it_could_not_resalt
 
     monkeypatch.setattr(store_module, "forget_store_salt", _cannot)
     dest = tmp_path / "restored" / "store.db"
-    with pytest.raises(BackupError, match="WAL could not be checkpointed"):
+    # The driver's own message is withheld from the stored reason, SQLite's text included (vault
+    # BACKLOG #8153, item 23); a raised sqlite3 error would keep its result-code name too.
+    with pytest.raises(BackupError, match=r"OperationalError: \[driver message withheld\]"):
         await run_restore(
             result.archive_path, dest_store_path=dest, store_settings=_store_settings(dest, key)
         )
