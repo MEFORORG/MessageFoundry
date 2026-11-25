@@ -3340,7 +3340,8 @@ the connector is built, so `messagefoundry check` / dry-run / start catches each
 first message. The one certificate property checked at send instead is the validity window, under **The
 validity window is checked at every send** below. Caught at construction, at least (the trust check's own
 refusals are listed under **Recipient trust** below): a malformed
-key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `recipient_cert` whose key
+key/cert, a `signing_key` whose public half **does not match** `signing_cert`, a `signing_cert` that does
+not name the `sender` address under the address rule of **Recipient trust** below (BACKLOG #5631), a `recipient_cert` whose key
 is **not RSA**, and a `recipient_cert` **not issued by** any supplied `trust_anchor` (PHI is never encrypted
 to a certificate from an untrusted issuer). All three of `signing_key`, `recipient_cert` and every
 `trust_anchor` in the file must also hold an allowed key type: RSA of at least 2048 bits, EC on P-256, P-384

@@ -513,15 +513,22 @@ def _split_address(address: str) -> tuple[str, str]:
     return local, domain.lower()
 
 
-def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) -> str | None:
-    """Why ``cert`` does not name every address in ``recipients``, or None. An address is named by
+def _address_binding_problem(
+    cert: x509.Certificate,
+    recipients: Sequence[str],
+    *,
+    setting: str = "recipient_cert",
+    field: str = "recipients",
+) -> str | None:
+    """Why ``cert``, read from ``setting``, does not name every address in ``recipients``, which
+    the ``field`` setting holds, or None. An address is named by
     an rfc822Name subjectAltName equal to it, or, on a cert that carries no rfc822Name at all, a
     dNSName equal to its domain. A cert carrying any rfc822Name is bound to those mailboxes, so a
     dNSName beside them binds no other mailbox at that domain: a CA that gave one subscriber a cert
     naming its mailbox and its domain gave it no other subscriber's mailbox. The refusal names the address's position among the checked addresses, never an
     address or a SAN value. One ``recipients`` entry can hold several comma-joined addresses, so
     that position counts addresses, not entries."""
-    names = _extension(cert, x509.SubjectAlternativeName, "recipient_cert") or (
+    names = _extension(cert, x509.SubjectAlternativeName, setting) or (
         x509.SubjectAlternativeName([])
     )
     mailboxes = {_split_address(v) for v in names.get_values_for_type(x509.RFC822Name)}
@@ -538,8 +545,8 @@ def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) 
             else ""
         )
         return (
-            f"Direct destination 'recipient_cert' does not name recipient address {position} of "
-            f"{len(recipients)} in 'recipients': it carries no subjectAltName rfc822Name equal to that address, and "
+            f"Direct destination '{setting}' does not name {field.rstrip('s')} address {position} of "
+            f"{len(recipients)} in '{field}': it carries no subjectAltName rfc822Name equal to that address, and "
             f"no dNSName equal to its domain on a cert that names no rfc822Name{ignored}"
         )
     return None
@@ -635,6 +642,15 @@ class DirectDestination(DestinationConnector):
         # validation needs the key's type: `pss` on an EC key is refused here rather than at wire time.
         self.signature_padding: str = self._parse_signature_padding(s.get("signature_padding"))
         self._rsa_padding: padding.PSS | padding.PKCS1v15 | None = self._select_rsa_padding()
+        # The partner reads the signer's address from the signing cert, so a cert that names some
+        # other mailbox or domain signs as someone the sender is not (BACKLOG #5631). The same
+        # binding rule as the recipient's, applied to the one sender address, after the signer's key
+        # gates so a key-type refusal still names the key.
+        problem = _address_binding_problem(
+            self._signing_cert, [self._envelope.sender], setting="signing_cert", field="sender"
+        )
+        if problem is not None:
+            raise ValueError(f"{problem}; refusing to sign as it")
         # Per-partner recipient certificate — the encryption target. Direct is 1:1 with a HISP
         # correspondent, so PR1 supports a single recipient cert (a per-recipient cert map is a later
         # phase, ADR 0085).

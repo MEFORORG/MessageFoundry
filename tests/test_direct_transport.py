@@ -154,6 +154,11 @@ def _mint_leaf(
     return key, builder.sign(ca_key, hashes.SHA256())
 
 
+#: The subjectAltName of the ``pki`` signer: dNSNames only, so it names every sender at those
+#: domains, including the envelope tests' senders borrowed from the Email destination's tests.
+_SIGNER_NAMES: dict[str, Any] = {"addresses": (), "dns_names": ("hisp.example", "hospital.example")}
+
+
 def _write_pem(path: Path, cert: x509.Certificate) -> None:
     path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
 
@@ -173,7 +178,9 @@ def pki(tmp_path: Path) -> dict[str, Any]:
     """A minted CA, a signer key/cert (issued by the CA), and a recipient key/cert (issued by the CA),
     written to PEM files under tmp_path. Returns the paths + the in-memory recipient key for decrypt."""
     ca_key, ca_cert = _mint_ca()
-    signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
+    # The signer names the sender's domains, as the recipient does: construction binds the
+    # signing cert to 'sender' (BACKLOG #5631).
+    signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert, **_SIGNER_NAMES)
     # No rfc822Name, so the dNSNames bind every mailbox at hisp.example
     # and at the hospital.example recipients the envelope tests borrow from the Email destination's
     # tests. A cert naming any rfc822Name would bind only that mailbox (BACKLOG #5631).
@@ -1007,7 +1014,7 @@ def _mint_ec_leaf(
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=365))
     )
-    return key, _with_san(builder, common_name).sign(ca_key, hashes.SHA256())
+    return key, _with_san(builder, common_name, **_SIGNER_NAMES).sign(ca_key, hashes.SHA256())
 
 
 def _ec_signer(pki: dict[str, Any], tmp_path: Path) -> dict[str, str]:
@@ -2475,7 +2482,9 @@ def _fresh_window_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _signer(pki: dict[str, Any], tmp_path: Path, tag: str, **mint: Any) -> dict[str, str]:
     """A signing pair issued by the ``pki`` CA, minted with ``mint``, as setting overrides."""
-    key, cert = _mint_leaf("Sender Direct", pki["ca_key"], pki["ca_cert"], **mint)
+    key, cert = _mint_leaf(
+        "Sender Direct", pki["ca_key"], pki["ca_cert"], **{**_SIGNER_NAMES, **mint}
+    )
     key_path = tmp_path / f"{tag}_signer.key"
     _write_key(key_path, key)
     return {"signing_key": str(key_path), **_files(tmp_path, tag, signing_cert=cert)}
@@ -2705,3 +2714,51 @@ def test_a_version_1_cert_another_party_issued_is_refused_as_an_anchor(
     _, recipient = _mint_leaf("recipient@hisp.example", key, v1_leaf)
     files = _files(tmp_path, "v1_leaf", recipient_cert=recipient, trust_anchor=v1_leaf)
     assert "not a CA certificate" in _refusal(pki, **files)
+
+
+# --- BACKLOG #5631: the signing cert names the sender ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mint",
+    [
+        pytest.param({"addresses": ("other@hisp.example",)}, id="another-mailbox"),
+        pytest.param({"addresses": (), "dns_names": ("elsewhere.example",)}, id="another-domain"),
+        pytest.param({"addresses": (), "dns_names": ()}, id="no-subject-alt-name"),
+        pytest.param(
+            {"addresses": ("other@hisp.example",), "dns_names": ("hisp.example",)},
+            id="domain-beside-a-mailbox",
+        ),
+    ],
+)
+def test_a_signing_cert_that_does_not_name_the_sender_is_refused(
+    pki: dict[str, Any], tmp_path: Path, mint: dict[str, Any]
+) -> None:
+    """RED when: a signing cert issued for another mailbox or domain, or naming none, signs as
+    'sender' (BACKLOG #5631, the sender-address binding of signing_cert)."""
+    text = _refusal(pki, **_signer(pki, tmp_path, "unbound", **mint))
+    assert "'signing_cert' does not name sender address 1 of 1 in 'sender'" in text
+    assert "refusing to sign as it" in text
+
+
+@pytest.mark.parametrize(
+    "mint",
+    [
+        pytest.param({"addresses": ("sender@hisp.example",), "dns_names": ()}, id="its-mailbox"),
+        pytest.param(
+            {"addresses": ("sender@HISP.example",), "dns_names": ()}, id="domain-case-insensitive"
+        ),
+        pytest.param({"addresses": (), "dns_names": ("hisp.example",)}, id="its-domain"),
+    ],
+)
+def test_a_signing_cert_that_names_the_sender_constructs(
+    pki: dict[str, Any], tmp_path: Path, mint: dict[str, Any]
+) -> None:
+    # The control: the same signer, bound to the sender by mailbox or by domain, constructs.
+    DirectDestination(_dest(pki, **_signer(pki, tmp_path, "bound", **mint)))
+
+
+def test_a_signing_cert_local_part_compares_exactly(pki: dict[str, Any], tmp_path: Path) -> None:
+    # RFC 5280 section 7.5: the local part compares exactly, so a case variant names another mailbox.
+    overrides = _signer(pki, tmp_path, "case", addresses=("Sender@hisp.example",), dns_names=())
+    assert "'signing_cert' does not name sender address" in _refusal(pki, **overrides)
