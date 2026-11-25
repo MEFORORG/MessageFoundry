@@ -7821,9 +7821,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        # This Forged arm names the user as typed, where the refusals below name the stored one:
-        # neither this text nor _seal_refusal's WARNING prints a value from a record that failed its
-        # seal (BACKLOG #5633 item 7; tests/test_cli.py pins it).
+        # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
+        # prints a value from the record that failed its seal (BACKLOG #5633 item 7; tests/test_cli.py
+        # pins it). The read-refused and no-such-user arms below name the typed name too. The other
+        # refusals after the read name named[0], the stored username, which get_user_by_username
+        # returns without checking the record's seal: at least the Unverifiable and Outage arms
+        # print a stored value nobody verified, as they did on main.
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -11983,8 +11986,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. The audit row goes first, so the address is not set. If the "
-        "engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, and the store refused it, so the "
+        "address is not set. If the engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }
