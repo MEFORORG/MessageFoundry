@@ -73,7 +73,10 @@
 param(
     [switch]$Uninstall,
     [switch]$Status,
-    # Milliseconds. Minimum honoured by Claude Code is 1000.
+    # Milliseconds. Minimum honoured by Claude Code is 1000, so a smaller value is refused rather than
+    # written: the run's own "refreshInterval: <n> ms" summary would otherwise state a rate that never
+    # applies (BACKLOG #7577).
+    [ValidateRange(1000, [int]::MaxValue)]
     [int]$RefreshInterval = 10000,
     # LOWEST-LEVEL OVERRIDE, AND IT HAS NO DEFAULT ON PURPOSE. A default here is what made the
     # CLAUDE_CONFIG_DIR pin unreachable: a pin can only be consulted when nothing has already answered
@@ -194,7 +197,22 @@ function Write-SettingsFile([string]$Path, $Data) {
         Copy-Item -LiteralPath $Path -Destination $dest -Force
         $backedTo = $dest
     }
-    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
+    # TEMP-THEN-RENAME, the discipline account-availability.ps1 and the collector already use. Claude
+    # Code reads this file at session start, and an in-place Set-Content truncates the live file first,
+    # so a crash or a concurrent session start mid-write sees a partial file that disables every
+    # setting in it (BACKLOG #7576). The encoding is UTF-8 WITHOUT a BOM, which is what Set-Content
+    # -Encoding UTF8 wrote on pwsh 7; [Text.Encoding]::UTF8 would add one. $Path is absolute (the
+    # target resolver makes it so), which matters because these .NET calls resolve a relative path
+    # against the process directory, not $PWD. The finally removes a temp file a failed write or
+    # rename leaves behind; after a successful rename it no longer exists.
+    $tmp = "$Path.$PID.tmp"
+    try {
+        [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::Move($tmp, $Path, $true)
+    }
+    finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
     return $backedTo
 }
 
@@ -246,16 +264,32 @@ if ($AllRoots -and ($script:GaveConfigDir -or $script:GaveSettingsPath)) {
 if ($script:GaveSettingsPath -and @($SettingsPath).Count -eq 0) { Stop-Cannot "-SettingsPath was given with no value" }
 if ($script:GaveConfigDir -and @($ConfigDir).Count -eq 0) { Stop-Cannot "-ConfigDir was given with no value" }
 
+# EVERY PATH ARGUMENT IS MADE ABSOLUTE AGAINST $PWD FIRST (BACKLOG #7577). ConvertTo-NormalRootPath
+# and the .NET file calls resolve a relative path against [Environment]::CurrentDirectory, which a
+# Set-Location does not move, while Test-Path and Set-Content resolve it against $PWD. Called with `&`
+# after a `cd`, the two differ, so a relative argument was checked in one directory and wired to
+# another. GetUnresolvedProviderPathFromPSPath reads $PWD, expands no wildcard, and needs no file to
+# exist. A bare file name also gets a real parent this way: Split-Path 'settings.json' -Parent is ''.
+function Resolve-ArgPath([string]$Path, [string]$What) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { Stop-Cannot "$What was given as an empty string" }
+    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+}
+
 $targets = @()
 $targetFrom = ""
 if ($script:GaveSettingsPath) {
     $targetFrom = "-SettingsPath"
     $targets = @($SettingsPath | ForEach-Object {
-            [pscustomobject]@{ Settings = $_; Root = (ConvertTo-NormalRootPath (Split-Path $_ -Parent)) }
+            $s = Resolve-ArgPath $_ "-SettingsPath"
+            [pscustomobject]@{ Settings = $s; Root = (ConvertTo-NormalRootPath (Split-Path $s -Parent)) }
         })
+    # BEFORE ANY WRITE, as for -ConfigDir: a missing directory found inside the write loop fails that
+    # one target after the others were written, the mixed state the pre-passes exist to prevent.
+    foreach ($t in $targets) { Assert-RootExists $t.Root "the directory of -SettingsPath $($t.Settings)" }
 }
 elseif ($script:GaveConfigDir) {
     $targetFrom = "-ConfigDir"
+    $ConfigDir = @($ConfigDir | ForEach-Object { Resolve-ArgPath $_ "-ConfigDir" })
     foreach ($d in $ConfigDir) { Assert-RootExists $d "config dir" }
     $targets = @($ConfigDir | ForEach-Object {
             $r = ConvertTo-NormalRootPath $_
@@ -447,6 +481,9 @@ if (-not $CollectorPath) {
     if ($LASTEXITCODE -ne 0 -or -not $common) { Stop-Cannot "not inside a git repository -- run this from the MessageFoundry checkout, or pass -CollectorPath" }
     $CollectorPath = Join-Path (Split-Path ($common.Trim()) -Parent) "scripts/coord/usage-collect.ps1"
 }
+# ABSOLUTE BEFORE IT IS CHECKED OR BAKED IN. A statusLine runs from the session's working directory,
+# so a relative path that passed the Test-Path below would name nothing when it fires (BACKLOG #7577).
+$CollectorPath = Resolve-ArgPath $CollectorPath "-CollectorPath"
 if (-not (Test-Path -LiteralPath $CollectorPath)) {
     Stop-Cannot "collector not found at $CollectorPath. The primary checkout does not carry it yet -- merge the branch that adds it, or advance the primary, before installing."
 }
@@ -481,7 +518,12 @@ foreach ($t in $targets) {
             $existing = [string]$settings['statusLine']['command']
             $wasState = Get-WiredStateDir $existing
             $wasColl = Get-WiredCollectorPath $existing
-            if ($existing -ceq $cmd -and [int]$settings['statusLine']['refreshInterval'] -eq $RefreshInterval) {
+            # A NUMBER, NOT A CAST. [int]'abc' threw here, inside the try, so the root counted FAILED
+            # on every run and a re-install could never repair it (BACKLOG #7577). A non-number is
+            # simply not the wanted value, so the root is rewired.
+            $ri = $settings['statusLine']['refreshInterval']
+            $sameRi = ($ri -is [long] -or $ri -is [int]) -and $ri -eq $RefreshInterval
+            if ($existing -ceq $cmd -and $sameRi) {
                 Write-Host "  UNCHANGED  $($t.Settings)"
                 Write-Host "             already carries exactly this command and refreshInterval; not rewritten, no backup taken"
                 $unchanged++
