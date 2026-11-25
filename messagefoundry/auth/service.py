@@ -9288,8 +9288,9 @@ class AuthService:
         revoke loses that session to the revoke. A sign-in that finds its target already written
         revokes deliberately, as above, and so ends a session the other writer minted. And the
         role write earlier in the same sign-in does the same when it finds its target roles already
-        written (``_SignInRoleSync``). What the compare-and-set does stop is a second write and a
-        second ``auth.ad_scope_resynced`` row for a scope already stored."""
+        written (``_SignInRoleSync``). Where the compare holds against another process (not on a
+        keyless SQLite store), what it does stop is a second write and a second
+        ``auth.ad_scope_resynced`` row for a scope already stored."""
         administrator = Role.ADMINISTRATOR in roles
         # An administrator's groups are not read: the decision ignores them. Read once: a retry
         # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
