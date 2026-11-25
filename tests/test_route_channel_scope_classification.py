@@ -98,6 +98,8 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /me/mfa/confirm": (NOT_CHANNEL_BEARING, "the caller's own second factor"),
     "DELETE /me/mfa": (NOT_CHANNEL_BEARING, "the caller's own second factor"),
     "GET /me/sessions": (NOT_CHANNEL_BEARING, "the caller's own sessions"),
+    "GET /me/step-up": (NOT_CHANNEL_BEARING, "the caller's own step-up state, read unspent"),
+    "GET /auth/check": (NOT_CHANNEL_BEARING, "a gate-only answer about the caller's own session"),
     "GET /me/security-events": (
         NOT_CHANNEL_BEARING,
         "the caller's own authentication events; a channel named there is one the caller itself "
@@ -242,6 +244,20 @@ ROUTES: dict[str, tuple[str, str]] = {
     "POST /dr/release": (ADMINISTRATOR_ONLY, "dr:operate"),
     "POST /status/integrity-check": (NOT_CHANNEL_BEARING, "a database integrity verdict"),
 }
+
+#: The gate-only ``GET /auth/check/<permission>`` routes, one per permission (ADR 0215 section 2).
+#: Each answers whether the caller holds one permission, which ``GET /auth/me`` already lists, and
+#: names no channel. Built from the enum rather than listed, and checked for overlap rather than
+#: merged blind, so the one-class-per-route rule above still holds.
+_CHECK_ROUTES = {
+    f"GET /auth/check/{permission.value}": (
+        NOT_CHANNEL_BEARING,
+        "a gate-only answer about the caller's own permission, naming no channel",
+    )
+    for permission in Permission
+}
+assert not _CHECK_ROUTES.keys() & ROUTES.keys()
+ROUTES.update(_CHECK_ROUTES)
 
 
 @functools.cache

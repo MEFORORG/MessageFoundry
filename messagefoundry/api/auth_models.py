@@ -43,6 +43,8 @@ _MFA_CODE_MAX = 64
 _CONFIRM_CODE_MAX = 16
 # A session token is 43 URL-safe characters (auth/tokens.py); the cap only refuses absurd input.
 _TOKEN_MAX = 256
+#: A step-up action id: ``ReauthRequest.purpose`` and the ``action`` ``GET /me/step-up`` reads.
+STEP_UP_ACTION_MAX = 64
 
 #: The response header an ``oidc`` session's step-up refusal carries, set to
 #: :data:`STEP_UP_VIA_IDP`, so a client can branch on a header rather than parse the detail
@@ -50,6 +52,20 @@ _TOKEN_MAX = 256
 #: FastAPI-free ``apiclient`` share one spelling (vault BACKLOG #3145 item 6).
 STEP_UP_VIA_HEADER = "X-Step-Up-Via"
 STEP_UP_VIA_IDP = "idp"
+
+#: The step-up refusal's reason header and its three values (ADR 0215 section 2). What each value
+#: means is stated once, in docs/SECURITY.md beneath the gate-wrapper table.
+STEP_UP_REASON_HEADER = "X-Step-Up-Reason"
+STEP_UP_REASON_NEW_ADDRESS = "new-address"
+STEP_UP_REASON_REVERIFY = "reverify"
+STEP_UP_REASON_VERIFY_FACTOR = "verify-factor"
+
+#: The must-change refusal's next-step header and its three values (ADR 0215 section 2). What each
+#: value means is stated once, in docs/SECURITY.md under the ``require*()`` ladder.
+MUST_CHANGE_NEXT_HEADER = "X-Password-Change-Next"
+MUST_CHANGE_NEXT_VERIFY_FACTOR = "verify-factor"
+MUST_CHANGE_NEXT_ENROL_FACTOR = "enrol-factor"
+MUST_CHANGE_NEXT_ROTATE = "change-password"
 
 
 class CredentialReply(BaseModel):
@@ -497,7 +513,7 @@ class ReauthRequest(RequestModel):
     # 403 handed back in `X-Step-Up-Action`), minting a single-use per-action grant instead of only
     # refreshing the session window. Bounded length — it is an opaque action tag, never reflected;
     # an unknown tag simply fails closed (nothing consumes it, so the action re-prompts).
-    purpose: str | None = Field(default=None, max_length=64)
+    purpose: str | None = Field(default=None, max_length=STEP_UP_ACTION_MAX)
 
 
 class UserCreatedResponse(UserSummary, CredentialReply):
@@ -780,6 +796,15 @@ class AuditList(BaseModel):
 
 class SimpleMessage(BaseModel):
     detail: str
+
+
+class StepUpStatusReply(BaseModel):
+    """``GET /me/step-up`` (ADR 0215 section 2), read without spending anything.
+    ``action_proof_live`` is ``None`` when no ``action`` was asked. The action is not echoed back:
+    the caller already holds it. docs/SECURITY.md's route row says what neither field decides."""
+
+    window_live: bool
+    action_proof_live: bool | None = None
 
 
 class SessionInfo(BaseModel):

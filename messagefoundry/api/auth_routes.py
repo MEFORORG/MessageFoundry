@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from messagefoundry.api._ui_seam import AdminHandlers
 from messagefoundry.api.auth_models import (
     _GROUP_MAX,
+    STEP_UP_ACTION_MAX,
     STEP_UP_VIA_HEADER,
     STEP_UP_VIA_IDP,
     AdGroupMap,
@@ -70,6 +71,7 @@ from messagefoundry.api.auth_models import (
     SessionInfo,
     SessionList,
     SimpleMessage,
+    StepUpStatusReply,
     UserCreatedResponse,
     UserCreateRequest,
     UserListEntry,
@@ -98,6 +100,7 @@ from messagefoundry.api.security import (
     pending_credential_deadline_for,
     public_route,
     recheck_standing,
+    record_check_grant,
     record_repeated_credential,
     refuse_unless_step_up_window_live,
     require,
@@ -106,6 +109,7 @@ from messagefoundry.api.security import (
     require_step_up,
     require_step_up_action,
     spend_step_up_action,
+    step_up_status,
 )
 from messagefoundry.api.validation import (
     AUDIT_EXPORT_DEFAULT_LIMIT,
@@ -836,6 +840,44 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     @app.get("/auth/me", response_model=CurrentUser)
     async def me(identity: Identity = Depends(require())) -> CurrentUser:
         return _current_user(identity)
+
+    # ADR 0215 section 2: gate-only routes, for the web console's later slices to sub-request before
+    # a page that shows no engine data of its own renders. No console code calls them yet. Each is a
+    # static gate, require(p) for one permission, registered in a loop over Permission so the route
+    # walk and the route map read it; the permission never comes from the request. Each writes the
+    # grant row its permission's own routes audit (record_check_grant). docs/SECURITY.md (Gate-only
+    # check routes) states what they answer and which rows they write.
+    @app.get("/auth/check", response_model=SimpleMessage)
+    async def auth_check(_: Identity = Depends(require())) -> SimpleMessage:
+        return SimpleMessage(detail="authorized")
+
+    def _add_permission_check(permission: Permission) -> None:
+        async def auth_check_permission(
+            request: Request,
+            identity: Identity = Depends(require(permission)),
+        ) -> SimpleMessage:
+            await record_check_grant(request, identity, permission)
+            return SimpleMessage(detail="authorized")
+
+        app.add_api_route(
+            f"/auth/check/{permission.value}",
+            auth_check_permission,
+            methods=["GET"],
+            response_model=SimpleMessage,
+            name=f"auth_check_{permission.name.lower()}",
+        )
+
+    for check_permission in Permission:
+        _add_permission_check(check_permission)
+
+    @app.get("/me/step-up", response_model=StepUpStatusReply)
+    async def my_step_up_status(
+        request: Request,
+        action: Annotated[str | None, Query(max_length=STEP_UP_ACTION_MAX)] = None,
+        identity: Identity = Depends(require()),
+    ) -> StepUpStatusReply:
+        """:func:`step_up_status`, for the caller's own session (ADR 0215 section 2)."""
+        return await step_up_status(request, identity, action)
 
     @app.post("/me/password", response_model=SimpleMessage)
     async def change_password(

@@ -3845,6 +3845,8 @@ _SESSION_ID_SHAPE: Final = re.compile(r"[0-9a-f]{1,64}")
 #: Vault BACKLOG #3260: the row an admin route writes when it refuses the caller's own account.
 #: Its detail's ``op`` names the route, one of :data:`SelfTargetOp`.
 SELF_TARGET_REFUSED_ACTION: Final = "auth.self_target_refused"
+#: The row ``GET /me/step-up`` writes for each answered read (ADR 0215 section 2, BACKLOG #2603).
+STEP_UP_STATUS_READ_ACTION: Final = "auth.step_up_status_read"
 SelfTargetOp = Literal[
     "password_reset",
     "mfa_reset",
@@ -22456,6 +22458,35 @@ class AuthService:
             "auth.permission_granted",
             actor=identity.username,
             detail=_json({"permission": permission.value, "path": path}),
+            client=client,
+        )
+
+    async def audit_step_up_status_read(
+        self,
+        identity: Identity,
+        path: str,
+        *,
+        action: str | None,
+        window_live: bool,
+        action_proof_live: bool | None,
+        client: str | None,
+    ) -> None:
+        """Audit one answered ``GET /me/step-up`` read (ADR 0215 section 2, BACKLOG #2603).
+
+        The read tells its caller whether a proof is live, so each answer leaves a row naming who
+        asked, about which action, and what it was told. ``client`` is required, as for
+        :meth:`audit_self_target_refused`."""
+        await self._audit(
+            STEP_UP_STATUS_READ_ACTION,
+            actor=identity.username,
+            detail=_json(
+                {
+                    "path": path,
+                    "action": action,
+                    "window_live": window_live,
+                    "action_proof_live": action_proof_live,
+                }
+            ),
             client=client,
         )
 
