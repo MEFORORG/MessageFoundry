@@ -83,13 +83,17 @@ def _spend_one_verify() -> None:
     :func:`verify_password`.
 
     What it does: either refusal returns before the hasher runs, so without this it would cost
-    almost nothing; with it, a refused verify costs one argon2id verify, like an ordinary
-    mismatch. The padding plays no part in hiding which recovery-code slot matched; the walk (ADR
-    0170) runs every slot whatever the result, and neither refusal's cost depends on the presented
-    code: a non-ASCII stored hash is refused for any code, and a surrogate in the code makes every
-    slot refuse the same way. This does not
-    raise: if argon2 itself fails here, the failure is logged without content, and the refusal then
-    costs whatever was spent."""
+    almost nothing; with it, a refused verify costs one argon2id verify at the pinned parameters.
+    That matches an ordinary mismatch only when the stored hash is at the pinned parameters too: a
+    mismatch costs a verify at the stored hash's own parameters, so for a stored hash at other
+    parameters, for example one that ``needs_rehash`` would upgrade, the two costs differ. While the
+    fixed hash is not cached, a refusal also pays one hash to make it, at least the first refusal in
+    a process and every refusal after a failed hash; :func:`verify_password` lists when. The padding
+    plays no part in hiding which recovery-code slot matched; the walk (ADR 0170) runs every slot
+    whatever the result, and neither refusal's cost depends on the presented code: a non-ASCII
+    stored hash is refused for any code, and a surrogate in the code makes every slot refuse the
+    same way. This does not raise: if argon2 itself fails here, the failure is logged without
+    content, and the refusal then costs whatever was spent."""
     failure: str | None = None
     try:
         _hasher.verify(_constant_work_hash(), _CONSTANT_WORK_INPUT)
@@ -109,10 +113,12 @@ def verify_password(stored_hash: str, password: str) -> bool:
     a surrogate code point, pays one argon2id verify at the pinned parameters against a fixed hash.
     Until that fixed hash is cached, a refusal also pays one hash to make it: at least the first
     refusal in a process, any refusal that runs while another is still making it (the cache does not
-    serialize a miss), and every refusal after a failed hash (a failure is not cached). A well-formed
-    stored hash at the pinned parameters costs one verify. Other stored hashes cost what argon2-cffi
-    spends on them: at least a malformed ASCII hash is refused before any hashing and costs almost
-    nothing, and a hash at other parameters costs its own verify."""
+    serialize a miss), and every refusal after a failed hash (a failure is not cached). A password
+    holding a surrogate is refused at that cost whatever ASCII stored hash it meets, a malformed one
+    included. For any other password, a well-formed stored hash at the pinned parameters costs one
+    verify, and other stored hashes cost what argon2-cffi spends on them: at least a malformed ASCII
+    hash is refused before any hashing and costs almost nothing, and a hash at other parameters
+    costs its own verify, which is not what a refusal costs."""
     # argon2-cffi encodes the hash as ASCII and the password as UTF-8 before argon2 sees either, and
     # neither encode failure becomes one of its own exception types. Both inputs are therefore
     # screened first, so no ``UnicodeEncodeError`` is ever raised here: that exception carries the
