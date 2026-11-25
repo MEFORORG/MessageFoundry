@@ -556,8 +556,9 @@ async def test_an_undecodable_stored_credential_id_is_refused_at_the_begin_leg(
     decode error out of :meth:`AuthService.begin_webauthn_assertion`, when that leg answers
     ``None`` for it (the web console reads ``None`` as an origin migration), or when it writes the
     refusal on every call, or when the WARNING or the row says the passkey can never sign in. The
-    passkey is left out of the allow list and reported: the WARNING by label, saying the combined
-    sign-in can still use it, and the ``stored_id_unreadable`` row, once per throttle interval.
+    passkey is left out of the allow list and reported: the WARNING by label, saying it is not
+    listed in this leg's allow list, and the ``stored_id_unreadable`` row, once per throttle
+    interval.
     Not ``stored_key_refused``, which the verify writes for a stored key that never signs in
     again. It was the only passkey, so no ceremony can be staged:
     :class:`StoredPasskeysUnreadable`."""
@@ -591,8 +592,8 @@ async def test_registration_leaves_out_an_undecodable_stored_credential_id(
 ) -> None:
     """BACKLOG #6886, the id at registration. RED when: a discoverable passkey whose stored
     ``credential_id`` does not decode raises out of the registration options instead of being left
-    out of the exclude list. Left out, its holder can register that authenticator again, the
-    remedy the WARNING names. The control shows the same row with its own id is excluded."""
+    out of the exclude list. Left out, its holder can register that authenticator again, which is
+    the remedy. The control shows the same row with its own id is excluded."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
