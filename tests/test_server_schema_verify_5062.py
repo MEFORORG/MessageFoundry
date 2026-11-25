@@ -815,12 +815,18 @@ def test_a_line_comment_holding_a_break_other_than_lf_raises(
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
-@pytest.mark.parametrize("ending", ["\r\n", "\r"])
+@pytest.mark.parametrize("ending", ["\r\n", "\r", "\r\r\n"])
 def test_a_cr_that_ends_a_line_comment_is_accepted(ending: str, dialect: Dialect | None) -> None:
-    """The CR of a CRLF, or a CR that ends the batch, ends the comment where the server does too, so
-    nothing after it is hidden and the exemption refuses nothing main read."""
+    """A run of CRs reaching the LF or the end of the batch ends the comment where the server does
+    too, so nothing after it is hidden and the exemption refuses nothing main read."""
     shape = declared_schema((f"CREATE TABLE v (c INT NOT NULL); -- note{ending}",), dialect)
     assert shape.columns["v"] == frozenset({"c"})
+
+
+def test_a_cr_followed_by_more_text_before_the_lf_raises() -> None:
+    """The exemption is a run of CRs reaching the LF, not trailing whitespace."""
+    with pytest.raises(ValueError, match=re.escape("a DDL line comment holds '\\r'")):
+        declared_schema(("CREATE TABLE v (c INT NOT NULL); -- note\r  \n",), "postgres")
 
 
 @pytest.mark.parametrize("name", ["AS[x--y]", "AS [a[--b]"])
@@ -833,12 +839,15 @@ def test_a_comment_marker_inside_a_bracket_name_still_reads_the_ddl_after_it(nam
 
 
 @pytest.mark.xfail(
-    strict=True, reason="known misread, as on main: the comment reader ends [ at its first ]"
+    raises=AssertionError,
+    strict=True,
+    reason="known misread, as on main: the comment reader ends [ at its first ]",
 )
 @pytest.mark.parametrize("name", ["AS [x]]--y]", "AS [p]]/*q]"])
 def test_a_comment_marker_after_a_doubled_bracket_is_a_known_misread(name: str) -> None:
     """SQL Server reads ``]]`` as a ``]`` inside the name, so it builds ``v``; the reader takes the
-    marker for a comment and hides it. Named in the module docstring; strict, so a fix shows here."""
+    marker for a comment and hides it. Named in the module docstring; strict and bound to the
+    assertion, so a fix that reads the name, or one that raises instead, shows here."""
     statement = f"SELECT 1 {name}; CREATE TABLE v (a INT NOT NULL); SELECT 1 AS [*/];"
     assert set(declared_schema((statement,), "sqlserver").columns) == {"v"}
 

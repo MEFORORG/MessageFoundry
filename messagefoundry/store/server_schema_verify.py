@@ -52,9 +52,9 @@ inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it do
 Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
 or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
 ``/*`` inside a block comment, even a balanced one, since both servers nest them, and a line
-comment holding a NUL or a line break other than LF, at least a CR that does not run up to the LF
-or the end that closes it. A unit test
-reads each shipped batch, so a new form fails there before it reaches an open.
+comment holding a NUL, or a CR or other line break that is not part of a run of CRs reaching the
+LF or the end of the batch that closes the comment. A unit test reads each shipped batch, so a new
+form fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
 before it, is read as reaching every store, and one with anything before it, even a statement a
@@ -69,11 +69,15 @@ procedure's body runs only when it is called; DDL an ``EXEC ... AT`` runs on a l
 after a ``USE`` in another database, is read as this store's; a literal joined to more text by
 anything other than a ``+`` or ``||`` right after its closing quote is read whole; a literal a
 variable holds is read as run by an ``EXEC`` of that variable whatever the text between them does
-to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; a
-``--`` or ``/*`` after a ``]]`` inside a SQL Server bracketed name, which the comment reader ends at
-its first ``]``, is read as a comment and hides the DDL after it; and a ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
-``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
-a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
+to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; the comment
+reader ends a ``[`` at its first ``]`` on both servers, so after a SQL Server ``]]`` escape a
+``--``, or a ``/*`` that a later ``*/`` closes, is read as a comment and hides the DDL after it,
+and a ``'`` or ``"`` there opens a quote that can hide a real comment, so DDL the server skips is
+read as run, and on PostgreSQL a comment inside an ``ARRAY[...]`` or subscript is read as part of
+a name and the DDL it comments out as run; and a ``DROP COLUMN`` raises where the reader finds the
+column's name among the words of an expression, ``INCLUDE`` or partial index on its table, other
+than as a key column, but that word search can miss a name, so a ``DROP COLUMN`` that should raise
+may instead keep an index PostgreSQL drops.
 
 What is NOT compared includes at least: a column's default, other than whether PostgreSQL's is a
 ``nextval()`` call, which reads as numbering; a PostgreSQL column's collation; constraint indexes (a
