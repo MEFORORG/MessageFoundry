@@ -4184,18 +4184,19 @@ def _needle_shape(needle: str) -> str:
 
     An operator's needle may itself be PHI — an MRN, a patient name (ADR 0046 §4/AC-6). The audit must
     record *that a content search ran and roughly what kind of term*, never the term verbatim. We emit
-    only a structural class (all-digits / alphanumeric / has-separators / other) — not the characters —
-    so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
+    only a structural class (all-digits / all-letters / letters and digits / anything else) — not the
+    characters — so even a 9-digit MRN logs as ``digits`` with a length, never the number itself.
 
     The shape is read with the padding removed: ``make_spec`` keeps a needle's spaces (BACKLOG #6700),
     and a pasted `` 123456789`` is still an MRN-shaped lookup, so it must audit as ``digits``."""
     needle = needle.strip()
     if needle.isdigit():
         return "digits"
-    if needle.isalnum():
-        return "alnum"
+    # Before isalnum, which every all-letter needle also passes (BACKLOG #6700).
     if needle.isalpha():
         return "alpha"
+    if needle.isalnum():
+        return "alnum"
     return "mixed"
 
 
@@ -4219,7 +4220,8 @@ def _search_audit_detail(
 ) -> dict[str, object]:
     """Build the ``message_search`` audit detail — metadata filters + needle SHAPE + scan counts, with
     **no** needle value (AC-6). The HL7 ``field_path`` (e.g. ``PID-3``) is a structural locator, not PHI,
-    so it is recorded; the matched VALUE is never recorded."""
+    so it is recorded; the matched VALUE is never recorded. ``needle_len`` is the needle's length with
+    its padding removed, as :func:`_needle_shape` reads it (BACKLOG #6700)."""
     # `result` is a MessageSearchResult (kept loosely-typed to avoid importing the store dataclass here).
     scanned = getattr(result, "scanned", None)
     matched = getattr(result, "matched", None)
@@ -4235,7 +4237,7 @@ def _search_audit_detail(
     if spec.substring is not None:
         detail["needle_kind"] = "substring"
         detail["needle_shape"] = _needle_shape(spec.substring)
-        detail["needle_len"] = len(spec.substring)
+        detail["needle_len"] = len(spec.substring.strip())
     else:
         detail["needle_kind"] = "field_path"
         detail["field_path"] = spec.field_path  # structural locator, not PHI
@@ -4243,12 +4245,12 @@ def _search_audit_detail(
         detail["field_value_present"] = spec.field_value is not None
         if spec.field_value is not None:
             detail["needle_shape"] = _needle_shape(spec.field_value)
-            detail["needle_len"] = len(spec.field_value)
+            detail["needle_len"] = len(spec.field_value.strip())
     return detail
 
 
 def _compose_preset_layers(
-    criterias: list[dict[str, Any]],
+    criterias: list[dict[str, Any]], *, scan_limit: int = DEFAULT_CONTENT_SCAN_LIMIT
 ) -> tuple[SearchSpec, dict[str, str | None]]:
     """AND-compose N saved-preset criteria into one ``(SearchSpec, metadata-filters)`` for
     ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
@@ -4259,10 +4261,12 @@ def _compose_preset_layers(
     ``ContentSearchError`` from a malformed field path likewise.
 
     A lone ``field_value`` counts as a needle too, so ``make_spec`` refuses it (400) rather than the
-    compose dropping it (BACKLOG #6700)."""
+    compose dropping it (BACKLOG #6700). Each needle is validated as it is found, at ``scan_limit``,
+    so a malformed one is refused with its own cause rather than counted as a second needle, and
+    its terms reach ``make_spec`` as stored, so a non-text one is refused rather than dropped."""
     meta_keys = ("channel_id", "status", "message_type", "control_id")
     meta: dict[str, str | None] = dict.fromkeys(meta_keys)
-    needle: dict[str, Any] | None = None
+    spec: SearchSpec | None = None
     for crit in criterias:
         for key in meta_keys:
             value = crit.get(key)
@@ -4280,26 +4284,29 @@ def _compose_preset_layers(
             v.strip() if isinstance(v, str) else v
             for v in (crit.get("content"), crit.get("field_path"))
         )
-        if sends_a_needle(content, path, crit.get("field_value")):
-            if needle is not None:
-                raise HTTPException(
-                    400, "layered search allows at most one content predicate across presets"
-                )
-            needle = crit
-    if needle is None:
+        if not sends_a_needle(content, path, crit.get("field_value")):
+            continue
+        # make_spec reads an empty or blank term as not sent, so nothing here coerces one.
+        try:
+            found = make_spec(
+                content=crit.get("content"),
+                field_path=crit.get("field_path"),
+                field_value=crit.get("field_value"),
+                target=crit.get("target") or "both",
+                scan_limit=scan_limit,
+            )
+        except (ContentSearchError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if spec is not None:
+            raise HTTPException(
+                400, "layered search allows at most one content predicate across presets"
+            )
+        spec = found
+    if spec is None:
         raise HTTPException(
             400,
             "layered search needs exactly one preset carrying a content term (substring or field)",
         )
-    try:
-        spec = make_spec(
-            content=(needle.get("content") or None),
-            field_path=(needle.get("field_path") or None),
-            field_value=(needle.get("field_value") or None),
-            target=needle.get("target") or "both",
-        )
-    except (ContentSearchError, ValueError) as exc:
-        raise HTTPException(400, str(exc)) from exc
     return spec, meta
 
 
@@ -10631,15 +10638,7 @@ def create_app(
                     "malformed",
                 )
             criterias.append(criteria)
-        spec, meta = _compose_preset_layers(criterias)
-        # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
-        spec = make_spec(
-            content=spec.substring,
-            field_path=spec.field_path,
-            field_value=spec.field_value,
-            target=spec.target,
-            scan_limit=scan_limit,
-        )
+        spec, meta = _compose_preset_layers(criterias, scan_limit=scan_limit)
         allowed = _scope(identity)
         result = await engine.store.search_messages(
             spec,
