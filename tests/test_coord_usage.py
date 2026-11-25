@@ -474,15 +474,19 @@ def test_a_window_carried_from_another_root_is_no_floor_for_this_one(tmp_path: P
 
 
 def test_the_status_line_truncates_hours_rather_than_rounding_them(tmp_path: Path) -> None:
-    """90 minutes rounded to the even hour read as 2h30m."""
-    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5430)}})
+    """90 minutes rounded to the even hour read as 2h30m.
+
+    5459 s, not 5400: the countdown truncates, so the fixture sits at the top of the 1h30m minute and
+    leaves about a minute for the spawn lock and a slow pwsh start before it reads 1h29m.
+    """
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 5459)}})
     assert re.search(r"resets 1h30m", line), line
 
 
 def test_the_status_line_floors_the_minutes_rather_than_rounding_them(tmp_path: Path) -> None:
-    """59m45s left is 0h59m. A cast to [int] rounded the total minutes up to 1h00m (BACKLOG #7597)."""
+    """59m59s left is 0h59m. A cast to [int] rounded the total minutes up to 1h00m (BACKLOG #7597)."""
     line = collect(
-        tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 59 * 60 + 45)}}
+        tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 59 * 60 + 59)}}
     )
     assert re.search(r"resets 0h59m", line), line
 
@@ -491,6 +495,12 @@ def test_a_reset_seconds_ago_is_a_gone_window_not_zero_minutes(tmp_path: Path) -
     """Rounding -0.3 minutes to 0 printed a 0h00m countdown for a window that had already reset."""
     line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(99.0, -20)}})
     assert line == "7d reset passed, no current reading", line
+
+
+def test_a_window_in_its_last_minute_still_shows_a_countdown(tmp_path: Path) -> None:
+    """The control for the gone-window test: under a minute left is 0h00m, not the gone line."""
+    line = collect(tmp_path, {"session_id": "A", "rate_limits": {"seven_day": window(9.0, 59)}})
+    assert re.search(r"resets 0h00m", line), line
 
 
 @pytest.mark.parametrize("bad", ["", "not json at all", "{truncated", "null"])
