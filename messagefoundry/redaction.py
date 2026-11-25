@@ -2104,8 +2104,10 @@ def _redact_noted(text: str, *, noted: bool) -> str:
     stand-in note written into the text changed a whole-text gate in :func:`_redact_unguarded`
     (a final ``bearer`` then read as a scheme), which the earlier attempt at this fix found. A
     trailing note already in ``text`` is still the one the passes read, and ``noted`` then changes
-    nothing for the value before it. ``noted`` only turns end-of-text refusals off, so it can only
-    add masks; :func:`_masked_only` says what a mask can still change in a later round."""
+    nothing for the value before it. ``noted`` turns end-of-text refusals off, so a value they kept
+    is masked. A mask can still change what a later pass or round reads (:func:`_masked_only`), so
+    that the answer only hides more is a measurement, not a proof: the differential tests in
+    ``tests/test_redaction_clamp_note_end.py`` measure it on their inputs."""
     try:
         return _redact_unguarded(text, noted=noted)
     except _MismatchedJsonCloser:
@@ -2855,8 +2857,9 @@ def redact_bounded_head(head: str, note: str) -> str:
     note appended after it, follows (BACKLOG #5925), and stripped. ``note`` is ``""`` when nothing
     was cut, and ``head`` is then redacted as :func:`redact` redacts any text.
 
-    One place for what :func:`safe_text`, the off-box audit tee and
-    ``verify_leaf.safe_detail_text`` each do with a head they bound, so the three answer alike:
+    One place for what :func:`safe_text` and ``verify_leaf.safe_detail_text`` each do with a head
+    they bound, so the two answer alike (the off-box audit tee does not use it; its
+    ``_bounded_detail`` says why):
     ``_held_back(redact_bounded_head(head, note), limit) + note`` is ``safe_text(text, limit=limit)``
     for ``(head, note) = safe_text_bound(text)``. With a note, the head's trailing whitespace is
     dropped first: a cut can leave it after the head's last value, the answer is stripped anyway,

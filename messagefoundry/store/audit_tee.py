@@ -49,12 +49,9 @@ from messagefoundry.logging_setup import (
     sink_readings,
 )
 from messagefoundry.redaction import (
-    _DEFAULT_LIMIT,
     _REDACT_WINDOW,
     _REDACTED,
-    _held_back,
     clamp_untrusted,
-    redact_bounded_head,
     safe_text,
     safe_text_bound,
 )
@@ -311,10 +308,11 @@ def _bounded_detail(kept: str, note: str, old: str) -> str:
     own window cut off. Where ``old``, the detail the line before #3045 shipped, parses as JSON
     and the bounded result does not, it ships as the JSON string ``"[redacted]"`` instead.
 
-    ``safe_text`` here does not see ``note``, so a value the cut left last in ``kept`` is judged
-    as ending the text and can print, where the unscrubbed path's answer
-    (:func:`~messagefoundry.redaction.redact_bounded_head`) masks it: a residual of BACKLOG
-    #5925."""
+    Neither this nor ``old`` is told that the note follows the head, so a value the cut left
+    last is judged as ending the text and can print, as on the code before BACKLOG #5925's
+    bounded-head rule (:func:`~messagefoundry.redaction.redact_bounded_head`). That is a named
+    residual: ``kept`` is already the handler chain's scrub of the head, which reads no note, so
+    telling only this bound would make the two answers differ and ship the whole detail hidden."""
     shipped = safe_text(kept) + note
     if _parses(old) and not _parses(shipped):
         return json.dumps(_FIELD_REDACTED)
@@ -638,10 +636,12 @@ def emit_audit_tee(
             tee_detail = _withhold_detail(detail)
         except Exception:  # noqa: BLE001 - its fault warning can raise; the row is committed
             tee_detail = _DETAIL_WITHHELD_WHOLE
-    # This is safe_text(tee_detail), split so the note is kept for a scrubbed detail: the head is
-    # redacted knowing the note follows (redact_bounded_head, BACKLOG #5925), as safe_text does.
+    # safe_text(head) + note, with the note kept apart for a scrubbed detail. This is NOT
+    # safe_text(tee_detail): that is told the note follows its head (BACKLOG #5925), and this is
+    # not, so it matches the scrubbed path, whose head the handler chain read with no note. A value
+    # the cut left last can print here; _bounded_detail names the residual.
     head, note = safe_text_bound(tee_detail) if tee_detail else ("", "")
-    old_detail = _held_back(redact_bounded_head(head, note), _DEFAULT_LIMIT) + note
+    old_detail = safe_text(head) + note
     texts: dict[str, str | None] = {
         "action": action,
         "actor": actor,
