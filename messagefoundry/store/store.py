@@ -20874,7 +20874,8 @@ class MessageStore:
             # record in flight to the reserve-ahead (BACKLOG #5738). Charged whether or not the
             # write landed: a compare-and-set that lost to a concurrent write returns None after the
             # change already re-encrypted the secret, so that invocation is spent all the same. A
-            # record with nothing spent costs no lock, since the checkpoint returns early when idle.
+            # record with nothing spent takes no lock once the bound is hydrated, since the
+            # checkpoint then returns early when idle.
             # Through the public checkpoint, which takes the writer lock its commit needs and
             # unwinds a failed add.
             await self.checkpoint_cipher_invocations()

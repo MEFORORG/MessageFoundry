@@ -10277,7 +10277,9 @@ class PostgresStore(ServerCipherWalk):
 
     async def _charge_bound_batch(self) -> None:
         """Top the AES-GCM invocation reserve up mid-burst — called after EVERY committed batch of a
-        rotation / at-rest-migration loop (ASVS 11.3.4; the SQLite twin documents why).
+        rotation / at-rest-migration loop (ASVS 11.3.4; the SQLite twin documents why), and by the
+        user re-seal pass after every record it did not refuse, a compare-and-set that lost and
+        wrote nothing included, since that record's re-encrypt was already spent (BACKLOG #5738).
 
         Runs on its own pooled connection, OUTSIDE the batch transaction: the batch is already committed,
         and an accounting write must never be rolled back with a retried batch."""

@@ -5,8 +5,8 @@
 Two defects, one test each, each with its control:
 
 * The AES-GCM invocation bound was charged once, after the whole loop, and outside the writer lock
-  the charge's commit needs. It is now charged after each committed record, through
-  ``checkpoint_cipher_invocations``, which takes the lock.
+  the charge's commit needs. It is now charged after each record the pass did not refuse, a lost
+  compare-and-set included, through ``checkpoint_cipher_invocations``, which takes the lock.
 * The work filter used ``NOT LIKE``, which SQLite folds for ASCII case, so a record whose seal
   prefix differed from the active one only in case was skipped, neither moved nor counted refused.
 
@@ -89,8 +89,10 @@ async def test_a_seal_prefix_differing_only_in_case_is_not_skipped(
 #
 # The change re-encrypts the TOTP secret before the compare-and-set write, so a write that lost to a
 # concurrent writer has already spent an AES-GCM invocation. The pass charged the bound only when the
-# write landed, so a lost compare left that invocation to a later record's checkpoint, or to none
-# when the pass ended or was interrupted first.
+# write landed, so a lost compare left that invocation to a later checkpoint: the next record's, or
+# the close's settle. A hard kill before either outran the reserve-ahead by that record's spend.
+# These tests pin that the pass checkpoints after a lost compare; the accounts carry no TOTP secret,
+# so they do not measure the spend itself, which the checkpoint charges whatever it is.
 
 
 async def test_a_lost_compare_and_set_is_still_charged(

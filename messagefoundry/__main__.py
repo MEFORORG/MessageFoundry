@@ -7715,11 +7715,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
-        _StoreOpenRefused,  # the OPEN only: a refused hop (#2532), a key, a short schema (#1720)
-        # Not reached from the open, which _open_store_or_refuse turns into _StoreOpenRefused.
-        # Kept so a key error raised after the open, which no trace here rules out, is still
-        # exit 2 rather than the dispatch floor's 1 (BACKLOG #5633 item 11).
-        *_key_unresolved(),
+        # The OPEN only: a refused hop (#2532), a key, a short schema (#1720). A key that does not
+        # resolve arrives here as this class, never bare: _open_store_or_refuse converts it, and
+        # after the open every _key_unresolved() class is a RuntimeError or ValueError, which
+        # call_errors below takes as a refusal, exit 1. So the bare classes are not listed
+        # (BACKLOG #5633 item 11).
+        _StoreOpenRefused,
     )
     # A refused store call on every backend (BACKLOG #1983, store_call_errors), and what a store
     # raises when it cannot reach its database (vault BACKLOG #3054, item 10).
@@ -7820,9 +7821,10 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # BACKLOG #3510: the store's write helper refused the clear, which wrote nothing; the open
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
-        # The stored username, as every other refusal after the read names it (vault BACKLOG
-        # #5067 added item A): a case-insensitive server collation can find it under another case.
-        return _emit_error(f"{_seal_refusal(named[0], 'unlock')}. {left}", as_json=args.json)
+        # The name as typed, not the stored one the other refusals use: neither this text nor
+        # _seal_refusal's WARNING prints a value from a record that failed its seal (BACKLOG #5633
+        # item 7; tests/test_cli.py pins it).
+        return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
             # What the open may have changed before it, as for a keyless-chain refusal (#5067).
@@ -11883,16 +11885,14 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 # or a pool acquire that timed out. A busy store is not "could not start", so it
                 # keeps exit 1. The command has written nothing yet, but the open may have, so the
                 # text names it (BACKLOG #5067).
-                # The class only, never the text: a driver's message can quote a stored value
-                # (ASVS 16.5.4), as admin-unlock renders a refusal (vault BACKLOG #5067 added item
-                # B). The text and traceback go to DEBUG, so the cause can still be found.
-                log = logging.getLogger(__name__)
-                log.warning(
+                # The class only, never the text, on the console and in the WARNING log alike: a
+                # driver's message can quote a stored value (ASVS 16.5.4), as admin-unlock renders
+                # its refusals (vault BACKLOG #5067 added item B).
+                logging.getLogger(__name__).warning(
                     "admin-set-notify-email: the store refused the audit row for %r (%s)",
                     user.username,
                     type(exc).__name__,
                 )
-                log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
                 refused = f"the store refused the audit row ({type(exc).__name__})"
                 return ("audit-refused", user.username, f"{refused}. {left}")
@@ -11976,8 +11976,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. The audit row goes first, and the store refused it, so the "
-        "address is not set. If the engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, so the address is not set. If the "
+        "engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }

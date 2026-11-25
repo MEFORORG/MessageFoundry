@@ -27,22 +27,20 @@ def _fixture(tmp_path: Path) -> Path:
 
 @pytest.mark.parametrize("command", ["graph", "dryrun"])
 def test_missing_config_dir_emits_json_error(
-    command: str,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-    caplog: pytest.LogCaptureFixture,
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     missing = tmp_path / "no-such-config"
     argv = [command, "--project-root", str(tmp_path), "--config", str(missing), "--json"]
     if command == "dryrun":
         argv += ["--messages", str(_fixture(tmp_path))]
     rc = main(argv)
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
     assert rc == 1
-    payload = json.loads(out.strip().splitlines()[-1])
+    payload = json.loads(captured.out.strip().splitlines()[-1])
     # The command's own envelope, not the last-resort floor's "<ExceptionType>: ..." rendering.
     assert payload["error"].startswith("config directory not found")
-    assert not [r for r in caplog.records if r.name == "messagefoundry.last_resort"]
+    # --json replaces the root log handlers, so the floor's CRITICAL line is read on stderr.
+    assert "last-resort" not in captured.err
 
 
 @pytest.mark.parametrize("command", ["graph", "dryrun"])
