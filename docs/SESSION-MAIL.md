@@ -214,6 +214,16 @@ checkout's path. A prefix match therefore resolves *any* peer to some arbitrary 
 the primary one -- and does so silently, because a wrong-but-existing box looks exactly like a right
 one from both ends.
 
+**A folder inside a worktree addresses that worktree's box (BACKLOG #7581).** The sender, the drain,
+the watcher and `seat.ps1` each pass a path through `Resolve-BoxPath` in `mail-key.ps1` before keying
+it. A folder inside a live worktree is raised to the nearest root above it, so a session started in a
+subdirectory reads the box its seat record publishes. This is not a prefix match: the walk stops at the
+first `.git`, and every other path keeps the key it had before. That covers a root, a path in no
+checkout, a path under a `.git` that names no git directory, and a folder git ignores. A removed
+worktree's leftover directory under the primary's `.claude/worktrees/` is ignored, so it never reaches
+the primary's box. Mail queued under a subdirectory's old key is moved into the root's box by the
+drain and the watcher, as the legacy key's mail is.
+
 **Injectivity comes from the hash, not the slug.** The key is `<readable-slug>-<hash>`. Two different
 worktree paths can sanitise to the same slug, and the failure mode of a slug-only key is one worktree
 reading another's mail. The hash is computed over `<HOST>|<normalised path>` and carries the

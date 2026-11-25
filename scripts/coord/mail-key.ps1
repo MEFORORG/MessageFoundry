@@ -10,7 +10,7 @@
 
         . "$PSScriptRoot\mail-key.ps1"
         $key = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $cwd)
-        $old = Get-BoxReadKeys -Path $cwd   # READERS ONLY; see that function
+        foreach ($old in Get-BoxReadKeys -Path $cwd) { ... }   # READERS ONLY; see that function
 
     ONE COPY ON PURPOSE, for the same reason session-registry.ps1 states for the liveness fence. The
     sender (scripts/coord/mail.ps1) and the drain (scripts/hooks/mail-drain.ps1) must compute the SAME
@@ -95,21 +95,23 @@ function Resolve-BoxPath {
     #     the same reason, as it did before this function;
     #   - git cannot answer the ignore question. A failed probe is not "not ignored".
     #
-    # Calls git only for a path strictly below a worktree root. Never throws.
+    # Calls git only for a path strictly below a worktree root. Never throws. The walk mirrors
+    # Get-CcxWorktreeRoot in scripts/hooks/_hookinput.ps1, which adds neither guard above and which
+    # this file cannot load (see Test-BoxGitDir).
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
     try {
         $raw = $Path.Trim()
-        if (-not $raw -or -not [System.IO.Path]::IsPathRooted($raw)) { return $Path }
+        # Fully qualified, not merely rooted: `D:` or `\x` would resolve against a current directory.
+        if (-not $raw -or -not [System.IO.Path]::IsPathFullyQualified($raw)) { return $Path }
         # GetFullPath collapses `..` and slash direction, so the walk below climbs real parents.
         $full = [System.IO.Path]::GetFullPath($raw).TrimEnd('\', '/')
-        if (-not $full) { return $Path }
         $at = $full
         $root = $null
         while ($at) {
             $dotGit = Join-Path $at '.git'
             if (Test-Path -LiteralPath $dotGit) {
-                if (-not (Test-BoxGitDir -DotGit $dotGit -Root $at)) { return $Path }
+                if (-not (Test-BoxGitDir -DotGit $dotGit)) { return $Path }
                 $root = $at
                 break
             }
@@ -131,8 +133,11 @@ function Resolve-BoxPath {
 
 function Test-BoxGitDir {
     # Whether the `.git` at $DotGit names a git directory, read the way git reads it and calling no
-    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD.
-    param([Parameter(Mandatory)][string]$DotGit, [Parameter(Mandatory)][string]$Root)
+    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD. The same rule as
+    # Get-CcxGitCommonDir in scripts/hooks/_hookinput.ps1, which this file cannot load (it is kept
+    # byte-identical with korus, and mail.ps1 and seat.ps1 never load hook code); change both together.
+    param([Parameter(Mandatory)][string]$DotGit)
+    $Root = Split-Path -Parent $DotGit
     try {
         if (Test-Path -LiteralPath $DotGit -PathType Container) { $gitDir = $DotGit }
         else {

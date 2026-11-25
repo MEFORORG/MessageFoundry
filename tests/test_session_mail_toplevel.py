@@ -29,6 +29,7 @@ from _session_mail_harness import (
     MAIL,
     MAIL_KEY,
     TIMEOUT,
+    box_files,
     injection,
     mail_root,
     repo,
@@ -139,7 +140,7 @@ def test_mail_queued_under_a_subdirectory_key_is_still_read(repo: Path) -> None:
     old_inbox = _queue_under_the_subdirectory_key(repo, sub, "queued before the keyer")
     assert "queued before the keyer" in injection(run_drain(repo, event="SessionStart", cwd=sub))
     assert not list(old_inbox.glob("*.json")), "moved into the worktree's box"
-    assert list((mail_root(repo) / "box" / _key(repo) / "inbox").glob("*--*.json"))
+    assert box_files(repo, _key(repo), "inbox")
 
 
 def test_the_watcher_wakes_on_mail_under_a_subdirectory_key(repo: Path) -> None:
