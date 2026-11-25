@@ -221,8 +221,10 @@ def test_the_glued_differential_sees_a_widened_branch(
 def _words_later_passes_read() -> set[str]:
     """The lower case letter words the sources ``_GLUED_REFUSED_WORDS`` names hold."""
     words = {word.lower() for word in scrub_mod._MEMBER_KEEP_WORDS}
-    # No log pass reads these since the member mask stopped keeping them (BACKLOG #5030 added item
-    # 1); the refused list keeps them, which costs the glued branch coverage only.
+    # Not read by a log pass as words of their own since the member mask stopped keeping them
+    # (BACKLOG #5030 added item 1). The refused list keeps them: ``key`` and ``auth`` stand for
+    # compound key labels a log pass reads (``masterkey``, ``authkey``), and ``sig`` and ``jwt``
+    # were not reconsidered, which costs the glued branch coverage only. Admitted here by name.
     words.update(word.lower() for word in scrub_mod._QUERY_CREDENTIAL_WORDS)
     for source in (
         redaction._DICOM_PHI_LABEL.pattern,

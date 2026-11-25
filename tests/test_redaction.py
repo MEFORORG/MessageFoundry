@@ -767,8 +767,9 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
     )
     token = sum(chars - start for start in range(chars) if field_run.match(probe, start))
     spaced = 0
-    for space in _WHITESPACE:
-        words = f"a{space}" * (chars // 2 - 1) + "a" + fields
+    for spaces in (*_WHITESPACE, _NON_ASCII_WHITESPACE):
+        words = "".join(f"a{spaces[i % len(spaces)]}" for i in range(chars // 2 - 1))
+        words += "a" + fields
         spaced = max(
             spaced,
             sum(
@@ -784,6 +785,11 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
 #: the six usual ones and the four information separators ``\x1c`` to ``\x1f``, the first of
 #: which is MLLP's end-of-block byte. Read from ``re`` rather than listed.
 _WHITESPACE = "".join(c for c in map(chr, range(128)) if re.match(r"\s", c))
+
+#: The non-ASCII characters ``\s`` matches (none is past U+3000), separating the words of ONE
+#: more line in turn, such as NBSP and U+2028. A run class narrowed to ASCII white space crosses
+#: them all on that line; one that leaves out a single non-ASCII character is not seen.
+_NON_ASCII_WHITESPACE = "".join(c for c in map(chr, range(128, 0x3001)) if re.match(r"\s", c))
 
 
 def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
@@ -802,8 +808,9 @@ def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
     ends = [end.format(separator) for end in _SEGMENT_LINE_ENDS]
     unfit = [len(end) for end in ends if (chars - len(end)) % 4]
     assert chars % 4 == 0 and not unfit, (
-        f"{chars} characters do not split into 4-character headers, alone or before a "
-        f"{unfit}-character line end, so the meter cannot build its lines"
+        f"{chars} characters do not split into 4-character headers, alone or before line ends "
+        f"of {unfit} characters, so the meter cannot build its lines; _LINEARITY_CHARS and its "
+        f"half, which a reading over the line also reads, must each split"
     )
     header = re.compile(rf"\bOBX{re.escape(separator)}")
     readings = []
@@ -833,8 +840,9 @@ def _check_reads(reads: Callable[[int], int], what: str) -> None:
     character. A control reads the same line through the same call.
 
     A reading over the line is read again at half the input, so the failure says which it is: reads
-    that more than tripled when the input doubled are quadratic again, and reads that did not are a
-    constant factor, such as each character read twice (BACKLOG #2958 step 6 item e). The line is at
+    that more than tripled when the input doubled are quadratic again, and reads that did not are
+    reported as a constant factor, such as each character read twice (BACKLOG #2958 step 6 item
+    e), or a quadratic term still small at this size, which two readings cannot tell apart. The line is at
     most one read of each character either way, so the shipped token reading sits on it, at no
     margin, by design: it reads each character once (item f)."""
     large = reads(_LINEARITY_CHARS)
@@ -848,7 +856,8 @@ def _check_reads(reads: Callable[[int], int], what: str) -> None:
     )
     raise AssertionError(
         f"{what} read {large} characters of a {_LINEARITY_CHARS}-character input, and {small} of half "
-        f"of it: linear, but more than one read of each character, so a constant factor changed"
+        f"of it: at most three times as many for twice the input, so more than one read of each "
+        f"character by a constant factor, or a quadratic term still small at this size"
     )
 
 
@@ -889,7 +898,7 @@ def test_the_field_run_and_segment_patterns_read_each_character_once(case: str) 
 
 @pytest.mark.parametrize(
     ("factor", "message"),
-    [(2, "linear, but more than one read"), (None, "quadratic again")],
+    [(2, "by a constant factor"), (None, "quadratic again")],
     ids=["linear-twice", "quadratic"],
 )
 def test_a_reading_over_the_line_says_whether_it_is_quadratic(
@@ -1000,9 +1009,9 @@ def _nested_repetitions(pattern: str) -> list[str]:
     **Stricter than ``tests/test_security_static.py``'s ``_has_nested_quantifier``, on purpose.**
     That scanner reads the whole tree and flags only an unbounded outer count, so it passes
     ``(a+){2,5}`` and the lazy ``(a+?)+?``; this guard reads two runtime-built patterns and flags
-    both. Both pass ``(a+)?``, whose outer count repeats at most once. It does not see fixed-count
-    outer nesting (``(?:a+){3}``), adjacent repetitions (``a*a*``) or overlapping alternation
-    (item d)."""
+    both. Both pass ``(a+)?``, whose outer count repeats at most once. It does not see, at least,
+    fixed-count outer nesting (``(?:a+){3}``), adjacent repetitions (``a*a*``) and overlapping
+    alternation (item d)."""
     repeats = (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT, sre_constants.POSSESSIVE_REPEAT)
     found: list[str] = []
 
@@ -1010,12 +1019,14 @@ def _nested_repetitions(pattern: str) -> list[str]:
         for op, arg in items:
             if op in repeats:
                 low, high, body = arg
-                open_count = low != high and high > 1
+                open_count = low != high
                 if open_count and inside:
                     if op == sre_constants.POSSESSIVE_REPEAT:
                         continue
                     found.append(f"{op} {{{low},{high}}}")
-                walk(body, inside or open_count)
+                # An outer count that repeats at most once (``?``) nests nothing; an optional
+                # INSIDE an open repetition is still flagged above (``(?:a?b?)*``).
+                walk(body, inside or (open_count and high > 1))
             elif op == sre_constants.SUBPATTERN:
                 walk(arg[3], inside)
             elif op == sre_constants.ATOMIC_GROUP:
@@ -1044,6 +1055,8 @@ def _nested_repetitions(pattern: str) -> list[str]:
         (r"(a)?(?(1)c|(?:b+)*)", True),
         (r"(?=(?:a+)*)", True),
         (r"(a+)?", False),
+        (r"(?:a?b?)*c", True),
+        (r"(?:[^|]?[^|]?)*\|", True),
         (r"(?:a*+)*", False),
         (r"(?:ab)+", False),
     ],

@@ -774,8 +774,9 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 # widened branch as its positive control; the conditions before that space are tested only by the
 # refused-shape cases.
 #: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
-#: (and :data:`_QUERY_CREDENTIAL_WORDS`, which it held until BACKLOG #5030 added item 1, kept here
-#: since refusing a word costs coverage only) and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
+#: (and :data:`_QUERY_CREDENTIAL_WORDS`, which it held until BACKLOG #5030 added item 1 and no
+#: log pass reads as words of their own; ``key`` and ``auth`` stand for the compound key labels
+#: ``_KEY_MATERIAL`` reads, and ``sig`` and ``jwt`` stay since refusing costs coverage only) and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
 #: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
 #: holding "_", "-" or a digit left out, since no such text holds one. Refusing a short word such as
 #: ``id`` refuses every glued word holding it; that costs coverage only.
@@ -1875,11 +1876,12 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
 _MEMBER_EXTRA_WORDS = ("token",)
 
 # A connection-string member whose KEY ends in a credential word, its value taken to the next ";"
-# (BACKLOG #5030). A credential an ODBC connection string sends WITHOUT braces may hold a space, ",",
-# "&" or "=": the generic dialect sends every ``odbc_params`` value plain, ``sslpassword`` among
-# them, and a plain password can still reach a log by other routes, at least a driver's own error
-# text echoing a string. Since BACKLOG #5041 the builder braces every password it sends.
-# ``_CREDENTIAL_KV``'s plain value class stops at the first three, so an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed " kx,Pw&mv=Ty9", and
+# (BACKLOG #5030). The generic dialect sends every ``odbc_params`` value plain, ``sslpassword``
+# among them, and such a value may hold a space, "," and "&". A plain password can still reach a
+# log by another route, at least a driver's own error text echoing a string, and may also hold
+# "="; since BACKLOG #5041 the builder braces every password it sends. ``_CREDENTIAL_KV``'s plain
+# value class stops at the first three, so an echoed ``;PWD=Zq7 kx,Pw&mv=Ty9;`` printed
+# " kx,Pw&mv=Ty9", and
 # ``;sslpassword=...`` printed whole: "ssl" glued to "password" leaves no ``\b`` for a label.
 #
 # IT IS ITS OWN PASS, AND IT RUNS LAST in :func:`_run`, over the text every other pass left. Its

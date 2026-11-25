@@ -5,8 +5,8 @@ character on the log surfaces below, except at least the words a later pass read
 comment on ``secretscrub._CONNECTION_STRING_MEMBER`` names (BACKLOG #5030).
 
 ``transports/database.py`` sends every ``odbc_params`` value plain, ``sslpassword`` among them. Such
-a value may hold a space, ",", "&" and, for a password, "=". The plain value class of the log
-scrubbers stopped at the first three, so an echoed connection string printed the tail of a plain
+a value may hold a space, "," and "&", and a plain password a log reaches by another route may
+also hold "=". The plain value class of the log scrubbers stopped at the first three, so an echoed connection string printed the tail of a plain
 password, and ``sslpassword`` printed whole, since "ssl" glued to "password" leaves no word boundary
 for the label.
 
@@ -934,5 +934,7 @@ def test_the_query_credential_words_are_not_kept_words() -> None:
 def test_a_hex_escape_before_a_segment_prefix_stays_a_hex_escape(line: str, masked: str) -> None:
     """Right after a "%", the two characters of a hex escape stay hex in the segment-ID branch too,
     as they do for any other word (BACKLOG #5030 added item 3): ``%3B.PID|`` was ``%0x.PID|``. A pair
-    that is not a hex escape (``7Z``) is masked like any other word."""
+    that is not a hex escape (``7Z``) is masked like any other word. The bundle runs the same mask
+    after its PHI pass, which rewrites the text after the ``|``."""
     assert scrub_credentials(line) == masked
+    assert masked.split("|")[0] + "|" in redact_log_line(line)
