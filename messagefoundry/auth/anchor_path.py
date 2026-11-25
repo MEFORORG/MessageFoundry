@@ -355,9 +355,15 @@ def evaluate_windows_object(
                     (sid,),
                 )
             )
-    if sec.error is not None:
-        failed = ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")
-        return insecure + unsure + [failed]
+    # A read that failed after the owner was read still has its owner judged, so a definite
+    # untrusted owner is not hidden behind the failure either.
+    failed = (
+        [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
+        if sec.error is not None
+        else []
+    )
+    if sec.owner is None and failed:
+        return insecure + unsure + failed
     if sec.owner is None:
         unsure.append(ChainFinding(path, kind, False, "its owner could not be read"))
     else:
@@ -385,7 +391,7 @@ def evaluate_windows_object(
                     owner=True,
                 )
             )
-    return insecure + unsure
+    return insecure + unsure + failed
 
 
 # =================================================================================================

@@ -1684,6 +1684,22 @@ def test_s12_15_a_grant_read_before_a_bad_entry_is_still_judged_insecure() -> No
     assert _verdict(sec, DIRECTORY, trust) is False
 
 
+def test_s12_15_an_owner_read_before_a_failed_dacl_read_is_still_judged() -> None:
+    """An untrusted owner read before the DACL walk stopped is definitely insecure, as origin/main
+    judged it: its GetAce walk recorded no failure for an AceSize-0 entry. Red on 72fb7e1a874: the
+    failure returned before the owner was judged, so the verdict was only indeterminate."""
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    failed = "entry 0 of its DACL is shorter than an entry header"
+    users = WinSecurity("S-1-5-32-545", (), failed)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, users, trust)
+    assert findings[0].insecure is True and findings[0].owner is True
+    assert findings[-1].reason == f"its permissions could not be read: {failed}"
+    assert _verdict(users, DIRECTORY, trust) is False
+    # The control: an owner that could not be read adds nothing beside the failure itself.
+    [only] = evaluate_windows_object("C:\\x", DIRECTORY, WinSecurity(None, (), failed), trust)
+    assert only.insecure is False and only.reason == f"its permissions could not be read: {failed}"
+
+
 def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
     """What the reader returns for a refused DACL, an error, makes the object indeterminate."""
     sec = WinSecurity("S-1-5-18", (), "entry 0 of its DACL is shorter than an entry header")
