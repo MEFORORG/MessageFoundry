@@ -14455,7 +14455,8 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             f"({audit_problem}); record the attempt by hand"
         )
         return _emit_error(
-            "the connection to the store failed during the revoke, so whether it took effect is "
+            "the store connection failed or timed out during the revoke, so whether it took "
+            "effect is "
             f"unknown ({problem}). {recorded}. Re-run the command: a second revoke ends what "
             "this one would have, within the limits docs/SECURITY.md, Limits of the session "
             "sweep, names, and also every session signed in since this attempt",
