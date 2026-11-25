@@ -271,9 +271,7 @@ if ($gitRedirects) {
         "the one named. Unset it and re-run. Nothing was removed.")
 }
 
-# The checkout this copy lives in. Without -RepoRoot it is only where to ASK: it is replaced by the
-# clone's primary below, once the config-carrier refusal has run, because that one comes before any
-# git call.
+# Without -RepoRoot this copy's checkout is only where to ASK; the primary replaces it below.
 $anchorOnPrimary = -not $RepoRoot
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 elseif (-not (Test-Path -LiteralPath $RepoRoot)) { throw "RepoRoot does not exist: $RepoRoot" }
@@ -372,10 +370,10 @@ if ($gitCarriers.Count -gt 0) {
 # ANCHOR ON THE PRIMARY, NOT ON THIS COPY (BACKLOG #1894). $PSScriptRoot\..\.. is the checkout the
 # copy sits in, so a copy in a linked worktree used to search `<that worktree>-<Name>`: what -Name
 # reached depended on which copy ran. The first entry of `git worktree list` is the same from every
-# worktree of one clone. This narrows -Name: no copy reaches a sibling of a LINKED worktree any more,
-# only siblings of the primary, which the primary's own copy reached already. An explicit -RepoRoot
-# is kept as given, and is the route to a tree an older new.ps1 made beside a linked worktree.
-# FAIL CLOSED: an unreadable list must not fall back to this copy's own checkout.
+# worktree of one clone. This narrows -Name: no copy reaches a sibling of a LINKED worktree any more.
+# An explicit -RepoRoot is kept as given. FAIL CLOSED: an unreadable list must not fall back to this
+# copy's own checkout. The list is reused below; nothing between here and there changes it.
+$anchorList = @()
 if ($anchorOnPrimary) {
     $anchorList = @(Get-RepoWorktrees $RepoRoot)
     if ($anchorList.Count -eq 0) {
@@ -389,7 +387,7 @@ $RepoName = Split-Path $RepoRoot -Leaf
 if ($byPath -or $listing) {
     # Every registered worktree, primary first. FAIL CLOSED: an unreadable list is the same empty
     # answer as a clone with none, and must never read as permission.
-    $registered = @(Get-RepoWorktrees $RepoRoot)
+    $registered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
     if ($registered.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
     }
@@ -503,7 +501,7 @@ else {
     # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
     # .claude/worktrees is one: a session launched in the target puts its subagents there. Refused as
     # on -Path, and for the same reason not overridable.
-    $nameRegistered = @(Get-RepoWorktrees $RepoRoot)
+    $nameRegistered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
     if ($nameRegistered.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
     }
