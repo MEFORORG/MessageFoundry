@@ -1783,6 +1783,90 @@ def test_a_reminder_lead_below_its_default_is_a_named_loosening() -> None:
     assert "warn_days = 1, shorter than the default of 14" in named["secret_rotation.warn_days"]
 
 
+def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
+    """BACKLOG #2008, #3301: a slow rescan delays a reminder, and a very large value used to load
+    with nothing named. The default, and a faster cadence, name nothing; with the reminder off the
+    interval is not named on top of the warn_days entry."""
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=1e9),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=86_401.0),
+        )
+    )
+    assert (
+        "check_interval_seconds = 1000000000.0, longer than the default of 43200"
+        in named["cert_monitor.check_interval_seconds"]
+    )
+    assert (
+        "check_interval_seconds = 86401.0, longer than the default of 86400"
+        in named["secret_rotation.check_interval_seconds"]
+    )
+    # The after-the-deadline clause only where the interval reaches warn_days + 1 days.
+    assert "after the deadline itself" in named["cert_monitor.check_interval_seconds"]
+    assert "after the deadline itself" not in named["secret_rotation.check_interval_seconds"]
+    # The lead counts whole days rounded down, so the window opens warn_days + 1 days before the
+    # deadline: 15 days, 1_296_000 s, for warn_days = 14. The clause prints from exactly that value,
+    # and a second less prints none.
+    clause = (
+        ", which is at least the 15 days between the warn window opening and the deadline, "
+        "since warn_days = 14 counts whole days, so that reminder can come after the deadline "
+        "itself"
+    )
+    for interval, printed in ((1_296_000.0, True), (1_295_999.0, False)):
+        entry = dict(
+            _pairs(
+                cert_monitor=CertMonitorSettings(warn_days=14, check_interval_seconds=interval),
+                backup=BackupSettings(),
+                rotation=SecretRotationSettings(),
+            )
+        )["cert_monitor.check_interval_seconds"]
+        assert (clause in entry) is printed, entry
+        assert ("after the deadline" in entry) is printed, entry
+    # No "; " inside an entry: the serve warning joins whole entries with it.
+    assert not any("; " in named[k] for k in named if k.endswith("check_interval_seconds"))
+    keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
+    for cert, rotation in ((43_200.0, 86_400.0), (60.0, 3_600.0)):
+        on = _names(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=cert),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(check_interval_seconds=rotation),
+        )
+        assert not any(k in on for k in keys), on
+    off = _names(
+        cert_monitor=CertMonitorSettings(warn_days=0, check_interval_seconds=1e9),
+        backup=BackupSettings(),
+        rotation=SecretRotationSettings(warn_days=0, check_interval_seconds=1e9),
+    )
+    assert not any(k in off for k in keys), off
+    assert "cert_monitor.warn_days" in off and "secret_rotation.warn_days" in off
+
+
+@pytest.mark.parametrize("section", [CertMonitorSettings, SecretRotationSettings])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_reminder_interval_that_is_not_a_finite_positive_number_is_refused(
+    section: type[CertMonitorSettings] | type[SecretRotationSettings], value: float
+) -> None:
+    """BACKLOG #2008: see the check_interval_seconds validator in settings.py for why NaN is
+    refused; infinity would sleep forever."""
+    with pytest.raises(ValueError, match="finite number > 0"):
+        section(check_interval_seconds=value)
+
+
+def test_a_reminder_interval_one_step_past_its_default_does_not_print_as_the_default() -> None:
+    """repr round-trips, as the [auth] limits print theirs."""
+    value = math.nextafter(43_200.0, math.inf)
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=value),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(),
+        )
+    )
+    assert f"= {value!r}, longer" in named["cert_monitor.check_interval_seconds"]
+    assert "= 43200, longer" not in named["cert_monitor.check_interval_seconds"]
+
+
 def _rules(*rules: dict[str, object]) -> AlertsSettings:
     return AlertsSettings.model_validate({"rules": list(rules)})
 

@@ -2840,7 +2840,7 @@ file raises no alert of its own.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `warn_days` | int | 30 | alert when a served cert expires within this many days; **`0` disables** the monitor. `0`, or any value below `30`, is named as the security loosening `cert_monitor.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
-| `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle is `[alerts].realert_seconds` |
+| `check_interval_seconds` | num | 43200 | rescan cadence (default 12h); the per-cert re-alert throttle for a watched file is `[alerts].realert_seconds`, and a service caller's expiring client certificate is re-alerted at a handshake no more often than once per this interval. Must be a finite number `> 0`. A value above the default is named as the security loosening `cert_monitor.check_interval_seconds` while `warn_days` is above `0` ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)) |
 | `crl_max_reloads` | int | 10000 | how many replaced copies of one CRL file a running hop takes before it refuses the next and asks for a restart (BACKLOG #299). Must be above 0. The CRL reload reads it even when `warn_days` is `0`. The default outlasts a year of hourly CRLs (8,760). **What each held copy costs**, measured on CPython 3.14 / OpenSSL 3.5.7: about four times the CRL file's size plus about 1.5 KB of memory. Each handshake takes about 2 microseconds longer per copy held for its issuer. So 10,000 copies of a 1 KB CRL hold about 40 MB and add about 20 ms to each handshake. Lower it for a large CRL that is reissued often. |
 
 ```toml
@@ -3126,7 +3126,7 @@ tracked; set `warn_days = 0` to disable the reminder.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `warn_days` | int | 14 | alert when a tracked secret is due within this many days; **`0` disables** the reminder. `0`, or any value below `14`, is named as the security loosening `secret_rotation.warn_days` at every start and in `GET /security/posture` (BACKLOG #2227) |
-| `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds` |
+| `check_interval_seconds` | num | 86400 | rescan cadence (default 24h); the per-secret re-alert throttle is `[alerts].realert_seconds`. Must be a finite number `> 0`. A value above the default is named as the security loosening `secret_rotation.check_interval_seconds` while `warn_days` is above `0` ([SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)) |
 | `store_key_last_rotated` | str | — | ISO `YYYY-MM-DD` the store DEK was last rotated; **unset ⇒ the DEK is still tracked live-by-default** off a persisted first-seen stamp (this date is an override) |
 | `store_key_max_age_days` | int | 365 | rotate the store DEK within this many days of its effective last-rotated (the operator date if set, else the persisted stamp) |
 | `secret_max_age_days` | int | 365 | max age for the **non-DEK** tracked secret classes (connector/AD/SMTP/Vault/OIDC), alerted this many days after their last observed fingerprint change |

@@ -247,6 +247,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[api].trusted_proxies` | `[]` (any network covering more than one address is named, once, a `/31` or `/127` included, because every host inside it may set `X-Forwarded-For`. Entries covering every address, such as `0.0.0.0/0` or `::/0`, trust it from every peer, as the refused `*` would, and get their own wording) |
 | | `[secret_rotation].enforce_store_key_expiry` | `true` (a calendar-overdue store DEK refuses to start) |
 | | `[cert_monitor].warn_days`, `[secret_rotation].warn_days` | `30` / `14` (`0` turns that credential reminder off, and a smaller value makes it later; named as `cert_monitor.warn_days` and `secret_rotation.warn_days`) |
+| | `[cert_monitor].check_interval_seconds`, `[secret_rotation].check_interval_seconds` | `43200` / `86400` s (a longer interval makes that credential reminder later, and is named while the reminder is on, as `cert_monitor.check_interval_seconds` and `secret_rotation.check_interval_seconds`) |
 | | `[[alerts.rules]]` | `[]` (a rule that can send a credential reminder to no transport: `mute = true`, `transports = []`, or an `escalate` tier with `transports = []`; named as `alerts.rules`) |
 | | `[alerts].security_signals`, its five detector counts and `security_window_seconds` | `true`, each count's default, `300` (`false` turns the security-signal layer off and is named as `alerts.security_signals`; with the layer on, a count at `0` turns that one detector off, a count above its default needs a larger burst, a shorter window lets a burst spread past it raise nothing, and each is named as `alerts.<setting>`, the window only while any count is above `0`) |
 | | `[api].plaintext_upstream_hop_acknowledged` | `false` (*conditional* — a loosening only while `[api].tls_terminated_upstream` is set with no `[api].tls_cert_file`, the one topology where the engine serves the proxy-to-engine hop in plaintext) |
@@ -282,7 +283,7 @@ keys, the three named `[auth].phi_read_rate_limit_*` keys, the three named
 `[auth].ad_session_*` reconciler keys, `[auth].ad_reconcile_outage_passes`, the five `[auth].oidc_*` lifetime and skew keys,
 `[approvals].min_dwell_seconds`, `[approvals].expiry_hours`, `[approvals].operations`,
 `[secret_rotation].enforce_store_key_expiry`, `[secret_rotation].warn_days`,
-`[cert_monitor].warn_days`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
+`[cert_monitor].warn_days`, both `check_interval_seconds`, `[[alerts.rules]]`, `[alerts].security_signals`, its counts and
 `security_window_seconds`, `[api].trusted_proxies`,
 `[api].plaintext_upstream_hop_acknowledged`, `[api].expose_docs`, `[backup].allow_unencrypted`,
 `[store].vault_revocation_attested`, `[secrets].vault_revocation_attested`,
@@ -854,11 +855,36 @@ than theirs: a reminder one day ahead leaves no time to renew.
   listed in `enforce_secret_expiry_classes` does the same. On a keyless or `vault_transit` store
   these checks find nothing, so with `warn_days = 0` no `secret_rotation` alert of any kind fires
   there. The `[alerts]` recipient gate counts each reminder separately, so turning one off does not
-  hide the others. A longer `check_interval_seconds` also delays a reminder, and it is not named.
+  hide the others.
 - **When acceptable:** an instance where something outside the engine tracks the same certificates or
   secrets and reminds a person in time.
 - **Compensating controls:** that outside tracker, and a calendar entry per credential.
 - **Reversible:** yes. Set the default or more, or delete the line, and restart.
+
+### `[cert_monitor].check_interval_seconds` or `[secret_rotation].check_interval_seconds` above its default — a credential reminder is later
+Named as `cert_monitor.check_interval_seconds` and `secret_rotation.check_interval_seconds` (ASVS
+6.4.5, BACKLOG #2008). Each runner scans once at start, then once per interval, so a longer interval
+than the shipped default (`43200` and `86400` seconds) is named while that reminder is on. Using the
+default as the bound is a judgment, not a measured threshold, made as the sign-in limits are read
+against theirs. With `warn_days = 0` the reminder is already named as off, so its interval is not
+named as well. A value that is not a finite number above `0` is refused at load.
+- **What you lose:** time. A certificate, CRL file or secret that enters its warn window after start
+  waits up to one interval plus up to two scans' duration for its first reminder, which spends part
+  of the lead `warn_days` gives.
+  The lead counts whole days, so the window opens `warn_days + 1` days before a certificate or CRL
+  expires or a secret's due day ends, and an interval of at least that can put the first reminder
+  after that point,
+  and at an interval of a year nothing is reminded until the next restart. `[cert_monitor]`'s
+  interval also throttles the handshake alert for a service caller's expiring client certificate,
+  so that alert repeats no more often than once per interval.
+- **What you keep:** the scan at each start, and the first handshake alert for each expiring client
+  certificate, which fires immediately whatever the interval. For `[secret_rotation]`, also the start-time expiry
+  checks the entry above describes; `[cert_monitor]` has no start-time check beyond its first scan.
+- **When acceptable:** an instance that restarts more often than the interval, or where something
+  outside the engine tracks the same credentials.
+- **Compensating controls:** a scheduled restart, that outside tracker, or a calendar entry per
+  credential.
+- **Reversible:** yes. Set the default or less, or delete the line, and restart.
 
 ### `[[alerts.rules]]` that send a credential reminder to no transport — the reminder is recorded but nobody is told
 Named as `alerts.rules`, with each rule's position, its `id`, and the reminder events it can match
@@ -2775,7 +2801,7 @@ chapter was not part of the verification above.
 | `[auth].ad_session_recheck_strikes`, `ad_session_recheck_max_users`, `ad_session_revoke_max`, `ad_session_revoke_max_fraction` (directory revocation pace and its brake) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.308(a)(3)(ii)(C) Termination Procedures |
 | `[auth].ad_reconcile_outage_passes` (the page on a directory outage, while revocation stops) | V7 Session Management · V16 Security Logging and Error Handling | **AC-2(3)** Disable Accounts · **SI-4(5)** System-Generated Alerts | §164.308(a)(3)(ii)(C) Termination Procedures · §164.312(b) Audit Controls |
 | `[auth].oidc_clock_skew_seconds`, `oidc_jwks_ttl_seconds`, `oidc_jwks_min_refetch_seconds`, `oidc_flow_ttl_seconds`, `oidc_max_age_seconds` (federated token acceptance) | V6 Authentication (6.8) | **IA-2** Identification and Authentication · **IA-8** Identification and Authentication (Non-Organizational Users) | §164.312(d) Person or Entity Authentication |
-| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, `[[alerts.rules]]` (credential reminders off, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
+| `[cert_monitor].warn_days`, `[secret_rotation].warn_days`, both `check_interval_seconds`, `[[alerts.rules]]` (credential reminders off, later, or sent to no transport) | V6 Authentication (6.4.5) | **IA-5(1)** Authenticator Management · **SI-4(5)** System-Generated Alerts | §164.308(a)(5)(ii)(D) Password Management |
 | `[api].trusted_proxies` (forwarded header trusted from a multi-address range, up to every peer) | V13 Configuration · V16 Security Logging and Error Handling | **AU-3** Content of Audit Records · **SC-7** Boundary Protection | §164.312(b) Audit Controls |
 | `[api].plaintext_upstream_hop_acknowledged` (plaintext proxy-to-engine hop, site-secured) | V12 Secure Communication (12.3.3) | **SC-8** Transmission Confidentiality and Integrity · **SC-7** Boundary Protection | §164.312(e)(1) Transmission Security |
 | `[api].expose_docs` (API schema and interactive docs served with no sign-in) | V13 Configuration | **CM-7** Least Functionality | §164.312(a)(1) Access Control |
