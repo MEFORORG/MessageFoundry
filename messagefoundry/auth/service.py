@@ -9336,8 +9336,21 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
+            # BACKLOG #6589: the birth is recorded in the INSERT's transaction, as an
+            # administrator's create is, so no directory row commits without a row naming it. Its
+            # own action, not `user.created`: no administrator issued anything, and
+            # `_temporary_credential_issuer` reads `user.created` rows as credential issues,
+            # counting each in its window against its page.
+            born = AuditAppend(
+                "auth.ad_user_created",
+                actor=principal.username,
+                detail=_json(
+                    {"username": principal.username, "provider": "ad", "federated": federated}
+                ),
+                client=client,
+            )
             try:
-                user_id = await self._create_directory_row(principal, client=client)
+                user_id = await self._create_directory_row(principal, client=client, audits=(born,))
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
                     raise
@@ -9514,7 +9527,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -9528,7 +9541,9 @@ class AuthService:
         no address. The profile mirror still gets the directory's ``mail``.
 
         ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
-        transaction, after any not-adopted row (BACKLOG #2221).
+        transaction, after any not-adopted row (BACKLOG #2221). Required with no default (BACKLOG
+        #6589), so each caller states the row that records the birth: ``user.created`` for an
+        administrator's create, ``auth.ad_user_created`` for a sign-in's.
         """
         user_id = uuid4().hex
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can

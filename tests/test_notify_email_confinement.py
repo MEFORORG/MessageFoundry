@@ -11,6 +11,7 @@ session that still owes its second factor choose the address.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -361,10 +362,60 @@ async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
         _refuse_audit_appends(store)
         with pytest.raises(RuntimeError, match="audit append refused"):
             await service._create_directory_row(
-                _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]), client=None
+                _directory_principal("torn", _UNADOPTABLE_DIRECTORY_MAIL[0][1]),
+                client=None,
+                audits=(),
             )
         assert await store.get_user_by_username("torn") is None
         assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
+    finally:
+        await store.close()
+
+
+def test_the_directory_birth_requires_its_audits() -> None:
+    """BACKLOG #6589: ``_create_directory_row`` takes ``audits`` keyword-only with no default, so
+    each caller states the row that records a birth rather than leave it out."""
+    param = inspect.signature(AuthService._create_directory_row).parameters["audits"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is inspect.Parameter.empty
+
+
+async def test_a_sign_in_birth_commits_its_own_audit_row() -> None:
+    """BACKLOG #6589. A directory sign-in that creates the row records the birth as
+    ``auth.ad_user_created``, in the INSERT's transaction: with the append refused, neither the row
+    nor the account lands. Control: with the append working, both land, and a second sign-in, which
+    finds the row, records no second birth."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        _refuse_audit_appends(store)
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await service._upsert_ad_user(
+                _directory_principal("born", "born@example.org"), by_name=None, federated=False
+            )
+        assert await store.get_user_by_username("born") is None
+        assert await store.list_audit(action="auth.ad_user_created") == []
+    finally:
+        await store.close()
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _ad_service(store)
+        await service.initialize()
+        for _ in range(2):
+            out = await service._complete_ad_login(
+                _directory_principal("born", "born@example.org"), None, mfa_verified=True
+            )
+            assert out.ok
+        [row] = await store.list_audit(action="auth.ad_user_created")
+        assert row["actor"] == "born"
+        assert json.loads(row["detail"]) == {
+            "username": "born",
+            "provider": "ad",
+            "federated": False,
+        }
+        assert await store.get_user_by_username("born") is not None
     finally:
         await store.close()
 
