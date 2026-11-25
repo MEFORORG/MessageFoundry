@@ -926,22 +926,27 @@ def test_a_backlog_record_with_a_branch_is_named_unrecoverable(fx: Fixture) -> N
 
 
 _DELETE_BRANCH_WARNING = (
-    "A record with no branch, or whose branch is deleted (-DeleteBranch on this run deletes the "
-    "branch checked out here), can then be committed only from a worktree recreated at this path"
+    "A record with no branch, or whose branch is deleted (-DeleteBranch on this run can delete the "
+    "branch checked out here), can then be committed only from a worktree recreated at this path, "
+    "or from one on a branch recreated under the recorded name"
 )
 
 
 def test_under_DeleteBranch_a_recorded_branch_is_not_named_recoverable(fx: Fixture) -> None:
-    """The re-run this refusal offers, with -AllowOrphanedAllocations, also deletes the branch
-    checked out here, which is usually the recorded one, so the line must not promise it survives."""
+    """The re-run this refusal offers, with -AllowOrphanedAllocations, can also delete the branch
+    checked out here, which is usually the recorded one, so the line must not promise it survives.
+
+    The record names the branch the worktree is on, as alloc.ps1 records it."""
     wt = fx.add("alpha")
-    _write_alloc(fx, "9111", wt, kind="adr", branch="feat/x")
+    here = _git(wt, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    assert here and here != "HEAD", here
+    _write_alloc(fx, "9111", wt, kind="adr", branch=here)
 
     proc = run(fx, "-Name", "alpha", "-DeleteBranch")
     flat = _flat(proc.stderr)
     assert proc.returncode != 0, "removal proceeded past a recorded allocation"
     assert _RECOVERABLE not in flat, proc.stderr
-    assert "if that is the recorded branch feat/x, " + _STRANDED in flat, proc.stderr
+    assert f"if that is the recorded branch {here}, " + _STRANDED in flat, proc.stderr
     assert _DELETE_BRANCH_WARNING in flat, proc.stderr
     assert fx.is_registered(wt)
 

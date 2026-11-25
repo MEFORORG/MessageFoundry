@@ -7179,9 +7179,10 @@ class CertMonitorSettings(_Section):
     @classmethod
     def _check_interval(cls, v: float) -> float:
         # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN timeout to
-        # the monitor's ``asyncio.wait_for`` would raise ValueError, out of the event loop's poll
-        # rather than out of ``wait_for`` itself (measured, Python 3.14, proactor and selector
-        # loops), and the handshake re-alert throttle in api/security.py would never hold.
+        # the monitor's ``asyncio.wait_for`` would raise ValueError, on the proactor and selector
+        # loops out of the event loop's poll rather than out of ``wait_for`` itself (measured,
+        # Python 3.14; uvloop, which Linux installs, was not measured), and the handshake re-alert
+        # throttle in api/security.py would never hold.
         if not (v > 0 and math.isfinite(v)):
             raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v

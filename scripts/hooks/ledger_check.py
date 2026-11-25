@@ -800,12 +800,12 @@ class Ledger:
         elif worktree:
             lines.append(f"    1. commit from the worktree that holds it:  {worktree}")
         if branch:
-            lines.append(f"    2. or check that branch out and commit there: {branch}")
-        lines += [
-            "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
-            "        not force past that. From the worktree in 1 you can still reach it with:",
-            "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
-        ]
+            lines += [
+                f"    2. or check that branch out and commit there: {branch}",
+                "       (git refuses an ORDINARY second checkout of a branch another worktree holds. Do",
+                "        not force past that. From the worktree in 1 you can still reach it with:",
+                "        git checkout -b <alias> <branch>, then push <alias>:<branch>)",
+            ]
         # A record whose worktree and branch are both gone still has a recovery: the owner-ruled
         # recreate of the recorded path, which restores the condition owns() tests.
         if worktree:
@@ -814,6 +814,11 @@ class Ledger:
                 "       a worktree at the path in 1 (on the machine 1 names, if it names one) and commit",
                 "       from it",
             ]
+            if branch:
+                lines.append(
+                    "       (a branch recreated under the name in 2 is entitled too: owns() matches it"
+                    " by name)"
+                )
         lines += [
             "    4. ONLY if neither the recorded worktree nor the branch exists, and no step above",
             "       applies, allocate a new number:",
