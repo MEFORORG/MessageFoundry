@@ -4,19 +4,23 @@
 
 What a ``redacted_log_field`` caller passes as ``before``, ``after`` and ``checks`` decides what
 the logged field hides, and only the caller's own hides-no-less-than-main test shows that a
-choice is safe. So this pins, by an AST walk of the shipped packages, every reference to
-``redacted_log_field``, to ``redact_log_value`` (which takes no ``checks``) and to
+choice is safe. So this pins, by an AST walk of the shipped packages, each reference it finds by
+name to ``redacted_log_field``, to ``redact_log_value`` (which takes no ``checks``) and to
 ``controlchars.log_field_token`` (which redacts nothing), and fails on:
 
 - a new reference, a call or not, so a new caller arrives here with its own test named below;
 - an import of any of the three under another name, which a walk by name would miss;
 - a ``before`` or ``after`` that is not a string literal or a module-level constant built only
   from literals and other such constants, since caller text there can leave readable what the
-  shipped filters would redact;
+  shipped filters would redact. A name counts as a constant only when the file binds it once, by
+  one plain module-level assignment: a parameter, a local, a loop, ``with``, ``except`` or
+  ``match`` target, a walrus, an import, a ``def``, a tuple target, an augmented assignment or a
+  ``global`` declaration of that name anywhere in the file disqualifies it;
 - a pinned caller whose named test module does not name it.
 
 The walk reads names, so it misses at least a reference reached through ``getattr`` with a
-computed name, or through a module object passed around; the negative controls below show what
+computed name, or through a module object passed around, and a constant rebound from another
+module, through ``globals()`` or by ``setattr``; the negative controls below show what
 it does catch. Synthetic code only.
 """
 
@@ -101,8 +105,38 @@ def _enclosing_names(tree: ast.Module) -> dict[ast.AST, str]:
     return owner
 
 
+def _bindings(tree: ast.Module) -> Counter[str]:
+    """How many times the file binds each name, anywhere: a store, a parameter, an import, a
+    ``def`` or ``class``, an ``except`` or ``match`` capture, or a ``global`` declaration."""
+    bound: Counter[str] = Counter()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound[node.id] += 1
+        elif isinstance(node, ast.arg):
+            bound[node.arg] += 1
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound[alias.asname or alias.name.split(".", 1)[0]] += 1
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound[node.name] += 1
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+        elif (
+            isinstance(node, ast.ExceptHandler)
+            and node.name
+            or isinstance(node, (ast.MatchAs, ast.MatchStar))
+            and node.name
+        ):
+            bound[node.name] += 1
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound[node.rest] += 1
+    return bound
+
+
 def _module_constants(tree: ast.Module) -> dict[str, ast.expr]:
-    """Module-level ``NAME = value`` and ``NAME: T = value`` bindings, by name."""
+    """Module-level ``NAME = value`` and ``NAME: T = value`` bindings, by name, of the names the
+    file binds nowhere else."""
+    bound = _bindings(tree)
     found: dict[str, ast.expr] = {}
     for node in tree.body:
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -112,7 +146,7 @@ def _module_constants(tree: ast.Module) -> dict[str, ast.expr]:
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             if isinstance(node.target, ast.Name):
                 found[node.target.id] = node.value
-    return found
+    return {name: value for name, value in found.items() if bound[name] == 1}
 
 
 def _is_constant_text(expr: ast.expr, constants: dict[str, ast.expr], seen: frozenset[str]) -> bool:
@@ -286,6 +320,41 @@ def test_the_census_accepts_literal_and_module_constant_context(argument: str) -
         "HEAD = f'{_BASE}: path='\n"
         "def f(text):\n"
         f"    return redacted_log_field(text, 64, {argument}, checks=())\n"
+    )
+    _, findings = _census("messagefoundry/new.py", source)
+    assert findings == []
+
+
+_CALL = "    return redacted_log_field(text, 64, before=HEAD, checks=())\n"
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [
+        "def f(text, HEAD='x'):\n" + _CALL,
+        "def f(text):\n    HEAD = text\n" + _CALL,
+        "def f(text):\n    for HEAD in text:\n        pass\n" + _CALL,
+        "def f(text):\n    if (HEAD := text):\n        pass\n" + _CALL,
+        "HEAD, OTHER = 'x', 'y'\ndef f(text):\n" + _CALL,
+        "HEAD += 'y'\ndef f(text):\n" + _CALL,
+        "def g(text):\n    global HEAD\n    HEAD = text\ndef f(text):\n" + _CALL,
+        "HEAD = 'z'\ndef f(text):\n" + _CALL,
+    ],
+    ids=["parameter", "local", "loop", "walrus", "tuple", "augmented", "global", "rebound"],
+)
+def test_the_census_refuses_a_constant_the_file_binds_again(shadow: str) -> None:
+    """NEGATIVE CONTROL: before this rule each of these read ``HEAD`` as the module constant
+    ``'x'``, so caller text could reach ``before`` past the census."""
+    source = "from messagefoundry.logging_setup import redacted_log_field\nHEAD = 'x'\n" + shadow
+    _, findings = _census("messagefoundry/new.py", source)
+    assert len(findings) == 1
+
+
+def test_the_census_still_accepts_a_constant_bound_once() -> None:
+    """The control for the test above: the same file with no second binding is accepted."""
+    source = (
+        "from messagefoundry.logging_setup import redacted_log_field\nHEAD = 'x'\n"
+        "def f(text):\n" + _CALL
     )
     _, findings = _census("messagefoundry/new.py", source)
     assert findings == []

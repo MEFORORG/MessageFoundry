@@ -274,7 +274,8 @@ its statements no longer match the code; where they disagree, this amendment hol
   instead would turn spool retention into a loss of log evidence for every cause that clears.
   A filter that refuses one record by its content or length with one of these errnos would hold
   the spool head; that case is not handled (reasoned, not measured). Over TCP or TLS, a spooled
-  entry whose send fails 5 times in a row on a connection the collector had accepted is dropped as
+  entry whose send fails 5 times in a row because the collector closed or reset a connection it had
+  accepted is dropped as
   undeliverable instead (BACKLOG #5923), as `docs/CONFIGURATION.md` `[logging]` says.
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process

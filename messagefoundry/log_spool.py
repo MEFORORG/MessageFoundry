@@ -198,18 +198,21 @@ def count_segments(directory: str | Path) -> int:
 def _indexed_size(path: Path) -> int | None:
     """The size :meth:`LogSpool.open` counts for segment ``path`` against the cap, or ``None`` when
     the file is confirmed gone between the listing and this read, as :func:`_not_found_confirms`
-    reads it. A symlink whose target cannot be read just now, a target on a mount that is down for
-    one, is indexed at size 0 rather than refusing the whole spool: the read passes over it and
-    keeps the link, so a later start replays it once its target is back (BACKLOG #5811). Any other
-    ``OSError`` propagates."""
+    reads it; the caller checks the directory after this. A symlink whose target cannot be read
+    just now, for any reason, a target on a mount that is down or stale for one, is indexed at size
+    0 rather than refusing the whole spool: the read passes over it and keeps the link, so a later
+    start replays it once its target is back, and the reader takes its real size when it opens it
+    (BACKLOG #5811). Any other ``OSError`` propagates."""
     try:
         return path.stat().st_size
-    except FileNotFoundError as exc:
+    except OSError as exc:
         try:
             mode = path.lstat().st_mode
         except FileNotFoundError as gone:
-            if _not_found_confirms(gone):
+            if isinstance(exc, FileNotFoundError) and _not_found_confirms(gone):
                 return None
+            raise exc from None
+        except OSError:
             raise exc from None
         if stat.S_ISLNK(mode):
             return 0
@@ -316,13 +319,20 @@ class LogSpool:
             identity = os.stat(self.directory)
             if identity.st_ino:
                 self._directory_identity = (identity.st_dev, identity.st_ino)
+            skipped = False
             for path in self.directory.iterdir():
                 seq = _segment_seq(path)
                 if seq is not None:
                     size = _indexed_size(path)
-                    if size is not None:
+                    if size is None:
+                        skipped = True
+                    else:
                         self._segments.append(seq)
                         self._sizes[seq] = size
+            if skipped and not self._directory_present():
+                # A segment read as gone while the directory itself dropped mid-listing: index
+                # nothing from a listing that may not be the directory's.
+                raise OSError(errno.ENOENT, "the directory went out of reach while it was read")
         except OSError as exc:
             # Unreadable leftovers make the spool unusable, not the process: the caller runs
             # spool-less. A bare OSError here would reach serve's [logging].file refusal instead.
@@ -444,6 +454,10 @@ class LogSpool:
         ):
             self._close_writer()
         if self._writer is None:
+            if not self._directory_present():
+                # Not the directory open() locked, or out of reach: a segment made there would be
+                # hidden once the spool's own directory is back (BACKLOG #5811). Counted as dropped.
+                raise OSError(errno.ENOENT, "the spool directory is not the one this spool opened")
             seq = self._last_seq + 1
             try:
                 fd = os.open(self._path(seq), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY, 0o600)
@@ -510,7 +524,9 @@ class LogSpool:
         A retired segment's file is never unlinked here, so a segment whose own ``lstat`` reports
         it gone when it is not is skipped, not lost: a DFS or share failover that briefly reports
         a live file gone, in the same directory, can still take it out of the order, and the next
-        start replays it, possibly after newer records were sent."""
+        start replays it, possibly after newer records were sent. A link whose target stays out of
+        reach is kept too, so each start passes over it again and counts it in
+        :attr:`unreadable`, until it is removed by hand."""
         while True:
             try:
                 entry = self._peek()
@@ -589,10 +605,12 @@ class LogSpool:
         """Whether the spool directory can be reached, is a directory, and is the one :meth:`open`
         locked, read by ``stat``. Any ``OSError`` reads as not present.
 
-        A directory at the path with another ``(st_dev, st_ino)`` is not present either (BACKLOG
-        #5811): an empty mountpoint a dropped mount leaves, or a directory replaced under the
-        spool, holds none of its segments, and reading it as this spool would retire every one of
-        them. Where the platform reports no inode, only the path and the type are compared."""
+        A directory at the path with another ``(st_dev, st_ino)`` and no ``spool.lock`` in it is
+        not present either (BACKLOG #5811): an empty mountpoint a dropped mount leaves, or a
+        directory replaced under the spool, holds none of its segments, and reading it as this
+        spool would retire every one of them. Where the platform reports no inode, only the path
+        and the type are compared. A replaced directory that someone gave a ``spool.lock`` reads as
+        present."""
         try:
             found = self.directory.stat()
         except OSError:
@@ -600,7 +618,15 @@ class LogSpool:
         if not stat.S_ISDIR(found.st_mode):
             return False
         identity = self._directory_identity
-        return identity is None or (found.st_dev, found.st_ino) == identity
+        if identity is None or (found.st_dev, found.st_ino) == identity:
+            return True
+        # Another identity, but the lock file this spool holds is there: the same directory with
+        # unstable IDs, as a share remounted with client-made inode numbers can give.
+        try:
+            os.lstat(self.directory / _LOCK_NAME)
+        except OSError:
+            return False
+        return True
 
     def _close_reader(self) -> None:
         if self._reader is not None:
@@ -651,10 +677,20 @@ class LogSpool:
             self._retire(seq)
 
     def _open_reader(self, seq: int) -> None:
-        if self._reader is not None:
-            with contextlib.suppress(OSError):
-                self._reader.close()
-        self._reader = open(self._path(seq), "rb")  # noqa: SIM115 - held across calls on purpose
+        self._close_reader()
+        reader = open(self._path(seq), "rb")  # noqa: SIM115 - held across calls on purpose
+        if seq != self._write_seq:
+            # A closed segment's size is what is on disk. A link open() could not read was indexed
+            # at 0, and advance() reads a segment as drained at its size, so the real one is taken
+            # here, before any line of it is read (BACKLOG #5811). A failed read of it leaves no
+            # reader, so the next try takes it again.
+            try:
+                self._sizes[seq] = os.fstat(reader.fileno()).st_size
+            except OSError:
+                with contextlib.suppress(OSError):
+                    reader.close()
+                raise
+        self._reader = reader
         self._read_seq = seq
 
     def _retire(self, seq: int, *, unlink: bool = True) -> None:
