@@ -120,8 +120,8 @@ def _argv(command: str, db: Path, tmp: Path) -> list[str]:
         ]
     if command == "admin-unlock":
         return ["admin-unlock", "--username", "ops", "--db", str(db), "--json"]
-    if command == "audit-anchor":
-        return ["audit-anchor", "--db", str(db), "--json"]
+    if command in ("audit-anchor", "admin-revoke-sessions"):
+        return [command, "--db", str(db), "--json"]
     if command == "admin-reset-totp":
         return ["admin-reset-totp", "--username", "ops", "--db", str(db), "--json"]
     if command == "admin-set-notify-email":
@@ -148,6 +148,7 @@ _STORE_OPENING_COMMANDS = (
     "admin-unlock",
     "admin-set-notify-email",
     "admin-reset-totp",
+    "admin-revoke-sessions",
     "audit-anchor",
     "audit-verify",
 )
@@ -579,8 +580,15 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
 
 
 #: The commands that route a store key that does not resolve to exit 2. The admin pair joined in
-#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before.
-_KEY_REFUSING_COMMANDS = ["audit-verify", "audit-anchor", "admin-unlock", "admin-set-notify-email"]
+#: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before. ``admin-revoke-sessions``
+#: joined in BACKLOG #5093.
+_KEY_REFUSING_COMMANDS = [
+    "audit-verify",
+    "audit-anchor",
+    "admin-unlock",
+    "admin-set-notify-email",
+    "admin-revoke-sessions",
+]
 
 
 #: The commands `_argv` runs with no --json, so their refusal is a line on stderr.

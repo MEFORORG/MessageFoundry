@@ -16,6 +16,7 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -367,3 +368,187 @@ def test_the_cli_command_refuses_a_missing_store(
     assert main(["admin-revoke-sessions", "--db", str(missing), "--json"]) == 2
     assert "refusing to create one" in json.loads(capsys.readouterr().out)["error"]
     assert not missing.exists()
+
+
+# --- BACKLOG #5093: a revoke whose link to the store failed is reported as unknown ---------------
+
+
+class _LinkLost(RuntimeError):
+    """A stand-in for a server driver's lost-connection error: asyncpg's carry a ``sqlstate``
+    attribute, and class 08 is a connection exception. A ``RuntimeError``, so it is one of
+    ``store_call_errors()`` with no server driver installed."""
+
+    sqlstate = "08006"
+
+
+@pytest.mark.parametrize(
+    "lost", [OSError("connection reset by peer"), _LinkLost()], ids=["OSError", "sqlstate-08"]
+)
+@pytest.mark.parametrize("committed", [True, False], ids=["after-commit", "before-commit"])
+def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
+    lost: Exception,
+    committed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A link that fails during the revoke may fail after the server applied the COMMIT, so the
+    command says the outcome is unknown, never "nothing was revoked", and its row records the
+    attempt. The after-commit arm is the case the old text misreported: the sessions ended."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    revoke = MessageStore.revoke_all_sessions
+
+    async def losing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        if committed:
+            await revoke(self)
+        raise lost
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", losing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "nothing was revoked" not in error, error
+    assert "records the attempt" in error and "Re-run the command" in error, error
+    revoked, audits = asyncio.run(_state(db, tokens))
+    assert revoked == [committed, committed]
+    assert len(audits) == 1
+    assert json.loads(str(audits[0]["detail"])) == {
+        "scope": "all",
+        "count": None,
+        "outcome": "unknown",
+    }
+    assert str(audits[0]["actor"]).startswith("cli:")
+
+
+def test_an_unknown_outcome_whose_row_is_refused_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the row that would record an unknown outcome is refused too, the command says to
+    record the attempt by hand rather than claim a row it did not write."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+    record = MessageStore.record_audit
+
+    async def losing(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise OSError("connection reset by peer")
+
+    async def refusing(self: MessageStore, action: str, **kwargs: Any) -> Any:
+        if action == "auth.session_revoked":
+            raise OSError("connection reset by peer")
+        return await record(self, action, **kwargs)
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", losing)
+    monkeypatch.setattr(MessageStore, "record_audit", refusing)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert "whether it took effect is unknown" in error, error
+    assert "could not be written either" in error and "record the attempt by hand" in error
+    assert "records the attempt" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_refused_revoke_still_says_nothing_was_revoked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: a refusal that is not a lost link rolled the revoke back, so the command says
+    nothing was revoked and writes no row."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def busy(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", busy)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_the_cli_text_says_what_the_count_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5095 step 2: the count is the unrevoked rows the sweep ended, an expired one never
+    purged among them, so the text says so; the global epoch is what ends every other session."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+
+    async def expired_row() -> None:
+        store = await MessageStore.open(db)
+        try:
+            await store.create_session(
+                token_hash=hash_token(mint_token()),
+                user_id="cli-a",
+                expires_at=1.0,  # long expired, and never purged
+                client="192.0.2.10",
+                auth_mechanism="password",
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(expired_row())
+    assert main(["admin-revoke-sessions", "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    # Two live sessions and the expired row: the count is every unrevoked row the sweep ended.
+    assert out.startswith("OK: ended 3 unrevoked session row(s), expired ones included"), out
+    assert "raised the global session epoch" in out, out
+
+
+_ROOT = Path(__file__).resolve().parents[1]
+
+#: BACKLOG #5095 step 3: phrases the every-account revoke's texts no longer say, by file. Each
+#: claimed more than the code does, at least where an account's record fails its seal check, a
+#: count holds expired rows, the audit row follows the commit, or the step-up is turned off.
+_RETRACTED = {
+    "messagefoundry/__main__.py": (
+        "The engine may be running or stopped.",
+        "OK: revoked {revoked} session(s); every signed-in user must sign in again",
+    ),
+    "messagefoundry/api/auth_routes.py": ("Audited, with the count, even when nothing was live.",),
+    "messagefoundry/api/app.py": ("and raises every account's epoch.",),
+    "messagefoundry/store/store.py": (
+        "then every account's epoch, as :meth:`revoke_user_sessions` raises one",
+        "The first start still raises every account's session epoch",
+    ),
+    "messagefoundry/pipeline/dr_backup.py": ("open session(s)",),
+    "docs/SECURITY.md": ("or ending every session (BACKLOG #2614)",),
+}
+
+
+def _flat(path: str) -> str:
+    """The file's text with every run of whitespace as one space, so a phrase a re-wrap split
+    across lines is still found."""
+    return " ".join((_ROOT / path).read_text("utf-8").split())
+
+
+@pytest.mark.parametrize("path", sorted(_RETRACTED))
+def test_the_retracted_revoke_all_phrases_stay_out(path: str) -> None:
+    text = _flat(path)
+    assert text  # the control: the file was read
+    for phrase in _RETRACTED[path]:
+        assert phrase not in text, f"{path} says {phrase!r} again"
+
+
+def test_the_store_contract_states_the_transaction_and_reseal_rules() -> None:
+    """BACKLOG #5095 step 3, its second half: ``AuthStore.revoke_all_sessions`` states that the
+    raises, the sweep and the kept session's re-seal are one transaction, and that a refused
+    re-seal or a missing global epoch rolls it back."""
+    text = _flat("messagefoundry/store/base.py")
+    contract = text[text.index("async def revoke_all_sessions(") :]
+    contract = contract[: contract.index("async def consume_restore_record(")]
+    for rule in (
+        "In one transaction it raises the store's global session epoch",
+        "re-seals the kept session under its account's new epoch and the new global one",
+        "but for an account whose record the seal check refuses, which goes without its raise",
+        "either way the transaction rolls back",
+    ):
+        assert rule in contract, rule

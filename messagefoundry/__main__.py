@@ -820,8 +820,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "admin-revoke-sessions",
         help="end the sessions it finds, of any account, from the host (the API is not needed)",
         description="End the sessions it finds, of any account, directly against the store, on "
-        "the same host gate as admin-unlock. docs/SECURITY.md, Limits of the session sweep, says "
-        "what it may miss. Audited. The engine may be running or stopped.",
+        "the same host gate as admin-unlock, and raise the global session epoch, which refuses "
+        "every session signed in before it. docs/SECURITY.md, Limits of the session sweep, says "
+        "what it may miss. It writes an auth.session_revoked audit row after the revoke commits, "
+        "and says so when the store refuses that row. Run it with the engine stopped, as ADR 0171 "
+        "says for the commands on that gate.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",
@@ -14179,16 +14182,21 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     It keeps no session: the shell that runs it holds none.
 
     The audit row is written after the revoke, and the audit append is checked for a refusal
-    before the revoke, so a refused row cannot follow a change that already landed.
+    before the revoke, so a key-check refusal of the row cannot follow a change that already
+    landed; a store that refuses the append itself still can, and the command then says so.
     ``admin-unlock`` no longer works this way: its row commits in the clear's own transaction
-    (BACKLOG #5633)."""
+    (BACKLOG #5633).
+
+    A revoke whose link to the store failed may have committed, so it is reported as unknown, as
+    the transit-bound commands report a write (BACKLOG #5093), and its own row records the attempt
+    with ``"outcome": "unknown"`` and no count, where the store accepts that row."""
     import getpass
 
     from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
     from messagefoundry.config.settings import keyless_opt_out_refusal
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.pipeline.alerts import LoggingAlertSink, authority_seal_page
-    from messagefoundry.redaction import safe_exc
+    from messagefoundry.redaction import codec_safe_str
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
@@ -14200,8 +14208,22 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     if isinstance(settings, int):
         return settings
     posture = _command_hop_posture(settings)
+    try:
+        # Before the store opens, as admin-unlock names it: a shell whose OS user cannot be named
+        # must not end the sessions and then fail to write the row that says who did.
+        actor = f"cli:{getpass.getuser()}"
+    except OSError as exc:
+        return _emit_error(
+            f"cannot name the OS user for the audit row ({codec_safe_str(exc)}); nothing was "
+            "revoked",
+            as_json=args.json,
+        )
 
-    async def run() -> tuple[int | None, str | None]:
+    async def run() -> tuple[str, int | None, str | None, str | None]:
+        """``(outcome, count, problem, audit_problem)``. ``revoked`` carries the count;
+        ``refused`` the store's refusal, which rolled the revoke back; ``unknown`` the link
+        failure, after which the revoke may have committed. ``audit_problem`` is the refusal of
+        this command's row, or ``None`` once it is written."""
         _warn_on_an_unrevoked_store_hop(settings)  # serve's WARNING at warn (#2532)
         store = await _open_store_or_refuse(
             open_store(
@@ -14210,6 +14232,18 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                 keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
             )
         )
+
+        async def audit(detail: dict[str, object]) -> str | None:
+            try:
+                await store.record_audit(
+                    "auth.session_revoked", actor=actor, detail=json.dumps(detail)
+                )
+            except AUDIT_WRITE_DEFECTS:
+                raise  # a bug, not a refused write
+            except store_call_errors() as exc:
+                return _store_error_text(exc)
+            return None
+
         # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through the
         # store's own pager, on the logging sink, serve's fallback, since the CLI holds no notifier.
         seal_pager = getattr(store, "seal_pager", None)
@@ -14222,49 +14256,68 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
             except store_call_errors() as exc:
+                if _write_outcome_unknown(exc):
+                    # The link failed, possibly after the server applied the COMMIT, so nothing
+                    # here can say whether the sessions ended. The row records the attempt.
+                    detail: dict[str, object] = {
+                        "scope": "all",
+                        "count": None,
+                        "outcome": "unknown",
+                    }
+                    return "unknown", None, _store_error_text(exc), await audit(detail)
                 # The store opened; the revoke itself was refused and rolled back. Not the open
                 # error the arm below words, which would read as a wrong --db path.
-                return None, f"nothing was revoked: {safe_exc(exc)}. Retry"
+                return "refused", None, _store_error_text(exc), None
             # The revoke has committed. A failed audit append (a running engine holding the
             # write lock past the busy timeout, say) must not read as "nothing happened".
-            try:
-                await store.record_audit(
-                    "auth.session_revoked",
-                    actor=f"cli:{getpass.getuser()}",
-                    detail=json.dumps({"scope": "all", "count": revoked}),
-                )
-            except AUDIT_WRITE_DEFECTS:
-                raise  # a bug, not a refused write
-            except store_call_errors() as exc:
-                return revoked, safe_exc(exc)
-            return revoked, None
+            return "revoked", revoked, None, await audit({"scope": "all", "count": revoked})
         finally:
-            await store.close()
+            # A close that fails after the commit must not report the revoke as refused.
+            await _close_store_quietly(store)
 
     try:
-        revoked, problem = run_guarded(run())
+        outcome, revoked, problem, audit_problem = run_guarded(run())
     except (
         KeylessAuditChainRefused,
         StoreNotFoundError,
         _UnauditableWrite,
         _StoreOpenRefused,
     ) as exc:
-        _emit_error(str(exc), as_json=args.json)
+        # Through `codec_safe_str`: a key source's codec error quotes a byte of what it decoded.
+        _emit_error(codec_safe_str(exc), as_json=args.json)
         return 2
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
-    if revoked is None:
-        return _emit_error(problem or "nothing was revoked", as_json=args.json)
-    if problem is not None:
+    if outcome == "refused":
+        return _emit_error(f"nothing was revoked: {problem}. Retry", as_json=args.json)
+    if outcome == "unknown":
+        recorded = (
+            "An auth.session_revoked row with the outcome unknown records the attempt"
+            if audit_problem is None
+            else "The audit row that would record the attempt could not be written either "
+            f"({audit_problem}); record the attempt by hand"
+        )
         return _emit_error(
-            f"revoked {revoked} session(s), but the audit row could not be written: {problem}. "
-            "The sessions are ended; record the act by hand",
+            "the connection to the store failed during the revoke, so whether it took effect is "
+            f"unknown ({problem}). {recorded}. Re-run the command; a second revoke is harmless",
+            as_json=args.json,
+        )
+    if audit_problem is not None:
+        return _emit_error(
+            f"revoked {revoked} session(s), but the audit row could not be written: "
+            f"{audit_problem}. The sessions are ended; record the act by hand",
             as_json=args.json,
         )
     if args.json:
         print(json.dumps({"ok": True, "revoked": revoked}))
     else:
-        print(f"OK: revoked {revoked} session(s); every signed-in user must sign in again")
+        # The count is the rows the sweep ended, expired ones never purged among them; the global
+        # session epoch the revoke raised is what ends every other session (BACKLOG #5091, #5095).
+        print(
+            f"OK: ended {revoked} unrevoked session row(s), expired ones included, and raised the "
+            "global session epoch, so every session signed in before this is refused and every "
+            "signed-in user must sign in again"
+        )
     return 0
 
 
