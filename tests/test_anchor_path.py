@@ -1483,23 +1483,35 @@ def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
 
 
 @_windows_only
-def test_s12_52_both_windows_readers_read_the_run_as_sid_through_the_shared_helper() -> None:
-    """The anchor reader and the config-source reader share one token read (BACKLOG #6281, member
-    S12-52). Both answer the SID ``whoami`` reports for this process's account, an instrument
-    outside either reader."""
+def test_s12_52_the_shared_token_read_answers_the_sid_whoami_reports() -> None:
+    """The shared run-as SID read answers the SID ``whoami`` reports for this process's account, an
+    instrument outside every reader (BACKLOG #6281, member S12-52)."""
     from messagefoundry.auth import _win32_sid
-    from messagefoundry.config.wiring import _win32_config_source_probes
 
     row = subprocess.run(
-        ["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, check=True
-    ).stdout
+        [_system_exe("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        check=True,
+    ).stdout.decode("ascii", errors="replace")
     expected = row.strip().rsplit(",", 1)[1].strip('"')
     assert expected.startswith("S-1-")
     advapi32, kernel32 = _win32_sid.sid_libraries()
     assert _win32_sid.process_user_sid(advapi32, kernel32) == expected
-    assert ap.windows_host_readers().engine_sid == expected
-    assert _win32_config_source_probes().self_sid == expected
     assert _win32_sid.sid_text(advapi32, kernel32, None) is None
+
+
+@_windows_only
+def test_s12_52_both_windows_readers_take_the_run_as_sid_from_the_shared_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anchor reader and the config-source reader each answer whatever the shared token read
+    answers, so neither keeps a private copy of it. Red: each read its own token."""
+    from messagefoundry.auth import _win32_sid
+    from messagefoundry.config.wiring import _win32_config_source_probes
+
+    monkeypatch.setattr(_win32_sid, "process_user_sid", lambda _a, _k: "S-1-5-21-1-2-3-4242")
+    assert ap.windows_host_readers().engine_sid == "S-1-5-21-1-2-3-4242"
+    assert _win32_config_source_probes().self_sid == "S-1-5-21-1-2-3-4242"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the refusal is the non-Windows branch")
@@ -1526,3 +1538,43 @@ def test_s12_15_the_reader_still_reads_a_well_formed_allow_entry(tmp_path: Path)
     sec = ap.windows_host_readers().read_security(str(target), FILE)
     assert sec.error is None
     assert sec.aces == ((0x01, 0, 0, ""), (0x00, 0, 0x001F01FF, "S-1-1-0"))
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        # An undefined type, header only: no rights recorded, and nothing past the header read.
+        (bytes([0x20, 0, 4, 0]), (0x20, 0, 0)),
+        # A deny entry grants nothing, so its mask is not recorded.
+        (_ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES), (0x01, 0, 0)),
+        # A well-formed allow entry, with its inheritance flags.
+        (
+            bytes([0x00, 0x03])
+            + (20).to_bytes(2, "little")
+            + (0x1F01FF).to_bytes(4, "little")
+            + _EVERYONE_SID_BYTES,
+            (0x00, 0x03, 0x1F01FF),
+        ),
+        # A callback allow entry carries its mask after the header; its SID is not parsed here.
+        (_ace(0x09, (0x40).to_bytes(4, "little")), (0x09, 0, 0x40)),
+        # A granting entry with no room for a mask.
+        (_ace(0x09, b""), "too short to hold its rights"),
+        (_ace(0x00, b""), "too short to hold its rights"),
+        # An allow entry with a mask but no room for a SID's fixed 8 bytes.
+        (_ace(0x00, (0x1F01FF).to_bytes(4, "little")), "too short to hold its SID"),
+        # An allow entry whose SID counts five sub-authorities but holds one.
+        (
+            _ace(
+                0x00, (0x1F01FF).to_bytes(4, "little") + bytes([1, 5, 0, 0, 0, 0, 0, 1]) + bytes(4)
+            ),
+            "too short to hold its SID",
+        ),
+    ],
+)
+def test_s12_15_a_dacl_entry_is_read_only_as_far_as_it_reaches(
+    entry: bytes, expected: tuple[int, int, int] | str
+) -> None:
+    """Every platform runs the entry parse the Windows reader uses (BACKLOG #6281, member S12-15).
+    The kernel refuses a too-short granting entry in a file's DACL (error 1340, measured on Windows
+    11, 2026-11-24), so these shapes reach no real-host test."""
+    assert ap.dacl_entry_fields(entry) == expected

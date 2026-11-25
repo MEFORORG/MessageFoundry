@@ -224,7 +224,9 @@ class WinSecurity:
     """One object's owner and DACL, as the reader recorded them.
 
     ``aces`` holds ``(type, flags, mask, sid)`` per entry, with ``sid`` empty for an entry type the
-    reader does not parse. ``aces is None`` is a NULL DACL. ``error`` is set when the read failed."""
+    reader does not parse, and ``mask`` 0 for a type outside ``_GRANTING_ACE_TYPES``
+    (:func:`dacl_entry_fields`). ``aces is None`` is a NULL DACL. ``error`` is set when the read
+    failed."""
 
     owner: str | None
     aces: tuple[tuple[int, int, int, str], ...] | None
@@ -1063,6 +1065,27 @@ class WinHost:
     drive_target: Callable[[str], str | None]
 
 
+def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
+    """``(type, flags, mask)`` of one DACL entry, from as many bytes as its own AceSize gives, or
+    what the entry is too short to hold.
+
+    Only a granting entry's mask is read, and the mask is 0 for any other type, because no caller
+    reads a mask of a type that grants nothing. An entry of a type Windows does not define may be
+    its 4-byte header alone, so reading a mask from it would read the next entry, or past the DACL.
+    Every granting type carries its mask right after the header. An allow entry must also hold its
+    whole SID, which starts at offset 8 and is 8 bytes plus 4 per sub-authority; the SID's second
+    byte, at offset 9, counts them. The caller renders that SID once this answers. Kept free of
+    ctypes so every platform tests it."""
+    ace_type, flags = entry[0], entry[1]
+    if ace_type not in _GRANTING_ACE_TYPES:
+        return ace_type, flags, 0
+    if len(entry) < 8:
+        return "too short to hold its rights"
+    if ace_type == ACCESS_ALLOWED_ACE_TYPE and (len(entry) < 16 or len(entry) < 16 + 4 * entry[9]):
+        return "too short to hold its SID"
+    return ace_type, flags, int.from_bytes(entry[4:8], "little")
+
+
 def windows_host_readers() -> WinHost:
     """Build the in-process Windows readers. Every object, links included, is opened with
     ``FILE_FLAG_OPEN_REPARSE_POINT`` and read with ``GetSecurityInfo``, so a link's own owner and
@@ -1164,34 +1187,15 @@ def windows_host_readers() -> WinHost:
                 if not advapi32.GetAce(dacl_ptr.value, index, ctypes.byref(ace_ptr)):
                     return WinSecurity(owner, (), f"entry {index} of its DACL could not be read")
                 base = ace_ptr.value or 0
-                ace_type = ctypes.cast(base, ctypes.POINTER(ctypes.c_ubyte))[0]
-                ace_flags = ctypes.cast(base + 1, ctypes.POINTER(ctypes.c_ubyte))[0]
+                # The header's AceSize, at offset 2, bounds the copy, so nothing past the entry is
+                # read. The header itself is always there: GetAce pointed at it.
                 ace_size = ctypes.cast(base + 2, ctypes.POINTER(wintypes.WORD))[0]
-                # Only a granting entry's mask is read, because no caller reads any other type's.
-                # An entry of a type Windows does not define may be its 4-byte header alone, so
-                # reading a mask from it would read the next entry, or past the DACL. Every
-                # granting type carries its mask right after the header, so each is checked long
-                # enough to hold one first.
-                ace_mask = 0
-                if ace_type in _GRANTING_ACE_TYPES:
-                    if ace_size < 8:
-                        return WinSecurity(
-                            owner, (), f"entry {index} of its DACL is too short to hold its rights"
-                        )
-                    ace_mask = ctypes.cast(base + 4, ctypes.POINTER(wintypes.DWORD))[0]
+                fields = dacl_entry_fields(ctypes.string_at(base, max(ace_size, 4)))
+                if isinstance(fields, str):
+                    return WinSecurity(owner, (), f"entry {index} of its DACL is {fields}")
+                ace_type, ace_flags, ace_mask = fields
                 sid = ""
                 if ace_type == ACCESS_ALLOWED_ACE_TYPE:
-                    # The SID starts at offset 8. It is 8 bytes plus 4 per sub-authority, and its
-                    # second byte, at offset 9, counts them.
-                    sub_authorities = (
-                        ctypes.cast(base + 9, ctypes.POINTER(ctypes.c_ubyte))[0]
-                        if ace_size >= 16
-                        else 0
-                    )
-                    if ace_size < 16 + 4 * sub_authorities:
-                        return WinSecurity(
-                            owner, (), f"entry {index} of its DACL is too short to hold its SID"
-                        )
                     parsed = sid_text(base + 8)
                     if parsed is None:
                         return WinSecurity(owner, (), f"the SID in entry {index} could not be read")
