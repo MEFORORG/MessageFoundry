@@ -14270,6 +14270,14 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
             except (*store_call_errors(), *store_connect_errors()) as exc:
+                # The defect first, in the transit-bound commands' order, so a defect whose
+                # context holds a lost link is not read as an unknown outcome.
+                if not isinstance(exc, store_call_errors()) and not _is_transient_driver_error(exc):
+                    # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
+                    # bind-count mismatch: a defect, as the transit-bound commands treat it, which
+                    # the dispatch floor reports by class and SQLSTATE only. Classes 08 and 40 are
+                    # transient, so a lost link or 40003 never lands here.
+                    raise _StoreDefect(_store_error_text(exc)) from exc
                 if _write_outcome_unknown(exc):
                     # The link failed, possibly after the server applied the COMMIT, so nothing
                     # here can say whether the sessions ended. The row records the attempt.
@@ -14279,11 +14287,6 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                         "outcome": "unknown",
                     }
                     return "unknown", None, _store_error_text(exc), await audit(detail)
-                if not isinstance(exc, store_call_errors()) and not _is_transient_driver_error(exc):
-                    # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
-                    # bind-count mismatch: a defect, as the transit-bound commands treat it, which
-                    # the dispatch floor reports by class and SQLSTATE only.
-                    raise _StoreDefect(_store_error_text(exc)) from exc
                 # The store opened; the revoke itself was refused and rolled back. Not the open
                 # error the arm below words, which would read as a wrong --db path. Only a lock
                 # is fixed by stopping a SQLite engine, so only a lock gets that hint, as the
@@ -14325,7 +14328,8 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         )
         return _emit_error(
             "the connection to the store failed during the revoke, so whether it took effect is "
-            f"unknown ({problem}). {recorded}. Re-run the command; a second revoke is harmless",
+            f"unknown ({problem}). {recorded}. Re-run the command: a second revoke ends what "
+            "this one would have, and also every session signed in since this attempt",
             as_json=args.json,
         )
     if audit_problem is not None:
@@ -14338,11 +14342,13 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": True, "revoked": revoked}))
     else:
         # The count is the rows the sweep ended, expired ones never purged among them; the global
-        # session epoch the revoke raised is what ends every other session (BACKLOG #5091, #5095).
+        # session epoch the revoke raised is what ends the rest (BACKLOG #5091, #5095). The row is
+        # not sealed, so the claim is scoped to the documented limit rather than stated whole.
         print(
             f"OK: ended {revoked} unrevoked session row(s), expired ones included, and raised the "
-            "global session epoch, so every session signed in before this is refused and every "
-            "signed-in user must sign in again"
+            "global session epoch, which refuses the sessions signed in before it unless someone "
+            "with write access to the database lowers or deletes its row; docs/SECURITY.md, "
+            "Limits of the session sweep, says what else it may miss"
         )
     return 0
 
@@ -15705,10 +15711,12 @@ def _write_outcome_unknown(exc: BaseException) -> bool:
     """Whether a failed write may still have committed: a lost connection (OSError, or SQLSTATE
     class 08), or 40003, "statement completion unknown" (BACKLOG #2337).
 
-    The chain is followed through ``__cause__``, or ``__context__`` where no cause was set and
-    the context is not suppressed, as :func:`_engine_refusal_text` follows it (BACKLOG #5093): a
+    The implicit ``__context__`` is followed, never an explicit ``__cause__`` (BACKLOG #5093): a
     backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost link to
-    the rollback's own error on a dead connection, which then carries it only as its context."""
+    the rollback's own error on a dead connection, which then carries it only as its context. An
+    error raised ``from`` another was raised as that error's meaning, at least the pool's
+    ``StoreAcquireTimeout`` from a ``TimeoutError`` before any transaction began, so a chain
+    stops there, as it does at a suppressed context."""
     from messagefoundry.store.base import driver_sqlstate
 
     link: BaseException | None = exc
@@ -15720,7 +15728,8 @@ def _write_outcome_unknown(exc: BaseException) -> bool:
         state = driver_sqlstate(link)
         if state is not None and (state.startswith("08") or state == "40003"):
             return True
-        link = link.__cause__ or (None if link.__suppress_context__ else link.__context__)
+        explicit = link.__cause__ is not None or link.__suppress_context__
+        link = None if explicit else link.__context__
     return False
 
 

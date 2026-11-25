@@ -428,16 +428,14 @@ def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
     assert str(audits[0]["actor"]).startswith("cli:")
 
 
-@pytest.mark.parametrize("cause", [False, True], ids=["context", "cause"])
 def test_a_rollback_error_that_masks_a_lost_commit_reads_as_unknown(
-    cause: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A backend that rolls back in an ``except`` block and re-raises loses the COMMIT's lost
-    link to the rollback's own error on the dead connection, which carries it only in its chain.
-    That is still an unknown outcome, never "nothing was revoked"; the sessions did end here."""
+    link to the rollback's own error on the dead connection, which carries it only as its
+    implicit context. That is still an unknown outcome, never "nothing was revoked"; the sessions did end here."""
     monkeypatch.chdir(tmp_path)
     setenv_at_rest_opt_out(monkeypatch)
     db = tmp_path / "cli.db"
@@ -448,11 +446,9 @@ def test_a_rollback_error_that_masks_a_lost_commit_reads_as_unknown(
         await revoke(self)
         try:
             raise _LinkLost()  # the COMMIT's lost link
-        except _LinkLost as lost:
-            rollback = sqlite3.OperationalError("cannot rollback: the connection is closed")
-            if cause:
-                raise rollback from lost
-            raise rollback  # noqa: B904 -- the implicit context is the case under test
+        except _LinkLost:
+            # The implicit context is the case under test.
+            raise sqlite3.OperationalError("cannot rollback: the connection is closed")  # noqa: B904
 
     monkeypatch.setattr(MessageStore, "revoke_all_sessions", masked)
     assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
@@ -461,6 +457,32 @@ def test_a_rollback_error_that_masks_a_lost_commit_reads_as_unknown(
     assert "nothing was revoked" not in error, error
     revoked, audits = asyncio.run(_state(db, tokens))
     assert revoked == [True, True] and len(audits) == 1
+
+
+def test_a_pool_timeout_raised_from_a_timeout_error_stays_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pool's ``StoreAcquireTimeout`` is raised ``from`` a ``TimeoutError``, an OSError, before
+    any transaction began. An explicit cause is not followed, so it stays "nothing was revoked"
+    and writes no row."""
+    from messagefoundry.store.base import StoreAcquireTimeout
+
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    tokens = asyncio.run(_seed(db))
+
+    async def borrow_timed_out(self: MessageStore, **kwargs: object) -> RevokeResult:
+        try:
+            raise TimeoutError
+        except TimeoutError as exc:
+            raise StoreAcquireTimeout("store pool acquire timed out after 5s") from exc
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", borrow_timed_out)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert asyncio.run(_state(db, tokens)) == ([False, False], [])
 
 
 def test_a_suppressed_context_is_not_read_as_a_lost_link(
