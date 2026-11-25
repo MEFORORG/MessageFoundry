@@ -1297,7 +1297,10 @@ try {
     }
     if ($hookFault) { Write-WriterError -Stage 'hook-input' -Message $hookFault }
 
-    $boxKey = ConvertTo-BoxKey -Path $wt
+    # Through Resolve-BoxPath, the keyer the sender, drain and watcher share (BACKLOG #7581). $wt is
+    # git's toplevel, which it returns unchanged, so a seat's key is what it was; one keyer keeps the
+    # seat record and the mailbox from drifting apart if either end changes.
+    $boxKey = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $wt)
 
     # Rule 3. BEFORE any early return, so a no-op invocation still proves the writer ran.
     try {

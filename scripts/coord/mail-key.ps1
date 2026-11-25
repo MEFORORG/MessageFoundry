@@ -9,8 +9,8 @@
     Dot-source this; it defines functions and does nothing on its own.
 
         . "$PSScriptRoot\mail-key.ps1"
-        $key = ConvertTo-BoxKey -Path $cwd
-        $old = ConvertTo-LegacyBoxKey -Path $cwd   # READERS ONLY; see that function
+        $key = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $cwd)
+        $old = Get-BoxReadKeys -Path $cwd   # READERS ONLY; see that function
 
     ONE COPY ON PURPOSE, for the same reason session-registry.ps1 states for the liveness fence. The
     sender (scripts/coord/mail.ps1) and the drain (scripts/hooks/mail-drain.ps1) must compute the SAME
@@ -73,6 +73,96 @@ function ConvertTo-LegacyBoxKey {
     param([Parameter(Mandatory)][string]$Path)
     $norm = ConvertTo-BoxKeyPath -Path $Path
     return (Format-BoxKey -Norm $norm -HashInput $norm)
+}
+
+function Resolve-BoxPath {
+    # THE DIRECTORY A BOX IS KEYED ON, FOR ANY PATH INSIDE A WORKTREE (BACKLOG #7581). The sender,
+    # the drain, the watcher and seat.ps1 each pass a path through this before ConvertTo-BoxKey, so a
+    # session whose cwd is a SUBDIRECTORY of its worktree reads the box its seat record publishes,
+    # the worktree root, and mail sent to a subdirectory path lands there too. Before this, the drain
+    # keyed on the session's cwd and seat.ps1 on `git rev-parse --show-toplevel`, so one worktree
+    # could name two boxes, each one the other end never read.
+    #
+    # Returns the worktree root when $Path is a folder inside a live worktree that git does not
+    # ignore. Returns $Path UNCHANGED, so its key is exactly what it was before this function, when:
+    #   - $Path is the worktree root itself (the common case, answered with no git call);
+    #   - $Path is not rooted, or sits in no checkout: no root is guessed;
+    #   - the nearest `.git` above $Path names no git directory, as a pruned worktree's stale `.git`
+    #     file does: the walk never passes it to reach a checkout further up;
+    #   - git IGNORES $Path in the checkout found above it. A removed worktree's leftover directory
+    #     under the primary's .claude/worktrees/ is such a folder, and raising it would send its mail
+    #     to the PRIMARY checkout's box. An ignored folder of a live worktree keeps its own box for
+    #     the same reason, as it did before this function;
+    #   - git cannot answer the ignore question. A failed probe is not "not ignored".
+    #
+    # Calls git only for a path strictly below a worktree root. Never throws.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        $raw = $Path.Trim()
+        if (-not $raw -or -not [System.IO.Path]::IsPathRooted($raw)) { return $Path }
+        # GetFullPath collapses `..` and slash direction, so the walk below climbs real parents.
+        $full = [System.IO.Path]::GetFullPath($raw).TrimEnd('\', '/')
+        if (-not $full) { return $Path }
+        $at = $full
+        $root = $null
+        while ($at) {
+            $dotGit = Join-Path $at '.git'
+            if (Test-Path -LiteralPath $dotGit) {
+                if (-not (Test-BoxGitDir -DotGit $dotGit -Root $at)) { return $Path }
+                $root = $at
+                break
+            }
+            $parent = Split-Path -Parent $at
+            if (-not $parent -or $parent -eq $at) { break }
+            $at = $parent.TrimEnd('\', '/')
+        }
+        if (-not $root -or $full.Length -eq $root.Length) { return $Path }
+        # Relative to the root, in forward slashes, with a trailing slash so a directory-only pattern
+        # such as `/.claude/worktrees/` matches it.
+        $rel = ($full.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/') + '/'
+        $null = & git -C $root check-ignore -q -- $rel 2>$null
+        # 1 is "not ignored". 0 is ignored, and anything else is git failing to answer.
+        if ($LASTEXITCODE -eq 1) { return $root }
+        return $Path
+    }
+    catch { return $Path }
+}
+
+function Test-BoxGitDir {
+    # Whether the `.git` at $DotGit names a git directory, read the way git reads it and calling no
+    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD.
+    param([Parameter(Mandatory)][string]$DotGit, [Parameter(Mandatory)][string]$Root)
+    try {
+        if (Test-Path -LiteralPath $DotGit -PathType Container) { $gitDir = $DotGit }
+        else {
+            $line = [string](Get-Content -LiteralPath $DotGit -TotalCount 1 -ErrorAction Stop)
+            if ($line -notmatch '^gitdir:\s*(.+?)\s*$') { return $false }
+            $gitDir = $Matches[1]
+            if (-not [System.IO.Path]::IsPathRooted($gitDir)) { $gitDir = Join-Path $Root $gitDir }
+        }
+        return (Test-Path -LiteralPath (Join-Path $gitDir 'HEAD') -PathType Leaf)
+    }
+    catch { return $false }
+}
+
+function Get-BoxReadKeys {
+    # EVERY OLDER KEY A READER OF $Path'S BOX STILL DRAINS, so no message already queued goes unread
+    # when Resolve-BoxPath moves a box. Returns the keys to move mail FROM, never the current one. A
+    # reader (the drain, the watcher) passes each to Move-LegacyInbox; NO WRITER MAY ADDRESS ONE.
+    #   - the legacy path-only key of the resolved directory (the host joining the key, step 4);
+    #   - when $Path is a subdirectory raised to its root: the key it was addressed by before
+    #     Resolve-BoxPath, ConvertTo-BoxKey of $Path itself, and that path's legacy key.
+    # -Resolved takes the caller's own Resolve-BoxPath answer for $Path, to spare a second git call.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [string]$Resolved)
+    $resolved = if ($Resolved) { $Resolved } else { Resolve-BoxPath -Path $Path }
+    $keys = @(ConvertTo-LegacyBoxKey -Path $resolved)
+    if ((ConvertTo-BoxKeyPath -Path $resolved) -cne (ConvertTo-BoxKeyPath -Path $Path)) {
+        $keys += ConvertTo-BoxKey -Path $Path
+        $keys += ConvertTo-LegacyBoxKey -Path $Path
+    }
+    return , $keys
 }
 
 # Set at load so a StrictMode caller can read it before the first load below.

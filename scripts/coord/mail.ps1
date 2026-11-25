@@ -599,9 +599,11 @@ if ($Send) {
     # move that did not happen is reported instead of assumed -- a broadcast that aborted on target 1
     # would hide targets 2..N, and one that swallowed the failure would put the defect back at the
     # reporting layer. Every target gets its own row and its own status.
-    # One row per recipient. A path is keyed through ConvertTo-BoxKey; a seat id already IS the key.
+    # One row per recipient. A path is keyed through Resolve-BoxPath and ConvertTo-BoxKey, the drain's
+    # own two steps, so a subdirectory of a worktree addresses the box its session reads (BACKLOG
+    # #7581); a seat id already IS the key.
     $rows = @()
-    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path $t); Cwd = $t } }
+    foreach ($t in $targets) { $rows += [pscustomobject]@{ To = $t; Key = (ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $t)); Cwd = $t } }
     foreach ($s in $seatTargets) {
         $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
         $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
@@ -703,11 +705,13 @@ if ($List) {
 
 # -Status (default): this worktree's own box.
 $here = (Get-Location).Path
-$key = ConvertTo-BoxKey -Path $here
+# The box the drain reads from here: a subdirectory is raised to its worktree root (BACKLOG #7581).
+$boxPath = Resolve-BoxPath -Path $here
+$key = ConvertTo-BoxKey -Path $boxPath
 # The box under the old path-only key, read only. The drain moves the inbox names this channel
 # minted into $key, so only those are counted as waiting; claiming/ and stranded/ stay where they are,
 # and are counted here because no sweep of this box reaches them.
-$legacyKey = ConvertTo-LegacyBoxKey -Path $here
+$legacyKey = ConvertTo-LegacyBoxKey -Path $boxPath
 $legacyInbox = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'inbox' |
         Where-Object { Split-MailFileName -Name (Split-Path $_.File -Leaf) }).Count
 $legacyClaiming = @(Get-BoxMessages -Root $root -Key $legacyKey -Sub 'claiming').Count
