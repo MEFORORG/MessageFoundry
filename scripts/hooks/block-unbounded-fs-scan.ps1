@@ -80,11 +80,14 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # substitution in the body of a heredoc whose delimiter is unquoted (`cat <<EOF`), though the rest
 # of the body is data, so every view above blanks it and allowed `cat <<EOF\n$(find /proc)\nEOF`.
 # This reads each such body from the raw text and adds the text inside each substitution to $Into,
-# to be judged as a command of its own. Openers are found on $Masked, the bash reading, which blanks
-# quotes, `$((...))` and comments, glued (`cat<<EOF`) or spaced, every one on a line; an opener on a
-# line after a `((` or `$[` is skipped, as a shift. The bodies of a line's openers follow it in
-# order, and a body ends only at a line that is exactly its delimiter, after leading tabs for `<<-`,
-# as bash reads it. A delimiter with any quote or backslash in it is quoted: its body takes no
+# to be judged as a command of its own. Openers are found on $Masked, the bash reading, glued
+# (`cat<<EOF`) or spaced, every one on a line; an opener on a line after a `((` or `$[` is skipped,
+# as a shift. In a command holding a quote, that reading blanks quotes, `$((...))` and comments; a
+# command with no quote is read as it is, so there an opener in a comment, such as `#<<\A`, is read
+# as one. The bodies of a line's openers follow it in order, and a body ends only at a line that is
+# exactly its delimiter, after leading tabs for `<<-`. For an unquoted delimiter that line is the
+# one bash compares, after joining each backslash-newline; for a quoted one bash joins none, and
+# neither does this. A delimiter with any quote or backslash in it is quoted: its body takes no
 # substitution and adds nothing, nor does a `$(` or backtick after a backslash. A backslash-newline
 # in a body is removed first, as bash removes it.
 # A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
@@ -105,11 +108,21 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
         $joined = [regex]::Replace($body.ToString(), '(?<!\\)((?:\\\\)*)\\\n', '$1')
         Add-BodySubstitutions $joined $Into $Seen $Spent $Cap
     }
+    # The start of a body line a backslash-newline continues, in a body with an unquoted delimiter.
+    $logical = ''
     for ($n = 0; $n -lt $lines; $n++) {
         $raw = $rawLines[$n]
         if ($queue.Count -gt 0 -and $null -ne $body) {
             $cur = $queue[0]
-            $line = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
+            $full = $logical + $raw
+            $logical = ''
+            if ($cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
+                # Bash joins this line to the next before it compares the delimiter.
+                $logical = $full.Substring(0, $full.Length - 1)
+                [void]$body.Append($raw).Append("`n")
+                continue
+            }
+            $line = if ($cur.Dash) { $full.TrimStart([char]9) } else { $full }
             if ($line -ceq $cur.T) {
                 if ($cur.Bare) { & $flush }
                 $queue.RemoveAt(0)
