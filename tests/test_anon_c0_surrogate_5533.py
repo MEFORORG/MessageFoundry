@@ -22,7 +22,9 @@ import pytest
 
 import messagefoundry_toolkit.anon as engine_anon
 import tee.anon as tee_anon
+from messagefoundry_toolkit.anon import hl7 as engine_hl7
 from messagefoundry_toolkit.anon import surrogates as engine_surrogates
+from tee.anon import hl7 as tee_hl7
 from tee.anon import surrogates as tee_surrogates
 
 _SALT = "b5533-c0-salt-0123456789abcdef-0123456789"
@@ -84,6 +86,21 @@ def test_a_field_a_keep_rule_leaves_is_not_checked(char: str) -> None:
     engine_out = engine_anon.anonymize(message, salt=_SALT, rules=rules_engine)
     assert engine_out == tee_anon.anonymize(message, salt=_SALT, rules=rules_tee)
     assert f"{_NEEDLE}{char}34" in engine_out
+
+
+@pytest.mark.parametrize("char", ["\x07", "\t"], ids=["BEL", "TAB"])
+def test_a_keep_rule_passed_straight_to_an_adapter_is_not_checked(char: str) -> None:
+    """Each adapter's ``anonymize_message`` takes keep rules too. A keep writes nothing, so the
+    field it keeps passes, as on origin/main, on both adapters alike."""
+    message = _message(f"{_NEEDLE}{char}34^^^H^MR")
+    engine_keep = (engine_anon.FieldRule("PID-3", engine_anon.SurrogateKind.KEEP),)
+    tee_keep = (tee_anon.FieldRule("PID-3", tee_anon.SurrogateKind.KEEP),)
+    outs = [
+        engine_hl7.anonymize_message(message, engine_anon.Keyer(_SALT), engine_keep),
+        tee_hl7.anonymize_message(message, tee_anon.Keyer(_SALT), tee_keep),
+    ]
+    assert outs[0] == outs[1]
+    assert f"{_NEEDLE}{char}34" in outs[0]
 
 
 @pytest.mark.parametrize("encoding", ["\x1f~\\&", "\t~\\&", "^\x1e\\&"], ids=["US", "TAB", "RS"])

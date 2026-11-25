@@ -22,7 +22,8 @@ and a street's space, is judged first, against the field separator and the MSH-2
 same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
 :func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
 the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
-``Message.set`` refuses too. The shared site-code pass that runs after the rules writes no digit
+``Message.set`` refuses too; ``surrogate_field_recorded`` refuses every undeclared C0 byte
+first (BACKLOG #5533 item 14), so the last four reach it only as a declared delimiter. The shared site-code pass that runs after the rules writes no digit
 the message declares as a separator.
 """
 
