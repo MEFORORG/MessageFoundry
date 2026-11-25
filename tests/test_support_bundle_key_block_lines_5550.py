@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import itertools
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -57,20 +58,41 @@ def test_a_short_last_body_line_no_longer_prints() -> None:
     assert (new[0], new[1], new[4:]) == (old[0], old[1], old[4:])
 
 
-def test_a_body_ending_at_an_escaped_break_is_masked_to_it() -> None:
+def test_a_body_ending_at_an_escaped_break_leaves_its_line_whole() -> None:
     # The last body line is followed on the same line by an escaped break and the END marker, so
-    # the body covers that line only in part: masked to the break, the rest kept.
+    # the body covers that line only in part. It is left as it was, a stated residual: a masked
+    # prefix would change what the line passes read in the rest of the line.
     end = "\\n" + pem_marker("END", "RSA PRIVATE KEY") + " PID|2||ZQROE^ZQRICH"
     lines = [pem_marker("BEGIN", "RSA PRIVATE KEY"), _KEY_LINE, _KEY_LAST + end]
-    out = mask_key_body_lines(lines)
-    assert out == [lines[0], "x" * len(_KEY_LINE), "x" * len(_KEY_LAST) + end]
-    assert _KEY_LAST[:-2] in _per_line("\n".join(lines))
-    assert _KEY_LAST[:-2] not in redact_log_text("\n".join(lines))
+    assert mask_key_body_lines(lines) == [lines[0], "x" * len(_KEY_LINE), lines[2]]
 
 
 def test_a_one_line_escaped_block_is_left_to_the_line_pass() -> None:
     lines = ["before", pem_block("EC PRIVATE KEY", "\\n", _KEY_LINE, _KEY_LAST), "after"]
     assert mask_key_body_lines(lines) is lines
+
+
+def test_lines_holding_a_line_break_are_returned_unchanged() -> None:
+    lines = ["a\nb", *pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LAST).split("\n")]
+    assert mask_key_body_lines(lines) is lines
+
+
+def test_the_log_viewer_masks_a_block_whose_begin_line_is_on_an_earlier_page(
+    tmp_path: Path,
+) -> None:
+    from messagefoundry.api.app import _read_log_tail
+
+    lines = [
+        "2026-11-25 12:00:00,001 ERROR mefor.tls key load failed:",
+        *pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LINE[::-1], _KEY_LAST).split("\n"),
+        "PID|1||MRN7712345^^^HOSP^MR||ZQDOE^ZQJANE||19700101|F",
+    ]
+    (tmp_path / "engine.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    whole, total, available = _read_log_tail(str(tmp_path), limit=len(lines), offset=0)
+    page, _, _ = _read_log_tail(str(tmp_path), limit=4, offset=0)
+    assert available and total == len(lines)
+    assert not any(_KEY_LAST[:-2] in line for line in whole + page), (whole, page)
+    assert page == whole[-4:]
 
 
 def test_two_blocks_are_each_masked_at_their_own_lines() -> None:
@@ -122,9 +144,11 @@ _BODIES = (
 _RUN = re.compile(r"[A-Za-z0-9]{3,}")
 
 
-def _printed(line: str) -> list[str]:
+def _printed(line: str) -> Counter[str]:
+    """Each letter or digit run of three or more ``line`` prints, counted, but "x" runs and the
+    placeholder word. Counted, so a run printed once more than the reading before is caught."""
     runs = _RUN.findall(line.replace("\\n", "  "))
-    return [run for run in runs if run.strip("x") and run != "REDACTED"]
+    return Counter(run for run in runs if run.strip("x") and run != "REDACTED")
 
 
 def _corpus() -> list[str]:
@@ -151,8 +175,8 @@ def test_no_line_prints_a_value_the_per_line_reading_hid(crlf: bool) -> None:
         new_lines = redact_log_text(text).split("\n")
         assert len(old_lines) == len(new_lines), text
         for old, new in zip(old_lines, new_lines, strict=True):
-            assert not set(_printed(new)) - set(_printed(old)), (text, old, new)
-            hidden += bool(set(_printed(old)) - set(_printed(new)))
+            assert not _printed(new) - _printed(old), (text, old, new)
+            hidden += bool(_printed(old) - _printed(new))
     assert hidden > 0
 
 
@@ -218,7 +242,7 @@ def test_the_fallback_mask_prints_nothing_the_reading_before_it_hid(
             before_lines, after_lines = before.split("\n"), after.split("\n")
             assert len(before_lines) == len(after_lines), (name, text)
             for old_line, new_line in zip(before_lines, after_lines, strict=True):
-                newly = set(_printed(new_line)) - set(_printed(old_line))
+                newly = _printed(new_line) - _printed(old_line)
                 assert not newly, (name, text, old_line, new_line)
-                hidden += bool(set(_printed(old_line)) - set(_printed(new_line)))
+                hidden += bool(_printed(old_line) - _printed(new_line))
     assert hidden > 0

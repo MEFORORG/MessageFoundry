@@ -77,6 +77,7 @@ from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY
 from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
+    "mask_key_body_lines",
     "redact_log_line",
     "redact_log_record",
     "redact_log_text",
@@ -815,23 +816,27 @@ def redact_log_text(text: str) -> str:
 
 
 def mask_key_body_lines(lines: list[str]) -> list[str]:
-    """``lines`` with the part of each line after the BEGIN line that a PRIVATE KEY block's body
-    covers written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
+    """``lines`` with each line after a BEGIN line that a PRIVATE KEY block's body covers whole
+    written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
 
-    :func:`redact_log_line` masks a block inside one line, and so one whose line breaks are escaped,
-    but a block with real line breaks reaches it one line at a time, where no line holds its BEGIN
-    marker and its body together. A body line of 24 or more base64 characters fell to the
-    long-base64 sweep, and a shorter one, such as a block's padded last line, printed. So the block is
-    found over the joined lines. The BEGIN line and every line after the body stay as they were; the
-    lines between are masked from their start, a last one to an escaped line break inside it, as in
-    ``<body>\\n-----END ...``. The mask keeps a ``Proc-Type:`` or ``DEK-Info:`` header as it is.
+    ``lines`` is what :func:`split_log_lines` returns: no element holds a "\\n" (one that does is
+    returned unchanged, with every other line). :func:`redact_log_line` masks a block inside one
+    line, and so one whose line breaks are escaped, but a block with real line breaks reaches it one
+    line at a time, where no line holds its BEGIN marker and its body together. A body line of 24 or
+    more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
+    last line, printed. So the block is found over the joined lines, and only the lines its body
+    covers from their first character to their last are replaced, so nothing but "x" runs is left
+    on them for a later pass to read differently. Every other line stays as it was. The mask keeps a
+    ``Proc-Type:`` or ``DEK-Info:`` header as it is.
 
-    At least these still print as before: a body whose lines each carry a log record's own prefix,
-    such as a timestamp, which the block pattern does not read as body lines; a block whose BEGIN
-    line is not among ``lines``; and every gap of secretscrub's pattern, such as a body line ending
-    in a label word. A block with no END marker is masked to its last line boundary, so a line after
-    it that reads as a base64 run, such as a single word, is masked too."""
-    if not any("-----" in line for line in lines):
+    At least these still print as before: a last body line that shares its line with an escaped line
+    break, as in ``<body>\\n-----END ...``, and is too short for the sweep; a body whose lines each
+    carry a log record's own prefix, such as a timestamp, which the block pattern does not read as
+    body lines; a block whose BEGIN line is not among ``lines``; and every gap of secretscrub's
+    pattern, such as a body line ending in a label word. A block with no END marker is masked to its
+    last line boundary, so a line after it that reads as a base64 run, such as a single word, is
+    masked too."""
+    if not any("-----" in line for line in lines) or any("\n" in line for line in lines):
         return lines
     joined = "\n".join(lines)
     out = lines
@@ -843,13 +848,15 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
             continue  # every line break in it is escaped, so it sits on one line, masked there
         masked = _braced_tail(block)  # the body masked, one character for one
         # The first real line break in the body ends the BEGIN line, which the line pass masks
-        # itself; every later piece starts a line.
+        # itself; every later piece starts a line, and is that whole line unless it is the last
+        # and ends at an escaped line break inside it.
         index += joined.count("\n", cursor, start) + 1
         offset = body.index("\n") + 1
         for piece in body[offset:].split("\n"):
-            if out is lines:
-                out = list(lines)
-            out[index] = masked[offset : offset + len(piece)] + lines[index][len(piece) :]
+            if len(lines[index]) == len(piece):
+                if out is lines:
+                    out = list(lines)
+                out[index] = masked[offset : offset + len(piece)]
             offset += len(piece) + 1
             index += 1
         index -= 1

@@ -409,8 +409,9 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
                 continue
             return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
         break
-    # A PRIVATE KEY block is masked over the whole file before the tail is cut, so a block whose
-    # BEGIN line falls outside the tail still has its body masked inside it (BACKLOG #5550).
+    # A PRIVATE KEY block is masked over the read window before the tail is cut, so a block whose
+    # BEGIN line is in the window but outside the tail still has its body masked inside it (BACKLOG
+    # #5550). A block whose BEGIN line is before the window is not.
     tail = redact.mask_key_body_lines(split_log_lines(text))[-lines:]
     return redact_log_text("\n".join(tail))
 

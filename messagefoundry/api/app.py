@@ -983,7 +983,8 @@ def _read_log_tail(
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
     newest ``.log``/``.txt`` file (``offset=0`` = the most recent ``limit`` lines); the page is returned in
     file order (oldest-first within the window). Every line is passed through
-    :func:`~messagefoundry.support.redact.redact_log_line` — the SAME redactor the support bundle uses — so
+    :func:`~messagefoundry.support.redact.redact_log_line`, after the cross-line key-body mask
+    (:func:`~messagefoundry.support.redact.mask_key_body_lines`) — the SAME redactor the support bundle uses — so
     the browser sees identical PHI/secret coverage; the redaction is best-effort (a residual single-token
     identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
@@ -994,6 +995,7 @@ def _read_log_tail(
     and the page boundaries do not count them either (BACKLOG #1131; see
     :func:`~messagefoundry.auth.audit_visibility.reads_audit_copies_in_the_log`)."""
     from messagefoundry.auth.audit_visibility import is_audit_copy_line
+    from messagefoundry.support import redact
     from messagefoundry.support.redact import redact_log_record, split_log_lines
 
     if not log_dir:
@@ -1017,7 +1019,9 @@ def _read_log_tail(
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
-    page = all_lines[start:end]
+    # Before paging, as the bundle does before its tail cut, so a PRIVATE KEY block whose BEGIN line
+    # is on an earlier page still has its body masked on this one (BACKLOG #5550).
+    page = redact.mask_key_body_lines(all_lines)[start:end]
     return [redact_log_record(line) for line in page], total, True
 
 

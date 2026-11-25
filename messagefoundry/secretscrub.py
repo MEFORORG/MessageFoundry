@@ -1207,13 +1207,12 @@ _CAMEL_PLAIN_KEY_VALUE, _CAMEL_KEY_VALUE_CLASSES = _narrowed_value(
 # and an untraceable one. :func:`_pre_camel` leaves the tails and the key-block pass out of that
 # reading, so in such a text no tail runs, on any line of it. :func:`scrub_credentials` runs the
 # key-block mask once more over the reading it keeps, which writes characters as "x" and nothing
-# else (BACKLOG #5550 added items 14 and 26), so a key body there is masked where that reading
-# still holds the BEGIN marker. Where a label's value took the marker, as in
-# ``secret=-----BEGIN ...``, the mask finds no block and the body prints in such a text.
-# ``support.redact.redact_log_text`` splits the text at line breaks, so it masks a block's body
-# lines across them first (``support.redact.mask_key_body_lines``, which says what that leaves).
-# ``GET /logs/tail`` reads its lines through ``redact_log_record`` one at a time and does not, so
-# there a body line too short for the long-base64 sweep still prints.
+# else (BACKLOG #5550 added items 14 and 26). It masks only what the pattern reads as a body, so
+# in such a text a body prints at least where a label's value took the BEGIN marker, as in
+# ``secret=-----BEGIN ...``, and wherever the pattern itself stops, such as at a body line ending in
+# a label word. The support bundle and ``GET /logs/tail`` split their text at line breaks, so they
+# mask a block's body lines across them first (``support.redact.mask_key_body_lines``, which says
+# what that leaves).
 
 #: The label words a padded token68 may not end in: every family's, and the query keys
 #: ``logging_setup``'s query filter reads. Case-insensitive, one fixed-width lookbehind per word.
@@ -2294,11 +2293,12 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
-    #5550). Where it runs, it runs first: :func:`scrub_credentials` runs it as its first pass (and
-    once more, last, over the reading it keeps; the comment above :data:`_NO_LABEL_BEFORE` says
-    why), and
-    ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass, which
-    would rewrite the markers. At least :func:`scrub_credentials_without_tails`, and so the verify
+    #5550). Each caller runs it before the passes that would rewrite the markers:
+    :func:`scrub_credentials` runs it as its first pass, before its label passes, and
+    ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass.
+    :func:`scrub_credentials` also runs it a second time, last, over the reading it keeps, where it
+    masks only a block whose BEGIN marker that reading still holds (the comment above
+    :data:`_NO_LABEL_BEFORE` says why). At least :func:`scrub_credentials_without_tails`, and so the verify
     details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
     (``logging_setup.scrub_log_text``), do not run it, by design: they read as the code before it.
     Text holding no ``-----`` returns as the same object."""
