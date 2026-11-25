@@ -1569,6 +1569,45 @@ def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
     assert "1 finding(s)" in capsys.readouterr().err
 
 
+def test_a_pyproject_named_by_two_spellings_is_swept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5641: one file reached by two spellings is one file. Before, it was swept once per
+    spelling, so each of its refusals was reported twice and its path listed twice."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\n'
+        'dependencies = ["fastapi>=0.100", "evil @ https://evil.example/x.whl"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "sub").mkdir()
+    other = tmp_path / "sub" / ".." / "pyproject.toml"
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project), "--pyproject", str(other)]) == 1
+    captured = capsys.readouterr()
+    assert "1 finding(s)" in captured.err
+    assert captured.err.count("direct reference") == 1
+    sources = next(line for line in captured.out.splitlines() if "examined" in line)
+    assert str(other) not in sources and sources.count("pyproject.toml") == 1
+
+
+def test_two_distinct_pyprojects_are_both_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control: two different files, each with its own refusal, are both reported."""
+    for sub in ("a", "b"):
+        (tmp_path / sub).mkdir()
+        (tmp_path / sub / "pyproject.toml").write_text(
+            f'[project]\nname = "{sub}"\n'
+            f'dependencies = ["fastapi>=0.100", "evil{sub} @ https://evil.example/x.whl"]\n',
+            encoding="utf-8",
+        )
+    _stub_registry(monkeypatch)
+    paths = [str(tmp_path / sub / "pyproject.toml") for sub in ("a", "b")]
+    assert main(["--pyproject", paths[0], "--pyproject", paths[1]]) == 1
+    assert "2 finding(s)" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -1580,6 +1619,10 @@ def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
         {"info": {"name": "fastapi"}, "releases": {"1.0": "x"}},
         {"info": {"name": "fastapi"}, "releases": {"1.0": ["x"]}},
         {"info": {"name": "fastapi"}, "releases": {"1.0": [{"upload_time_iso_8601": 5}]}},
+        # BACKLOG #5641: a reply with no `releases` object says nothing about release history, so
+        # it is "could not see" (2), not the "no release history" refusal (1) it used to read as.
+        {"info": {"name": "fastapi"}},
+        {"info": {"name": "fastapi"}, "releases": None},
     ],
     ids=[
         "info",
@@ -1590,6 +1633,8 @@ def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
         "file-list",
         "file",
         "upload-time",
+        "no-releases-key",
+        "null-releases",
     ],
 )
 def test_a_reply_of_the_wrong_shape_exits_2_not_a_traceback(
