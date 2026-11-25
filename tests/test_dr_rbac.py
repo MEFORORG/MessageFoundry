@@ -64,7 +64,12 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
         poll_interval=0.02,
         config_dir=None,
         store_settings=StoreSettings(path=str(tmp_path / "rbac.db")),
-        dr_settings=DrSettings(enabled=True, activate=False, priority_threshold=Priority.CRITICAL),
+        dr_settings=DrSettings(
+            enabled=True,
+            activate=False,
+            seed_archive="seed.mfbak",
+            priority_threshold=Priority.CRITICAL,
+        ),
         egress_settings=EgressSettings(deny_by_default=False),
     )
     await eng.start()
