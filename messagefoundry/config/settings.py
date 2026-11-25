@@ -7178,8 +7178,11 @@ class CertMonitorSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("cert_monitor.check_interval_seconds must be > 0")
+        # Finite as well as positive (BACKLOG #2008): NaN passed ``v <= 0``, and a NaN sleep wakes
+        # at the loop's next timer, so the monitor rescanned almost continuously and the handshake
+        # re-alert throttle in api/security.py never held.
+        if not (v > 0 and math.isfinite(v)):
+            raise ValueError("cert_monitor.check_interval_seconds must be a finite number > 0")
         return v
 
     @field_validator("crl_max_reloads")
@@ -7335,8 +7338,9 @@ class SecretRotationSettings(_Section):
     @field_validator("check_interval_seconds")
     @classmethod
     def _check_interval(cls, v: float) -> float:
-        if v <= 0:
-            raise ValueError("secret_rotation.check_interval_seconds must be > 0")
+        # Finite as well as positive, for the reason [cert_monitor]'s validator gives.
+        if not (v > 0 and math.isfinite(v)):
+            raise ValueError("secret_rotation.check_interval_seconds must be a finite number > 0")
         return v
 
     @field_validator("store_key_max_age_days", "secret_max_age_days")
@@ -10647,27 +10651,29 @@ def _reminder_lead(
 
 
 def _reminder_cadence(
-    section: str, warn_days: int, interval: float, default: float, what: str
+    section: str, warn_days: int, interval: float, default: float, what: str, extra: str = ""
 ) -> list[tuple[str, str]]:
     """One reminder's ``check_interval_seconds`` entry: named above the shipped default while the
     reminder is on, nothing otherwise (BACKLOG #2008, #3301; ASVS 6.4.5).
 
     The runner scans once at start and then once per interval, so a credential that enters its warn
-    window after start waits up to one interval for its first reminder. **The bound is the shipped
-    default, and that is a judgment:** the default cadence is the one each section's ``warn_days``
-    lead was sized against, so any slower cadence spends part of that lead before anyone is told,
-    and an interval of a year means no reminder until the next restart. This follows BACKLOG
-    #1131, which names a limit looser than its default rather than picking a second threshold.
-    With ``warn_days = 0`` the runner does not start, and :func:`_reminder_lead` already names
-    that, so the interval is not named on top of it."""
+    window after start waits up to one interval for its first reminder. Once the interval passes
+    the ``warn_days`` lead, that first reminder can come after the credential has expired, and an
+    interval of a year means none until the next restart. **The bound is the shipped default, and
+    that is a judgment, not a measured threshold.** It follows BACKLOG #1131, which names a limit
+    looser than its default rather than picking a second number. With ``warn_days = 0`` the runner
+    does not start, and :func:`_reminder_lead` already names that, so the interval is not named on
+    top of it."""
     if warn_days == 0 or interval <= default:
         return []
     return [
         (
             f"{section}.check_interval_seconds",
-            f"[{section}].check_interval_seconds = {interval:.15g}, longer than the default of "
+            # repr round-trips, so a value one step past the default never prints as it.
+            f"[{section}].check_interval_seconds = {interval!r}, longer than the default of "
             f"{default:g} -- {what} that enters its warn window after start waits up to "
-            f"{interval:.15g} s for its first reminder, which spends the lead warn_days gives",
+            f"{interval!r} s for its first reminder, and an interval longer than the "
+            f"{warn_days}-day warn_days lead can put that reminder after the deadline itself{extra}",
         )
     ]
 
@@ -10724,6 +10730,10 @@ def _reminder_loosenings(
         cert_monitor.check_interval_seconds,
         CertMonitorSettings.model_fields["check_interval_seconds"].default,
         "a certificate or CRL file the monitor watches",
+        # The same setting is the handshake re-alert throttle for a service caller's client
+        # certificate (api/security.py), so a longer one delays that repeat alert too.
+        ", and a service caller's expiring client certificate is re-alerted no more often than "
+        "once per interval",
     )
     out += _reminder_cadence(
         "secret_rotation",
@@ -10882,7 +10892,8 @@ def security_loosenings(
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)),
     ``[alerts].email_use_tls``/``email_tls_verify`` (#323
     layer 3), ``[secret_rotation].enforce_store_key_expiry`` (#1004), the two credential-reminder
-    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` and an
+    leads ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days``, their two
+    ``check_interval_seconds`` above the default (#2008), and an
     ``[[alerts.rules]]`` entry that can silence a reminder (#2227, #2008), the per-connection
     deviations — ``cleartext_accepted``, ``tls_allow_expired``, ``tls_check_hostname=false`` (ASVS
     12.3.2), an endpoint ``url`` with a credential in its query string (ASVS 14.2.1), a generic-ODBC
@@ -10932,7 +10943,8 @@ def security_loosenings(
     every call site names it. It carries the BACKLOG #1179 acknowledgement. ``approvals`` sits beside
     it for the same reason and carries the dual-control dwell and expiry (BACKLOG #2489) and the
     held list (vault BACKLOG #3123).
-    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227). ``backup`` joins them for
+    ``cert_monitor`` joins them for its ``warn_days`` (BACKLOG #2227) and its
+    ``check_interval_seconds`` (BACKLOG #2008). ``backup`` joins them for
     ``[backup].allow_unencrypted`` (vault BACKLOG #2302). ``secrets`` joins them for
     ``[secrets].vault_revocation_attested`` (vault BACKLOG #2983). ``ai`` joins them for
     ``[ai].endpoint_revocation_attested`` (BACKLOG #2193 slice (e)).
@@ -10945,7 +10957,8 @@ def security_loosenings(
     **The credential reminders (ASVS 6.4.5, BACKLOG #2227 and #2008 step 4).** At least these
     settings silence one or more of them with no refusal, and each is named here, so the serve-time
     warning says so: ``[cert_monitor].warn_days`` and ``[secret_rotation].warn_days`` at ``0`` or
-    below their defaults, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
+    below their defaults, each section's ``check_interval_seconds`` above its default while that
+    reminder is on, and an ``[[alerts.rules]]`` entry that can send a reminder event to no
     transport (:func:`_reminder_loosenings`). Not every way is named.
     ``[auth].initial_password_expiry_hours = 0`` also stops a reminder, and its entry says so
     (vault BACKLOG #2600 step 4).

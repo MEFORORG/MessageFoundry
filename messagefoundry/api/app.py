@@ -2441,7 +2441,7 @@ def _posture_loosenings(
             # BACKLOG #2489, vault #3123: the dual-control dwell, expiry and held list, read off the
             # gate that enforces them.
             approvals=gate.settings if gate is not None else ApprovalsSettings(),
-            # BACKLOG #2227: a short or zero warn_days is named. The managed lifespan stashes the
+            # BACKLOG #2227, #2008: a short or zero warn_days, and a long interval, is named. The managed lifespan stashes the
             # live section. An app built without it (an embedding, or a test) is read at the
             # shipped default, the stash-or-default rule [secret_rotation] follows above. KNOWN
             # GAP: such an engine may run no cert monitor at all, and this then reads it as on.

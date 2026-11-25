@@ -864,12 +864,16 @@ than theirs: a reminder one day ahead leaves no time to renew.
 ### `[cert_monitor].check_interval_seconds` or `[secret_rotation].check_interval_seconds` above its default — a credential reminder is later
 Named as `cert_monitor.check_interval_seconds` and `secret_rotation.check_interval_seconds` (ASVS
 6.4.5, BACKLOG #2008). Each runner scans once at start, then once per interval, so a longer interval
-than the shipped default (`43200` and `86400` seconds) is named while that reminder is on. The
-default is the bound because it is the cadence each `warn_days` lead was sized against. With
-`warn_days = 0` the reminder is already named as off, so its interval is not named as well.
+than the shipped default (`43200` and `86400` seconds) is named while that reminder is on. Using the
+default as the bound is a judgment, not a measured threshold, made as the sign-in limits are read
+against theirs. With `warn_days = 0` the reminder is already named as off, so its interval is not
+named as well. A value that is not a finite number above `0` is refused at load.
 - **What you lose:** time. A certificate, CRL file or secret that enters its warn window after start
   waits up to one interval for its first reminder, which spends part of the lead `warn_days` gives.
-  At an interval of a year, nothing is reminded until the next restart.
+  An interval longer than that lead can put the first reminder after the expiry or due date itself,
+  and at an interval of a year nothing is reminded until the next restart. `[cert_monitor]`'s
+  interval also throttles the handshake alert for a service caller's expiring client certificate,
+  so that alert repeats no more often than once per interval.
 - **What you keep:** the scan at each start, and the start-time expiry checks described in the
   entry above.
 - **When acceptable:** an instance that restarts more often than the interval, or where something

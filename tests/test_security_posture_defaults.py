@@ -1795,11 +1795,11 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
         )
     )
     assert (
-        "check_interval_seconds = 1000000000, longer than the default of 43200"
+        "check_interval_seconds = 1000000000.0, longer than the default of 43200"
         in named["cert_monitor.check_interval_seconds"]
     )
     assert (
-        "check_interval_seconds = 86401, longer than the default of 86400"
+        "check_interval_seconds = 86401.0, longer than the default of 86400"
         in named["secret_rotation.check_interval_seconds"]
     )
     keys = ("cert_monitor.check_interval_seconds", "secret_rotation.check_interval_seconds")
@@ -1817,6 +1817,31 @@ def test_a_reminder_interval_above_its_default_is_a_named_loosening() -> None:
     )
     assert not any(k in off for k in keys), off
     assert "cert_monitor.warn_days" in off and "secret_rotation.warn_days" in off
+
+
+@pytest.mark.parametrize("section", [CertMonitorSettings, SecretRotationSettings])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_reminder_interval_that_is_not_a_finite_positive_number_is_refused(
+    section: type[CertMonitorSettings] | type[SecretRotationSettings], value: float
+) -> None:
+    """BACKLOG #2008: NaN passed the old ``v <= 0`` check and would be named as a longer interval
+    while the runner rescanned almost continuously; infinity would sleep forever."""
+    with pytest.raises(ValueError, match="finite number > 0"):
+        section(check_interval_seconds=value)
+
+
+def test_a_reminder_interval_one_step_past_its_default_does_not_print_as_the_default() -> None:
+    """repr round-trips, as the [auth] limits print theirs."""
+    value = math.nextafter(43_200.0, math.inf)
+    named = dict(
+        _pairs(
+            cert_monitor=CertMonitorSettings(check_interval_seconds=value),
+            backup=BackupSettings(),
+            rotation=SecretRotationSettings(),
+        )
+    )
+    assert f"= {value!r}, longer" in named["cert_monitor.check_interval_seconds"]
+    assert "= 43200, longer" not in named["cert_monitor.check_interval_seconds"]
 
 
 def _rules(*rules: dict[str, object]) -> AlertsSettings:
