@@ -24,6 +24,7 @@
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
 tests/test_adr_0019_0173_revert_guard.py
+tests/test_adr_0019_status_names_every_amendment.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py

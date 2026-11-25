@@ -2365,9 +2365,25 @@ the same permission set on the same method reds CI until it is listed here.
 > by a reload. `test_a_scoped_operator_asking_the_wrong_engine_gets_the_403_and_a_denial_row` in
 > `tests/test_multishard_smoke.py` runs the wrong-engine cause on `GET /connections/{name}/metadata`
 > only, against two plain `serve` processes
-> over one store, each with its own graph and API port. It is not run under `serve --shard`, whose
-> engine shards split one config, so on engine shards that cause is read from the code (BACKLOG
-> #3031). A row naming an in-scope inbound has at least one more cause, on any deployment: a
+> over one store, each with its own graph and API port.
+> `tests/test_engine_shard_wrong_shard_403.py` runs it on engine shards (BACKLOG #3031): two
+> engines of one config, each on the graph `filter_registry_for_shard` gives it as `serve --shard`
+> does, over one SQLite store, answering in process. It pins the metadata 403 and its denial row on
+> both engine shards, and the flag route writing the flag for a sibling engine shard's inbound, as
+> the flag paragraph below says. It runs no `serve --shard` subprocess and no server-DB store,
+> which `serve --shard` requires with more than one engine shard (ADR 0063). Of the routes this
+> paragraph lists it runs metadata and flag only. That `/test`, `/test-credential`, `/start`, `/stop`,
+> `/restart` and the web console's bulk control answer the same on engine shards is read from the
+> code, since they share `_resolve_connection`. Also read from the code, and run by no test on
+> engine shards: `GET /connections/{name}/events` does not use that resolver. It checks the scope
+> only, through `_control_guard`, on any deployment, so it answers an in-scope name the graph does
+> not hold, and on the wrong engine shard an in-scope inbound, from the shared store, with no 403
+> and no denial row. `GET /events?connection=<name>` and the web console's `/ui/events` page and
+> its reason view check the scope only too, through `_admit_event_read`, and refuse a name outside
+> it with their own 403 body, `connection is outside your channel scope`. The console's connection
+> detail page answers 404 `connection not found`, with no denial row, for a name its scoped
+> connection list lacks.
+> A row naming an in-scope inbound has at least one more cause, on any deployment: a
 > flag request refused for its direction. Such a row's detail carries
 > `"flag_direction_not_inbound": true`, so a row without that marker was not refused for its
 > direction (BACKLOG #3378). `POST /connections/{name}/flag` writes it for a direction of
