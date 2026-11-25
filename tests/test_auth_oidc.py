@@ -587,7 +587,12 @@ _OMIT_TYP = object()
 
 
 def _mint_with_typ(
-    key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any], typ: Any = _OMIT_TYP
+    key: rsa.RSAPrivateKey,
+    kid: str,
+    claims: Mapping[str, Any],
+    typ: Any = _OMIT_TYP,
+    *,
+    extra_header: Mapping[str, Any] | None = None,
 ) -> str:
     """Mint a **properly signed** compact JWS carrying an arbitrary ``typ`` header.
 
@@ -602,6 +607,7 @@ def _mint_with_typ(
     header: dict[str, Any] = {"alg": SignatureAlgorithm.RS256.value, "kid": kid}
     if typ is not _OMIT_TYP:
         header["typ"] = typ
+    header.update(extra_header or {})
     header_b64 = _b64u_encode(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
     claims_b64 = _b64u_encode(
         json.dumps(dict(claims), separators=(",", ":"), sort_keys=True).encode()
@@ -655,6 +661,123 @@ def test_a_media_type_prefixed_or_differently_cased_typ_still_validates(
     jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ=typ)
     principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
     assert principal.username == "jdoe"
+
+
+# --- claims: the JOSE crit header (RFC 7515 section 4.1.11) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "crit",
+    [
+        ["exp"],  # a well-formed crit naming an extension the engine does not implement
+        ["b64"],  # RFC 7797's unencoded payload: real, and not implemented here
+        ["exp", "b64"],
+        [],  # RFC 7515 forbids an empty list
+        ["alg"],  # a registered header name, which crit must not list
+        "exp",  # not an array
+        [1],  # a non-string entry
+        None,  # present as null is present
+    ],
+)
+def test_a_crit_header_is_refused_at_key_selection(rsa_key: rsa.RSAPrivateKey, crit: Any) -> None:
+    """BACKLOG #6065. The engine implements no JWS header extension, so a properly signed token
+    carrying ``crit`` in any form is invalid. The extensions it names are present in the header too,
+    so the refusal cannot come from a crit naming a member the header lacks."""
+    extensions = {"crit": crit, "exp": 1_000_300, "b64": True}
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ="JWT", extra_header=extensions)
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), oidc.JwksCache(fetch), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unsupported_crit"
+    # Refused before the kid lookup, so the token spends no JWKS fetch.
+    assert fetch.calls == 0
+
+
+def test_typ_is_checked_before_crit(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The first step of the rung order: a token declaring another class AND carrying crit is
+    refused as wrong_token_type, so this test fails if the crit check moves above the typ check."""
+    jws = _mint_with_typ(
+        rsa_key, "k1", _good_claims(), typ="at+jwt", extra_header={"crit": ["exp"]}
+    )
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "wrong_token_type"
+
+
+@pytest.mark.parametrize(
+    ("header", "other_reason"),
+    [
+        ({"kid": ""}, "unknown_kid"),  # crit before the kid guard
+        ({"alg": "ES256"}, "key_rejected"),  # crit before the alg pin (policy pins RS256 only)
+    ],
+)
+def test_crit_is_checked_before_the_kid_guard_and_the_alg_pin(
+    rsa_key: rsa.RSAPrivateKey, header: dict[str, Any], other_reason: str
+) -> None:
+    """The rung order the federation verifier's title states: typ, then crit, then kid, then the alg
+    pin. A token failing both crit and a later rung is refused as unsupported_crit, and the same token
+    without crit fails that later rung, so each case would catch crit moving below it."""
+    claims = _good_claims()
+    with pytest.raises(oidc.ClaimsError) as exc:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header={"crit": ["exp"], **header})
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unsupported_crit"
+    with pytest.raises(oidc.ClaimsError) as control:
+        jws = _mint_with_typ(rsa_key, "k1", claims, extra_header=header)
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert control.value.reason == other_reason
+
+
+def test_the_crit_positive_control_validates(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Guard-the-guard for the crit cases: the same extension members WITHOUT ``crit`` validate, so
+    those refusals come from ``crit`` and not from the other members the helper adds."""
+    jws = _mint_with_typ(
+        rsa_key, "k1", _good_claims(), typ="JWT", extra_header={"exp": 1_000_300, "b64": True}
+    )
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+def test_a_jwks_with_a_duplicate_kid_is_refused_as_ambiguous_kid(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6065 item 1 (S12-24). The JWKS refuses two usable keys under one kid; the ladder
+    records that as ``ambiguous_kid``, an IdP key-set fault, not as the token's ``unknown_kid``."""
+    # The refusal is on the kid alone, so the same key twice is enough (and needs no new keygen).
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k1"))
+    jws = _mint(rsa_key, "k1", _good_claims())
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(
+            jws, _policy(), oidc.JwksCache(_CountingFetch(body)), clock=lambda: 1_000_100
+        )
+    assert exc.value.reason == "ambiguous_kid"
+
+
+def test_only_the_fetching_lookup_sees_ambiguous_kid(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Pins the limit the claims.py comment states: a sign-in inside the min-refetch floor after the
+    refused fetch gets the cache's throttled refusal, so it is recorded as unknown_kid."""
+    body = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k1"))
+    cache = oidc.JwksCache(_CountingFetch(body), clock=lambda: 0.0)
+    jws = _mint(rsa_key, "k1", _good_claims())
+    reasons = []
+    for _ in range(2):
+        with pytest.raises(oidc.ClaimsError) as exc:
+            oidc.validate_id_token(jws, _policy(), cache, clock=lambda: 1_000_100)
+        reasons.append(exc.value.reason)
+    assert reasons == ["ambiguous_kid", "unknown_kid"]
+
+
+def test_any_other_jwks_fault_is_still_unknown_kid(rsa_key: rsa.RSAPrivateKey) -> None:
+    """The ambiguous_kid arm is narrow: a JWKS with no usable key still reads as unknown_kid."""
+    jws = _mint(rsa_key, "k1", _good_claims())
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(
+            jws,
+            _policy(),
+            oidc.JwksCache(_CountingFetch(_jwks_bytes())),
+            clock=lambda: 1_000_100,
+        )
+    assert exc.value.reason == "unknown_kid"
 
 
 def test_an_events_bearing_claim_set_is_refused_under_its_own_slug(
