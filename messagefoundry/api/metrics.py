@@ -60,6 +60,7 @@ __all__ = [
     "build_otel_meter_provider",
     "gather_snapshot",
     "render_metrics",
+    "scoped_snapshot",
 ]
 
 

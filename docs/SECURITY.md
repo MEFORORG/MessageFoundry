@@ -2333,7 +2333,8 @@ the same permission set on the same method reds CI until it is listed here.
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
 > `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
 > of its own inbounds only, and no per-destination or latency series, because their `destination`
-> label names an outbound, which a scoped caller is not shown. Its aggregates that carry no connection or destination label stay global, like the
+> label names an outbound, and the connections dashboard and the graph hide outbounds from such a
+> caller. Its aggregates that carry no connection or destination label stay global, like the
 > counters above. A scraper that needs the whole
 > estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
 > with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
@@ -2343,10 +2344,10 @@ the same permission set on the same method reds CI until it is listed here.
 > these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
 > `/ui/audit` calls the same core as `GET /audit` through the console seam; no test executes those
 > two refusals.
-> The monitoring half of this paragraph is derived, not asserted:
 > `tests/test_monitoring_scope_doc_drift.py` executes each narrowed and global monitoring read
-> above against a scoped caller with an all-channels caller as the control, and reds if the prose
-> and the app disagree. It does not check the refusal sentence.
+> above against a scoped caller with an all-channels caller as the control. On the prose side it
+> checks only that each of those route tokens is present in this paragraph, not which side of the
+> rule the paragraph puts it on. It does not check the refusal sentence.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
