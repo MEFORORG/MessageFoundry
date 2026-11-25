@@ -19,8 +19,9 @@
     script's REPORT-ONLY list after its own re-checks. Which mechanism makes which layout is stated once, in the
     "WHICH MECHANISM MADE THIS WORKTREE" block of scripts/hooks/worktree_gate.ps1 (BACKLOG #1038).
 
-      (a) merged     -- no commits beyond origin/main, OR a merged PR whose head is this exact tip, OR
-                        its OWN upstream branch is gone (squash-merged + remote-deleted),
+      (a) merged     -- no commits beyond origin/main, OR a PR merged into main from this repo whose
+                        head is this exact tip, OR its OWN upstream branch is gone (squash-merged +
+                        remote-deleted) and the PR probe did not answer that no such PR exists,
       (b) clean      -- no uncommitted tracked changes AND no untracked files (see below), and none of
                         the work git status cannot see: skip-worktree or assume-unchanged edits, an
                         ignored entry that is not a regenerable cache, a nested checkout or link, or an
@@ -435,7 +436,10 @@ if ($SkipFetch) { $fetchDetail = 'skipped (-SkipFetch): merge decisions use what
 elseif (-not ($Apply -or $Fetch)) { $fetchDetail = 'skipped (dry run): pass -Fetch to refresh origin/* first' }
 else {
     Write-Note "Fetching origin (--prune)..."
-    & git -C $RepoRoot fetch origin --prune --quiet 2>$null
+    # --no-auto-maintenance (BACKLOG #7614): a plain fetch ends with `maintenance run --auto`, whose
+    # `gc --auto` runs `git worktree prune` and expires registrations this pass is about to reason
+    # about -- detached by default, so possibly in the middle of it. Measured on a repo past gc.auto.
+    & git -C $RepoRoot fetch origin --prune --quiet --no-auto-maintenance 2>$null
     if ($LASTEXITCODE -eq 0) { $fetched = $true; $fetchDetail = 'origin fetched (--prune)' }
     else {
         $fetchDetail = "FETCH FAILED (exit $LASTEXITCODE): merge decisions are being made against stale refs"
@@ -456,6 +460,10 @@ function Get-GitHubSlug([string]$Repo) {
 }
 
 $ghSlug = if ($SkipGh) { $null } else { Get-GitHubSlug $RepoRoot }
+# The base branch a merged PR must have gone INTO to count (BACKLOG #7615). The probe is scoped to
+# origin's slug, so an origin/ prefix names that repo's branch; any other spelling simply matches no
+# PR, which fails closed.
+$mainBase = ($MainRef -replace '^refs/remotes/', '') -replace '^origin/', ''
 $hasGh = (-not $SkipGh) -and $ghSlug -and [bool](Get-Command gh -ErrorAction SilentlyContinue)
 # The receipt is written AFTER the probes, from what they actually answered. It used to be decided up
 # front from "gh is installed and origin is GitHub", so an unauthenticated, rate-limited, offline or
@@ -515,12 +523,17 @@ function Test-Merged {
     #    as merged and gets its later commits force-deleted. Repo-scoped: gh resolves the repo from the
     #    CALLER'S cwd otherwise, so launching this by absolute path from another checkout would answer
     #    from that repo's merged PRs.
-    #    `--json number,headRefOid` is ONE argv entry. A space after the comma makes PowerShell pass
-    #    three, gh rejects the third, and this whole block silently never ran (it didn't, for a while)
-    #    while the receipt still claimed a PR probe was scoped. Keep the comma tight.
+    #    `--json number,headRefOid,...` is ONE argv entry. A space after a comma makes PowerShell pass
+    #    several, gh rejects the extra ones, and this whole block silently never ran (it didn't, for a
+    #    while) while the receipt still claimed a PR probe was scoped. Keep the commas tight.
+    #    `--head` also matches a PR into ANY base and a fork's PR from a branch of the same name, so only
+    #    a PR into $mainBase from this repository counts (BACKLOG #7615). A row that does not say fails
+    #    closed.
+    #    $answeredNo: the probe ran, parsed, and found no such PR. Step 3 reads it.
+    $answeredNo = $false
     if ($hasGh) {
         $script:ghAttempts++
-        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid --limit 20 2>&1
+        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid,baseRefName,isCrossRepository --limit 20 2>&1
         $ghExit = $LASTEXITCODE
         # 2>&1 folds stderr in as ErrorRecords; keep them out of the JSON but keep them as the reason.
         $ghText = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
@@ -532,12 +545,21 @@ function Test-Merged {
         }
         if ($ghExit -eq 0 -and $ghText) {
             $prs = $null
-            try { $prs = @($ghText | ConvertFrom-Json) } catch { $prs = @() }
-            $exact = @($prs | Where-Object { $_.headRefOid -eq $tip })
+            $parsed = $true
+            try { $prs = @($ghText | ConvertFrom-Json) } catch { $prs = @(); $parsed = $false }
+            $atTip = @($prs | Where-Object { $_.headRefOid -eq $tip })
+            $exact = @($atTip | Where-Object { $_.baseRefName -ceq $mainBase -and $_.isCrossRepository -eq $false })
             if ($exact.Count -gt 0) {
                 return @{ Merged = $true; Reason = "PR #$($exact[0].number) merged at this exact tip"; Unique = $uniq; Notes = $notes; NeverUsed = $false }
             }
-            if ($prs.Count -gt 0) {
+            foreach ($pr in $atTip) {
+                $why = if ($null -eq $pr.baseRefName -or $null -eq $pr.isCrossRepository) { 'gh did not say which base it merged into or whether it came from a fork' }
+                elseif ($pr.isCrossRepository -ne $false) { 'it came from a fork' }
+                else { "it merged into '$($pr.baseRefName)', not '$mainBase'" }
+                $notes += "PR #$($pr.number) merged at this exact tip, but $why -- not a merge signal"
+            }
+            $answeredNo = $parsed
+            if ($prs.Count -gt 0 -and $atTip.Count -eq 0) {
                 $notes += "a merged PR (#$($prs[0].number)) exists for the branch NAME '$Branch', but its head was $($prs[0].headRefOid.Substring(0,8)) and this branch is at $($tip.Substring(0,8)) -- the branch moved on after that merge"
             }
         }
@@ -565,7 +587,13 @@ function Test-Merged {
         $upTrack = if ($parts.Count -gt 1) { $parts[1] } else { '' }
         $upRemote = if ($parts.Count -gt 2) { $parts[2] } else { '' }
         if ($upTrack -match 'gone') {
-            if ($upShort -eq "$upRemote/$Branch") {
+            # A gone upstream is no proof once the probe ANSWERED that no PR merged into $mainBase at
+            # this tip: a closed PR, or a branch that moved on after its merge, leaves the same shape
+            # (BACKLOG #7615). With no answer (-SkipGh, no gh, a failed probe) it still reads as merged.
+            if ($upShort -eq "$upRemote/$Branch" -and $answeredNo) {
+                $notes += "upstream $upShort is gone, but the merged-PR probe found no PR merged into '$mainBase' at this tip, and a closed PR or a deleted remote branch leaves the same shape -- not a merge signal"
+            }
+            elseif ($upShort -eq "$upRemote/$Branch") {
                 return @{
                     Merged = $true
                     Reason = "upstream $upShort is gone (squash-merged + remote-deleted); the branch is KEPT because $uniq commit(s) are not on $MainRef"
@@ -1524,7 +1552,13 @@ function Get-LiveOrphans([object[]]$Ledger) {
         $txt = ''
         try { $txt = Get-Content -LiteralPath $dotgit -Raw -EA Stop } catch { continue }
         if ($txt -notmatch 'gitdir:\s*(.+)') { continue }
-        $target = ConvertTo-Norm ($Matches[1].Trim())
+        # Resolved against the directory holding the pointer: git writes it relative under
+        # worktree.useRelativePaths, and the raw text then never matched (BACKLOG #7616).
+        $ptr = $Matches[1].Trim()
+        if (-not [IO.Path]::IsPathRooted($ptr)) {
+            try { $ptr = [IO.Path]::GetFullPath($ptr, $dir.FullName) } catch [System.ArgumentException], [System.NotSupportedException], [System.IO.PathTooLongException] { continue }
+        }
+        $target = ConvertTo-Norm $ptr
         if (-not $gitCommonDir -or -not $target.StartsWith((ConvertTo-Norm $gitCommonDir) + '/')) { continue }
         $seen[$n] = $true
         $out += [pscustomobject]@{ Path = $dir.FullName; Leaf = $dir.Name; Branch = ''; At = ''; Why = 'it still points into this repo''s worktree admin directory, but git no longer lists it' }

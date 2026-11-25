@@ -973,10 +973,11 @@ def test_a_dead_or_stale_record_arriving_mid_run_holds_the_tree(
     fx: Fixture, sleeper: int, tmp_path: Path, state: str
 ) -> None:
     """The -Apply re-check reads the same hold: the record lands after the decision pass."""
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     pid, started_at = _gone_session_fields(state)
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=(
             "import json\n"
             f"rec = {{'pid': {pid}, 'sessionId': 'beef0002-2222',"
@@ -1952,13 +1953,13 @@ def test_refuses_outside_a_repository(tmp_path: Path) -> None:
 
 
 def test_gh_json_field_list_is_one_argv_entry() -> None:
-    """`--json number, headRefOid` is three argv entries; gh rejects the third and the block dies.
+    """`--json number, headRefOid` is two argv entries; gh rejects the second and the block dies.
 
     That is the whole exact-tip merge probe silently never running while the receipt still claimed a
     PR probe was scoped -- a green gate that cannot see the thing it guards.
     """
     src = SCRIPT.read_text(encoding="utf-8")
-    assert "--json number,headRefOid" in src
+    assert "--json number,headRefOid,baseRefName,isCrossRepository " in src
     assert "--json number, " not in src
 
 
@@ -1972,11 +1973,15 @@ def test_gh_json_field_list_is_one_argv_entry() -> None:
 # --------------------------------------------------------------------------------------------------
 
 
-def _stage_recheck(fx: Fixture, sleeper: int) -> None:
+def _stage_recheck(fx: Fixture, sleeper: int) -> str:
+    """Returns the gh payload to answer with: ``gone``'s PR merged at its tip, so it stays the
+    positive control once the probe answers (BACKLOG #7615 made a gone upstream with an answered
+    ``[]`` a SKIP)."""
     live_record(fx, sleeper, fx.primary)
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("clean"), hours=100)
     _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    return json.dumps([_pr(11, _git(fx.primary, "rev-parse", "gone").strip())])
 
 
 def test_a_session_arriving_mid_run_is_vetoed_and_counted(
@@ -1987,9 +1992,10 @@ def test_a_session_arriving_mid_run_is_vetoed_and_counted(
     The fence receipt must also OWN the save: a re-check veto used to leave `Occupants: []` on the one
     candidate the fence stopped, so `vetoedCandidates` reported 0 for a run signal 1 had rescued.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=(
             "import json, time\n"
             f"rec = {{'pid': {sleeper}, 'sessionId': 'beef0001-1111',"
@@ -2021,9 +2027,9 @@ def test_activity_is_rechecked_before_the_removal(
     Signal 1 has been measured vetoing 0 of 4 live siblings, so during the apply window the fence was
     effectively down: a git command by the occupant between the decision and the delete changed nothing.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     gitdir = fx.primary / ".git" / "worktrees" / "repo-clean" / "HEAD"
-    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{gitdir}', None)\n")
+    shim = gh_shim(tmp_path, payload=merged, side_effect=f"os.utime(r'{gitdir}', None)\n")
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -2040,9 +2046,9 @@ def test_a_mypy_run_during_the_apply_window_is_caught_by_the_recheck(
     """BACKLOG #5603. The re-check reads the working tree too: a mypy run between the decision and
     the delete touches no git metadata, only mypy's cache."""
     wt = _populate_mypy_cache(fx)
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     cache = wt / ".mypy_cache" / "3.14" / "cache.0.db"
-    shim = gh_shim(tmp_path, side_effect=f"os.utime(r'{cache}', None)\n")
+    shim = gh_shim(tmp_path, payload=merged, side_effect=f"os.utime(r'{cache}', None)\n")
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -2077,7 +2083,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_
     the side effect, is ``gone``'s, after ``clean``'s decision, as in the default-mode re-check tests.
     """
     _exclude(fx, ".ruff_cache/")
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     for other in fx.primary.parent.glob("repo-*"):
         if other.name not in ("repo-clean", "repo-gone"):
             subprocess.run(
@@ -2085,7 +2091,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_idle_hours_
                 capture_output=True,
                 check=False,
             )
-    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"))
+    shim = _grow_past_the_cap(tmp_path, fx.sibling("clean"), merged)
 
     res = run(fx, "-Apply", "-IdleHours", "0", skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "clean")
@@ -2106,7 +2112,7 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("ahead"), hours=100)
     tip = _git(fx.primary, "rev-parse", "ahead").strip()
-    payload = json.dumps([{"number": 7, "headRefOid": tip}])
+    payload = json.dumps([_pr(7, tip)])
     shim = _grow_past_the_cap(tmp_path, fx.sibling("ahead"), payload)
 
     res = run(fx, "-Apply", "-Name", "ahead", skip_gh=False, path_prepend=shim)
@@ -2120,10 +2126,11 @@ def test_a_tree_gone_unreadable_in_the_apply_window_is_skipped_under_name(
 def test_a_nested_worktree_appearing_mid_run_is_vetoed(
     fx: Fixture, sleeper: int, tmp_path: Path
 ) -> None:
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     late = fx.sibling("clean") / ".claude" / "worktrees" / "late"
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=(
             f"subprocess.run(['git', '-C', r'{fx.primary}', 'worktree', 'add', '-q', '-b',"
             f" 'late-branch', r'{late}'], check=True)\n"
@@ -2145,10 +2152,12 @@ def test_the_clean_recheck_keeps_the_specific_reason(
     A vanished directory, an exit-128 status, a new untracked file and a real edit are not the same
     event, and the operator is reading this precisely because something moved under a destructive run.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     victim = fx.sibling("clean") / "brand_new.py"
     shim = gh_shim(
-        tmp_path, side_effect=f"pathlib.Path(r'{victim}').write_text('x', encoding='utf-8')\n"
+        tmp_path,
+        payload=merged,
+        side_effect=f"pathlib.Path(r'{victim}').write_text('x', encoding='utf-8')\n",
     )
 
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
@@ -2167,10 +2176,11 @@ def test_a_fence_that_dies_mid_run_refuses_and_says_so(
     A caller gating on the receipt concluded the fence was fine; a caller gating on the exit code
     concluded a refusal. Both were reading the same run.
     """
-    _stage_recheck(fx, sleeper)
+    merged = _stage_recheck(fx, sleeper)
     sessions = fx.cfg / "sessions"
     shim = gh_shim(
         tmp_path,
+        payload=merged,
         side_effect=f"[p.unlink() for p in pathlib.Path(r'{sessions}').glob('*.json')]\n",
     )
     res = run(fx, "-Apply", skip_gh=False, path_prepend=shim)
@@ -2215,7 +2225,7 @@ def test_a_merged_pr_at_this_exact_tip_is_a_merge_signal(
     use_github_remote(fx)
     _backdate(fx.primary, fx.sibling("ahead"), hours=100)
     tip = _git(fx.primary, "rev-parse", "ahead").strip()
-    shim = gh_shim(tmp_path, payload=json.dumps([{"number": 7, "headRefOid": tip}]))
+    shim = gh_shim(tmp_path, payload=json.dumps([_pr(7, tip)]))
 
     res = run(fx, skip_gh=False, path_prepend=shim)
     d = by_leaf(res, "ahead")
@@ -2261,6 +2271,78 @@ def test_a_failing_gh_probe_is_reported_not_claimed(
     assert "FAILED on 1 of 1" in res["gh"]
     assert any("merged-PR probe FAILED" in r for r in res["fence"]["reducedAssurance"])
     assert any("probe FAILED for this branch" in n for n in by_leaf(res, "ahead")["Notes"])
+
+
+def _pr(number: int, oid: str, *, base: str = "main", fork: bool = False) -> dict[str, Any]:
+    """One row of ``gh pr list --json number,headRefOid,baseRefName,isCrossRepository``."""
+    return {"number": number, "headRefOid": oid, "baseRefName": base, "isCrossRepository": fork}
+
+
+@pytest.mark.parametrize(
+    ("row", "needle"),
+    [
+        pytest.param({"base": "release/1"}, "into 'release/1', not 'main'", id="other-base"),
+        pytest.param({"fork": True}, "from a fork", id="fork"),
+        pytest.param(None, "did not say which base", id="fields-missing"),
+    ],
+)
+def test_a_pr_merged_at_this_tip_but_not_into_main_from_this_repo_is_not_a_merge_signal(
+    fx: Fixture, sleeper: int, tmp_path: Path, row: dict[str, Any] | None, needle: str
+) -> None:
+    """BACKLOG #7615. ``--head <branch>`` matches a PR into ANY base, and a fork's PR from a branch of
+    the same name. A stacked PR merged into another feature branch leaves this branch's commits off
+    main, so it must not read as merged. A row without the two fields fails closed too."""
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("ahead"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "ahead").strip()
+    pr = {"number": 7, "headRefOid": tip} if row is None else _pr(7, tip, **row)
+    shim = gh_shim(tmp_path, payload=json.dumps([pr]))
+
+    res = run(fx, skip_gh=False, path_prepend=shim)
+    d = by_leaf(res, "ahead")
+    assert d["Decision"] == "SKIP", d
+    assert d["Reason"] != "PR #7 merged at this exact tip"
+    assert any(needle in n for n in d["Notes"]), d["Notes"]
+    assert res["ghProbes"] == {"attempted": 1, "failed": 0, "firstError": ""}
+
+
+@pytest.mark.parametrize(
+    ("payload", "decision"),
+    [
+        pytest.param("[]", "SKIP", id="no-merged-pr"),
+        pytest.param("older", "SKIP", id="merged-at-an-older-tip"),
+        pytest.param("tip", "PRUNE", id="control-merged-at-this-tip"),
+    ],
+)
+def test_a_gone_upstream_is_not_a_merge_signal_when_the_pr_probe_answered_no(
+    fx: Fixture, sleeper: int, tmp_path: Path, payload: str, decision: str
+) -> None:
+    """BACKLOG #7615. ``[gone]`` means the remote ref is absent, which a CLOSED PR or a ``push
+    --delete`` leaves as well as a merge. When the probe ANSWERED and found no PR merged into main at
+    this tip, the gone upstream is not proof. ``-SkipGh`` keeps the old reading (the control below)."""
+    live_record(fx, sleeper, fx.primary)
+    use_github_remote(fx)
+    _backdate(fx.primary, fx.sibling("gone"), hours=100)
+    tip = _git(fx.primary, "rev-parse", "gone").strip()
+    body = {
+        "[]": "[]",
+        "older": json.dumps([_pr(5, "deadbeef" * 5)]),
+        "tip": json.dumps([_pr(6, tip)]),
+    }[payload]
+    shim = gh_shim(tmp_path, payload=body)
+
+    d = by_leaf(run(fx, skip_gh=False, path_prepend=shim), "gone")
+    assert d["Decision"] == decision, d
+    if decision == "SKIP":
+        assert any("not a merge signal" in n and "is gone" in n for n in d["Notes"]), d["Notes"]
+    else:
+        assert d["Reason"] == "PR #6 merged at this exact tip"
+
+    # Control: with no probe at all the gone upstream still reads as merged, as before.
+    skipped = by_leaf(run(fx), "gone")
+    assert skipped["Decision"] == "PRUNE", skipped
+    assert "is gone" in skipped["Reason"]
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2318,6 +2400,43 @@ def test_apply_fetches_for_real(fx: Fixture, sleeper: int) -> None:
     assert res["fetched"] is True
     assert "origin fetched" in res["refs"]
     assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
+def test_the_fetch_never_runs_background_maintenance(fx: Fixture, sleeper: int) -> None:
+    """BACKLOG #7614. A plain ``git fetch`` runs ``maintenance run --auto``, whose ``gc --auto`` runs
+    ``git worktree prune`` and expires registrations in the middle of a pass that is reasoning about
+    them. The repo here is set so the auto gc fires and expires at once; the control after the run
+    proves a plain fetch really would have pruned the registration."""
+    live_record(fx, sleeper, fx.primary)
+    _git(fx.primary, "push", "-q", "origin", "main")
+    far = fx.root / "far-away"
+    _add_worktree(fx.primary, far, "far-away")
+    shutil.rmtree(far)
+    for key, value in (
+        ("gc.auto", "1"),
+        ("gc.autoDetach", "false"),
+        ("maintenance.autoDetach", "false"),
+        ("gc.worktreePruneExpire", "now"),
+    ):
+        _git(fx.primary, "config", key, value)
+    blobs = fx.root / "blobs"
+    blobs.mkdir()
+    for i in range(64):
+        (blobs / f"b{i}").write_text(f"loose object {i}\n", encoding="utf-8")
+    _git(fx.primary, "hash-object", "-w", *(str(b) for b in sorted(blobs.iterdir())))
+
+    def registered() -> bool:
+        return "far-away" in _git(fx.primary, "worktree", "list", "--porcelain")
+
+    assert registered()
+    res = run(fx, "-Fetch", skip_fetch=False)
+    assert res["fetched"] is True, res["refs"]
+    assert registered(), "the script's fetch ran git's auto maintenance and pruned a registration"
+
+    _git(fx.primary, "fetch", "origin", "--prune", "--quiet")
+    assert not registered(), (
+        "control: a plain fetch must prune it here, or this test proves nothing"
+    )
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2427,6 +2546,42 @@ def test_a_repaired_orphan_stops_being_reported(fx: Fixture, sleeper: int) -> No
     later = run(fx)
     assert later["counts"]["orphansFromEarlierRuns"] == 0
     assert later["_exit"] == 0
+
+
+@pytest.mark.parametrize("relative", [True, False], ids=["relative-gitdir", "absolute-gitdir"])
+def test_an_unregistered_sibling_pointing_into_this_repo_is_an_orphan(
+    fx: Fixture, sleeper: int, relative: bool
+) -> None:
+    """BACKLOG #7616. The ledger-free detector compared the raw ``gitdir:`` line against the common
+    dir, so a pointer git wrote with ``worktree.useRelativePaths`` never matched and the orphan went
+    unreported. The absolute case is the control."""
+    live_record(fx, sleeper, fx.primary)
+    tree = fx.sibling("lost")
+    flag = "true" if relative else "false"
+    _git(
+        fx.primary,
+        "-c",
+        f"worktree.useRelativePaths={flag}",
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "lost",
+        str(tree),
+    )
+    pointer = (tree / ".git").read_text(encoding="utf-8")
+    assert Path(pointer.split("gitdir:", 1)[1].strip()).is_absolute() is not relative, pointer
+    # Deregister it the way a failed removal leaves it: the admin entry gone, the directory and its
+    # .git pointer still on disk.
+    shutil.rmtree(_gitdir(tree))
+    assert "repo-lost" not in _git(fx.primary, "worktree", "list", "--porcelain")
+
+    res = run(fx)
+    assert [o["leaf"] for o in res["orphansFromEarlierRuns"]] == ["repo-lost"], res[
+        "orphansFromEarlierRuns"
+    ]
+    assert "git no longer lists it" in res["orphansFromEarlierRuns"][0]["why"]
+    assert res["_exit"] == 3
 
 
 def _write_orphan_ledger(fx: Fixture, *paths: Path) -> None:
