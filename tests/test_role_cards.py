@@ -47,7 +47,8 @@ SEAT_SCRIPT = _REPO / "scripts" / "coord" / "seat.ps1"
 SETTINGS = _REPO / ".claude" / "settings.json"
 
 #: The marker and the injected copy. BOTH MUST STAY GIT-IGNORED, and the ignore rule here is the
-#: INVERSE of korus's: `/.claude/*` covers the directory and one negation re-adds settings.json.
+#: INVERSE of korus's: `/.claude/*` covers the directory, and its negations re-add settings.json
+#: and skills/verify/SKILL.md alone.
 MARKER_RELPATH = ".claude/seat.local.txt"
 ROLE_COPY_RELPATH = ".claude/ROLE.local.md"
 

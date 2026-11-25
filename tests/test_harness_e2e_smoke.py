@@ -39,8 +39,9 @@ from harness.load import rigadmin
 from messagefoundry.apiclient import ApiError
 from tests._harness_engine import free_port
 
-#: Above the subprocess cap below, so a hung engine fails as that timeout, with its output.
-pytestmark = pytest.mark.timeout(300)
+#: Above the subprocess cap and its grace below, so a hung engine fails as that timeout, with
+#: its output.
+pytestmark = pytest.mark.timeout(360)
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -69,28 +70,41 @@ inbound("IB_E2E_ADT", MLLP(port={port}), router="no_such_router")
 
 
 def _smoke(config: Path, port: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "harness.e2e_smoke",
-            "--config",
-            str(config),
-            "--inbound",
-            "IB_E2E_ADT",
-            "--mllp-port",
-            str(port),
-            "--api-port",
-            str(free_port()),
-        ],
+    argv = [
+        sys.executable,
+        "-m",
+        "harness.e2e_smoke",
+        "--config",
+        str(config),
+        "--inbound",
+        "IB_E2E_ADT",
+        "--mllp-port",
+        str(port),
+        "--api-port",
+        str(free_port()),
+    ]
+    with subprocess.Popen(  # noqa: S603 -- our own interpreter and fixed arguments
+        argv,
         cwd=_REPO,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=240,
-        check=False,
-    )
+    ) as proc:
+        try:
+            out, err = proc.communicate(timeout=240)
+        except subprocess.TimeoutExpired:
+            # SIGTERM first, as subprocess.run's timeout does not: the smoke's teardown runs on it,
+            # and a SIGKILL would skip it and, on POSIX, orphan the engine with its ports held.
+            proc.terminate()
+            try:
+                out, err = proc.communicate(timeout=50)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, err = proc.communicate()
+            pytest.fail(f"the smoke hung past 240 s\n{err}{out}")
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
 def _config(tmp_path: Path, template: str, **values: object) -> tuple[Path, int]:
@@ -148,10 +162,17 @@ def test_the_command_line_parses(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--mllp-port" in capsys.readouterr().out
 
 
-def test_the_mllp_timeout_is_a_parameter(capsys: pytest.CaptureFixture[str]) -> None:
-    with pytest.raises(SystemExit):
-        e2e_smoke.main(["--help"])
-    assert "--mllp-timeout" in capsys.readouterr().out
+def test_the_mllp_timeout_reaches_the_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(e2e_smoke, "run", lambda **kwargs: seen.update(kwargs))
+    assert e2e_smoke.main(["--mllp-timeout", "3.5"]) == 0
+    assert seen["mllp_timeout"] == 3.5
+
+
+def test_a_timeout_of_zero_is_refused() -> None:
+    with pytest.raises(SystemExit) as exited:
+        e2e_smoke.main(["--mllp-timeout", "0"])
+    assert exited.value.code == 2
 
 
 class _Proc:
@@ -216,10 +237,14 @@ def test_a_connections_api_error_is_a_ready_failure() -> None:
     assert "GET /connections failed: 429 Too Many Requests" in str(failed)
 
 
-def test_a_not_deployed_inbound_fails_at_once() -> None:
-    failed, took = _wait_inbound(lambda: _rows(("IB_E2E_ADT", "not_deployed", 2575)))
+@pytest.mark.parametrize(
+    ("status", "port"),
+    [("not_deployed", 2575), ("failed", 2575), ("filtered", 2575), ("running", 2600)],
+)
+def test_an_inbound_that_waiting_cannot_change_fails_at_once(status: str, port: int) -> None:
+    failed, took = _wait_inbound(lambda: _rows(("IB_E2E_ADT", status, port)))
     assert failed.step == "ready"
-    assert "not_deployed" in str(failed)
+    assert f"status {status}, port {port}, expected port 2575" in str(failed)
     assert took < 5
 
 
@@ -228,6 +253,29 @@ def test_an_inbound_missing_from_the_graph_fails_at_once() -> None:
     assert failed.step == "ready"
     assert "IB_E2E_ADT is not in the engine's graph" in str(failed)
     assert took < 5
+
+
+def test_a_connection_closed_before_the_ack_says_so() -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen()
+        port = int(server.getsockname()[1])
+
+        def close_at_once() -> None:
+            conn, _ = server.accept()
+            with conn:  # read the whole frame first, so the close is a FIN and not a reset
+                received = b""
+                while not received.endswith(b"\x1c\r") and (chunk := conn.recv(4096)):
+                    received += chunk
+
+        closer = threading.Thread(target=close_at_once)
+        closer.start()
+        message = e2e_smoke._DEFAULT_MESSAGE.read_text(encoding="utf-8")
+        with pytest.raises(e2e_smoke.StepFailed) as failed:
+            e2e_smoke._send(port, message, timeout=10.0)
+        closer.join()
+    assert failed.value.step == "mllp"
+    assert "closed the connection before an ACK" in str(failed.value)
 
 
 @pytest.mark.parametrize(
@@ -269,14 +317,26 @@ def test_checkout_accepts_this_checkout(tmp_path: Path) -> None:
     assert package == Path(messagefoundry.__file__ or "").resolve().parent
 
 
-@pytest.mark.skipif(
-    threading.current_thread() is not threading.main_thread(),
-    reason="signal handlers are installed only from the main thread",
-)
-def test_a_signal_during_teardown_is_held_until_it_finishes(
+def test_a_held_signal_waits_for_the_block_then_ends_the_run() -> None:
+    state = e2e_smoke._SignalState()
+    finished: list[str] = []
+    with pytest.raises(SystemExit) as exited, state.held():
+        state.handle(signal.SIGTERM, None)
+        state.handle(signal.SIGINT, None)  # a second one neither aborts nor replaces the first
+        finished.append("teardown")
+    assert finished == ["teardown"]
+    assert exited.value.code == 128 + signal.SIGTERM
+    with pytest.raises(KeyboardInterrupt):
+        state.handle(signal.SIGINT, None)  # outside the block, at once
+
+
+def test_a_ctrl_c_during_teardown_is_held_until_it_finishes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The control: without the hold, the SIGINT aborts _remove before it deletes anything."""
+    """End to end through main()'s handler: without the hold, the SIGINT aborts _remove before it
+    deletes anything."""
+    if threading.current_thread() is not threading.main_thread():
+        pytest.skip("signal handlers are installed only from the main thread")
     removed: list[Path] = []
     before = signal.getsignal(signal.SIGINT)
     real_remove = e2e_smoke._remove
@@ -293,16 +353,8 @@ def test_a_signal_during_teardown_is_held_until_it_finishes(
     monkeypatch.setattr(rigadmin, "provision", refuse_provision)
     monkeypatch.setattr(e2e_smoke, "_remove", interrupted_remove)
     config, port = _config(tmp_path, _DANGLING_ROUTER)
-    with pytest.raises(SystemExit) as exited:
-        e2e_smoke.run(
-            config=config,
-            message_file=e2e_smoke._DEFAULT_MESSAGE,
-            inbound="IB_E2E_ADT",
-            mllp_port=port,
-            expect="processed",
-            timeout=5,
-        )
-    assert exited.value.code == 128 + signal.SIGINT
+    code = e2e_smoke.main(["--config", str(config), "--mllp-port", str(port)])
+    assert code == 128 + signal.SIGINT
     assert len(removed) == 1
     assert not removed[0].exists()
     assert signal.getsignal(signal.SIGINT) is before
