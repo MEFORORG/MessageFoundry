@@ -72,12 +72,14 @@ variable holds is read as run by an ``EXEC`` of that variable whatever the text 
 to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; the comment
 reader ends a ``[`` at its first ``]`` on both servers, so after a SQL Server ``]]`` escape a
 ``--``, or a ``/*`` that a later ``*/`` closes, is read as a comment and hides the DDL after it,
-and a ``'`` or ``"`` there opens a quote that can hide a real comment, so DDL the server skips is
-read as run, and on PostgreSQL a comment inside an ``ARRAY[...]`` or subscript is read as part of
-a name and the DDL it comments out as run; and a ``DROP COLUMN`` raises where the reader finds the
-column's name among the words of an expression, ``INCLUDE`` or partial index on its table, other
-than as a key column, but that word search can miss a name, so a ``DROP COLUMN`` that should raise
-may instead keep an index PostgreSQL drops.
+a ``"`` there opens a quote that can hide a real comment, so DDL the server skips is read as run,
+and a ``'`` there opens a string the server does not see, which hides no comment, since a marker
+inside one raises, but pairs the ``'`` of a later real literal as its close, so a ``--`` inside that
+literal is read as a comment and hides the DDL after it, and on PostgreSQL a comment inside an
+``ARRAY[...]`` or subscript is read as part of a name and the DDL it comments out as run; and a
+``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
+``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
+a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
 
 What is NOT compared includes at least: a column's default, other than whether PostgreSQL's is a
 ``nextval()`` call, which reads as numbering; a PostgreSQL column's collation; constraint indexes (a
@@ -238,7 +240,8 @@ _DDL_OBJECT = re.compile(
     r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
 )
 #: Characters that may end a ``--`` comment on some server, or cut a batch, where the reader ends
-#: one at LF alone. PostgreSQL ends one at CR as well; the rest are refused for the same reason
+#: one at LF alone. PostgreSQL ends one at CR as well, and SQL Server's reading of a CR is not
+#: relied on; the rest are refused for the same reason
 #: ``transports/database.py`` refuses them.
 _OTHER_LINE_BREAKS: Final = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
@@ -316,8 +319,10 @@ def _strip_comments(raw: str) -> str:
     literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment raises,
     even a balanced one, because both servers nest them and the first ``*/`` would not end it
     (BACKLOG #5062 item 26). A line comment holding a NUL or a line break other than LF raises,
-    because PostgreSQL ends one at a CR too. CRs that run up to the LF ending it, or to the end of
-    ``raw``, are allowed: nothing follows them on the line for a server to run."""
+    because a server may end the comment there and run what follows: PostgreSQL ends one at a CR,
+    and the reader does not rely on SQL Server reading a CR otherwise. CRs that run up to the LF
+    ending it, or to the end of ``raw``, are allowed: nothing follows them on the line for a
+    server to run."""
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
