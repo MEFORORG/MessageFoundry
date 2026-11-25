@@ -80,8 +80,13 @@ if ($gitDir -ne $commonDir) {
         "primary, run its own copy: pwsh -NoProfile -File `"$mainPath\scripts\worktree\rescue.ps1`" -Name $Name")
 }
 
-$Parent   = Split-Path $RepoRoot -Parent
-$Target   = Join-Path $Parent ("{0}-{1}" -f (Split-Path $RepoRoot -Leaf), $Name)
+# Where new.ps1 will put the tree: beside the main worktree as git records it (BACKLOG #1894), which
+# can be spelled differently from $PSScriptRoot, for example through a junction.
+$mainLine = @(& git -C $RepoRoot worktree list --porcelain) | Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
+if (-not $mainLine) { throw "Cannot find the main worktree of $RepoRoot. Nothing was moved." }
+$MainRoot = [System.IO.Path]::GetFullPath($mainLine.Substring('worktree '.Length)).TrimEnd('\', '/')
+$Parent   = Split-Path $MainRoot -Parent
+$Target   = Join-Path $Parent ("{0}-{1}" -f (Split-Path $MainRoot -Leaf), $Name)
 
 if (Test-Path $Target) { throw "Worktree path already exists: $Target  (pick another -Name, or just work in it)" }
 # Everything new.ps1 would refuse or misread about the branch is refused HERE, before the primary is

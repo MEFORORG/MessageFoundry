@@ -229,10 +229,10 @@ function Show-NextSteps {
         Write-Host "  code --extensionDevelopmentPath=`"$WorktreePath\ide`" `"$WorktreePath\mefor.code-workspace`""
     }
     Write-Host "  # ... build/commit/push on branch '$Branch'; open a PR as usual."
-    # THE CLEANUP ADVICE NAMES $RepoRoot (BACKLOG #1078), the copy that ran. Since BACKLOG #1894 both
-    # this script and remove.ps1 anchor the sibling on the main worktree, so any copy's remove.ps1
-    # reaches it; naming the root keeps the command runnable from any cwd. -Name here is the
-    # DIRECTORY, which is what remove.ps1 takes -- correct even when it differs from the branch.
+    # THE CLEANUP ADVICE NAMES $MainRoot (BACKLOG #1078, #1894): the main worktree outlives a harness
+    # tree this copy may run in, and its remove.ps1, of any vintage, reaches <main>-<Name>. Naming the
+    # root keeps the command runnable from any cwd. -Name here is the DIRECTORY, which is what
+    # remove.ps1 takes -- correct even when it differs from the branch.
     #
     # EXTRACTION CONTRACT: a line beginning "  #   " (hash, THREE spaces) is a command meant to be run
     # verbatim; "  # " (hash, one space) is prose. tests/test_worktree_new_cleanup_advice.py extracts
@@ -253,7 +253,7 @@ function Show-NextSteps {
     # test there runs it from this script's real output instead.
     if ($Nested) {
         Write-Host "  # When done, from any directory OUTSIDE the worktree:"
-        Write-Host ("  #   " + "git -C `"$RepoRoot`" worktree remove `"$WorktreePath`"")
+        Write-Host ("  #   " + "git -C `"$MainRoot`" worktree remove `"$WorktreePath`"")
         Write-Host "  # git refuses a dirty tree without --force, but nothing checks whether a session is still in it."
         # BACKLOG #2554 finding 1: plain git also skips remove.ps1's other refusals (its header lists
         # them), so the advice names at least three, and says "at least" because there are more.
@@ -265,8 +265,8 @@ function Show-NextSteps {
         return
     }
     Write-Host "  # When done, from any directory OUTSIDE the worktree, either of:"
-    Write-Host "  #   pwsh -NoProfile -File `"$RepoRoot\scripts\worktree\remove.ps1`" -Name $Name"
-    Write-Host "  #   git -C `"$RepoRoot`" worktree remove --force `"$WorktreePath`""
+    Write-Host "  #   pwsh -NoProfile -File `"$MainRoot\scripts\worktree\remove.ps1`" -Name $Name"
+    Write-Host "  #   git -C `"$MainRoot`" worktree remove --force `"$WorktreePath`""
     # --force because the untracked .venv makes git consider the worktree non-empty. The first form is
     # the one to reach for: it refuses on uncommitted tracked changes and untracked files that
     # no exclude rule covers, which the bare git call with --force does not.

@@ -2,19 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """``new.ps1``'s cleanup advice must be runnable as written (BACKLOG #1078).
 
-THE DEFECT. ``new.ps1`` anchors on ``$PSScriptRoot``, so run from a linked worktree it creates the
-new tree beside **itself** -- e.g. under ``.claude/worktrees/`` -- and then printed *"When done (run
-from the MAIN checkout): scripts\\worktree\\remove.ps1 -Name <name>"*. ``remove.ps1`` anchors on its
-own location too, so the main checkout's copy derives ``<main-parent>/<main-leaf>-<name>``, which
-does not exist, and it throws ``No such worktree``. The sentence was wrong; since BACKLOG #1894 the
-anchoring changed too: both scripts anchor the sibling on the MAIN worktree, whichever copy runs.
+THE RULE. Both scripts anchor the sibling on the MAIN worktree, whichever copy runs (BACKLOG #1894),
+and the advice names the main worktree's root explicitly, so it runs from any cwd. Historically
+(BACKLOG #1078) both anchored on ``$PSScriptRoot`` and the advice told the reader to run a root-less
+command from the main checkout, which then looked for a sibling that did not exist.
 
 THE INSTRUMENT. A text assertion that the advice "mentions $RepoRoot" would pass on advice that is
 still unrunnable, so the commands are **extracted from the script and executed** against a synthetic
-repo. ``test_the_advice_that_used_to_be_printed_still_throws_today`` carries the live positive
-control in the same test as the fix: the old ``main checkout`` form is run against the very fixture
-the new form then cleans up successfully, so a green here is evidence that the assertion can see the
-class rather than evidence that nothing was checked.
+repo. ``test_a_linked_copy_makes_the_sibling_of_the_main_worktree_and_its_advice_removes_it``
+drives a linked copy of new.ps1 and runs what it printed; it is red on the pre-#1894 scripts.
 
 THE EXTRACTION CONTRACT, which ``new.ps1`` states on its side too: inside ``Show-NextSteps`` an
 advice line whose text begins ``"  #   "`` (hash, then THREE spaces) is a command meant to be run
@@ -33,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_worktree_remove_path import REAL_SCRIPTS, copy_real_scripts, settle_worktrees
+from tests.test_worktree_remove_path import _ENV, REAL_SCRIPTS, copy_real_scripts, settle_worktrees
 
 _REPO = Path(__file__).resolve().parents[1]
 _NEW_PS1 = _REPO / "scripts" / "worktree" / "new.ps1"
@@ -73,6 +69,7 @@ def _render(cmd: str, *, repo_root: Path, worktree: Path, name: str) -> list[str
     text = cmd.replace('`"', '"')
     for token, value in (
         ("$WorktreePath", str(worktree)),
+        ("$MainRoot", str(repo_root)),
         ("$RepoRoot", str(repo_root)),
         ("$Name", name),
     ):
@@ -141,10 +138,10 @@ def fx(tmp_path: Path) -> Fixture:
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    # Without git config carried in the environment, which remove.ps1 refuses on every route (vault
-    # BACKLOG #8225 item 2): a run under `git -c` exports GIT_CONFIG_PARAMETERS.
-    env = {k: v for k, v in os.environ.items() if not re.match(r"GIT_CONFIG(_|$)", k, re.I)}
-    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=env)
+    # The shared isolated environment: no GIT_* variable (remove.ps1 refuses config carriers and
+    # redirects on every route, vault BACKLOG #8225 item 2), and no CLAUDE_CONFIG_DIR or
+    # MEFOR_COORD_ROOT, so the claim and allocation reads stay inside the fixture.
+    return subprocess.run(argv, capture_output=True, text=True, timeout=180, check=False, env=_ENV)
 
 
 def test_the_advice_is_a_non_empty_set_of_commands_naming_the_checkout(fx: Fixture) -> None:
@@ -155,7 +152,7 @@ def test_the_advice_is_a_non_empty_set_of_commands_naming_the_checkout(fx: Fixtu
         f"{_NEW_PS1.name} prints no cleanup command in the extractable form. If Show-NextSteps was "
         "restructured, re-point this guard rather than letting it pass on an empty set."
     )
-    rootless = [c for c in commands if "$RepoRoot" not in c]
+    rootless = [c for c in commands if "$RepoRoot" not in c and "$MainRoot" not in c]
     assert not rootless, (
         "a cleanup command does not name the checkout the worktree belongs to:\n  "
         + "\n  ".join(rootless)

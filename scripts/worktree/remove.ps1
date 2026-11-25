@@ -12,8 +12,9 @@
 .DESCRIPTION
     THREE WAYS IN.
 
-      -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the checkout THIS
-                  COPY lives in. Unchanged by the routes below. It can also delete the branch.
+      -Name <n>   The sibling worktree new.ps1 made for <n>, at <repo>-<n> beside the PRIMARY
+                  checkout, whichever copy runs (BACKLOG #1894; the header below says more). It must
+                  be a registered worktree of this clone. It can also delete the branch.
       -Path <p>   Any registered linked worktree of this clone that is not under .claude/worktrees (a
                   segment above the primary does not count, as the list below says): a
                   harness scratchpad, a hand-made directory, a sibling. This is the CHECKED route, and
@@ -370,9 +371,12 @@ if ($gitCarriers.Count -gt 0) {
 # ANCHOR ON THE PRIMARY, NOT ON THIS COPY (BACKLOG #1894). $PSScriptRoot\..\.. is the checkout the
 # copy sits in, so a copy in a linked worktree used to search `<that worktree>-<Name>`: what -Name
 # reached depended on which copy ran. The first entry of `git worktree list` is the same from every
-# worktree of one clone. This narrows -Name: no copy reaches a sibling of a LINKED worktree any more.
-# An explicit -RepoRoot is kept as given. FAIL CLOSED: an unreadable list must not fall back to this
-# copy's own checkout. The list is reused below; nothing between here and there changes it.
+# worktree of one clone. Across all copies -Name now reaches fewer trees, only siblings of the
+# primary; a linked copy's own run moves from its own siblings to the primary's, and refuses below
+# while its old target still exists. An explicit -RepoRoot is kept as given. FAIL CLOSED: an
+# unreadable list must not fall back to this copy's own checkout. The list is reused below; nothing
+# between here and there changes it.
+$CopyRoot = $RepoRoot
 $anchorList = @()
 if ($anchorOnPrimary) {
     $anchorList = @(Get-RepoWorktrees $RepoRoot)
@@ -496,6 +500,19 @@ if ($byPath) {
 }
 else {
     $WorktreePath = Join-Path $Parent "$RepoName-$Name"
+    # A COMMAND PRINTED BEFORE BACKLOG #1894 names a linked copy and meant `<that copy>-<Name>`. Run
+    # now, it would reach `<primary>-<Name>`, another tree that may be someone else's. While the tree
+    # it meant still exists, refuse and name both, rather than pick one.
+    if ($anchorOnPrimary -and (ConvertTo-Norm $CopyRoot) -ne (ConvertTo-Norm $RepoRoot)) {
+        $beside = Join-Path (Split-Path $CopyRoot -Parent) ("{0}-{1}" -f (Split-Path $CopyRoot -Leaf), $Name)
+        if (Test-Path -LiteralPath $beside) {
+            Write-Host "REFUSED: -Name $Name from the copy in '$CopyRoot' is ambiguous." -ForegroundColor Red
+            Write-Host "  -Name now reaches the sibling of the primary: $WorktreePath" -ForegroundColor Red
+            Write-Host "  An older new.ps1 run from that copy made:     $beside" -ForegroundColor Red
+            Write-Host "Name the one you mean: run the primary's copy for the first, or add -RepoRoot `"$CopyRoot`" for the second." -ForegroundColor Red
+            throw "Ambiguous -Name. Nothing was removed."
+        }
+    }
     if (-not (Test-Path $WorktreePath)) { throw "No such worktree: $WorktreePath" }
     Assert-NotInsideTarget $WorktreePath "Run a copy in another checkout of this clone, such as $RepoRoot."
     # A worktree registered INSIDE the target goes with it, and a harness tree under the target's own
@@ -504,6 +521,13 @@ else {
     $nameRegistered = @(if ($anchorOnPrimary) { $anchorList } else { Get-RepoWorktrees $RepoRoot })
     if ($nameRegistered.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot'. Nothing was removed."
+    }
+    # The target must be a registered LINKED worktree of this clone. A directory that only sits at the
+    # sibling path, such as a separate clone beside the primary, would have every read below asked of
+    # the wrong repository's refs and registries.
+    $nameNorm = ConvertTo-Norm $WorktreePath
+    if (@($nameRegistered | Select-Object -Skip 1 | Where-Object { (ConvertTo-Norm $_.Path) -eq $nameNorm }).Count -ne 1) {
+        throw "'$WorktreePath' is not a registered linked worktree of '$RepoRoot'. Nothing was removed."
     }
     $nestedTrees = @(Get-NestedWorktrees -Occupancy ([pscustomobject]@{ Worktrees = $nameRegistered }) -Path $WorktreePath)
     if ($nestedTrees.Count -gt 0) {

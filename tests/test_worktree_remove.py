@@ -356,8 +356,9 @@ def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) ->
     copy in linked worktree ``repo-host`` searched ``repo-host-foo`` and threw "No such worktree"
     while ``repo-foo``, the sibling of the primary, stood there.
 
-    The fix narrows -Name and must not widen it: ``repo-host-foo``, the tree the old anchoring would
-    have reached, survives the run. The explicit ``-RepoRoot`` override still reaches it, unchanged.
+    While ``repo-host-foo``, the tree an older new.ps1 run from that copy made and its printed
+    command meant, still exists, the anchored run is ambiguous and refuses, naming both, so a stale
+    command cannot quietly reach a different tree. ``-RepoRoot`` is used as given and reaches it.
     """
     host = fx.add("host")
     target = fx.add("foo")
@@ -366,23 +367,48 @@ def test_a_copy_in_a_LINKED_worktree_anchors_name_on_the_primary(fx: Fixture) ->
     copy_real_scripts(host)
     copied = host / "scripts" / "worktree" / "remove.ps1"
 
+    ambiguous = run(fx, "-Name", "foo", script=copied, repo_root="")
+    assert ambiguous.returncode != 0
+    assert "Ambiguous -Name" in ambiguous.stderr, ambiguous.stdout + ambiguous.stderr
+    assert str(target) in ambiguous.stdout and str(beside_host) in ambiguous.stdout
+    assert target.exists() and beside_host.exists()
+
+    # -RepoRoot is used as given, so naming the linked worktree reaches its own sibling.
+    old_shape = run(fx, "-Name", "foo", script=copied, repo_root=host)
+    assert old_shape.returncode == 0, old_shape.stdout + old_shape.stderr
+    assert not beside_host.exists()
+    assert not fx.is_registered(beside_host)
+    assert target.exists()
+
     proc = run(fx, "-Name", "foo", script=copied, repo_root="")
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not target.exists()
     assert not fx.is_registered(target)
-    assert beside_host.exists() and fx.is_registered(beside_host)
     assert host.exists() and fx.is_registered(host)
 
     listing = run(fx, "-List", script=copied, repo_root="")
     assert listing.returncode == 0, listing.stdout + listing.stderr
     assert f"-Name root: {fx.primary}" in listing.stdout, listing.stdout
 
-    # Control: -RepoRoot is used as given, so naming the linked worktree reaches its own sibling.
-    again = run(fx, "-Name", "foo", script=copied, repo_root=host)
-    assert again.returncode == 0, again.stdout + again.stderr
-    assert not beside_host.exists()
-    assert not fx.is_registered(beside_host)
+
+def test_name_refuses_a_directory_that_is_not_a_registered_worktree(fx: Fixture) -> None:
+    """A separate clone at the sibling path is not this clone's worktree, and every read -Name makes
+    would be asked of the wrong repository. Refused up front; the registered control goes through."""
+    stranger = fx.sibling("stranger")
+    stranger.mkdir()
+    _git(stranger, "init", "-q", "-b", "main")
+
+    proc = run(fx, "-Name", "stranger", "-Force")
+
+    assert proc.returncode != 0
+    assert "not a registered linked worktree" in proc.stderr, proc.stdout + proc.stderr
+    assert (stranger / ".git").is_dir()
+
+    wt = fx.add("known")
+    control = run(fx, "-Name", "known")
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not wt.exists()
 
 
 # --- BACKLOG #1038: what the removal must not lose ------------------------------------------------
