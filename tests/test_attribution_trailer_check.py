@@ -79,9 +79,12 @@ def test_a_clean_message_passes(tmp_path: Path) -> None:
     """The negative control: an ordinary message, including another person's trailer."""
     proc = _run(
         tmp_path,
-        "docs: a plain subject\n\nSome body.\n\nCo-Authored-By: A Person <a@example.invalid>\n",
+        "docs: a plain subject\n\nSome body.\n\nCo-Authored-By: A Person <a@example.invalid>\n"
+        "Verified-by: tests\n",
     )
     assert proc.returncode == 0, proc.stderr
+    # Empty because the message carries a valid Verified-by trailer; without one the hook prints
+    # an advisory line (test_verified_by_trailer.py).
     assert proc.stderr == ""
 
 
