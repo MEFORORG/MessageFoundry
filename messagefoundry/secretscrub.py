@@ -770,8 +770,9 @@ _GUARDED_BRACED_NO_SPACE = r"\{(?:[^}'\"\s]|\}\})*+\}(?!\})"
 #
 # These are the readings found so far, not a proof that no later pass reads anything else in such
 # text. ``tests/test_secretscrub_braced_glued.py`` compares both surfaces with and without the
-# branch over a seeded corpus that holds the anchors above, with a widened branch as its positive
-# control.
+# branch over a seeded corpus that holds the conditions above after the braces' first space, with a
+# widened branch as its positive control; the conditions before that space are tested only by the
+# refused-shape cases.
 #: Words a later pass reads, as lower case ASCII letters spell them, at least: :data:`_MEMBER_KEEP_WORDS`
 #: and the PHI pass's anchor and unbounded words (``redaction._ANCHOR_PREFIXES``' sources and
 #: ``redaction._UNBOUNDED_WORDS``, ``nonnumeric`` among them), reduced by subsumption, with entries
