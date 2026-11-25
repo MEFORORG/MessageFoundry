@@ -88,35 +88,52 @@ def _cache_path(repo: Path) -> Path:
     return Path(common) / "mefor-coord" / "overlap-cache" / f"{key}.json"
 
 
-def _run(repo: Path, sandbox: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    repo: Path, sandbox: Path, *args: str, culture: str | None = None
+) -> subprocess.CompletedProcess[str]:
     """Drive overlap.ps1 against one throwaway repo, with every machine-global input redirected.
 
     ``-ConfigRoot`` and ``-TasksDir`` point at paths that do not exist on purpose: without them the
     script reads this developer's REAL session registry and task lists, and the answer would depend on
     who else is logged in. They cannot contribute a row here anyway (only worktrees of this repo are
     walked), but a fixture whose result varies with the machine is not a fixture.
+
+    With ``culture``, ``CurrentCulture`` is set in the runspace the script then runs in, and printed
+    to stderr first, so the caller can prove the setting took rather than assume it.
     """
+    script_args = [
+        "-Repo",
+        str(repo),
+        "-ConfigRoot",
+        str(sandbox / "no-such-config"),
+        "-TasksDir",
+        str(sandbox / "no-such-tasks"),
+        *args,
+    ]
+    if culture is None:
+        argv = ["-File", str(OVERLAP), *script_args]
+    else:
+        # A quoted '-Refresh' binds as a positional STRING, not the switch, so names stay bare.
+        quoted = " ".join(
+            a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in script_args
+        )
+        argv = [
+            "-Command",
+            f"[System.Globalization.CultureInfo]::CurrentCulture = '{culture}'; "
+            "[Console]::Error.WriteLine('culture=' + "
+            "[System.Globalization.CultureInfo]::CurrentCulture.Name); "
+            f"& '{OVERLAP}' {quoted}; exit $LASTEXITCODE",
+        ]
     proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(OVERLAP),
-            "-Repo",
-            str(repo),
-            "-ConfigRoot",
-            str(sandbox / "no-such-config"),
-            "-TasksDir",
-            str(sandbox / "no-such-tasks"),
-            *args,
-        ],
+        ["pwsh", "-NoProfile", "-NonInteractive", *argv],
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
         check=False,
     )
     assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}\n{proc.stdout}"
+    if culture is not None:
+        assert f"culture={culture}" in proc.stderr, f"the culture did not take: {proc.stderr!r}"
     return proc
 
 
@@ -229,32 +246,6 @@ def test_the_cache_is_keyed_on_the_querying_head_and_not_only_its_root(tmp_path:
     )
 
 
-def _run_in_culture(repo: Path, sandbox: Path, culture: str, *args: str) -> str:
-    """Run overlap.ps1 with ``CurrentCulture`` set first, and return its stderr.
-
-    The culture is set in the same runspace the script runs in, and printed to stderr before the call,
-    so a test can prove the setting took rather than assume it.
-    """
-    # A quoted '-Refresh' binds as a positional STRING, not the switch, so parameter names stay bare.
-    quoted = " ".join(a if a.startswith("-") else "'" + a.replace("'", "''") + "'" for a in args)
-    command = (
-        f"[System.Globalization.CultureInfo]::CurrentCulture = '{culture}'; "
-        "[Console]::Error.WriteLine('culture=' + [System.Globalization.CultureInfo]::CurrentCulture.Name); "
-        f"& '{OVERLAP}' -Repo '{repo}' -ConfigRoot '{sandbox / 'no-such-config'}' "
-        f"-TasksDir '{sandbox / 'no-such-tasks'}' {quoted}; exit $LASTEXITCODE"
-    )
-    proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
-        capture_output=True,
-        text=True,
-        timeout=TIMEOUT,
-        check=False,
-    )
-    assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}\n{proc.stdout}"
-    assert f"culture={culture}" in proc.stderr, f"the culture did not take: {proc.stderr!r}"
-    return proc.stderr
-
-
 @pytest.mark.parametrize("culture", ["en-US", "th-TH", "fi-FI", "ar-SA"])
 def test_a_fresh_cache_is_a_hit_under_any_culture(tmp_path: Path, culture: str) -> None:
     """The cache stamp is ISO-8601 and must be read back as ISO-8601 whatever the current culture.
@@ -265,9 +256,9 @@ def test_a_fresh_cache_is_a_hit_under_any_culture(tmp_path: Path, culture: str) 
     miss, and the cache never hit. en-US is the control that passes either way.
     """
     repo = _repo(tmp_path, "culture")
-    _run_in_culture(repo, tmp_path, culture, "-Refresh", "-Json")
+    _run(repo, tmp_path, "-Refresh", "-Json", culture=culture)
     before = _cache_path(repo).read_bytes()
-    _run_in_culture(repo, tmp_path, culture, "-CacheSeconds", "3600", "-Json")
+    _run(repo, tmp_path, "-CacheSeconds", "3600", "-Json", culture=culture)
     assert _cache_path(repo).read_bytes() == before, (
         f"under {culture} a cache written seconds ago was not a hit: the run re-walked and rewrote it"
     )

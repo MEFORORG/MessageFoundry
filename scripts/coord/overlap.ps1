@@ -981,17 +981,12 @@ if (-not $Refresh -and (Test-Path -LiteralPath $cacheFile)) {
     # THE STAMP IS ISO-8601 AND IS READ AS ISO-8601. ConvertFrom-Json hands it back as a [datetime];
     # `[datetime]::Parse` once took that, rendered it as an invariant-culture string, and re-parsed it
     # under the CURRENT culture, which threw under th-TH, fi-FI and ar-SA (and can misdate elsewhere),
-    # and a catch-all turned the throw into a cache that silently never hit. Both shapes are accepted,
-    # the string one parsed invariantly; an unreadable stamp is a miss that says so on stderr.
-    $stamp = $null
-    if ($c) {
-        if ($c.at -is [datetime]) { $stamp = $c.at }
-        else {
-            $parsed = [datetime]::MinValue
-            if ([datetime]::TryParse([string]$c.at, [System.Globalization.CultureInfo]::InvariantCulture,
-                    [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { $stamp = $parsed }
-            else { [Console]::Error.WriteLine("overlap.ps1: cache timestamp '$($c.at)' is unreadable; re-walking.") }
-        }
+    # and a catch-all turned the throw into a cache that silently never hit. `-as [datetime]` passes a
+    # [datetime] through and parses a string with the INVARIANT culture, as every PowerShell conversion
+    # does, giving $null rather than a throw; an unreadable stamp is a miss that says so on stderr.
+    $stamp = if ($c) { $c.at -as [datetime] }
+    if ($c -and -not $stamp) {
+        [Console]::Error.WriteLine("overlap.ps1: cache timestamp '$($c.at)' is unreadable; re-walking.")
     }
     if ($stamp) {
         # Both sides in UTC, so a stamp read back as Local, Utc or Unspecified ages the same way.
