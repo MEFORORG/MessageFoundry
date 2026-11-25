@@ -916,11 +916,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-age-days", type=int, default=DEFAULT_MIN_AGE_DAYS)
     args = parser.parse_args(argv)
 
-    # De-duplicated by the resolved file, in order, keeping the first spelling, so a --pyproject
-    # repeated or reached by two spellings is swept and reported once (BACKLOG #5641).
-    by_file: dict[Path, Path] = {}
+    # De-duplicated by the resolved file AND the directory it was named from, in order, keeping the
+    # first spelling, so a --pyproject repeated or reached by two spellings is swept and reported
+    # once (BACKLOG #5641). The directory is part of the key because the hatch.toml and uv.toml
+    # swept beside a file are read from it: a link to one pyproject from another directory still
+    # has that directory's siblings swept, at the cost of its own refusals reported twice.
+    by_file: dict[tuple[Path, Path], Path] = {}
     for candidate in args.pyproject or default_pyprojects(_ROOT):
-        by_file.setdefault(_same_file_key(candidate), candidate)
+        key = (_same_file_key(candidate), _same_file_key(candidate.parent))
+        by_file.setdefault(key, candidate)
     files: list[Path] = list(by_file.values())
     if not args.pyproject and len(files) == 1:
         print(
@@ -957,8 +961,8 @@ def main(argv: list[str] | None = None) -> int:
             if not args.pyproject and index == 0:
                 root_runtime = _runtime_names(text)
             reading = uv_toml
-            if uv_toml.is_file() and uv_toml.resolve() not in seen_uv_toml:
-                seen_uv_toml.add(uv_toml.resolve())
+            if uv_toml.is_file() and _same_file_key(uv_toml) not in seen_uv_toml:
+                seen_uv_toml.add(_same_file_key(uv_toml))
                 uv_text = uv_toml.read_text(encoding="utf-8")
                 swept.append((uv_toml, scan_uv_toml(uv_text, source=str(uv_toml))))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:

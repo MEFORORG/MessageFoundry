@@ -19,6 +19,7 @@ import json
 import re
 import socket
 import ssl
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -1562,10 +1563,30 @@ def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
         '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
     )
     (tmp_path / "uv.toml").write_text("extra-index-url = ['https://e.invalid/s']\n", "utf-8")
-    other = tmp_path / "sub" / ".." / "pyproject.toml"
-    (tmp_path / "sub").mkdir()
+    # A second, DISTINCT pyproject in the same directory shares the uv.toml, and the pyproject
+    # de-duplication cannot collapse it (review round e8390625a8: two spellings of one file did).
+    other = tmp_path / "other-pyproject.toml"
+    other.write_text('[project]\nname = "y"\ndependencies = ["httpx>=0.1"]\n', encoding="utf-8")
     _stub_registry(monkeypatch)
     assert main(["--pyproject", str(project), "--pyproject", str(other)]) == 1
+    assert "1 finding(s)" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privilege on Windows")
+def test_a_linked_pyproject_in_another_directory_still_sweeps_that_directorys_uv_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    project = tmp_path / "a" / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "b" / "pyproject.toml").symlink_to(project)
+    (tmp_path / "b" / "uv.toml").write_text("extra-index-url = ['https://e.invalid/s']\n", "utf-8")
+    _stub_registry(monkeypatch)
+    args = ["--pyproject", str(project), "--pyproject", str(tmp_path / "b" / "pyproject.toml")]
+    assert main(args) == 1
     assert "1 finding(s)" in capsys.readouterr().err
 
 
