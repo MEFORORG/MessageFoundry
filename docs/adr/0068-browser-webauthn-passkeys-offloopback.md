@@ -796,7 +796,9 @@ the account's known-address record, under the conditions `_mark_login_address_kn
 BACKLOG #2145). It moves no anchor and no window. So, unlike a TOTP code, a passkey never renews a window
 once the factor is met. `POST /ui/mfa` no longer re-renders the gate for a session that has
 already met its factor: a refused code there lands on `/ui`, as the page's GET does, with a
-notice that the session needed no code (vault BACKLOG #2964 item 21).
+notice that the session needed no code (vault BACKLOG #2964 item 21). An `oidc` session on an
+account with TOTP enrolled is the exception: its code is refused unread
+(`idp_step_up_required`) and it lands on a bare `/ui` without the notice.
 
 Unchanged: enrolment, TOTP confirm and passkey registration alike, does not re-anchor, since ADR
 0197 Amendment A lets a holder of the password alone enrol. The combined password-and-passkey

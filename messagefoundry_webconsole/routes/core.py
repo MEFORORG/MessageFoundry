@@ -2021,11 +2021,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return RedirectResponse("/ui?m=mfa_code_refused", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
-        # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
-        # already audited the failure of any code within the bound. Generic copy: the form cannot
-        # say whether the code was wrong or expired without narrowing a guess. A directory refusal
-        # narrows nothing, because the code was never checked (BACKLOG #2023), so it says what did
-        # happen.
+        # The submitted code is NOT echoed back — it is a bearer credential. verify_mfa has audited
+        # the failure of a code within the bound, except at least on an account with TOTP off,
+        # for example a passkey-only one, where it returns before any audit. Generic copy: the
+        # form cannot say whether the code was wrong or expired without narrowing a guess. A
+        # directory refusal narrows nothing, because the code was never checked (BACKLOG #2023),
+        # so it says what did happen.
         return HTMLResponse(
             pages.mfa_gate(
                 totp_enrolled=mfa.enabled,

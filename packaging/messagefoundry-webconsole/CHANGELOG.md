@@ -303,11 +303,13 @@ this line.**
 
 ### Fixed
 
-- **A refused code on a verified session no longer lands as a success does (vault BACKLOG #2964 item 21).**
+- **A refused code on a verified session, except an `oidc` one with TOTP enrolled, no longer lands
+  as a success does (vault BACKLOG #2964 item 21).**
   `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
   the same landing a success gets, so the refusal showed nothing. It now lands on
   `/ui?m=mfa_code_refused`, whose banner says the session needed no code and the code was not
-  accepted.
+  accepted. An `oidc` session that met its factor, on an account with TOTP enrolled, does not get
+  the notice: its code is refused unread (`idp_step_up_required`) and still lands on a bare `/ui`.
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page
