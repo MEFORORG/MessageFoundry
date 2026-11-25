@@ -306,8 +306,8 @@ this line.**
 - **A refused code on a verified session no longer lands as a success does (vault BACKLOG #2964 item 21).**
   `POST /ui/mfa` on a session that had already met its second factor sent a refused code to `/ui`,
   the same landing a success gets, so the refusal showed nothing. It now lands on
-  `/ui?m=mfa_code_refused`, whose banner says the session needed no code, so the code changed
-  nothing.
+  `/ui?m=mfa_code_refused`, whose banner says the session needed no code, so the code was not
+  used to sign in.
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page

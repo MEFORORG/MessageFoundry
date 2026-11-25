@@ -2014,9 +2014,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # A session that already met its factor owes this page nothing, as the GET says, so
             # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
             # has already audited and charged any code within the bound. The re-render below is
-            # pending-only. The notice says the code changed nothing (vault BACKLOG #2964 item
-            # 21): a bare /ui is what a success lands on, so the refusal read as one. It does not
-            # say the code was checked, since a lock or a directory refusal checks none.
+            # pending-only. The notice says the code was not used to sign in (vault BACKLOG #2964
+            # item 21): a bare /ui is what a success lands on, so the refusal read as one. It does
+            # not say the code changed nothing, since verify_mfa above may have audited it and
+            # charged it to the second-step lockout, nor that the code was checked, since a lock or
+            # a directory refusal checks none.
             return RedirectResponse("/ui?m=mfa_code_refused", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
