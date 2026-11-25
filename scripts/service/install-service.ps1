@@ -909,10 +909,10 @@ function Get-OtherServiceNamingPath {
       protected Windows services deny administrators that read, and none of them is an NSSM service.
 
       A SECOND SERVICE ON THE SAME -DataDir GETS THE SAME DEFAULT secrets directory, and
-      Set-SecretsDirAcl tries to remove every Allow entry but its own service's and the two admin
-      ones, and its read-back refuses any that survive. So adopting the directory would strip the
-      first service's read, and sharing it would let each service read the other's secrets. The
-      installer refuses instead.
+      Set-SecretsDirAcl tries to remove every Allow entry Get-Acl lists but its own service's and
+      the two admin ones, and its read-back refuses a listed one that survives. So adopting the
+      directory would strip the first service's read, and sharing it would let each service read
+      the other's secrets. The installer refuses instead.
     #>
     param([Parameter(Mandatory)][string]$ServiceName, [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)][string]$Path,
@@ -1013,9 +1013,11 @@ function Set-SecretsDirAcl {
       THE ACCOUNT'S GRANT IS ADDED, NEVER REPLACED. An existing directory may give a dedicated engine
       account more than read, for the Vault Agent sink route docs/CONFIGURATION.md describes, and a
       rerun must not take that away. Inheritance comes off, so a grant the directory inherited goes.
-      Every Allow entry for another account is targeted for removal (icacls /remove:g removes
-      grants only, so an explicit Deny entry stays; at least a conditional (callback) Allow entry
-      and an APPLICATION PACKAGE AUTHORITY entry survive it, and the read-back below refuses them):
+      Every Allow entry for another account that Get-Acl lists is targeted for removal (icacls
+      /remove:g removes grants only, so an explicit Deny entry stays; at least a conditional
+      (callback) Allow entry and an APPLICATION PACKAGE AUTHORITY Allow entry survive it, and the
+      read-back below refuses them; an object entry is not listed, so it is neither removed nor
+      refused):
       none is offered one, and anyone may have made the folder first under ProgramData.
 
       THROWS WHEN THE RESULT IS NOT RESTRICTED. Each step runs whatever the one before it did, so one
@@ -1057,7 +1059,8 @@ function Set-SecretsDirAcl {
     & icacls $Path /remove:g @broad | Out-Null
     # No other account is offered a grant here (docs/CONFIGURATION.md), and a folder made under
     # ProgramData may have been made by any local user first. So every other Allow entry is
-    # targeted; any that survives /remove:g is refused by the read-back.
+    # targeted; a listed one that survives /remove:g is refused by the read-back, and an object
+    # entry is neither.
     foreach ($holder in @(Get-BroadAclResidue -Path $Path -Account $Account)) {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:g $spelled | Out-Null
@@ -1243,10 +1246,11 @@ function Set-CustodyDirAcl {
       to it at start.
 
       THE ACCOUNT'S GRANT IS REPLACED, unlike the secrets directory's: no route needs more, so a
-      rerun takes back any wider grant. Every entry for another account is targeted for removal; at
-      least conditional entries and APPLICATION PACKAGE AUTHORITY entries survive icacls, and the
-      read-back judges what is left. The owner goes first, for the reason Set-SecretsDirAcl gives.
-      Throws when the result is not that.
+      rerun takes back a wider plain grant; a conditional one survives, and the read-back refuses
+      it only when it is wider. Every entry for another account that Get-Acl lists is targeted for
+      removal; at least conditional entries and APPLICATION PACKAGE AUTHORITY entries survive it,
+      an object entry is not listed, and the read-back judges only what is listed. The owner goes
+      first, for the reason Set-SecretsDirAcl gives. Throws when the result is not that.
     #>
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Account)
     $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
@@ -1267,7 +1271,9 @@ function Set-CustodyDirAcl {
         $problems += "inheritance could not be turned off with SYSTEM and Administrators granted (icacls exit $LASTEXITCODE)"
     }
     # A deny for the account, or for a group it is in, would outrank its grant, and /grant:r and
-    # /remove:g leave every deny in place, so each one goes. The read-back refuses any left.
+    # /remove:g leave every deny in place, so each one Get-Acl lists is targeted. At least a
+    # conditional deny and an APPLICATION PACKAGE AUTHORITY deny survive; the read-back refuses one
+    # that applies to the directory itself, and not an inherit-only one.
     $denied = @(try { (Get-Acl -LiteralPath $Path).Access } catch { @() }) | Where-Object {
         $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Deny -and -not $_.IsInherited }
     foreach ($holder in @($denied | ForEach-Object {
@@ -1277,8 +1283,9 @@ function Set-CustodyDirAcl {
         $spelled = if ($holder -match '^S-1-') { "*$holder" } else { $holder }
         & icacls $Path /remove:d $spelled | Out-Null
     }
-    # /grant:r replaces only an entry with the same inheritance flags, so every allow entry for the
-    # account goes first, and a wider one cannot survive beside the grant.
+    # /grant:r replaces only an entry with the same inheritance flags, so every plain allow entry for
+    # the account goes first; a conditional one survives, and the read-back refuses it only when it
+    # is wider than the grant.
     & icacls $Path /remove:g $Account | Out-Null
     # No inheritance flag: the grant is on the directory, and the key files carry their own lists.
     & icacls $Path /grant:r "${Account}:(RX,WD)" | Out-Null
