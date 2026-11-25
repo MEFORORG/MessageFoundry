@@ -219,13 +219,18 @@ the worktree in place and untouched either way, so the next session can see what
 ### The worktree gate refuses the tool call, not the commit
 
 The worktree gate is not a git hook. `scripts/worktree/install-gate.ps1` installs it as a PreToolUse
-hook in user scope, for the checkouts on its allowlist, and where it is installed it denies the
-tool call itself, long before commit time. It refuses at least a Write, Edit, MultiEdit or
-NotebookEdit into the primary's working tree, and some git commands aimed at the primary or at a
-linked worktree, so write inside your own worktree, by absolute path. It does not judge where an
-ordinary shell write, such as a redirect into a file, lands. [WORKTREE-GATE.md](WORKTREE-GATE.md),
-*What it blocks*, lists the rules, and the hook itself,
-[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
+hook in user scope, and where it is installed it denies the tool call itself, long before commit
+time. An empty allowlist of checkouts turns it off. Most of its rules protect the checkouts the
+allowlist names, but at least rules 1a, 1b and the opt-in rule 4 can refuse a call that targets
+none of them. It refuses at least a Write, Edit, MultiEdit or NotebookEdit into the primary's
+working tree or its `.git/` directory, apart from part of `.git/mefor-coord/`, and some git
+commands aimed at the primary or at a linked worktree, so write inside your own worktree, by
+absolute path. It does not judge where an ordinary shell write, such as a redirect into a file,
+lands. Such a write into the primary is not refused, and it still breaks rule 1; see
+[item 2](#a-builder-gets-one-turn-items-2-5-and-6-from-section-5) below.
+[WORKTREE-GATE.md](WORKTREE-GATE.md), *What it blocks*, describes some of the rules and says it is
+not the whole set. The hook itself, [`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1),
+is the source of record.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
 
