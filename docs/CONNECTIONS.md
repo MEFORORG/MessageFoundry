@@ -2441,7 +2441,9 @@ Two limits follow from this:
   file and a share Windows could not reach, saying the file must be a plain local path, not a
   share, a network drive, a link to one, or a path the check cannot read. A denial or fault on the
   file's own name can pass the walk, since Windows answers it from the folder's listing; the
-  read then refuses it as a file that could not be read. A missing name, which Windows reports as
+  file's own `stat` and read then judge it. A `stat` failure that libpq could not get past either,
+  at least a denial (code 5) or a missing name, is left to libpq; any other refusal there says its
+  `stat` failed or that it could not be read. A missing name, which Windows reports as
   code 2 or 3, ends the walk and is left to libpq. Another code Windows raises as not found is not
   read as a missing name: a share it could not reach is refused as above, and at least codes 161
   and 206 stop the walk, and the build is refused.
@@ -2450,7 +2452,8 @@ Two limits follow from this:
   application-data folder, which the engine asks the shell for as libpq does, through the ANSI
   call. Where that call returns a `?` past the drive, which it writes for a character the code
   page cannot hold, the engine cannot say which file libpq reads, so it refuses the build; set
-  `PGSSLROOTCERT` to a local path. Best-fit maps other such characters to other characters, and
+  `PGSSLROOTCERT` to a copy in a local folder only administrators and the service account can
+  write. Best-fit maps other such characters to other characters, and
   the engine checks that path like any other; one mapped to a character no Windows name holds,
   at least `*` for a fullwidth asterisk, refuses the build. Elsewhere it is under `.postgresql`
   in `HOME`, which libpq 15 and later read (or the password-file home when `HOME` is unset or

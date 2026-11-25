@@ -53,7 +53,7 @@ from dataclasses import dataclass
 from datetime import date
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, Self
 from urllib.parse import SplitResult, urlsplit
 
 from pydantic import (
@@ -417,6 +417,25 @@ class _Section(_InputHidingModel, NumbersRefuseBool):
                     raise ValueError(refusal)
         return data
 
+    @model_validator(mode="after")
+    def _refuse_non_finite_floats(self) -> Self:
+        """Refuse NaN or an infinity left in any float field once its own validators ran (BACKLOG
+        #5769).
+
+        No setting gives either a meaning as a number, and each slips past the usual range check:
+        NaN compares False against every bound, so a ``value <= 0`` refusal admits it, and +inf
+        admits ``value > 0``. A consumer then waits on a deadline or a cadence that never arrives,
+        such as a WAL checkpoint that never runs. This runs after the field validators, so a field
+        that already refuses a non-finite value keeps its own message, and one that reads ``inf`` as
+        a spelling of off (the ``[delivery]`` age thresholds) has turned it into ``None`` by now. A
+        model-wide ``allow_inf_nan=False`` would do neither. The message names the field, never
+        the value."""
+        for name in type(self).model_fields:
+            value = getattr(self, name)
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number; nan and infinity are refused")
+        return self
+
 
 #: Env var that explicitly permits MITM-able TLS overrides for a trusted-network dev/test bind,
 #: honoured only on an instance at ``[security].enforcement = warn``.
@@ -748,7 +767,8 @@ class StoreSettings(_Section):
     # their connection pool + concurrent submission instead. "Native commit_delay" is PostgreSQL-ONLY
     # (a durability-neutral GUC, a planned gated/off-by-default increment); SQL Server has NO durability-
     # neutral group-commit knob (its DELAYED_DURABILITY relaxes durability and is rejected for the PHI
-    # store), so its scale path is the concurrent pool + sharding (ADR 0037), not a native GUC.
+    # store), so its scale path is the concurrent pool + engine sharding (ADR 0037), not a native
+    # GUC.
     group_commit_window_ms: float = 0.0
     # Flush threshold for the group-commit committer: once this many members are enrolled in the open
     # batch, it commits immediately without waiting out the rest of `group_commit_window_ms` (bounds
@@ -932,10 +952,11 @@ class StoreSettings(_Section):
     # the check reads the sidecars off disk with no cache, so engine shards sharing one dir see each
     # other's files and the budget does NOT multiply (measured 2026-08-10 — two UploadStores over one
     # dir, the second refused the same uploader at quota, against a live positive control). The
-    # check-then-write race that used to survive across them — an overshoot of one file per shard
-    # caught between its scan and its write — is closed by an atomic reservation on the unified store
-    # every shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated once in
-    # `uploads.UploadQuotaError`. Shards given SEPARATE dirs get separate budgets, by construction.
+    # check-then-write race that used to survive across them — an overshoot of one file per engine
+    # shard caught between its scan and its write — is closed by an atomic reservation on the unified
+    # store every engine shard shares (ASVS 2.3.4, BACKLOG #1112); the surviving residuals are stated
+    # once in `uploads.UploadQuotaError`. Engine shards given SEPARATE dirs get separate budgets,
+    # by construction.
     max_upload_files_per_user: int = Field(
         default=100,
         ge=1,
@@ -971,7 +992,8 @@ class StoreSettings(_Section):
     # Default is SQL Server's port (1433); for the Postgres backend a left-at-default 1433 is treated
     # as "use Postgres's conventional 5432" by the model_validator below, so a Postgres deployment that
     # omits `port` still connects (set MEFOR_STORE_PORT explicitly to override either default).
-    port: int = 1433
+    # A TCP port a database server can listen on (BACKLOG #5769).
+    port: int = Field(default=1433, ge=1, le=65535)
     database: str | None = None
     auth: SqlAuth = SqlAuth.SQL
     username: str | None = None
@@ -1041,9 +1063,14 @@ class StoreSettings(_Section):
     # instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for
     # Postgres/SQLite (they never see the ODBC string). Default off — only multi-subnet AOAG needs it.
     multi_subnet_failover: bool = False
-    pool_size: int = 40
-    connect_timeout: int = 15  # seconds
-    command_timeout: int = 30  # seconds
+    # At least one connection; a pool of 0 could serve no borrow (BACKLOG #5769).
+    pool_size: int = Field(default=40, ge=1)
+    # Seconds (BACKLOG #5769). The login timeout is at least 1, as a connection's is
+    # (check_db_connect_timeout): asyncpg reads 0 as a deadline already past, so every connect would
+    # fail, and pyodbc reads it as the driver's default. The statement timeout keeps its
+    # documented 0 = no limit (STORE-3) and refuses only a negative.
+    connect_timeout: int = Field(default=15, ge=1)
+    command_timeout: int = Field(default=30, ge=0)
     # Upper bound (seconds) on ONE pooled-connection borrow from the server-DB store pool, and on the
     # throwaway pool a DatabaseRef reference sync opens (BACKLOG #1052, ASVS 13.2.6). Server-DB only —
     # SQLite has no pool. `connect_timeout` bounds the LOGIN and `command_timeout` the STATEMENT;
@@ -1773,7 +1800,9 @@ def _check_ws_allowed_origin(entry: str, position: int) -> None:
 
 class ApiSettings(_Section):
     host: str = "127.0.0.1"  # Phase 1 = localhost only
-    port: int = 8765
+    # 0 to 65535 (BACKLOG #5769): 0 asks the OS for a free port, and supervise counts each engine
+    # shard's port up from this one.
+    port: int = Field(default=8765, ge=0, le=65535)
     # Serve the API documentation routes, at least /docs, /redoc and /openapi.json, with no sign-in.
     # Off by default; on, it widens the surface and security_loosenings() names it (#2385).
     expose_docs: bool = False
@@ -3590,9 +3619,10 @@ class AuthSettings(_Section):
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
     # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
-    # 0 = unlimited.
+    # 0 = unlimited. A negative cap is refused at load (BACKLOG #5318): it used to read as unlimited
+    # too, a second spelling of off that nobody means.
     # Default 5 (WP-10): generous for a few devices/console instances.
-    max_sessions_per_user: int = 5
+    max_sessions_per_user: int = Field(default=5, ge=0)
     # Step-up re-verification (ASVS 7.5.3): a highly sensitive operation requires the session to have
     # re-verified its credential -- at login, via POST /me/reauth, or with a code at
     # POST /auth/mfa-verify (or their console twins) -- within this many seconds. A LOCAL login
@@ -3714,7 +3744,9 @@ class AuthSettings(_Section):
     admin_new_ip_step_up: bool = True
 
     # Local-password policy — ASVS 5.0-aligned (WP-3): length-first, no mandatory composition.
-    password_min_length: int = 15
+    # 0 sets no floor (a loosening security_loosenings() names); a negative is refused at load
+    # (BACKLOG #5318), as a second spelling of 0.
+    password_min_length: int = Field(default=15, ge=0)
     # Character-class requirements are OFF by default (ASVS forbids mandatory composition) but kept
     # as opt-in knobs for deployments with a legacy standard that still mandates them.
     password_require_uppercase: bool = False
@@ -3959,8 +3991,10 @@ class AuthSettings(_Section):
     oidc_authorization_endpoint: str | None = None  # https, pinned
     oidc_token_endpoint: str | None = None  # https, pinned
     oidc_jwks_uri: str | None = None  # https, pinned
-    # Defence-in-depth allow-list: every OIDC endpoint host must appear here (the model-validator
-    # checks it, and jwks/flow re-check before each outbound call). Refused empty when enabled.
+    # Defence-in-depth allow-list: every OIDC endpoint host must appear here. Only the
+    # model-validator reads it, at load; no OIDC runtime module checks it again before an outbound
+    # call (BACKLOG #5318 item 1). The pinned URLs cannot change without a restart, which re-runs
+    # the validator. Refused empty when enabled.
     oidc_allowed_endpoints: list[str] = Field(default_factory=list)
     # The engine's OWN back-channel TLS trust for the IdP. transports/rest.py uses OpenSSL's default
     # trust, which does NOT consult the Windows machine store — a domain-issued / self-signed IdP cert
@@ -4003,8 +4037,11 @@ class AuthSettings(_Section):
     # while oidc_require_mfa_claim is off (BACKLOG #2325). A whitespace-only value loads as None.
     oidc_acr_values: str | None = None
     oidc_prompt: str | None = None  # requested `prompt` authorize param; blank loads as None
-    oidc_jwks_ttl_seconds: int = 3600
-    oidc_jwks_min_refetch_seconds: int = 300  # the amplification bound
+    # 0 serves no key as fresh, so each unknown or stale lookup asks for a fetch, still throttled by
+    # the refetch bound below; 0 there removes that bound. A negative is refused for both (BACKLOG
+    # #5318): the consumers read it as 0.
+    oidc_jwks_ttl_seconds: int = Field(default=3600, ge=0)
+    oidc_jwks_min_refetch_seconds: int = Field(default=300, ge=0)  # the amplification bound
     oidc_flow_ttl_seconds: int = 300  # single-use flow window; validator-capped 30..1800
     # The FLOOR beside that ceiling (BACKLOG #2301, ASVS 2.4.2), PROVISIONAL: a callback that returns
     # sooner than this after its flow started is refused as "federated sign-in failed". A step-up
@@ -4025,8 +4062,13 @@ class AuthSettings(_Section):
     # are both on. A value oidc_mfa_amr_values also accepts is refused at load while the claim
     # gate is on: every token the gate admits by it would skip the floor, the floor off in effect.
     oidc_callback_floor_exempt_amr: list[str] = Field(default_factory=list)
-    oidc_flow_cache_max: int = 512  # reject-when-full (never evict — that is a login DoS)
-    oidc_session_max_hours: int | None = None  # G2: cap below id_token.exp if tighter is wanted
+    # Reject-when-full (never evict — that is a login DoS). At least 1 (BACKLOG #5318): 0 or less
+    # refused every federated sign-in and step-up.
+    oidc_flow_cache_max: int = Field(default=512, ge=1)
+    # G2: cap below id_token.exp if tighter is wanted. None = no cap. At least 1 (BACKLOG #5318):
+    # the service skips a falsy cap, so 0 meant no cap, and a negative one ended every federated
+    # session as it was minted.
+    oidc_session_max_hours: int | None = Field(default=None, ge=1)
     # ASVS 6.8.4 / 7.6.1, BACKLOG #296 / #1150: the most time, in seconds, that may pass between the
     # user's authentication AT THE IdP and the end of the engine session it mints. Sent as `max_age` on
     # every authorization request, so a conforming IdP re-authenticates only when its own SSO session
@@ -4041,32 +4083,39 @@ class AuthSettings(_Section):
     # Login rate limiting (AUTH-RATE) — in-process sliding window in front of the per-account
     # lockout: bounds password-spray + argon2 CPU-burn. In-process only; an exposed/multi-host
     # deployment must also front the API with a proxy/WAF limiter. 0 disables a limit, and a window
-    # of 0 or less disables both. A count above its default, a window below it, and each off value is
+    # of 0 disables both. A negative count or window is refused at load (BACKLOG #5318): a negative
+    # per-address count refused every attempt after an address's first, a negative global count
+    # refused every attempt, the first included, and a negative window was a second spelling of 0.
+    # A count above its default, a window below it, and each off value is
     # a LOOSENING that `security_loosenings()` names (BACKLOG #1131); so are the
     # PHI-read, admin-write, session-cap and OIDC flow-cache limits below.
     login_rate_limit_enabled: bool = True
-    login_rate_limit_per_ip: int = 10  # max attempts per client IP per window
-    login_rate_limit_global: int = 60  # max attempts across all clients per window
+    login_rate_limit_per_ip: int = Field(default=10, ge=0)  # max attempts per client IP per window
+    login_rate_limit_global: int = Field(default=60, ge=0)  # max attempts, all clients, per window
     # No nan/inf (vault BACKLOG #2466): the limiter prunes a hit once it is older than the window,
     # and no hit is ever older than a NaN or +inf one. The counts then fill once and never drain, so
     # after login_rate_limit_global attempts every sign-in would be refused until a restart. A huge
     # finite window does the same in practice, so it is capped (_RATE_WINDOW_MAX_SECONDS). -inf is
-    # refused with them; 0 and a finite negative still load, as the named off value above.
+    # refused with them, and so is a finite negative; 0 still loads, as the named off value above.
     login_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Anti-automation on the authenticated PHI-read endpoints (WP-8, ASVS 2.4.1): a per-actor sliding
     # window over /messages, /messages/{id}, /dead-letters — bounds scripted PHI harvesting on top of
     # pagination + access auditing. Generous by default (clears console/human use); in-process only,
-    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension.
+    # so an exposed deployment must also front a proxy/WAF limiter. 0 disables that dimension; a
+    # negative count or window is refused at load, as for the sign-in limits (BACKLOG #5318).
     phi_read_rate_limit_enabled: bool = True
-    phi_read_rate_limit_per_actor: int = 120  # max PHI reads per user per window
-    phi_read_rate_limit_global: int = 0  # max PHI reads across all users per window (0 = off)
+    phi_read_rate_limit_per_actor: int = Field(
+        default=120, ge=0
+    )  # max PHI reads per user per window
+    # Max PHI reads across all users per window (0 = off).
+    phi_read_rate_limit_global: int = Field(default=0, ge=0)
     # No nan/inf, for the reason login_rate_limit_window_seconds gives: the count would fill once
     # and then refuse every PHI read until a restart. Capped for the same reason.
     phi_read_rate_limit_window_seconds: float = Field(
-        default=60.0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
+        default=60.0, ge=0, allow_inf_nan=False, le=_RATE_WINDOW_MAX_SECONDS
     )
 
     # Per-actor pacing on six monitoring:read GETs (vault BACKLOG #1191, ASVS 15.2.2):
@@ -7758,7 +7807,9 @@ class DrSettings(_Section):
 
     ``enabled``/``activate`` are read at engine start (the DR run-profile is a startup decision, ADR
     0048); a deployment is either a DR box (``enabled = true``) or it is not. ``activate = true`` (or
-    the operator endpoint) declares this box should run under the DR profile this boot.
+    the operator endpoint) declares this box should run under the DR profile this boot. Without
+    ``enabled``, ``activate = true`` is refused at load, where it was silently ignored (BACKLOG
+    #5965).
     """
 
     # Opt-in master switch: is this deployment a DR standby box at all? false = the engine runs the
@@ -7767,7 +7818,7 @@ class DrSettings(_Section):
     # Whether this DR box should come up UNDER the DR run-profile on this boot (the startup activation
     # latch — distinct from the runtime POST /dr/activate endpoint, which re-evaluates the graph). When
     # enabled but activate=false the box is provisioned-but-passive: it does NOT bind the priority feeds
-    # until an operator activates it. A no-op unless enabled.
+    # until an operator activates it. Refused at load unless enabled (BACKLOG #5965).
     activate: bool = False
     activation_mode: DrActivationMode = DrActivationMode.MANUAL
     # The DR run-profile threshold: start ONLY connections whose resolved priority rank >= this tier's
@@ -7793,12 +7844,17 @@ class DrSettings(_Section):
     # The #60 .mfbak backup archive to cold-seed the DR store from on activation. "" = the operator
     # supplies the archive path in the POST /dr/activate request body instead (the runbook path),
     # which needs seed_dir below. A URL is rejected (the seed is local/UNC only, like the
-    # backup destination — no new egress).
+    # backup destination — no new egress). With seed_dir also empty, a passive box (enabled, with
+    # activate = false) is refused at load: no activation could ever name a seed (BACKLOG #5965 item
+    # 1). A box latched with activate = true loads with neither set; what that means after POST
+    # /dr/release is stated once, in the [dr] enabled row of docs/CONFIGURATION.md. Whitespace-only
+    # is refused too.
     seed_archive: str = ""
     # The one directory a POST /dr/activate request body may name an archive under (vault BACKLOG
     # #2581). "" (the default) = a request may name NO archive, and activation uses seed_archive,
     # which is operator configuration and is not confined. Must be absolute. A URL is
-    # rejected, like seed_archive.
+    # rejected, like seed_archive. With seed_archive also empty, a passive box is refused at load;
+    # see seed_archive above (BACKLOG #5965). Whitespace-only is refused too.
     seed_dir: str = ""
     # OPT-IN server-DB DR restore-token (BACKLOG #223, ADR 0102 — option b). A LOCAL/UNC path to a small
     # JSON token the DBA/operator places on the DR box recording the EXPECTED source-backup anchor of a
@@ -7807,7 +7863,8 @@ class DrSettings(_Section):
     # the #102 server-DB seed gate cross-checks it against the restored DB's OWN latest successful dr_backup
     # archive — a VINTAGE FLOOR a bare boolean attestation cannot give (a stale/wrong native restore's
     # latest anchor differs → activation refuses closed). "" (the default) = OFF: the #102 gate is
-    # byte-unchanged and SQLite is a no-op. A URL is rejected (local/UNC only, like seed_archive).
+    # byte-unchanged. A URL is rejected (local/UNC only, like seed_archive). Whitespace-only is
+    # refused, and so is any value on a SQLite store, where no check reads it (BACKLOG #5965 item 1).
     restore_token: str = ""
     # Environment variable NAMES the takeover and release hooks are given, beyond the allowlist
     # messagefoundry/childenv.py hook_environment builds: a cloud profile, a proxy, a credential
@@ -7836,6 +7893,19 @@ class DrSettings(_Section):
             )
         return value
 
+    @field_validator("seed_archive", "seed_dir", "restore_token")
+    @classmethod
+    def _path_not_blank(cls, value: str, info: ValidationInfo) -> str:
+        # "" switches each off. A blank or space-padded value is a path activation would try to open
+        # as written and abort on every time, during the disaster (BACKLOG #5965 item 1).
+        if value and not value.strip():
+            raise ValueError(f"[dr].{info.field_name} must be a non-blank path (or omit it)")
+        if value != value.strip():
+            raise ValueError(
+                f"[dr].{info.field_name} must not begin or end with whitespace; remove the padding"
+            )
+        return value
+
     @field_validator("takeover_timeout_seconds")
     @classmethod
     def _positive_timeout(cls, value: float) -> float:
@@ -7856,11 +7926,11 @@ class DrSettings(_Section):
     @field_validator("seed_dir")
     @classmethod
     def _seed_dir_absolute(cls, value: str) -> str:
-        # "" switches request-named archives off. A blank-but-present or relative value would
-        # instead resolve against the service's working directory and quietly open that. So blank
-        # reads as "" and relative fails at load. "Absolute" is judged for THIS platform, the one
-        # that will resolve it: a rooted path with no drive is relative on Windows.
-        value = value.strip()
+        # "" switches request-named archives off. A relative value would instead resolve against
+        # the service's working directory and quietly open that, so it fails at load; a blank or
+        # padded one is refused above, as seed_archive's is (BACKLOG #5965). "Absolute" is judged
+        # for THIS platform, the one that will resolve it: a rooted path with no drive is relative
+        # on Windows.
         if value and not os.path.isabs(value):
             # The value is not quoted: a URL that _looks_like_url missed could carry a
             # credential (vault BACKLOG #2600).
@@ -7889,6 +7959,33 @@ class DrSettings(_Section):
                 "[dr].activation_mode='auto' is not yet supported — automatic HA-pair-loss detection "
                 "and self-promotion are deferred to a future ADR (ADR 0048); use activation_mode='manual' "
                 "(the default) and the RBAC-gated POST /dr/activate operator action"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _activate_needs_enabled(self) -> DrSettings:
+        # BACKLOG #5965: without enabled the engine never read activate, so a box an operator
+        # meant to bring up under the DR run-profile came up as an ordinary engine with nothing
+        # said. With enabled it is the startup latch, unchanged.
+        if self.activate and not self.enabled:
+            raise ValueError(
+                "[dr].activate = true needs [dr].enabled = true: it brings a DR box up under the "
+                "DR run-profile, and has no meaning on a box that is not a DR box"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enabled_names_a_seed(self) -> DrSettings:
+        # BACKLOG #5965 item 1: on a passive box with neither set, every activation aborts for
+        # want of a seed, and that is found only during the disaster. seed_archive names one;
+        # seed_dir lets the POST /dr/activate request name one. A box under activate = true is
+        # exempt: it takes the startup latch, which reads no seed, and that path is unchanged
+        # here (its routing through a seeded activation is the open part of BACKLOG #5965).
+        if self.enabled and not self.activate and not self.seed_archive and not self.seed_dir:
+            raise ValueError(
+                "[dr].enabled = true needs [dr].seed_archive or [dr].seed_dir: with neither, "
+                "POST /dr/activate could never name the cold seed it verifies, so every activation "
+                "would abort"
             )
         return self
 
@@ -8563,9 +8660,9 @@ class ServiceSettings(_InputHidingModel):
         return self
 
     @model_validator(mode="after")
-    def _dr_activate_not_clustered(self) -> ServiceSettings:
-        """A DR box coming up under the DR run-profile must not also be a ``[cluster]`` member (ADR 0096
-        rider). The two govern DIFFERENT things — ``[dr].activate`` gates which *connections* start (the
+    def _dr_not_clustered(self) -> ServiceSettings:
+        """A DR box must not also be a ``[cluster]`` member (ADR 0096 rider). The two govern
+        DIFFERENT things — an activated ``[dr]`` box gates which *connections* start (the
         priority-threshold run-profile, ADR 0048), while ``[cluster].enabled`` makes the node contend for
         *leadership* of a shared store — and combining them is a topology error: a warm DR-site engine
         should be a NON-PROMOTABLE cluster member (``[cluster].promotable = false``) OR a cold/manually
@@ -8574,11 +8671,12 @@ class ServiceSettings(_InputHidingModel):
         Spans two sections, so it lives here (not on either section, which can't see the other).
 
         ``[dr].enabled`` is refused with ``[cluster].enabled`` as well, whatever ``activate`` says
-        (vault BACKLOG #3263). A provisioned DR box that is not activated is passive: it binds no
-        listener and delivers nothing (ADR 0048). As a cluster member it could win the lease and
-        then serve nothing, and ``POST /dr/activate`` would make it the lease-contending DR box
-        the check above refuses at boot."""
-        if (self.dr.enabled or self.dr.activate) and self.cluster.enabled:
+        (vault BACKLOG #3263); ``activate`` without ``enabled`` is refused on its own (BACKLOG
+        #5965). A provisioned DR box that is not activated is passive: it binds no listener and
+        delivers nothing (ADR 0048). As a cluster member it could win the lease and then serve
+        nothing, and ``POST /dr/activate`` would make it the lease-contending DR box described
+        above."""
+        if self.dr.enabled and self.cluster.enabled:
             key = "[dr].activate" if self.dr.activate else "[dr].enabled"
             raise ValueError(
                 f"{key} cannot be combined with [cluster].enabled: the DR run-profile gates which "
@@ -8588,6 +8686,20 @@ class ServiceSettings(_InputHidingModel):
                 "engine cold (or manually promoted) with [cluster] disabled, or make the warm DR node a "
                 "NON-PROMOTABLE cluster member ([cluster].enabled=true, [cluster].promotable=false) "
                 "instead of a [dr] box."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _dr_restore_token_needs_a_server_db(self) -> ServiceSettings:
+        """``[dr].restore_token`` is read only by the server-DB seed gate (BACKLOG #223), so on a
+        SQLite store it was a silent no-op an operator could take for provenance protection
+        (BACKLOG #5965 item 1). SQLite's own seed check verifies the whole store, so there is
+        nothing for it to add. Refused, as ``[store].db_schema`` is off Postgres; the message names no
+        configured value."""
+        if self.dr.restore_token and self.store.backend is StoreBackend.SQLITE:
+            raise ValueError(
+                "[dr].restore_token applies only to a Postgres or SQL Server store; on SQLite no "
+                "check reads it (the cold-seed archive verifies the whole store instead). Remove it"
             )
         return self
 
@@ -9734,9 +9846,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       admin-write limiters) treats a
       falsy count as "no limit on that dimension" and admits more as a count rises. It prunes every hit
       older than the window, so a SHORTER window admits more, and one of 0 or less prunes each hit
-      before it is counted. A negative count refuses more, so it is not named; the admin-write
-      count (BACKLOG #3293) and the two monitoring-read counts (vault BACKLOG #1191) refuse a
-      negative value at load, so only the others reach here. A NaN or infinite
+      before it is counted. The load refuses a negative count or window (BACKLOG #3293 for the
+      admin-write count, #5318 for the sign-in and PHI-read ones, vault BACKLOG #1191 for the
+      monitoring-read ones), so none reaches here. A NaN or infinite
       window never reaches this function: the load refuses it (vault BACKLOG #2466), since a NaN or
       ``+inf`` one never prunes. A ``min_interval_seconds`` of 0 turns the gap off, and a shorter gap
       admits a faster burst.
@@ -9746,10 +9858,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       lower ceiling is looser, and one equal to ``lockout_minutes`` turns the doubling off. A ceiling
       at the default or above is not named even when it equals ``lockout_minutes``: every lock then
       lasts at least as long as the default's longest.
-    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0 or less, and a higher cap keeps
-      more sessions live.
+    * ``_enforce_session_cap`` skips a ``max_sessions_per_user`` of 0, and a higher cap keeps more
+      sessions live. The load refuses a negative cap (BACKLOG #5318).
     * ``FlowCache`` refuses a new federated flow once it holds ``oidc_flow_cache_max`` pending ones, so
-      a higher cap holds more and 0 or less refuses every flow, which is stricter, not looser.
+      a higher cap holds more. The load refuses a cap below 1 (BACKLOG #5318), which refused every
+      flow.
 
     A part of a limiter is named only while that limiter is built, as ``email_tls_verify`` sits under
     ``email_use_tls``: with the limiter off, a weak count or window changes nothing and would only
@@ -9915,7 +10028,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
             f"the window of the per-address and all-clients sign-in limits, and of {ceremonies},"
         ),
         off=(
-            "the sign-in rate-limit window is zero or negative, which ages every attempt out "
+            "the sign-in rate-limit window is zero, which ages every attempt out "
             "before it is counted -- neither the per-address nor the all-clients sign-in "
             f"limit holds, and nor does {ceremonies}, although login_rate_limit_enabled "
             "still reads as on"
@@ -10022,7 +10135,7 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         auth.phi_read_rate_limit_window_seconds,
         what="the PHI-read rate-limit window",
         off=(
-            "the PHI-read rate-limit window is zero or negative, which ages every read out before "
+            "the PHI-read rate-limit window is zero, which ages every read out before "
             "it is counted -- no PHI-read limit holds, although phi_read_rate_limit_enabled still "
             "reads as on"
         ),
@@ -10190,11 +10303,11 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
                 )
             )
 
-    # --- concurrent sessions (ASVS 7.1.2). 0 or less means unlimited, so a negative cap is off too.
+    # --- concurrent sessions (ASVS 7.1.2). 0 means unlimited; the load refuses a negative cap.
     sessions = auth.max_sessions_per_user
     _count(
         "max_sessions_per_user",
-        max(sessions, 0),
+        sessions,
         what="the per-user cap on live sessions",
         so=(
             "a user may hold that many sessions at once before the oldest is revoked, and more "
@@ -10207,8 +10320,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         ),
     )
 
-    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, so 0 or
-    # less refuses every flow, which is stricter; only a cap above the default is looser.
+    # --- the federated sign-in flow cache. Built only with OIDC on. It refuses at the cap, and the
+    # load refuses a cap below 1, so only a cap above the default is looser.
     if auth.oidc_enabled:
         _count(
             "oidc_flow_cache_max",

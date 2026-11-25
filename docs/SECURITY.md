@@ -945,7 +945,7 @@ below that, at 1 s, because M is an average and some people are faster. The comm
   start and its callback, and it cannot check the IdP's own anti-automation. This is a decided
   limitation of the floors, recorded on 2026-10-09 under BACKLOG #1115. It still counts as a gap.
   The sign-in rate limit would still apply to that path, and it does not detect automation either.
-  Switching it off, or setting its window to 0 or less or both its counts to 0, removes it.
+  Switching it off, or setting its window to 0 or both its counts to 0, removes it.
   [Business-logic limits](#business-logic-limits-asvs-213) gives its size and settings. The [Route
   to limiter map](#route--limiter-map) lists the routes that charge it, and says when the "you are
   leaving this site" confirm is shown before the start. That confirm is no control on this path: a
@@ -1697,9 +1697,19 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else. They are built for the web console's later ADR 0215 slices to
+the caller and reads nothing else, except the check routes for the permissions in
+`SCOPED_READER_REFUSALS`. At the time of writing those are `/auth/check/audit:read`,
+`/auth/check/audit:export` and `/auth/check/logs:view`, which refuse a channel-scoped caller 403, as
+`GET /audit`, `GET /audit/export` and `GET /logs/tail` refuse every such caller, and write the
+rows those routes write for it: the gate's grant row where the gate writes one, then the same
+`auth.channel_denied` row (`SCOPED_READER_REFUSALS` in `messagefoundry/api/message_scope.py`,
+BACKLOG #4346). They match those routes on channel scope only: `/auth/check/logs:view` does not
+run the PHI-read gate `GET /logs/tail` runs. A check route whose permission's routes refuse a
+scoped caller for another reason still answers it 200: at least `/auth/check/messages:purge`
+does, although every purge route refuses a channel-scoped caller. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
-yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
+yet. Apart from those refusals, which tell a channel-scoped caller what the real route's 403
+tells it, a caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
 `auth.permission_granted` row naming its permission wherever a grant of that permission is
 audited (`record_check_grant`). Under `[security].audit_all_authorization_decisions`, on by default, that is every
 permission, the two PHI views `messages:view_raw` and `messages:view_summary` included: their own
@@ -1949,7 +1959,7 @@ exempt like any other, and the save re-seals the row as it always has.
 | `GET` | `/uploads` | `files:browse` | `require` | metadata only — no body, no summary; **owner-scoped** (ASVS 8.2.2) — the caller sees only the files they uploaded unless they hold `files:access_any`; **paged** `limit`/`offset` (50, 1..500 / 0..), the window applied AFTER the owner filter so a page's length can never encode another operator's file count |
 | `GET` | `/uploads/{file_id}/messages` | `files:browse` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (bulk decrypt + split); **owner-only** — another operator's file answers **404**, before the decrypt |
 | `POST` | `/uploads/{file_id}/messages/search` | `files:browse` | `require_step_up` | the needle-bearing sibling of the browse GET (BACKLOG #1184); same owner-only 404 before the decrypt, same bulk PHI-read pacing |
-| `POST` | `/uploads/{file_id}/resend` | `files:browse` **+** `messages:edit` | `require_step_up_action` (action `upload_resend`) | vault BACKLOG #2625: it injects a message, so `files:browse`, a read, is not enough alone; fails closed on either permission. Per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404) |
+| `POST` | `/uploads/{file_id}/resend` | `files:browse` **+** `messages:edit` | `require_step_up_action` (action `upload_resend`) | vault BACKLOG #2625: it injects a message, so `files:browse`, a read, is not enough alone; fails closed on either permission. Per-channel `can_access_channel` check on the target inbound (403) **and** an owner check on the source file (404). After the channel check, an acting username that is blank or has surrounding whitespace is refused 403 with `X-Refusal-Code: username_unusable` and an `upload.resend_reject` row, since it cannot label the injected message (BACKLOG #6589) |
 | `DELETE` | `/uploads/{file_id}` | `files:delete` | `require_step_up` | destructive, audited; **owner-only** — another operator's file answers **404** and is never unlinked |
 
 > **Object-level authorization for uploaded files (ASVS 8.2.2).** An uploaded file belongs to the
@@ -2427,12 +2437,28 @@ the same permission set on the same method reds CI until it is listed here.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
 > whose sibling `connections_html` field **is** scoped, so a single frame carries both rules.
-> `GET /metrics` is the exception in the other direction: the Prometheus exposition is keyed by
-> connection and destination and is **not** narrowed, so on a first deployment any `monitoring:read`
-> holder would read every connection's series regardless of scope (tracked as BACKLOG #1152).
-> This paragraph is derived, not asserted: `tests/test_monitoring_scope_doc_drift.py` executes each
-> route above against a scoped caller with an all-channels caller as the control, and reds if the
-> prose and the app disagree.
+> `GET /metrics` is narrowed as well (BACKLOG #4346): a scoped caller reads the per-connection series
+> of its own inbounds only, and no per-destination or latency series, because their `destination`
+> label names an outbound, and the connections dashboard and the graph hide outbounds from such a
+> caller. Its aggregates that carry no connection or destination label stay global, like the
+> counters above. A scraper that needs the whole
+> estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
+> with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
+> `auth.channel_denied` row naming no channel and the operation, `audit_read`, `audit_export` or
+> `logs_view`: a log line names no single channel, and the owner's answer for the
+> audit trail was to narrow or refuse such a reader. So a built-in Auditor, or an Operator reading
+> the log, needs the all-channels grant. `tests/test_scoped_caller_metrics_logs_audit.py` executes
+> these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
+> `/ui/audit` calls the same core as `GET /audit` through the console seam; no test executes those
+> two refusals.
+> `tests/test_monitoring_scope_doc_drift.py` executes GET /channels, GET /connections,
+> GET /events, GET /graph/edges, GET /alerts/active and GET /metrics as narrowed reads, and
+> GET /stats and GET /metrics/history as global ones, against a scoped caller with an
+> all-channels caller as the control. It does not measure at least the `/ws/stats` fields, the
+> per-name 403s, an outbound the scope lists in GET /alerts/active, the control half of the
+> GET /connections shared-outbound suppression, or the GET /metrics latency-series drop. On the prose side it checks, among other things, that each of those route tokens appears
+> somewhere in this DLQ-SCOPE blockquote; it does not check which paragraph holds a token or which
+> side of the rule it is on. It does not check the refusal sentence.
 
 > **The per-name connection routes do not tell a scoped caller which names exist (BACKLOG #2551).**
 > This covers at least `GET /connections/{name}/metadata` and `POST /connections/{name}/test`,
@@ -2456,9 +2482,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `auth.gate_refused` and `auth.mfa_denied`). An admitted caller's grant row is written under the
 > shipped default of `[security].audit_all_authorization_decisions`; with that switch off it is
 > written on the POST routes, whose permissions are in the sensitive set, and not on the GET routes.
-> The console checks the rule before it calls in. `audit_channel_denied`
+> The console checks the rule before it calls in. `record_channel_denied`
 > in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks the name it is given against the rule too, and records a name
+> the console seam record (`audit_channel_denied` and `refuse_a_channel_scoped_reader` call it), checks the name it is given against the rule too, and records a name
 > that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
 > unbounded length. For its own refusal of a channel-scoped actor's bulk selection the console
 > gives it an empty name, never the caller's text. A row written for a name that fails the rule
@@ -2555,13 +2581,13 @@ the same permission set on the same method reds CI until it is listed here.
 > `audit_all_authorization_decisions`, every JSON request already writes a grant row, so this
 > adds at most one row per request. With that switch off, this row is the only one such a read
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
-> that polled would need the row coalesced. The counts are a disclosure in their own right. A
-> scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> it was not shown. That count includes at least rules outside its scope, rules withheld by the
-> inbound, outbound, `restart_outbound` and event-type tests above, and, with no graph loaded, every rule that names a
-> connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
-> Without either, one extra write's latency can show that some rule was withheld. It cannot show
-> which rules or how many. Why it is not
+> that polled would need the row coalesced. The counts are a disclosure in their own right, but
+> not to the scoped caller itself: `GET /audit` and `GET /logs/tail`, where they are written,
+> refuse a channel-scoped caller (BACKLOG #4346). The withheld count includes at least rules
+> outside the caller's scope, rules withheld by the inbound, outbound, `restart_outbound` and
+> event-type tests above, and, with no graph loaded, every rule that names a connection, so it is
+> not a count of rules outside the scope alone. One extra write's latency can show the scoped
+> caller that some rule was withheld. It cannot show which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
 > `messagefoundry/api/app.py` (BACKLOG #3403).
 > `tests/test_channel_rbac.py` pins the six routes, not that list.
@@ -6190,7 +6216,9 @@ on that session, for example) ends it as a revocation would.
   `users:manage`, would still receive the lock rows. A role change through the API revokes the
   session, so that loss stops the export with the reason `standing_changed`. Only when the session
   survives the loss, as after a direct store write or on a page checked before the revoke lands,
-  does it stop with the reason `scope_changed`. A stop records `audit.export.stopped` with the counted and streamed rows and
+  does it stop with the reason `scope_changed`. A caller that comes back channel-scoped on a
+  surviving session stops it with the reason `channel_scoped`, since such a caller may not read
+  the trail at all (BACKLOG #4346). A stop records `audit.export.stopped` with the counted and streamed rows and
   the reason, then raises to abort the transfer, which reaches the client as a failed download,
   as the bulk export bullet above says. The idle clock moves at most every quarter of the window,
   as the bulk export's does, but the quarter is counted from when the stream starts sending, not
@@ -6920,9 +6948,10 @@ under running engines skips that moment, so stop every engine process and cluste
 store before the restore):
 
 - run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
-  finds, of any account, and writes one `auth.session_revoked` audit row; *Limits of the session
-  sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
-  may miss;
+  finds, of any account, then writes one `auth.session_revoked` audit row, and says so when the
+  store refuses that row or when the outcome of the revoke itself is unknown; *Limits of the
+  session sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says
+  what it may miss;
 - re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of
   what a restore rolls back, and the guide lists its classes; it applies to these restores too.
   The source's audit log, or its off-host copy, lists the changes themselves.
@@ -7434,11 +7463,11 @@ threshold, the switch that disables it, and — the part that matters for "not d
 | 4 | **argon2 concurrency cap** | executor exhaustion under a login flood | an instance semaphore sized `max(2, min(8, cpu_count))`; every hash/verify runs off the event loop | none | n/a |
 | 5 | **Request-body cap + field limits** | oversized/ambiguous auth requests | ASGI middleware ahead of every route: any `Transfer-Encoding` (**411** for a coding list ending in a single `chunked` with no `Content-Length`, otherwise **400**), a `Content-Length` that is not one line of plain decimal digits (**400**), and a declared length over 1 MiB (**413**; the upload routes `/uploads` and `/ui/uploaded-logs/upload` alone admit up to `[store].max_upload_bytes`), each refused with the connection closed on HTTP/1.x (HTTP/2 and HTTP/3 forbid the `Connection` field, so a refusal there does not ask for a close). Every admitted request's body is also counted as the route reads it and held to the same cap, because a host need not deliver what the headers declare: at the first chunk past the cap the route gets a disconnect, and the client a **413** unless a response has already started, when no 413 is sent and the log says so. The count is held to the cap, not to the declared length. Under `serve`, llhttp ends a body at its `Content-Length` and frames a request with neither header as an empty body, so the count cannot pass the cap there; at least HTTP/2, HTTP/3 and an in-process ASGI call can deliver a body no header announced, or more than its `Content-Length`. A call with no body is admitted. Under `serve`, the pinned llhttp parser refuses some framing with its own **400**: most in the request head, so the middleware never runs; a malformed chunk in the body, unless the middleware's 411 has already closed the connection. [DEPLOYMENT.md](DEPLOYMENT.md#a-proxy-in-front-of-the-api-must-refuse-the-request-shapes-the-engine-refuses) lists the measured shapes | none | n/a |
 | 6 | **Pre-auth client-network gate** | reaching the auth surface at all from an unlisted network | membership in `[security].allowed_client_networks` | `[]` = no restriction (the default) | limiters 1–3 |
-| 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` rejects **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). No validator floors it; treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
+| 7 | **Federated pending-flow bound** (`FlowCache.put`, **reject-when-full**) | flooding the OIDC start legs to exhaust engine memory or deny federated sign-in and step-up. The sign-in start is `POST /ui/oidc/start`, and `GET /ui/oidc/start` when its 3.7.3 interstitial is skipped, because that GET then runs the POST leg and stages a flow; with the interstitial shown, the default, the GET stages nothing — see the [Route → limiter map](#route--limiter-map). The step-up start is `POST /ui/reauth/oidc`, whose `begin_oidc_step_up` stages its flow in the **same** cache, so a flood on either start fills it for both | 16 pending flows per client IP, 512 engine-wide, 300 s TTL. It **rejects** rather than evicts — evict-oldest would turn a start-leg flood into a login DoS for legitimate users | **none** — and `oidc_flow_cache_max = 0` is not an opt-out either: `put` refuses at `len(entries) >= global_cap`, so `0` would reject **every** federated sign-in and IdP step-up (`FlowCacheFullError` on the first flow, an OIDC denial of service). The load refuses a cap below `1` (BACKLOG #5318); treat it as a security-relevant value | limiter 2 on the sign-in start, which charges `allow_login_attempt` first; limiter 3 on the step-up start, which charges `allow_reauth_attempt` first |
 | 8 | **WebAuthn pending-ceremony bound** (`ChallengeCache.put`), and the **pre-auth sign-in pool** (`PreAuthChallengePool.put`, ADR 0197 Amendment A wave 2) | flooding passkey registration/assertion ceremonies, and the usernameless passkey sign-in's challenges | 16 pending ceremonies per **user** (evicts that *same* user's oldest, so one principal can never deny another's), 4096 engine-wide (**refuses** with a cause-naming `ChallengeCacheFullError`), 120 s TTL. The pre-auth pool is its own: 4096 challenges, 120 s TTL, keyed by an opaque per-begin handle and never by client address, and a full pool **evicts its oldest** rather than refusing, so a flood can cost the owner a retry but never refuses the ceremony. Its begin leg (`POST /ui/login/passkey`) charges limiter 2 first; with limiter 2 off a fast enough flood can evict an owner's challenge before they finish | none | limiter 3 where the console charges it — `POST /ui/reauth/webauthn` (`ui_reauth_webauthn`, the assertion **finish** leg), plus `POST /ui/reauth` (`ui_reauth`) and `POST /ui/mfa` (`ui_mfa_submit`), whose code and password error re-renders re-stage fresh assertion options, for a session they read as not having met its factor, after the route has already charged `allow_reauth_attempt`. One `POST /ui/reauth` branch is the exception: its passkey-first refusal for a passkey-only session re-stages options **before** the limiter and charges nothing. The routes that *stage* a ceremony — the thing `ChallengeCache.put` actually bounds — charge no **auth-surface** limiter, but they are not unpaced: `POST /ui/account/webauthn/enroll` charges the per-actor **admin-write floor** (`allow_admin_write`, non-GET only, in `require_ui` — see 2.1.3 below). `GET /ui/reauth` and `GET /ui/mfa`, which re-stage fresh assertion options on **every** render for a session they read as not having met its factor, charge nothing at all, because that floor is non-GET only. There this bound plus cookie-holder-only reachability is all there is |
-| 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — no validator floor, so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
+| 9 | **JWKS min-refetch floor** (`JwksCache.get_key`) | unauthenticated `kid`-driven refetch amplification against the IdP on the OIDC callback leg — the sibling of control 7 on the *other* federated leg | one upstream fetch per **300 s**, globally (`[auth].oidc_jwks_min_refetch_seconds`), plus a `_MAX_JWKS_BYTES` **512 KiB** response-body cap and a 3600 s key TTL. Within the floor an unknown `kid` raises `JwksError` and that login fails (a still-cached key is served even past the soft TTL rather than fail while throttled) | `oidc_jwks_min_refetch_seconds = 0` — the load floors it at `0`, refusing only a negative (BACKLOG #5318), so this **is** a genuine opt-out, and it restores the amplification | limiter 2 and control 7 (the same legs charge `allow_login_attempt` and stage a bounded flow first) |
 | 10 | **Repeated-credential audit budget** (`allow_repeated_credential_audit`) | an unauthenticated caller growing `audit_log` by sending a repeated `Authorization` header or session cookie, which is refused before any credential is read (BACKLOG #2454) | > 10 `auth.repeated_credential` rows per client IP **or** > 60 across all clients, per 60 s. Its own budget: it never draws on, or exhausts, limiter 2. A flood from many addresses can spend the global 60, and other refusals in that window then get the line and no row | *the same* `[auth].login_rate_limit_enabled` | the refusal is unchanged: every repeat is still a `400` and a WARNING line. Only the row loses its bound, so with the switch off every refusal writes one |
-| 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` or less the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows, and a negative one only each account's one row a window, paging once a window per action it stops. The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
+| 11 | **Step-up return audit budget** (`allow_step_up_return_audit`) | many accounts' live IdP step-up flows, or a page that sends many operators' browsers to `GET /ui/oidc/callback`, growing `audit_log` through the step-up return's refusals that consume nothing and so repeat while the flow lives: a `state` mismatch, on the completion or the abandon leg, and a non-navigation fetch (BACKLOG #3965) | > 10 such rows per **source** per 60 s, where the source is the staged **user**, or, for a flow that names no user, the callback's client **address**. Behind that, a **backstop** of 60 rows across all sources per 60 s: past it each **account** still writes one row a window, and a source with no account writes none. The first row it stops in a window, per audit action, pages `audit_write_failed` keyed `step_up_return:audit_budget:<action>`, with an ERROR line; a row the per-account floor writes pages nothing. Its own budget: it never draws on, or exhausts, limiter 2 or limiter 3, and it gates the **row only**. An over-budget refusal answers exactly as before (a `state` mismatch the step-up page with **403**, a non-navigation fetch a **303** to `/ui/login?e=oidc_failed`), consumes nothing, and writes a WARNING line instead of the row. So one source spending its budget costs no other source a row; a flood across many sources that spends the backstop still leaves each account one row that window, and pages once it stops one; and none of it refuses anyone's step-up return | *the same* `[auth].login_rate_limit_enabled`, among others: `login_rate_limit_global = 0` removes its backstop and with it the page, `login_rate_limit_per_ip = 0` its per-source figure, and a `login_rate_limit_window_seconds` of `0` the whole budget while the switch reads on. A **lower** `login_rate_limit_global` also writes fewer of these rows; a negative one is refused at load (BACKLOG #5318). The startup loosening report names those values for the sign-in and ceremony limits only; [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md#authlogin_rate_limit_enabled--false-or-a-limit-looser-than-its-default--sign-in-attempts-go-less-paced) says they loosen this budget too | nothing: the same switch removes limiter 3, whose per-user return key otherwise holds each user's step-up returns, these rows among them, to 10 a window with no ceiling across users. The refusals are unchanged, and with the switch off every one writes its row |
 | 12 | **Sign-out miss-row budget** (`_admit_logout_miss_row`) | an unauthenticated caller growing `audit_log` through `POST /ui/logout` with a cookie that ends no session, each request writing an `auth.logout` row with `outcome` `nothing_to_revoke` (BACKLOG #4735) | For each engine process, per 60 s: > 3 such row writes begun per source **or** > 120 begun across all sources, where the source is the client address and every caller with no address shares one; a miss past either is counted, and at most one `auth.logout` row with `outcome` `unrecorded` is begun to write the count, with a WARNING line once it is written. [Session inventory](#session-inventory--targeted-revocation-wp-10) states its limits | none: it is always on, and `[auth].login_rate_limit_enabled` does not turn it off | nothing to turn off. It gates the row only, so a sign-out is never refused, and each miss still runs one store write transaction that this budget does not bound |
 
 **Control 1 bounds the lock; it bounds the campaign only where the owner has a way past it
@@ -7818,12 +7847,12 @@ Read the two together: the table above is the operator-surface half, and that se
 picture including the ingest plane. That document is maintainer-internal;
 [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
-**Almost no limiter has a validator floor.** None of the fifteen `*_rate_limit_*` fields carries a
-lower-bound validator except `admin_write_rate_limit_window_seconds` and
-`monitoring_read_rate_limit_window_seconds`, which must be above `0`, and
-`admin_write_rate_limit_per_actor` (BACKLOG #3293), `monitoring_read_rate_limit_per_actor` and
-`monitoring_read_rate_limit_global` (vault BACKLOG #1191), which must be `0` or more; the windows' other
-validators refuse NaN, infinity and a very long window, not a small one. And
+**The rate limiters' floors refuse a negative value, not a weak one.**
+Every count among the fifteen `*_rate_limit_*` fields must be `0` or more: the sign-in and PHI-read
+counts (BACKLOG #5318), `admin_write_rate_limit_per_actor` (BACKLOG #3293) and the two
+monitoring-read counts (vault BACKLOG #1191). The sign-in and PHI-read windows must be `0` or more,
+and `admin_write_rate_limit_window_seconds` and `monitoring_read_rate_limit_window_seconds` above
+`0`; the windows' other validators refuse NaN, infinity and a very long window, not a small one. And
 neither `lockout_threshold` nor `lockout_minutes` carries one. So a `per_key` or `glob` of `0` disables that
 dimension, and a sign-in or PHI-read `*_window_seconds` of `0` ages every recorded hit out
 immediately — disabling enforcement while the limiter still reports as "enabled". Treat these as
@@ -7832,7 +7861,7 @@ security-relevant values, not tuning knobs. **These limits are no longer silent 
 value **looser than its shipped default** for the sign-in limiter, the lockout
 (`lockout_minutes`, `lockout_threshold`, `lockout_max_minutes`), the PHI-read limiter, the
 monitoring-read limiter, the admin-write limiter and its minimum gap, `max_sessions_per_user`, and, with OIDC on,
-`oidc_flow_cache_max`. That covers an off switch, a zeroed count and a window of `0` or less, and
+`oidc_flow_cache_max`. That covers an off switch, a zeroed count and a window of `0`, and
 also a weak but non-zero value: a `1e-6` s window or a count of `1e9` is named. A value at or stricter
 than the default is not. The two counts with no looser value are `phi_read_rate_limit_global` and
 `monitoring_read_rate_limit_global`, which ship off. Each named value reaches the `serve` loosening warning, `messagefoundry security show` and
@@ -7976,7 +8005,7 @@ user: `auth.login_success` / `auth.login_failed` / `auth.login_locked` / `auth.d
 `auth.login_new_ip` / `auth.login_address_unevaluated` (the first-seen sign-in address, BACKLOG #288;
 on a directory sign-in the row's `mech` names the leg, `kerberos` or `oidc`) /
 `auth.permission_denied` / `auth.channel_denied` / `auth.gate_refused` / `auth.self_target_refused` / `auth.session_revoke_missed` / `auth.step_up_status_read`, the 6.3.5 events `auth.account_locked` /
-`auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `user.roles_changed` /
+`auth.login_after_failures`, the re-proof rows `auth.reauth` / `auth.password_change_failed`, plus `user.created` / `auth.ad_user_created` (a directory sign-in that creates the account's row, committed with it; BACKLOG #6589) / `user.roles_changed` /
 `user.channel_scope_changed` / `user.channel_scope_change_refused` / `user.deleted`, `ad_group_map.updated` / `ad_group_scope_map.updated`,
 and `auth.ad_scope_resynced`. Most reads narrowed to the caller's channel scope write no row
 that records the narrowing. The alert-rules read is an exception. When it withholds a rule, it
@@ -8244,7 +8273,8 @@ begun to close, a cut close leaves the notice queued or cuts its send, or the se
 engine tries to write one more row, with the notice's recipient as the actor; when that write
 can fail is under *Still open* below. A lock
 notice writes `auth.lock_notice_undelivered`, hidden as above. Every other notice kind writes
-`auth.security_notice_undelivered`, which every `audit:read` reader sees. The detail names the
+`auth.security_notice_undelivered`, which every all-channels `audit:read` reader sees; a
+channel-scoped one is refused the trail (BACKLOG #4346). The detail names the
 notice kind and the `reason`, at least `queue_full`, `closing`, `abandoned`, `interrupted` or
 `send_failed`. An issuer's reminder also names the
 holder. The row never carries the address, the rest of the notice's detail, or the error. The

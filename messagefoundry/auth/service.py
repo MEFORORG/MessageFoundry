@@ -2535,15 +2535,22 @@ async def _write_through_cancellation(
 ) -> None:
     """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
 
-    Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
-    writes nor lets the caller leave (and release the account's queue) before they finish. A write
-    that fails raises as it did when the rows were written inline. ``what`` names the writes in
-    the ERROR line logged when one fails while the caller is cancelled."""
+    Waited on, and waited on again after each cancel, so a repeated cancellation neither abandons
+    the writes nor lets the caller leave (and release the account's queue) before they finish. A
+    write that fails raises as it did when the rows were written inline. ``what`` names the writes
+    in the ERROR line logged when one fails while the caller is cancelled.
+
+    BACKLOG #6884: :func:`asyncio.wait`, not :func:`asyncio.shield`. A cancel of the caller cancels
+    neither, but an awaited shield raises the write's own error, so a write that failed after an
+    earlier cancel left the loop with that error, skipping the branch below: the caller left with
+    the write's error and its cancel unconsumed. ``wait`` raises only the caller's cancel, so every
+    outcome is read from ``task`` below. It also leaves no shield behind to log the same failure a
+    second time on asyncio's own logger."""
     task = asyncio.ensure_future(_run_in_order(writes))
     cancelled = False
     while not task.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.wait((task,))
         except asyncio.CancelledError:
             # Recorded before anything else, so a cancel that lands in the turn the writes finish
             # is still re-raised rather than swallowed.
@@ -4513,8 +4520,8 @@ class AuthService:
         # (_step_up_return_audit_floor, charged only past the backstop), so the ceiling never
         # silences a named user outright; a source with no account gets no such row, because
         # client addresses are the caller's to multiply and accounts are not. A row it stops pages
-        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0 or less, which
-        # removes the whole budget (a negative global would otherwise refuse every row there).
+        # (_page_step_up_return_audit_backstop). Neither is built for a window of 0, which removes
+        # the whole budget. The load refuses a negative window or global (BACKLOG #5318).
         backstop_on = (
             settings.login_rate_limit_enabled and settings.login_rate_limit_window_seconds > 0
         )
@@ -7289,7 +7296,6 @@ class AuthService:
             self._oidc_flows,
             return_to="/ui",
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             prior_session_hash=_superseded_hash(prior_session),
         )
         challenge = oidc.pkce_challenge(flow.code_verifier)
@@ -7857,7 +7863,6 @@ class AuthService:
             self._oidc_flows,
             return_to=return_to,
             client_ip=client or "",
-            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
             step_up_session_hash=token_hash,
             step_up_user_id=session.user_id,
             step_up_purpose=purpose,
@@ -9362,8 +9367,29 @@ class AuthService:
             if refusal is not None:
                 raise _DirectoryLoginRefused(refusal)
         if existing is None:
+            # BACKLOG #6589: the birth is recorded in the INSERT's transaction, as an
+            # administrator's create is, so no directory row commits without a row naming it. Its
+            # own action, not `user.created`: no administrator issued anything, and
+            # `_temporary_credential_issuer` reads `user.created` rows as credential issues,
+            # counting each in its window against its page. It names the new row's id, because a
+            # directory may reissue the username (BACKLOG #1471).
+            def born(new_id: str) -> AuditAppend:
+                return AuditAppend(
+                    "auth.ad_user_created",
+                    actor=principal.username,
+                    detail=_json(
+                        {
+                            "user_id": new_id,
+                            "username": principal.username,
+                            "provider": "ad",
+                            "federated": federated,
+                        }
+                    ),
+                    client=client,
+                )
+
             try:
-                user_id = await self._create_directory_row(principal, client=client)
+                user_id = await self._create_directory_row(principal, client=client, birth=born)
             except Exception as exc:
                 if not _is_integrity_refusal(exc):
                     raise
@@ -9540,7 +9566,7 @@ class AuthService:
         client: str | None,
         actor: str | None = None,
         typed_notify_email: str | None = None,
-        audits: Sequence[AuditAppend] = (),
+        birth: Callable[[str], AuditAppend],
     ) -> str:
         """Insert the mirror row for a directory principal the store does not hold, and return its id.
 
@@ -9553,10 +9579,19 @@ class AuthService:
         not adopted (#2021 only). It is bound in the same INSERT, so no crash leaves that row with
         no address. The profile mirror still gets the directory's ``mail``.
 
-        ``audits`` are the caller's own rows for this birth. They commit in the INSERT's
-        transaction, after any not-adopted row (BACKLOG #2221).
+        ``birth`` builds the caller's row recording this birth from the new row's id:
+        ``user.created`` for an administrator's create, ``auth.ad_user_created`` for a sign-in's.
+        Required with no default (BACKLOG #6589), and it must return an :class:`AuditAppend`, or
+        :class:`TypeError` is raised before anything is written. The row commits in the INSERT's
+        transaction (BACKLOG #2221), first, so any not-adopted row follows the birth it names.
         """
         user_id = uuid4().hex
+        born = birth(user_id)
+        if not isinstance(born, AuditAppend):
+            raise TypeError(
+                f"a directory account's birth needs its AuditAppend; got {type(born).__name__}"
+                " (BACKLOG #6589)"
+            )
         # BACKLOG #2014, ASVS 6.3.7. The birth seed is the one time the directory's `mail` can
         # become `notify_email`, where every later security notice goes. So it must pass the test
         # the address form applies before it suggests the same value; the form never sees an
@@ -9592,7 +9627,7 @@ class AuthService:
             directory_object_id=principal.directory_object_id,
             adopt_notify_email=adopt,
             notify_email=typed_notify_email,
-            audits=[*rows, *audits],
+            audits=[born, *rows],
             password_generated=False,
         )
         if not adopt:
@@ -9690,23 +9725,33 @@ class AuthService:
                     " give one as notify_email, such as name@example.org"
                 )
             typed = address = _require_single_mailbox(notify_email)
-        # Committed with the INSERT, not after it (BACKLOG #2221).
-        created = AuditAppend(
-            "user.created",
-            actor=actor,
-            detail=_json(
-                {
-                    "username": principal.username,
-                    "roles": [],
-                    "provider": "ad",
-                    "notify_email_source": "directory" if typed is None else "administrator",
-                }
-            ),
-            client=client,
-        )
+
+        # Committed with the INSERT, not after it (BACKLOG #2221). It names the new row's id, as
+        # the sign-in's birth row does, because a directory may reissue the username (BACKLOG
+        # #6589); `_temporary_credential_issuer` keys on `username` and ignores the extra key.
+        def created(new_id: str) -> AuditAppend:
+            return AuditAppend(
+                "user.created",
+                actor=actor,
+                detail=_json(
+                    {
+                        "user_id": new_id,
+                        "username": principal.username,
+                        "roles": [],
+                        "provider": "ad",
+                        "notify_email_source": "directory" if typed is None else "administrator",
+                    }
+                ),
+                client=client,
+            )
+
         try:
             user_id = await self._create_directory_row(
-                principal, client=client, actor=actor, typed_notify_email=typed, audits=(created,)
+                principal,
+                client=client,
+                actor=actor,
+                typed_notify_email=typed,
+                birth=created,
             )
         except Exception as exc:
             if not _is_integrity_refusal(exc):
@@ -12857,8 +12902,9 @@ class AuthService:
         multi-session revocations record it. The count includes lapsed rows the cap ended, which
         the validator already refused; the store returns one count for both.
         """
+        # 0 = unlimited; the load refuses a negative cap (BACKLOG #5318).
         cap = self._settings.max_sessions_per_user
-        if not cap or cap <= 0:
+        if not cap:
             return
         user = await self._load_user(user_id)
         # A user row that has gone owes nothing more; splitting is then the closed choice, since it
