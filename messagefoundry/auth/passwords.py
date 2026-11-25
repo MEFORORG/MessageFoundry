@@ -84,9 +84,10 @@ def _spend_one_verify() -> None:
 
     What it does: either refusal returns before the hasher runs, so without this it would cost
     almost nothing; with it, a refused verify costs one argon2id verify, like an ordinary
-    mismatch. It does not keep the recovery-code walk (ADR 0170) from revealing which slot matched,
-    because neither refusal's cost depends on the presented code: a non-ASCII stored hash is refused
-    for any code, and a surrogate in the code makes every slot refuse the same way. This does not
+    mismatch. The padding plays no part in hiding which recovery-code slot matched; the walk (ADR
+    0170) runs every slot whatever the result, and neither refusal's cost depends on the presented
+    code: a non-ASCII stored hash is refused for any code, and a surrogate in the code makes every
+    slot refuse the same way. This does not
     raise: if argon2 itself fails here, the failure is logged without content, and the refusal then
     costs whatever was spent."""
     failure: str | None = None
