@@ -352,6 +352,7 @@ async def test_totp_can_be_removed_while_a_discoverable_passkey_remains(
 _SET_STORED = {
     "credential_id": "UPDATE webauthn_credentials SET credential_id=? WHERE user_id=?",
     "public_key": "UPDATE webauthn_credentials SET public_key=? WHERE user_id=?",
+    "credential_id_hash": "UPDATE webauthn_credentials SET credential_id_hash=? WHERE user_id=?",
 }
 
 
@@ -362,14 +363,12 @@ async def _set_stored(store: MessageStore, user_id: str, column: str, value: Any
     await store._db.commit()
 
 
-@pytest.mark.parametrize("column", ["credential_id", "public_key"])
-async def test_a_passkey_whose_stored_cell_does_not_decode_opens_no_rotation_gate(
-    column: str,
-) -> None:
-    """BACKLOG #6886. RED when: a passkey whose stored ``credential_id`` or ``public_key`` does not
-    decode counts as a way past the sign-in lock (the key half is RED on ``322afa57f11``). The
-    verify refuses such a passkey, so an account whose only factor it is has no way past, and the
-    rotation gate stays shut. The same row with its own value is the control that opens it."""
+async def test_a_passkey_whose_stored_key_does_not_decode_opens_no_rotation_gate() -> None:
+    """BACKLOG #6886. RED when: a passkey whose stored ``public_key`` does not decode counts as a
+    way past the sign-in lock (RED on ``322afa57f11``). The verify refuses such a passkey, so an
+    account whose only factor it is has no way past, and the rotation gate stays shut. The same
+    row with its own key is the control that opens it."""
+    column = "public_key"
     store = await MessageStore.open(":memory:")
     try:
         service = _service(store)
@@ -388,17 +387,36 @@ async def test_a_passkey_whose_stored_cell_does_not_decode_opens_no_rotation_gat
         await store.close()
 
 
-@pytest.mark.parametrize("column", ["credential_id", "public_key"])
-async def test_totp_stays_while_the_only_passkey_has_a_stored_cell_that_does_not_decode(
-    monkeypatch: pytest.MonkeyPatch, column: str
+async def test_a_passkey_whose_stored_id_does_not_decode_is_still_a_way_past() -> None:
+    """BACKLOG #6886. RED when: a passkey whose stored ``credential_id`` does not decode is not
+    counted as a way past the sign-in lock, or does not sign in through the combined passkey
+    sign-in (RED on ``f8e68d56cb3``). That sign-in names no credential up front and finds the
+    passkey by the hash of the id the browser sends, and the verify reads only the stored key, so
+    the passkey signs in as it does on ``main``: the rotation gate opens, and the right password
+    with it signs in past a live sign-in lock with the second factor met."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        await _set_stored(store, identity.user_id, "credential_id", "AAAAA")
+        assert not await service.must_enrol_before_rotating(identity)
+        await _set_sign_in_lock(store, identity.user_id)
+        full = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert full.ok and full.token is not None and full.mfa_required is False
+    finally:
+        await store.close()
+
+
+async def test_totp_stays_while_the_only_passkey_has_a_stored_key_that_does_not_decode(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """BACKLOG #6886. RED when: TOTP may be removed beside a discoverable passkey whose stored
-    ``credential_id`` or ``public_key`` does not decode (the key half is RED on ``322afa57f11``).
-    That passkey cannot sign in, so removing TOTP would leave the account no way past the sign-in
-    lock. The same row with its own value is the control that lets TOTP go."""
+    ``public_key`` does not decode (RED on ``322afa57f11``). That passkey cannot sign in, so
+    removing TOTP would leave the account no way past the sign-in lock. The same row with its own
+    key is the control that lets TOTP go."""
     from messagefoundry.auth import totp
     from tests._totp_clock import pin_totp_clock
 
+    column = "public_key"
     store = await MessageStore.open(":memory:")
     try:
         service = _service(store)
@@ -739,17 +757,16 @@ async def test_an_undecodable_stored_key_is_no_combined_sign_in(
         await store.close()
 
 
-@pytest.mark.parametrize("column", ["credential_id", "public_key"])
-async def test_a_passkey_whose_stored_cell_does_not_decode_is_no_combined_sign_in(
-    column: str,
-) -> None:
-    """BACKLOG #6886. RED when: a passkey whose stored ``credential_id`` or ``public_key`` does not
-    decode still takes the combined passkey sign-in, which satisfies the second factor and opens
-    the sign-in lock (the key half is RED on ``322afa57f11``). Such a passkey is no way past
+async def test_a_passkey_whose_stored_key_does_not_decode_is_no_combined_sign_in() -> None:
+    """BACKLOG #6886. RED when: a passkey whose stored ``public_key`` does not decode still takes
+    the combined passkey sign-in, which satisfies the second factor and opens the sign-in lock (RED
+    on ``322afa57f11``). Such a passkey is no way past
     (:func:`~messagefoundry.store.store.passkey_is_way_past`), so the request is the password
     sign-in it would be with no passkey: the right password gives a session that still owes its
     second factor, and under a live sign-in lock the sign-in is refused. The same row with its own
-    value is the control that signs in with the factor met."""
+    key is the control that signs in with the factor met. A stored id that does not decode is a
+    way past: :func:`test_a_passkey_whose_stored_id_does_not_decode_is_still_a_way_past`."""
+    column = "public_key"
     store = await MessageStore.open(":memory:")
     try:
         service, identity, password, auth = await _passkey_owner(store)
@@ -1202,9 +1219,11 @@ async def test_the_reset_list_names_a_directory_passkey_only_where_it_can_sign_i
 async def test_the_reset_list_leaves_out_a_directory_passkey_that_does_not_decode() -> None:
     """BACKLOG #6886. RED when: the census's reset list names a directory account whose passkey's
     stored ``credential_id`` or ``public_key`` does not decode (RED on ``322afa57f11``, which asked
-    only the hash scheme). The verify refuses such a passkey, so it cannot sign the holder in, a
-    reset costs it nothing, and naming it would steer the operator away from the reset that is the
-    way out. The control: a usable passkey on the same kind of account is named."""
+    only the hash scheme). A directory account's passkey is only ever its second factor: the begin
+    leg leaves one whose id does not decode out of the allow list, so the browser never offers it,
+    and the verify refuses one whose key does not. Either way it cannot sign the holder in, a reset
+    costs it nothing, and naming it would steer the operator away from the reset that is the way
+    out. The control: a usable passkey on the same kind of account is named."""
     store = await MessageStore.open(":memory:")
     try:
         usable = await _directory_account_with_a_passkey(store)
@@ -1241,10 +1260,35 @@ async def test_the_census_does_not_count_a_passkey_whose_stored_key_does_not_dec
         await store.close()
 
 
-def test_a_credential_id_hash_that_is_not_text_is_no_way_past() -> None:
+async def test_the_census_counts_a_local_passkey_whose_stored_id_does_not_decode() -> None:
+    """BACKLOG #6886. RED when: the census does not count a local account's discoverable passkey
+    whose stored ``credential_id`` does not decode as one it signs in with (RED on
+    ``f8e68d56cb3``). The combined sign-in names no credential up front, so that passkey signs the
+    holder in, and a reset would remove it: the account is named as relying on it and in the reset
+    list, as with the id it registered."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = _service(store)
+        identity, token, _ = await login_admin(service)
+        await _register(service, identity, token)
+        await service.change_password(identity, _NEW_PASSWORD)
+        await _enable_totp(store, identity.user_id, _REFUSED_TOTP)
+        await _set_stored(store, identity.user_id, "credential_id", "AAAAA")
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.passkey_only == (identity.username,)
+        assert census.reset_would_remove_a_passkey == (identity.username,)
+        assert census.no_way_past == ()
+    finally:
+        await store.close()
+
+
+def test_a_credential_id_hash_read_back_as_bytes_counts_as_the_text_it_holds() -> None:
     """BACKLOG #6886. RED when: a stored ``credential_id_hash`` that reads back as bytes (a BLOB in
-    the TEXT column) raises ``TypeError`` out of the way-past rule instead of answering ``False``.
-    No sign-in can find such a passkey by its hash. The control is the same hash as text."""
+    the TEXT column) raises ``TypeError`` out of the way-past rule (RED on ``322afa57f11``), or is
+    not counted when it holds today's hash as UTF-8 (RED on ``f8e68d56cb3``). The sign-in finds a
+    passkey with ``constant_time_equal``, which compares bytes, so such a hash matches as its text
+    does. Bytes that are not UTF-8 never match, and answer ``False``. The control is the hash as
+    text."""
     from messagefoundry.auth.tokens import credential_id_hash
     from messagefoundry.store.store import passkey_is_way_past
     from tests._webauthn_store_contract import _cred
@@ -1252,19 +1296,34 @@ def test_a_credential_id_hash_that_is_not_text_is_no_way_past() -> None:
     good = _cred("u1", "resident", id_hash=credential_id_hash(b"u1-resident"), discoverable=True)
     assert passkey_is_way_past(good), "the control: the same row with its hash as text"
     stored: Any = good.credential_id_hash.encode()
-    as_bytes = dataclasses.replace(good, credential_id_hash=stored)
-    assert passkey_is_way_past(as_bytes) is False
-    # The census's directory-account rule asks the same stored-cell check.
-    from messagefoundry.auth.tokens import stored_passkey_is_readable
+    assert passkey_is_way_past(dataclasses.replace(good, credential_id_hash=stored)) is True
+    not_utf8: Any = b"\xff" + stored
+    assert passkey_is_way_past(dataclasses.replace(good, credential_id_hash=not_utf8)) is False
 
-    assert (
-        stored_passkey_is_readable(
-            credential_id_hash=as_bytes.credential_id_hash,
-            credential_id=as_bytes.credential_id,
-            public_key=as_bytes.public_key,
+
+async def test_the_census_counts_a_passkey_whose_hash_reads_back_as_bytes() -> None:
+    """BACKLOG #6886. RED when: the census does not count a directory account's passkey whose
+    ``credential_id_hash`` is a BLOB holding today's hash (RED on ``f8e68d56cb3``), so the reset
+    list would not warn that an MFA reset removes a working passkey. The finish leg finds that
+    passkey by ``constant_time_equal``, which compares bytes, so it signs the holder in. The
+    control: a BLOB that is not UTF-8 matches no hash, and is not counted."""
+    store = await MessageStore.open(":memory:")
+    try:
+        as_bytes = await _directory_account_with_a_passkey(store)
+        not_utf8 = await _directory_account_with_a_passkey(store, user_id="dir-not-utf8")
+        (cred,) = await store.list_webauthn_credentials("dir-u1")
+        await _set_stored(store, "dir-u1", "credential_id_hash", cred.credential_id_hash.encode())
+        (other,) = await store.list_webauthn_credentials("dir-not-utf8")
+        await _set_stored(
+            store, "dir-not-utf8", "credential_id_hash", b"\xff" + other.credential_id_hash.encode()
         )
-        is False
-    )
+        (read_back,) = await store.list_webauthn_credentials("dir-u1")
+        assert isinstance(read_back.credential_id_hash, bytes), "the row is not a BLOB"
+        census = await lockable_account_census(store, AuthSettings(), way_past_rp_id=RP)
+        assert census.undecryptable_totp == tuple(sorted((as_bytes, not_utf8)))
+        assert census.reset_would_remove_a_passkey == (as_bytes,)
+    finally:
+        await store.close()
 
 
 @pytest.mark.parametrize("other_error", [False, True], ids=["undecodable", "control-other-error"])

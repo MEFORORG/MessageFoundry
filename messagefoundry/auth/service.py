@@ -146,6 +146,8 @@ from messagefoundry.auth.tokens import (
     hash_token,
     mint_enrolment_code,
     mint_token,
+    stored_b64url_decodes,
+    stored_credential_id_hash_text,
     stored_passkey_is_readable,
 )
 from messagefoundry.auth.tokens import (
@@ -3515,16 +3517,17 @@ async def lockable_account_census(
     def second_factor_counts(cred: WebAuthnCredential) -> bool:
         # A directory account's passkey second factor: offered only under the request's rp_id,
         # found at the finish only by a credential-id hash in today's scheme, and verified only
-        # where its stored id and key decode (BACKLOG #6886). The rp_id rule is
-        # ``sign_in_counts``'s, and the stored-cell rule is ``passkey_is_way_past``'s; the
-        # discoverable record is not asked, since the second-factor ceremony names the credential
-        # itself.
-        return (way_past_rp_id is None or cred.rp_id == way_past_rp_id) and (
-            stored_passkey_is_readable(
-                credential_id_hash=cred.credential_id_hash,
-                credential_id=cred.credential_id,
-                public_key=cred.public_key,
+        # where its stored key decodes. The rp_id rule is ``sign_in_counts``'s, and the stored-cell
+        # rule is ``passkey_is_way_past``'s; the discoverable record is not asked, since the
+        # second-factor ceremony names the credential itself. That naming is why the stored id
+        # must decode too: the begin leg leaves one that does not out of the allow list
+        # (BACKLOG #6886), so the browser never offers it.
+        return (
+            (way_past_rp_id is None or cred.rp_id == way_past_rp_id)
+            and stored_passkey_is_readable(
+                credential_id_hash=cred.credential_id_hash, public_key=cred.public_key
             )
+            and stored_b64url_decodes(cred.credential_id)
         )
 
     integrity_failed: list[str] = []
@@ -3650,9 +3653,9 @@ def _passkey_label(label: object) -> str | None:
 
 
 def _stored_key_refused_detail(cred: WebAuthnCredential) -> str:
-    """The one audit detail for a passkey whose stored cells will never sign in (BACKLOG #1963,
-    #6886), written by both the assertion begin leg and the verify: a fixed slug and the label,
-    never the refusal text, which can quote the key."""
+    """The one audit detail for a passkey a stored cell refuses (BACKLOG #1963, #6886), written by
+    both the assertion begin leg (a stored id it cannot list) and the verify (a stored key it
+    cannot use): a fixed slug and the label, never the refusal text, which can quote the key."""
     return _json({"reason": "stored_key_refused", "label": _passkey_label(cred.label)})
 
 
@@ -5192,14 +5195,19 @@ class AuthService:
         it from the raw ``credential_id`` stored beside it, so a hash change does not lose a
         registered passkey. No secret is needed: the raw id is not one.
 
-        Sign-in finds a passkey only by today's hash, so a row this pass has not moved does not sign
-        in. A bare digest (every release before #3423) is today's hash with no tag, and moves. A
-        value whose tag this release does not compile in is REFUSED: left as it is, never matched,
-        and counted. So are a ``credential_id`` that is not base64url, a today-tagged hash its raw
-        id does not give, and a move the store refuses: the account's seal failed between the read
-        and the write, or the new hash is already held. An account or passkey set already failing
-        its seal is left to the checked loaders, which report it. Returns ``(rehashed, refused)``;
-        a refusal never stops start-up."""
+        Sign-in finds a passkey only by today's hash, so a row whose hash is in another scheme does
+        not sign in until this pass moves it. A bare digest (every release before #3423) is today's
+        hash with no tag, and moves. A hash is read as the sign-in's compare reads it
+        (:func:`~messagefoundry.auth.tokens.stored_credential_id_hash_text`), so one that reads back
+        as bytes holding today's hash is left as it is and not counted. A value whose tag this
+        release does not compile in, or that text cannot be read from, is REFUSED: left as it is,
+        never matched, and counted. So are a ``credential_id`` that is not base64url, which the
+        pass cannot hash, a today-tagged hash its raw id does not give, and a move the store
+        refuses: the account's seal failed between the read and the write, or the new hash is
+        already held. A refused row whose hash is in today's scheme is still found by the sign-in;
+        the pass only cannot check it. An account or passkey set already failing its seal is left
+        to the checked loaders, which report it. Returns ``(rehashed, refused)``; a refusal never
+        stops start-up."""
         rehashed = refused = 0
         if not await self._store.any_webauthn_credentials():
             return 0, 0
@@ -5207,15 +5215,19 @@ class AuthService:
         # skipped here, since it signs in with no passkey whatever its hash says.
         for user in await self._load_users():
             for cred in await self._verified_passkeys(user) or ():
+                stored_hash = stored_credential_id_hash_text(cred.credential_id_hash)
+                if stored_hash is None:
+                    refused += 1
+                    continue
                 try:
-                    scheme = credential_id_hash_scheme(cred.credential_id_hash)
+                    scheme = credential_id_hash_scheme(stored_hash)
                     # binascii.Error, a ValueError, for a credential_id that is not base64url; a
                     # TypeError for one that is not text at all (BACKLOG #6886).
                     new_hash = _credential_id_hash(self._b64url_decode(cred.credential_id))
                 except (ValueError, TypeError):  # CredentialHashSchemeError is a ValueError too
                     refused += 1
                     continue
-                if constant_time_equal(cred.credential_id_hash, new_hash):
+                if constant_time_equal(stored_hash, new_hash):
                     continue
                 if scheme == CREDENTIAL_ID_HASH_SCHEME:
                     # Today's tag over a digest its own raw id does not give: not a row this
@@ -5243,11 +5255,11 @@ class AuthService:
             )
         if refused:
             _log.warning(
-                "%d passkey(s) were left as stored, and no sign-in can use them: each has a"
-                " credential-id hash in a scheme this release does not know or of a malformed"
-                " shape, a stored credential id that does not decode, or today's scheme tag over a"
-                " digest its own credential id does not give, or the store refused its move to"
-                " today's scheme",
+                "%d passkey(s) were left as stored: each has a credential-id hash in a scheme this"
+                " release does not know or of a malformed shape, a stored credential id that does"
+                " not decode, or today's scheme tag over a digest its own credential id does not"
+                " give, or the store refused its move to today's scheme. One whose hash is not in"
+                " today's scheme cannot sign in",
                 refused,
             )
         return rehashed, refused
@@ -6992,10 +7004,11 @@ class AuthService:
         runs each audit row: at once on the second-factor leg, deferred into the failure pad on the
         sign-in.
 
-        * A stored key the registration rule refuses (BACKLOG #1963), or a stored key or id that
-          does not decode (BACKLOG #6886), will never sign in again, so it is logged and audited
-          with a fixed slug, never the refusal text, which can quote the key. The log line says
-          which of the two.
+        * A stored key the registration rule refuses (BACKLOG #1963), or a stored key that does not
+          decode (BACKLOG #6886), will never sign in again, so it is logged and audited with a
+          fixed slug, never the refusal text, which can quote the key. The log line says which of
+          the two. The stored ``credential_id`` is not read: the passkey was found by the hash of
+          the id the browser sent, and the signature check does not use the stored one.
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
 
@@ -7004,17 +7017,10 @@ class AuthService:
             return "auth.webauthn_failed", _stored_key_refused_detail(cred)
 
         try:
-            # The id is decoded only to be checked. The second-factor begin leg and the registration
-            # options leave out a passkey whose id does not decode
-            # (:meth:`_split_stored_credential_ids`), and the combined sign-in is taken only where
-            # some passkey of the account is a way past (``passkey_is_way_past``). A browser can
-            # still answer either ceremony with another of the account's passkeys, found by its
-            # hash, so this refuses one whose stored id or key does not decode.
-            self._b64url_decode(cred.credential_id)
             public_key = self._b64url_decode(cred.public_key)
         except (ValueError, TypeError):
-            # BACKLOG #6886. A stored key or id that is not base64url text (a length one past a
-            # multiple of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
+            # BACKLOG #6886. A stored key that is not base64url text (a length one past a multiple
+            # of four, non-ASCII text, or not a string at all; ``binascii.Error`` is a
             # ``ValueError``) escaped as an unhandled error. Decoded apart from the verify, so an
             # error the verify raises is not read as the stored row's. Only a row written outside
             # the store holds one: on a sealed store the passkey digest refuses such a row first.
@@ -15533,10 +15539,13 @@ class AuthService:
         whole by the first call; a broken bundled corpus is re-read the same way. Run on a worker
         thread, none of that blocks the loop. The answer, and any exception, is unchanged.
 
-        One screen at a time, as the loop used to run them, and the lock is held until the
-        screen's THREAD ends, not until its caller stops waiting. So a corpus that appears is
-        loaded once, not by every screen that missed the cache together, and a corpus on a path
-        that stops answering blocks one worker thread in all, however many callers give up on it;
+        One screen at a time per service instance, as the loop used to run them, and the lock is
+        held until the screen's THREAD ends, not until its caller stops waiting. The lock is this
+        instance's while the corpus cache is the module's, so the claims that follow hold within
+        one instance; two instances can each load a corpus, or each block a thread, at once. Within
+        one, a corpus that appears is loaded once, not by every screen that missed the cache
+        together, and a corpus on a path that stops answering blocks one worker thread in all,
+        however many callers give up on it;
         the others wait on the lock, which a caller may leave by being cancelled. The one way the
         lock goes early is a cancel of the screen task itself, at loop teardown for example, which
         releases it while the thread runs on. The screen itself is set lookups, so the queue costs
@@ -20350,9 +20359,11 @@ class AuthService:
             creds, username=user.username, leg="assert"
         )
         for cred in due:
-            # BACKLOG #6886: a passkey whose stored id does not decode can never sign in, so it is
-            # refused here as a refused stored key is at the finish leg, row and all. The row is
-            # throttled with the WARNING, because the web console begins a ceremony on every render.
+            # BACKLOG #6886: a passkey whose stored id does not decode cannot be listed, so this
+            # ceremony cannot offer it, and it is refused here as a refused stored key is at the
+            # finish leg, row and all. The combined sign-in, which lists no credential, can still
+            # use it. The row is throttled with the WARNING, because the web console begins a
+            # ceremony on every render.
             await self._audit(
                 "auth.webauthn_failed",
                 actor=user.username,

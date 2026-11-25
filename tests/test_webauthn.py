@@ -629,6 +629,30 @@ async def test_the_rehash_pass_counts_an_undecodable_stored_credential_id_as_ref
         await store.close()
 
 
+async def test_the_rehash_pass_reads_a_bytes_hash_as_the_sign_in_does(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #6886. RED when: the rehash pass refuses a ``credential_id_hash`` that reads back as
+    bytes holding today's hash (RED on ``f8e68d56cb3``), whose WARNING would then call a passkey
+    the sign-in finds unusable. The sign-in's compare reads it as its text, so the pass leaves it
+    as it is and counts nothing. The control: bytes that are not UTF-8 match no hash, and are
+    refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        await _enroll(service, identity, token)
+        (cred,) = await store.list_webauthn_credentials(identity.user_id)
+        _with_stored(monkeypatch, store, credential_id_hash=cred.credential_id_hash.encode())
+        assert await service.rehash_webauthn_credentials() == (0, 0)
+        _with_stored(
+            monkeypatch, store, credential_id_hash=b"\xff" + cred.credential_id_hash.encode()
+        )
+        assert await service.rehash_webauthn_credentials() == (0, 1)
+    finally:
+        await store.close()
+
+
 async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -653,18 +677,19 @@ async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
         await store.close()
 
 
-async def test_the_finish_leg_refuses_a_passkey_whose_stored_id_does_not_decode() -> None:
-    """BACKLOG #6886, the verify's own id check. RED when: the verify stops checking that the stored
-    ``credential_id`` decodes. The begin leg leaves such a passkey out of the allow list, but a
-    browser can still answer with it, and the finish leg finds it by its hash. Here the account
-    holds a good passkey, so a ceremony is staged, and a second one whose stored id does not decode
-    answers it: refused, with the ``stored_key_refused`` row naming it. The good passkey's own
-    assertion is the control that the ceremony itself works."""
+async def test_the_finish_leg_accepts_a_passkey_whose_stored_id_does_not_decode() -> None:
+    """BACKLOG #6886. RED when: the verify refuses a valid assertion because the stored
+    ``credential_id`` does not decode (RED on ``f8e68d56cb3``). The finish leg finds the passkey by
+    the hash of the id the browser sends, and the signature check reads only the stored key, so
+    the stored id plays no part and the passkey signs in, as on ``main``. The begin leg leaves such
+    a passkey out of the allow list and reports it, but a browser can still answer with it. Here
+    the account holds a good passkey, so a ceremony is staged, and the second one answers it: it
+    signs in, and the finish leg writes no refusal row."""
     store = await MessageStore.open(":memory:")
     try:
         service = await _service(store)
         identity, token, _ = await login_admin(service)
-        good, token = await _enroll(service, identity, token, label="good key")
+        _, token = await _enroll(service, identity, token, label="good key")
         bad = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
         bad, token = await _enroll(service, identity, token, label="bad key", auth=bad)
         await store._db.execute(
@@ -683,16 +708,11 @@ async def test_the_finish_leg_refuses_a_passkey_whose_stored_id_does_not_decode(
         assert options is not None
         before = await refusals()
         challenge = base64url_to_bytes(json.loads(options)["challenge"])
-        refused = await service.finish_webauthn_assertion(
+        verified = await service.finish_webauthn_assertion(
             token, bad.get_response(challenge), rp_id=RP, origin=ORIGIN
         )
-        assert refused == Elevation(), "a passkey whose stored id does not decode signed in"
-        after = await refusals()
-        row = {"reason": "stored_key_refused", "label": "bad key"}
-        assert len(after) == len(before) + 1 and after.count(row) == before.count(row) + 1, after
-
-        verified = await _finish_assertion(service, token, good)
         assert verified.ok and verified.token is not None, verified
+        assert await refusals() == before, "the finish leg refused it"
     finally:
         await store.close()
 

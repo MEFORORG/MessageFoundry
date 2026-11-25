@@ -289,6 +289,16 @@ this line.**
 
 ### Fixed
 
+- **A passkey whose stored id cannot be read gets its own notice.** The engine's passkey begin leg
+  now raises `StoredPasskeysUnreadable` for an account whose passkeys under this origin all have a
+  stored credential id that does not decode; before, the decode error escaped as a 500. Every
+  page that stages a passkey ceremony through `_reauth_webauthn_state` in `routes/core.py`
+  catches it and shows the new `WEBAUTHN_UNREADABLE_NOTICE`, exported from the package, in place
+  of the origin-migration notice its `None` would have shown. The notice sends a holder with
+  another factor to sign in with it and remove the unreadable passkey, and one with no other
+  factor to an administrator for an MFA reset. The supported engine seam moved with it:
+  `StoredPasskeysUnreadable` is part of it, and `SUPPORTED_ENGINE_SEAMS` names the new digest.
+  (`BACKLOG #6886`)
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page
