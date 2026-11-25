@@ -915,6 +915,37 @@ def test_date_diff_field_ignores_trailing_empty_components(start: str) -> None:
     assert m["ZTS-3"] == "3"
 
 
+@pytest.mark.parametrize(
+    "start",
+    ["20260101^&", "20260101^&&", "20260101^^&", "20260101^&^", "20260101^D&", "20260101^D^&"],
+)
+def test_date_diff_field_ignores_a_trailing_subcomponent_separator(start: str) -> None:
+    # BACKLOG #5822 added item 3, PR 2975 open finding 6: "20260101^&" raised. A trailing empty
+    # subcomponent holds nothing, as a trailing empty component does. NEGATIVE CONTROL: on the
+    # unfixed code each of these raised ValueError.
+    m = _two_stamps(start, "20260104")
+    date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] == "3"
+
+
+@pytest.mark.parametrize("start", ["20260101^&D", "20260101^D&S", "20260101^S&"])
+def test_date_diff_field_still_refuses_a_code_beside_a_subcomponent(start: str) -> None:
+    # Only trailing EMPTY subcomponents are dropped: a code after one, a second code, or a finer
+    # code still raises.
+    m = _two_stamps(start, "20260104")
+    with pytest.raises(ValueError, match="degree of precision"):
+        date_diff_field(m, "ZTS-1", "ZTS-2", "ZTS-3", unit="days")
+    assert m["ZTS-3"] is None
+
+
+def test_date_diff_field_shares_timezones_time_precisions() -> None:
+    # BACKLOG #5822 added item 4 ("`_TIME_PRECISIONS` repeats a tuple from timezone.py"): the
+    # helper reads the one tuple timezone.py defines rather than keeping its own copy.
+    import messagefoundry.timezone as timezone_mod
+
+    assert actions_mod._TIME_PRECISIONS is timezone_mod._TIME_PRECISIONS
+
+
 @pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
 def test_date_diff_field_refuses_a_repeating_ts_field(path: str) -> None:
     # A timestamp field holds one value, so a second repetition raises however it is addressed.
