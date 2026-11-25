@@ -1128,6 +1128,7 @@ other verdict is a question the instrument could not close, not a finding that t
 - **BLOCKING** — nothing on `origin/main` protects the item, so the key is stuck in the worst way:
   unclaimable *and* unbuilt. These are **grouped by branch**, because that is where the decision
   lives — one *land it or abandon it* call cleared nine keys at once on the day this was written.
+  A claim that records no branch has no such decision, so those keys are listed one by one.
 - **NO-ITEM** — the key is outside the backlog namespace (`ha-recheck-inc145`, `usage-forecast` on
   the live registry). The instrument does not reach it. That is not a finding about the work.
 - **STRANDED-REGISTERED** — half a removal. `prune-merged.ps1` owns it and releases as it removes.

@@ -93,7 +93,8 @@
 param(
     # Machine-readable output for a caller that wants to act on the classification.
     [switch]$Json,
-    # Adjudicate one key only. The key as it appears in the registry, not a file name.
+    # Adjudicate one key only. The key as it appears in the registry, not a file name; an unreadable
+    # claim, which carries no key, is matched by the file name claim.ps1 gives this key.
     [string]$Key = "",
     # Also adjudicate claims whose holder still exists. Off by default: a live holder is being worked
     # and the claim is doing its job, so the question does not arise.
@@ -385,14 +386,14 @@ function Get-Citations([string]$ItemKey) {
     $notPr = "(?<!\b(?:PR|pull request)\s*)"
     $inParen = [regex]"(?i)\(\s*BACKLOG\s+(?=#[0-9])[^)]*?$notPr#$ItemKey\b[^)]*\)"
     $afterTok = [regex]"(?i)\bBACKLOG\s+(?=#[0-9])[^()]*?$notPr#$ItemKey\b"
-    # Candidates: any message naming this number at all, deliberately broader than the old query.
-    # git's --grep reads the BODY as well as the subject, and a squash suffix `(#N)` names a pull
-    # request, so most candidates are not citations. NO --max-count, then (BACKLOG #7562): a cap of
-    # 40 raw candidates let 40 newer non-citations hide every real delivery. The cap of five is
-    # applied to FILTERED rows, and Select-Object -First stops git once it has them. A display, so a
-    # git that was stopped or failed yields fewer rows, never a throw.
+    # Candidates: a message line holding the BACKLOG token before this number, a superset of both
+    # subject rules above, so a bare squash suffix `(#N)` never becomes one. git's --grep still reads
+    # the BODY as well as the subject, so a candidate is not yet a citation. NO --max-count, then
+    # (BACKLOG #7562): a cap of 40 raw candidates let 40 newer non-citations hide every real
+    # delivery. The cap of five is applied to FILTERED rows, and Select-Object -First stops git once
+    # it has them. A display, so a git that was stopped or failed yields fewer rows, never a throw.
     $PSNativeCommandUseErrorActionPreference = $false
-    @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E $mainSha 2>$null |
+    @(& git -C $repo log --format="%h%x09%s" --grep="BACKLOG[^)]*#$ItemKey([^0-9]|`$)" -E --regexp-ignore-case $mainSha 2>$null |
         ForEach-Object {
             $p = $_ -split "`t", 2
             if ($p.Count -eq 2 -and ($inParen.IsMatch($p[1]) -or $afterTok.IsMatch($p[1]))) {
@@ -418,9 +419,10 @@ function ConvertTo-KeyFile([string]$Key) {
     if (-not $safe) { throw "Key '$Key' reduces to nothing usable -- pick something with letters or digits." }
     $safe
 }
-# A -Key that folds to nothing names no file, so no unreadable claim matches it.
-$keyFile = ""
-if ($Key) { try { $keyFile = ConvertTo-KeyFile $Key } catch { $keyFile = "" } }
+# A -Key that folds to nothing names no file, so no unreadable claim matches it: $null equals no
+# BaseName, not even the empty one of a file named `.json`.
+$keyFile = $null
+if ($Key) { try { $keyFile = ConvertTo-KeyFile $Key } catch { $keyFile = $null } }
 $files = @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)
 foreach ($f in $files) {
     $k = $f.BaseName
@@ -520,25 +522,31 @@ foreach ($f in $files) {
     else {
         # BOTH copies of the branch, spelled in full (BACKLOG #7563). Probing the local branch first and
         # alone let a stale local copy at main read "no commit" while origin held the unmerged work,
-        # and a bare name resolves to a tag of that name first. Each copy is counted on its own, so a
-        # rebased pair is neither under- nor double-counted. for-each-ref lists the refs that exist
-        # and exits 0 either way, so a missing copy is not a native-command failure; it also matches
-        # under a `/` boundary, hence the exact compare.
-        $counts = [ordered]@{}
+        # and a bare name resolves to a tag of that name first. Copies with one tip are one copy;
+        # diverged copies are each counted and named, so neither is hidden behind the other.
+        # for-each-ref lists the refs that exist and exits 0 either way, so a missing copy is not a
+        # native-command failure; it also matches under a `/` boundary, hence the exact compare.
+        $tips = [ordered]@{}
         if ($branch) {
             $want = @("refs/heads/$branch", "refs/remotes/origin/$branch")
-            foreach ($ref in @(& git -C $repo for-each-ref --format='%(refname)' @want)) {
-                if ($want -ccontains $ref) { $counts[$ref] = [int](& git -C $repo rev-list --count "$mainSha..$ref") }
+            foreach ($line in @(& git -C $repo for-each-ref --format='%(refname) %(objectname)' @want)) {
+                $ref, $sha = $line -split ' ', 2
+                if (($want -ccontains $ref) -and ($tips.Values -notcontains $sha)) { $tips[$ref] = $sha }
             }
         }
-        $distinct = @($counts.Values | Select-Object -Unique)
+        # A count git could not produce says so: `[int]` of no output is 0, which would assert that
+        # the copy carries nothing.
+        $parts = @(foreach ($ref in $tips.Keys) {
+                $n = "$(& git -C $repo rev-list --count "$mainSha..$ref" 2>$null)".Trim()
+                $ok = ($LASTEXITCODE -eq 0) -and ($n -match '^\d+$')
+                [pscustomobject]@{ Ref = $ref; Zero = ($ok -and [int]$n -eq 0)
+                    Text = if ($ok) { "$n commit(s) $mainRef lacks" } else { "commits git rev-list could not count" } }
+            })
         $aheadTxt = if (-not $branch) { "the claim records no branch" }
-                    elseif (-not $counts.Count) { "branch '$branch' is on neither this clone nor origin" }
-                    elseif ($distinct.Count -gt 1) {
-                        "'$branch' carries " + ((@($counts.Keys) | ForEach-Object { "$($counts[$_]) commit(s) $mainRef lacks at $_" }) -join ' and ')
-                    }
-                    elseif ($distinct[0] -eq 0) { "'$branch' carries no commit $mainRef lacks" }
-                    else { "'$branch' carries $($distinct[0]) commit(s) $mainRef lacks" }
+                    elseif (-not $parts.Count) { "branch '$branch' is on neither this clone nor origin" }
+                    elseif ($parts.Count -gt 1) { "'$branch' carries " + (@($parts | ForEach-Object { "$($_.Text) at $($_.Ref)" }) -join ' and ') }
+                    elseif ($parts[0].Zero) { "'$branch' carries no commit $mainRef lacks" }
+                    else { "'$branch' carries $($parts[0].Text)" }
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = $block.File; banner = $bannerState; citations = $cites; verdict = "BLOCKING"
             why = "item reads $bannerState on $ledgerAt and $aheadTxt -- so the key is unclaimable by any future session while nothing on $ledgerAt protects it" }
@@ -615,7 +623,7 @@ if ($sup.Count) {
         Write-Host ("  {0,-18} {1}" -f "", $r.why)
         # Single-quoted, so a path holding a space, `$` or a backtick pastes as one literal argument.
         # Every character PowerShell reads as a single quote is doubled, the curly ones included.
-        Write-Host ("  {0,-18} pwsh -NoProfile -File '{1}' -Release {2} -Force" -f "", ($claimTool -replace "['‘’‚‛]", '$0$0'), $r.key) -ForegroundColor Cyan
+        Write-Host ("  {0,-18} pwsh -NoProfile -File '{1}' -Release {2} -Force" -f "", ($claimTool -replace '[''\u2018-\u201B]', '$0$0'), $r.key) -ForegroundColor Cyan
         Write-Host ""
     }
 }

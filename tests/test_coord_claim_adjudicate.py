@@ -931,18 +931,41 @@ def test_a_plan_file_named_backlog_is_not_part_of_the_namespace(repo: Path, tmp_
 
 def test_the_citation_cap_is_applied_after_filtering_not_before(repo: Path, tmp_path: Path) -> None:
     """MUST TRIP on origin/main (BACKLOG #7562). git's `--grep` reads the whole message, so every
-    commit whose squash suffix or body names the number is a candidate, and `--max-count=40` kept
-    only the 40 newest candidates before the subject filter ran. Forty newer non-citations then
-    hid the real delivery commit behind them."""
+    commit whose BODY cites the number is a candidate, and `--max-count=40` kept only the 40 newest
+    candidates before the subject filter ran. Forty newer non-citations then hid the real delivery
+    commit behind them. A body citation stays a candidate under the narrower git-side query too."""
     backlog(repo, f"## 47. Delivered long ago\n\n> {PRIORITIZED} open\n\nbody\n")
     git(repo, "commit", "-q", "--allow-empty", "-m", "the real delivery (BACKLOG #47)")
     for i in range(41):
-        git(repo, "commit", "-q", "--allow-empty", "-m", f"unrelated change {i} (#47)")
+        git(
+            repo,
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            f"change {i} (#47)",
+            "-m",
+            "see BACKLOG #47",
+        )
     git(repo, "push", "-q", "origin", "main")
     unmerged_branch(repo, "seat")
     write_claim(repo, "47", tmp_path / "gone", "seat")
     cites = rows(repo)["47"]["citations"]
     assert [c["subject"] for c in cites] == ["the real delivery (BACKLOG #47)"], cites
+
+
+def test_at_most_five_citations_are_kept_and_they_are_the_newest(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The cap of five survives the move from a loop to Select-Object, and keeps the newest."""
+    backlog(repo, f"## 47. Delivered in pieces\n\n> {PRIORITIZED} open\n\nbody\n")
+    for i in range(6):
+        git(repo, "commit", "-q", "--allow-empty", "-m", f"piece {i} (BACKLOG #47)")
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "47", tmp_path / "gone", "seat")
+    cites = rows(repo)["47"]["citations"]
+    assert [c["subject"] for c in cites] == [f"piece {i} (BACKLOG #47)" for i in (5, 4, 3, 2, 1)]
 
 
 def test_an_unreadable_claim_for_another_key_stays_out_of_a_single_key_query(
@@ -956,6 +979,12 @@ def test_an_unreadable_claim_for_another_key_stays_out_of_a_single_key_query(
     assert verdicts(repo, "-Key", "23") == {"23": "SUPERSEDED"}
     # ...and the key's own unreadable file is still reported.
     assert verdicts(repo, "-Key", "99") == {"99": "UNREADABLE"}
+    # A -Key is matched against the file name claim.ps1 folds it to, and one that folds to nothing
+    # matches no file at all, not even one named `.json`.
+    (claims_dir(repo) / "foo-bar.json").write_text("{not json", encoding="utf-8")
+    assert verdicts(repo, "-Key", "Foo Bar") == {"foo-bar": "UNREADABLE"}
+    (claims_dir(repo) / ".json").write_text("{not json", encoding="utf-8")
+    assert verdicts(repo, "-Key", "!!!") == {}
 
 
 def test_a_stale_local_branch_does_not_hide_unmerged_commits_on_origin(
