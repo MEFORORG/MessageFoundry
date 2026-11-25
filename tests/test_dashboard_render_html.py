@@ -345,7 +345,11 @@ def test_asvs_tool_provenance_is_in_the_disclosure_not_the_facts() -> None:
     tile = page[page.index("<h3>asvs") :]
     tile = tile[: tile.index("</section>")]
     assert "<dt>Tool provenance</dt>" not in tile
-    assert "# asvs-status scorecard=NO-GIT<br># generated=x" in tile
+    face, disclosure = tile.split('<details class="how">')
+    # The header line, with its ref pair, is part of the measurement: on the face, not hidden.
+    assert '<p class="mono"># asvs-status scorecard=NO-GIT</p>' in face
+    assert "# asvs-status" not in disclosure
+    assert '<p class="mono"># generated=x</p>' in disclosure
 
 
 def test_short_pair_cuts_full_commits() -> None:
@@ -361,6 +365,17 @@ def test_an_info_status_is_a_progress_pill() -> None:
     page = rh.render(snap)
     assert '<span class="pill info">info</span>' in page
     assert "1 progress only" in page
+
+
+def test_the_burndown_note_counts_the_undated_rows() -> None:
+    snap = _history_snapshot(10)
+    snap["metrics"][0]["detail"]["undated"] = {"filed": 879}
+    page = rh.render(snap)
+    card = page[page.index("<h2>Backlog burndown</h2>") :]
+    assert (
+        "Rows with no readable filing date (879) are never removed going back, so early weeks "
+        "overstate the open count by up to that many." in card[: card.index("</section>")]
+    )
 
 
 def test_a_burndown_with_no_open_series_says_no_data() -> None:

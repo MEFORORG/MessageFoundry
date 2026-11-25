@@ -248,6 +248,8 @@ def forecast_line(snap: Snapshot) -> str | None:
         return None
     if d.get("finish"):
         return f"At the last {cm.FORECAST_WEEKS} full weeks' pace ({net:,g} net rows closed a week) it reaches zero about {d['finish']}."
+    if net == 0:
+        return f"At the last {cm.FORECAST_WEEKS} full weeks' pace filing matched closing, so it never reaches zero."
     return (
         f"At the last {cm.FORECAST_WEEKS} full weeks' pace it never reaches zero: filing "
         f"outran closing by {-net:,g} rows a week."

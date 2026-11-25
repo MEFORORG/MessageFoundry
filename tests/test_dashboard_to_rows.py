@@ -437,6 +437,16 @@ def test_forecast_facts_read_never_only_when_a_pace_was_read() -> None:
     assert rows["backlog_forecast.short_finish"]["value"] is None
 
 
+@pytest.mark.parametrize("net", [0.0, -0.0, 0])
+def test_forecast_line_says_filing_matched_closing_at_a_zero_net(net: float) -> None:
+    detail = {"pace": {"net_closed_per_week": net}, "finish": None}
+    data = {"metrics": [{"id": "backlog_forecast", "value": "x", "detail": detail}]}
+    line = tr.forecast_line(tr.Snapshot(data))
+    assert line is not None
+    assert "filing matched closing, so it never reaches zero" in line
+    assert "-0" not in line
+
+
 def test_batch_facts_count_every_state() -> None:
     data = {
         "metrics": [

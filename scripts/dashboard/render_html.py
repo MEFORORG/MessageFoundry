@@ -21,7 +21,8 @@ snapshot, so the directory is refused, before anything is read, whenever the col
 (``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
 it cannot see. Every ASVS number is shown beside the collector's ref pair (``to_rows.py`` says how
 it is built), its commits shortened on the tile and given in full, with the scorecard tool's own
-``#`` provenance lines, in the tile's "how it is measured" disclosure. The ASVS headline is shown
+``#`` header line on the tile's face and its other ``#`` provenance lines in the tile's "how it is
+measured" disclosure. The ASVS headline is shown
 beside its needs-review and unverified counts, or not at all unless the snapshot holds both.
 
 TIMES ARE US CENTRAL (``to_rows.central``), with the UTC time beside the page's own stamp.
@@ -450,8 +451,7 @@ def tile(
     status = _status(row.get("status"))
     unit = str(row.get("unit") or "")
     shown_unit = "" if unit == "percent" else unit
-    # The scorecard tool's provenance lines say where it ran, not what it measured: they go in the
-    # disclosure with the full ref pair, never in the facts list.
+    # The scorecard tool's provenance lines are part of the measurement (scripts/asvs/CLAUDE.md); the header line stays on the tile face, and only the extra tool lines sit in the disclosure.
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
@@ -467,15 +467,18 @@ def tile(
             error = f"{error}; {reason}"
     note = f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else ""
     how = ""
+    header = ""
     if row.get("ref"):
+        if provenance_lines:
+            header = f'<p class="mono">{esc(provenance_lines[0])}</p>'
         # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
         lines = [
             f'<p>Collector ref pair:</p><p class="mono">{esc(row["ref"])}</p>',
             (
                 '<p>Scorecard tool provenance:</p><p class="mono">'
-                + "<br>".join(esc(ln) for ln in provenance_lines)
+                + "<br>".join(esc(ln) for ln in provenance_lines[1:])
                 + "</p>"
-                if provenance_lines
+                if provenance_lines[1:]
                 else ""
             ),
             f"<p>{esc(row['note'])}</p>" if row.get("note") else "",
@@ -496,6 +499,7 @@ def tile(
         f'<div><span class="big">{fmt(row.get("value"), unit)}</span>'
         + (f'<span class="unit">{esc(shown_unit)}</span>' if shown_unit else "")
         + "</div>"
+        + header
         + (f"<dl>{dl}</dl>" if dl else "")
         + how
         + note
@@ -578,6 +582,13 @@ def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tup
         )
 
     forecast = tr.forecast_line(snap)
+    undated = tr._dict(snap.detail("backlog_burn").get("undated")).get("filed")
+    undated_note = (
+        f" Rows with no readable filing date ({undated:,}) are never removed going back, so early "
+        "weeks overstate the open count by up to that many."
+        if isinstance(undated, int) and not isinstance(undated, bool)
+        else ""
+    )
     controls = range_controls(options, checked)
     charts = (
         '<section class="chart"><h2>Ledger rows filed and closed</h2>'
@@ -590,6 +601,7 @@ def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tup
         + ("" if any(_number(v) for v in opened.values()) else '<p class="nodata">no data</p>')
         + '<p class="note">Open rows at the end of each week, worked back from the count at run '
         "time through each week's filed and closed rows."
+        + esc(undated_note)
         + (f" {esc(forecast)}" if forecast else "")
         + "</p></section>"
     )

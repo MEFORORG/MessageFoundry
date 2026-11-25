@@ -1363,6 +1363,19 @@ def test_backlog_forecast_says_never_when_filing_outruns_closing(tmp_path: Path)
     assert m.detail["no_filing_finish"] == "2026-12-31"  # 12 / 2 = 6 weeks
 
 
+def test_backlog_forecast_dates_from_the_unrounded_pace(tmp_path: Path) -> None:
+    # A net of 1 row over 4 weeks is 0.25 a week, shown as 0.2: 12 rows take 48 weeks, not 60.
+    weeks = {f"2026-W{n}": {"filed": 1, "closed": 1} for n in (43, 44, 45)}
+    weeks["2026-W46"] = {"filed": 1, "closed": 2}
+    m = cm.Metric("backlog_forecast", "", "", "", "")
+    cm.c_backlog_forecast(_vault_ctx(tmp_path, _census(weeks=weeks)), m)
+    pace = m.detail["pace"]
+    assert (pace["net_closed_per_week"], pace["net_closed_per_week_raw"]) == (0.2, 0.25)
+    assert pace["closed_per_week_raw"] == 1.25
+    assert m.detail["weeks_to_zero"] == 48.0
+    assert m.detail["no_filing_weeks_to_zero"] == 9.6
+
+
 def test_backlog_forecast_refuses_a_short_history(tmp_path: Path) -> None:
     with pytest.raises(cm.CollectError, match="fewer than 4 full weeks"):
         cm.c_backlog_forecast(_vault_ctx(tmp_path), cm.Metric("x", "", "", "", ""))
@@ -1516,7 +1529,7 @@ def test_default_runbook() -> None:
 
 def test_the_runbook_parser_refuses_a_dtd() -> None:
     bomb = (
-        '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]>'
+        '<?xml version="1.0"?><!DOCTYPE x [<!ELEMENT x ANY>]>'
         f'<workbook xmlns="{_MAIN}"><sheets/></workbook>'
     )
     buf = io.BytesIO()
