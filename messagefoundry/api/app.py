@@ -1076,9 +1076,12 @@ _CONTROL_ACTION_SIDE: Final = {"restart_inbound": "inbound", "restart_outbound":
 #: whose emitters, read on 2026-11-22, raise it only for an outbound lane, ``"both"`` one raised
 #: on both sides, ``"inbound"`` one raised on the inbound side, and ``"none"`` one whose emitters
 #: were read as keying it on something other than a connection name, a label such as a sink's or
-#: ``dr_backup``. ``GET /alerts/rules`` withholds on ``"outbound"`` and, for a ``"*"`` rule,
-#: ``"both"``; ``"inbound"`` and ``"none"`` show alike. So a type an outbound raises that is read
-#: as ``"inbound"`` or ``"none"`` would show a rule that should be withheld. No test checks a value
+#: ``dr_backup``. For a channel-scoped caller only, ``GET /alerts/rules`` withholds on
+#: ``"outbound"`` and, for a ``"*"`` rule, ``"both"``; ``"inbound"`` and ``"none"`` show alike. An
+#: all-channels caller sees every rule whatever the side. So for a scoped caller, a misread side
+#: shows a rule that should be withheld in at least these cases: an outbound-only type read as
+#: ``"inbound"`` or ``"none"`` (any rule) or as ``"both"`` (a rule naming a connection); and a type
+#: both sides raise read as ``"inbound"`` or ``"none"`` (a ``"*"`` rule). No test checks a value
 #: against the emitters. A test pins the keys to
 #: ``config.settings._ALERT_EVENT_TYPES``, so a new type has to be classified.
 _ALERT_EVENT_SIDE: Final[Mapping[str, str]] = MappingProxyType(
