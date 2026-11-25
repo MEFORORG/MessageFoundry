@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, get_args
 
 from fastapi import HTTPException, Request
 
 from messagefoundry.api.security import client_ip
+from messagefoundry.auth import Permission
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.controlchars import scrub_log_argument
 from messagefoundry.store.cell_tag import CellTagError
@@ -38,6 +41,7 @@ from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTE
 if TYPE_CHECKING:
     from messagefoundry.auth import Identity
     from messagefoundry.pipeline import Engine
+    from messagefoundry.store.base import AuditStore
 
 _log = logging.getLogger(__name__)
 
@@ -48,8 +52,11 @@ CONNECTION_DENIED_DETAIL: Final = "not authorized for this connection"
 
 #: What a refused request whose row names no channel was asking for (vault BACKLOG #3748 item 7):
 #: a config reload, its dry run, a reset of every statistic, a replay of every channel's dead
-#: letters, a purge, and a start, stop or restart. Each value is the name of the audit action
-#: that operation writes when it runs and has an effect. A row names no channel either by design or
+#: letters, a purge, a start, stop or restart, a read of the audit trail, an audit export, and a
+#: read of the application log. Each of the first six is the name of the audit action that
+#: operation writes when it runs and has an effect; ``logs_view`` is too. ``audit_read`` and
+#: ``audit_export`` name the audit trail reads (BACKLOG #4346); the export's own action is
+#: ``audit.export``, and a read writes none of its own. A row names no channel either by design or
 #: because the name failed the connection-name rule, which ``"malformed_name"`` marks.
 DeniedOperation = Literal[
     "config_reload",
@@ -58,8 +65,47 @@ DeniedOperation = Literal[
     "dead_letter_replay",
     "connection_purge",
     "connection_control",
+    "audit_read",
+    "audit_export",
+    "logs_view",
 ]
 _DENIED_OPERATIONS: Final[frozenset[str]] = frozenset(get_args(DeniedOperation))
+
+#: The permissions whose routes refuse a channel-scoped holder outright, because what they read is
+#: not attributable to one channel, so there is nothing to narrow it by (BACKLOG #4346). Each maps
+#: to the operation its refusal row names and the refusal's 403 detail. The real routes and the
+#: gate-only ``GET /auth/check/<permission>`` routes both read this map, so the two answer alike.
+SCOPED_READER_REFUSALS: Final[Mapping[Permission, tuple[DeniedOperation, str]]] = MappingProxyType(
+    {
+        Permission.AUDIT_READ: (
+            "audit_read",
+            "channel-scoped users cannot read the audit trail",
+        ),
+        Permission.AUDIT_EXPORT: (
+            "audit_export",
+            "channel-scoped users cannot read the audit trail",
+        ),
+        Permission.LOGS_VIEW: (
+            "logs_view",
+            "channel-scoped users cannot read the application log",
+        ),
+    }
+)
+
+
+async def refuse_a_channel_scoped_reader(
+    store: AuditStore, identity: Identity, permission: Permission, client: str | None
+) -> None:
+    """Refuse a channel-scoped caller a read :data:`SCOPED_READER_REFUSALS` names, with an
+    ``auth.channel_denied`` row naming the operation (BACKLOG #4346). Does nothing for an
+    all-channels caller. ``client`` is ``None`` from the console seam, which has no request in
+    hand. Takes the store rather than the engine because the audit routes hold only the auth
+    service's."""
+    if identity.allowed_channels is None:
+        return
+    operation, detail = SCOPED_READER_REFUSALS[permission]
+    await record_channel_denied(store, identity, None, client, operation=operation)
+    raise HTTPException(403, detail)
 
 
 async def audit_channel_denied(
@@ -71,10 +117,30 @@ async def audit_channel_denied(
     flag_direction_not_inbound: bool = False,
     operation: DeniedOperation | None = None,
 ) -> None:
+    """Audit a per-channel RBAC denial: :func:`record_channel_denied` on the engine's store."""
+    await record_channel_denied(
+        engine.store,
+        identity,
+        channel,
+        client,
+        flag_direction_not_inbound=flag_direction_not_inbound,
+        operation=operation,
+    )
+
+
+async def record_channel_denied(
+    store: AuditStore,
+    identity: Identity,
+    channel: str | None,
+    client: str | None = None,
+    *,
+    flag_direction_not_inbound: bool = False,
+    operation: DeniedOperation | None = None,
+) -> None:
     """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
 
     ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
-    wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
+    wants a host for. It is OPTIONAL because :func:`audit_channel_denied` is handed to the console seam as a bare
     callback (``audit_channel_denied=``). The console's callers pass the browser's address; a caller
     that passes none leaves it NULL rather than inheriting some other caller's address.
 
@@ -116,7 +182,7 @@ async def audit_channel_denied(
             )
         elif channel is None:
             detail["operation"] = operation
-    await engine.store.record_audit(
+    await store.record_audit(
         "auth.channel_denied",
         actor=identity.username,
         channel_id=channel,

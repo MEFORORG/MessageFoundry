@@ -113,6 +113,7 @@ from messagefoundry.api.message_scope import (
     MessageKeyServiceUnavailableError,
     get_scoped_message,
     read_scoped_message,
+    refuse_a_channel_scoped_reader,
 )
 from messagefoundry.api.message_scope import audit_channel_denied as _audit_channel_denied
 from messagefoundry.api.metrics import (
@@ -11369,9 +11370,9 @@ def create_app(
         A channel-scoped caller is refused 403, with an ``auth.channel_denied`` row (BACKLOG #4346,
         the route build of #1152). A log line is not attributable to one channel, so there is
         nothing to narrow the page by; a reader who needs the log is given the all-channels grant."""
-        if identity.allowed_channels is not None:
-            await _audit_channel_denied(engine, identity, None, client_ip(request))
-            raise HTTPException(403, "channel-scoped users cannot read the application log")
+        await refuse_a_channel_scoped_reader(
+            engine.store, identity, Permission.LOGS_VIEW, client_ip(request)
+        )
         log_dir = getattr(request.app.state, "log_dir", None)
         # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
         lines, total, available = await asyncio.to_thread(

@@ -23,8 +23,8 @@ So the constants cannot drift from the code without the first test reddening, an
 drop a route the constants name without the second. A name-presence scan was rejected as the
 instrument after measurement: over the live app it MISSES ``_control_guard`` (the three
 ``connections:control`` routes enforce the scope through a helper, so their bodies name no
-primitive) and it misses the per-property rule inside ``/ws/stats``. A scan that cannot see a rule it is checking for is not an
-instrument, so the executed request is the measurement here.
+primitive) and it misses the per-property rule inside ``/ws/stats``. A scan that cannot see a
+rule it is checking for is not an instrument, so the executed request is the measurement here.
 
 ``GET /metrics`` was recorded here as the one monitoring read that was NOT narrowed. It narrows
 since BACKLOG #4346, the route build of #1152, and is measured below with the other narrowed reads.
@@ -35,6 +35,7 @@ from __future__ import annotations
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -198,7 +199,13 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
     wide_id = await _operator(service, "allchannels")
     await service.set_channel_scope(wide_id, [ALL_CHANNELS], actor="admin")
 
-    async with _client(engine, service) as c:
+    app = create_app(engine, auth=service)
+    # One planted history sample counting both inbounds' deliveries, so a history read that
+    # narrowed, or answered an empty ring, would differ from it. The ring is otherwise fed only by
+    # the /ws/stats sampler, which this test does not run.
+    planted = {"pending": 2}
+    app.state.metrics_history.record(time.time(), planted)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
         s = await _login(c, "scoped")
         u = await _login(c, "allchannels")
 
@@ -245,14 +252,24 @@ async def test_monitoring_plane_scope_is_measured_against_a_live_app(engine: Eng
         # narrow. Asserted as "no connection name reaches the payload" rather than as byte equality:
         # /stats also exposes live cost counters (committed_txns) that tick between two requests, and
         # an equality assertion on those would be flaky for a reason unrelated to scoping.
+        bodies: dict[str, tuple[Any, Any]] = {}
         for path in ("/stats", "/metrics/history"):
-            scoped_body, control_body = (
-                (await c.get(path, headers=s)).json(),
-                (await c.get(path, headers=u)).json(),
-            )
+            scoped_r, control_r = await c.get(path, headers=s), await c.get(path, headers=u)
+            assert scoped_r.status_code == 200, f"{path} answered the scoped caller {scoped_r.text}"
+            assert control_r.status_code == 200, f"{path} answered the control {control_r.text}"
+            scoped_body, control_body = scoped_r.json(), control_r.json()
             assert scoped_body.keys() == control_body.keys()
             for name in ("IB_A", "IB_B", "OB_X"):
                 assert name not in str(scoped_body), f"{path} named {name} — it is not an aggregate"
+            bodies[path] = (scoped_body, control_body)
+        # GLOBAL, not narrowed: the scoped caller reads the same counts as the control, and they
+        # count both inbounds' deliveries (one each), where a narrowing to IB_A would count one.
+        scoped_stats, control_stats = bodies["/stats"]
+        assert scoped_stats["outbox_by_status"] == control_stats["outbox_by_status"]
+        assert sum(scoped_stats["outbox_by_status"].values()) == 2
+        scoped_hist, control_hist = bodies["/metrics/history"]
+        assert scoped_hist == control_hist
+        assert [x["outbox_by_status"] for x in scoped_hist["samples"]] == [planted]
 
         # --- GET /metrics: NARROWED (BACKLOG #4346) -----------------------------------------------
         smetrics = (await c.get("/metrics", headers=s)).text

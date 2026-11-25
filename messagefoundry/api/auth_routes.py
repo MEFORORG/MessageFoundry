@@ -82,6 +82,10 @@ from messagefoundry.api.auth_models import (
     changed_name_refusal,
     custom_role_name_refusal,
 )
+from messagefoundry.api.message_scope import (
+    SCOPED_READER_REFUSALS,
+    refuse_a_channel_scoped_reader,
+)
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
     AUTH_NOT_CONFIGURED,
@@ -854,8 +858,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     def _add_permission_check(permission: Permission) -> None:
         async def auth_check_permission(
             request: Request,
+            service: AuthService = Depends(_service),
             identity: Identity = Depends(require(permission)),
         ) -> SimpleMessage:
+            # A permission whose routes refuse a channel-scoped holder is refused here too, with
+            # the same row and before the check's own grant row, so this route does not admit a
+            # caller those routes refuse (BACKLOG #4346).
+            if permission in SCOPED_READER_REFUSALS:
+                await refuse_a_channel_scoped_reader(
+                    service.store, identity, permission, client_ip(request)
+                )
             await record_check_grant(request, identity, permission)
             return SimpleMessage(detail="authorized")
 
@@ -2399,23 +2411,16 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     # --- audit ---------------------------------------------------------------
 
     async def _refuse_a_channel_scoped_reader(
-        service: AuthService, identity: Identity, client: str | None
+        service: AuthService, identity: Identity, permission: Permission, client: str | None
     ) -> None:
         """Refuse a channel-scoped caller the audit trail, with an ``auth.channel_denied`` row
-        (BACKLOG #4346, the route build of #1152). The owner's answer of 2026-10-26 was to narrow
-        or refuse such a caller; an Auditor who needs the whole trail is given the all-channels
-        grant. ``GET /audit``, ``GET /audit/export`` and their ``/ui`` twins call this before they
-        read a row. ``client`` is ``None`` from the console seam, which has no request in hand."""
-        if identity.allowed_channels is None:
-            return
-        await service.store.record_audit(
-            "auth.channel_denied",
-            actor=identity.username,
-            channel_id=None,
-            detail=json.dumps({"channel": None}),
-            client=client,
-        )
-        raise HTTPException(403, "channel-scoped users cannot read the audit trail")
+        naming the operation (BACKLOG #4346, the route build of #1152). The owner's answer of
+        2026-10-26 was to narrow or refuse such a caller; an Auditor who needs the whole trail is
+        given the all-channels grant. ``GET /audit``, ``GET /audit/export`` and their ``/ui`` twins
+        call this before they read a row. ``client`` is ``None`` from the console seam, which has
+        no request in hand. :func:`refuse_a_channel_scoped_reader` writes the row through
+        :func:`record_channel_denied`, as ``audit_channel_denied`` does."""
+        await refuse_a_channel_scoped_reader(service.store, identity, permission, client)
 
     async def _read_audit(
         service: AuthService,
@@ -2515,7 +2520,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         page would repeat the last row of the one before it. The pin is a timestamp and never a
         row id: :mod:`messagefoundry.api.paging` says why an id would leak the lock rows."""
 
-        await _refuse_a_channel_scoped_reader(service, identity, client)
+        await _refuse_a_channel_scoped_reader(service, identity, Permission.AUDIT_READ, client)
 
         def bound(pin: float | None) -> float | None:
             # The pin is one more ``until``, so the tighter of the two applies.
@@ -2664,7 +2669,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             raise TypeError("export_audit needs the caller's session token")
         # BACKLOG #4346: a channel-scoped caller is refused before the first page and before the
         # audit.export row, so a refusal records no export.
-        await _refuse_a_channel_scoped_reader(service, identity, client_ip(request))
+        await _refuse_a_channel_scoped_reader(
+            service, identity, Permission.AUDIT_EXPORT, client_ip(request)
+        )
         page_size = min(limit, _AUDIT_EXPORT_PAGE)
 
         async def _page(size: int, before_id: int | None) -> Sequence[Any]:

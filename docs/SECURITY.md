@@ -1697,7 +1697,12 @@ tuple: they act only on the caller's own account.
 
 One `GET /auth/check/<permission>` per permission, registered in a loop over `Permission`, each
 gated `require(<that permission>)` (ADR 0215 section 2). Each answers 200 once the ladder admits
-the caller and reads nothing else. They are built for the web console's later ADR 0215 slices to
+the caller and reads nothing else, except where its permission's routes refuse a channel-scoped
+holder. `/auth/check/audit:read`, `/auth/check/audit:export` and `/auth/check/logs:view` refuse
+such a caller 403 as `GET /audit`, `GET /audit/export` and `GET /logs/tail` do, with the same
+`auth.channel_denied` row, before the check route's own grant row (`SCOPED_READER_REFUSALS` in
+`messagefoundry/api/message_scope.py`, BACKLOG #4346). The gate's own grant row, where the gate
+writes one, is written before the refusal, as on the real route. They are built for the web console's later ADR 0215 slices to
 sub-request before a page that shows no engine data of its own renders; no console page calls one
 yet. A caller learns nothing it cannot read from its own `GET /auth/me`. Each writes an
 `auth.permission_granted` row naming its permission wherever a grant of that permission is
@@ -2434,7 +2439,8 @@ the same permission set on the same method reds CI until it is listed here.
 > counters above. A scraper that needs the whole
 > estate is given the all-channels grant. `GET /logs/tail`, `GET /audit` and `GET /audit/export`,
 > with the console's `/ui/audit` and `/ui/audit/export`, refuse a scoped caller 403 and write an
-> `auth.channel_denied` row: a log line names no single channel, and the owner's answer for the
+> `auth.channel_denied` row naming no channel and the operation, `audit_read`, `audit_export` or
+> `logs_view`: a log line names no single channel, and the owner's answer for the
 > audit trail was to narrow or refuse such a reader. So a built-in Auditor, or an Operator reading
 > the log, needs the all-channels grant. `tests/test_scoped_caller_metrics_logs_audit.py` executes
 > these refusals on the JSON routes. `/ui/audit/export` calls the `GET /audit/export` handler, and
@@ -2443,8 +2449,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `tests/test_monitoring_scope_doc_drift.py` executes GET /channels, GET /connections,
 > GET /events, GET /graph/edges, GET /alerts/active and GET /metrics as narrowed reads, and
 > GET /stats and GET /metrics/history as global ones, against a scoped caller with an
-> all-channels caller as the control. It does not execute the `/ws/stats` fields or the per-name
-> 403s. On the prose side it checks, among other things, that each of those route tokens appears
+> all-channels caller as the control. It does not measure at least the `/ws/stats` fields, the
+> per-name 403s, outbound names in GET /alerts/active, the control half of the GET /connections
+> shared-outbound suppression, or the GET /metrics latency-series drop. On the prose side it checks, among other things, that each of those route tokens appears
 > somewhere in this DLQ-SCOPE blockquote; it does not check which paragraph holds a token or which
 > side of the rule it is on. It does not check the refusal sentence.
 
@@ -2470,9 +2477,9 @@ the same permission set on the same method reds CI until it is listed here.
 > `auth.gate_refused` and `auth.mfa_denied`). An admitted caller's grant row is written under the
 > shipped default of `[security].audit_all_authorization_decisions`; with that switch off it is
 > written on the POST routes, whose permissions are in the sensitive set, and not on the GET routes.
-> The console checks the rule before it calls in. `audit_channel_denied`
+> The console checks the rule before it calls in. `record_channel_denied`
 > in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks the name it is given against the rule too, and records a name
+> the console seam record (`audit_channel_denied` and `refuse_a_channel_scoped_reader` call it), checks the name it is given against the rule too, and records a name
 > that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
 > unbounded length. For its own refusal of a channel-scoped actor's bulk selection the console
 > gives it an empty name, never the caller's text. A row written for a name that fails the rule

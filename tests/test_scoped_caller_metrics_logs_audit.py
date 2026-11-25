@@ -228,3 +228,85 @@ async def test_audit_export_stops_when_the_caller_becomes_scoped(
                     pass
     stops = await engine.store.list_audit(limit=10, action="audit.export.stopped", actor="wide")
     assert [json.loads(row["detail"])["reason"] for row in stops] == ["channel_scoped"]
+
+
+#: Each gate-only check route whose real route refuses a channel-scoped holder (BACKLOG #4346),
+#: beside the real route it stands in for and the operation the refusal row names.
+_REFUSING_CHECKS = [
+    ("/auth/check/audit:read", "/audit", "audit_read"),
+    ("/auth/check/audit:export", "/audit/export", "audit_export"),
+    ("/auth/check/logs:view", "/logs/tail", "logs_view"),
+]
+
+
+async def _rows(eng: Engine, actor: str) -> list[dict[str, Any]]:
+    return [dict(r) for r in await eng.store.list_audit(limit=1000, actor=actor)]
+
+
+def _added(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen = {r["id"] for r in before}
+    return [r for r in after if r["id"] not in seen]
+
+
+def _actions(rows: list[dict[str, Any]]) -> list[str]:
+    return sorted(r["action"] for r in rows)
+
+
+def _log_dir(tmp_path: Path) -> Path:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_text("2026-01-01 INFO messagefoundry started\n", "utf-8")
+    return log_dir
+
+
+@pytest.mark.parametrize(("check", "real", "operation"), _REFUSING_CHECKS)
+async def test_check_route_answers_a_scoped_holder_as_its_real_route_does(
+    engine: Engine,  # noqa: F811
+    tmp_path: Path,
+    check: str,
+    real: str,
+    operation: str,
+) -> None:
+    """``GET /auth/check/<permission>`` stands in for a page its permission's routes serve (ADR
+    0215 section 2). Where those routes refuse a channel-scoped holder, the check route refuses
+    that holder too, and writes the rows the real route writes for the refusal: no grant row of
+    its own (``record_check_grant``), and one ``auth.channel_denied`` row naming the operation."""
+    _service, c = await _setup(engine, _log_dir(tmp_path))
+    async with c:
+        s = await _login(c, "scoped")
+        w = await _login(c, "wide")
+        # Positive control: the all-channels holder is admitted by both.
+        assert (await c.get(check, headers=w)).status_code == 200
+        assert (await c.get(real, headers=w)).status_code == 200
+        r0 = await _rows(engine, "scoped")
+        real_r = await c.get(real, headers=s)
+        r1 = await _rows(engine, "scoped")
+        check_r = await c.get(check, headers=s)
+        r2 = await _rows(engine, "scoped")
+    assert real_r.status_code == 403, real_r.text
+    assert check_r.status_code == 403, check_r.text
+    # The check route writes the same rows as the real route it stands in for.
+    assert _actions(_added(r1, r2)) == _actions(_added(r0, r1))
+    denied = [r for r in _added(r1, r2) if r["action"] == "auth.channel_denied"]
+    assert [json.loads(r["detail"]) for r in denied] == [{"channel": None, "operation": operation}]
+
+
+@pytest.mark.parametrize(("check", "real", "operation"), _REFUSING_CHECKS)
+async def test_a_scoped_reader_refusal_row_names_its_operation(
+    engine: Engine,  # noqa: F811
+    tmp_path: Path,
+    check: str,
+    real: str,
+    operation: str,
+) -> None:
+    """A refusal row that names no channel names the operation it refused (vault BACKLOG #3748
+    item 7)."""
+    del check
+    _service, c = await _setup(engine, _log_dir(tmp_path))
+    async with c:
+        s = await _login(c, "scoped")
+        r0 = await _rows(engine, "scoped")
+        assert (await c.get(real, headers=s)).status_code == 403
+        r1 = await _rows(engine, "scoped")
+    denied = [r for r in _added(r0, r1) if r["action"] == "auth.channel_denied"]
+    assert [json.loads(r["detail"]) for r in denied] == [{"channel": None, "operation": operation}]
