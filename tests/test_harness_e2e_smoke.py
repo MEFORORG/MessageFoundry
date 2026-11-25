@@ -228,7 +228,7 @@ def test_health_failures_name_the_last_api_error() -> None:
 
 def _rows(*rows: tuple[str, str, int]) -> list[SimpleNamespace]:
     return [
-        SimpleNamespace(role="source", channel_id=name, status=status, port=port)
+        SimpleNamespace(role="source", channel_id=name, status=status, port=port, method="MLLP")
         for name, status, port in rows
     ]
 
@@ -278,6 +278,7 @@ def test_a_connection_closed_before_the_ack_says_so() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.bind(("127.0.0.1", 0))
         server.listen()
+        server.settimeout(30)  # a send that never connects fails the test, not hangs it
         port = int(server.getsockname()[1])
 
         def close_at_once() -> None:
@@ -392,7 +393,9 @@ def test_a_running_inbound_that_reports_no_port_is_ready_on_its_name() -> None:
     """An inbound whose port comes from ``env()`` reports none; its name and status are the word."""
     client: Any = SimpleNamespace(
         connections=lambda: [
-            SimpleNamespace(role="source", channel_id="IB_E2E_ADT", status="running", port=None)
+            SimpleNamespace(
+                role="source", channel_id="IB_E2E_ADT", status="running", port=None, method="MLLP"
+            )
         ]
     )
     reported = e2e_smoke._wait_inbound(
@@ -403,6 +406,58 @@ def test_a_running_inbound_that_reports_no_port_is_ready_on_its_name() -> None:
         deadline=time.monotonic() + 30,
     )
     assert reported is None
+
+
+def test_an_inbound_that_is_not_mllp_fails_at_once() -> None:
+    """/connections reports no port for a non-MLLP inbound, so a None port must not pass it."""
+    rows = [
+        SimpleNamespace(
+            role="source", channel_id="IB_E2E_ADT", status="running", port=None, method="X12"
+        )
+    ]
+    failed, took = _wait_inbound(lambda: rows)
+    assert failed.step == "ready"
+    assert "IB_E2E_ADT is X12, not MLLP" in str(failed)
+    assert took < 5
+
+
+def test_an_engine_left_running_fails_a_run_whose_steps_passed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def fake_start(argv: object, **_: object) -> tuple[_Proc, None]:
+        return _Proc(), None
+
+    class _Client:
+        base_url = "https://127.0.0.1:1"
+
+        def __init__(self, *_: object, **__: object) -> None: ...
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_: object) -> None: ...
+        def set_token(self, token: str) -> None: ...
+
+    monkeypatch.setattr(e2e_smoke, "_check_checkout", lambda env, work: work)
+    monkeypatch.setattr(rigadmin, "provision", lambda **_: True)
+    monkeypatch.setattr(rigadmin, "sign_in", lambda *a, **k: "token")
+    monkeypatch.setattr(e2e_smoke, "EngineClient", _Client)
+    monkeypatch.setattr(e2e_smoke, "_start", fake_start)
+    monkeypatch.setattr(e2e_smoke, "_wait_api", lambda *a: None)
+    monkeypatch.setattr(e2e_smoke, "_wait_inbound", lambda *a, **k: 2575)
+    monkeypatch.setattr(e2e_smoke, "_send", lambda *a, **k: "AA")
+    monkeypatch.setattr(e2e_smoke, "_poll_disposition", lambda *a, **k: "processed")
+    monkeypatch.setattr(e2e_smoke, "_stop", lambda proc, job: False)
+    config, port = _config(tmp_path, _DANGLING_ROUTER)
+    with pytest.raises(e2e_smoke.StepFailed) as failed:
+        e2e_smoke.run(
+            config=config,
+            message_file=e2e_smoke._DEFAULT_MESSAGE,
+            inbound="IB_E2E_ADT",
+            mllp_port=port,
+            expect="processed",
+            timeout=1.0,
+        )
+    assert failed.value.step == "teardown"
 
 
 def test_a_signal_held_by_a_block_that_raises_still_ends_the_run() -> None:
@@ -437,9 +492,9 @@ def test_a_failing_stop_still_removes_the_temp_directory_and_keeps_the_step_fail
     removed: list[Path] = []
     real_remove = e2e_smoke._remove
 
-    def remove(path: Path) -> None:
+    def remove(path: Path) -> bool:
         removed.append(path)
-        real_remove(path)
+        return real_remove(path)
 
     def fail_stop(proc: object, job: object) -> None:
         raise OSError("stop failed")
@@ -511,6 +566,7 @@ def test_a_reply_that_does_not_parse_says_so() -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.bind(("127.0.0.1", 0))
         server.listen()
+        server.settimeout(30)  # a send that never connects fails the test, not hangs it
         port = int(server.getsockname()[1])
 
         def answer_garbage() -> None:

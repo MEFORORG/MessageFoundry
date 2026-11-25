@@ -284,8 +284,9 @@ def _wait_inbound(
     deadline: float,
 ) -> int | None:
     """Wait until the API reports THIS engine's inbound running on ``mllp_port``, and return the
-    port it reported. A running inbound that reports no port (one whose port comes from ``env()``)
-    passes on its name, and returns ``None``.
+    port it reported. A running MLLP inbound that reports no port (one whose port comes from
+    ``env()``) passes on its name, and returns ``None``. ``GET /connections`` reports a port for no
+    other connector type, so any other inbound fails at once: the smoke sends MLLP.
 
     A bare connect would accept any process holding the port, and a failed inbound bind leaves the
     engine up (ADR 0031), so only the engine's own word that its listener runs is evidence. An
@@ -305,6 +306,10 @@ def _wait_inbound(
         if sources and not mine:
             raise StepFailed("ready", f"inbound {_shown(inbound)} is not in the engine's graph")
         for row in mine:
+            if row.method != "MLLP":
+                raise StepFailed(
+                    "ready", f"inbound {_shown(inbound)} is {_shown(row.method)}, not MLLP"
+                )
             seen = f"status {row.status}, port {row.port}"
             if row.status == "running" and row.port in (mllp_port, None):
                 return row.port
@@ -363,7 +368,7 @@ def _poll_disposition(
         time.sleep(_POLL_S)
 
 
-def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = False) -> None:
+def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = False) -> bool:
     """Stop the engine and everything it started. It is not meant to raise: it runs in a
     ``finally``, where :func:`run` reports an error it does raise as a ``WARNING`` when a step had
     already failed. ``never_ran`` is for a child that was never resumed, whose job already ended
@@ -375,7 +380,8 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = F
     pid nothing else can hold, takes :func:`~messagefoundry.proctree.kill_process_group`.
 
     A refused or failed kill is not swallowed: an engine still running afterwards, or a Windows
-    engine no kill-on-close job held, prints a ``WARNING`` line."""
+    engine no kill-on-close job held, prints a ``WARNING`` line, and the return is ``False``."""
+    clean = True
     if proc.poll() is None:
         # PermissionError: Windows refuses TerminateProcess on a root its job is already ending.
         # Suppressed only because the check below reports an engine that outlived the refusal.
@@ -394,12 +400,14 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = F
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(timeout=5)
     if proc.poll() is None:
+        clean = False
         print(
             f"WARNING the engine (pid {proc.pid}) did not stop; stop it by hand",
             file=sys.stderr,
             flush=True,
         )
     elif sys.platform == "win32" and job is None and not never_ran:
+        clean = False
         print(
             f"WARNING no kill-on-close job held the engine (pid {proc.pid}); a process it started"
             " may still run",
@@ -412,12 +420,14 @@ def _stop(proc: subprocess.Popen[bytes], job: int | None, *, never_ran: bool = F
         else:
             reached = kill_reaped_leader_group(proc.pid) is not None
         if not reached:
+            clean = False
             print(
                 f"WARNING the engine's process group {proc.pid} could not be signalled; a process"
                 " it started may still run",
                 file=sys.stderr,
                 flush=True,
             )
+    return clean
 
 
 def _start(
@@ -478,6 +488,7 @@ def run(
     work = Path(tempfile.mkdtemp(prefix="mefor-e2e-smoke-"))
     proc: subprocess.Popen[bytes] | None = None
     job: int | None = None
+    failing: BaseException | None = None
     try:
         cert, key = work / "api-cert.pem", work / "api-key.pem"
         db = work / "store.db"
@@ -505,6 +516,8 @@ def run(
             raise StepFailed("provision", "the fresh store already held an Administrator")
         if api_port is None:
             api_port = _free_port()  # drawn last, so another process has least time to take it
+            while api_port == mllp_port:  # free now, but the inbound is about to bind it
+                api_port = _free_port()
 
         argv = [
             sys.executable,
@@ -601,21 +614,32 @@ def run(
                     f"control id {shown_id} on {shown_inbound}: {seen}, expected {expect.upper()}",
                 )
             print(f"step disposition: {status.upper()}", flush=True)
+    except BaseException as exc:
+        failing = exc
+        raise
     finally:
         _SIGNALS.holding = True  # first, one store: a signal from here on waits for the teardown
         # A step's failure stays the run's failure: a teardown error then is only a WARNING. With
-        # no failure in flight, the teardown's own error ends the run as ``teardown``.
-        failing = sys.exc_info()[1]
+        # no failure in flight, the teardown's own error, or anything it left behind, ends the run
+        # as ``teardown``.
         failed_step, _PROGRESS.step = _PROGRESS.step, "teardown"
+        clean = True
         try:
             try:
                 if proc is not None:
-                    _stop(proc, job)
+                    clean = _stop(proc, job)
             finally:
                 try:
-                    _remove(work)
+                    clean = _remove(work) and clean
                 finally:
                     _SIGNALS.release()
+            if not clean and failing is None:
+                raise StepFailed(
+                    "teardown",
+                    "the run left the engine or its temp directory behind (WARNING above)",
+                )
+        except StepFailed:
+            raise
         except Exception as exc:
             if failing is None:
                 raise
@@ -627,18 +651,20 @@ def run(
         _PROGRESS.step = failed_step
 
 
-def _remove(path: Path) -> None:
-    """Delete the temp dir. Windows may hold the store file briefly after the engine dies."""
+def _remove(path: Path) -> bool:
+    """Delete the temp dir, and say whether it is gone. Windows may hold the store file briefly
+    after the engine dies."""
     for _ in range(8):
         try:
             shutil.rmtree(path)
-            return
+            return True
         except FileNotFoundError:
-            return
+            return True
         except OSError:
             time.sleep(0.25)
     try:
         shutil.rmtree(path)
+        return True
     except OSError as exc:
         # It holds a throwaway loopback key and a synthetic store; say so rather than pass quietly.
         print(
@@ -646,6 +672,7 @@ def _remove(path: Path) -> None:
             file=sys.stderr,
             flush=True,
         )
+        return False
 
 
 def _positive_seconds(text: str) -> float:

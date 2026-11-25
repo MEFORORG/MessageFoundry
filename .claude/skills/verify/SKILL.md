@@ -36,8 +36,9 @@ on 2575, signs in as a per-run rig Administrator, and reads the message's dispos
   move the sample inbound, whose port is fixed at 2575 in `samples/config/adt.py`; to run beside the
   holder, point the smoke at a graph whose inbound listens elsewhere:
   `--config <dir> --inbound <name> --mllp-port <port>`. Otherwise report the held port and stop.
-- `FAIL teardown` names an error while the engine was being stopped after every step passed; a
-  `WARNING the teardown failed too` line is the same after a step failed. Either way, check for a
+- `FAIL teardown` means every step passed but stopping the engine raised an error or left the
+  engine, a process it started, or the temp directory behind (a `WARNING` line says which); a
+  `WARNING the teardown failed too` line is the error case after a step failed. Either way, check for a
   leftover engine process and temp directory (`mefor-e2e-smoke-*`).
 - `--expect unrouted|filtered|not_deployed|error` asserts another final disposition (`error`
   only after the ACK: a NAKed message fails `mllp`); `--message <file>` sends
