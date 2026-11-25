@@ -217,7 +217,10 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
     to charge a step-up return to the staged user's ceremony budget.
 
     ADR 0207 (vault BACKLOG #2609) added ``EnrolmentCodeRefused``, which the TOTP confirm form
-    answers on itself, and the two enrolment-code actions the user page's lanes bind."""
+    answers on itself, and the two enrolment-code actions the user page's lanes bind.
+
+    BACKLOG #6886 added ``StoredPasskeysUnreadable``, which the reauth and MFA pages catch from the
+    passkey begin leg to show the unreadable-passkey notice."""
     assert surface.auth_service_symbols == (
         "AuthService",
         "DirectoryRefusal",
@@ -249,6 +252,7 @@ def test_auth_service_symbols_are_what_the_console_actually_imports(surface: Any
         "STEP_UP_ACTION_UPLOAD_RESEND",
         "STEP_UP_ACTION_WEBAUTHN_DELETE",
         "STEP_UP_ACTION_WEBAUTHN_ENROLL",
+        "StoredPasskeysUnreadable",
     )
 
 
