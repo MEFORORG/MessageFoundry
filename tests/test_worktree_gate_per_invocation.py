@@ -285,6 +285,45 @@ def test_a_quoted_victim_holding_a_closer_character_is_still_judged(
     assert "worktree remove" in _reason(rig, cmd, rig.tmp)
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        'git worktree remove "{tmp}/x;y/../Primary-wt2"',
+        'git worktree remove "{tmp}/x&&y/../Primary-wt2"',
+        'git worktree remove "{tmp}/x)y/../Primary-wt2"',
+        'git worktree remove "{tmp}/x}}y/../Primary-wt2"',
+        "git worktree remove '{tmp}/x;y/../Primary-wt2'",
+        'git worktree move "{tmp}/x;y/../Primary-wt2" {tmp}/moved',
+        'git status ; git worktree remove "{tmp}/x|y/../Primary-wt2"',
+    ],
+)
+def test_a_quoted_victim_holding_a_separator_is_read_whole(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """BACKLOG #5643 residual "the pre-splitters are not quote-aware": both splits cut a quoted
+    victim at a separator inside its quotes, so it named a path that does not exist, and the remove
+    of a governed worktree was ALLOWED (measured on origin/main 33870a40944 for the `;`, `&&` and
+    `|` rows). The `)` and `}` rows already deny there, through the first reading's split, which
+    does not cut at those; they pin that."""
+    cmd = template.format(tmp=rig.tmp.as_posix())
+    assert "worktree" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # The same quoted separator in a victim that names nothing governed.
+        'git worktree remove "{tmp}/x;y/../Outside"',
+        # A separator the shell does read as code still ends the victim.
+        'git worktree remove "{o}/nope" ; echo "{tmp}/Primary-wt2"',
+        "git worktree remove {o}/nope && echo '{tmp}/x;y/../Primary-wt2'",
+    ],
+)
+def test_a_quoted_separator_control_is_allowed(rig: SimpleNamespace, template: str) -> None:
+    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
+    assert _allowed(rig, cmd, rig.outside)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
 def test_a_printed_upper_case_git_is_not_judged_on_windows(rig: SimpleNamespace) -> None:
     """ALLOW on origin/main; the case-insensitive token test caught a word `echo` prints."""

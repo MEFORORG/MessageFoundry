@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.20.2"
+$GateVersion = "2026.11.25.1"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -915,6 +915,25 @@ function Get-ScanRawIndexMap($Seg) {
     if ($again -cne [string]$Seg.Scan -or $map.Count -ne $again.Length) { return $null }
     $map.Add(([string]$Seg.Raw).Length)
     , $map.ToArray()
+}
+
+# $Raw from $Start up to the first match of $Split whose every character the shell reads as code, by
+# Get-QuoteStateMap's reading, or to the end of $Raw where none is. Rule 3d's quote-aware victim split
+# (BACKLOG #5643). Where Get-QuoteStateMap misreads a quote, the cut lands elsewhere; rule 3d only ADDS
+# the victims read from this text, so a misreading costs a false deny or a victim not read here, never a
+# deny the other splits make.
+function Get-CodeSplitPrefix([string]$Raw, [string]$Convention, [int]$Start, [string]$Split) {
+    if ($Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
+    $q = Get-QuoteStateMap $Raw $Convention
+    foreach ($m in [regex]::Matches($Raw.Substring($Start), $Split)) {
+        $at = $Start + $m.Index
+        $code = $true
+        for ($k = $at; $k -lt $at + $m.Length; $k++) {
+            if ($q[$k] -ne [char]'N') { $code = $false; break }
+        }
+        if ($code) { return $Raw.Substring($Start, $m.Index) }
+    }
+    $Raw.Substring($Start)
 }
 
 # ===================================================================================================
@@ -5153,7 +5172,16 @@ What to do instead:
                 $sameAsOld = ($rawEnd -eq $oldEnd)
                 if ($sameAsOld) { $oldWindow = $win }
                 $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
-                foreach ($v in @(Get-WorktreeVictimTokens $a2)) {
+                # AND THE SAME SPLIT, QUOTE-AWARE (BACKLOG #5643 residual list, "the pre-splitters are
+                # not quote-aware"): both splits above cut a quoted victim at a `;`, `&&`, `}` or `)`
+                # inside its quotes, so `"<tmp>/x;y/../<wt>"` named `"<tmp>/x` and was ALLOWED. This one
+                # ends only at a separator the shell reads as code. ADDED beside the two, so a victim
+                # either of them names is still judged.
+                $a3 = Get-CodeSplitPrefix $seg.Raw ([string]$seg.Conv) $rawEnd $wtVictimSplit
+                $seenHere = @()
+                foreach ($v in @(Get-WorktreeVictimTokens $a2) + @(Get-WorktreeVictimTokens $a3)) {
+                    if ($seenHere -ccontains $v) { continue }
+                    $seenHere += $v
                     if ($sameAsOld -and @($oldVictims | Where-Object {
                                 [string]::Equals($_, $v, [System.StringComparison]::Ordinal) }).Count -gt 0) { continue }
                     $added += [pscustomobject]@{
@@ -5266,7 +5294,11 @@ What to do instead:
         #     `(?:&&|\|\||;|\|)`, so a quoted victim path containing `;` or `&&` is truncated before the
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
         #     segment loop, which also cuts at a `}`, `)` or lone `&`, so there a quoted path holding
-        #     one of those is truncated too, and only the first reading judges it.
+        #     one of those is truncated too. NARROWED 2026-11-25 (BACKLOG #5643), NOT FIXED: the added
+        #     reading also reads the victims before the first separator Get-QuoteStateMap calls code
+        #     (Get-CodeSplitPrefix), so `"<tmp>/x;y/../<wt>"` is judged whole there. It runs only
+        #     where the added reading runs (Get-ScanRawIndexMap answers, and the invocation passes
+        #     its tests), and it shares that quoting model's misreadings.
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.
