@@ -2735,8 +2735,8 @@ known; it does not prove there are no others.
 
 **Everything else in a field no rule maps passes.** That includes a name, a date, an undashed SSN,
 a bare ten-digit phone number, an account number and a free-text note. A Z-segment is the common
-case, since no default rule names one. A value in a standard field no rule maps, such as `NK1-10`,
-the next of kin's job title, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
+case, since no default rule names one. A value in a standard field no rule maps, such as `NK1-11`,
+the next of kin's job code and class, passes the same way. The detectors stay narrow on purpose: a broad digit search flags almost every HL7 body.
 
 **An escaped value is read decoded too (BACKLOG #5532).** HL7 lets a sender write any character
 as an escape sequence, so `123\X2D\45\X2D\6789` is a dashed SSN and `M\X52\` is the id type
