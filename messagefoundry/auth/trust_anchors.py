@@ -1030,7 +1030,7 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             f"{spec.setting}: the trust anchor {spec.path!r} holds the certificate the engine "
             "appends to test that the TLS library reads a trust anchor to its end. That "
             "certificate is never trusted, so remove it",
-            scope="unloadable",
+            scope="holds_probe",
         )
     if not _reads_to_the_end(text, len(loaded)):
         raise TrustAnchorError(
@@ -1070,9 +1070,11 @@ def _reads_to_the_end(text: str, loaded: int) -> bool:
     this loads ``text`` with :data:`_READ_TO_END_PROBE` after it into a throwaway context: a load
     that stopped early never reaches the probe. A load that raises here counts as not reaching it.
     ``loaded`` is how many CA certificates the load of ``text`` alone holds, and the load with the
-    probe must hold exactly one more and hold the probe. The caller refuses ``text`` that already
-    holds the probe, since OpenSSL keeps one copy of a certificate it reads twice, so the probe
-    would show whether or not the load reached the end.
+    probe must hold exactly one more and hold the probe. OpenSSL does not always drop a
+    certificate it is given twice (:func:`messagefoundry.pki._refuse_unless_openssl_loads` records
+    a case), so where ``text`` already holds the probe, the load may or may not count it twice, and
+    neither the count nor the probe's presence would show whether the load reached the end. The
+    caller refuses such ``text`` first.
     It does not judge a block's contents once decoded: at least a ``X509 CRL`` block whose base64
     decodes to bytes that are no CRL loads here and refuses under ``cafile=``."""
     probe = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

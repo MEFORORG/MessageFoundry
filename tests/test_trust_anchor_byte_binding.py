@@ -817,10 +817,10 @@ def test_a_block_the_load_stops_at_refuses_as_cafile_does(
 
 
 def test_a_file_holding_the_read_to_end_probe_refuses(cas: tuple[_Ca, _Ca]) -> None:
-    """The check appends a throwaway certificate and looks for it after the load. OpenSSL keeps
-    one copy of a certificate it reads twice, so in a file that already holds that certificate
-    ahead of a block the load stops at, the certificate would show either way. Such a file
-    refuses, naming the certificate, and so does one holding it with no damaged block."""
+    """The check appends a throwaway certificate and looks for it after the load. In a file that
+    already holds that certificate, the certificate shows whether or not the load reached the end,
+    and OpenSSL may or may not count it twice, so neither its presence nor the count would tell.
+    Such a file refuses first, naming the certificate, with or without a damaged block."""
     good, _ = cas
     probe = ta._READ_TO_END_PROBE.encode("ascii")
     damaged = b"-----BEGIN EXAMPLE DATA-----\nName: value\nAAAA\n-----END EXAMPLE DATA-----\n"
@@ -829,7 +829,7 @@ def test_a_file_holding_the_read_to_end_probe_refuses(cas: tuple[_Ca, _Ca]) -> N
     for refused_data in (data, good.pem + probe):
         with pytest.raises(TrustAnchorError, match="never trusted, so remove it") as refused:
             anchor_cadata(refused_data, _SPEC)
-        assert refused.value.scope == "unloadable"
+        assert refused.value.scope == "holds_probe"
 
 
 @pytest.mark.parametrize(
