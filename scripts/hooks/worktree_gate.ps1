@@ -3619,9 +3619,9 @@ function Get-GovernedRootForCommon([string[]]$CommonCmps) {
 # -Reask, which rule 3d passes, a failed relative ask, whose answer is handed to that caller and not
 # kept, so rule 3c's view stays the first answer. Rule 3d tries every base and denies on any match.
 # Neither re-ask runs in the call that made the first ask, and each goes through Invoke-GitRead, so
-# it reaches git except where, in the rewritten pass, that function already asked the question in
-# that pass; its note says when. The comparable forms are built in the
-# path form current at the call.
+# it reaches git except at least where that function serves a kept success, or, in the rewritten
+# pass, a question it already asked in that pass; its note says when. The comparable forms are
+# built in the path form current at the call.
 $commonDirAnswers = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
 function Read-AbsoluteCommonDir([string]$CandRaw) {
     $absolute = "$(Invoke-GitRead @('-C', $CandRaw, 'rev-parse', '--path-format=absolute', '--git-common-dir'))".Trim()

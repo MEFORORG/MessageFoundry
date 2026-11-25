@@ -440,7 +440,8 @@ def test_a_failed_answer_on_a_device_spelling_is_asked_again(
     """.NET reports these spellings of the worktree missing while git enters them (review round a9c38332ff).
 
     A failure was kept wherever .NET found no directory, so one failed `worktree list` ask let the
-    hijack through that origin/main refused on its second ask. No failure is kept for the run now.
+    hijack through that origin/main refused on its second ask. The given pass keeps no failure now;
+    the rewritten pass still replays one for the rest of that pass (Invoke-GitRead's note).
     """
     state = _install_stub_git(tmp_path, monkeypatch, 1, "worktree list")
     win = str(rig.wt).replace("/", "\\")
