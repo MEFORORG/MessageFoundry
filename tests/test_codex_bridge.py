@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -678,3 +679,84 @@ def test_user_prompt_submit_keeps_plain_text_as_context(bridge, tmp_path):
     payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
     result = bridge.dispatch(tmp_path, payload)
     assert result["hookSpecificOutput"]["additionalContext"] == "plain prompt context"
+
+
+# --- BACKLOG #5501: dispatch over the TRACKED .claude/settings.json, not a synthetic one, with
+# the hook process stubbed, so every hook the repo registers is reached with the argv Claude Code
+# would run, a command-only hook with no args included; and exit 1 stays apart from exit 2.
+
+_TRACKED = json.loads((ROOT / ".claude/settings.json").read_text(encoding="utf-8-sig"))
+_PROBE_TOOLS = ("Bash", "PowerShell", "Agent", "Task", "Workflow", "EnterWorktree", "Edit", "Write")
+_BASH = "stub-git-bash"
+
+
+def _tracked_repo(tmp_path):
+    (tmp_path / ".claude").mkdir()
+    shutil.copy2(ROOT / ".claude/settings.json", tmp_path / ".claude/settings.json")
+    return tmp_path
+
+
+def _expected_argv(root, hook):
+    """What Claude Code runs for a hook, written from its hook schema rather than from hook_argv."""
+    if "args" in hook:
+        return [
+            hook["command"],
+            *(a.replace("${CLAUDE_PROJECT_DIR}", str(root)) for a in hook["args"]),
+        ]
+    assert hook.get("shell") == "bash", f"add the expected argv for shell {hook.get('shell')!r}"
+    return [_BASH, "-c", hook["command"]]
+
+
+def _tracked_payloads():
+    """One payload per tracked group, with a tool name its matcher accepts."""
+    for event, groups in _TRACKED["hooks"].items():
+        for group in groups:
+            payload = {"session_id": "x", "hook_event_name": event}
+            if event in ("PreToolUse", "PostToolUse", "PermissionRequest"):
+                matcher = group.get("matcher", "")
+                tools = [t for t in _PROBE_TOOLS if matcher in ("", "*") or re.search(matcher, t)]
+                assert tools, f"no probe tool name matches {event} matcher {matcher!r}"
+                payload["tool_name"] = tools[0]
+            yield event, group, payload
+
+
+def _stub_hooks(bridge, monkeypatch, returncode=0):
+    calls = []
+
+    def run_hook(argv, payload, root, env, timeout):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+    monkeypatch.setattr(bridge, "run_hook", run_hook)
+    monkeypatch.setattr(bridge, "find_bash", lambda: _BASH)
+    return calls
+
+
+def test_the_tracked_settings_has_a_command_only_hook_with_no_args():
+    """The case this file's synthetic settings never wrote; it must stay covered below."""
+    hooks = [h for groups in _TRACKED["hooks"].values() for g in groups for h in g["hooks"]]
+    assert any("args" not in hook for hook in hooks)
+
+
+def test_every_tracked_hook_is_dispatched_with_its_claude_argv(bridge, tmp_path, monkeypatch):
+    root = _tracked_repo(tmp_path)
+    calls = _stub_hooks(bridge, monkeypatch)
+    for _event, group, payload in _tracked_payloads():
+        calls.clear()
+        bridge.dispatch(root, payload)
+        for hook in group["hooks"]:
+            assert _expected_argv(root, hook) in calls, (payload, hook)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "expected"), [(1, subprocess.CalledProcessError), (2, None)], ids=["1", "2"]
+)
+def test_a_tracked_guards_exit_1_is_not_its_exit_2(
+    bridge, tmp_path, monkeypatch, returncode, expected
+):
+    root = _tracked_repo(tmp_path)
+    _stub_hooks(bridge, monkeypatch, returncode)
+    payload = {"session_id": "x", "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+    with pytest.raises(expected or bridge.HookBlocked) as caught:
+        bridge.dispatch(root, payload)
+    assert isinstance(caught.value, bridge.HookBlocked) == (returncode == 2)
