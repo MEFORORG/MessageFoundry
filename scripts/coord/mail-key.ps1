@@ -130,6 +130,9 @@ function Resolve-BoxPath {
         # check-ignore matched it against every `<untracked dir>/` probe, so an untracked subdirectory
         # read as ignored. A folder that a pattern does ignore still answers for its children.
         $rel = ($full.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/') + '/mefor-box-probe'
+        # Local to this function: with the preference on, a caller's EAP Stop turns git's exit 1, the
+        # "raise" answer, into a throw, and the catch below would then keep the subdirectory.
+        $PSNativeCommandUseErrorActionPreference = $false
         $null = & git -C $root check-ignore -q -- $rel 2>$null
         # 1 is "not ignored". 0 is ignored, and anything else is git failing to answer.
         if ($LASTEXITCODE -eq 1) { return $root }
@@ -165,18 +168,28 @@ function Get-BoxReadKeys {
     # reader (the drain, the watcher) passes each to Move-LegacyInbox; NO WRITER MAY ADDRESS ONE.
     #   - the legacy path-only key of the resolved directory (the host joining the key, step 4);
     #   - when $Path is a subdirectory raised to its root: the key it was addressed by before
-    #     Resolve-BoxPath, ConvertTo-BoxKey of $Path itself, and that path's legacy key.
+    #     Resolve-BoxPath, ConvertTo-BoxKey of $Path itself and that path's legacy key, for $Path as
+    #     spelled (an old drain keyed its cwd so) and in GetFullPath's form (an old sender ran
+    #     Resolve-Path, which collapses `..`).
     # -Resolved takes the caller's own Resolve-BoxPath answer for $Path, to spare a second git call.
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path, [string]$Resolved)
     $resolved = if ($Resolved) { $Resolved } else { Resolve-BoxPath -Path $Path }
-    $keys = @(ConvertTo-LegacyBoxKey -Path $resolved)
-    if ((ConvertTo-BoxKeyPath -Path $resolved) -cne (ConvertTo-BoxKeyPath -Path $Path)) {
-        $keys += ConvertTo-BoxKey -Path $Path
-        $keys += ConvertTo-LegacyBoxKey -Path $Path
+    $here = ConvertTo-BoxKeyPath -Path $resolved
+    $keys = [System.Collections.Generic.List[string]]::new()
+    $keys.Add((ConvertTo-LegacyBoxKey -Path $resolved))
+    $spellings = @($Path)
+    try {
+        if ([System.IO.Path]::IsPathFullyQualified($Path.Trim())) { $spellings += [System.IO.Path]::GetFullPath($Path.Trim()) }
+    } catch { }
+    foreach ($s in $spellings) {
+        if ((ConvertTo-BoxKeyPath -Path $s) -ceq $here) { continue }
+        foreach ($k in @((ConvertTo-BoxKey -Path $s), (ConvertTo-LegacyBoxKey -Path $s))) {
+            if (-not $keys.Contains($k)) { $keys.Add($k) }
+        }
     }
     # Unrolled, so `@(Get-BoxReadKeys ...)` and `foreach ($k in Get-BoxReadKeys ...)` both see keys.
-    return $keys
+    return $keys.ToArray()
 }
 
 # Set at load so a StrictMode caller can read it before the first load below.

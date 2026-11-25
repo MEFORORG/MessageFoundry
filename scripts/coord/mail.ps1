@@ -606,10 +606,18 @@ if ($Send) {
     # Two targets in one worktree (a broadcast reaching a root session and a subdirectory session)
     # share one box, so the second is skipped rather than queue the same message twice.
     $keysSeen = [System.Collections.Generic.HashSet[string]]::new()
+    # A broadcast never queues into the sender's OWN box: a peer elsewhere in the sender's worktree
+    # shares it, and the sender's own drain would show and consume the copy. The roster's cwd
+    # comparison above cannot see that, since the two cwds differ.
+    if ($To -ieq 'all') { $null = $keysSeen.Add((ConvertTo-BoxKey -Path (Resolve-BoxPath -Path (Get-Location).Path))) }
+    $folded = @()
     foreach ($t in $targets) {
         $k = ConvertTo-BoxKey -Path (Resolve-BoxPath -Path $t)
         if ($keysSeen.Add($k)) { $rows += [pscustomobject]@{ To = $t; Key = $k; Cwd = $t } }
+        else { $folded += "$t (box $k)" }
     }
+    # Said, so a target that got no copy of its own is not silent.
+    foreach ($f in $folded) { [Console]::Error.WriteLine("mail.ps1: no separate copy for $f, which shares a box already addressed or the sender's own.") }
     foreach ($s in $seatTargets) {
         $label = if ($s.Host) { "$($s.Key) (seat on $($s.Host))" } else { "$($s.Key) (seat)" }
         $cwd = if ($s.Worktree) { $s.Worktree } else { $s.Key }
@@ -767,7 +775,7 @@ if ($Json) {
             Claiming = $claiming.Count; Stranded = $stranded.Count
             Expired = $expired.Count
             NextDrainShowsAtLeast = $fits
-            LegacyKey = $legacyKey; LegacyInbox = $legacyInbox
+            LegacyKey = $legacyKey; OldKeys = $oldKeys; LegacyInbox = $legacyInbox
             LegacyClaiming = $legacyClaiming; LegacyStranded = $legacyStranded
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
         } | ConvertTo-Json -Depth 4) | Write-Output

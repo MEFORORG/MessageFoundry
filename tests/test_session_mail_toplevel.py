@@ -192,6 +192,15 @@ def test_an_untracked_subdirectory_is_raised_under_a_crlf_gitignore(repo: Path) 
     assert not _same(_resolve(repo / ".claude" / "worktrees" / "gone"), repo)
 
 
+def test_a_caller_that_stops_on_native_errors_still_raises(repo: Path) -> None:
+    sub = _sub(repo)
+    strict = (
+        "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; "
+        "Resolve-BoxPath -Path $env:BK_PATH"
+    )
+    assert _same(_ps_expr(strict, sub), repo)
+
+
 def test_a_path_in_no_checkout_is_keyed_as_given(tmp_path: Path) -> None:
     outside = tmp_path / "loose" / "dir"
     outside.mkdir(parents=True)
