@@ -18297,10 +18297,12 @@ class AuthService:
     ) -> Elevation:
         """Validate a TOTP code (or a single-use recovery code) for the caller's session and, on
         success, mark the session's second factor satisfied and re-key the session (ASVS 7.2.4).
-        Not every refusal is audited: at least a missing token, a session or account gone at the
-        first read, a disabled account and an account with TOTP off (the ``totp_enabled`` check)
-        return before any audit. The API gates this behind the login rate limiter. Returns a
-        not-``ok`` :class:`Elevation` (never raises) for any invalid input.
+        Not every refusal writes an ``auth.mfa_failed`` row: at least a missing token, and at the
+        first read a session or account gone, an account disabled or an account with TOTP off (the
+        ``totp_enabled`` check), return before any such row. The JSON route gates this behind the
+        login rate limiter; the console's code legs draw the per-actor ceremony budget
+        (``allow_reauth_attempt``) instead. Returns a not-``ok`` :class:`Elevation` (never raises)
+        for any invalid input.
 
         This is the leg the 7.2.4 verb is really about: without the rotation, a pre-MFA token captured
         before the second factor would be elevated in place to a fully authenticated session on a

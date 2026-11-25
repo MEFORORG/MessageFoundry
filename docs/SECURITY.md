@@ -4401,8 +4401,11 @@ and answered after another tab met the factor, neither re-anchors nor stamps. Th
 inside the factor write, from the session row that write reads in its own transaction
 (`mark_session_mfa_verified` with an anchor; its docstring says what each store backend does
 between that read and the write). A refused code at `POST /ui/mfa` on a session that had already met its factor lands on
-`/ui`, as the page's GET does, with a notice that the session needed no code (vault BACKLOG #2964 item 21), and stages no assertion. The exception is an `oidc` session on an account with TOTP enrolled: its code is refused unread (`idp_step_up_required`) and it lands on a bare `/ui` without the notice; a must-change session that must change its
-password first is sent to `/ui/account/password` before its code is read. An
+`/ui`, as the page's GET does, with a notice that the session needed no code (vault BACKLOG #2964 item 21), and stages no assertion; a must-change session that must change its
+password first is sent to `/ui/account/password` before its code is read. Not every session that had met its factor
+gets the notice: at least an `oidc` session on an account with TOTP enrolled, whose code is within the
+form's length bound, is refused unread (`idp_step_up_required`) and lands on a bare `/ui` without it
+(ADR 0142 Amendment F). An
 action-bound grant still comes only from the credential leg: the password leg of `POST /ui/reauth`,
 or for an `oidc` session the IdP leg, which shows no password field. Enrollment (`POST /ui/account/webauthn/enroll`) sits behind the **re-proof-only
 step-up**, with no MFA gate: the password or directory re-bind, or the IdP leg for an `oidc`
@@ -7832,7 +7835,7 @@ below its default, and as off at `0`. The `[approvals].min_dwell_seconds` floor 
 WARNING with a route label and the client address, deliberately **not** to the hash-chained
 `audit_log`, so a sustained flood cannot amplify into unbounded DB growth (ASVS 16.3.3); the durable
 trail is the per-account `auth.login_failed` / `auth.login_locked` / `auth.directory_login_locked` rows, plus `auth.mfa_failed` and
-`auth.webauthn_failed` for refusals on the factor legs (a lockout hit while proving a second factor
+`auth.webauthn_failed` for refusals on the factor legs, though not for every one: at least a code on an account with TOTP off writes none, and `verify_mfa`'s docstring names more (a lockout hit while proving a second factor
 is audited under those names, not `auth.login_locked`), `auth.reauth` and `auth.password_change_failed`
 for the post-session re-proofs, and the two 6.3.5 events, `auth.account_locked` and
 `auth.login_after_failures`. PHI-read and admin-write
