@@ -559,7 +559,7 @@ section 2 and the 2026-11-24 amendment state. docs/SECURITY.md (Gate-only check 
 rule.
 
 Provenance. This amendment is a class B follow-on under docs/AUTONOMY-PLAN.md section 3, decided by
-Manager runbook-batch-manager-fa3030 (session e0f59fb7) at the Lander's hold of 2026-11-25 on head
-02973ed99ae; it only tightens the check routes. The Lander's hold on engine PR 3281, which rests on
-its review round-f5d632c0f3 at xhigh, named this amendment's content as the fix; no
-`scripts/coord/decision.ps1` record was written for it.
+the batch Manager (session e0f59fb7) at the Lander's hold of 2026-11-25 on head 02973ed99ae; it
+only tightens the check routes. The Lander's hold on engine PR 3281 named this amendment's content
+as the fix, and the Lander's review rounds round-f5d632c0f3 and round-e5008ee02a, at xhigh, are
+the decision's adversarial review. No `scripts/coord/decision.ps1` record was written for it.
