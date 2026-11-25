@@ -1947,7 +1947,9 @@ def test_parse_audit_anchor_refuses_an_empty_head_with_a_nonzero_count() -> None
 
 
 @pytest.mark.parametrize(
-    "head", ["a" * 64, "vault:v1:c3ludGhldGlj"], ids=["hex-digest", "isolated-module-mac"]
+    "head",
+    ["a" * 64, "vault:v1:" + base64.b64encode(b"\x02" * 32).decode("ascii")],
+    ids=["hex-digest", "isolated-module-mac"],
 )
 def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
     """The converse of the pairing above (vault BACKLOG #5987 item 1). A log with rows has a newest
@@ -1959,6 +1961,50 @@ def test_parse_audit_anchor_refuses_a_head_with_a_zero_count(head: str) -> None:
         "a zero row count is only producible from an EMPTY log, so it cannot carry a head"
     )
     assert parse_audit_anchor(f"1:{head}") == (1, head)  # the control: the head itself is legal
+
+
+@pytest.mark.parametrize(
+    ("count", "reason"),
+    [
+        ("+5", "the row count is not an integer"),
+        ("1_000", "the row count is not an integer"),
+        ("٣", "the row count is not an integer"),  # a non-ASCII digit int() accepts
+        ("--5", "the row count is not an integer"),
+        (str(2**63), "the row count is larger than any store can hold"),
+        ("9" * 5000, "the row count is larger than any store can hold"),
+    ],
+    ids=["plus-sign", "underscore", "arabic-indic-digit", "double-minus", "past-int64", "long"],
+)
+def test_parse_audit_anchor_takes_only_a_count_a_store_can_hold(count: str, reason: str) -> None:
+    """Vault BACKLOG #5987: the count is ASCII digits bounded by the signed 64-bit ``seq`` column,
+    not whatever ``int()`` takes, and the reason names no part of it."""
+    with pytest.raises(AuditAnchorError) as caught:
+        parse_audit_anchor(f"{count}:{'a' * 64}")
+    assert caught.value.reason == reason
+    assert parse_audit_anchor(f"{2**63 - 1}:{'a' * 64}") == (2**63 - 1, "a" * 64)  # the bound
+    assert parse_audit_anchor(f" 7 :{'a' * 64}") == (7, "a" * 64)  # spaces around it, as before
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "vault:v",
+        "vault:v1:",
+        "vault:v1:c3ludGhldGlj",
+        "vault:v01:{b}",
+        "vault:v1:{b} x",
+        "vault:v1:{b}=",
+    ],
+    ids=["prefix-only", "no-body", "short-digest", "leading-zero", "inner-space", "trailing-pad"],
+)
+def test_parse_audit_anchor_refuses_a_transit_mac_the_writer_never_emits(head: str) -> None:
+    """Vault BACKLOG #5987 item 1: a ``vault:v`` head is held to the shape
+    ``TransitCipher.audit_hmac`` writes, so a truncated or space-bearing copy is refused as
+    malformed input rather than reported as tampering on an intact chain."""
+    body = base64.b64encode(b"\x04" * 32).decode("ascii")
+    with pytest.raises(AuditAnchorError, match="not a whole one"):
+        parse_audit_anchor(f"3:{head.format(b=body)}")
+    assert parse_audit_anchor(f"3:vault:v12:{body}") == (3, f"vault:v12:{body}")  # the control
 
 
 @pytest.mark.parametrize(

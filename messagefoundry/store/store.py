@@ -230,6 +230,7 @@ from messagefoundry.store.row_seal import (
     seal_bytes,
     seal_chunks,
     seal_row_ref,
+    transit_mac_version,
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
@@ -6746,6 +6747,11 @@ AUDIT_ANCHOR_ISOLATED_MAC_PREFIX = "vault:v"
 #: the PHI rule in CLAUDE.md section 9.
 AUDIT_ANCHOR_MAX_BYTES = 4096
 
+#: The largest row count an anchor can name: the audit ``seq`` is a signed 64-bit column on every
+#: backend. Checked on the digit count first, so ``int()`` never parses a long run of digits.
+_AUDIT_ANCHOR_COUNT_MAX = 2**63 - 1
+_AUDIT_ANCHOR_COUNT_MAX_DIGITS = len(str(_AUDIT_ANCHOR_COUNT_MAX))
+
 
 class AuditAnchorError(ValueError):
     """A ``COUNT:HEAD`` anchor that :func:`parse_audit_anchor` refuses, carrying TWO renderings.
@@ -6866,16 +6872,20 @@ def parse_audit_anchor(text: str) -> tuple[int, str]:
     count_text, sep, head = raw.partition(":")
     if not sep:
         raise AuditAnchorError("no ':' separator", text)
-    try:
-        count = int(count_text)
-    except ValueError:
-        # The count is quoted in `str(exc)` via `text`, so the reason stays content-free: a row count
-        # is short and non-secret, but "content-free" has to be a rule, not a judgement per branch.
-        raise AuditAnchorError("the row count is not an integer", text) from None
-    if count < 0:
+    count_text = count_text.strip()
+    digits = count_text.removeprefix("-")
+    # ASCII digits only, not `int()`'s grammar: it also takes `+5`, `1_000` and non-ASCII digits,
+    # and any length up to Python's digit limit, none of which a store can emit (vault BACKLOG
+    # #5987). The count is quoted in `str(exc)` via `text`, so each reason stays content-free.
+    if not digits or not all("0" <= c <= "9" for c in digits):
+        raise AuditAnchorError("the row count is not an integer", text)
+    if count_text.startswith("-"):
         # No value in a reason, not even the count: `--expected-anchor-file` prints the reason, and
         # the count is that file's content (vault BACKLOG #2612).
         raise AuditAnchorError("the row count is negative", text)
+    if len(digits) > _AUDIT_ANCHOR_COUNT_MAX_DIGITS or int(digits) > _AUDIT_ANCHOR_COUNT_MAX:
+        raise AuditAnchorError("the row count is larger than any store can hold", text)
+    count = int(digits)
     head = head.strip()
     if not head:
         if count != 0:
@@ -6912,7 +6922,17 @@ def _audit_head_shape(head: str, noun: str = "the head") -> tuple[str | None, st
             )
         return None, head.lower()
     if head.startswith(AUDIT_ANCHOR_ISOLATED_MAC_PREFIX):
-        return None, head  # opaque by construction; never normalise what we do not define
+        # Opaque by construction, so never normalised, but held to the shape the writer itself
+        # requires (`TransitCipher.audit_hmac` refuses any reply `transit_mac_version` does not
+        # accept): a truncated `vault:v1:` or one carrying a space is one the store never wrote,
+        # and a comparator would report it as tampering (vault BACKLOG #5987 item 1).
+        if transit_mac_version(head) is None:
+            return (
+                f"{noun} starts like an isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC "
+                "(ADR 0138) but is not a whole one",
+                head,
+            )
+        return None, head
     return (
         f"{noun} is neither a {AUDIT_ANCHOR_DIGEST_HEX_LEN}-character hex digest nor an "
         f"isolated-module {AUDIT_ANCHOR_ISOLATED_MAC_PREFIX}… MAC (ADR 0138)",
