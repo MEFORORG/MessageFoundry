@@ -418,8 +418,8 @@ def dispatch(root: Path, payload: dict) -> dict:
     # hook is recorded as timed out without running. A hook's exit 2 still ends the event at once,
     # as on origin/main. The first fault is raised once the event's hooks end, unless another
     # hook's deny, ask or block stands; that keeps the exit code a lone failing hook gave on main.
-    # A fault outside a hook's own run, such as an unsupported hook, ends them early, before every
-    # hook has been tried, and that fault is then the one raised.
+    # A fault outside a hook's own run, such as an unsupported hook or a field of the wrong type,
+    # ends them early, before every hook has been tried, and that fault is then the one raised.
     fault: Exception | None = None
 
     def record(exc: Exception, label: str) -> None:

@@ -736,6 +736,15 @@ def test_user_prompt_submit_refuses_json_that_is_not_an_object(bridge, tmp_path,
     payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
     with pytest.raises(ValueError, match="must be an object"):
         bridge.dispatch(tmp_path, payload)
+    # A later hook's block shows that hook ran after the failure, and the block then stands.
+    later = {"decision": "block", "reason": "later hook ran"}
+    _event_settings(
+        tmp_path, "UserPromptSubmit", "", [handler(printed), handler(json.dumps(later))]
+    )
+    result = bridge.dispatch(tmp_path, payload)
+    assert result["decision"] == "block" and result["reason"] == "later hook ran"
+    assert "must be an object" in result["systemMessage"]
+    assert "additionalContext" not in result.get("hookSpecificOutput", {})
 
 
 # --- BACKLOG #5501: dispatch over the TRACKED .claude/settings.json, not a synthetic one, with
