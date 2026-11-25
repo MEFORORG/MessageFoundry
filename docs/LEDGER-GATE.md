@@ -282,28 +282,33 @@ a pair.
 ### When the owning worktree is gone — check out the branch, or recreate it (BACKLOG #1293, #1282)
 
 `Checker.owns` compares the recorded worktree path to the committing one by **casefolded string
-equality** first. When the path misses, it falls back to the **recorded branch**: a commit from any
-worktree standing on the branch the allocation recorded is entitled to the number (BACKLOG #1282).
+equality** first. When the path misses, it falls back to the **recorded branch**: a commit from a
+worktree whose `HEAD` is a branch of the recorded name is entitled to the number (BACKLOG #1282).
+Both keys apply only to a record this machine made (`record_is_here`), so another PC's number is
+never this tree's.
 The path is mortal and the branch is not, so removing a worktree no longer strands its number on that
 alone. Before the fallback, removing a worktree that held an unlanded allocation stranded the number:
 `owns()` returned false for **every** session from then on, and any PR that had to re-introduce that
 heading was unlandable **by anyone**. PR #397 was stranded exactly this way.
 
-**The fallback is as exclusive as git's single-checkout default, and no more.** Git refuses an
-ordinary second checkout of one branch, so two worktrees do not both hold it; `git worktree add
---force` and `git checkout --ignore-other-worktrees` defeat that default (BACKLOG #1039), and the
-`Checker.owns` docstring states the residual. **A number still strands once both keys are gone**: the
-recorded worktree removed and the recorded branch deleted, or an allocation recorded before the
-branch field existed. Then the recovery below is the one that works.
+**The fallback is as exclusive as git's single-checkout default within one clone, and no more.**
+Git refuses an ordinary second checkout of one branch, so two worktrees of one clone do not both hold
+it; `git worktree add --force` and `git checkout --ignore-other-worktrees` defeat that default
+(BACKLOG #1039), and the `Checker.owns` docstring states the residual. **The match is by name.**
+`owns()` reads the name of the current branch and never checks that it is the branch the allocation
+saw, so a deleted branch recreated under the same name restores entitlement, and an unrelated branch
+that reuses the name inherits it. **A number still strands when the record carries no branch**, as
+one made before the branch field existed does, and its worktree is gone. Then the recovery below is
+the one that works.
 
 **Prevention is enforced.** `scripts/worktree/remove.ps1` refuses a removal while this worktree owns a
 number whose item is not yet on `origin/main`, and a cannot-tell reads as at-risk. The override is
 `-AllowOrphanedAllocations` and deliberately **not** `-Force`: that one already means *"I accept losing
 uncommitted changes"*, and one consent must not silently cover a second, irreversible risk.
 
-**Recovery, for a number the fallback cannot reach: check out the recorded branch in any worktree if it
-still exists, which is the `orphan-branch-free` row of the table below; otherwise RECREATE A WORKTREE AT
-THE RECORDED PATH.** Owner ruling for the recreate,
+**Recovery, for a number refused after its worktree is gone: commit from a worktree on the recorded
+branch, which is the `orphan-branch-held` and `orphan-branch-free` rows of the table below; where the
+record names no branch, RECREATE A WORKTREE AT THE RECORDED PATH.** Owner ruling for the recreate,
 2026-08-21. Its closeness to the rename workaround [`CLAUDE.md`](../CLAUDE.md) §5 forbids was put to the
 owner explicitly and ruled acceptable **for this case only**.
 
