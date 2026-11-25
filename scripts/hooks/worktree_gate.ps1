@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.25.2"
+$GateVersion = "2026.11.25.3"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -923,30 +923,42 @@ function Get-ScanRawIndexMap($Seg) {
 # the victims read from this text, so a misreading costs a false deny or a victim not read here, never a
 # deny the other splits make.
 #
-# Three cases answer less than the split's text (review round of 70fbdc7122a, each measured a false
-# deny there, ALLOW on origin/main). Where the character before $Start is not code, the verb ended
-# inside a quote or comment, so the text after it is a mention and this answers "". A comment, a `#`
-# Get-QuoteStateMap reads literal after a character it reads as not literal, ends the text, since
-# nothing after it is an argument. And $Split is matched against $Raw with every character the shell
-# does not read as code masked to `_`, so a lookbehind sees the mask and not the literal: in `\&&`
-# the escaped `&` no longer hides the lone `&` after it, which the shell reads as a separator.
-function Get-CodeSplitPrefix([string]$Raw, $Quote, [int]$Start, [string]$Split) {
-    if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
+# $Mask is Get-CodeMask's copy of $Raw, built once per segment. $Split is matched against its slice
+# from $Start, so a lookbehind sees neither a literal character nor text before $Start: in `\&&` the
+# escaped `&` no longer hides the lone `&` after it, which the shell reads as a separator, and a `$(`
+# that opens before the verb does not stop its `)` from ending the victim.
+#
+# At least two cases answer less than that (review round of 70fbdc7122a, each measured a false deny
+# there, ALLOW on origin/main). A `#` Get-QuoteStateMap reads as opening a comment, literal after a
+# character it reads as code, ends the text. And where the character before $Start is not code, the
+# verb ended inside quotes or a comment, and this answers "". That is a mention in `git commit -m "...
+# worktree remove ..."`, but not in `bash -c "git worktree remove ..."` or a backtick span inside
+# double quotes, which the shell runs; those are judged by the interpreter-payload and hoist readings,
+# not by this one (measured DENY for both on 2026-11-25 by review round 31371c5b75).
+function Get-CodeSplitPrefix([string]$Raw, $Quote, [string]$Mask, [int]$Start, [string]$Split) {
+    if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length -or $Mask.Length -ne $Raw.Length) { return "" }
     $q = $Quote
     if ($Start -gt 0 -and $q[$Start - 1] -ne [char]'N') { return "" }
     $end = $Raw.Length
-    for ($k = $Start; $k -lt $Raw.Length; $k++) {
-        if ($Raw[$k] -eq [char]'#' -and $q[$k] -eq [char]'S' -and $k -gt 0 -and $q[$k - 1] -ne [char]'S') {
-            $end = $k; break
-        }
+    $k = $Raw.IndexOf([char]'#', $Start)
+    while ($k -gt 0) {
+        if ($q[$k] -eq [char]'S' -and $q[$k - 1] -eq [char]'N') { $end = $k; break }
+        $k = $Raw.IndexOf([char]'#', $k + 1)
     }
-    $masked = [char[]]::new($end)
-    for ($k = 0; $k -lt $end; $k++) {
-        $masked[$k] = $(if ($q[$k] -eq [char]'N') { $Raw[$k] } else { [char]'_' })
-    }
-    $m = [regex]::new($Split).Match([string]::new($masked), $Start)
-    if ($m.Success) { $end = $m.Index }
+    $m = [regex]::new($Split).Match($Mask.Substring($Start, $end - $Start))
+    if ($m.Success) { $end = $Start + $m.Index }
     $Raw.Substring($Start, $end - $Start)
+}
+
+# $Raw with every character Get-QuoteStateMap does not read as code replaced by `_`, except a `$`, kept so
+# that `"$(pwd)/x"` still reads as a substitution, whose `)` is not a separator. Built once per segment.
+function Get-CodeMask([string]$Raw, $Quote) {
+    if ($null -eq $Quote) { return "" }
+    $chars = $Raw.ToCharArray()
+    for ($k = 0; $k -lt $chars.Length; $k++) {
+        if ($Quote[$k] -ne [char]'N' -and $chars[$k] -ne [char]'$') { $chars[$k] = [char]'_' }
+    }
+    [string]::new($chars)
 }
 
 # ===================================================================================================
@@ -5148,12 +5160,13 @@ What to do instead:
         $added = @()
         # One quote map per segment, shared by every quote-aware split below.
         $segQuote = Get-QuoteStateMap $seg.Raw ([string]$seg.Conv)
+        $segMask = Get-CodeMask $seg.Raw $segQuote
         # THE FIRST READING'S VICTIM, QUOTE-AWARE TOO (BACKLOG #5643, review round e8390625a8): its split
         # cuts a quoted victim at a `;`, `&&`, `||` or `|` inside the quotes. The victims read off the
         # text before the first separator the shell reads as code are ADDED to its own, so this runs
         # even where Get-ScanRawIndexMap answers nothing and the added reading below is skipped.
         if ($oldEnd -ge 0) {
-            foreach ($v in @(Get-WorktreeVictimTokens (Get-CodeSplitPrefix $seg.Raw $segQuote $oldEnd $wtVictimSplit))) {
+            foreach ($v in @(Get-WorktreeVictimTokens (Get-CodeSplitPrefix $seg.Raw $segQuote $segMask $oldEnd $wtVictimSplit))) {
                 if ($oldVictims -cnotcontains $v) { $oldVictims += $v }
             }
         }
@@ -5201,7 +5214,7 @@ What to do instead:
                 # `}`, `)` or lone `&` inside its quotes, so `"<tmp>/x;y/../<wt>"` named `"<tmp>/x` and
                 # was ALLOWED. This one ends only at a separator the shell reads as code. ADDED beside
                 # it, so a victim it names is still judged.
-                $a3 = Get-CodeSplitPrefix $seg.Raw $segQuote $rawEnd $wtVictimSplit
+                $a3 = Get-CodeSplitPrefix $seg.Raw $segQuote $segMask $rawEnd $wtVictimSplit
                 $seenHere = @()
                 foreach ($v in @(Get-WorktreeVictimTokens $a2) + @(Get-WorktreeVictimTokens $a3)) {
                     if ($seenHere -ccontains $v) { continue }

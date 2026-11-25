@@ -377,13 +377,33 @@ def test_a_quoted_separator_control_is_allowed(rig: SimpleNamespace, template: s
         "git worktree remove {o}/nope # x; echo -- {tmp}/Primary-wt2",
         # `\\&&` is a literal `&` and then a lone `&`, which the shell does read as a separator.
         "git worktree remove {o}/nope\\&& echo -- {tmp}/Primary-wt2",
+        # A `$(` that opens before the verb: its `)` still ends the victim (review round 31371c5b75).
+        "git worktree remove {o}/nope2 ; echo $(git worktree remove --force) {tmp}/Primary-wt2",
+        "git worktree remove {o}/nope2 ; echo $(git worktree remove {o}/nope) -- {tmp}/Primary-wt2",
     ],
 )
-def test_the_quote_aware_split_adds_no_false_deny(rig: SimpleNamespace, template: str) -> None:
-    """ALLOW on origin/main; each was DENIED by the first quote-aware victim split (review round
-    of 70fbdc7122a), which read a quoted mention, a comment, or the text past `\\&&` as a victim."""
+def test_these_quote_aware_split_false_denies_are_gone(rig: SimpleNamespace, template: str) -> None:
+    """ALLOW on origin/main. The first three were DENIED on 70fbdc7122a, whose quote-aware victim
+    split read a quoted mention, a comment, or the text past `\\&&` as a victim; the last two were
+    DENIED by the first repair of those, whose lookbehind saw a `$(` before the verb."""
     cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
     assert _allowed(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        'git worktree remove "{tmp}/x;y/../Primary-wt2" # note',
+        'git worktree remove "{tmp}/x;y/../Primary-wt2"\\&& echo hi',
+        'git commit -m "worktree remove" ; git worktree remove "{tmp}/x;y/../Primary-wt2"',
+    ],
+)
+def test_the_quote_aware_split_still_denies_beside_those_cases(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """The deny the quote-aware split added holds beside a comment, a `\\&&` and a quoted mention."""
+    cmd = template.format(tmp=rig.tmp.as_posix())
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
