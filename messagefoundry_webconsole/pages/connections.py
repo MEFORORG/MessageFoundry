@@ -378,7 +378,8 @@ _CONTROL_NOTICES: dict[str, str] = {
     # POST /ui/mfa, for a refused code on a session that had already met its factor (vault BACKLOG
     # #2964 item 21): without it the refusal landed on this page exactly as a success does.
     "mfa_code_refused": (
-        "this session needed no code, so the code you entered was not used to sign in"
+        "this session had already met its second factor and needed no code; the code you entered "
+        "was not accepted"
     ),
 }
 

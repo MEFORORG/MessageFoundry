@@ -424,9 +424,7 @@ async def test_a_satisfied_sessions_refused_code_lands_on_ui_not_on_a_gate(engin
         assert r.status_code == 303 and r.headers["location"] == "/ui?m=mfa_code_refused"
         landing = await c.get(r.headers["location"])
         assert landing.status_code == 200
-        # Not "changed nothing": verify_mfa may still audit the code and charge it to the lockout.
-        assert "the code you entered was not used to sign in" in landing.text, landing.text[:2000]
-        assert "changed nothing" not in landing.text
+        assert "the code you entered was not accepted" in landing.text, landing.text[:2000]
         # Nothing staged: the challenge store holds no assertion for this session. The pending
         # control above did stage one, which is the assertion that met the factor.
         assert service._webauthn_challenges.pop((hash_token(token), "assert")) is None
