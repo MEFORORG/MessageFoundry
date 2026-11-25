@@ -821,10 +821,11 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         help="end the sessions it finds, of any account, from the host (the API is not needed)",
         description="End the sessions it finds, of any account, directly against the store, on "
         "the same host gate as admin-unlock, and raise the global session epoch, which refuses "
-        "every session signed in before it. docs/SECURITY.md, Limits of the session sweep, says "
-        "what it may miss. It writes an auth.session_revoked audit row after the revoke commits, "
-        "and says so when the store refuses that row. Run it with the engine stopped, as ADR 0171 "
-        "says for the commands on that gate.",
+        "the sessions signed in before it unless someone with write access to the database "
+        "lowers or deletes its row. docs/SECURITY.md, Limits of the session sweep, says what "
+        "else it may miss. It writes an auth.session_revoked audit row after the revoke, and says "
+        "so when the store refuses that row or when the revoke's outcome is unknown. Run it with "
+        "the engine stopped, as ADR 0171 says for the commands on that gate.",
     )
     admin_revoke_sessions.add_argument(
         "--service-config",
