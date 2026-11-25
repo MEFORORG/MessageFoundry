@@ -50,7 +50,7 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
                 # The typ assertion runs at the top of key selection, so a token declaring a
                 # non-id_token class indicts THIS rung and no other (ASVS 9.2.2).
                 "wrong_token_type",
-                # RFC 7515 section 4.1.11: refused at the top of key selection too.
+                # RFC 7515 section 4.1.11: refused right after the typ assertion, before the kid guard.
                 "unsupported_crit",
                 "unknown_kid",
                 "ambiguous_kid",
