@@ -83,8 +83,10 @@ def _sandbox_arms(records: Iterable[ConnScaleRecord]) -> tuple[str, ...]:
     beside any other A/B, so one run's records carry one arm. Records from two arms would pool into
     one cell, so a comparison handed them fails rather than grade the mixture, and every comparison
     names the arm its records name, which its table did not. A record whose env parses as another
-    arm than it asked for counts as its own arm, so the mixed-arm FAIL catches a record whose env
-    names a different arm. It does not detect an engine that ran another mode than its env names;
+    arm than it asked for counts as its own arm, so the mixed-arm FAIL catches records whose
+    env-parsed arms differ from one another; a run whose every record parses as the same other arm
+    is named in the label but not failed. It does not detect an engine that ran another mode than
+    its env names;
     the ``sandbox_workers`` SLO's process walk is the runtime evidence, and only for a subprocess arm.
     """
     return tuple(sorted({_sandbox_arm(r) for r in records}))
