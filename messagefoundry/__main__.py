@@ -6351,6 +6351,7 @@ def _validate(args: argparse.Namespace) -> int:
 
 def _graph(args: argparse.Namespace) -> int:
     from messagefoundry.config.graph import build_wiring_graph
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, display_settings, load_config
 
     # The missing-value-file refusal (exit 2) is the pre-check graph ran before --env read values:
@@ -6376,7 +6377,9 @@ def _graph(args: argparse.Namespace) -> int:
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
         # would make the reporting surface go dark on the config an operator most wants to look at.
         reg = load_config(config_dir, allow_empty=True)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # ConfigDirMissing is a FileNotFoundError, not a WiringError: uncaught, a missing --config
+        # directory reached the last-resort CRITICAL floor instead of this envelope (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     # For the same reason an env() reference that does not resolve is reported beside the graph,
     # never instead of it. Keys only, never values.
@@ -6553,6 +6556,7 @@ def _dryrun_loop_error(exc: ValueError | KeyError) -> str:
 
 def _dryrun(args: argparse.Namespace) -> int:
     from messagefoundry.config.settings import SectionNameEnvError
+    from messagefoundry.config.snapshot import ConfigDirMissing
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, fixture_cap, read_messages
     from messagefoundry.redaction import safe_error
@@ -6566,7 +6570,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return env_values
     try:
         reg = load_config(config_dir)
-    except WiringError as exc:
+    except (WiringError, ConfigDirMissing) as exc:
+        # As in _graph: a missing --config directory is not a WiringError (BACKLOG #7107).
         return _emit_error(str(exc), as_json=args.json)
     if env_values is not None and (problems := reg.env_resolution_problems(env_values)):
         # A preview in an environment the graph does not resolve in is refused. Keys only.
