@@ -3271,10 +3271,10 @@ class AuthStore(Protocol):
         read, or the row is gone, nothing is written and this returns ``False``.
 
         **What makes that compare hold differs per backend**, as for every user-record write. Each
-        reads the row, compares in Python, and writes with a compare on the seal it read, so a row
-        changed after the read writes nothing and this returns ``False``. Postgres and SQL Server
-        also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK, ROWLOCK``), so
-        there the seal compare is a second guard. On SQLite the writer lock holds the read and the
+        reads the row, compares in Python, and writes with a compare on the seal it read. Whether a
+        row changed after the read then writes nothing depends on the backend. Postgres and SQL
+        Server also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK,
+        ROWLOCK``), so there it does, and the seal compare is a second guard. On SQLite the writer lock holds the read and the
         write together within one process, but the read takes no lock against ANOTHER process
         writing the same file. Across processes the only guard there is the seal compare in the
         ``UPDATE``, and only under a row sealer: with one, a row changed in any column after the

@@ -9264,13 +9264,15 @@ class AuthService:
         sign-in that read the scope before a concurrent one replaced it judged ``changes`` against
         the replaced value: it revoked the other sign-in's brand-new session and audited the resync
         a second time. On a miss the grant is NOT taken from the row the other writer left, since
-        that writer may have read older group memberships; the row is read again and decided again
-        from this sign-in's own groups, at most :data:`_AD_SCOPE_WRITE_ATTEMPTS` times, and past
-        that the sign-in fails (:class:`_AdChannelScopeContended`). A re-read that finds the row
-        gone, failing its seal, disabled or locked fails the sign-in too, with nothing written
-        (:class:`_AdChannelScopeRefused`), as the role write refuses it. Both are raised, and the
-        caller audits and answers them as refusals. A withdrawal that misses still returns the row
-        as it now stands (BACKLOG #1927), and the caller judges that row before the mint.
+        that writer may have read older group memberships. Nothing tells which read is newer,
+        though: when this sign-in's groups are the older ones, its write replaces the newer scope
+        and revokes, as the role write's compare cannot tell either. The row is read again and
+        decided again from this sign-in's own groups, at most :data:`_AD_SCOPE_WRITE_ATTEMPTS`
+        times, and past that the sign-in fails (:class:`_AdChannelScopeContended`). A re-read that
+        finds the row gone, failing its seal, disabled or locked fails the sign-in too, with nothing
+        written (:class:`_AdChannelScopeRefused`), as the role write refuses it. Both are raised,
+        and the caller audits and answers them as refusals. A withdrawal that misses still returns
+        the row as it now stands (BACKLOG #1927), and the caller judges that row before the mint.
 
         **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** At least two paths still end a concurrent
         sign-in's new session. The revoke after a grant is a separate transaction, so a sign-in
