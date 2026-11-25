@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from messagefoundry.store.server_schema_verify import (
+    Dialect,
     ServerSchemaMismatchError,
     declared_schema,
     refuse_short_schema,
@@ -762,3 +763,85 @@ def test_a_default_of_more_than_one_token_is_named_as_the_default() -> None:
         declared_schema(
             ("CREATE TABLE t (a TIMESTAMPTZ DEFAULT now() + interval '1 day')",), "postgres"
         )
+
+
+#: DDL a dynamic-SQL variable carries; ``NOT NULL`` so no rule about NULL refuses it first.
+_RUN_DDL = "DECLARE @sql nvarchar(max) = N'CREATE TABLE t (a INT NOT NULL)';"
+_DIALECTS: tuple[Dialect | None, ...] = (None, "sqlserver", "postgres")
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize(
+    "tail",
+    [
+        # Both servers nest block comments, so the EXEC is still inside the outer comment.
+        "/* /* */ EXEC(@sql) */",
+        "/* a /* b */ sp_executesql @sql */",
+        # Unterminated under nesting: the server's batch errors rather than running the EXEC.
+        "/* /* */ EXEC(@sql);",
+        # The inner opener shares its star with the first closer the old reader found.
+        "/* a /*/ EXEC(@sql);",
+        # Balanced, so the server runs the EXEC; refused by design rather than modelling depth.
+        "/* /* */ */ EXEC(@sql)",
+    ],
+)
+def test_a_nested_block_comment_raises(tail: str, dialect: Dialect | None) -> None:
+    """BACKLOG #5062 item 26: the comment reader closed a block comment at its first ``*/``, so an
+    ``EXEC`` a nesting server comments out was counted as running the literal's DDL. Any ``/*``
+    inside a block comment now raises, a balanced nesting too: fail closed, not a depth model."""
+    with pytest.raises(ValueError, match="a nested block comment in DDL"):
+        declared_schema((f"{_RUN_DDL} {tail}",), dialect)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DO $$ BEGIN /* /* */ EXECUTE 'CREATE TABLE v (c INT NOT NULL)'; */ END $$;",
+        # A subscript's ``[`` is not a quoted name, so the comment inside it is still read.
+        "DO $$ BEGIN PERFORM ARRAY[1 /* ] /* */ EXECUTE 'CREATE TABLE v (c INT NOT NULL)'; */ ];"
+        " END $$;",
+    ],
+)
+def test_a_nested_block_comment_in_plpgsql_raises(statement: str) -> None:
+    with pytest.raises(ValueError, match="a nested block comment in DDL"):
+        declared_schema((statement,), "postgres")
+
+
+@pytest.mark.parametrize(
+    ("statement", "match"),
+    [
+        # ``]]`` continues a SQL Server name, so the ``/*`` is inside the name, not a comment.
+        (
+            "SELECT 1 AS [p]]/*q]; CREATE TABLE v (c INT NOT NULL); SELECT 1 AS [*/];",
+            None,
+        ),
+        ("SELECT 1 AS [x]]--y]; CREATE TABLE v (c INT NOT NULL);", None),
+        # PostgreSQL ends a line comment at a CR, so it runs what follows.
+        (
+            "CREATE TABLE v (c INT NOT NULL); -- note\rCREATE TABLE b (y INT NOT NULL);\n",
+            "a line break other than LF",
+        ),
+    ],
+)
+def test_a_comment_boundary_the_server_reads_otherwise_is_not_misread(
+    statement: str, match: str | None
+) -> None:
+    """Review of BACKLOG #5062 item 26: the comment reader's other boundaries a server reads
+    differently. Each hid DDL a server runs before the fix."""
+    if match is None:
+        assert declared_schema((statement,), "sqlserver").columns["v"] == frozenset({"c"})
+    else:
+        with pytest.raises(ValueError, match=match):
+            declared_schema((statement,), "postgres")
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_exec_after_a_plain_block_comment_still_runs(dialect: Dialect | None) -> None:
+    shape = declared_schema((f"{_RUN_DDL} /* c */ EXEC(@sql)",), dialect)
+    assert shape.columns["t"] == frozenset({"a"})
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_exec_in_a_line_comment_is_not_a_run(dialect: Dialect | None) -> None:
+    with pytest.raises(ValueError, match="sees no EXEC run"):
+        declared_schema((f"{_RUN_DDL} -- EXEC(@sql)\n",), dialect)

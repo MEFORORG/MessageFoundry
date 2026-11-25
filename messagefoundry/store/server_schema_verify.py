@@ -50,7 +50,9 @@ method, a key column or expression carrying a collation, an operator class or a 
 that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
 Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
-or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text. A unit test
+or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
+``/*`` inside a block comment, even a balanced one, since both servers nest them, and a line
+comment holding a line break other than LF. A unit test
 reads each shipped batch, so a new form fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
@@ -229,6 +231,10 @@ _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "t
 _DDL_OBJECT = re.compile(
     r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
 )
+#: Characters that may end a ``--`` comment on some server, or cut a batch, where the reader ends
+#: one at LF alone. PostgreSQL ends one at CR as well; the rest are refused for the same reason
+#: ``transports/database.py`` refuses them.
+_OTHER_LINE_BREAKS: Final = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85  ")
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
 
 
@@ -301,31 +307,43 @@ def _strip_comments(raw: str) -> str:
     """``raw`` with its ``--`` and ``/* */`` comments blanked, read left to right so a quote inside a
     comment opens nothing and a comment marker inside a quoted name is not one. A marker inside a
     string literal raises: in an ``EXEC`` string it is dynamic SQL's comment, in any other a
-    literal's text, and the reader cannot tell which."""
+    literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment raises,
+    even a balanced one, because both servers nest them and the first ``*/`` would not end it
+    (BACKLOG #5062 item 26). A line comment holding a line break other than LF raises, because
+    PostgreSQL ends one at a CR too. Quoted runs are read by :func:`_quoted_end`, so a ``]]``
+    continues a name and a PostgreSQL subscript opens none."""
     out: list[str] = []
     i, n = 0, len(raw)
+    last_close = raw.rfind("]")  # a ``[`` after it is unterminated, which raises as it always has
     while i < n:
         ch = raw[i]
         if raw.startswith("--", i):
             end = raw.find("\n", i)
-            i = n if end < 0 else end
+            end = n if end < 0 else end
+            if not _OTHER_LINE_BREAKS.isdisjoint(raw[i:end].rstrip("\r")):
+                raise ValueError(
+                    f"a line break other than LF in a DDL comment: {raw[i:end][:60]!r}"
+                )
+            i = end
             out.append(" ")
         elif raw.startswith("/*", i):
             end = raw.find("*/", i + 2)
             if end < 0:
                 raise ValueError(f"unterminated comment in DDL near {raw[i : i + 40]!r}")
+            # Through the closer's star, so a ``/*/`` inside counts as the opener a server reads.
+            if (inner := raw.find("/*", i + 2, end + 1)) >= 0:
+                near = raw[max(i, inner - 20) : inner + 40]
+                raise ValueError(f"a nested block comment in DDL near {near!r}")
             i = end + 2
             out.append(" ")
-        elif ch in "'\"[":
-            close = "]" if ch == "[" else ch
-            end = raw.find(close, i + 1)
-            if end < 0:
-                raise ValueError(f"unterminated quote in DDL near {raw[i : i + 40]!r}")
-            quoted = raw[i : end + 1]
+        elif ch == "[" and i > last_close:
+            raise ValueError(f"unterminated quote in DDL near {raw[i : i + 40]!r}")
+        elif (after := _quoted_end(raw, i)) is not None:
+            quoted = raw[i:after]
             if ch == "'" and ("--" in quoted or "/*" in quoted):
                 raise ValueError(f"a comment marker inside a string in DDL: {quoted[:60]!r}")
             out.append(quoted)
-            i = end + 1
+            i = after
         else:
             out.append(ch)
             i += 1
