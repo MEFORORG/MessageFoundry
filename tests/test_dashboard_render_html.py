@@ -338,18 +338,42 @@ def test_the_burndown_says_when_the_ledger_empties() -> None:
     assert "it reaches zero about 2027-02-11" in page
 
 
-def test_asvs_tool_provenance_is_in_the_disclosure_not_the_facts() -> None:
+def _asvs_face_and_disclosure(provenance: list[str]) -> tuple[str, str]:
     snap = _snapshot()
-    snap["metrics"][3]["detail"]["provenance"] = ["# asvs-status scorecard=NO-GIT", "# generated=x"]
+    snap["metrics"][3]["detail"]["provenance"] = provenance
     page = rh.render(snap)
     tile = page[page.index("<h3>asvs") :]
     tile = tile[: tile.index("</section>")]
     assert "<dt>Tool provenance</dt>" not in tile
     face, disclosure = tile.split('<details class="how">')
-    # The header line, with its ref pair, is part of the measurement: on the face, not hidden.
-    assert '<p class="mono"># asvs-status scorecard=NO-GIT</p>' in face
+    return face, disclosure
+
+
+def test_a_real_asvs_tool_header_is_on_the_face() -> None:
+    header = "# asvs-status scorecard=vault@abc engine=def1234"
+    face, disclosure = _asvs_face_and_disclosure(["# generated=x", header])
+    # Chosen by content, not position: the engine= line, not the first one.
+    assert f'<p class="mono">{header}</p>' in face
+    assert "# generated=x" not in face
     assert "# asvs-status" not in disclosure
-    assert '<p class="mono"># generated=x</p>' in disclosure
+    assert "# generated=x" in disclosure
+    assert "NO-GIT" not in disclosure
+
+
+def test_a_no_git_asvs_tool_header_is_labelled_in_the_disclosure() -> None:
+    header = "# asvs-status scorecard=NO-GIT engine=NO-GIT"
+    face, disclosure = _asvs_face_and_disclosure([header, "# generated=x"])
+    # One ref pair on the face: the collector's, never the tool's empty one beside it.
+    assert "NO-GIT" not in face
+    assert "Measured at" in disclosure
+    assert "it ran from an archive, so it prints NO-GIT" in disclosure
+    assert f"{header}<br># generated=x" in disclosure
+
+
+def test_a_line_with_no_engine_ref_is_never_promoted_to_the_face() -> None:
+    face, disclosure = _asvs_face_and_disclosure(["# engine: freshness=STALE", "# generated=x"])
+    assert "# engine:" not in face and "# engine: freshness=STALE" in disclosure
+    assert "prints NO-GIT" not in disclosure
 
 
 def test_short_pair_cuts_full_commits() -> None:
@@ -367,15 +391,39 @@ def test_an_info_status_is_a_progress_pill() -> None:
     assert "1 progress only" in page
 
 
-def test_the_burndown_note_counts_the_undated_rows() -> None:
-    snap = _history_snapshot(10)
-    snap["metrics"][0]["detail"]["undated"] = {"filed": 879}
-    page = rh.render(snap)
+def _burndown_card(snap: dict[str, Any]) -> str:
+    page: str = rh.render(snap)
     card = page[page.index("<h2>Backlog burndown</h2>") :]
+    return card[: card.index("</section>")]
+
+
+def test_the_burndown_note_counts_the_undated_rows_both_ways() -> None:
+    snap = _history_snapshot(10)
+    snap["metrics"][0]["detail"]["undated"] = {"filed": 879, "closed": 3, "declined": 2}
+    card = _burndown_card(snap)
     assert (
-        "Rows with no readable filing date (879) are never removed going back, so early weeks "
-        "overstate the open count by up to that many." in card[: card.index("</section>")]
+        "Rows with no readable filing date (879) are never taken off going back, so early weeks "
+        "can overstate the open count by up to that many." in card
     )
+    assert (
+        "Closed rows with no readable closing date (5) are never counted open again going back, "
+        "so early weeks can understate the open count by up to that many." in card
+    )
+
+
+@pytest.mark.parametrize("undated", [{}, {"filed": 0, "closed": 0}])
+def test_no_undated_rows_means_no_undated_note(undated: dict[str, int]) -> None:
+    snap = _history_snapshot(10)
+    snap["metrics"][0]["detail"]["undated"] = undated
+    assert "no readable" not in _burndown_card(snap)
+
+
+def test_an_undrawn_burndown_carries_no_undated_note() -> None:
+    snap = _snapshot()
+    snap["metrics"][0]["detail"]["undated"] = {"filed": 879}
+    card = _burndown_card(snap)
+    assert '<p class="nodata">no data</p>' in card
+    assert "no readable" not in card
 
 
 def test_a_burndown_with_no_open_series_says_no_data() -> None:

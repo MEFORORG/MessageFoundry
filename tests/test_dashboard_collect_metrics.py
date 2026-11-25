@@ -1363,15 +1363,15 @@ def test_backlog_forecast_says_never_when_filing_outruns_closing(tmp_path: Path)
     assert m.detail["no_filing_finish"] == "2026-12-31"  # 12 / 2 = 6 weeks
 
 
-def test_backlog_forecast_dates_from_the_unrounded_pace(tmp_path: Path) -> None:
-    # A net of 1 row over 4 weeks is 0.25 a week, shown as 0.2: 12 rows take 48 weeks, not 60.
+def test_backlog_forecast_dates_from_the_pace_it_prints(tmp_path: Path) -> None:
+    # A net of 1 row over 4 weeks is 0.25 a week, printed as 0.25: 12 rows take 48 weeks.
     weeks = {f"2026-W{n}": {"filed": 1, "closed": 1} for n in (43, 44, 45)}
     weeks["2026-W46"] = {"filed": 1, "closed": 2}
     m = cm.Metric("backlog_forecast", "", "", "", "")
     cm.c_backlog_forecast(_vault_ctx(tmp_path, _census(weeks=weeks)), m)
     pace = m.detail["pace"]
-    assert (pace["net_closed_per_week"], pace["net_closed_per_week_raw"]) == (0.2, 0.25)
-    assert pace["closed_per_week_raw"] == 1.25
+    assert (pace["net_closed_per_week"], pace["closed_per_week"]) == (0.25, 1.25)
+    assert not any(k.endswith("_raw") for k in pace)
     assert m.detail["weeks_to_zero"] == 48.0
     assert m.detail["no_filing_weeks_to_zero"] == 9.6
 
@@ -1527,16 +1527,27 @@ def test_default_runbook() -> None:
     assert cm.default_runbook({}) is None
 
 
-def test_the_runbook_parser_refuses_a_dtd() -> None:
-    bomb = (
-        '<?xml version="1.0"?><!DOCTYPE x [<!ELEMENT x ANY>]>'
-        f'<workbook xmlns="{_MAIN}"><sheets/></workbook>'
-    )
+@pytest.mark.parametrize(
+    "part",
+    [
+        "xl/workbook.xml",
+        "xl/_rels/workbook.xml.rels",
+        "xl/sharedStrings.xml",
+        "xl/worksheets/sheet2.xml",
+    ],
+)
+def test_the_runbook_parser_refuses_a_dtd_in_every_part(part: str) -> None:
+    good = _xlsx(_QUEUE)
+    assert cm.xlsx_sheet_rows(good, "Batch queue")  # the control: unaltered, it reads
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("xl/workbook.xml", bomb)
-        z.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{_PKG}"/>')
-    with pytest.raises(cm.CollectError, match="unreadable workbook"):
+    with zipfile.ZipFile(io.BytesIO(good)) as src, zipfile.ZipFile(buf, "w") as dst:
+        assert part in src.namelist()
+        for name in src.namelist():
+            data = src.read(name)
+            if name == part:
+                data = b"<!DOCTYPE x [<!ELEMENT x ANY>]>" + data
+            dst.writestr(name, data)
+    with pytest.raises(cm.CollectError, match="unreadable workbook: DTDForbidden"):
         cm.xlsx_sheet_rows(buf.getvalue(), "Batch queue")
 
 

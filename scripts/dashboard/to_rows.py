@@ -249,11 +249,37 @@ def forecast_line(snap: Snapshot) -> str | None:
     if d.get("finish"):
         return f"At the last {cm.FORECAST_WEEKS} full weeks' pace ({net:,g} net rows closed a week) it reaches zero about {d['finish']}."
     if net == 0:
-        return f"At the last {cm.FORECAST_WEEKS} full weeks' pace filing matched closing, so it never reaches zero."
+        return f"At the last {cm.FORECAST_WEEKS} full weeks' pace, filing matched closing, so it never reaches zero."
     return (
         f"At the last {cm.FORECAST_WEEKS} full weeks' pace it never reaches zero: filing "
         f"outran closing by {-net:,g} rows a week."
     )
+
+
+def _positive(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def burndown_undated_note(snap: Snapshot) -> str | None:
+    """What the rows with no readable date do to the worked-back open count, or ``None`` when
+    the census records none. Going back, an undated filing is never taken off, so early weeks
+    read high by up to that many; an undated closing is never put back, so they read low."""
+    undated = _dict(snap.detail("backlog_burn").get("undated"))
+    filed = _positive(undated.get("filed"))
+    closed = sum(_positive(undated.get(k)) for k in cm.CLOSED_COLUMNS)
+    parts = []
+    if filed:
+        parts.append(
+            f"Rows with no readable filing date ({filed:,}) are never taken off going back, so "
+            "early weeks can overstate the open count by up to that many."
+        )
+    if closed:
+        parts.append(
+            f"Closed rows with no readable closing date ({closed:,}) are never counted open again "
+            "going back, so "
+            "early weeks can understate the open count by up to that many."
+        )
+    return " ".join(parts) or None
 
 
 def ledger_history(snap: Snapshot) -> list[dict[str, Any]]:

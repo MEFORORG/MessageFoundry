@@ -344,14 +344,13 @@ def pace(history: Sequence[Mapping[str, Any]], full: str, n: int) -> dict[str, A
         return None
     filed = statistics.fmean(int(p["filed"]) for p in weeks)
     closed = statistics.fmean(int(p["closed"]) for p in weeks)
+    # Two places: a mean over 4 or 2 whole weeks is a multiple of 0.25, so the printed pace is
+    # exact, and weeks_to_zero dates the finish from the same figure the page prints.
     return {
         "weeks": [p["week"] for p in weeks],
-        "filed_per_week": round(filed, 1),
-        "closed_per_week": round(closed, 1),
-        "net_closed_per_week": round(closed - filed, 1),
-        # Unrounded, for weeks_to_zero: a pace rounded to 0.1 moves a small net's finish by weeks.
-        "closed_per_week_raw": closed,
-        "net_closed_per_week_raw": closed - filed,
+        "filed_per_week": round(filed, 2),
+        "closed_per_week": round(closed, 2),
+        "net_closed_per_week": round(closed - filed, 2),
     }
 
 
@@ -922,11 +921,9 @@ def c_backlog_forecast(ctx: Context, m: Metric) -> None:
     if recent is None:
         raise CollectError(f"the ledger history holds fewer than {FORECAST_WEEKS} full weeks")
     short = pace(history, full, FORECAST_SHORT_WEEKS)
-    weeks = weeks_to_zero(open_now, recent["net_closed_per_week_raw"])
-    no_filing = weeks_to_zero(open_now, recent["closed_per_week_raw"])
-    short_weeks = (
-        None if short is None else weeks_to_zero(open_now, short["net_closed_per_week_raw"])
-    )
+    weeks = weeks_to_zero(open_now, recent["net_closed_per_week"])
+    no_filing = weeks_to_zero(open_now, recent["closed_per_week"])
+    short_weeks = None if short is None else weeks_to_zero(open_now, short["net_closed_per_week"])
 
     def rounded(n: float | None) -> float | None:
         return None if n is None else round(n, 1)
@@ -1459,17 +1456,20 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
     """Every row of ``sheet`` in an .xlsx file, as text, read with the standard library and the
     vendored defusedxml. A formula cell reads as the value Excel last cached for it."""
     ET = safe_xml()  # noqa: N806 - the module's conventional name
+
+    def parse(xml: bytes) -> Any:
+        # Every part is read through here, so no new part can skip the DTD refusal.
+        return ET.fromstring(xml, forbid_dtd=True)
+
     ns = _XLSX_NS
     text_tag = f"{{{ns['m']}}}t"
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            book = ET.fromstring(z.read("xl/workbook.xml"), forbid_dtd=True)
-            rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"), forbid_dtd=True)
+            book = parse(z.read("xl/workbook.xml"))
+            rels = parse(z.read("xl/_rels/workbook.xml.rels"))
             shared: list[str] = []
             if "xl/sharedStrings.xml" in z.namelist():
-                for si in ET.fromstring(z.read("xl/sharedStrings.xml"), forbid_dtd=True).findall(
-                    "m:si", ns
-                ):
+                for si in parse(z.read("xl/sharedStrings.xml")).findall("m:si", ns):
                     shared.append("".join(t.text or "" for t in si.iter(text_tag)))
             rid = next(
                 (
@@ -1492,7 +1492,7 @@ def xlsx_sheet_rows(data: bytes, sheet: str) -> list[list[str]]:
             if not target:
                 raise CollectError(f"the workbook names no part for the {sheet!r} tab")
             part = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
-            root = ET.fromstring(z.read(part), forbid_dtd=True)
+            root = parse(z.read(part))
     except (zipfile.BadZipFile, KeyError, ValueError, ET.ParseError) as exc:
         raise CollectError(f"unreadable workbook: {type(exc).__name__}: {exc}") from None
     rows: list[list[str]] = []

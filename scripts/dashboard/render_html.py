@@ -20,9 +20,10 @@ input and is never copied beside the page. The page quotes the same private vaul
 snapshot, so the directory is refused, before anything is read, whenever the collector's guard
 (``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
 it cannot see. Every ASVS number is shown beside the collector's ref pair (``to_rows.py`` says how
-it is built), its commits shortened on the tile and given in full, with the scorecard tool's own
-``#`` header line on the tile's face and its other ``#`` provenance lines in the tile's "how it is
-measured" disclosure. The ASVS headline is shown
+it is built), its commits shortened on the tile and given in full. The scorecard tool's own ``#``
+header line (the one naming ``engine=``) is on the tile's face when it carries a real ref pair;
+a ``NO-GIT`` header, and the tool's other ``#`` provenance lines, are in the tile's "how it is
+measured" disclosure, so the face never shows a ``NO-GIT`` pair beside the collector's. The ASVS headline is shown
 beside its needs-review and unverified counts, or not at all unless the snapshot holds both.
 
 TIMES ARE US CENTRAL (``to_rows.central``), with the UTC time beside the page's own stamp.
@@ -436,6 +437,8 @@ def lede(headline: Sequence[Mapping[str, Any]]) -> str:
 
 
 _SHA = re.compile(r"\b([0-9a-f]{7})[0-9a-f]{33}\b")
+# The scorecard tool's header is the line naming engine=, as the collector reads it.
+_ENGINE_REF = re.compile(r"\bengine=\S")
 
 
 def short_pair(pair: str) -> str:
@@ -451,7 +454,13 @@ def tile(
     status = _status(row.get("status"))
     unit = str(row.get("unit") or "")
     shown_unit = "" if unit == "percent" else unit
-    # The scorecard tool's provenance lines are part of the measurement (scripts/asvs/CLAUDE.md); the header line stays on the tile face, and only the extra tool lines sit in the disclosure.
+    # The scorecard tool's provenance lines are part of the measurement (scripts/asvs/CLAUDE.md).
+    # Its header, the line naming engine=, goes on the face only when it carries a real ref pair;
+    # a NO-GIT header (the tool ran from an archive) would put a second, empty pair beside the
+    # collector's, so it joins the other tool lines in the disclosure, labelled.
+    header_line = next((ln for ln in provenance_lines if _ENGINE_REF.search(ln)), None)
+    face_line = header_line if header_line and "NO-GIT" not in header_line else None
+    tool_lines = [ln for ln in provenance_lines if ln != face_line]
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
@@ -469,16 +478,23 @@ def tile(
     how = ""
     header = ""
     if row.get("ref"):
-        if provenance_lines:
-            header = f'<p class="mono">{esc(provenance_lines[0])}</p>'
+        if face_line:
+            header = f'<p class="mono">{esc(face_line)}</p>'
         # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
         lines = [
             f'<p>Collector ref pair:</p><p class="mono">{esc(row["ref"])}</p>',
             (
-                '<p>Scorecard tool provenance:</p><p class="mono">'
-                + "<br>".join(esc(ln) for ln in provenance_lines[1:])
+                "<p>Scorecard tool provenance, as the tool printed it"
+                + (
+                    "; it ran from an archive, so it prints NO-GIT, and the collector's ref "
+                    "pair above is the one to quote"
+                    if header_line and not face_line
+                    else ""
+                )
+                + ':</p><p class="mono">'
+                + "<br>".join(esc(ln) for ln in tool_lines)
                 + "</p>"
-                if provenance_lines[1:]
+                if tool_lines
                 else ""
             ),
             f"<p>{esc(row['note'])}</p>" if row.get("note") else "",
@@ -582,13 +598,9 @@ def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tup
         )
 
     forecast = tr.forecast_line(snap)
-    undated = tr._dict(snap.detail("backlog_burn").get("undated")).get("filed")
-    undated_note = (
-        f" Rows with no readable filing date ({undated:,}) are never removed going back, so early "
-        "weeks overstate the open count by up to that many."
-        if isinstance(undated, int) and not isinstance(undated, bool)
-        else ""
-    )
+    has_open = any(_number(v) for v in opened.values())
+    # A caveat on the worked-back count only beside a count that was drawn.
+    undated = tr.burndown_undated_note(snap) if has_open else None
     controls = range_controls(options, checked)
     charts = (
         '<section class="chart"><h2>Ledger rows filed and closed</h2>'
@@ -598,10 +610,10 @@ def ledger_charts(snap: tr.Snapshot, series: Sequence[Mapping[str, Any]]) -> tup
         '<section class="chart"><h2>Backlog burndown</h2>'
         + ranged(options, down)
         + legend([("Open rows", "s3")])
-        + ("" if any(_number(v) for v in opened.values()) else '<p class="nodata">no data</p>')
+        + ("" if has_open else '<p class="nodata">no data</p>')
         + '<p class="note">Open rows at the end of each week, worked back from the count at run '
         "time through each week's filed and closed rows."
-        + esc(undated_note)
+        + (f" {esc(undated)}" if undated else "")
         + (f" {esc(forecast)}" if forecast else "")
         + "</p></section>"
     )
