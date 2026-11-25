@@ -324,7 +324,28 @@ def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_pa
     assert "statusLine" in json.loads(tmp.read_text(encoding="utf-8"))
     assert json.loads(bak.read_text(encoding="utf-8")) == {"keep": True}
     flat = " ".join(proc.stdout.split())
+    assert "settings.json is MISSING" in flat, proc.stdout
     assert str(tmp) in flat and str(bak) in flat, proc.stdout
+
+
+def test_a_failed_swap_on_a_root_with_no_settings_keeps_the_new_content(tmp_path: Path) -> None:
+    """With no settings.json before the run there is no backup to put back, so the complete temp file
+    is the only copy of the new content; it stays, and the FAILED line names it."""
+    root = _root(tmp_path)
+    settings = root / "settings.json"
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside"},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert not settings.exists()
+    (tmp,) = [p for p in root.iterdir() if p.name.endswith(".tmp")]
+    assert "statusLine" in json.loads(tmp.read_text(encoding="utf-8"))
+    flat = " ".join(proc.stdout.split())
+    assert "settings.json was not created" in flat and str(tmp) in flat, proc.stdout
 
 
 def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
@@ -334,7 +355,22 @@ def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> 
     for mode in ("-Status", "-Uninstall"):
         proc = _install(tmp_path, mode, "-SettingsPath", str(gone), cwd=tmp_path)
         assert "CANNOT START" not in proc.stdout, (mode, proc.stdout)
-        assert proc.returncode != 2, (mode, proc.stdout + proc.stderr)
+        assert "UNKNOWN" not in proc.stdout, (mode, proc.stdout)
+    # On a reachable drive the absence IS what the run read.
+    status = _install(tmp_path, "-Status", "-SettingsPath", str(gone), cwd=tmp_path)
+    assert re.search(r"publishes to\s+: nothing", status.stdout), status.stdout
+    assert status.returncode == 1, status.stdout + status.stderr
+    uninstall = _install(tmp_path, "-Uninstall", "-SettingsPath", str(gone), cwd=tmp_path)
+    assert re.search(r"^\s*NOT PRESENT\s+", uninstall.stdout, re.M), uninstall.stdout
+    assert uninstall.returncode == 0, uninstall.stdout + uninstall.stderr
+
+
+def test_a_dry_run_uninstall_over_a_gone_drive_does_not_exit_zero(tmp_path: Path) -> None:
+    """Exit 0 means every root reached the desired state, and nothing about this one was read."""
+    gone = f"{_free_drive()}:\\nope\\settings.json"
+    proc = _install(tmp_path, "-Uninstall", "-WhatIf", "-SettingsPath", gone, cwd=tmp_path)
+    assert "unknown: 1" in proc.stdout, proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
 
 
 def test_a_hard_linked_settings_file_is_written_through_not_cut(tmp_path: Path) -> None:

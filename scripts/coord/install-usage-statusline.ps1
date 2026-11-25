@@ -226,17 +226,26 @@ function Write-SettingsFile([string]$Path, $Data) {
     # documented ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176, no backup name) leaves the replaced file gone,
     # and _2 (1177) leaves it under another name. With no backup name and an unconditional temp-file
     # delete, settings.json was gone and the only copy of its new content was deleted after it. So the
-    # replace now names its own backup, a failure puts that backup back, and the temp file is deleted
-    # only while settings.json exists.
+    # replace now names its own backup, a failure puts that backup back, and a COMPLETE temp file is
+    # deleted only while settings.json exists.
     $tmp = "$Path.$PID.tmp"
-    $swapBak = "$Path.$PID.swap-bak"
+    # A FREE NAME, so a file found there after a failure can only be this run's: a stale one left by a
+    # crashed run under a recycled PID would otherwise be "restored" as this root's settings.
+    $swapBak = $null
+    if ($item) {
+        $swapBak = "$Path.$PID.swap-bak"
+        $n = 1
+        while (Test-Path -LiteralPath $swapBak) { $swapBak = "$Path.$PID.swap-bak-$n"; $n++ }
+    }
+    $tmpComplete = $false
     $swapped = $false
     try {
         [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+        $tmpComplete = $true
         foreach ($attempt in 1..3) {
             # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
             try {
-                Invoke-SettingsSwap $tmp $Path $(if ($item) { $swapBak } else { '' })
+                Invoke-SettingsSwap $tmp $Path $swapBak
                 $swapped = $true
                 break
             }
@@ -249,27 +258,33 @@ function Write-SettingsFile([string]$Path, $Data) {
         }
     }
     catch {
-        throw (Get-FailedSwapReport $Path $tmp $swapBak $backedTo ([bool]$item) $_.Exception.GetBaseException().Message)
+        $why = $_.Exception.GetBaseException().Message
+        if (-not $tmpComplete) { throw "settings.json was not touched: writing the new content to a temp file failed ($why)" }
+        throw (Get-FailedSwapReport $Path $tmp $swapBak $backedTo $why)
     }
     finally {
-        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        # A temp file that was never completely written is never anyone's only copy.
+        if (-not $tmpComplete -or (Test-Path -LiteralPath $Path)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         # The swap's backup is the old content, already kept under $backedTo; after a success it is spare.
-        if ($swapped) { Remove-Item -LiteralPath $swapBak -Force -ErrorAction SilentlyContinue }
+        if ($swapped -and $swapBak) { Remove-Item -LiteralPath $swapBak -Force -ErrorAction SilentlyContinue }
     }
     return $backedTo
 }
 
 # TEST SEAM, AND THE ONLY WAY TO REACH THE PATH IT GUARDS. A part-way ReplaceFile failure cannot be
 # provoked on demand, so MEFOR_TEST_STATUSLINE_SWAP_FAULT, set to a value starting with
-# 'original-moved-aside', makes this swap do what 1177 leaves behind -- the replaced file moved to the backup name (or gone,
-# with no backup name) and the replacement not moved -- then throw. Any other value, or none, is the
-# real swap.
+# 'original-moved-aside', makes this swap do what 1177 leaves behind -- the replaced file moved to the
+# backup name and the replacement not moved -- then throw. It fires ONLY for a file under the system
+# temp directory, so a value leaked into an operator's environment cannot touch a real config root.
+# Any other value, or none, is the real swap.
+function Test-SwapFault([string]$Path, [string]$Mode) {
+    return $env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -like $Mode -and
+    $Path.StartsWith([System.IO.Path]::GetTempPath(), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [string]$Backup) {
-    if ($env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -like 'original-moved-aside*') {
-        if (Test-Path -LiteralPath $Path) {
-            if ($Backup) { Move-Item -LiteralPath $Path -Destination $Backup -Force }
-            else { Remove-Item -LiteralPath $Path -Force }
-        }
+    if (Test-SwapFault $Path 'original-moved-aside*') {
+        if ($Backup -and (Test-Path -LiteralPath $Path)) { Move-Item -LiteralPath $Path -Destination $Backup }
         throw [System.IO.IOException]::new("simulated part-way replace failure (ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)", -2147023719)
     }
     if ($Backup) { [System.IO.File]::Replace($Tmp, $Path, $Backup) }
@@ -277,26 +292,31 @@ function Invoke-SettingsSwap([string]$Tmp, [string]$Path, [string]$Backup) {
 }
 
 # PUTS THE ORIGINAL BACK IF THE SWAP TOOK IT AWAY, THEN SAYS WHERE EVERY COPY IS. The returned text
-# is the FAILED line's reason, so an operator reads the paths without opening a log.
-function Get-FailedSwapReport([string]$Path, [string]$Tmp, [string]$SwapBak, [string]$BackedTo, [bool]$Existed, [string]$Why) {
-    $restoreErr = $null
-    if (-not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $SwapBak)) {
+# is the FAILED line's reason, so an operator reads the paths without opening a log. It never says
+# what settings.json now HOLDS: a concurrent writer can have put anything there.
+function Get-FailedSwapReport([string]$Path, [string]$Tmp, [string]$SwapBak, [string]$BackedTo, [string]$Why) {
+    $restoreErr = $null; $restored = $false
+    # $SwapBak is set only when settings.json existed, and it was a free name, so a file there is ours.
+    if ($SwapBak -and -not (Test-Path -LiteralPath $Path) -and (Test-Path -LiteralPath $SwapBak)) {
         try {
             # Second seam value: the restore fails too, the case that must still keep the temp file.
-            if ($env:MEFOR_TEST_STATUSLINE_SWAP_FAULT -eq 'original-moved-aside-restore-fails') { throw "simulated restore failure" }
+            if (Test-SwapFault $Path 'original-moved-aside-restore-fails') { throw "simulated restore failure" }
             Move-Item -LiteralPath $SwapBak -Destination $Path
+            $restored = $true
         }
         catch { $restoreErr = "$_" }
     }
-    if (Test-Path -LiteralPath $Path) {
-        return "settings.json was not updated ($Why); it holds its previous content, and the new content was discarded"
+    $msg = if (Test-Path -LiteralPath $Path) {
+        "settings.json was not updated ($Why); the new content was discarded"
     }
-    $msg = "settings.json is MISSING after a failed swap ($Why). The new content is in $Tmp"
-    if (Test-Path -LiteralPath $SwapBak) { $msg += "; the previous content is in $SwapBak" }
+    elseif ($SwapBak) { "settings.json is MISSING after a failed swap ($Why). The new content is in $Tmp" }
+    else { "settings.json was not created ($Why). The new content is in $Tmp" }
+    if ($restored) { $msg += "; the previous content was put back from the swap's backup" }
+    if ($SwapBak -and (Test-Path -LiteralPath $SwapBak)) { $msg += "; the previous content is in $SwapBak" }
+    if ($restoreErr) { $msg += "; putting it back failed: $restoreErr" }
     if ($BackedTo) { $msg += "; a copy of the previous content is in $BackedTo" }
-    if ($restoreErr) { $msg += "; putting the previous content back failed: $restoreErr" }
-    if (-not $Existed) { $msg = "settings.json was not created ($Why). The new content is in $Tmp" }
-    return "$msg. Rename one of them to $Path."
+    if (-not (Test-Path -LiteralPath $Path)) { $msg += ". Rename one of them to $Path" }
+    return "$msg."
 }
 
 # THREE-WAY, NOT TWO-WAY. A statusLine object present with a null or empty command is NONE, not
@@ -363,8 +383,9 @@ function Resolve-ArgPath([string]$Path, [string]$What) {
     try { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive) }
     catch {
         # AN AUDIT OR AN UNINSTALL GOES ON PAST A GONE ROOT, so one root on an unmapped drive does not
-        # hide the rest. The raw path is NOT a reading of that root: both modes test it with
-        # Test-PathRootReachable and report it UNKNOWN, never as absent.
+        # hide the rest. The raw path is NOT a reading of that root. For a -SettingsPath target both
+        # modes test it with Test-PathRootReachable and report it UNKNOWN, never as absent; a
+        # -ConfigDir, -HomeDir or pinned root still stops at Assert-RootExists with exit 2.
         if ($Status -or $Uninstall) { return $Path }
         Stop-Cannot "$What cannot be resolved to a file path: $Path ($($_.Exception.GetBaseException().Message))"
     }
@@ -591,9 +612,10 @@ if ($Uninstall) {
     Write-Host ("  removed: {0}   not present: {1}   foreign: {2}   failed: {3}   unknown: {4}   would remove: {5}" -f `
             $removed, $absent, $foreign, $failed, $unknown, $wouldRemove)
     Write-Host ""
-    if ($WhatIfPreference) { exit 0 }
+    # An unreachable root is not a dry-run success either: nothing about it was read.
+    if ($WhatIfPreference -and $unknown -eq 0) { exit 0 }
     if ($failed + $unknown -eq 0) { exit 0 }
-    if ($removed + $absent + $foreign -eq 0) { exit 1 }
+    if ($removed + $absent + $foreign + $wouldRemove -eq 0) { exit 1 }
     exit 3
 }
 
