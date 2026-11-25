@@ -594,13 +594,13 @@ async def test_an_overtaken_refusal_re_pends_with_no_error_traceback(
 
 
 @pytest.mark.parametrize("overtaken", [True, False], ids=["overtaken", "control_infra_fault"])
-def test_the_pooled_dispatcher_re_pends_an_overtaken_refusal_as_a_hand_back(
+def test_the_pooled_dispatcher_logs_an_overtaken_refusal_without_a_traceback(
     overtaken: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The default claim mode, pooled (BACKLOG #6830): an overtaken refusal escaping the per-item
-    body re-pends the head on the base backoff with one INFO line and no traceback, as a hand-back,
-    so it neither counts toward the infra-fault STOP nor resets that count. CONTROL: any other
-    exception there is still a T17 infra fault, logged at ERROR with its traceback."""
+    body is logged at INFO with no traceback, and is still a T17 infra fault in every other way, so
+    the infra-fault STOP bound still holds if it never stops. CONTROL: any other exception there is
+    logged at ERROR with its traceback."""
     dispatcher = StageDispatcher(
         Stage.INGRESS,
         cast(Any, None),
@@ -619,11 +619,10 @@ def test_the_pooled_dispatcher_re_pends_an_overtaken_refusal_as_a_hand_back(
     assert outcome.kind is LaneResultKind.RETRY and outcome.park_until == head[1]
     records = [r for r in caplog.records if r.name == "messagefoundry.pipeline.stage_dispatcher"]
     assert records
+    assert outcome.is_infra_fault and not outcome.hand_back  # counted toward the STOP
     if overtaken:
-        assert not outcome.is_infra_fault and outcome.hand_back
         assert all(r.levelno == logging.INFO and not r.exc_info for r in records)
     else:
-        assert outcome.is_infra_fault and not outcome.hand_back
         assert any(r.levelno >= logging.ERROR and r.exc_info for r in records)
 
 

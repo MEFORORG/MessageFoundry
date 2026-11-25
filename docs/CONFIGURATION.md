@@ -1578,11 +1578,10 @@ other module bytes than the engine loaded:
    rollback replaces the worker is neither alerted nor failed: the message is retried at once on a
    fresh worker, or re-pended, and the refusal of the worker it next runs on, if the cause stands,
    raises the alert. A re-pended message does not always run again: at least a row whose inbound
-   the reload removed never runs. The re-pend of an overtaken refusal is logged at `INFO` and, on
-   a pooled lane, does not count toward `infra_fault_stop_after` (BACKLOG #6830). Other re-pends
-   for a closed worker are still infrastructure faults, logged at `ERROR`, and on a pooled lane
-   repeated ones can stop it: at least a dispatch whose worker a reload closed after the reload
-   swapped the graph, and one whose worker was closed twice in one call. Each other inbound's worker is compared when it starts,
+   the reload removed never runs, and on a pooled lane repeated re-pends count as infrastructure
+   faults toward `infra_fault_stop_after`, which can stop the lane. The re-pend of an overtaken
+   refusal is logged at `INFO` with no traceback (BACKLOG #6830), though it still counts there;
+   other re-pends for a closed worker are logged at `ERROR`. Each other inbound's worker is compared when it starts,
    and each one refused raises its own alert. A reload that does not clear the cause raises the
    alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.

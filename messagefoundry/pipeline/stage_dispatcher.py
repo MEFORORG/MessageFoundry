@@ -100,9 +100,9 @@ def _capped_backoff(base: float, exp: int, cap: float) -> float:
 class RependWithoutFault(Exception):  # noqa: N818 - a marker mixin, not an error of its own
     """A mixin for an exception a per-item body raises to hand its row back when nothing failed,
     such as a sandbox refusal a reload overtook (BACKLOG #6830). :meth:`StageDispatcher._drain_lane`
-    re-pends the head on the base backoff, as for an infra fault, but logs one INFO line with no
-    traceback, does not escalate the backoff, and neither counts it toward the infra-fault STOP
-    nor resets that count, as for any zero-progress hand-back."""
+    treats it exactly as a T17 infra fault, escalating backoff and infra-fault STOP bound included,
+    so a condition that keeps raising it still stops the lane; only its line differs: INFO, with
+    no traceback."""
 
 
 class HoldResult(Enum):
@@ -421,9 +421,7 @@ class _LaneOutcome:
     # (i > 0): the prefix made forward progress (>=1 item RESOLVED) before the fault, so this is NOT a
     # head-of-line-blocked zero-progress fault — it resets the streak rather than accruing it.
     made_progress: bool = False
-    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704), or set by
-    # _infra_fault_outcome for a RependWithoutFault (BACKLOG #6830): either way a head that
-    # says nothing about the lane's health, so the infra streak is left as it was.
+    # LaneItemResult.hand_back, carried to _apply_retry (BACKLOG #5704).
     hand_back: bool = False
 
 
@@ -2111,13 +2109,12 @@ class StageDispatcher:
         # NOT-due (collapsing the spin). A zero-progress (i==0) fault escalates the backoff by the
         # lane's streak; a fault that made forward progress (i>0) resets the streak (fix B terminal
         # block), so it retries at the base backoff.
-        head_id = items[i].id
-        tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
+        st = self._states.get(lane)
+        streak = st.infra_error_streak if (st is not None and i == 0) else 0
+        park_until = self._clock() + self._infra_backoff(streak)
         if isinstance(exc, RependWithoutFault):
-            # Not a fault (BACKLOG #6830): the base backoff, no traceback, and a hand-back, which
-            # leaves the infra streak as it was, so a run of reloads neither stops the lane through
-            # it nor resets a real fault's count toward the STOP.
-            park_until = self._clock() + self._infra_backoff(0)
+            # Not a fault (BACKLOG #6830), so no traceback; still counted and backed off as one, so
+            # the STOP bound still holds if whatever raises it never stops.
             log.info(
                 "StageDispatcher %s lane %s: item %d handed back (%s); re-pending head until %.3f",
                 self._stage.value,
@@ -2126,25 +2123,18 @@ class StageDispatcher:
                 type(exc).__name__,
                 park_until,
             )
-            return (
-                _LaneOutcome(
-                    LaneResultKind.RETRY, park_until, made_progress=(i > 0), hand_back=True
-                ),
-                tail,
-                (head_id, park_until),
+        else:
+            log.error(
+                "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
+                "re-pending head with backoff until %.3f",
+                self._stage.value,
+                lane,
+                i,
+                park_until,
+                exc_info=exc,
             )
-        st = self._states.get(lane)
-        streak = st.infra_error_streak if (st is not None and i == 0) else 0
-        park_until = self._clock() + self._infra_backoff(streak)
-        log.error(
-            "StageDispatcher %s lane %s serializer failed at item %d (T17 infra fault); "
-            "re-pending head with backoff until %.3f",
-            self._stage.value,
-            lane,
-            i,
-            park_until,
-            exc_info=exc,
-        )
+        head_id = items[i].id
+        tail = [it.id for it in items[i + 1 :]]  # tail only — the head is re-pended, not released
         return (
             _LaneOutcome(
                 LaneResultKind.RETRY, park_until, is_infra_fault=True, made_progress=(i > 0)

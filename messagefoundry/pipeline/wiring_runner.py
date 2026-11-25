@@ -688,7 +688,8 @@ class SandboxRefusalOvertaken(SandboxSessionClosed, RependWithoutFault):
     (BACKLOG #6830; :meth:`RegistryRunner._sandboxed_dispatch` says when). It is retried or
     re-pended as any close is, but a per-lane worker's fault arm, and the pooled dispatcher
     (:class:`~messagefoundry.pipeline.stage_dispatcher.RependWithoutFault`), log its re-pend at INFO
-    with no traceback, since what overtook it is not a fault. The message's rerun compares again, and a
+    with no traceback, since what overtook it is not a fault. The pooled dispatcher still counts
+    and backs it off as an infra fault, so its STOP bound holds. The message's rerun compares again, and a
     refusal there alerts and dead-letters as before."""
 
 
@@ -8064,8 +8065,8 @@ class RegistryRunner:
                 )
         if not demote and self._abandoned_lookup_closes:
             log.warning(
-                "teardown: cancelling %d detached close(s) a demotion abandoned; a sandbox session's "
-                "close thread runs on regardless",
+                "teardown: cancelling %d detached close(s) a demotion abandoned; a sandbox session "
+                "close already running runs on, and one not yet started never runs",
                 len(self._abandoned_lookup_closes),
             )
             for _close_task in list(self._abandoned_lookup_closes):
