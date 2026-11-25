@@ -12,8 +12,8 @@
   is configured (the viewer degrades to "no file", never raises).
 - **Related:** [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
   (the PHI-read hop guard the viewer inherits), [ADR 0065](0065-web-ops-dashboard.md)
-  (the console that renders it), `support/redact.redact_log_record` (#49 — the per-line redactor the viewer
-  shares with the support bundle's `redact_log_text`; corrected 2026-11-25, this read
+  (the console that renders it), `support/redact.redact_log_record` (the per-line redactor the viewer shares
+  with the #49 support bundle's `redact_log_text`; corrected 2026-11-25, this read
   "`support/redact.redact_log_text` (#49 — the shared redactor the viewer reuses)", and the viewer
   never calls `redact_log_text`), BACKLOG #171. Companion: [ADR 0131](0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)
   (the S7b bulk-export item).
@@ -64,7 +64,7 @@ serve's Gate #1 refuses to start at it. *(Corrected 2026-10-06. This sentence re
 `GET /logs/tail` reads the **newest** file under `[logging].log_dir` (one level, `.log`/`.txt`), pages
 back from the end (`offset`/`limit`, newest page first), and returns each line **through
 `support.redact.redact_log_record`**, the per-line pass the support bundle's `redact_log_text` also
-runs; its docstring says how it wraps `redact_log_line`. Since BACKLOG
+runs; the `redact_log_record` docstring says how it wraps `redact_log_line`. Since BACKLOG
 #5550 both also mask PRIVATE KEY body lines across lines first, over different spans of text, so the
 two need not mask a line the same way; the `_read_log_tail` docstring says how they differ. The route is gated by a **new `logs:view` permission** via `require_phi_read`,
 which folds in the [ADR 0092] `enforce_phi_read_hop` data-path guard (a production-PHI instance on an
@@ -101,8 +101,9 @@ knob — a runtime level change re-levels whatever handlers exist.
 ## Consequences
 
 **Positive** — operators raise/lower verbosity and read the redacted log live, without a restart or a
-bundle pull; the viewer reuses the shared redactor (one PHI-coverage source of truth) and inherits the
-existing PHI-read hop guard + audit chain; additive, off-path when no log dir is configured.
+bundle pull; the viewer shares the bundle's per-line redactor, though the two need not mask a line the same way
+(section 2), and inherits the existing PHI-read hop guard + audit chain *(corrected 2026-11-25: this
+read "the viewer reuses the shared redactor (one PHI-coverage source of truth)")*; additive, off-path when no log dir is configured.
 
 **Negative / residual** — the runtime override is invisible after a restart (by design — the config dial
 is the durable setting), and `/config/reload` intentionally does **not** reset it. The viewer's redaction

@@ -687,7 +687,8 @@ _LEADING_TS = re.compile(
 def redact_log_line(line: str) -> str:
     """Return ``line`` with PHI/secret patterns replaced by a redaction placeholder.
 
-    Two layers: (1) the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
+    Two layers: (1) on a line holding "-----", secretscrub's PRIVATE KEY block pattern (BACKLOG
+    #5550), then the bundle-specific **secret** markers (``mfb64:`` bodies, ``MEFOR_*`` values,
     bearer/session tokens) the engine redactor does not carry; then (2) the shared engine **PHI**
     redactor (:func:`messagefoundry.redaction.redact`) for HL7-shaped spans (any segment id, not a
     fixed allowlist), free-text DOB/date runs, multi-token name runs, and the labelled values of FHIR
@@ -697,8 +698,10 @@ def redact_log_line(line: str) -> str:
     so far, or over the whole line when the line arrived holding the placeholder text (BACKLOG
     #2694); its last pass masks the words of a connection-string member's value. Then that member
     mask runs once more over the whole joined line (BACKLOG #5030), then secretscrub's widened DSN
-    reading, over the whole line too (BACKLOG #5386). A final long-base64 sweep catches
-    any residual key/token run.
+    reading, over the whole line too (BACKLOG #5386). On a line a masked tail could fire on, the
+    line is also read without the tails, the key-block pattern's included, and that reading is kept
+    unless the tailed one differs from it only by characters written as "x" (the comment on the
+    comparison below says why). A final long-base64 sweep catches any residual key/token run.
     The leading log timestamp is carved off first so the engine's date pass doesn't scrub it. This errs
     toward over-redaction (e.g. a capitalized two-word phrase in ordinary log text may be scrubbed) —
     the correct trade-off for a file that leaves the box."""
