@@ -1136,15 +1136,16 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nestin
 # The meters above read cost on inputs they build, so a regression is seen only on an input someone
 # thought to build. The argument at ``_delimiter_patterns`` instead rests on the shape of the
 # patterns, and the arm below asserts that shape on the parsed pattern, for each case, with no
-# input. The field run: its guard and every open run over one item in it match one character set,
-# and each of those runs is possessive. The segment pattern: no open repetition before its tail, and
-# a tail of an open ``[^\r\n]*`` with nothing after it. The guard and the segment's shape are what
-# make the scans linear; possessive runs are pinned because ``_delimiter_patterns`` states them, and
-# the comment on ``_HL7_FIELD_RUN`` says what they save, so a red that names only possessiveness is
-# not a linearity red. It reads at least the regressions its controls build. It does not replace
-# the meters or the nesting arm: a repetition nested around a repetition over several items
-# (``(?:(?:XY)*)*``) is read by the nesting arm and not here, and one nested around a possessive
-# run (``(?:[^|]*+)*``) is read by neither.
+# input. The field run: its guard and every open repetition over one item in it match one
+# character set, so each such item is one class and not a repetition, an alternation or a group of
+# them, and each of those runs is possessive. The segment pattern: no open repetition before its
+# tail, and a tail of an open ``[^\r\n]*`` with nothing after it. The guard, the nesting and the
+# segment's tail are what make the scans linear. Possessive runs and the segment's fixed head are
+# pinned because the patterns state them, so a red that names only one of those is not always a
+# linearity red: possessive runs save about half (the comment on ``_HL7_FIELD_RUN``), and an open
+# segment-ID run (``[A-Z0-9]*``) is still linear behind ``\b``, though a repeated group there
+# (``(?:[A-Z]\.)*``) is not. It reads at least the regressions its controls build, and does not
+# replace the meters or the nesting arm.
 
 #: The characters two classes are compared over: every one up to U+3000, past which ``\s``
 #: matches none (:data:`_NON_ASCII_WHITESPACE`), and a case's own delimiters. Two classes that
@@ -1202,41 +1203,47 @@ def _ungroup(body: Any) -> list[Any]:
     return body
 
 
-def _open_runs(items: Any) -> Iterator[tuple[Any, Any]]:
-    """``(repeat opcode, item)`` for each repetition in ``items``, at any depth, with no fixed count
-    over one leaf item, a group around one included (``([^|])*``). A repetition over more than one
-    item is read into rather than yielded. An atomic group around a sole repetition is read as the
-    possessive repetition it is (``(?>[^|]*)`` is ``[^|]*+``). Read through the same group kinds as
-    :func:`_nested_repetitions`, and an opcode neither reads raises, so it is read before it is
-    trusted."""
+def _sole_repetition(op: Any, arg: Any) -> Any:
+    """The repetition an atomic group holds alone, or None. Such a group matches what the
+    repetition made possessive does (``(?>[^|]*)`` is ``[^|]*+``)."""
+    if op != sre_constants.ATOMIC_GROUP:
+        return None
+    inner = _ungroup(arg)
+    return inner[0] if len(inner) == 1 and inner[0][0] in _REPEATS else None
+
+
+def _open_repetitions(items: Any) -> Iterator[tuple[Any, list[Any]]]:
+    """``(repeat opcode, body with single-item groups taken off)`` for each repetition in
+    ``items`` with no fixed count, at any depth, a repetition an atomic group holds alone read as
+    possessive. Read through the same group kinds as :func:`_nested_repetitions`, and an opcode
+    neither reads raises, so it is read before it is trusted."""
     for op, arg in items:
-        if op == sre_constants.ATOMIC_GROUP:
-            inner = _ungroup(arg)
-            if len(inner) == 1 and inner[0][0] in _REPEATS:
-                for _op, item in _open_runs(inner):
-                    yield sre_constants.POSSESSIVE_REPEAT, item
-            else:
-                yield from _open_runs(inner)
+        sole = _sole_repetition(op, arg)
+        if sole is not None:
+            low, high, body = sole[1]
+            if low != high:
+                yield sre_constants.POSSESSIVE_REPEAT, _ungroup(body)
+            yield from _open_repetitions(body)
         elif op in _REPEATS:
             low, high, body = arg
-            body = _ungroup(body)
-            if low != high and len(body) == 1 and body[0][0] in _LEAF_OPCODES:
-                yield op, body[0]
-            else:
-                yield from _open_runs(body)
+            if low != high:
+                yield op, _ungroup(body)
+            yield from _open_repetitions(body)
         elif op == sre_constants.SUBPATTERN:
-            yield from _open_runs(arg[3])
+            yield from _open_repetitions(arg[3])
+        elif op == sre_constants.ATOMIC_GROUP:
+            yield from _open_repetitions(arg)
         elif op == sre_constants.GROUPREF_EXISTS:
             for option in arg[1:]:
                 if option is not None:
-                    yield from _open_runs(option)
+                    yield from _open_repetitions(option)
         elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
-            yield from _open_runs(arg[1])
+            yield from _open_repetitions(arg[1])
         elif op == sre_constants.BRANCH:
             for option in arg[1]:
-                yield from _open_runs(option)
+                yield from _open_repetitions(option)
         elif op not in _LEAF_OPCODES:
-            raise AssertionError(f"{op} is not read by _open_runs")
+            raise AssertionError(f"{op} is not read by _open_repetitions")
 
 
 def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[str]:
@@ -1253,15 +1260,21 @@ def _field_run_violations(field_run: str, delimiters: frozenset[str]) -> list[st
     ):
         return [f"the field run does not open with a one-class negative lookbehind: {field_run!r}"]
     guard = _class_set(first[1][1][0], universe)
-    runs = list(_open_runs(items[1:]))
-    violations = [] if runs else [f"the field run has no open run: {field_run!r}"]
-    for op, item in runs:
+    violations = []
+    runs = 0
+    for op, body in _open_repetitions(items[1:]):
+        if len(body) != 1:
+            continue  # a sequence, such as a delimiter then a run; its runs are read on their own
+        runs += 1
+        (item,) = body
         if item[0] != sre_constants.IN:
-            violations.append(f"a run over {item!r} is not over a class")
+            violations.append(f"a run over {item!r} is not over one class")
         elif _class_set(item, universe) != guard:
             violations.append(f"a run class is not the guard's class: {item!r}")
         if op != sre_constants.POSSESSIVE_REPEAT:
             violations.append(f"a run over {item!r} is {op}, not possessive")
+    if not runs:
+        violations.append(f"the field run has no open run: {field_run!r}")
     return violations
 
 
@@ -1270,10 +1283,12 @@ def _segment_violations(segment: str, delimiters: frozenset[str]) -> list[str]:
     universe = _class_universe(delimiters)
     items = list(sre_parser.parse(segment))
     violations = [
-        f"an open repetition over {item!r} comes before the tail: {segment!r}"
-        for _op, item in _open_runs(items[:-1])
+        f"an open repetition over {body!r} comes before the tail: {segment!r}"
+        for _op, body in _open_repetitions(items[:-1])
     ]
     last = items[-1] if items else None
+    if last is not None:
+        last = _sole_repetition(*last) or last
     if not (
         last is not None
         and last[0] in (sre_constants.MAX_REPEAT, sre_constants.POSSESSIVE_REPEAT)
@@ -1327,6 +1342,10 @@ _FIELD_RUN_SHAPE_BREAKS = _unique(
             "run-not-possessive": "{}*",
             "grouped-run-not-possessive": "({})*",
             "atomic-group-run-not-possessive": "(?>{})*",
+            "run-spelled-as-an-alternation": "(?:{}|\u2028)*+",
+            "fixed-count-group-repeated": "(?:{}{{2}})*",
+            "repetition-around-a-possessive-run": "(?:{}*+)*",
+            "atomic-group-around-a-nesting": "(?>(?:{}+)*)",
         }.items()
     },
     {
@@ -1382,8 +1401,22 @@ _SEGMENT_SHAPE_BREAKS = _unique(
         "tail-bounded": lambda case: _linearity_case(case).segment.pattern.replace(
             r"[^\r\n]*", r"[^\r\n]{0,64}"
         ),
+        "tail-stops-at-a-tab": lambda case: _linearity_case(case).segment.pattern.replace(
+            r"[^\r\n]*", r"[^\r\n\t]*"
+        ),
+        "head-repeats-a-group": lambda case: _linearity_case(case).segment.pattern.replace(
+            r"\b(", r"\b((?:[A-Z]\.)*", 1
+        ),
     },
 )
+
+
+def test_an_atomic_segment_tail_reads_as_the_possessive_tail_it_is() -> None:
+    """The segment half reads an atomic tail as the field-run half reads an atomic run."""
+    pair = _linearity_case("hardcoded")
+    segment = pair.segment.pattern.replace(r"[^\r\n]*", r"(?>[^\r\n]*)")
+    assert segment != pair.segment.pattern
+    assert _segment_violations(segment, pair.delimiters) == [], segment
 
 
 @pytest.mark.parametrize("case", _LINEARITY_CASES)
