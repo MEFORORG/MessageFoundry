@@ -7,8 +7,9 @@
 *send* image and SR objects to MessageFoundry. ``pynetdicom``'s AE server is **blocking/threaded, not
 asyncio-native**, and its C-STORE callback runs on a foreign (acceptor) thread — so the SCP:
 
-* starts/stops the AE server **off the event loop** (``asyncio.to_thread``), so binding/shutdown never
-  stalls other listeners/workers/API calls;
+* starts/stops the AE server **off the event loop** (``asyncio.to_thread``), so binding/shutdown does
+  not stall other listeners/workers/API calls, except when the default executor refuses the hop and
+  it runs on the loop instead (:func:`~messagefoundry.threadhop.to_thread_or_loop`);
 * in the C-STORE callback (the foreign thread) re-encodes the received object to its **Part-10 bytes**
   and bridges them back onto the loop-owned ingress via ``asyncio.run_coroutine_threadsafe`` — the same
   loop-bridge pattern as ``db_lookup`` (ADR 0010) — blocking the **worker thread** (never the loop) on
@@ -121,6 +122,7 @@ from messagefoundry.redaction import (
     safe_text,
     safe_traceback,
 )
+from messagefoundry.threadhop import to_thread_or_loop
 from messagefoundry.tls_handshake_failures import HUNG_UP, HandshakeFailures, handshake_cause
 from messagefoundry.transports.admission import (
     REFUSAL_LOG_MAX_PER_WINDOW,
@@ -2303,7 +2305,9 @@ class DicomScpSource(SourceConnector):
         self._loop = asyncio.get_running_loop()  # captured ON the loop, before any off-loop work
         _redact_flagged_peer_values()  # again: warnings filters can be put back after the import
         # start_server binds a socket + spawns acceptor threads — do it OFF the loop, then it is live.
-        await asyncio.to_thread(self._start_server)
+        # A default executor that refuses the hop binds it on the loop instead, so a reload's
+        # rollback still brings the listener back up (BACKLOG #5755, item 3).
+        await to_thread_or_loop("DICOM listener start", self._start_server)
 
     def _start_server(self) -> None:
         # Imported lazily (the [dicom] extra); a missing extra surfaces as an internal/connection error
@@ -2884,11 +2888,13 @@ class DicomScpSource(SourceConnector):
         # with them: the loop cannot tell the two apart.
         self._tls_failures.close()
         # Shut the blocking pynetdicom AE server down OFF the loop (it stops accepting new associations,
-        # aborts active ones, and joins its threads) so teardown never stalls the loop. Idempotent.
+        # aborts active ones, and joins its threads) so teardown does not stall the loop. Idempotent.
         server = self._server
         try:
             if server is not None:
-                await asyncio.to_thread(server.shutdown)
+                # A refused hop shuts it down on the loop instead, so a reload's rollback does not
+                # leave the port held by a server it meant to stop (BACKLOG #5755, item 3).
+                await to_thread_or_loop("DICOM listener stop", server.shutdown)
             # Only once the shutdown returned: one that raised or was cancelled keeps the server,
             # so the next stop() shuts it down again.
             self._server = None

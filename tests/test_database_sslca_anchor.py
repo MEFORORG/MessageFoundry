@@ -602,3 +602,28 @@ def test_a_path_like_value_is_checked_at_the_text_the_driver_is_sent(tmp_path: P
             return sent
 
     assert database.driver_file_spellings(Split()) == (sent,)
+
+
+async def test_a_refused_executor_still_runs_the_lane_check(
+    store: MessageStore, tmp_path: Path, judged: None
+) -> None:
+    """BACKLOG #5755, items 3 and 5: a default executor that refuses the hop runs the lane check's
+    spec build and CA read on the loop. Red with ``asyncio.to_thread`` at those hops: the check
+    raises ``RuntimeError`` and fails a reload, or its rollback, that the CA would pass. The
+    refusing executor is one that was shut down, as at a loop's shutdown."""
+    import asyncio
+    import concurrent.futures
+
+    loop = asyncio.get_running_loop()
+    original = getattr(loop, "_default_executor", None)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pool.shutdown()
+    loop.set_default_executor(pool)
+    try:
+        await ta.make_lane_anchor_check(store, enforcing=True)(
+            "outbound", _OUT, _settings(_ca(tmp_path))
+        )
+    finally:
+        # The loop outlives the test, and the store fixture's close hops to a thread. The
+        # attribute is private to asyncio's base loop; None there means "make one when needed".
+        loop._default_executor = original  # type: ignore[attr-defined]

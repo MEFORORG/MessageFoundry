@@ -339,7 +339,6 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import errno
 import hashlib
@@ -357,7 +356,7 @@ from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, Protocol, runtime_checkable
 
 from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.anchor_path import (
@@ -373,6 +372,7 @@ from messagefoundry.credential import constant_time_equal
 from messagefoundry.path_reach import is_unreachable
 from messagefoundry.redaction import codec_safe_str, log_timestamp, safe_exc
 from messagefoundry.service_status import _system_exe
+from messagefoundry.threadhop import to_thread_or_loop
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import (
@@ -2955,6 +2955,13 @@ async def _preflight_one(
 #: read as a network loss, counted as one here (module item 11).
 _TRANSIENT_WINERRORS: frozenset[int] = frozenset({1236})
 
+#: What a refused anchor hop's WARNING names. A default executor that refuses the hop runs it on
+#: the loop rather than failing a reload's lane check or its rollback
+#: (:func:`~messagefoundry.threadhop.to_thread_or_loop`, BACKLOG #5755, items 3 and 5). The read
+#: has no bound of its own (see ``_ICACLS_TIMEOUT_S``), so on that fallback a CA on a stalled share
+#: stalls the loop for as long as the read takes.
+_ANCHOR_HOP: Final = "trust anchor read"
+
 
 def _transient_read_fault(exc: OSError | ValueError) -> bool:
     """Whether reading an anchor failed in a way that sets no store pin hold (module item 11),
@@ -3029,7 +3036,7 @@ async def _preflight_checks(
     pin_warning: PinReason | None = None  # why the store open would refuse a pin (item 11)
     try:
         if verdict is None:
-            verdict = await asyncio.to_thread(evaluate_anchor, spec)
+            verdict = await to_thread_or_loop(_ANCHOR_HOP, evaluate_anchor, spec)
         elif isinstance(verdict, OSError):
             raise verdict  # the caller's read failed: refused below, as this read's would be
         if verdict.pin_ok is not False:
@@ -3038,10 +3045,10 @@ async def _preflight_checks(
             # refuse a TRUSTED CERTIFICATE block its build accepts.
             try:
                 if spec.loads_verified_bytes:
-                    await asyncio.to_thread(anchor_cadata, verdict.data, spec)
+                    await to_thread_or_loop(_ANCHOR_HOP, anchor_cadata, verdict.data, spec)
                 else:
-                    pin_warning = await asyncio.to_thread(
-                        _refuse_by_path_content, verdict.data, spec
+                    pin_warning = await to_thread_or_loop(
+                        _ANCHOR_HOP, _refuse_by_path_content, verdict.data, spec
                     )
             except TrustAnchorError as exc:
                 shape_error = exc
@@ -3430,7 +3437,9 @@ class _LaneAnchorCheck:
         # off the loop; any other lane's spec reads only the settings.
         try:
             if settings.get("odbc_params"):
-                spec = await asyncio.to_thread(lane_anchor_spec, direction, name, settings)
+                spec = await to_thread_or_loop(
+                    _ANCHOR_HOP, lane_anchor_spec, direction, name, settings
+                )
             else:
                 spec = lane_anchor_spec(direction, name, settings)
         except ValueError as exc:
@@ -3440,7 +3449,7 @@ class _LaneAnchorCheck:
             self._last.pop(lane, None)
             return
         try:
-            read = await asyncio.to_thread(self._read, spec)
+            read = await to_thread_or_loop(_ANCHOR_HOP, self._read, spec)
         except (ValueError, TrustAnchorError) as exc:
             # A path the OS will not take, such as one holding a NUL, or an env() pin that
             # resolved but does not parse, the one TrustAnchorError evaluate_anchor raises. Each
