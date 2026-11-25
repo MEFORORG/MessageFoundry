@@ -6858,7 +6858,9 @@ def create_app(
         if req.all:
             # "Reset all" spans every channel, so a channel-scoped user may not run it (mirror purge).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, None, client_ip(request))
+                await _audit_channel_denied(
+                    engine, identity, None, client_ip(request), operation="stats_reset"
+                )
                 raise HTTPException(403, "channel-scoped users cannot reset all statistics")
         else:
             for t in req.targets:
@@ -7634,7 +7636,15 @@ def create_app(
         # A channel-scoped user must target one of their channels (replay isn't channel-filtered at
         # the engine level, so an unscoped "replay all" would cross channels).
         if not _replay_in_scope(identity, req.channel_id):
-            await _audit_channel_denied(engine, identity, req.channel_id, client_ip(request))
+            # A replay of every channel names none, so its row names the operation instead (vault
+            # BACKLOG #3748 item 7); the helper writes it only on a row with no channel.
+            await _audit_channel_denied(
+                engine,
+                identity,
+                req.channel_id,
+                client_ip(request),
+                operation="dead_letter_replay",
+            )
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (
             gate is not None
@@ -7915,10 +7925,17 @@ def create_app(
         ``hold_refusal`` is the refusal taking them met instead. The console passes neither, and
         the params are captured here."""
         # BACKLOG #3189: here rather than in the route, so the console's path is refused too. The
-        # refusal names no channel, so its audit row carries none.
+        # refusal names no channel, so its audit row carries none, and names the operation instead
+        # (vault BACKLOG #3748 item 7).
         refusal = _reload_refusal(user)
         if refusal is not None:
-            await _audit_channel_denied(engine, user, None, client_ip(request))
+            await _audit_channel_denied(
+                engine,
+                user,
+                None,
+                client_ip(request),
+                operation="config_reload_check" if req.dry_run else "config_reload",
+            )
             raise HTTPException(403, refusal)
         # Hold a real (non-dry-run) reload for a second approver when dual-control gates it. A dry_run
         # is a read-only pre-flight (no swap), so it is never held. The guard runs AFTER the caller's

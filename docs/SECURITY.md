@@ -2359,12 +2359,30 @@ the same permission set on the same method reds CI until it is listed here.
 > unknown name, since a scope is not checked against the registry (BACKLOG #2640). Only an
 > unscoped caller gets 404 for an unknown name. So a denial row can name a channel inside the
 > actor's own scope, for example one a reload removed. Read such a row as a miss, not a probe.
-> A name that fails the connection-name rule is never in a scope, and its denial row carries no
-> channel, so `audit_log.channel_id` never holds a caller-chosen string of unbounded length. The
-> console checks the rule before it calls in, and `audit_channel_denied` in
-> `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
-> the console seam record, checks it again. Its detail then carries `"malformed_name": true`, so
-> such a row is told apart from a refusal that names no channel by design (BACKLOG #3031).
+> A name that fails the connection-name rule is never in a scope. The per-name JSON routes above
+> declare the rule on the path, so they answer such a name with 422 before any scope check and
+> write no `auth.channel_denied` row for it. A name with a `/` in it, literal or encoded, never
+> matches the `{name}` segment, so it is answered 404 before any dependency runs and writes no row.
+> For any other name that fails the rule, the gate runs before the path is validated, so the gate's
+> own row still records the attempt with the caller's path in its detail: `auth.permission_granted`
+> for a caller it admits, or its refusal row for one it refuses (at least `auth.permission_denied`,
+> `auth.gate_refused` and `auth.mfa_denied`). An admitted caller's grant row is written under the
+> shipped default of `[security].audit_all_authorization_decisions`; with that switch off it is
+> written on the POST routes, whose permissions are in the sensitive set, and not on the GET routes.
+> The console checks the rule before it calls in. `audit_channel_denied`
+> in `messagefoundry/api/message_scope.py`, which writes every `auth.channel_denied` row the API and
+> the console seam record, checks the name it is given against the rule too, and records a name
+> that fails it as no channel, so `audit_log.channel_id` never holds a caller-chosen string of
+> unbounded length. For its own refusal of a channel-scoped actor's bulk selection the console
+> gives it an empty name, never the caller's text. A row written for a name that fails the rule
+> carries `"malformed_name": true` in its detail, so it is told apart from a refusal that names no
+> channel by design (BACKLOG #3031). At least some rows that name no channel carry `"operation"` in
+> their detail, naming the operation refused: a channel-scoped caller's config reload is one, and a
+> channel-scoped actor's web console bulk selection whose name fails the rule is another.
+> `DeniedOperation` in the same file lists the values. A core handler such as `_dual_role_control`
+> in `messagefoundry/api/app.py` passes no operation, so it would write a row with no channel and
+> no operation only if called directly with a malformed name; no shipped route does (vault BACKLOG
+> #3748 item 7).
 > On a deployment with more than one engine shard the same row has a second cause. Each engine
 > shard's graph holds only its own inbounds, and each serves its own API port. So a scoped caller
 > who asks one engine shard about an in-scope inbound that another owns gets the 403 and a denial
@@ -2729,19 +2747,14 @@ Approvals page keys on.
 
 **`GET /approvals` names at least some of the releases the gate refuses whoever approves them
 (vault BACKLOG #3192).** Each pending request carries `release_blocked`, which the release refuses
-on directly, so where it names a reason the two cannot disagree. It names at least a request with
-no requester id, an operation no longer registered, one dual control no longer gates, unreadable
-parameters, parameters naming no requester for an operation whose executor needs one (a purge or a
-reload, `params_no_requester`), a held reload whose parameters carry no config digest, or one not
-of the form the engine writes, which its release could only refuse whatever the directory holds
-(`params_no_fingerprint`), and a requester who no longer holds the authority the operation needs, such as a held
-reload or purge whose requester has since been channel-scoped (`requester_not_authorized`, BACKLOG
-#3189). The requester's standing is read when the queue is listed, by the rule the release
-applies, so a change after the listing, or a standing the listing could not read, is met only at
-release. A `null` does not promise a release: at least the self-approval refusal,
-the expiry, the dwell floor, the row's seal and the operation's own refusals are met only then.
-`PendingApprovalInfo` in `messagefoundry/api/models.py` lists the values. The console's Approvals
-page keys on it, and offers a blocked request only Reject, or Withdraw on the requester's own row,
+on directly, so where it names a reason the two cannot disagree. `PendingApprovalInfo` in
+`messagefoundry/api/models.py` lists the values and what each means. One of them,
+`requester_not_authorized` (BACKLOG #3189), turns on the requester's standing, such as a held
+reload or purge whose requester has since been channel-scoped. That standing is read when the
+queue is listed, by the rule the release applies, so a change after the listing, or a standing
+the listing could not read, is met only at release. A `null` does not promise a release: at least
+the self-approval refusal, the expiry, the dwell floor, the row's seal and the operation's own
+refusals are met only then. The console's Approvals page keys on `release_blocked`, and offers a blocked request only Reject, or Withdraw on the requester's own row,
 with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
 as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
