@@ -76,6 +76,7 @@ scope available. See ADR 0162 section 4.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import logging
 import logging.handlers
@@ -803,6 +804,39 @@ def _type_name(exc: BaseException) -> str:
         return _RECORD_LABEL_DROPPED
 
 
+def _encodable(line: str, stream: object) -> str:
+    """``line`` with each character ``stream``'s encoding has no byte for written as a JSON
+    ``\\uXXXX`` escape, a character past U+FFFF as its surrogate pair of them (BACKLOG #5813).
+    Never raises.
+
+    JSON's spelling, not Python's ``backslashreplace``, whose ``\\xNN`` is not a JSON escape: a
+    JSON sink writes text unescaped (``ensure_ascii=False``), so this keeps its line one object a
+    reader parses back to the record's text. A text sink shows the escape. A stream with no
+    encoding, or one Python does not know, is read as ASCII."""
+    encoding = getattr(stream, "encoding", None)
+    if isinstance(encoding, str):
+        try:
+            codecs.lookup(encoding)
+        except LookupError:
+            encoding = None
+    if not isinstance(encoding, str):
+        encoding = "ascii"
+    out: list[str] = []
+    for char in line:
+        try:
+            char.encode(encoding)
+        except (UnicodeError, LookupError):  # LookupError: a codec that is not a text encoding
+            code = ord(char)
+            if code > 0xFFFF:
+                code -= 0x10000
+                out.append(f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}")
+            else:
+                out.append(f"\\u{code:04x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def _safe_reason(exc: BaseException | None) -> str:
     """The guard's one way to turn a caught exception into a publishable reason string.
 
@@ -882,7 +916,9 @@ class _GuardedSinkMixin(_SinkBase):
             if stand_in is not None:
                 notice, kind = stand_in
                 try:
-                    stand_in_line = self._notice_line(notice)
+                    # Escaped as the record would be below: the logger name can hold a
+                    # character the stream has no byte for.
+                    stand_in_line = _encodable(self._notice_line(notice), self.stream)
                 except Exception as format_exc:
                     notice_kind = _type_name(format_exc)
                     self._note_format_fault(
@@ -912,6 +948,25 @@ class _GuardedSinkMixin(_SinkBase):
                 except Exception as sink_exc:
                     # The sink refused the stand-in too, so ITS failure is the reason now.
                     failure = sink_exc
+            elif isinstance(failure, UnicodeEncodeError):
+                # The record formatted, so the write raised this: the stream has no byte for a
+                # character in it, as a cp1252 stdout under NSSM has none for most of Unicode
+                # (BACKLOG #5813). That is the record's text, not a sink fault, and a roll cannot
+                # clear it: the re-resolved stream is the same one. The line is written again with
+                # each such character escaped; only a sink that refuses that too takes the stages.
+                # The escaped line is also what a roll re-writes, since the raw one cannot encode.
+                try:
+                    stand_in_line = _encodable(self.format(record) + self.terminator, self.stream)
+                    self._write_line(stand_in_line)
+                except Exception as sink_exc:
+                    failure = sink_exc
+                else:
+                    self._note_format_fault(
+                        f"could not encode a record for the sink's stream ({_type_name(failure)}); "
+                        "it was written with each character the stream has no byte for escaped"
+                    )
+                    self._report_format_faults()
+                    return
             # SCRUBBED HERE, WHERE IT IS BUILT, AND NOWHERE ELSE (BACKLOG #1591). The notice below is
             # written by ``_write_notice`` straight to the sink's stream through ``_write_line``, so
             # no handler filter will ever see it, and the three other consumers of this string take

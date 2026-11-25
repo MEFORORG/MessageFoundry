@@ -470,7 +470,13 @@ delegation of 2026-11-17 (decision d20261118T002722950-fa0f70). An alert and a
 `/status` signal for it are not built. When the sink refuses the notice, the two stages decide, as
 for any write failure. When the formatter cannot format the notice either, the sink is recorded
 unwritable with a reason that names a formatter fault, and the file is not rolled or renamed;
-stage 2 then decides the stop as for any other stage-2 failure. `_GuardedSinkMixin.handleError` and `_report_format_faults` in
+stage 2 then decides the stop as for any other stage-2 failure. A record that formats but holds a
+character the stream has no byte for, as a cp1252 stdout under NSSM has none for most of Unicode,
+raised `UnicodeEncodeError` from the write and went to stage 2 on `main` the same way, the
+re-resolved stream being the same one. Now the line is written again with each such character as a
+JSON `\uXXXX` escape, so its text is kept, not replaced, and the fault is counted on the same
+stderr line; a sink that refuses the escaped line too takes the two stages, and a roll re-writes
+the escaped line. `_GuardedSinkMixin.handleError` and `_report_format_faults` in
 `logging_guard.py` say what is counted and when the stderr line is written.
 
 **Part of the side-by-side check is now committed.**
