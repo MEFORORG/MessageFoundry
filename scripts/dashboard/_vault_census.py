@@ -75,7 +75,7 @@ def clipped_census(report: Any, sources: Any, through: dt.date) -> tuple[Any, in
 
 
 #: A row's priority, as its section marker line writes it: ``**Cluster:** X. **Priority:** P3.``
-_PRIORITY = re.compile(r"\*\*Priority:\*\*\s*(P[0-9])\b")
+_PRIORITY = re.compile(r"\*\*Priority:\*\*\s*(P[0-9]+)\b")
 #: The priority bucket of a row whose section marker names none.
 UNSCORED = "unscored"
 

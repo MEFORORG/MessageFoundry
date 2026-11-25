@@ -663,8 +663,8 @@ def render(data: dict[str, Any]) -> str:
 <p class="lede">{lede(headline)} Window {esc(window)}, through {esc(data.get("through") or "unknown")} (UTC).</p>
 <div class="tiles">{tiles}</div>
 <section class="chart wide"><h2>Ledger rows by priority</h2>{priority_table(tr.priority_rows(snap))}
-<p class="note">Every ledger row, open and closed, by the priority on its own Cluster line and its
-status banner. Open, partial and in progress are open rows; closed, declined and superseded are
+<p class="note">Every ledger row that carries a status banner, open and closed, by the priority on its
+own Cluster line and its status banner. Open, partial and in progress are open rows; closed, declined and superseded are
 closed ones. As of the vault at run time.</p></section>
 {ledger}
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}

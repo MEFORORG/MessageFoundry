@@ -504,6 +504,14 @@ def test_priority_rows_order_and_fill_every_status() -> None:
         "odd": 1,
     }
     assert tr.priority_rows(tr.Snapshot({})) == []
+    # A status only P2 carries is a zero cell for P1 and unscored, not a missing one.
+    assert {"priority": "P1", "status": "odd", "value": 0} in rows
+
+
+def test_priority_statuses_match_the_census_driver() -> None:
+    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
+    for status in tr.PRIORITY_STATUSES:
+        assert f'"{status}"' in source
 
 
 def test_main_writes_the_priority_file(tmp_path: Path) -> None:

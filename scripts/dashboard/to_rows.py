@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Flatten a ``collect_metrics.py`` snapshot into the dashboard's two row files.
+"""Flatten a ``collect_metrics.py`` snapshot into the dashboard's three row files.
 
 WRITES ``<out>/metrics.json`` (one row per headline metric, then one per fact),
 ``<out>/series.json`` (one row per series per ISO week) and ``<out>/priority.json`` (one row per
@@ -504,9 +504,12 @@ def priority_rows(snap: Snapshot) -> list[dict[str, Any]]:
     if not isinstance(by, dict):
         return []
     rows: list[dict[str, Any]] = []
+    # One column set for every priority: a status only one priority carries is a measured zero in
+    # the others, never a missing cell that would blank their totals.
+    extra = sorted({str(k) for c in by.values() for k in _dict(c) if k not in PRIORITY_STATUSES})
+    statuses = [*PRIORITY_STATUSES, *extra]
     for priority in sorted((str(p) for p in by), key=_priority_key):
         counts = _dict(by.get(priority))
-        statuses = [*PRIORITY_STATUSES, *sorted(k for k in counts if k not in PRIORITY_STATUSES)]
         for status in statuses:
             value = counts.get(status, 0)
             rows.append(
