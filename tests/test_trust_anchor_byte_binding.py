@@ -503,9 +503,7 @@ def _trusted(pem: bytes) -> bytes:
     ("shape", "expected"),
     [
         # A lone CR does not end a line in OpenSSL's reader, so the BEGIN behind one is hidden.
-        pytest.param(
-            lambda a, b: a + _E_ACUTE + b"\r" + b, _Refused(["good-ca"]), id="non-ASCII, lone CR"
-        ),
+        pytest.param(lambda a, b: a + _E_ACUTE + b"\r" + b, ["good-ca"], id="non-ASCII, lone CR"),
         pytest.param(
             lambda a, b: _E_ACUTE + b"\r" + b, _Refused(None, _NO_BLOCK), id="first line, lone CR"
         ),
@@ -522,10 +520,10 @@ def _trusted(pem: bytes) -> bytes:
         pytest.param(
             lambda a, b: a + b"#\r" + _E_ACUTE + b"\n" + b,
             ["evil-ca", "good-ca"],
-            id="lone CR inside a dropped line",
+            id="lone CR inside a non-ASCII line",
         ),
-        # A line holding a BEGIN anywhere opens a block for the ASCII check, as OpenSSL's reader
-        # can open one there. The two controls with a BEGIN at a line start read the same.
+        # A non-ASCII byte in a block OpenSSL reads refuses, whether its BEGIN starts a line or
+        # OpenSSL finds it mid-line. The two controls with a BEGIN at a line start read the same.
         pytest.param(
             lambda a, b: a + _LONG + _non_ascii_mid_body(b), _Refused(None), id="long, mid-body"
         ),
@@ -549,7 +547,7 @@ def _trusted(pem: bytes) -> bytes:
         ),
         pytest.param(
             lambda a, b: b"# -----BEGIN goes here\n" + _E_ACUTE + b"\n" + a,
-            _Refused(["good-ca"]),
+            ["good-ca"],
             id="comment holding a BEGIN, then non-ASCII",
         ),
         # OpenSSL drops a mark only after an END that closed a block it was reading.
@@ -609,15 +607,15 @@ def test_a_byte_order_mark_hides_or_shows_exactly_the_blocks_cafile_does(
     tmp_path: Path,
     cas: tuple[_Ca, _Ca],
 ) -> None:
-    """OpenSSL drops a byte-order mark only on the first line and on the line after an END line;
-    elsewhere the mark hides the block behind it. Stripping it anywhere would trust a certificate
-    ``cafile=`` never loaded, which is how round two of this slice's QA found it. Each case is held
+    """OpenSSL drops a byte-order mark only at the start of the file and of the read after the one
+    that ended a block; elsewhere the mark hides the block behind it. Stripping it anywhere would
+    trust a certificate ``cafile=`` never loaded, which is how round two of this slice's QA found it. Each case is held
     against ``cafile=`` itself, so the expectation is OpenSSL's, not this module's.
 
-    The same holds for what ``anchor_cadata`` drops: in these rows, a line it removes must not show
+    The same holds for the rest of the text ``anchor_cadata`` builds: in these rows it must not show
     OpenSSL a block ``cafile=`` never read, and a block OpenSSL reads must not lose a line. A row
-    where its line model and ``cafile=`` differ refuses (:class:`_Refused`). This holds these shapes
-    only: it is a line model, not OpenSSL's reader, so other shapes can still differ."""
+    where it refuses rather than follow ``cafile=`` is :class:`_Refused`. This holds these shapes
+    only."""
     good, evil = cas
     data = shape(good.pem, evil.pem)
     anchor = tmp_path / "bundle.pem"
@@ -679,6 +677,144 @@ def test_a_trusted_certificate_block_refuses_rather_than_vanishing(cas: tuple[_C
     assert _subjects(ssl.create_default_context(cadata=(good.pem + trusted).decode())) == [
         "good-ca"
     ]
+
+
+# --- the text keeps the file's bytes in place (BACKLOG #5229) ----------------------------------------
+
+
+def _as_query(data: bytes) -> str:
+    """``data`` with each byte at or above 0x80 as ``?``, every other byte as it is."""
+    return "".join(chr(byte) if byte < 0x80 else "?" for byte in data)
+
+
+def _line_feeds(text: bytes | str) -> list[int]:
+    return [at for at, char in enumerate(text) if char in (10, "\n")]
+
+
+_IN_PLACE = [
+    pytest.param(lambda a, b: a, True, id="one block"),
+    pytest.param(lambda a, b: b"# issued for testing\n" + a, True, id="ASCII comment above"),
+    pytest.param(lambda a, b: b"# one\n" + a + b"# two\r\n" + b, True, id="two blocks, comments"),
+    pytest.param(lambda a, b: b"# M\xc3\xbcller CA\n" + a, True, id="non-ASCII comment above"),
+    pytest.param(lambda a, b: a + b"# caf\xc3\xa9\n" + b, True, id="non-ASCII comment between"),
+    pytest.param(lambda a, b: a + b"trailer \xc3\xa9\n", True, id="non-ASCII trailer"),
+    pytest.param(lambda a, b: _BOM + a, False, id="mark at file start"),
+    pytest.param(lambda a, b: _BOM + a + _BOM + b, False, id="mark after END (copy a+b)"),
+]
+
+
+@pytest.mark.parametrize(("shape", "no_mark"), _IN_PLACE)
+def test_the_text_keeps_every_offset_and_loads_what_cafile_loads(
+    shape: Callable[[bytes, bytes], bytes], no_mark: bool, tmp_path: Path, cas: tuple[_Ca, _Ca]
+) -> None:
+    """The text is as long as the file and has its LFs where the file has them, so OpenSSL reads
+    both in the same pieces. A byte at or above 0x80 becomes ``?`` where it stands. A mark OpenSSL
+    drops is dropped from the text too, with the read padded so nothing after it moves, so in the
+    rows holding a mark only the length and the LFs are compared. In every row the text must load
+    exactly the certificates ``cafile=`` loads from the same bytes."""
+    good, evil = cas
+    data = shape(good.pem, evil.pem)
+    text = anchor_cadata(data, _SPEC)
+    assert len(text) == len(data)
+    assert _line_feeds(text) == _line_feeds(data)
+    if no_mark:
+        assert text == _as_query(data)
+    anchor = tmp_path / "bundle.pem"
+    anchor.write_bytes(data)
+    by_file = ssl.create_default_context(cafile=str(anchor))
+    by_data = ssl.create_default_context(cadata=text)
+    assert by_data.get_ca_certs() == by_file.get_ca_certs()
+    assert by_data.get_ca_certs()  # the control: a row that loads nothing would compare equal
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(lambda a, b: a, id="one block"),
+        pytest.param(lambda a, b: a + b, id="two blocks"),
+        pytest.param(lambda a, b: b"Bag Attributes\n    friendlyName: Test CA\n" + a, id="comment"),
+        pytest.param(lambda a, b: (b"# x\n" + a + b).replace(b"\n", b"\r\n"), id="CRLF, comment"),
+    ],
+)
+def test_an_ascii_file_is_handed_on_unchanged(
+    shape: Callable[[bytes, bytes], bytes], cas: tuple[_Ca, _Ca]
+) -> None:
+    good, evil = cas
+    data = shape(good.pem, evil.pem)
+    assert anchor_cadata(data, _SPEC) == data.decode("ascii")
+
+
+def _nul_in_the_body(pem: bytes) -> bytes:
+    lines = pem.split(b"\n")
+    lines[2] = lines[2][:10] + b"\0" + lines[2][10:]
+    return b"\n".join(lines)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param(_nul_in_the_body, id="inside the block"),
+        pytest.param(lambda pem: pem + b"# a\0b\n", id="after the block"),
+    ],
+)
+def test_a_nul_byte_refuses(shape: Callable[[bytes], bytes], cas: tuple[_Ca, _Ca]) -> None:
+    """A PEM file holds no NUL, so one refuses wherever it is."""
+    good, _ = cas
+    with pytest.raises(TrustAnchorError, match="NUL byte") as refused:
+        anchor_cadata(shape(good.pem), _SPEC)
+    assert refused.value.scope == "nul"
+
+
+def test_a_nul_byte_beside_a_private_key_still_names_the_key(cas: tuple[_Ca, _Ca]) -> None:
+    """The NUL refusal runs after the key check, so a file holding both names the key."""
+    good, _ = cas
+    data = good.pem + Path(good.key).read_bytes() + b"# a\0b\n"
+    with pytest.raises(TrustAnchorError) as refused:
+        anchor_cadata(data, _SPEC)
+    assert refused.value.scope == "private_key"
+
+
+@pytest.mark.parametrize(
+    ("version", "refuses"),
+    [
+        pytest.param((1, 1, 1, 23, 15), True, id="OpenSSL 1.1.1"),
+        pytest.param((3, 0, 0, 0, 15), False, id="OpenSSL 3.0.0"),
+    ],
+)
+def test_a_mark_the_text_would_drop_refuses_below_openssl_3(
+    version: tuple[int, ...],
+    refuses: bool,
+    cas: tuple[_Ca, _Ca],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where the mark is dropped is OpenSSL 3.x's rule, so below 3.0 a file where the text would
+    drop one in front of a BEGIN refuses rather than show OpenSSL a block it may keep hidden."""
+    good, _ = cas
+    monkeypatch.setattr(ssl, "OPENSSL_VERSION_INFO", version)
+    if not refuses:
+        assert anchor_cadata(_BOM + good.pem, _SPEC)
+        return
+    with pytest.raises(TrustAnchorError, match="byte-order mark") as refused:
+        anchor_cadata(_BOM + good.pem, _SPEC)
+    assert refused.value.scope == "byte_order_mark"
+    assert anchor_cadata(good.pem, _SPEC)  # the control: no mark, no refusal
+
+
+def test_a_non_ascii_byte_on_a_begin_line_refuses(cas: tuple[_Ca, _Ca]) -> None:
+    """A non-ASCII byte on a ``-----BEGIN `` line refuses. The second, clean block keeps the file
+    from refusing first as holding no block."""
+    good, evil = cas
+    data = good.pem.replace(b"BEGIN CERTIFICATE", b"BEGIN CERTIFIC\xc3\xa9ATE", 1) + evil.pem
+    with pytest.raises(TrustAnchorError, match="non-ASCII byte") as refused:
+        anchor_cadata(data, _SPEC)
+    assert refused.value.scope == "non_ascii"
+
+
+def test_a_begin_line_without_its_closing_dashes_opens_no_block() -> None:
+    """OpenSSL opens a block only on a line that starts ``-----BEGIN `` and ends ``-----``, and
+    the text follows it, so a file whose only such line lacks the dashes holds no block."""
+    with pytest.raises(TrustAnchorError, match="holds no PEM block"):
+        anchor_cadata(b"-----BEGIN not a block\n", _SPEC)
 
 
 # --- the verify row, anchored -------------------------------------------------------------------------

@@ -2254,7 +2254,7 @@ def _with_headers(headers: bytes) -> bytes:
 
 def _begin_past_a_long_line(end_line: bytes) -> Any:
     """Code review round 2's measured bypasses of a line-based check. The BEGIN sits after 254
-    bytes of one line, where OpenSSL reads it and anchor_cadata's own line loop does not, and the
+    bytes of one line, where OpenSSL reads it and that earlier line-based check did not, and the
     line after it looked like an END line to that check. With the real load, each shape did not
     return within 15 seconds."""
     second = _real_ca("second-ca")[0].replace(_BEGIN_CERT, b"")  # the body and its END line
@@ -2369,15 +2369,25 @@ def test_an_encryption_header_above_the_first_begin_still_passes() -> None:
         pytest.param(True, False, id="after the last END"),
     ],
 )
-def test_an_encryption_header_on_a_non_ascii_comment_line_passes(before: bool, after: bool) -> None:
-    """The check reads the text the load would get, and a non-ASCII comment line is not in it, so
-    the header name on one does not refuse, wherever the line sits. The ASCII case between two
-    blocks does: see the "comment between blocks" row above."""
+def test_an_encryption_header_on_a_non_ascii_comment_line_reads_as_on_an_ascii_one(
+    before: bool, after: bool
+) -> None:
+    """The check reads the text the load would get, which keeps every line with a non-ASCII byte as
+    ``?`` (BACKLOG #5229). So a header name on a non-ASCII comment line refuses after the first
+    BEGIN, as on an ASCII one (the "comment between blocks" row above), and passes above it."""
     first = _real_ca("crl-test-ca")[0] if before else b""
     last = _real_ca("second-ca")[0] if after else b""
     data = first + b"caf\xc3\xa9 Proc-Type: 4,ENCRYPTED\n" + last
     spec = AnchorSpec("api_client", "[api].tls_client_ca_file", "ca.pem", None)
-    assert ta.anchor_cadata(data, spec) == (first + last).decode()
+    if not before:
+        assert (
+            ta.anchor_cadata(data, spec)
+            == (first + b"caf?? Proc-Type: 4,ENCRYPTED\n" + last).decode()
+        )
+        return
+    with pytest.raises(TrustAnchorError) as err:
+        ta.anchor_cadata(data, spec)
+    assert ta.ENCRYPTION_HEADER_SCOPE in str(err.value)
 
 
 async def test_the_preflight_refuses_an_encrypted_anchor_as_the_consumer_does(
@@ -2475,8 +2485,8 @@ def test_a_private_key_block_in_an_anchor_refuses(
             lambda: _real_ca("crl-test-ca")[0] + f"# no {_PRIVATE}----- here\n".encode(),
             id="label in a comment after the last END",
         ),
-        # A non-ASCII line is dropped from the cadata= text, but the check reads the bytes. Both
-        # the BEGIN and the END line are non-ASCII, so a check of the kept text finds no label.
+        # The check reads the raw bytes. Here the label's BEGIN and END lines both hold non-ASCII
+        # bytes, which an earlier version dropped from the cadata= text, and the label still refuses.
         pytest.param(
             lambda: (
                 _real_ca("crl-test-ca")[0]

@@ -316,7 +316,6 @@ import asyncio
 import contextlib
 import errno
 import hashlib
-import io
 import json
 import logging
 import os
@@ -326,7 +325,7 @@ import ssl
 import stat
 import subprocess  # nosec B404 — used only to read a DACL via icacls (fixed tool, no shell)
 import time
-from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -641,7 +640,16 @@ def anchor_fingerprint(path: str | os.PathLike[str]) -> str:
 _UTF8_BOM = b"\xef\xbb\xbf"
 _PEM_BEGIN = b"-----BEGIN "
 _PEM_END = b"-----END "
+_PEM_DASHES = b"-----"
 _PEM_TRUSTED = b"-----BEGIN TRUSTED CERTIFICATE-----"
+#: The most bytes one read of OpenSSL's PEM reader takes: ``BIO_gets`` into its 255-byte line
+#: buffer, so 254 bytes, or fewer when an LF comes first (BACKLOG #5229, :func:`anchor_cadata`).
+_PEM_PIECE = 254
+#: What OpenSSL's PEM reader strips from the end of each read before it compares the text: at
+#: least every byte up to and including the space.
+_PEM_TRAILING = bytes(range(0x21))
+#: Each byte at or above 0x80 as ``?``, so the text keeps every offset and every LF of the file.
+_HIGH_AS_QUERY = bytes(range(0x80)) + b"?" * 0x80
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
 _PEM_ENCRYPTION_HEADERS = ("proc-type:", "dek-info:")
 #: What :func:`has_encryption_header` matches, in the words :func:`anchor_cadata`'s refusal uses
@@ -717,8 +725,8 @@ def has_private_key_label_bytes(data: bytes) -> bool:
 
 def _refuse_a_private_key(data: bytes, spec: AnchorSpec) -> None:
     """Refuse an anchor whose bytes hold a private-key label (BACKLOG #3745). It reads the raw
-    bytes, not the text :func:`anchor_cadata` keeps, so a key on a non-ASCII line it drops still
-    refuses. The refusal names the setting and the path, never the content."""
+    bytes, not the text :func:`anchor_cadata` builds from them. The refusal names the setting and
+    the path, never the content."""
     if has_private_key_label_bytes(data):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {PRIVATE_KEY_SCOPE}. A trust anchor "
@@ -810,29 +818,57 @@ _STORE_ANCHOR_LABELS = frozenset({"store_sqlserver_pin", "store_postgres_ca"})
 _STORE_CONTENT_RECORDED: dict[tuple[str, str], tuple[str, str]] = {}
 
 
+def _pem_reads(data: bytes) -> Iterator[tuple[int, int]]:
+    """The start and end of each read OpenSSL's PEM reader makes of ``data``: up to
+    :data:`_PEM_PIECE` bytes, ending after the first LF within them. A CR ends nothing. The reads
+    depend on the bytes alone, never on what the reader made of an earlier one."""
+    start = 0
+    while start < len(data):
+        lf = data.find(b"\n", start, start + _PEM_PIECE)
+        end = lf + 1 if lf >= 0 else min(start + _PEM_PIECE, len(data))
+        yield start, end
+        start = end
+
+
 def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     """The verified anchor bytes as the PEM text ``SSLContext.load_verify_locations(cadata=)`` takes.
 
     ``cadata=`` takes ASCII text only, while ``cafile=`` reads a file with any bytes between its PEM
     blocks. Measured on CPython 3.14.6 / OpenSSL 3.5.7: a ``cafile`` with a UTF-8 comment above the
     block (a PKCS#12 export's ``friendlyName``) or a UTF-8 byte-order mark loads, and the same bytes
-    as ``cadata`` raise. So this drops every non-ASCII line OUTSIDE a block, which OpenSSL skips
-    anyway, and a byte-order mark on the first line of the file and on the line straight after an
-    ``-----END`` line that closes a block in this function's line model, where any BEGIN opens
-    one. Measured, a mark ``cafile=`` drops loads the block behind it (two concatenated files), and
-    a mark it keeps hides that block, so stripping a mark it keeps would trust a certificate it
-    never loaded. ``tests/test_trust_anchor_byte_binding.py`` holds named shapes against
-    ``cafile=``. This is a line model, not OpenSSL's reader, so it does not match ``cafile=`` in
-    every shape, and the strip can fire where ``cafile=`` keeps the mark.
+    as ``cadata`` raise. **So the text is the file with each byte at or above 0x80 replaced by ``?``
+    where it stands** (BACKLOG #5229). Every LF stays where it is, so OpenSSL's reader, which reads
+    at most 254 bytes at a time and finds a BEGIN only at the start of one of those reads, starts
+    and ends each read of the text where it does in the file. For at least the comparisons OpenSSL
+    makes outside a block, ``?`` reads as the byte it replaced, with at least two exceptions: the
+    byte-order mark, handled next, and a read OpenSSL tests as a BEGIN, refused below. An earlier
+    version dropped non-ASCII lines and modelled OpenSSL's reader line by line; that model did not
+    match ``cafile=`` in every shape, and could trust a certificate ``cafile=`` does not show.
 
-    A line ends at an LF alone, as in OpenSSL's reader, so a lone CR does not end one, and dropping
-    a line never shows OpenSSL a block hidden behind a CR. A line holding ``-----BEGIN `` anywhere
-    opens a block for this rule, since OpenSSL finds a BEGIN mid-line in a long line, and the block
-    runs to the next line starting ``-----END``. The exception is a lone BEGIN straight behind a
-    byte-order mark this keeps, which hides that block as above. Every line of a block is kept
-    exactly, so a non-ASCII byte there refuses. That is stricter than ``cafile=`` in at least three
-    measured shapes, though ``cafile=`` refuses others (``PEM lib``). The text is derived from
-    ``data`` alone and nothing here opens a file, which is the point.
+    **One byte-order-mark rule is left.** OpenSSL drops a UTF-8 byte-order mark at the start of the
+    first read of each PEM object it looks for: the start of the file, and the read straight after
+    the one that ended a block. Elsewhere it keeps the mark, and a kept mark in front of a BEGIN
+    hides that block. To find those reads this follows OpenSSL's reads with two states, looking for
+    a BEGIN and inside a block, using the same tests OpenSSL applies to each read after stripping
+    its trailing bytes (:data:`_PEM_TRAILING`): a BEGIN read starts ``-----BEGIN `` and ends
+    ``-----``, and an END read starts ``-----END ``. Where OpenSSL drops a mark and the rest of that
+    read is a BEGIN, the text drops the mark too and puts three spaces at the end of the read, which
+    OpenSSL strips, so the read keeps its start and its end. Where the rest is not a BEGIN, ``???``
+    reads as the dropped mark would. Everything else this follows only decides which reads those
+    are.
+
+    **A non-ASCII byte refuses where OpenSSL could read it differently from ``?``.** That is at
+    least any read inside a block, from its BEGIN read to its END read, where the base64 decoder
+    and the blank-line test read it, and any read outside a block that starts ``-----BEGIN ``,
+    which OpenSSL tests as a BEGIN. This errs wide: it refuses at least some files ``cafile=``
+    reads. **A NUL anywhere refuses**, after the header and key checks: a PEM file
+    holds none. The text is derived from ``data`` alone and nothing here opens a file, which is the
+    point.
+
+    This rests on OpenSSL's PEM reader as measured on CPython 3.14 with OpenSSL 3.5, and
+    ``tests/test_trust_anchor_byte_binding.py`` holds it against ``cafile=`` itself. Another
+    OpenSSL that reads differently can make the two differ again. The mark rule is OpenSSL 3.x's,
+    so below OpenSSL 3.0 a file where this would drop a mark in front of a BEGIN refuses instead.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -878,58 +914,64 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
     and refuses here, and so does the header name in a comment between two blocks or after the
     last one. The
     same header in a comment above the first block still passes, unless a ``-----BEGIN `` comes
-    anywhere before it, on its own line or an earlier one. The check reads the text the load would get, so a comment line that is not
-    ASCII, dropped above, is not checked.
+    anywhere before it, on its own line or an earlier one. The check reads the text the load would
+    get, which keeps every line, so a header name on a line that also holds a non-ASCII byte is
+    checked too.
 
     **A private-key label after the first BEGIN refuses, after the header check and before the
     load** (BACKLOG #3745, a Manager decision to refuse rather than warn). ``cadata=`` skips a key
     block and loads the certificate beside it, so without this a key of any label, a plain
     ``PRIVATE KEY``, a PKCS#8 ``ENCRYPTED PRIVATE KEY`` with no RFC 1421 header, or an ``RSA`` or
     ``EC PRIVATE KEY``, passed every check and sat in a file the engine reads as public trust
-    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes, so a
-    non-ASCII line the load never sees is checked here. A legacy-encrypted key is refused by the
-    header check first, with that check's text. Both checks run ahead of the non-ASCII refusal, so
-    a block that holds a non-ASCII byte as well still names the header or the key."""
-    kept: list[bytes] = []
-
-    inside = False
+    material. :func:`has_private_key_label` says what it matches; it reads the raw bytes. A
+    legacy-encrypted key is refused by the header check first, with that check's text. Both checks
+    run ahead of the non-ASCII refusal, so a block that holds a non-ASCII byte as well still names
+    the header or the key."""
+    if _PEM_TRUSTED in data:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
+            "BEGIN marker, even outside a block, as in a comment. Converting such a block "
+            "discards its trust settings, so confirm the CA should be trusted without them. "
+            "The engine does not load such a block. Remove a comment that names the marker, "
+            "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
+            "CERTIFICATE block per run",
+            scope="trusted_certificate",
+        )
+    text_bytes = bytearray(data.translate(_HIGH_AS_QUERY))
+    inside = False  # between a BEGIN read and its END read
+    first = True  # the first read of a search for a BEGIN: OpenSSL drops a mark here
     blocks = 0
-    fresh = True  # the first line, or the line after a block's END line: OpenSSL drops a BOM there
-    for raw in io.BytesIO(data):  # splits at LF alone; bytes.splitlines also splits at a lone CR
-        line = raw[len(_UTF8_BOM) :] if fresh and raw.startswith(_UTF8_BOM) else raw
-        fresh = False
-        if _PEM_TRUSTED in line:
-            raise TrustAnchorError(
-                f"{spec.setting}: the trust anchor {spec.path!r} names the trusted-certificate "
-                "BEGIN marker, even outside a block, as in a comment. Converting such a block "
-                "discards its trust settings, so confirm the CA should be trusted without them. "
-                "The engine does not load such a block. Remove a comment that names the marker, "
-                "or convert: openssl x509 -in <one cert> -out <plain.pem> writes one plain "
-                "CERTIFICATE block per run",
-                scope="trusted_certificate",
-            )
-        if line.startswith(_PEM_BEGIN):
+    non_ascii = False
+    mark_dropped = False
+    for start, end in _pem_reads(data):
+        piece = data[start:end]
+        if first and len(piece) > len(_UTF8_BOM) and piece.startswith(_UTF8_BOM):
+            piece = piece[len(_UTF8_BOM) :]
+            dropped = True
+        else:
+            dropped = False
+        first = False
+        if (inside or piece.startswith(_PEM_BEGIN)) and not piece.isascii():
+            non_ascii = True
+        line = piece.rstrip(_PEM_TRAILING)
+        if inside:
+            if line.startswith(_PEM_END):  # a bad END line fails the load, as it fails cafile=
+                inside, first = False, True
+        elif line.startswith(_PEM_BEGIN) and line.endswith(_PEM_DASHES):
+            inside = True
             blocks += 1
-        # Any BEGIN, rather than a model of OpenSSL's 254-byte pieces. For the non-ASCII check that
-        # refuses more. But ``inside`` also decides ``fresh`` below, and there a BEGIN OpenSSL did
-        # not read can strip a mark OpenSSL keeps. A BEGIN straight behind a mark does not count.
-        opens = _PEM_BEGIN in line.removeprefix(_UTF8_BOM + _PEM_BEGIN)
-        inside = inside or opens
-        if inside or line.isascii():
-            kept.append(line)
-        if line.startswith(_PEM_END):
-            # A stray END closes nothing, so OpenSSL keeps a mark after it. An END and a BEGIN on
-            # one line leave a block open: OpenSSL may read that BEGIN past 254 bytes.
-            fresh = inside and not opens
-            inside = opens
+            if dropped:  # drop the mark too, and pad the read so no later offset moves
+                mark_dropped = True
+                body = piece.removesuffix(b"\n")
+                text_bytes[start:end] = body.translate(_HIGH_AS_QUERY) + b"   " + piece[len(body) :]
     if not blocks:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} holds no PEM block, so it names no "
             "certificate to trust",
             scope="no_pem_block",
         )
-    joined = b"".join(kept)
-    if has_encryption_header_bytes(joined):
+    text = text_bytes.decode("ascii")
+    if has_encryption_header(text):
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} {ENCRYPTION_HEADER_SCOPE}. An "
             "encrypted certificate carries one, as does a private key encrypted in the legacy PEM "
@@ -940,15 +982,27 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             scope="encryption_header",
         )
     _refuse_a_private_key(data, spec)
-    try:
-        text = joined.decode("ascii")
-    except UnicodeDecodeError as exc:
+    if b"\0" in data:
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} holds a NUL byte. A PEM file holds "
+            "no NUL, so the engine does not load it: remove that byte",
+            scope="nul",
+        )
+    if mark_dropped and ssl.OPENSSL_VERSION_INFO < (3, 0, 0):
+        raise TrustAnchorError(
+            f"{spec.setting}: the trust anchor {spec.path!r} has a UTF-8 byte-order mark in front "
+            "of a -----BEGIN line, and the engine knows where OpenSSL drops such a mark only for "
+            f"OpenSSL 3.0 and later, while this interpreter uses {ssl.OPENSSL_VERSION}. Save the "
+            "file without a byte-order mark",
+            scope="byte_order_mark",
+        )
+    if non_ascii:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} has a non-ASCII byte inside a PEM "
-            "block, or on or below a line holding a -----BEGIN and above the next -----END line. "
-            "Remove that byte, or the -----BEGIN text if that line is a comment",
+            "block, or on a line holding a -----BEGIN that the TLS library would test as the "
+            "start of one. Remove that byte, or the -----BEGIN text if that line is a comment",
             scope="non_ascii",
-        ) from exc
+        )
     try:
         ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=text)
     except ssl.SSLError as exc:
@@ -1799,8 +1853,10 @@ def verified_anchor_cadata(spec: AnchorSpec, *, enforcing: bool) -> str:
     Windows, CPython 3.14.6 / OpenSSL 3.5.7, with a real TCP socket to a localhost server, client side
     and server side: over a valid PEM, ``cadata=`` and ``cafile=`` each verify the right CA, each
     refuse a wrong one, and each hold exactly one anchor. ``tests/test_trust_anchor_byte_binding.py``
-    repeats the handshakes over memory BIOs. :func:`anchor_cadata` covers the inputs where the two
-    differ.
+    repeats the handshakes over memory BIOs. The two can differ on other inputs: at least on a
+    non-ASCII byte, which ``cadata=`` will not take, and on a byte-order mark. :func:`anchor_cadata`
+    says how its text tracks ``cafile=`` there, where it refuses instead, and that it rests on
+    OpenSSL's reader as measured, so it does not claim to match ``cafile=`` on every input.
 
     ``cadata=`` loads no CRL from the anchor file. A CRL file is loaded separately, by
     :func:`~messagefoundry.config.tls_policy.harden_crl_check`, which refuses a load that would add a

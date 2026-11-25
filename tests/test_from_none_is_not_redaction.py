@@ -902,10 +902,6 @@ _BODY_FIX = (
 #: One entry per (site key, count), with the same reason prefixes as :data:`_ALLOWED`.
 _BODY_ALLOWED: tuple[_Allowed, ...] = (
     _Allowed(
-        "messagefoundry/auth/trust_anchors.py::anchor_cadata::UnicodeDecodeError::TrustAnchorError",
-        _SAFE + "the decode input is the kept PEM text of a trust-anchor file: public certificates",
-    ),
-    _Allowed(
         "messagefoundry/store/content_search.py::SearchSpec.__post_init__::HL7PeekError::ContentSearchError",
         _SAFE + "parse_path quotes only the operator's own field path, and the new error's text is "
         "that same string",
