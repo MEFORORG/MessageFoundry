@@ -799,9 +799,31 @@ def test_control_an_x12_reply_with_ordinary_delimiters_is_replaced_and_sent(term
     reply = _isa(term=term) + "TA1*000000001*260101*1200*A*000中" + term
     body, replaced = framing_mod.encode_reply_reporting(reply, "ascii", connection="IB_X12_OK")
     assert replaced and body == reply.replace("中", "?").encode("ascii")
-    # A truncated ISA is no header the X12 read accepts, so it declares nothing and is replaced.
+    # A truncated ISA declares only the offsets it holds, here `*`, so its data is replaced.
     short = "ISA*00*中" + "~"
     assert framing_mod.encode_reply(short, "ascii") == b"ISA*00*?~"
+
+
+def test_an_isa_the_header_read_refuses_still_declares_its_offsets() -> None:
+    """Round-1 review: an ISA ``discover_delimiters`` refuses (here ISA11 and ISA16 are both ``?``,
+    so not distinct) declared nothing, and its data was replaced into ``?``. Its offsets are read
+    raw now, so it is refused."""
+    reply = _isa(component="?", repetition="?") + "TA1*000000001*260101*1200*A*000中~"
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "ascii", connection="IB_X12_BAD_ISA")
+
+
+@pytest.mark.parametrize("eol", [CR, "\n", "\r\n"], ids=["cr", "lf", "crlf"])
+def test_a_batch_members_own_msh_is_read_for_its_delimiters(eol: str) -> None:
+    """Round-1 review: only the first header line was read, so a member ``MSH`` declaring ``?``
+    inside an ordinary envelope had ``?`` written into its data, and LF line ends split nothing.
+    Every header line is read now, at CR, LF or CRLF."""
+    reply = eol.join(["BHS|^~" + BS + "&|R", "MSH|?~" + BS + "&|R", "MSA|AA|C|中", "BTS|1", ""])
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(reply, "latin-1", connection="IB_BATCH_MEMBER")
+    short_lead = eol.join(["FHS", "MSH|?~" + BS + "&|R", "MSA|AA|中", ""])
+    with pytest.raises(UnicodeError, match="collide with one of its own delimiters"):
+        framing_mod.encode_reply(short_lead, "latin-1", connection="IB_BATCH_MEMBER")
 
 
 @pytest.mark.parametrize("head", ["BHS", "FHS"])

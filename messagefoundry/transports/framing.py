@@ -14,6 +14,7 @@ senders and ACK writers use too.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from messagefoundry.config.wiring import _is_text_codec
@@ -29,11 +30,9 @@ from messagefoundry.framing import (
     FramePayloadError,
     codec_for,
 )
-from messagefoundry.parsing._builtin_hl7 import _extract_separators
+from messagefoundry.parsing._builtin_hl7 import HEADER_IDS, _extract_separators
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
-from messagefoundry.parsing.x12.delimiters import discover_delimiters
-from messagefoundry.parsing.x12.errors import X12PeekError
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
@@ -327,38 +326,41 @@ def _encodes(delimiter: str, encoding: str) -> bool:
 
 
 def _reply_delimiters(reply: str) -> frozenset[str]:
-    """The delimiters a ``reply`` declares in its header, read as the parser reads them, plus its
-    segment terminator. Read only: nothing here changes the reply.
+    """The delimiters a ``reply`` declares, plus its segment terminator. Read only: nothing here
+    changes the reply.
 
-    Three header shapes are read. An HL7 header led by ``MSH``, ``BHS`` or ``FHS`` declares its
-    delimiters in its first two fields, the layout ``_extract_separators`` reads for all three. An
-    X12 ``ISA`` declares them by fixed offset, read as
-    :func:`~messagefoundry.parsing.x12.delimiters.discover_delimiters` reads them; the X12
-    listener's reply is an interchange (BACKLOG #5799 item 2: before, only an ``MSH``-led reply was
-    read, so an X12 reply declaring ``?`` had ``?`` written into its data). A reply with any other
-    lead, or an ``ISA`` that header read refuses, declares nothing here.
+    Two layouts are read (BACKLOG #5799 item 2: before, only the first line of an ``MSH``-led reply
+    was read, so an X12 reply or a batch member declaring ``?`` had ``?`` written into its data).
+    An HL7 reply led by one of ``HEADER_IDS`` (``MSH``, ``BHS``, ``FHS``) is read on every line
+    that starts with one of them, each in the MSH-1/MSH-2 layout ``_extract_separators`` reads, so
+    a batch member's own ``MSH`` counts as its envelope does; lines are split at CR, LF or CRLF, as
+    the parser normalizes them. An X12 reply led by ``ISA`` is read at the ISA's fixed delimiter
+    offsets, raw and without the header checks ``discover_delimiters`` makes, so an ISA that read
+    refuses still declares what its offsets hold, and an offset past the reply's end declares
+    nothing. A reply with any other lead declares nothing here.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
-    leading noise (``sniff._LEADING_WS_STR``) skips them. For an HL7 header the first line is
-    measured, not the whole reply, so a first line of ``MSH`` alone has no field separator to read
-    and declares nothing, rather than indexing past its end."""
+    leading noise (``sniff._LEADING_WS_STR``) skips them. A header line of ``MSH`` alone has no
+    field separator to read and declares nothing, rather than indexing past its end."""
     body = reply.lstrip(_LEADING_WS_STR)
     if body.startswith("ISA"):
-        try:
-            found = discover_delimiters(body, 0)
-        except X12PeekError:
-            return frozenset()
-        # A CR+LF terminator is two characters, and a `?` written for either would break it.
-        return frozenset(
-            (found.element, found.component, *found.segment)
-            + ((found.repetition,) if found.repetition is not None else ())
-        )
-    line = body.partition("\r")[0]
-    if not line.startswith(_HL7_HEADERS) or len(line) < 4:
+        isa = {body[i] for i in _ISA_DELIMITER_OFFSETS if i < len(body)}
+        if body[105:107] == "\r\n":
+            isa.add("\n")  # a CR+LF terminator is two characters, and `?` for either breaks it
+        return frozenset(isa)
+    if not body.startswith(HEADER_IDS):
         return frozenset()
-    return frozenset((*_extract_separators(line), "\r"))
+    found = {"\r"}
+    for line in _LINE_BREAK.split(body):
+        if line.startswith(HEADER_IDS) and len(line) >= 4:
+            found.update(_extract_separators(line))
+    return frozenset(found)
 
 
-#: The HL7 segments that open a message or a batch and declare its delimiters in MSH-1/MSH-2's
-#: layout, so a reply led by any of them is read for its delimiters.
-_HL7_HEADERS = ("MSH", "BHS", "FHS")
+#: The ISA's delimiter offsets, as ``parsing.x12.delimiters`` reads them: the element separator
+#: (+3), ISA11 (+82, the repetition separator from 00501), ISA16 (+104, the component separator)
+#: and the segment terminator (+105).
+_ISA_DELIMITER_OFFSETS = (3, 82, 104, 105)
+
+#: A line break as the parser's normalization reads one.
+_LINE_BREAK = re.compile(r"\r\n|\r|\n")
