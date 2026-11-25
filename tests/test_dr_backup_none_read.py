@@ -10,9 +10,11 @@ include at least these. By way of :func:`dr_backup._read_chunks`: the no-key bui
 verify, the config-member restore, ``_extract_member`` and the plaintext branch of
 ``_restore_blocking``. Handed to ``shutil.copyfileobj``: the copy fallback of
 ``_place_restored_store``. The refusal is raised as an ``OSError``, so each site reports it the way
-it reports any ``OSError`` in that copy. These tests drive each of those sites, the last four
-against an ``OSError`` read as the control; for the placement copy they check the ``OSError``
-``_place_restored_store`` raises, not the restore's report of it. Reads in that module this branch does not change include at least
+it reports any ``OSError`` in that copy. These tests drive each of those sites with a ``None``
+read. The store-member verify and restore, the plaintext-archive restore and the placement copy
+are each also driven with an ``OSError`` read as the control; the config-member restore is not.
+For the placement copy they check the ``OSError`` ``_place_restored_store`` raises, not the
+restore's report of it. Reads in that module this branch does not change include at least
 ``_sha256_file``, where a ``None`` read raises a ``TypeError`` from the hash rather than ending the
 read short, ``_looks_encrypted`` and ``_read_manifest_from_tar``. The sources are synthetic: a
 store with one made-up row, and a tar of made-up config bytes."""
