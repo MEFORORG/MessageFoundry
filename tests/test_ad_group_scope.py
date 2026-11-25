@@ -13,6 +13,7 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1186,7 +1187,7 @@ async def test_a_miss_on_a_row_gone_is_not_reported_as_contention(
         await store.set_ad_group_scope_map([("grp-a", "IB_A")])
         user = await _ad_user(store, "ada")
         tries = 0
-        real_load = service._load_user
+        real_lookup = service._lookup_user_settled
 
         async def always_moved(*args: Any, **kwargs: Any) -> bool:
             nonlocal tries
@@ -1194,16 +1195,49 @@ async def test_a_miss_on_a_row_gone_is_not_reported_as_contention(
             return False
 
         async def gone_on_last(user_id: str) -> Any:
-            return None if tries >= _AD_SCOPE_WRITE_ATTEMPTS else await real_load(user_id)
+            if tries >= _AD_SCOPE_WRITE_ATTEMPTS:
+                return SimpleNamespace(user=None, held=False)
+            return await real_lookup(user_id)
 
         monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
-        monkeypatch.setattr(service, "_load_user", gone_on_last)
+        monkeypatch.setattr(service, "_lookup_user_settled", gone_on_last)
 
         out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
 
         assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the last attempt ran
         assert out.id == "ada" and out.channel_scope is None  # returned, nothing written
         assert await store.list_audit(action="auth.ad_scope_resynced") == []
+    finally:
+        await store.close()
+
+
+async def test_a_last_miss_onto_this_sign_ins_own_scope_is_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last attempt misses because another writer has just stored exactly this sign-in's
+    scope. The re-read is decided before the bound is checked, so the sync returns that row
+    rather than failing a sign-in whose scope is already right."""
+    store = await MessageStore.open(tmp_path / "svc6887e.db")
+    try:
+        service = AuthService(store, AuthSettings())
+        await service.initialize()
+        await store.set_ad_group_scope_map([("grp-a", "IB_A")])
+        user = await _ad_user(store, "ada")
+        tries = 0
+
+        async def lands_on_last(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            if tries == _AD_SCOPE_WRITE_ATTEMPTS:  # the other writer stores this target
+                await store.set_user_channel_scope("ada", '["IB_A"]', source=SCOPE_SOURCE_AD)
+            return False
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", lands_on_last)
+
+        out = await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the last attempt ran
+        assert (out.channel_scope, out.channel_scope_source) == ('["IB_A"]', SCOPE_SOURCE_AD)
     finally:
         await store.close()
 

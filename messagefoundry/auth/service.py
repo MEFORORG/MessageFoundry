@@ -9222,9 +9222,12 @@ class AuthService:
         that the sign-in fails (:class:`_AdChannelScopeContended`). A withdrawal that misses still
         returns the row as it now stands (BACKLOG #1927).
 
-        **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** The revoke after a grant is a separate
-        transaction. A concurrent sign-in that misses, reads the new scope and mints in the gap
-        between this write and this revoke still loses that session to the revoke."""
+        **WHAT THE COMPARE-AND-SET DOES NOT CLOSE.** At least two paths still end a concurrent
+        sign-in's new session. The revoke after a grant is a separate transaction, so a sign-in
+        that misses, reads the new scope and mints in the gap between this write and this revoke
+        loses that session to the revoke. And the role write earlier in the same sign-in revokes
+        when it finds its target roles already written (``_SignInRoleSync``), deliberately, so a
+        directory change that moves roles as well as scope still revokes there."""
         administrator = Role.ADMINISTRATOR in roles
         # An administrator's groups are not read: the decision ignores them. Read once: a retry
         # re-reads the ROW, never the groups, so every attempt decides from this sign-in's answer.
@@ -9271,10 +9274,19 @@ class AuthService:
             expected_scope=user.channel_scope,
             expected_source=user.channel_scope_source,
         ):
-            fresh = await self._load_user(user.id)
+            # Settled, as the role write's re-read is: a single read can report a row a concurrent
+            # write is moving as refused, and that must not end the loop with nothing written.
+            fresh = (await self._lookup_user_settled(user.id)).user
             if fresh is None:
                 # Nothing was written. A row gone, or one failing its seal, is refused by the
                 # caller's re-read before the mint, so it is never reported as contention.
+                return user
+            user = fresh
+            decision = decide(user)
+            if not decision.write or decision.scope_json is None:
+                # ``mapped`` is the same on every pass, and it decided a grant, so no pass decides
+                # a withdrawal: this is the row already holding this sign-in's scope. Judged before
+                # the bound, so a last miss onto this sign-in's own scope is not contention.
                 return user
             if attempt >= _AD_SCOPE_WRITE_ATTEMPTS:
                 _log.warning(
@@ -9284,12 +9296,6 @@ class AuthService:
                     attempt,
                 )
                 raise _AdChannelScopeContended(attempt)
-            user = fresh
-            decision = decide(user)
-            if not decision.write or decision.scope_json is None:
-                # ``mapped`` is the same on every pass, and it decided a grant, so no pass decides
-                # a withdrawal: this is the row already holding this sign-in's scope.
-                return user
             scope_json = decision.scope_json
             attempt += 1
         # Drop stale-scope tokens; the new one is issued after. Skipped when only the provenance
