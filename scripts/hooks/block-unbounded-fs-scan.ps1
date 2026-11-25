@@ -81,22 +81,26 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # of the body is data, so every view above blanks it and allowed `cat <<EOF\n$(find /proc)\nEOF`.
 # This reads each such body from the raw text and adds the text inside each substitution to $Into,
 # to be judged as a command of its own. Openers are found on $Masked, the bash reading, glued
-# (`cat<<EOF`) or spaced, every one on a line; an opener on a line after a `((` or `$[` is skipped,
-# as a shift. In a command holding a quote, that reading blanks quotes, `$((...))` and comments; a
-# command with no quote is read as it is, so there an opener in a comment, such as `#<<\A`, is read
-# as one. The bodies of a line's openers follow it in order, and a body ends only at a line that is
-# exactly its delimiter, after leading tabs for `<<-`. For an unquoted delimiter that line is the
-# one bash compares, after joining each backslash-newline; for a quoted one bash joins none, and
-# neither does this. A delimiter with any quote or backslash in it is quoted: its body takes no
-# substitution and adds nothing, nor does a `$(` or backtick after a backslash. A backslash-newline
-# in a body is removed first, as bash removes it.
+# (`cat<<EOF`) or spaced, on the lines that reading leaves visible; an opener on a line after a `((`
+# or `$[` is skipped, as a shift. In a command holding a quote, that reading blanks quotes,
+# `$((...))`, comments and heredoc bodies, each body ending at a line that is its delimiter after
+# trimming. A command with no quote is read as it is. There an opener in a comment, such as
+# `#<<\A`, is read as one, and its body never ends, so no opener or substitution after it is read.
+# The bodies of a line's openers follow it in order. A body ends only at a line that is exactly its
+# delimiter, after leading tabs for `<<-`. For an unquoted delimiter, bash compares the line after
+# joining each backslash-newline. This pass ends the body only where the line is the delimiter
+# both as written and as joined, so a body bash ends at a joined delimiter (`E\` then `OF`) is read
+# on past it. Its later lines are then read as body, which can add a false deny and hides any
+# opener on them. A quoted delimiter's body joins no line. A delimiter with any quote or backslash in
+# it is quoted: its body takes no substitution and adds nothing, nor does a `$(` or backtick after
+# a backslash. A backslash-newline in a body is removed first, as bash removes it.
 # A substitution's end is found by counting parens outside quotes and backticks, and a `case` in it
 # extends its text to the end of the body, since a pattern's `)` closes nothing. At least these can
-# still end it early, so the text after them is not read: a `)` in a comment, and a double quote
-# nested inside a double-quoted substitution. It also does not read at least an opener the bash
-# reading blanks, such as one after a body that reading ended early at an indented copy of its
-# delimiter. Each distinct text adds its length to $Spent, and once a text would pass $Cap the rest
-# of its body is skipped.
+# still end it early, so the text after them is not read: a `)` in a comment, in a `${...}` or in a
+# nested heredoc's body, and a double quote nested inside a double-quoted substitution. It also does
+# not read at least an opener the bash reading blanks, such as one after a body that reading ended
+# early at an indented copy of its delimiter, or never ended. Each distinct text adds its length to
+# $Spent, and once a text would pass $Cap the rest of its body is skipped.
 function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, $Spent, [int]$Cap) {
     if ($Masked.IndexOf('<<') -lt 0) { return }
     $rawLines = $Text.Split([char]10)
@@ -108,22 +112,30 @@ function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Seen, 
         $joined = [regex]::Replace($body.ToString(), '(?<!\\)((?:\\\\)*)\\\n', '$1')
         Add-BodySubstitutions $joined $Into $Seen $Spent $Cap
     }
-    # The start of a body line a backslash-newline continues, in a body with an unquoted delimiter.
+    # The start of a body line a backslash-newline continues, in a body with an unquoted delimiter,
+    # kept only while it is short enough to still equal the delimiter, so a long run stays linear.
     $logical = ''
+    $joinDead = $false
     for ($n = 0; $n -lt $lines; $n++) {
         $raw = $rawLines[$n]
         if ($queue.Count -gt 0 -and $null -ne $body) {
             $cur = $queue[0]
-            $full = $logical + $raw
-            $logical = ''
+            $own = if ($cur.Dash) { $raw.TrimStart([char]9) } else { $raw }
+            $joined = if ($joinDead) { $null } elseif ($logical) { $logical + $raw } else { $own }
             if ($cur.Bare -and $raw -cmatch '(?<!\\)(?:\\\\)*\\$') {
                 # Bash joins this line to the next before it compares the delimiter.
-                $logical = $full.Substring(0, $full.Length - 1)
+                if ($null -ne $joined -and $joined.Length -le $cur.T.Length + 1) {
+                    $logical = $joined.Substring(0, $joined.Length - 1)
+                } else { $logical = ''; $joinDead = $true }
                 [void]$body.Append($raw).Append("`n")
                 continue
             }
-            $line = if ($cur.Dash) { $full.TrimStart([char]9) } else { $full }
-            if ($line -ceq $cur.T) {
+            $logical = ''
+            $joinDead = $false
+            # The body ends only where the line is the delimiter both as written and as bash joins
+            # it. The other views compare the line as written, so ending at a joined delimiter they
+            # do not see would leave their blanked body as the only reading of the lines after it.
+            if ($own -ceq $cur.T -and $joined -ceq $cur.T) {
                 if ($cur.Bare) { & $flush }
                 $queue.RemoveAt(0)
                 $body = if ($queue.Count -gt 0) { [System.Text.StringBuilder]::new() } else { $null }
