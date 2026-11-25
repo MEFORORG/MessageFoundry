@@ -52,7 +52,7 @@ inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it do
 Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
 or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
 ``/*`` inside a block comment, even a balanced one, since both servers nest them, and a line
-comment holding a line break other than LF. A unit test
+comment holding a NUL or a line break other than LF, at least CR. A unit test
 reads each shipped batch, so a new form fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
@@ -309,20 +309,22 @@ def _strip_comments(raw: str) -> str:
     string literal raises: in an ``EXEC`` string it is dynamic SQL's comment, in any other a
     literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment raises,
     even a balanced one, because both servers nest them and the first ``*/`` would not end it
-    (BACKLOG #5062 item 26). A line comment holding a line break other than LF raises, because
-    PostgreSQL ends one at a CR too. Quoted runs are read by :func:`_quoted_end`, so a ``]]``
-    continues a name and a PostgreSQL subscript opens none."""
+    (BACKLOG #5062 item 26). A line comment holding a NUL or a line break other than LF raises,
+    because PostgreSQL ends one at a CR too. CRs that run up to the LF ending it, or to the end of
+    ``raw``, are allowed: nothing follows them on the line for a server to run."""
     out: list[str] = []
     i, n = 0, len(raw)
-    last_close = raw.rfind("]")  # a ``[`` after it is unterminated, which raises as it always has
     while i < n:
         ch = raw[i]
         if raw.startswith("--", i):
             end = raw.find("\n", i)
             end = n if end < 0 else end
-            if not _OTHER_LINE_BREAKS.isdisjoint(raw[i:end].rstrip("\r")):
+            body = raw[i:end].rstrip("\r")
+            if not _OTHER_LINE_BREAKS.isdisjoint(body):
+                bad = next(c for c in body if c in _OTHER_LINE_BREAKS)
                 raise ValueError(
-                    f"a line break other than LF in a DDL comment: {raw[i:end][:60]!r}"
+                    f"a DDL line comment holds {bad!r}, a NUL or a line break other than LF:"
+                    f" {raw[i:end][:60]!r}"
                 )
             i = end
             out.append(" ")
@@ -336,14 +338,18 @@ def _strip_comments(raw: str) -> str:
                 raise ValueError(f"a nested block comment in DDL near {near!r}")
             i = end + 2
             out.append(" ")
-        elif ch == "[" and i > last_close:
-            raise ValueError(f"unterminated quote in DDL near {raw[i : i + 40]!r}")
-        elif (after := _quoted_end(raw, i)) is not None:
-            quoted = raw[i:after]
+        elif ch in "'\"[":
+            # Not _quoted_end: its ``]]`` and subscript reading let ``AS[x--y]`` hide the DDL
+            # after it (review of BACKLOG #5062 item 26), so a ``[`` here ends at its first ``]``.
+            close = "]" if ch == "[" else ch
+            end = raw.find(close, i + 1)
+            if end < 0:
+                raise ValueError(f"unterminated quote in DDL near {raw[i : i + 40]!r}")
+            quoted = raw[i : end + 1]
             if ch == "'" and ("--" in quoted or "/*" in quoted):
                 raise ValueError(f"a comment marker inside a string in DDL: {quoted[:60]!r}")
             out.append(quoted)
-            i = after
+            i = end + 1
         else:
             out.append(ch)
             i += 1
