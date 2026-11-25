@@ -195,6 +195,27 @@ def count_segments(directory: str | Path) -> int:
         return 0
 
 
+def _indexed_size(path: Path) -> int | None:
+    """The size :meth:`LogSpool.open` counts for segment ``path`` against the cap, or ``None`` when
+    the file is confirmed gone between the listing and this read, as :func:`_not_found_confirms`
+    reads it. A symlink whose target cannot be read just now, a target on a mount that is down for
+    one, is indexed at size 0 rather than refusing the whole spool: the read passes over it and
+    keeps the link, so a later start replays it once its target is back (BACKLOG #5811). Any other
+    ``OSError`` propagates."""
+    try:
+        return path.stat().st_size
+    except FileNotFoundError as exc:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError as gone:
+            if _not_found_confirms(gone):
+                return None
+            raise exc from None
+        if stat.S_ISLNK(mode):
+            return 0
+        raise
+
+
 def _try_lock(fd: int) -> bool:
     """Take a non-blocking exclusive lock on ``fd``; ``False`` if another process holds it. Any
     other ``OSError`` reads as ``False`` too, as it always has here, so :meth:`LogSpool.open`
@@ -246,6 +267,11 @@ class LogSpool:
         #: :meth:`discard_unused` removes only what this object created.
         self._created_dirs: list[Path] = []
         self._created_lock = False
+        #: The spool directory's ``(st_dev, st_ino)`` when :meth:`open` took its lock, or ``None``
+        #: where the platform reports no inode. A directory at the same path with another identity
+        #: is not this spool's (BACKLOG #5811): an empty mountpoint left by a dropped mount, or a
+        #: directory someone replaced.
+        self._directory_identity: tuple[int, int] | None = None
 
     # --- lifecycle ------------------------------------------------------------------------------
 
@@ -287,11 +313,16 @@ class LogSpool:
             raise in_use
         self._lock_fd = fd
         try:
+            identity = os.stat(self.directory)
+            if identity.st_ino:
+                self._directory_identity = (identity.st_dev, identity.st_ino)
             for path in self.directory.iterdir():
                 seq = _segment_seq(path)
                 if seq is not None:
-                    self._segments.append(seq)
-                    self._sizes[seq] = path.stat().st_size
+                    size = _indexed_size(path)
+                    if size is not None:
+                        self._segments.append(seq)
+                        self._sizes[seq] = size
         except OSError as exc:
             # Unreadable leftovers make the spool unusable, not the process: the caller runs
             # spool-less. A bare OSError here would reach serve's [logging].file refusal instead.
@@ -469,11 +500,17 @@ class LogSpool:
         here would end the listener thread for good. Only a segment whose own file is confirmed
         GONE is retired, and the read then moves on to the next segment: answering ``None`` there would read as drained, and
         the forwarder could send live records ahead of the older ones still spooled (BACKLOG #5811).
-        A spool DIRECTORY that is missing, or that the read error names as out of reach
+        A spool DIRECTORY that is missing, is no longer the directory :meth:`open` locked
+        (:meth:`_directory_present`), or that the read error names as out of reach
         (:func:`_directory_unreachable`), is not a gone segment: like any other
         ``OSError`` (out of descriptors, a sharing violation) it retires nothing and returns
         ``None``, so the caller tries again later instead of deleting undelivered records. It also
-        closes the writer, for the reason the comment below gives."""
+        closes the writer, for the reason the comment below gives.
+
+        A retired segment's file is never unlinked here, so a segment whose own ``lstat`` reports
+        it gone when it is not is skipped, not lost: a DFS or share failover that briefly reports
+        a live file gone, in the same directory, can still take it out of the order, and the next
+        start replays it, possibly after newer records were sent."""
         while True:
             try:
                 entry = self._peek()
@@ -508,11 +545,12 @@ class LogSpool:
                 # Each pass retires one, so the loop ends with the segments.
                 if seq == self._write_seq:
                     self._close_writer()
-                # A gone file is not unlinked: a delete that later succeeded through reclaim()
-                # could only ever destroy a file the confirmation missed. A dangling link is: it
-                # holds no records, and left in place it would make the next open() refuse the
-                # whole spool.
-                self._retire(seq, unlink=gone == "link")
+                # Neither is unlinked. A delete of a gone file that later succeeded through
+                # reclaim() could only ever destroy a file the confirmation missed. A dangling link
+                # may point at a target that is only out of reach just now, a mount that is down
+                # for one, and the link is what lets a later start replay it; open() indexes such a
+                # link rather than refusing the spool (BACKLOG #5811).
+                self._retire(seq, unlink=False)
             except OSError as exc:
                 self.read_errors += 1
                 self.read_faulted = True
@@ -548,12 +586,21 @@ class LogSpool:
         return None
 
     def _directory_present(self) -> bool:
-        """Whether the spool directory can be reached and is a directory, read by ``stat``.
-        Any ``OSError`` reads as not present."""
+        """Whether the spool directory can be reached, is a directory, and is the one :meth:`open`
+        locked, read by ``stat``. Any ``OSError`` reads as not present.
+
+        A directory at the path with another ``(st_dev, st_ino)`` is not present either (BACKLOG
+        #5811): an empty mountpoint a dropped mount leaves, or a directory replaced under the
+        spool, holds none of its segments, and reading it as this spool would retire every one of
+        them. Where the platform reports no inode, only the path and the type are compared."""
         try:
-            return stat.S_ISDIR(self.directory.stat().st_mode)
+            found = self.directory.stat()
         except OSError:
             return False
+        if not stat.S_ISDIR(found.st_mode):
+            return False
+        identity = self._directory_identity
+        return identity is None or (found.st_dev, found.st_ino) == identity
 
     def _close_reader(self) -> None:
         if self._reader is not None:

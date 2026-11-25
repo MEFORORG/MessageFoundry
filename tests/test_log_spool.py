@@ -964,14 +964,15 @@ def test_on_windows_winerror_2_does_confirm_a_segment_gone(
 
 
 @pytest.mark.parametrize("winerror", [2, 3])
-def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
+def test_a_dangling_symlink_segment_is_retired_and_its_link_kept(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
 ) -> None:
     """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
-    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
-    the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
-    here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
-    the spool."""
+    cannot be opened now, so the read passes over it: it is retired from the order, and the read
+    moves on. The link is kept, since its target may only be out of reach just now (BACKLOG
+    #5811). On Windows a link into a missing directory gives winerror 3, which counts here too.
+    NEGATIVE CONTROL: on cf6bfe2d12 winerror 3 wedged the spool; on 33870a40944 the link was
+    unlinked."""
     monkeypatch.setattr(log_spool, "_WINDOWS", True)
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
@@ -1011,7 +1012,7 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
             entry = spool.peek()
             assert entry is not None and entry.line not in lost
             assert spool.unreadable == 1 and spool.read_errors == 0
-            assert unlinked == [head_seq]
+            assert unlinked == []
     finally:
         spool.close()
 
@@ -1019,9 +1020,9 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
 def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
     spool_dir: Path, tmp_path: Path
 ) -> None:
-    """A real dangling symlink at the head: peek retires it and removes the link, so the next
-    start's open() does not refuse the spool, and every other undelivered segment is sent.
-    NEGATIVE CONTROL: on cf6bfe2d12 the link stayed and the restart raised SpoolUnavailable."""
+    """A real dangling symlink at the head: peek retires it and keeps the link, the next start's
+    open() indexes the link rather than refusing the spool, and every other undelivered segment is
+    sent. NEGATIVE CONTROL: on cf6bfe2d12 the restart raised SpoolUnavailable for the link."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
     try:
@@ -1036,7 +1037,7 @@ def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
             pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
         entry = spool.peek()
         assert entry is not None and entry.line not in lost
-        assert not os.path.lexists(head)
+        assert os.path.lexists(head)
     finally:
         spool.close()
     restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
@@ -1046,6 +1047,101 @@ def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
         assert _drain(restarted) == expected
     finally:
         restarted.close()
+
+
+def _symlink_or_skip(target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError) as exc:  # Windows without symlink rights
+        pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
+
+
+def test_a_link_segment_whose_target_is_out_of_reach_is_replayed_once_it_is_back(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """A head segment that is a link to a file on a mount that is down: the read passes over it
+    and the rest is sent, and the link is kept, so once the mount is back the next start sends the
+    records it holds (BACKLOG #5811). NEGATIVE CONTROL: on 33870a40944 the peek unlinked the link,
+    so the restart never sent them."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    mount = tmp_path / "mount"
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        head = _segments(spool_dir)[0]
+        held = head.read_bytes()
+        lost = [json.loads(line)["line"] for line in held.splitlines()]
+        head.unlink()
+        _symlink_or_skip(mount / "head.jsonl", head)  # the mount is down: no such directory
+        rest = _drain(spool)
+        assert rest == [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
+    finally:
+        spool.close()
+    mount.mkdir()  # the mount is back
+    (mount / "head.jsonl").write_bytes(held)
+    restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    restarted.open()
+    try:
+        assert _drain(restarted) == lost
+    finally:
+        restarted.close()
+
+
+def test_a_directory_replaced_at_the_spool_path_retires_nothing(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """The path now names another, empty directory: an empty mountpoint left by a dropped mount, or
+    a directory replaced under the spool. Every segment's lstat there says not found, but that is
+    not this spool's directory, so it is a read fault that retires nothing, and the spool replays
+    whole once the path names its directory again (BACKLOG #5811). Simulated by pointing the spool
+    at the other directory, since Windows refuses to rename a directory holding an open file.
+    NEGATIVE CONTROL: on 33870a40944 one peek retired every segment."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    empty_mountpoint = tmp_path / "mountpoint"
+    empty_mountpoint.mkdir()
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        segments = _segments(spool_dir)
+        assert len(segments) >= 2
+        used = spool.bytes_used
+        spool.directory = empty_mountpoint
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
+        assert spool.bytes_used == used
+        assert spool._writer is None
+        spool.directory = spool_dir
+        assert _segments(spool_dir) == segments
+        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
+    finally:
+        spool.directory = spool_dir
+        spool.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to rename a directory with open files")
+def test_a_directory_renamed_away_and_replaced_retires_nothing(
+    spool_dir: Path, tmp_path: Path
+) -> None:
+    """The same case with a real rename: the spool's directory moves aside and an empty one takes
+    its path. Nothing is retired, and the moved directory still holds every segment. NEGATIVE
+    CONTROL: on 33870a40944 one peek retired every segment."""
+    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
+    spool.open()
+    moved = tmp_path / "moved"
+    try:
+        for n in range(6):
+            assert spool.append(_entry(n))
+        count = len(_segments(spool_dir))
+        os.rename(spool_dir, moved)
+        spool_dir.mkdir()
+        assert spool.peek() is None
+        assert spool.read_faulted and spool.unreadable == 0
+        assert len(spool._segments) == count
+        assert len(_segments(moved)) == count
+    finally:
+        spool.close()
 
 
 def test_a_directory_that_drops_between_the_checks_retires_nothing(
