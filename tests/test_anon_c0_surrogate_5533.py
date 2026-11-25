@@ -4,9 +4,9 @@
 #5533 item 14, which closes #5540; decision d20261121T180600851-e821ef).
 
 The identifier kinds copy every character of the sender's value that is not a letter or digit, so
-a BEL, an ESC or a TAB in a captured identifier reached the output. Of the C0 bytes the message
-does not declare as a delimiter, the engine adapter's whole-field ``Message.set`` refuses only CR,
-LF, the two MLLP frame bytes and NUL, and the tee copied that set, so both emitted the rest. Both
+a BEL, an ESC or a TAB in a captured identifier reached the output. The engine adapter's
+whole-field ``Message.set`` refuses CR, LF, the two MLLP frame bytes and NUL but not those three,
+and the tee copied that set, so both emitted them. Both
 now refuse a C0 byte the message does not declare, TAB included, in a field a surrogate rule
 writes, with the same :class:`SurrogateSeparatorRefused` naming the rule and never the value. A
 ``keep`` writes nothing, so a field it keeps is not checked. DEL (0x7F) is not a C0 byte and the

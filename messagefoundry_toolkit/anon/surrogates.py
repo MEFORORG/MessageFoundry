@@ -278,15 +278,17 @@ def _components(rep: str, seps: Seps) -> list[str]:
 class SurrogateSeparatorRefused(AnonError):
     """A rule's surrogate would hold a character that splits or ends a field, so writing it would
     add a field, a line or a component, or start an escape sequence, and move what follows past
-    its rule (BACKLOG #5540), or a C0 control character the message does not declare as a
-    delimiter (:func:`_no_control`, BACKLOG #5533 item 14). What a surrogate writes itself is
+    its rule (BACKLOG #5540), or a C0 control character the message does not declare as its
+    field separator, an MSH-2 separator or its escape character (:func:`_no_control`, BACKLOG
+    #5533 item 14). What a surrogate writes itself is
     judged here, the same on both adapters (:func:`_written`). The whole written field is checked
     by each adapter as it writes it: the tee raises this class, while the engine adapter's
-    ``Message.set`` refusal comes out as a plain :class:`AnonError` with no address. Under a rule
-    other than a ``keep``, an undeclared CR, LF, MLLP frame byte or NUL no longer reaches either
-    whole-field check, because :func:`_no_control` refuses it first; a ``keep`` rule passed
-    straight to an adapter skips :func:`_no_control`, so such a byte in the field it keeps still
-    reaches them. A ``keep`` on that field does not help: it would emit the captured value.
+    ``Message.set`` refusal comes out as a plain :class:`AnonError` with no address. CR, LF and
+    the two MLLP frame bytes never reach a field: :func:`normalized_message` turns the first two
+    into segment breaks and strips the others. An undeclared NUL under a rule other than a
+    ``keep`` is refused by :func:`_no_control` before either whole-field check sees it; a ``keep``
+    rule passed straight to an adapter skips :func:`_no_control`, so a NUL in the field it keeps
+    reaches the adapter's whole-field check, which refuses it. A ``keep`` on that field does not help: it would emit the captured value.
     ``path`` is the rule's field address, never a value."""
 
     def __init__(self, path: str, cause: str) -> None:
@@ -299,8 +301,10 @@ class _HeldDelimiter(AnonError):
     """:func:`_written` found a declared delimiter, or :func:`_no_control` a C0 control character,
     in a written value. It carries the cause only; :func:`surrogate_field_recorded` adds the
     rule's address and raises
-    :class:`SurrogateSeparatorRefused`. It is an ``AnonError`` itself, so a caller that reaches a
-    surrogate by another route still fails closed."""
+    :class:`SurrogateSeparatorRefused`. It is an ``AnonError`` itself, so a caller that reaches
+    :func:`_written` by another route still fails closed. :func:`_no_control` runs only in
+    :func:`surrogate_field_recorded`, so a caller of :func:`surrogate_field` or a per-kind
+    surrogate gets no C0 refusal."""
 
     def __init__(self, cause: str) -> None:
         super().__init__(f"a surrogate would hold {cause} — refusing to emit")
@@ -677,13 +681,16 @@ def surrogate_field_recorded(
 
 def _no_control(value: str, seps: Seps) -> None:
     """Refuse (:class:`_HeldDelimiter`) a whole field a rule wrote that holds a C0 control
-    character, 0x00 to 0x1F, TAB included, unless the message declares that character as a
-    delimiter, which is the field's structure rather than data (BACKLOG #5533 item 14). Unlike
+    character, 0x00 to 0x1F, TAB included, unless the message declares that character as its
+    field separator, an MSH-2 separator or its escape character (:func:`_reserved`, BACKLOG #5533
+    item 14). A declared escape character is exempt too, so a sender that declares a C0 byte as
+    its escape character gets that byte past this check in text a surrogate copies. Unlike
     :func:`_written`, this judges the written value itself, so sender text a surrogate copies,
     such as an identifier's punctuation or a kept CX.4, is checked with the rest. Both adapters
     reach it through :func:`surrogate_field_recorded`, so where they read the same value they
-    refuse the same undeclared bytes with the same cause; a declared C0 delimiter is left to each
-    adapter's own whole-field guard, and those differ. Not checked, at least: DEL (0x7F), a C1
+    refuse the same undeclared bytes with the same cause; a declared C0 character is left to each
+    adapter's own whole-field guard, and those refuse with different exception classes and
+    messages. Not checked, at least: DEL (0x7F), a C1
     control, an escape sequence such as ``\\X09\\``, and a field no rule writes, such as one a
     keep leaves or an OBX-5 value the free-text rule preserves."""
     reserved = _reserved(seps)
