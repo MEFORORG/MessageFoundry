@@ -1341,8 +1341,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof BOUND TO THIS ACTION
         # (BACKLOG #1149) — single-use, so the login-seeded window no longer satisfies it. Still the
-        # reauth-only family and NOT the MFA gate: a no-factor user must remain able to revoke; a
-        # pending session on an account WITH a factor is refused (#1951). The gate runs before the
+        # reauth-only family and NOT the MFA gate, but no pending session passes it: one on an
+        # account WITH a factor is refused (#1951), and so is one with NO factor that require_mfa
+        # covers, which is told to enrol (#1149). The gate runs before the
         # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
         identity: Identity = Depends(require_reauth_only_action(STEP_UP_ACTION_SESSION_TERMINATE)),
     ) -> SimpleMessage:

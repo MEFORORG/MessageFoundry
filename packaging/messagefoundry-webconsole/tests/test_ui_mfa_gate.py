@@ -697,15 +697,24 @@ async def test_a_session_that_proved_its_code_at_reauth_can_end_sessions(
         assert await service.identity_for_token(other.token) is None
 
 
-async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_session(
-    engine: Engine,
+@pytest.mark.parametrize("action_step_up", (True, False), ids=("enforced", "opted-out"))
+async def test_a_pending_session_with_no_factor_is_sent_to_enrol_not_to_end_sessions(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, action_step_up: bool
 ) -> None:
-    """RED when: the refusal over-reaches and blocks the un-enrolled case too.
+    """RED when: ``session_terminate`` is refused only to a pending session that HAS a factor, or
+    the console's refusal sends a no-factor session to ``/ui/reauth`` instead of to enrolment.
 
-    A fresh account is pending under the default ``require_mfa`` and has no code to give. The
-    password-only re-proof is its only way to end a session it does not recognise.
+    BACKLOG #1149 (ASVS 7.5.2). Under ``require_mfa`` a session on an account with no factor is
+    MFA-pending. It may reach enrolment and sign-out, and nothing that ends sessions: its next step
+    is to enrol, and the enrolment satisfies it. The step-up state is planted directly, so the
+    route is refused for being pending, not for want of a proof: ``enforced`` plants the single-use
+    grant, ``opted-out`` stamps the window, which is that branch's whole gate.
     """
-    service = await _service(engine, admin_write_min_interval_seconds=0)
+    from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE
+
+    service = await _service(
+        engine, admin_write_min_interval_seconds=0, require_action_step_up=action_step_up
+    )
     await _add(service, "op", Role.OPERATOR)
     other = await service.login("op", PW)
     assert other.ok and other.token is not None
@@ -714,7 +723,50 @@ async def test_an_account_with_no_factor_still_ends_sessions_from_a_pending_sess
         assert (await _login(c)).status_code == 303
         tok = c.cookies.get("mf_session")
         assert tok is not None and await service.mfa_satisfied(tok) is False
-        # The click, refused for want of a fresh proof; it issues the continuation (#2764).
+        calls = _spy_admin_write(service, monkeypatch)
+        for path in (f"/ui/account/sessions/{hash_token(other.token)}/revoke", _REVOKE_OTHERS):
+            if action_step_up:
+                service._grant_action_step_up(hash_token(tok), STEP_UP_ACTION_SESSION_TERMINATE)
+            else:
+                await service.store.mark_session_reauthed(hash_token(tok))
+                assert await service.has_recent_step_up(tok) is True  # the positive control
+            r = await c.post(path, headers=SAME_ORIGIN)
+            assert r.status_code == 303
+            assert r.headers["location"] == _ENROL_FIRST, (
+                f"{path} from a pending session with no factor was not sent to enrol"
+            )
+        # The page it lands on names enrolment as the next step.
+        page = await c.get(_ENROL_FIRST)
+        assert page.status_code == 200 and "enroll an authenticator" in page.text
+
+    assert await service.identity_for_token(other.token) is not None
+    assert calls == [], f"a refused pending session was charged: {calls}"
+    # Refused as a pending session, so audited like every other MFA refusal.
+    denied = [
+        a["detail"] or ""
+        for a in await engine.store.list_audit()
+        if a["action"] == "auth.mfa_denied"
+    ]
+    assert sum("/ui/account/sessions/" in d for d in denied) == 2
+
+
+async def test_a_no_factor_session_without_require_mfa_still_ends_sessions(
+    engine: Engine,
+) -> None:
+    """The control for the test above. RED when: the refusal reaches a session that owes no factor.
+
+    With ``require_mfa`` off an account with no factor is not pending, so the password re-proof at
+    ``/ui/reauth`` ends its other sessions as it did before BACKLOG #1149.
+    """
+    service = await _service(engine, admin_write_min_interval_seconds=0, require_mfa=False)
+    await _add(service, "op", Role.OPERATOR)
+    other = await service.login("op", PW)
+    assert other.ok and other.token is not None
+
+    async with _client(engine, service) as c:
+        assert (await _login(c)).status_code == 303
+        tok = c.cookies.get("mf_session")
+        assert tok is not None and await service.mfa_satisfied(tok) is True
         refused = await c.post(_REVOKE_OTHERS, headers=SAME_ORIGIN)
         assert refused.headers["location"] == f"/ui/reauth?next={_REVOKE_OTHERS}"
         minted = await c.post(
@@ -1252,7 +1304,12 @@ async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
 #: The password page is not among them any more: under require_mfa an account with no TOTP is sent
 #: to enrol before it may rotate (ADR 0197 Amendment A), which
 #: ``test_a_must_change_account_with_no_factor_enrols_before_it_rotates`` pins.
-_NO_FACTOR_PASSING_POSTS = tuple(p for p in _PENDING_REFUSED_POSTS if p.id != "password")
+#: The two session-terminate posts are not among them either: under require_mfa a pending session
+#: with no factor is sent to enrol before it may end sessions (BACKLOG #1149), which
+#: ``test_a_pending_session_with_no_factor_is_sent_to_enrol_not_to_end_sessions`` pins.
+_NO_FACTOR_PASSING_POSTS = tuple(
+    p for p in _PENDING_REFUSED_POSTS if p.id not in ("password", "revoke-one", "revoke-others")
+)
 
 
 @pytest.mark.parametrize(("path", "refused_to"), _NO_FACTOR_PASSING_POSTS)
@@ -1262,7 +1319,7 @@ async def test_a_pending_session_with_no_factor_is_charged_and_not_refused(
     """RED when: the early refusal over-reaches to an account with no factor.
 
     That account is pending under the default ``require_mfa`` with nothing to prove, and these
-    routes are how it enrols, rotates and ends sessions. It passes the gate, so it pays the budget
+    routes are how it enrols. It passes the gate, so it pays the budget
     like any other write, and it leaves no ``auth.mfa_denied`` row.
     """
     service = await _service(engine)

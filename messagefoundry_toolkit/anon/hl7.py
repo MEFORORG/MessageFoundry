@@ -55,7 +55,9 @@ def anonymize_message(
     :class:`AnonError` (carrying no body) when the message cannot be safely anonymized — fail closed.
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
-    (``surrogate_field_recorded``). It is the caller's list; nothing else is written to it.
+    (``surrogate_field_recorded``). It is the caller's list; nothing else is written to it. Those
+    addresses are added only once the message has been written, so a refused message adds none
+    (BACKLOG #5540).
     """
     _refuse_unwritable_rules(rules)
     # A keep rewrites nothing, so it never makes a line reachable (BACKLOG #3001).
@@ -68,6 +70,8 @@ def anonymize_message(
             raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, _field_sep = parsed
+    # None when the caller asked for no record, so the date check is not run for nothing.
+    found: list[str] | None = [] if blanked is not None else None
     try:
         msg = Message.parse(text)
         # Message reads and writes under the first line's delimiters (BACKLOG #5972), the surrogates
@@ -93,7 +97,7 @@ def anonymize_message(
                 if _skip_obx5(rule, msg, occ, value, seps):
                     continue
                 kind = _kind_for(rule, msg, occ)
-                scrubbed = surrogate_field_recorded(rule.path, kind, value, keyer, seps, blanked)
+                scrubbed = surrogate_field_recorded(rule.path, kind, value, keyer, seps, found)
                 msg.set(rule.path, scrubbed, occurrence=occ)
         encoded = msg.encode()
     except AnonError:
@@ -103,7 +107,10 @@ def anonymize_message(
         # let a traceback carry the message. ValueError includes HL7PeekError, which Message.parse
         # raises for a body with no leading MSH and for a parser fault.
         raise AnonError("could not anonymize HL7 message (malformed structure)") from exc
-    return scrub_message_site_codes(encoded, keyer, rules)
+    output = scrub_message_site_codes(encoded, keyer, rules)
+    if blanked is not None and found:
+        blanked.extend(found)
+    return output
 
 
 def _skip_obx5(rule: FieldRule, msg: Message, occurrence: int, value: str, seps: Seps) -> bool:

@@ -124,8 +124,8 @@ async def test_a_transit_seal_that_is_not_text_fails_every_check_without_raising
 
 
 async def test_a_session_row_whose_seal_cell_is_a_blob_fails_its_check_on_transit() -> None:
-    # BACKLOG #6718 items 2 and 3: from_mapping hands a BLOB seal cell through as it was read, and
-    # the session read check under the Transit sealer reads it as malformed rather than raising.
+    # BACKLOG #6718 items 2 and 3: a BLOB seal cell, which from_mapping reads with str(), fails the
+    # session read check under the Transit sealer rather than raising.
     sealer, _ = _transit()
     record = SessionRecord(
         token_hash="ab" * 32,

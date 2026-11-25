@@ -54,8 +54,9 @@ $env:GCM_INTERACTIVE = 'never'
 try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { [Console]::Error.WriteLine("WARNING: console encoding unchanged: $($_.Exception.Message)") }
 
 #: The engine paths the build reads from the archived copy: the whole of scripts/, so the list
-#: never lags what collect_metrics.py runs and imports.
-$ArchivePaths = @('scripts')
+#: never lags what collect_metrics.py runs and imports, and the vendored defusedxml, which
+#: collect_metrics.py loads by path to parse the runbook workbook.
+$ArchivePaths = @('scripts', 'messagefoundry/_vendor/defusedxml')
 
 function Invoke-Git([string[]]$GitArgs) {
     $out = & git @GitArgs
