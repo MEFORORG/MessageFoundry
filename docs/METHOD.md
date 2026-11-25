@@ -216,23 +216,17 @@ that fired.
 If your brief carries no address, name the file and the rule in your final message, then stop. Leave
 the worktree in place and untouched either way, so the next session can see what you saw.
 
-### The worktree gate refuses the tool call, not the commit
+### The harness guards refuse the tool call, not the commit
 
-The worktree gate is not a git hook. `scripts/worktree/install-gate.ps1` installs it as a PreToolUse
-hook in user scope, and where it is installed it denies the tool call itself, long before commit
-time, though it fails open on some errors. Many of its rules protect only the checkouts on its
-allowlist, but at least its refusals of a write to the gate's own files or to machine-read state on
-a shared coordination root, and its opt-in refusal of EnterWorktree, can fire on a call that targets none of them. It
-refuses at least a Write, Edit, MultiEdit or NotebookEdit into the primary's working tree outside
-`.claude/worktrees/`, or into its `.git/` directory apart from part of `.git/mefor-coord/`, and some
-git commands aimed at the primary or at a linked worktree, so write inside your own worktree, by
-absolute path. It does not judge where an ordinary shell write, such as a redirect into a file,
-lands, and a shell route around a write it denied still breaks its rule, as
-[`CLAUDE.md`](../CLAUDE.md) section 5, *A Builder gets one turn, and a brief that forgets this
-deadlocks it*, item 2, says.
-[WORKTREE-GATE.md](WORKTREE-GATE.md), *What it blocks*, describes some of the rules and says it is
-not the whole set. Where it and the hook disagree, the hook itself,
-[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), is the source of record.
+The user-scope PreToolUse guards, at least `collision_gate.ps1` and `worktree_gate.ps1`, are not git
+hooks: where one fires, it denies an edit tool's call itself, long before commit time, but neither
+judges where an ordinary shell write, such as a redirect into a file, lands, and the worktree gate's
+own deny text says a shell write that lands where it denied an edit still breaks the same rule.
+Which tools each guard sees is in
+[*A Builder gets one turn, items 2, 5 and 6, from section 5*](#a-builder-gets-one-turn-items-2-5-and-6-from-section-5),
+item 2; for the worktree gate the source of record is the hook,
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1), and
+[WORKTREE-GATE.md](WORKTREE-GATE.md), *What it blocks*, describes only part of it.
 
 ### Stage explicit paths; a guard catches only the common blanket spellings
 
