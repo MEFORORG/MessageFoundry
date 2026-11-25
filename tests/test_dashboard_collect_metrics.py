@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import io
 import json
 import sys
+import zipfile
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -383,11 +385,13 @@ def test_snapshot_schema(tmp_path: Path) -> None:
     keys = {"id", "label", "question", "value", "unit", "status", "series", "detail", "source"}
     for m in snap["metrics"]:
         assert keys | {"error"} == set(m)
-        assert m["status"] in {"good", "warn", "bad", "unknown"}
+        assert m["status"] in {"good", "warn", "bad", "info", "unknown"}
         assert m["source"]
     json.dumps(snap)  # serialisable
     assert [m["id"] for m in snap["metrics"]] == [
         "backlog_burn",
+        "backlog_forecast",
+        "batch_progress",
         "prs_merged",
         "flow_health",
         "ci_main",
@@ -1273,3 +1277,237 @@ def test_the_real_env_probe_sees_across_mounts(monkeypatch: pytest.MonkeyPatch) 
 
 def test_fetches_name_main_only() -> None:
     assert cm.MAIN_REFSPEC == "+refs/heads/main:refs/remotes/origin/main"
+
+
+# -- ledger history, burndown and forecast -------------------------------------------------------
+
+
+def test_burn_history_zero_fills_and_crosses_the_year() -> None:
+    weeks = {
+        "2026-W52": {"filed": 2},
+        "2027-W02": {"closed": 1, "declined": 1, "superseded": 1},
+        cm.AFTER_THROUGH: {"filed": 9},
+        "2027-W05": {"filed": 1},
+    }
+    hist = cm.burn_history(weeks, "2027-W02")
+    # 2026 has 53 ISO weeks, so W53 sits between W52 and 2027-W01.
+    assert [p["week"] for p in hist] == ["2026-W52", "2026-W53", "2027-W01", "2027-W02"]
+    assert [(p["filed"], p["closed"]) for p in hist] == [(2, 0), (0, 0), (0, 0), (0, 3)]
+
+
+def test_open_history_works_back_from_the_count_now() -> None:
+    hist = [
+        {"week": "2026-W46", "filed": 4, "closed": 3},
+        {"week": "2026-W47", "filed": 1, "closed": 3},
+    ]
+    # 12 open now; after the window 2 filed and 1 closed, so 11 at the end of W47, 13 of W46.
+    got = cm.open_history(hist, 12, {"filed": 2, "closed": 1})
+    assert got == [{"week": "2026-W46", "value": 13}, {"week": "2026-W47", "value": 11}]
+
+
+def test_backlog_burn_carries_the_history(tmp_path: Path) -> None:
+    m = cm.Metric("backlog_burn", "", "", "", "")
+    cm.c_backlog_burn(_vault_ctx(tmp_path), m)
+    assert [p["week"] for p in m.detail["history"]] == ["2026-W46", "2026-W47"]
+    assert m.detail["open_series"][-1] == {"week": "2026-W47", "value": 12}
+
+
+def test_backlog_forecast_dates_the_finish(tmp_path: Path) -> None:
+    weeks = {
+        "2026-W43": {"filed": 10, "closed": 2},
+        "2026-W44": {"filed": 1, "closed": 5},
+        "2026-W45": {"filed": 1, "closed": 5},
+        "2026-W46": {"filed": 1, "closed": 5},
+        "2026-W47": {"filed": 50},
+    }
+    m = cm.Metric("backlog_forecast", "", "", "", "")
+    # Through Wed 2026-11-18, so W46 is the last full week and W47's 50 filed rows are not read.
+    cm.c_backlog_forecast(_vault_ctx(tmp_path, _census(weeks=weeks)), m)
+    d = m.detail
+    assert d["pace"]["weeks"] == ["2026-W43", "2026-W44", "2026-W45", "2026-W46"]
+    assert d["pace"]["net_closed_per_week"] == 1.0
+    assert (d["open_total"], d["weeks_to_zero"]) == (12, 12.0)
+    assert m.value == d["finish"] == "2027-02-11"  # 2026-11-19 + 84 days
+    assert m.status == "good"
+    assert (d["short_weeks_to_zero"], d["short_finish"]) == (3.0, "2026-12-10")
+    assert d["no_filing_finish"] == "2026-12-09"  # 12 / 4.25 = 2.82 weeks, 20 days
+
+
+def test_backlog_forecast_says_never_when_filing_outruns_closing(tmp_path: Path) -> None:
+    weeks = {f"2026-W{n}": {"filed": 9, "closed": 2} for n in (43, 44, 45, 46)}
+    m = cm.Metric("backlog_forecast", "", "", "", "")
+    cm.c_backlog_forecast(_vault_ctx(tmp_path, _census(weeks=weeks)), m)
+    assert (m.value, m.status) == ("never at this pace", "bad")
+    assert m.detail["finish"] is None and m.detail["weeks_to_zero"] is None
+    assert m.detail["no_filing_finish"] == "2026-12-31"  # 12 / 2 = 6 weeks
+
+
+def test_backlog_forecast_refuses_a_short_history(tmp_path: Path) -> None:
+    with pytest.raises(cm.CollectError, match="fewer than 4 full weeks"):
+        cm.c_backlog_forecast(_vault_ctx(tmp_path), cm.Metric("x", "", "", "", ""))
+
+
+@pytest.mark.parametrize(
+    ("weeks", "status"),
+    [(0.0, "good"), (13.0, "good"), (13.1, "warn"), (52.0, "warn"), (52.1, "bad"), (None, "bad")],
+)
+def test_forecast_status_bands(weeks: float | None, status: str) -> None:
+    assert cm.status_forecast(weeks) == status
+
+
+def test_weeks_to_zero() -> None:
+    assert cm.weeks_to_zero(0, -5.0) == 0.0
+    assert cm.weeks_to_zero(10, 0.0) is None
+    assert cm.weeks_to_zero(10, 4.0) == 2.5
+
+
+# -- the /batch runbook ----------------------------------------------------------------------------
+
+_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_RELS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def _xlsx(sheet_rows: str, *, tab: str = "Batch queue") -> bytes:
+    """A minimal workbook: a decoy first tab, then ``tab``, whose part is named absolutely."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(
+            "xl/workbook.xml",
+            f'<workbook xmlns="{_MAIN}" xmlns:r="{_RELS}"><sheets>'
+            '<sheet name="Other" sheetId="1" r:id="rId1"/>'
+            f'<sheet name="{tab}" sheetId="2" r:id="rId2"/></sheets></workbook>',
+        )
+        z.writestr(
+            "xl/_rels/workbook.xml.rels",
+            f'<Relationships xmlns="{_PKG}">'
+            '<Relationship Id="rId1" Type="x" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="x" Target="/xl/worksheets/sheet2.xml"/>'
+            "</Relationships>",
+        )
+        z.writestr(
+            "xl/sharedStrings.xml",
+            f'<sst xmlns="{_MAIN}"><si><t>State</t></si>'
+            "<si><r><t>IN </t></r><r><t>PROGRESS</t></r></si></sst>",
+        )
+        z.writestr(
+            "xl/worksheets/sheet1.xml", f'<worksheet xmlns="{_MAIN}"><sheetData/></worksheet>'
+        )
+        z.writestr(
+            "xl/worksheets/sheet2.xml",
+            f'<worksheet xmlns="{_MAIN}"><sheetData>{sheet_rows}</sheetData></worksheet>',
+        )
+    return buf.getvalue()
+
+
+def _inline(ref: str, text: str) -> str:
+    return f'<c r="{ref}" t="inlineStr"><is><t>{text}</t></is></c>'
+
+
+_QUEUE = (
+    '<row r="1">'
+    + _inline("A1", "Batch")
+    + '<c r="B1" t="s"><v>0</v></c>'
+    + _inline("D1", "Ledger closed / rows")
+    + "</row>"
+    + '<row r="2"><c r="A2"><v>7</v></c><c r="B2" t="s"><v>1</v></c>'
+    + _inline("D2", "2/5")
+    + "</row>"
+    + '<row r="3"><c r="A3"><v>8</v></c>'
+    + _inline("B3", "EMPTY")
+    + "</row>"
+    + '<row r="4"><c r="A4"><v>9</v></c>'
+    + _inline("B4", "done")
+    + _inline("D4", " 3 / 3 ")
+    + "</row>"
+    + '<row r="5"><c r="A5"><v>10</v></c>'
+    + _inline("B5", "FREE")
+    + "</row>"
+    + '<row r="6">'
+    + _inline("B6", "FREE")
+    + _inline("D6", "1/1")
+    + "</row>"
+)
+
+
+def test_xlsx_reader_reads_shared_inline_and_numbers() -> None:
+    rows = cm.xlsx_sheet_rows(_xlsx(_QUEUE), "Batch queue")
+    assert rows[0] == ["Batch", "State", "", "Ledger closed / rows"]
+    assert rows[1] == ["7", "IN PROGRESS", "", "2/5"]
+
+
+def test_batch_census_counts_by_state_and_skips_empty() -> None:
+    got = cm.batch_census(cm.xlsx_sheet_rows(_xlsx(_QUEUE), "Batch queue"))
+    assert got["batches"] == {"IN PROGRESS": 1, "DONE": 1, "FREE": 1}
+    assert (sum(got["rows_closed"].values()), sum(got["rows"].values())) == (5, 8)
+    assert got["unread"] == ["10"]
+
+
+def test_batch_progress_metric(tmp_path: Path) -> None:
+    book = tmp_path / "runbook.xlsx"
+    book.write_bytes(_xlsx(_QUEUE))
+    ctx = _ctx(tmp_path, _failing)
+    ctx.runbook = book
+    m = cm.Metric("batch_progress", "", "", "", "")
+    cm.c_batch_progress(ctx, m)
+    assert (m.value, m.status) == (62.5, "info")
+    assert m.detail["batches_total"] == 3
+    assert "1 batches carry no" in m.detail["partial_error"]
+
+
+@pytest.mark.parametrize(
+    ("data", "match"),
+    [
+        (b"not a zip", "unreadable workbook"),
+        (_xlsx(_QUEUE, tab="Renamed"), "no 'Batch queue' tab"),
+        (_xlsx('<row r="1">' + _inline("A1", "Batch") + "</row>"), "no longer has the columns"),
+        (_xlsx('<row r="1"><c r="A1" t="s"><v>9</v></c></row>'), "names no shared string"),
+    ],
+)
+def test_batch_progress_refuses_an_unreadable_runbook(
+    tmp_path: Path, data: bytes, match: str
+) -> None:
+    book = tmp_path / "runbook.xlsx"
+    book.write_bytes(data)
+    ctx = _ctx(tmp_path, _failing)
+    ctx.runbook = book
+    with pytest.raises(cm.CollectError, match=match):
+        cm.c_batch_progress(ctx, cm.Metric("x", "", "", "", ""))
+
+
+def test_batch_progress_names_a_missing_runbook(tmp_path: Path) -> None:
+    ctx = _ctx(tmp_path, _failing)
+    with pytest.raises(cm.CollectError, match="no runbook path"):
+        cm.c_batch_progress(ctx, cm.Metric("x", "", "", "", ""))
+    ctx.runbook = tmp_path / "missing.xlsx"
+    with pytest.raises(cm.CollectError, match="cannot read the runbook"):
+        cm.c_batch_progress(ctx, cm.Metric("x", "", "", "", ""))
+
+
+def test_default_runbook() -> None:
+    env = {"MEFOR_RUNBOOK": "C:/r.xlsx", "USERPROFILE": "C:/u"}
+    assert cm.default_runbook(env) == Path("C:/r.xlsx")
+    assert cm.default_runbook({"USERPROFILE": "C:/u"}) == Path(
+        "C:/u/OneDrive/Desktop/MEFOR/MEFOR-backlog-runbook.xlsx"
+    )
+    assert cm.default_runbook({}) is None
+
+
+def test_the_runbook_parser_refuses_a_dtd() -> None:
+    bomb = (
+        '<?xml version="1.0"?><!DOCTYPE x [<!ENTITY a "aaaa">]>'
+        f'<workbook xmlns="{_MAIN}"><sheets/></workbook>'
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("xl/workbook.xml", bomb)
+        z.writestr("xl/_rels/workbook.xml.rels", f'<Relationships xmlns="{_PKG}"/>')
+    with pytest.raises(cm.CollectError, match="unreadable workbook"):
+        cm.xlsx_sheet_rows(buf.getvalue(), "Batch queue")
+
+
+def test_the_vendored_defusedxml_is_where_the_refresh_archives_it() -> None:
+    assert (cm.DEFUSEDXML_DIR / "ElementTree.py").is_file()
+    refresh = (_PATH.parent / "scheduled-refresh.ps1").read_text(encoding="utf-8")
+    rel = cm.DEFUSEDXML_DIR.relative_to(cm.ENGINE_ROOT).as_posix()
+    assert f"'{rel}'" in refresh

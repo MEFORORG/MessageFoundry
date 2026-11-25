@@ -106,7 +106,7 @@ def test_page_is_self_contained_and_counts_statuses() -> None:
     assert not re.search(r"https?://", page)
     assert "prefers-color-scheme:dark" in page
     assert "4 headline metrics: 1 good, 1 warn, 1 bad, 1 with no data. Bad: PRs merged." in page
-    assert page.count("<svg") == 3
+    assert page.count("<svg") == 4
     assert "95.5%" in page
 
 
@@ -129,7 +129,7 @@ def test_every_value_is_escaped() -> None:
 def test_missing_data_renders_as_no_data(data: dict[str, Any]) -> None:
     page = rh.render(data)
     assert "no data" in page
-    assert page.count("<svg") == 3
+    assert page.count("<svg") == 4
 
 
 def test_null_values_are_no_data_not_zero() -> None:
@@ -205,7 +205,9 @@ def test_the_asvs_ref_pair_sits_beside_its_value() -> None:
     tile = tile[: tile.index("</section>")]
     pair = "scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234"
     assert '<span class="big">50%</span></div><dl>' in tile
-    assert f'<p class="refpair">Collector ref pair: {pair}</p>' in tile
+    # The pair is on the tile's face, beside the value, and in full inside the disclosure.
+    assert f'<summary>Measured at <span class="mono">{pair}</span></summary>' in tile
+    assert f'<p class="mono">{pair}</p>' in tile
     # The headline's unexamined counts sit in the same tile.
     assert "<dt>Needs review</dt><dd>0</dd>" in tile
     assert "<dt>Unverified</dt><dd>0</dd>" in tile
@@ -250,3 +252,112 @@ def test_fmt_never_raises_or_shows_a_nonzero_as_zero(value: float, shown: str) -
 def test_an_overflowing_number_renders() -> None:
     snap = {"weeks": WEEKS, "metrics": [_metric("ci_main", value=float("inf"))]}
     assert "no data" in rh.render(snap)
+
+
+# -- the page's newer parts --------------------------------------------------------------------
+
+
+def _history_snapshot(n: int) -> dict[str, Any]:
+    snap = _snapshot()
+    weeks = [f"2026-W{w:02d}" for w in range(48 - n, 48)]
+    hist = [{"week": w, "filed": 2400 if i == 0 else 60, "closed": 90} for i, w in enumerate(weeks)]
+    snap["metrics"][0]["detail"]["history"] = hist
+    snap["metrics"][0]["detail"]["open_series"] = [
+        {"week": w, "value": 5000 - i} for i, w in enumerate(weeks)
+    ]
+    return snap
+
+
+def test_the_update_time_is_central_and_leads_the_page() -> None:
+    page = rh.render(_snapshot())
+    stamp = '<p class="stamp">Updated Wed Nov 18, 2026, 6:00 AM CST <span>(12:00 UTC)</span></p>'
+    assert stamp in page
+    assert page.index(stamp) < page.index('<div class="tiles">')
+    assert "Generated at" not in page
+
+
+def test_an_unreadable_update_time_says_so() -> None:
+    snap = _snapshot()
+    snap["generated_at"] = "not a time"
+    assert "update time unknown" in rh.render(snap)
+
+
+def test_ledger_ranges_draw_every_range_and_check_13_weeks() -> None:
+    page = rh.render(_history_snapshot(30))
+    for key in ("4", "8", "13", "26", "all"):
+        assert f'id="rg-{key}"' in page
+        assert f'<div class="rv rv-{key}">' in page
+        assert f"#rg-{key}:checked~.charts .rv-{key}{{display:block}}" in page
+    assert 'id="rg-52"' not in page  # longer than the history
+    assert '<input class="rg" type="radio" name="range" id="rg-13" checked>' in page
+    assert "All (30)" in page
+    # Five ranges, two ledger charts each, plus the PR and CI charts; still no script.
+    assert page.count("<svg") == 12
+    assert "<script" not in page
+
+
+def test_the_ledger_chart_uses_a_log_axis() -> None:
+    page = rh.render(_history_snapshot(30))
+    view = page[page.index('<div class="rv rv-all">') :]
+    view = view[: view.index("</svg>")]
+    labels = re.findall(r'text-anchor="end">([^<]+)</text>', view)
+    assert labels == ["0", "10", "100", "1k", "10k"]
+    # On a log axis 60 sits well above the floor beside 2,400.
+    assert "Filed 2026-W18: 2,400" in view
+
+
+def test_log_axis_places_powers_of_ten_evenly() -> None:
+    axis = rh.Axis(2443, log=True)
+    assert axis.top == 10_000
+    fracs = [f for f, _ in axis.ticks()]
+    assert fracs[0] == 0.0
+    steps = [b - a for a, b in zip(fracs[1:], fracs[2:], strict=False)]
+    assert max(steps) - min(steps) < 0.01
+
+
+def test_a_long_range_thins_its_week_labels() -> None:
+    weeks = [f"2026-W{w:02d}" for w in range(1, 41)]
+    svg = rh.line_chart("t", weeks, [("x", "s1", dict.fromkeys(weeks, 1))], set())
+    shown = re.findall(r'text-anchor="middle">(W\d+)</text>', svg)
+    assert len(shown) <= rh.MAX_X_LABELS
+    assert shown[-1] == "W40"
+
+
+def test_the_burndown_says_when_the_ledger_empties() -> None:
+    snap = _history_snapshot(10)
+    snap["metrics"].append(
+        _metric(
+            "backlog_forecast",
+            value="2027-02-11",
+            status="good",
+            detail={"pace": {"net_closed_per_week": 30.0}, "finish": "2027-02-11"},
+        )
+    )
+    page = rh.render(snap)
+    assert "<h2>Backlog burndown</h2>" in page
+    assert "it reaches zero about 2027-02-11" in page
+
+
+def test_asvs_tool_provenance_is_in_the_disclosure_not_the_facts() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["detail"]["provenance"] = ["# asvs-status scorecard=NO-GIT", "# generated=x"]
+    page = rh.render(snap)
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    assert "<dt>Tool provenance</dt>" not in tile
+    assert "# asvs-status scorecard=NO-GIT<br># generated=x" in tile
+
+
+def test_short_pair_cuts_full_commits() -> None:
+    full = "a" * 40
+    assert rh.short_pair(f"scorecard=vault@{full} engine={full}+archive") == (
+        "scorecard=vault@aaaaaaa engine=aaaaaaa+archive"
+    )
+
+
+def test_an_info_status_is_a_progress_pill() -> None:
+    snap = _snapshot()
+    snap["metrics"].append(_metric("batch_progress", value=11.8, unit="percent", status="info"))
+    page = rh.render(snap)
+    assert '<span class="pill info">info</span>' in page
+    assert "1 progress only" in page

@@ -50,6 +50,52 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import collect_metrics as cm  # noqa: E402
 
 
+def _nth_sunday(year: int, month: int, n: int) -> dt.date:
+    first = dt.date(year, month, 1)
+    return first + dt.timedelta(days=(6 - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def central_offset(moment: dt.datetime) -> tuple[dt.timedelta, str]:
+    """US Central's UTC offset and abbreviation at ``moment`` (aware).
+
+    The US rule since 2007, computed rather than read from a time zone database: Windows Python
+    ships none unless ``tzdata`` is installed, and this script runs under ``-I`` with the standard
+    library alone. Daylight time runs from 02:00 local on March's second Sunday (08:00 UTC) to
+    02:00 local on November's first Sunday (07:00 UTC)."""
+    utc = moment.astimezone(dt.UTC)
+    start = dt.datetime.combine(_nth_sunday(utc.year, 3, 2), dt.time(8), dt.UTC)
+    end = dt.datetime.combine(_nth_sunday(utc.year, 11, 1), dt.time(7), dt.UTC)
+    if start <= utc < end:
+        return dt.timedelta(hours=-5), "CDT"
+    return dt.timedelta(hours=-6), "CST"
+
+
+def _clock(moment: dt.datetime) -> str:
+    hour = moment.hour % 12 or 12
+    return f"{hour}:{moment.minute:02d} {'AM' if moment.hour < 12 else 'PM'}"
+
+
+def central(stamp: Any) -> str | None:
+    """An ISO-8601 timestamp as US Central wall time, ``Tue Nov 24, 2026, 7:01 AM CST``; ``None``
+    when it cannot be read."""
+    try:
+        moment = cm.parse_stamp(stamp)
+    except (TypeError, ValueError):
+        return None
+    offset, name = central_offset(moment)
+    local = (moment.astimezone(dt.UTC) + offset).replace(tzinfo=None)
+    return f"{local:%a %b} {local.day}, {local.year}, {_clock(local)} {name}"
+
+
+def utc_clock(stamp: Any) -> str | None:
+    """The same moment as ``13:01 UTC``; ``None`` when it cannot be read."""
+    try:
+        moment = cm.parse_stamp(stamp).astimezone(dt.UTC)
+    except (TypeError, ValueError):
+        return None
+    return f"{moment:%H:%M} UTC"
+
+
 def repo_series() -> tuple[tuple[str, str], ...]:
     """The ``prs_merged`` per-repo key -> the series name the dashboard plots, keyed by the
     collector's own repo names so a rename cannot leave a series quietly empty."""
@@ -167,7 +213,85 @@ def notes(snap: Snapshot) -> dict[str, str]:
         "owner_waiting": "Open ledger rows with verdict owner-ruling. Open class C questions not "
         "counted yet.",
         "release_distance": "Commits on engine main since the latest PyPI release tag.",
+        "backlog_forecast": forecast_note(snap),
+        "batch_progress": batch_note(snap),
     }
+
+
+def forecast_note(snap: Snapshot) -> str:
+    weeks = _dict(snap.detail("backlog_forecast").get("pace")).get("weeks")
+    span = f", {weeks[0]} to {weeks[-1]}" if isinstance(weeks, list) and weeks else ""
+    return (
+        f"Open rows divided by the mean net rows closed per week (closed minus filed) over the "
+        f"last {cm.FORECAST_WEEKS} full weeks{span}. A week of heavy filing in that span pushes "
+        "the date out until it leaves the span."
+    )
+
+
+def batch_note(snap: Snapshot) -> str:
+    saved = central(snap.detail("batch_progress").get("runbook_saved"))
+    return (
+        "Ledger rows closed across the runbook's batches, as the workbook's own last ledger sync "
+        "recorded them" + (f"; workbook saved {saved}." if saved else ".")
+    )
+
+
+def forecast_line(snap: Snapshot) -> str | None:
+    """One sentence for the burndown: when the open count reaches zero at the recent pace."""
+    m = snap.by_id.get("backlog_forecast")
+    if not m or m.get("error") or m.get("value") is None:
+        return None
+    d = snap.detail("backlog_forecast")
+    net = _dict(d.get("pace")).get("net_closed_per_week")
+    if not isinstance(net, (int, float)):
+        return None
+    if d.get("finish"):
+        return f"At the last {cm.FORECAST_WEEKS} full weeks' pace ({net:,g} net rows closed a week) it reaches zero about {d['finish']}."
+    return (
+        f"At the last {cm.FORECAST_WEEKS} full weeks' pace it never reaches zero: filing "
+        f"outran closing by {-net:,g} rows a week."
+    )
+
+
+def ledger_history(snap: Snapshot) -> list[dict[str, Any]]:
+    """Every week the census holds, oldest first: filed, closed and open rows at its end. Empty
+    for a snapshot collected before the history was."""
+    d = snap.detail("backlog_burn")
+    hist = d.get("history")
+    if not isinstance(hist, list):
+        return []
+    opened = {
+        str(p["week"]): p.get("value")
+        for p in d.get("open_series") or []
+        if isinstance(p, dict) and "week" in p
+    }
+    return [
+        {
+            "week": str(p["week"]),
+            "filed": p.get("filed"),
+            "closed": p.get("closed"),
+            "open": opened.get(str(p["week"])),
+        }
+        for p in hist
+        if isinstance(p, dict) and "week" in p
+    ]
+
+
+#: The runbook's batch states, from not started to finished, as its Status board names them.
+BATCH_STATES = ("FREE", "IN PROGRESS", "QUIET", "NO BUILDER", "BUILT", "MERGED", "DONE")
+
+
+def _batches(state: str) -> Callable[[dict[str, Any]], Any]:
+    def read(d: dict[str, Any]) -> Any:
+        by = d.get("batches_by_state")
+        return by.get(state, 0) if isinstance(by, dict) else None
+
+    return read
+
+
+def _finish_or_never(finish: str, pace_key: str) -> Callable[[dict[str, Any]], Any]:
+    # A pace that was read but never empties the ledger is "never", not a missing value.
+    return lambda d: d.get(finish) or ("never" if isinstance(d.get(pace_key), dict) else None)
 
 
 def _critical_high(d: dict[str, Any]) -> int | None:
@@ -228,6 +352,48 @@ def facts(weeks: int) -> list[Fact]:
         ),
         ("release_distance", "pypi_version", "Latest release", _key("pypi_version")),
         ("release_distance", "uploaded", "Released", _uploaded_day),
+        (
+            "backlog_forecast",
+            "net_closed_per_week",
+            f"Net closed a week ({cm.FORECAST_WEEKS} wk)",
+            lambda d: _dict(d.get("pace")).get("net_closed_per_week"),
+        ),
+        (
+            "backlog_forecast",
+            "closed_per_week",
+            f"Closed a week ({cm.FORECAST_WEEKS} wk)",
+            lambda d: _dict(d.get("pace")).get("closed_per_week"),
+        ),
+        (
+            "backlog_forecast",
+            "filed_per_week",
+            f"Filed a week ({cm.FORECAST_WEEKS} wk)",
+            lambda d: _dict(d.get("pace")).get("filed_per_week"),
+        ),
+        (
+            "backlog_forecast",
+            "short_finish",
+            f"At the last {cm.FORECAST_SHORT_WEEKS} weeks' pace",
+            _finish_or_never("short_finish", "short_pace"),
+        ),
+        (
+            "backlog_forecast",
+            "no_filing_finish",
+            "If filing stopped",
+            _finish_or_never("no_filing_finish", "pace"),
+        ),
+        ("batch_progress", "rows_closed", "Rows closed", _key("rows_closed")),
+        ("batch_progress", "rows_total", "Rows in batches", _key("rows_total")),
+        ("batch_progress", "batches_total", "Batches", _key("batches_total")),
+        *[
+            (
+                "batch_progress",
+                f"batches_{s.lower().replace(' ', '_')}",
+                s.capitalize(),
+                _batches(s),
+            )
+            for s in BATCH_STATES
+        ],
     ]
 
 

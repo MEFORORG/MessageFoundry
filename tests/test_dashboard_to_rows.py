@@ -376,3 +376,81 @@ def test_asvs_provenance_row_quotes_the_tools_own_lines() -> None:
     row = _rows(snap)["asvs.provenance"]
     assert row["value"] is None
     assert row["error"] == "the snapshot holds no scorecard provenance lines"
+
+
+# -- Central time, the ledger history and the new metrics' facts ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stamp", "shown"),
+    [
+        ("2026-11-24T13:01:32+00:00", "Tue Nov 24, 2026, 7:01 AM CST"),
+        ("2026-07-04T17:30:00Z", "Sat Jul 4, 2026, 12:30 PM CDT"),
+        # 2026's daylight time runs from Sun Mar 8 08:00 UTC to Sun Nov 1 07:00 UTC.
+        ("2026-03-08T07:59:00Z", "Sun Mar 8, 2026, 1:59 AM CST"),
+        ("2026-03-08T08:00:00Z", "Sun Mar 8, 2026, 3:00 AM CDT"),
+        ("2026-11-01T06:59:00Z", "Sun Nov 1, 2026, 1:59 AM CDT"),
+        ("2026-11-01T07:00:00Z", "Sun Nov 1, 2026, 1:00 AM CST"),
+        ("2026-12-31T23:30:00-05:00", "Thu Dec 31, 2026, 10:30 PM CST"),
+    ],
+)
+def test_central_time(stamp: str, shown: str) -> None:
+    assert tr.central(stamp) == shown
+
+
+@pytest.mark.parametrize("stamp", [None, "", "yesterday", 5])
+def test_central_time_of_junk_is_none(stamp: Any) -> None:
+    assert tr.central(stamp) is None
+    assert tr.utc_clock(stamp) is None
+
+
+def test_ledger_history_joins_the_open_series() -> None:
+    snap = tr.Snapshot(
+        {
+            "metrics": [
+                {
+                    "id": "backlog_burn",
+                    "detail": {
+                        "history": [{"week": "2026-W46", "filed": 4, "closed": 3}, "junk"],
+                        "open_series": [{"week": "2026-W46", "value": 13}],
+                    },
+                }
+            ]
+        }
+    )
+    assert tr.ledger_history(snap) == [{"week": "2026-W46", "filed": 4, "closed": 3, "open": 13}]
+    assert tr.ledger_history(tr.Snapshot({})) == []
+
+
+def _forecast_rows(detail: dict[str, Any]) -> dict[str, Any]:
+    data = {"metrics": [{"id": "backlog_forecast", "value": "x", "detail": detail}]}
+    return {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+
+
+def test_forecast_facts_read_never_only_when_a_pace_was_read() -> None:
+    pace = {"net_closed_per_week": -5.0, "closed_per_week": 0.0, "filed_per_week": 5.0}
+    rows = _forecast_rows({"pace": pace, "short_pace": pace})
+    assert rows["backlog_forecast.short_finish"]["value"] == "never"
+    assert rows["backlog_forecast.no_filing_finish"]["value"] == "never"
+    assert rows["backlog_forecast.net_closed_per_week"]["value"] == -5.0
+    rows = _forecast_rows({})
+    assert rows["backlog_forecast.short_finish"]["value"] is None
+
+
+def test_batch_facts_count_every_state() -> None:
+    data = {
+        "metrics": [
+            {
+                "id": "batch_progress",
+                "value": 10.0,
+                "detail": {
+                    "batches_by_state": {"FREE": 3},
+                    "runbook_saved": "2026-11-24T13:00:00Z",
+                },
+            }
+        ]
+    }
+    rows = {r["id"]: r for r in tr.metric_rows(tr.Snapshot(data))}
+    assert rows["batch_progress.batches_free"]["value"] == 3
+    assert rows["batch_progress.batches_done"]["value"] == 0
+    assert "workbook saved Tue Nov 24, 2026, 7:00 AM CST" in rows["batch_progress"]["note"]
