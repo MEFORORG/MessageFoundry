@@ -116,20 +116,22 @@ class OidcClaimPolicy:
 
 @dataclass(frozen=True, slots=True)
 class FederatedPrincipal:
-    """The verified outcome of a federated login — the username to resolve against on-prem AD, the
-    evidence folded into the ``auth.login_success`` audit detail, and the verified ``exp`` and
-    ``auth_time``."""
+    """The verified outcome of a federated login: the ``(issuer, sub)`` pair that selects the local
+    account, the claimed username, the evidence folded into the ``auth.login_success`` audit detail,
+    and the verified ``exp`` and ``auth_time``.
+
+    ``username`` selects nothing. The relying party selects the account by the non-reassignable
+    ``(issuer, subject)`` pair alone (ADR 0184), refuses a pair no account is bound to (only the
+    administrative binding surface binds one), and keeps the claimed username only as a hint in that
+    refusal's audit row. A username is reassignable, so selecting by it would hand a reassigned name
+    the prior holder's account."""
 
     username: str
     subject: str
     # The pinned issuer this assertion was verified against (``policy.issuer``, which ``_check_core_claims``
-    # already proved the token's ``iss`` equals). Carried alongside ``subject`` so the relying party can
-    # PIN the local federated account's identity to the non-reassignable ``(issuer, sub)`` tuple (BACKLOG
-    # #1015): the AD-backed account is still resolved BY its username (ADR 0142 keeps roles LDAP-sourced),
-    # but a login whose reassignable username resolves to an account already bound to a DIFFERENT
-    # ``(issuer, sub)`` is refused — so a reassigned username cannot take over the prior holder's account.
-    # A ``sub`` is only guaranteed stable WITHIN one issuer, so the binding needs both halves even though
-    # a single issuer is pinned today.
+    # already proved the token's ``iss`` equals): half of the ``(issuer, sub)`` selection key the class
+    # docstring describes (BACKLOG #1015). A ``sub`` is only guaranteed stable WITHIN one issuer, so the
+    # selection needs both halves even though a single issuer is pinned today.
     issuer: str
     amr: tuple[str, ...]
     acr: str | None
