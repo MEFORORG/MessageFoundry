@@ -5593,9 +5593,9 @@ def _cancel_borrow(borrow: asyncio.Future[Any], deferrals: int = 0, *, defer_unk
         if not _warned_no_waiter:
             _warned_no_waiter = True
             log.warning(
-                "a pool borrow, or a task it waits on, has a _fut_waiter the check cannot read; "
-                "abandoned pool borrows like it are cancelled without checking for a hand-over in "
-                "flight"
+                "a pool borrow, or a task it waits on, has no _fut_waiter, or one the check cannot "
+                "read; abandoned pool borrows like it are cancelled without checking for a hand-over "
+                "in flight"
             )
         if defer_unknown:
             asyncio.get_running_loop().call_soon(borrow.cancel)
