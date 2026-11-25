@@ -80,11 +80,11 @@ __all__ = [
 _JWKS_CODED = "JWKS response is in a content coding the engine does not decode"
 _JWKS_MISFRAMED = "JWKS response framed its body length ambiguously"
 
-#: The urllib ``timeout`` for an IdP HTTP round trip, which bounds each socket operation (the
-#: connect and each read), not the round trip as a whole. Deliberately short: both legs run inside a
-#: browser request, and a hung IdP must degrade the federated login. Defined in ``jwks``, the one
-#: place the number lives, because that module also bounds its gate wait by it and cannot import
-#: this one.
+#: The urllib ``timeout`` for the JWKS fetch, which bounds each socket operation (the connect and
+#: each read), not the round trip as a whole. Deliberately short: the fetch runs inside a browser
+#: request, and a hung IdP must degrade the federated login. Defined in ``jwks`` as
+#: ``IDP_TIMEOUT_SECONDS``, because that module also bounds its gate wait by it and cannot import
+#: this one. The token endpoint leg keeps its own 10 s default in ``flow.exchange_code``.
 DEFAULT_IDP_TIMEOUT_SECONDS = IDP_TIMEOUT_SECONDS
 
 

@@ -1310,7 +1310,9 @@ def test_a_cached_kid_lookup_does_not_wait_on_a_stalled_refresh(
     release.
     """
     later = _jwks_bytes(_rsa_jwk(rsa_key, "k1"), _rsa_jwk(rsa_key, "k2"))
-    cache, fetch, warm = _warm_cache(rsa_key, later)
+    # A gate wait far past the join below, so a fast path that took the gate could not return in
+    # time through the wait's timeout and its gate-free re-read.
+    cache, fetch, warm = _warm_cache(rsa_key, later, gate_wait=60.0)
 
     results: dict[str, object] = {}
     stalled = _run_lookup(cache, "k2", results, "stalled")

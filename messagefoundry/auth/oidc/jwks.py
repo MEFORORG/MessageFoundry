@@ -54,9 +54,10 @@ _JOSE_CURVES: dict[str, Callable[[], ec.EllipticCurve]] = {
 
 DEFAULT_JWKS_TTL_SECONDS = 3600.0
 DEFAULT_JWKS_MIN_REFETCH_SECONDS = 300.0
-#: The one definition of the IdP timeout. ``oidc_http`` passes it to urllib as
-#: ``DEFAULT_IDP_TIMEOUT_SECONDS``, where it bounds each socket operation of a fetch, not the fetch
-#: as a whole, so a refresh can run longer than this.
+#: The JWKS fetch timeout. ``oidc_http`` names it ``DEFAULT_IDP_TIMEOUT_SECONDS`` and passes it to
+#: urllib, where it bounds each socket operation of a fetch, not the fetch as a whole, so a refresh
+#: can run longer than this. The token endpoint leg does not use it: ``flow.exchange_code`` keeps its
+#: own 10 s default.
 IDP_TIMEOUT_SECONDS = 10.0
 #: How long a lookup waits for the gate a refresh holds across its fetch before it is refused
 #: (BACKLOG #6905): the IdP timeout, so a hung IdP degrades the login rather than pinning each
@@ -373,8 +374,10 @@ class JwksCache:
         raises :class:`JwkAlgMismatch` (BACKLOG #5517). A key whose JWK names none is returned, and
         the caller still checks that it fits ``alg``.
 
-        Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, or
-        if a forced refetch still does not yield the ``kid``.
+        Raises :class:`JwksError` if the key is unknown and the min-refetch floor has not elapsed, if
+        a forced refetch still does not yield the ``kid``, or if the wait for a refresh in progress
+        runs out before the ``kid`` is current. That last refusal can reach a cached key past its
+        TTL, which the throttled path would otherwise serve (BACKLOG #6905).
         """
         bound = self._lookup(kid)
         if bound.alg is not None and bound.alg != alg:
