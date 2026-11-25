@@ -560,8 +560,8 @@ def test_estimate_and_demand_gate_labels_match_the_census_driver() -> None:
 
 
 def test_priority_rows_order_tiers_then_demand_gate_estimates_and_unscored() -> None:
-    names = ("unscored", "estimate only", "DEMAND-GATE", "P10", "P2", "P1")
+    names = ("unscored", "scored, no tier", "DEMAND-GATE", "P10", "P2", "P1")
     by = {p: {"open": 1} for p in names}
     snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
     order = list(dict.fromkeys(r["priority"] for r in tr.priority_rows(snap)))
-    assert order == ["P1", "P2", "P10", "DEMAND-GATE", "estimate only", "unscored"]
+    assert order == ["P1", "P2", "P10", "DEMAND-GATE", "scored, no tier", "unscored"]

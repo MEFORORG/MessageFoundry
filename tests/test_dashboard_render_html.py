@@ -508,7 +508,7 @@ def test_the_priority_table_has_totals_and_every_status() -> None:
     snap["metrics"][0]["detail"]["by_priority"] = {
         "P1": {"open": 2, "closed": 3},
         "unscored": {"partial": 1, "declined": 1},
-        "estimate only": {"open": 1},
+        "scored, no tier": {"open": 1},
         "DEMAND-GATE": {"open": 1},
     }
     page = rh.render(snap)
@@ -529,7 +529,7 @@ def test_the_priority_table_has_totals_and_every_status() -> None:
         in table
     )
     assert "<th>Unscored</th>" in table
-    assert "<th>Estimate only</th>" in table
+    assert "<th>Scored, no tier</th>" in table
     assert "<th>DEMAND-GATE</th>" in table
     assert (
         '<tr class="sum"><th>Total</th><td>4</td><td>1</td><td>0</td><td>3</td><td>1</td><td>0</td><td>9</td></tr>'

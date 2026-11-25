@@ -509,11 +509,11 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
 UNSCORED_LABEL = "unscored"
 #: The bucket ``_vault_census.py`` puts a row in whose banner score carries no tier and whose
 #: Cluster line names no priority.
-ESTIMATE_LABEL = "estimate only"
+ESTIMATE_LABEL = "scored, no tier"
 #: The measured tier a scoring pass gives a row it holds for demand, a bucket of its own.
 DEMAND_GATE = "DEMAND-GATE"
 #: The priority table's display name for a bucket; a tier (P1, DEMAND-GATE) shows as it is.
-PRIORITY_LABELS = {UNSCORED_LABEL: "Unscored", ESTIMATE_LABEL: "Estimate only"}
+PRIORITY_LABELS = {UNSCORED_LABEL: "Unscored", ESTIMATE_LABEL: "Scored, no tier"}
 
 #: The priority table's columns, in order: the open statuses, then the closed kinds.
 PRIORITY_STATUSES = (*cm.OPEN_STATUSES, "closed", "declined", "superseded")

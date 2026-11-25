@@ -83,8 +83,8 @@ _SCORE = re.compile(r"[Vv]alue\s*\**\s*(?P<value>\d+)\s*/\s*10", re.I)
 #: ``**Re-scored 2026-11-25 -> P2.** Value **6/10**``. Some rows write the arrow as U+2192.
 _TIER = re.compile(r"(?:->|\u2192)\s*(P[0-9]+|DEMAND-GATE)\.")
 #: The priority bucket of a row whose first score line carries no tier, and whose section marker
-#: names no priority. Most are a filing seat's estimate; any score without a tier lands here.
-ESTIMATE = "estimate only"
+#: names no priority. Many are a filing estimate, but any score without a tier lands here.
+ESTIMATE = "scored, no tier"
 #: The priority bucket of a row with no tier, no section-marker priority and no score.
 UNSCORED = "unscored"
 

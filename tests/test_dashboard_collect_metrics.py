@@ -1620,15 +1620,15 @@ _ESTIMATE_LINE = "> **Filed 2026-11-20.** Value **4/10** . Difficulty **2/10**"
             "P1",
         ),
         # Only the FIRST score line counts: a later tier does not override an untiered first one.
-        ([_ESTIMATE_LINE, _SCORED.format(arrow="->", tier="P1")], None, "estimate only"),
+        ([_ESTIMATE_LINE, _SCORED.format(arrow="->", tier="P1")], None, "scored, no tier"),
         # An untiered estimate: the Cluster priority wins, else the estimate bucket.
         ([_ESTIMATE_LINE], _CLUSTER_P3, "P3"),
-        ([_ESTIMATE_LINE], None, "estimate only"),
+        ([_ESTIMATE_LINE], None, "scored, no tier"),
         # A tier quoted on a line with no score, or after the score, is prose, not the row's tier.
         (["> O filed; see the row re-scored -> P1. elsewhere"], None, "unscored"),
-        ([_ESTIMATE_LINE + ". Same cause as a row moved -> P1."], None, "estimate only"),
+        ([_ESTIMATE_LINE + ". Same cause as a row moved -> P1."], None, "scored, no tier"),
         # The vault's own score form, which needs no bold markers.
-        (["> _(was DEMAND-GATE . value 4/10 . Difficulty 3/10.)_"], None, "estimate only"),
+        (["> _(was DEMAND-GATE . value 4/10 . Difficulty 3/10.)_"], None, "scored, no tier"),
         (["> O filed"], None, "unscored"),
     ],
 )
