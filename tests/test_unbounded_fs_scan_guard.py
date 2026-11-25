@@ -1043,13 +1043,19 @@ _ROUNDS = 2
 _REQUEST_TIMEOUT_SECONDS = 100
 
 #: The ceiling on one `((` site's CPU cost, in calls of `_REFERENCE_SCRIPT`, which `_site_cost`
-#: reads. THE RATIO CANNOT SEE A GUARD THAT IS SLOWER BY A CONSTANT FACTOR, and one about 17 times
-#: slower would take about 75 s on 6,000 sites, the hook's timeout, past which the command runs.
-#: The test it replaced caught that only through `run_guard`'s 60 s cap. Measured locally on
-#: 2026-11-25: the guard read 0.0139 to 0.0274 unloaded and 0.0118 to 0.0281 under 32 spinning
-#: processes, over 25 readings; a copy given a constant cost per site, about 17 times its own, read
-#: 0.345. The ceiling is five times the highest reading. On that machine it is about 5 ms a site,
-#: so 6,000 sites stay well inside the hook's 75 s.
+#: reads. THE RATIO CANNOT SEE A GUARD THAT IS SLOWER BY A CONSTANT FACTOR; the test it replaced
+#: caught one only through `run_guard`'s 60 s cap at 6,000 sites. Measured locally on 2026-11-25:
+#: the guard read 0.0139 to 0.0274 unloaded and 0.0118 to 0.0281 under 32 spinning processes, over
+#: 25 readings, and a copy given a constant cost per site, about 17 times its own, read 0.345.
+#:
+#: WHAT IT DOES: the ceiling is five times the highest reading, so it fails a guard about five
+#: times or more over the cost measured here, and passes one under that.
+#:
+#: WHAT IT DOES NOT DO: guarantee the hook's budget. The 75 s timeout in .claude/settings.json
+#: belongs to scripts/hooks/shell-guard-dispatch.ps1, shared by the five guards it runs in turn,
+#: and the largest command block-blanket-git-stage.ps1 lets through is 65,536 characters, about
+#: 7,280 sites. At the ceiling, about 5 ms a site on that machine, that is about 36 s for this
+#: guard alone, and a slower machine takes longer.
 _MAX_SITE_COST = 0.14
 
 #: The most requests one test sends: `_site_cost` sends two, and three attempts one each.
@@ -1199,10 +1205,10 @@ def _attempt_ratio(
     away mid-call charges a wall clock and not this one. The wall reading is kept for the failure
     message only. `_TIMING_DRIVER` says which CPU clock it is.
 
-    THE FILE'S OWN COST IS TAKEN OFF BOTH SIZES. On that machine one call of a script file holding
-    only `exit 0` cost 24 to 29 million cycles of the calling thread. A
-    cost per call that does not grow with the input pulls the ratio toward 1, so
-    the baseline sample's cheapest per-call time comes off both before they are divided."""
+    THE FILE'S OWN COST IS TAKEN OFF BOTH SIZES. A call of a script file costs a fixed amount
+    before it reads anything, `_TIMING_DRIVER` says how much, and a cost per call that does not
+    grow with the input pulls the ratio toward 1, so the baseline sample's cheapest per-call time
+    comes off both before they are divided."""
     draw = random.Random()
     samples = [index for _ in range(_ROUNDS) for index in draw.sample((0, 1, 2), 3)]
     readings = driver.run(script, [small, large, _EMPTY_PAYLOAD], samples, warm=(0, 2))
@@ -1270,11 +1276,12 @@ def _scaling_ratios(
 ) -> tuple[list[float], str]:
     """One CPU reading of :func:`_attempt_ratio` per attempt, at ``k`` and `_GROWTH` times as many
     sites, all in one warm driver process, ``driver``, and a record of every attempt on both
-    clocks. A reading outside the band from `_MIN_WORKING_RATIO` up to the line is taken again, up to three attempts, so one
-    stretch of load cannot fake a curve or a no-op. So a reader fails the linear check only if
-    every attempt reads outside the band, and the control must show every attempt over the line.
-    The rule is this module's own; `test_the_scaling_rule_takes_another_attempt_only_outside_the_band`
-    pins it."""
+    clocks. A reading outside the band from `_MIN_WORKING_RATIO` up to the line, a NaN included,
+    is taken again, up to three attempts, so one stretch of load cannot fake a curve or a no-op.
+    So a reader fails the linear check only if every attempt reads outside the band, and the
+    control passes only as :func:`_over_the_line` says: every readable attempt over the line, and
+    at least one readable. The rule is this module's own;
+    `test_the_scaling_rule_takes_another_attempt_only_outside_the_band` pins it."""
     small, large = _arithmetic_run(k), _arithmetic_run(_GROWTH * k)
     readings: list[float] = []
     record: list[str] = []
@@ -1455,7 +1462,7 @@ def test_the_timing_driver_reads_a_command_as_the_hook_does(
     for row, reading in zip(rows, real, strict=True):
         out = reading["outputs"][0]
         assert (json.loads(out) if out.strip() else None) == run_guard(bash(row)), row
-    assert real[0]["outputs"][0].strip(), "the timed shape did not deny in-process"
+    assert _denies(real[0]["outputs"][0]), "the timed shape did not deny in-process"
     assert not without[0]["outputs"][0].strip(), "a view other than the refined one denied it"
 
 
