@@ -5571,11 +5571,11 @@ def create_app(
         # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
         # BACKLOG #2193 slice (e): the derived instance posture (the same _phi_read_posture derived at
         # create_app time from ai_settings, which == app.state.ai == `ai` on the managed path) keys
-        # the broker's revocation refusal. An endpoint whose host does not read as loopback (as
-        # ai_broker._refuse_an_unrevoked_ai_hop reads it; a gateway on this machine spelled with a
-        # trailing dot or a short form is one) with no [ai].endpoint_revocation_attested
-        # pair is refused under enforce, and a None posture counts as enforcing there. The cleartext-
-        # http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
+        # the broker's revocation refusal. An endpoint whose host does not read as loopback, in the
+        # reading ai_broker._refuse_an_unrevoked_ai_hop states (it can be one on this machine), is
+        # refused under enforce unless a [tls].crl_file is checked on it or the
+        # [ai].endpoint_revocation_attested pair is set, and a None posture counts as enforcing
+        # there. The cleartext-http refusal takes no posture: it refuses in every one (vault BACKLOG #3533 item 5).
         # BACKLOG #5527: the [tls] policy too, the one the alerts test send reads, so the endpoint is
         # verified against [tls].internal_ca_file under augment or pinned and checked against
         # [tls].crl_file as the other HTTP-family hops are. A direct create_app stashes its

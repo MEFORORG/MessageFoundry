@@ -1659,12 +1659,12 @@ count is above `0` (vault BACKLOG #2613).
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
   endpoint's host is not loopback as `is_loopback_hop_host` in `config/tls_policy.py` reads it.
-  That reads the host as spelled, not where the endpoint runs: at least a spelling with a
-  trailing dot, such as `localhost.`, or a short form such as `127.1` reads as remote, so an
-  endpoint on this machine spelled that way gets the CRL and, without one, the refusal below.
-  That predicate's docstring lists `[::1]` as remote, but that is its raw input: the broker hands
-  it the URL's host with the brackets stripped, so an endpoint URL holding `[::1]` reads as
-  loopback. In this entry, "loopback" means this reading.
+  That reads the host as spelled, apart from case and the brackets of an IPv6 host, not where
+  the endpoint runs: at least a spelling with a trailing dot, such as `localhost.`, or a
+  shortened IPv4 address such as `127.1` reads as remote, so an endpoint on this machine spelled
+  that way gets the CRL and, without one, the refusal below. An endpoint URL holding `[::1]`
+  reads as loopback, because the broker reads the host without its brackets. In this entry,
+  "loopback" means this reading.
   `messagefoundry serve`
   hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
   `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
@@ -1688,8 +1688,10 @@ count is above `0` (vault BACKLOG #2613).
   For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
   main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
   upstream's revocation itself needs no attestation when the endpoint URL spells its host as
-  loopback, in the first bullet's reading: a loopback endpoint is not refused. Spelled with a
-  trailing dot or a short form, the same gateway is refused like an off-box endpoint.
+  loopback, in the first bullet's reading: a loopback endpoint is not refused. It is verified
+  against the OS roots alone, since a loopback endpoint takes neither `[tls]` file. Spelled with
+  a trailing dot or a shortened IPv4 address, its URL reads as remote and is judged like an
+  off-box endpoint, and a proxy that applies can carry it off the box.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
