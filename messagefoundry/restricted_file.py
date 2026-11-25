@@ -2163,14 +2163,16 @@ def write_restricted_file(
 
     ``read_grants`` (Windows only) names further accounts to grant read: an account name such as
     ``NT SERVICE\\MessageFoundry``, or a SID, with or without a leading ``*``. A name must resolve
-    to a user, a well-known or a computer account (:data:`_GRANT_NAME_KINDS`); a group, an alias or
-    a domain is refused.
+    to a user, a well-known or a computer account (:data:`_GRANT_NAME_KINDS`); a name of any other
+    kind is refused, at least a group, an alias, a domain, and one that resolves to no live account.
 
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
     it, and read back through the creating handle before a byte is written. It is a SID, with or
-    without a leading ``*``, or a name: a name Windows reports as a group, an alias, a domain or a
-    computer account is refused (a read grant admits a computer account; an owner name does not),
-    so a group such as Administrators is named by its SID. A name it
+    without a leading ``*``, or a name, which must resolve to a user or a well-known account
+    (:data:`_OWNER_NAME_KINDS`). A name of any other kind is refused, at least a group, an alias, a
+    domain, a computer account (a read grant admits one; an owner name does not), a label, a logon
+    session and one that resolves to no live account, so a group such as Administrators is named by
+    its SID. A name it
     reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
     Everyone all report) passes that gate, and a SID is taken as given. Then an
     application package, and at least the broad groups :func:`_is_broad_group` knows, are refused
