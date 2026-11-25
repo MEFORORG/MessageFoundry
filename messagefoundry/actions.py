@@ -381,8 +381,9 @@ def date_diff_field(
     component path reads only the component it names, with no code. A whole field raises
     :class:`ValueError` when component 2 holds anything but a degree-of-precision code no finer than
     its time, or a later component is not empty (``20260101^S`` and a range ``20260101^20260201``
-    both raise); trailing empty components and subcomponents are ignored, so ``20260101^&`` reads as
-    ``20260101``. Once both fields are present, either path
+    both raise); trailing empty components, and trailing empty subcomponents after the time's own
+    component, are ignored, so ``20260101^&`` reads as ``20260101`` (a subcomponent separator in
+    the time's own component, ``20260101&``, still raises). Once both fields are present, either path
     raises when its field holds more than one repetition, ignoring trailing ones that hold nothing
     but component or subcomponent separators, so
     ``~20270101`` and ``20260101~~20270101`` raise and ``20260101~`` reads as ``20260101``: a
@@ -516,8 +517,8 @@ def _check_ts_field(
     code states them. The caller has refused a second repetition already.
 
     A whole field may hold only its time plus, in component 2, a degree-of-precision code, with any
-    trailing empty components and subcomponents dropped (``20260101^`` and ``20260101^&`` read as
-    ``20260101``, BACKLOG #5822). A range
+    trailing empty components, and trailing empty subcomponents after component 1, dropped
+    (``20260101^`` and ``20260101^&`` read as ``20260101``, BACKLOG #5822). A range
     (``start^end``) raises, and so does a code finer than the stamp (``20260101^S``). A code
     coarser than the stamp is the precision HL7 v2.3 says the stamp holds, so ``198807050000^D`` is
     read as the date ``19880705``. A component path is returned as it is."""
