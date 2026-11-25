@@ -30,13 +30,14 @@ import pytest
 from messagefoundry.auth.identity import SessionMechanism
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import (
+    _CHECKED_READ_PASSES,
     ACCOUNT_REFUSED,
     NO_ENABLED_ADMINISTRATOR_ACTION,
     ROLE_SYNC_CONTENDED,
     AuthService,
     LoginOutcome,
-    _SealCheck,
     _SignInRolesUnread,
+    _UserLookup,
 )
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
@@ -226,28 +227,28 @@ async def test_two_lost_compare_and_sets_refuse_the_sign_in_closed(
 async def test_a_record_that_fails_its_seal_when_read_again_refuses_the_sign_in(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, leg: str
 ) -> None:
-    """After a lost compare-and-set the record is read again, through ``_checked_by_id``, which
-    checks it again on a check that raced a re-key (vault BACKLOG #3085 item 7), and the record
-    fails its seal. The sign-in is refused as ``account_refused``, not as contention, and nothing
-    is written."""
+    """After a lost compare-and-set the record is read again, up to ``_CHECKED_READ_PASSES``
+    times since a refused read may be a re-key (vault BACKLOG #3085 item 7), and every read fails
+    the seal. The sign-in is refused as ``account_refused``, not as
+    contention, and nothing is written."""
     service, user_id, first = await _signed_in(store, leg)
     await store.set_ad_group_role_map([(_GROUP, VIEWER)])
     seen = _interleave(monkeypatch, store, [[ADMIN]])
-    real_checked = service._checked_by_id
+    real_lookup = service._lookup_user
     reads: list[str] = []
 
-    async def checked(uid: str, listed: Any = None) -> _SealCheck:
+    async def lookup(uid: str) -> Any:
         if seen:
             reads.append(uid)
-            return _SealCheck(failed=True)
-        return await real_checked(uid, listed)
+            return _UserLookup(None, True)
+        return await real_lookup(uid)
 
-    monkeypatch.setattr(service, "_checked_by_id", checked)
+    monkeypatch.setattr(service, "_lookup_user", lookup)
     out = await _sign_in(service, leg)
     monkeypatch.undo()
     assert not out.ok and out.reason == ACCOUNT_REFUSED
     assert out.error == "invalid credentials", out.error
-    assert len(seen) == 1 and len(reads) == 1
+    assert len(seen) == 1 and len(reads) == _CHECKED_READ_PASSES
     assert await store.get_user_role_ids(user_id) == [ADMIN]
     # The row's shape, pinned per leg (vault BACKLOG #3085 item 20): both legs write it through
     # ``_refuse_directory_row``, so neither carries a ``mech``.
@@ -413,7 +414,7 @@ async def test_a_retry_whose_roles_cannot_be_read_back_ends_the_sessions_then_fa
     await store.set_ad_group_role_map([(_GROUP, VIEWER)])
     real_cas = store.set_user_roles_if_held
     real_plain = store.set_user_roles
-    real_checked = service._checked_by_id
+    real_lookup = service._lookup_user
     calls: list[int] = []
 
     async def racing(uid: str, role_ids: Sequence[str], **kw: Any) -> bool:
@@ -423,13 +424,13 @@ async def test_a_retry_whose_roles_cannot_be_read_back_ends_the_sessions_then_fa
             raise sqlite3.OperationalError("synthetic: disk I/O error")
         return await real_cas(uid, role_ids, **kw)
 
-    async def checked(uid: str, listed: Any = None) -> _SealCheck:
+    async def lookup(uid: str) -> Any:
         if len(calls) >= 2:
             raise sqlite3.OperationalError("synthetic: disk I/O error")
-        return await real_checked(uid, listed)
+        return await real_lookup(uid)
 
     monkeypatch.setattr(store, "set_user_roles_if_held", racing)
-    monkeypatch.setattr(service, "_checked_by_id", checked)
+    monkeypatch.setattr(service, "_lookup_user", lookup)
     with pytest.raises(_SignInRolesUnread):
         await _sign_in(service, "kerberos")
     monkeypatch.undo()

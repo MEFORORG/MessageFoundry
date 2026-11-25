@@ -4225,9 +4225,11 @@ class _SealCheck:
         return self.user is not None or self.failed
 
 
-#: How many times :meth:`AuthService.checked_user` and :meth:`AuthService.list_checked_users` check
-#: an account by id while each check races a write that deletes or re-keys the row (BACKLOG #5520).
-#: What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
+#: How many times a checked read of an account by id checks it while each check races a write that
+#: deletes or re-keys the row (BACKLOG #5520). Read by at least :meth:`AuthService.checked_user`,
+#: :meth:`AuthService.list_checked_users` and the directory sign-in's settled read,
+#: ``AuthService._lookup_user_settled`` (vault BACKLOG #3085 item 7), which reads again on a failed
+#: check too. What happens once every pass has raced is :meth:`AuthService._checked_by_id`'s to say.
 _CHECKED_READ_PASSES: Final = 3
 
 
@@ -8557,18 +8559,21 @@ class AuthService:
         return synced.result, held
 
     async def _lookup_user_settled(self, user_id: str) -> _UserLookup:
-        """The account ``user_id`` names, read through :meth:`_checked_by_id`, as a
-        :class:`_UserLookup`: ``held`` without ``user`` is a record that fails its seal, and a row
-        gone is not ``held``.
+        """:meth:`_lookup_user`, read again while it is refused, up to
+        :data:`_CHECKED_READ_PASSES` reads in all: ``_lookup_user`` also reads a row deleted or
+        re-keyed between its row and role reads as refused, and two honest role writes committing
+        across one check's reads can fail it, so a later read decides. Refused on every read is
+        refused, which fails closed.
 
-        Vault BACKLOG #3085 item 7: this read ``_lookup_user`` at most twice, and ``_lookup_user``
-        reads a check that raced a delete or a re-key as refused, so two raced checks refused the
-        sign-in as a seal failure for contention alone. :meth:`_checked_by_id` checks up to
-        :data:`_CHECKED_READ_PASSES` times and fails closed, reported, only once every pass
-        raced. A record Vault transit cannot verify is answered as :meth:`_checked_by_id` answers
-        it."""
-        found = await self._checked_by_id(user_id)
-        return _UserLookup(found.user, found.settled)
+        Vault BACKLOG #3085 item 7: this read at most twice, so contention on two reads refused
+        the sign-in as a seal failure; :meth:`_checked_by_id`, which the admin reads use, allows
+        :data:`_CHECKED_READ_PASSES` checks. What each read raises still raises."""
+        stored = await self._lookup_user(user_id)
+        for _pass in range(_CHECKED_READ_PASSES - 1):
+            if not stored.refused:
+                break
+            stored = await self._lookup_user(user_id)
+        return stored
 
     async def _roles_read_back(
         self, user_id: str, username: str, role_ids: Iterable[str], *, where: str

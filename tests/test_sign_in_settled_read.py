@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Vault BACKLOG #3085 item 7: the directory sign-in's settled read is as strong as
+"""Vault BACKLOG #3085 item 7: the directory sign-in's settled read allows as many checks as
 ``_checked_by_id``.
 
 ``AuthService._lookup_user_settled`` backs the sign-in role sync's re-read, its read-back, and the
 pre-mint read. It read the account twice and took a record whose seal check raced a write on both
 reads as a record that fails its seal: the sign-in was refused ``account_refused`` for contention
-alone. ``_checked_by_id``, which the admin reads use, checks up to ``_CHECKED_READ_PASSES`` times
-and fails closed only once every pass raced, reporting it. Each test stands a raced check in for
-the contention by making ``_verified`` settle nothing on its first calls. Synthetic accounts only.
+alone. ``_checked_by_id``, which the admin reads use, checks up to ``_CHECKED_READ_PASSES`` times;
+the settled read now reads that many times too, and a record refused on every read is still
+refused. Each test stands a raced check in for the contention by making ``_verified`` settle
+nothing on its first calls. Synthetic accounts only.
 """
 
 from __future__ import annotations
