@@ -349,31 +349,46 @@ def _asvs_face_and_disclosure(provenance: list[str]) -> tuple[str, str]:
     return face, disclosure
 
 
-def test_a_real_asvs_tool_header_is_on_the_face() -> None:
+def test_the_asvs_tool_header_is_on_the_face_chosen_by_content() -> None:
     header = "# asvs-status scorecard=vault@abc engine=def1234"
     face, disclosure = _asvs_face_and_disclosure(["# generated=x", header])
-    # Chosen by content, not position: the engine= line, not the first one.
+    # The engine= line, not the first one.
     assert f'<p class="mono">{header}</p>' in face
     assert "# generated=x" not in face
     assert "# asvs-status" not in disclosure
     assert "# generated=x" in disclosure
-    assert "NO-GIT" not in disclosure
+    assert "Scorecard tool header, as printed" not in face  # no NO-GIT half to explain
 
 
-def test_a_no_git_asvs_tool_header_is_labelled_in_the_disclosure() -> None:
-    header = "# asvs-status scorecard=NO-GIT engine=NO-GIT"
+def test_a_no_git_asvs_tool_header_is_labelled_on_the_face() -> None:
+    # The shape every collector run writes: the tool read an archived scorecard copy.
+    header = "# asvs-status scorecard=NO-GIT engine=abc1234+archive"
     face, disclosure = _asvs_face_and_disclosure([header, "# generated=x"])
-    # One ref pair on the face: the collector's, never the tool's empty one beside it.
-    assert "NO-GIT" not in face
-    assert "Measured at" in disclosure
-    assert "it ran from an archive, so it prints NO-GIT" in disclosure
-    assert f"{header}<br># generated=x" in disclosure
+    label = face.index("Scorecard tool header, as printed.")
+    assert "so its scorecard half says NO-GIT" in face
+    assert label < face.index(f'<p class="mono">{header}</p>')
+    assert "# asvs-status" not in disclosure
+    assert "# generated=x" in disclosure
 
 
-def test_a_line_with_no_engine_ref_is_never_promoted_to_the_face() -> None:
-    face, disclosure = _asvs_face_and_disclosure(["# engine: freshness=STALE", "# generated=x"])
-    assert "# engine:" not in face and "# engine: freshness=STALE" in disclosure
-    assert "prints NO-GIT" not in disclosure
+def test_lines_without_an_engine_header_say_so_on_the_face() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["error"] = None
+    snap["metrics"][3]["detail"]["provenance"] = ["# engine: freshness=STALE", "# generated=x"]
+    page = rh.render(snap)
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    face, disclosure = tile.split('<details class="how">')
+    assert '<p class="mono"># engine:' not in face
+    assert "# engine: freshness=STALE" in disclosure
+    assert '<p class="err">the scorecard provenance lines hold no engine= header</p>' in tile
+
+
+def test_a_two_place_pace_prints_both_places() -> None:
+    assert rh.fmt(0.25) == "0.25"
+    assert rh.fmt(1.25) == "1.25"
+    assert rh.fmt(87.53333) == "87.5"
+    assert rh.fmt(2.5) == "2.5"
 
 
 def test_short_pair_cuts_full_commits() -> None:

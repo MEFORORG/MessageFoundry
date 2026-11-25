@@ -257,7 +257,7 @@ def forecast_line(snap: Snapshot) -> str | None:
 
 
 def _positive(value: Any) -> int:
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    return max(_whole(value) or 0, 0)
 
 
 def burndown_undated_note(snap: Snapshot) -> str | None:

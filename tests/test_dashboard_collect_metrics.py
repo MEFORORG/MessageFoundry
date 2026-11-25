@@ -1376,6 +1376,13 @@ def test_backlog_forecast_dates_from_the_pace_it_prints(tmp_path: Path) -> None:
     assert m.detail["no_filing_weeks_to_zero"] == 9.6
 
 
+def test_the_pace_windows_keep_two_places_exact() -> None:
+    # A mean of whole weeks over n is a multiple of 1/n; two places hold it exactly only when n
+    # divides 100. Otherwise the rounded pace the finish is dated from moves a small net by weeks.
+    for n in (cm.FORECAST_WEEKS, cm.FORECAST_SHORT_WEEKS):
+        assert 100 % n == 0, n
+
+
 def test_backlog_forecast_refuses_a_short_history(tmp_path: Path) -> None:
     with pytest.raises(cm.CollectError, match="fewer than 4 full weeks"):
         cm.c_backlog_forecast(_vault_ctx(tmp_path), cm.Metric("x", "", "", "", ""))

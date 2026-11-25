@@ -21,9 +21,9 @@ snapshot, so the directory is refused, before anything is read, whenever the col
 (``refuse_dir_reason``) finds git reporting a work tree there; that guard's docstring says what
 it cannot see. Every ASVS number is shown beside the collector's ref pair (``to_rows.py`` says how
 it is built), its commits shortened on the tile and given in full. The scorecard tool's own ``#``
-header line (the one naming ``engine=``) is on the tile's face when it carries a real ref pair;
-a ``NO-GIT`` header, and the tool's other ``#`` provenance lines, are in the tile's "how it is
-measured" disclosure, so the face never shows a ``NO-GIT`` pair beside the collector's. The ASVS headline is shown
+header line (the one the collector reads ``engine=`` from) is on the tile's face, labelled when
+its scorecard half reads ``NO-GIT`` so the collector's pair is the one to quote; the tool's other
+``#`` provenance lines are in the tile's "how it is measured" disclosure. The ASVS headline is shown
 beside its needs-review and unverified counts, or not at all unless the snapshot holds both.
 
 TIMES ARE US CENTRAL (``to_rows.central``), with the UTC time beside the page's own stamp.
@@ -102,7 +102,10 @@ def fmt(value: Any, unit: str = "") -> str:
             # One decimal would show a nonzero value as 0; keep two significant digits instead.
             text = f"{value:.2g}"
         else:
-            text = f"{value:,.1f}".rstrip("0").rstrip(".")
+            # A value the collector wrote at two places (a weekly pace) keeps both, so the page
+            # prints the figure a date beside it was worked from; anything finer shows one.
+            places = 2 if round(value, 2) == value else 1
+            text = f"{value:,.{places}f}".rstrip("0").rstrip(".")
     elif isinstance(value, int):
         text = f"{value:,}"
     else:
@@ -437,8 +440,6 @@ def lede(headline: Sequence[Mapping[str, Any]]) -> str:
 
 
 _SHA = re.compile(r"\b([0-9a-f]{7})[0-9a-f]{33}\b")
-# The scorecard tool's header is the line naming engine=, as the collector reads it.
-_ENGINE_REF = re.compile(r"\bengine=\S")
 
 
 def short_pair(pair: str) -> str:
@@ -455,21 +456,23 @@ def tile(
     unit = str(row.get("unit") or "")
     shown_unit = "" if unit == "percent" else unit
     # The scorecard tool's provenance lines are part of the measurement (scripts/asvs/CLAUDE.md).
-    # Its header, the line naming engine=, goes on the face only when it carries a real ref pair;
-    # a NO-GIT header (the tool ran from an archive) would put a second, empty pair beside the
-    # collector's, so it joins the other tool lines in the disclosure, labelled.
-    header_line = next((ln for ln in provenance_lines if _ENGINE_REF.search(ln)), None)
-    face_line = header_line if header_line and "NO-GIT" not in header_line else None
-    tool_lines = [ln for ln in provenance_lines if ln != face_line]
+    # Its header, the line the collector reads engine= from, stays on the face; the other tool
+    # lines sit in the disclosure.
+    header_line = cm.asvs_header_line(provenance_lines)
+    tool_lines = [ln for ln in provenance_lines if ln != header_line]
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
-    if row.get("ref") and not provenance_lines:
+    if row.get("ref") and header_line is None:
         # A missing tool header is said on the tile's face, never only inside the disclosure,
         # and beside any other error rather than hidden by it.
         # Its own words, not the provenance fact's error: that fact inherits the metric's error,
         # which says why the metric failed, not that the header is absent.
-        reason = "the snapshot holds no scorecard provenance lines"
+        reason = (
+            "the scorecard provenance lines hold no engine= header"
+            if provenance_lines
+            else "the snapshot holds no scorecard provenance lines"
+        )
         if not error:
             error = reason
         elif reason not in str(error):
@@ -478,20 +481,22 @@ def tile(
     how = ""
     header = ""
     if row.get("ref"):
-        if face_line:
-            header = f'<p class="mono">{esc(face_line)}</p>'
+        if header_line:
+            # The collector hands the tool an archived copy of the scorecard, so the header's
+            # scorecard half reads NO-GIT; labelled, so the face shows one pair to quote.
+            label = (
+                '<p class="note">Scorecard tool header, as printed. The tool reads an archived '
+                "copy of the scorecard, so its scorecard half says NO-GIT; the ref pair under "
+                "Measured at names that copy's vault commit.</p>"
+                if "scorecard=NO-GIT" in header_line
+                else ""
+            )
+            header = f'{label}<p class="mono">{esc(header_line)}</p>'
         # The ASVS ref pair sits beside the value it qualifies, never only in a footnote.
         lines = [
             f'<p>Collector ref pair:</p><p class="mono">{esc(row["ref"])}</p>',
             (
-                "<p>Scorecard tool provenance, as the tool printed it"
-                + (
-                    "; it ran from an archive, so it prints NO-GIT, and the collector's ref "
-                    "pair above is the one to quote"
-                    if header_line and not face_line
-                    else ""
-                )
-                + ':</p><p class="mono">'
+                '<p>Scorecard tool provenance:</p><p class="mono">'
                 + "<br>".join(esc(ln) for ln in tool_lines)
                 + "</p>"
                 if tool_lines

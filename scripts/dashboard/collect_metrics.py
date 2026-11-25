@@ -344,8 +344,8 @@ def pace(history: Sequence[Mapping[str, Any]], full: str, n: int) -> dict[str, A
         return None
     filed = statistics.fmean(int(p["filed"]) for p in weeks)
     closed = statistics.fmean(int(p["closed"]) for p in weeks)
-    # Two places: a mean over 4 or 2 whole weeks is a multiple of 0.25, so the printed pace is
-    # exact, and weeks_to_zero dates the finish from the same figure the page prints.
+    # Two places: a mean over n whole weeks is exact there while n divides 100 (a test pins the
+    # forecast windows to that), so weeks_to_zero dates the finish from the figure the page prints.
     return {
         "weeks": [p["week"] for p in weeks],
         "filed_per_week": round(filed, 2),
@@ -1217,13 +1217,16 @@ def c_asvs(ctx: Context, m: Metric) -> None:
 _ENGINE_REF = re.compile(r"\bengine=(\S+)")
 
 
+def asvs_header_line(provenance: Sequence[str]) -> str | None:
+    """The scorecard tool's provenance header: the first line naming ``engine=``, or ``None``."""
+    return next((line for line in provenance if _ENGINE_REF.search(line)), None)
+
+
 def asvs_engine_ref(provenance: Sequence[str]) -> str | None:
     """The ``engine=<ref>`` the scorecard tool's provenance header names, or ``None``."""
-    for line in provenance:
-        found = _ENGINE_REF.search(line)
-        if found:
-            return found.group(1)
-    return None
+    header = asvs_header_line(provenance)
+    found = _ENGINE_REF.search(header) if header else None
+    return found.group(1) if found else None
 
 
 def asvs_ref_pair(detail: dict[str, Any]) -> str:
