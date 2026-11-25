@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.25.1"
+$GateVersion = "2026.11.25.2"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -922,26 +922,31 @@ function Get-ScanRawIndexMap($Seg) {
 # (BACKLOG #5643). Where Get-QuoteStateMap misreads a quote, the cut lands elsewhere; rule 3d only ADDS
 # the victims read from this text, so a misreading costs a false deny or a victim not read here, never a
 # deny the other splits make.
+#
+# Three cases answer less than the split's text (review round of 70fbdc7122a, each measured a false
+# deny there, ALLOW on origin/main). Where the character before $Start is not code, the verb ended
+# inside a quote or comment, so the text after it is a mention and this answers "". A comment, a `#`
+# Get-QuoteStateMap reads literal after a character it reads as not literal, ends the text, since
+# nothing after it is an argument. And $Split is matched against $Raw with every character the shell
+# does not read as code masked to `_`, so a lookbehind sees the mask and not the literal: in `\&&`
+# the escaped `&` no longer hides the lone `&` after it, which the shell reads as a separator.
 function Get-CodeSplitPrefix([string]$Raw, $Quote, [int]$Start, [string]$Split) {
     if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
     $q = $Quote
-    $tail = $Raw.Substring($Start)
-    $re = [regex]::new($Split)
-    $from = 0
-    while ($from -le $tail.Length) {
-        $m = $re.Match($tail, $from)
-        if (-not $m.Success) { break }
-        $at = $Start + $m.Index
-        $code = $true
-        for ($k = $at; $k -lt $at + $m.Length; $k++) {
-            if ($q[$k] -ne [char]'N') { $code = $false; break }
+    if ($Start -gt 0 -and $q[$Start - 1] -ne [char]'N') { return "" }
+    $end = $Raw.Length
+    for ($k = $Start; $k -lt $Raw.Length; $k++) {
+        if ($Raw[$k] -eq [char]'#' -and $q[$k] -eq [char]'S' -and $k -gt 0 -and $q[$k - 1] -ne [char]'S') {
+            $end = $k; break
         }
-        if ($code) { return $tail.Substring(0, $m.Index) }
-        # One character on, not past the match: in `\||` only the first `|` is literal, and the
-        # separator after it must still be tried.
-        $from = $m.Index + 1
     }
-    $tail
+    $masked = [char[]]::new($end)
+    for ($k = 0; $k -lt $end; $k++) {
+        $masked[$k] = $(if ($q[$k] -eq [char]'N') { $Raw[$k] } else { [char]'_' })
+    }
+    $m = [regex]::new($Split).Match([string]::new($masked), $Start)
+    if ($m.Success) { $end = $m.Index }
+    $Raw.Substring($Start, $end - $Start)
 }
 
 # ===================================================================================================

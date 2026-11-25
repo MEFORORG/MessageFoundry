@@ -367,6 +367,25 @@ def test_a_quoted_separator_control_is_allowed(rig: SimpleNamespace, template: s
     assert _allowed(rig, cmd, rig.outside)
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        # The first reading's `worktree remove` is inside a quoted mention, so the text after it is
+        # not a victim the shell passes to git.
+        'git commit -m "see worktree remove x; -- {tmp}/Primary-wt2" && git worktree remove {o}/nope',
+        # A `#` comment is not argument text, and a separator inside it ends nothing.
+        "git worktree remove {o}/nope # x; echo -- {tmp}/Primary-wt2",
+        # `\\&&` is a literal `&` and then a lone `&`, which the shell does read as a separator.
+        "git worktree remove {o}/nope\\&& echo -- {tmp}/Primary-wt2",
+    ],
+)
+def test_the_quote_aware_split_adds_no_false_deny(rig: SimpleNamespace, template: str) -> None:
+    """ALLOW on origin/main; each was DENIED by the first quote-aware victim split (review round
+    of 70fbdc7122a), which read a quoted mention, a comment, or the text past `\\&&` as a victim."""
+    cmd = template.format(tmp=rig.tmp.as_posix(), o=rig.outside.as_posix())
+    assert _allowed(rig, cmd, rig.outside)
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="the case-insensitive match is Windows-only")
 def test_a_printed_upper_case_git_is_not_judged_on_windows(rig: SimpleNamespace) -> None:
     """ALLOW on origin/main; the case-insensitive token test caught a word `echo` prints."""
