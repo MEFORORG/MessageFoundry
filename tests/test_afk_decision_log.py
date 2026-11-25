@@ -466,3 +466,94 @@ def test_an_outcome_record_refers_to_a_decision(sb: Sandbox) -> None:
     assert sb.run(DECISION, *args).returncode == 0
     outcome = next(r for r in _list(sb) if r["kind"] == "outcome")
     assert outcome["ref"] == did and outcome["outcome"] == "reversed"
+
+
+# BACKLOG #7555: on a host whose OutputEncoding setter throws IOException, Invoke-DecisionGh threw.
+# A stub stands in for System.Console, so the real console's code page is never set by these tests.
+# A gh.ps1 stub first on PATH prints the prompt variable gh saw and exits 3, so the tests also prove
+# gh still ran under GH_PROMPT_DISABLED=1 and that its failure still comes back as its own code.
+
+_DECISIONLOG = COORD / "_decisionlog.ps1"
+
+
+def _throwing_console(exception: str) -> str:
+    """A pwsh prelude pointing the ``Console`` accelerator at a stub whose setter throws."""
+    return (
+        "Add-Type -TypeDefinition @'\n"
+        "public static class MeforDecisionThrowingConsole {\n"
+        "    public static int SetAttempts;\n"
+        "    public static System.Text.Encoding OutputEncoding {\n"
+        "        get { return System.Console.OutputEncoding; }\n"
+        f'        set {{ SetAttempts++; throw new {exception}("The handle is invalid."); }}\n'
+        "    }\n"
+        "    public static System.IO.TextWriter Out { get { return System.Console.Out; } }\n"
+        "    public static System.IO.TextWriter Error { get { return System.Console.Error; } }\n"
+        "}\n"
+        "'@\n"
+        "[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')"
+        "::Add('Console', [MeforDecisionThrowingConsole])\n"
+    )
+
+
+_SET_ATTEMPTS = (
+    '[System.Console]::Out.WriteLine("SETS=$([MeforDecisionThrowingConsole]::SetAttempts)")\n'
+)
+
+
+def _run_decision_gh(tmp_path: Path, prelude: str, epilogue: str) -> dict[str, str]:
+    """Dot-source the library, call Invoke-DecisionGh against the stub, and read KEY=value lines."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gh.ps1").write_text(
+        '"SAW=$env:GH_PROMPT_DISABLED"; exit 3\n',
+        encoding="utf-8",
+    )
+    lib = "'" + str(_DECISIONLOG).replace("'", "''") + "'"
+    out_line = "[System.Console]::Out.WriteLine"
+    script = (
+        prelude
+        + f". {lib}\n"
+        + "try { $r = Invoke-DecisionGh @('api', 'x')\n"
+        + f'  {out_line}("CODE=$($r.Code)"); {out_line}("GHOUT=$($r.Out)") }}\n'
+        + f'catch {{ {out_line}("THREW=$($_.Exception.Message)") }}\n'
+        + epilogue
+    )
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=tmp_path,
+        env=env,
+        timeout=GUARDED_TIMEOUT_S,
+    )
+    got: dict[str, str] = {"_raw": proc.stdout + proc.stderr}
+    for line in proc.stdout.splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            got[key.strip()] = value.strip()
+    return got
+
+
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
+def test_invoke_decision_gh_does_not_throw_when_the_encoding_setter_refuses(
+    tmp_path: Path,
+) -> None:
+    got = _run_decision_gh(tmp_path, _throwing_console("System.IO.IOException"), _SET_ATTEMPTS)
+    assert "THREW" not in got, got["_raw"]
+    # gh itself ran with prompts disabled, and its failure came back as its own code.
+    assert got.get("CODE") == "3" and got.get("GHOUT") == "SAW=1", got["_raw"]
+    # The control: the setter was reached, so the refusal path really ran.
+    assert got.get("SETS") == "1", got["_raw"]
+
+
+@pytest.mark.timeout(GUARDED_TIMEOUT_S)
+def test_invoke_decision_gh_still_throws_a_console_error_that_is_not_io(tmp_path: Path) -> None:
+    """The negative control: only an IOException from the setter is caught."""
+    prelude = _throwing_console("System.InvalidOperationException")
+    got = _run_decision_gh(tmp_path, prelude, _SET_ATTEMPTS)
+    assert "THREW" in got and "CODE" not in got, got["_raw"]
+    assert got.get("SETS") == "1", got["_raw"]

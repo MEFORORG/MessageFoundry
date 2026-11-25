@@ -933,10 +933,21 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             "`tests` was imported from another checkout, so its list would mark this one's tests"
         )
     names = frozenset(tooling_manifest.names())  # raises if absent or malformed -- see above
+    stray: list[str] = []
     for item in items:
         path = getattr(item, "path", None)
         if path is not None and path.parent == _TESTS_DIR and path.name in names:
             item.add_marker(pytest.mark.tooling)
+        elif item.get_closest_marker("tooling") is not None:
+            stray.append(item.nodeid)
+    # A `tooling` mark from anywhere but the manifest is refused, on every leg and platform. The
+    # engine legs deselect such a test and the tier's test shards, split from the manifest, never
+    # name it, so it would run nowhere with every check green.
+    if stray:
+        raise RuntimeError(
+            "these tests carry the `tooling` mark but are not in tests/tooling_manifest.txt, so no "
+            f"leg would run them; list the file or drop the mark: {sorted(stray)[:5]}"
+        )
     # BACKLOG #4773: the timing quarantine, from tests/timing_quarantine.txt, which states its rules.
     timing_quarantine.mark_quarantined(items, _TESTS_DIR)
 

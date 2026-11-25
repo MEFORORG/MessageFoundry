@@ -337,3 +337,71 @@ export function wiringMapPayload(g: Graph | undefined, focus: MapFocus | null): 
   }
   return { type: "map", map, focus, names };
 }
+
+/**
+ * The source location a Wiring Map "open" request may open, or undefined to refuse it (ASVS 5.3.2,
+ * BACKLOG #4277). The page posts back a node's `open.file` copied unchanged from the payload it was
+ * sent, but a page script is not trusted to name a file: the string must EQUAL the file of an
+ * element the current graph reports, read through the same collectElements the payload is built
+ * from, so what the map offers and what this accepts share one source. Exact equality, not a
+ * resolved or case-folded key, so neither the workspace root nor the platform's case rules can widen
+ * the match. The line is only a cursor position; a value that is not a positive safe integer falls
+ * back to 1. This checks WHO named the file, not WHERE it is: a graph that reports a file outside
+ * the workspace (on a UNC share, say) still opens it.
+ */
+export function graphOpenTarget(
+  g: Graph | undefined,
+  file: unknown,
+  line: unknown,
+): { file: string; line: number } | undefined {
+  if (!g || typeof file !== "string") {
+    return undefined;
+  }
+  let reported = false;
+  for (const e of collectElements(normalize(g)).values()) {
+    if (e.open?.file === file) {
+      reported = true;
+      break;
+    }
+  }
+  if (!reported) {
+    return undefined;
+  }
+  const ln = typeof line === "number" && Number.isSafeInteger(line) && line >= 1 ? line : 1;
+  return { file, line: ln };
+}
+
+/** What the Wiring Map host needs to act on an "open" request; injected so the decision is tested node-side. */
+export interface OpenRequestHost {
+  /** Runs a VS Code command; the host passes vscode.commands.executeCommand. */
+  execute(command: string, ...args: unknown[]): PromiseLike<unknown>;
+  /** Tells the operator something went wrong; the host passes a warning toast. */
+  warn(message: string): void;
+}
+
+/**
+ * Act on a Wiring Map "open" request (BACKLOG #4277): open the file through messagefoundry.openSource
+ * only when graphOpenTarget accepts it, passing the graph's file, never the page's; otherwise warn and
+ * open nothing. A failed open (a file gone since the last refresh) warns rather than being dropped.
+ */
+export async function handleOpenRequest(
+  g: Graph | undefined,
+  file: unknown,
+  line: unknown,
+  host: OpenRequestHost,
+): Promise<void> {
+  const target = graphOpenTarget(g, file, line);
+  if (!target) {
+    host.warn(
+      g
+        ? "MessageFoundry: the Wiring Map asked to open a file the wiring graph does not report; it was not opened."
+        : "MessageFoundry: no wiring graph is loaded, so the Wiring Map cannot open a file.",
+    );
+    return;
+  }
+  try {
+    await host.execute("messagefoundry.openSource", target.file, target.line);
+  } catch (err) {
+    host.warn(`MessageFoundry: could not open the source file: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}

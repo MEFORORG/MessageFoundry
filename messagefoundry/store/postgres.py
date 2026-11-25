@@ -217,6 +217,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -3142,6 +3143,7 @@ class PostgresStore:
                 status=StorePrivilegeStatus.UNOBSERVABLE,
                 principal=str(scalar["principal"] or ""),
                 database=database,
+                unread=("CREATE on the store's schema",),
                 detail=(
                     "current_schema() resolved to NULL, so CREATE on the store's schema was not read; "
                     "[store].schema_management is 'external', which requires the runtime role to hold "
@@ -3168,7 +3170,8 @@ class PostgresStore:
             # read unobserved rather than clean. With an over-grant already found it stays OBSERVED,
             # so the start still refuses on what WAS read: a partial read only understates.
             unread_note = (
-                f"the audit-table grants read NULL for {', '.join(audit_unread)}, so whether this "
+                "the audit-table grants read NULL, or a value that is not true or false, for "
+                f"{', '.join(audit_unread)}, so whether this "
                 "role can change audit rows was not read; [store].schema_management is "
                 "'external', which requires INSERT and SELECT only on audit_log"
             )
@@ -3178,6 +3181,7 @@ class PostgresStore:
                     status=StorePrivilegeStatus.UNOBSERVABLE,
                     principal=str(scalar["principal"] or ""),
                     database=database,
+                    unread=audit_unread,
                     detail=unread_note,
                 )
             unread_note = "; " + unread_note
@@ -3192,6 +3196,8 @@ class PostgresStore:
             server_roles=(),
             database_roles=tuple(f.name for f in facts if not f.is_self),
             excess=excess,
+            # #6015 item 2: an unread audit grant beside a read over-grant reaches the summary.
+            unread=audit_unread if external else (),
             detail=(
                 "roles are every role this principal may assume (pg_has_role MEMBER, so roles reached by "
                 "inheritance and by the set-role command alike); role ATTRIBUTES (SUPERUSER/CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS) "
@@ -3975,21 +3981,21 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                for r in rows:
-                    await conn.execute(
-                        f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
-                        (
-                            await self._aencrypt(
-                                r["v"],
-                                aad=(
-                                    aad_of(r)
-                                    if aad_of is not None
-                                    else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                ),
-                            )
-                        ),
-                        *(r[c] for c in keys),
-                    )
+                async for chunk, sealed_values in seal_chunks(
+                    self._cipher,
+                    table,
+                    column,
+                    rows,
+                    aad_cols=aad_cols,
+                    aad_of=aad_of,
+                    local_whole_page=False,
+                ):
+                    for value, r in zip(sealed_values, chunk, strict=True):
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE {where_keys}",
+                            value,
+                            *(r[c] for c in keys),
+                        )
                 sealed += len(rows)
         # Top the reserve back up for whatever follows; the burst itself was reserved above.
         await self._charge_bound_batch()

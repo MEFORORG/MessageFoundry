@@ -77,7 +77,7 @@ _HOOK_PATH_DEFAULT = re.search(
 INSTALLER_DEFAULT_REL: str | None = _HOOK_PATH_DEFAULT.group(1) if _HOOK_PATH_DEFAULT else None
 
 # A SessionStart command names its script as a double-quoted, single-quoted, or bare path. All four
-# commands wired on this box today are double-quoted and install-selfheal.ps1:96 only ever emits that
+# commands wired on this box today are double-quoted and install-selfheal.ps1's $entry only ever emits that
 # form, so the other two branches are hardening rather than a live need.
 #
 # The single-quote branch is NOT redundant with the bare branch, which is the trap: without it,
@@ -99,7 +99,7 @@ def content_hash(data: bytes) -> str:
     Deliberately the SAME basis as ``test_gate_installed_parity.content_hash`` and
     ``test_installed_coord_hooks.content_hash``. The reasoning and the measurements behind choosing
     content over bytes are stated once, in the first of those; the consequence here is the same
-    mechanism -- ``install-selfheal.ps1`` copies the payload with ``Copy-Item`` (:57), which translates
+    mechanism -- ``install-selfheal.ps1`` copies the payload with ``Copy-Item``, which translates
     nothing, so the installed file carries whatever line endings the checkout that installed it had. On a
     box with ``core.autocrlf=true`` a byte-exact digest therefore reports a difference that ``git status``
     reports as clean, about a file with no content change at all, and the prescribed remedy for that false

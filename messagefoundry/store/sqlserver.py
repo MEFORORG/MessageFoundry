@@ -74,6 +74,8 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
     _clamped_statement_timeout,
+    _sqlserver_shared_borrow_limit,
+    _sqlserver_statement_timeout_left,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -101,6 +103,7 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreAcquireTimeout,
     StoreNotFoundError,
     TableCensusIncomplete,
     acquire_pooled,
@@ -209,6 +212,7 @@ from messagefoundry.store.row_seal import (
     cipher_call,
     classify_unrotated,
     row_sealer_for_cipher,
+    seal_chunks,
 )
 from messagefoundry.store.schema_verify import IndexShape
 from messagefoundry.store.sealed_cache import (
@@ -3561,21 +3565,6 @@ def _any_grant(answers: str) -> str:
     )
 
 
-def _probed_grant(value: Any) -> bool | None:
-    """Classify one privilege-probe column THREE ways: ``True`` held, ``False`` not held, ``None`` **not
-    read**. A NULL never becomes a boolean here, and that is the whole point (BACKLOG #1234).
-
-    ``IS_SRVROLEMEMBER``, ``IS_ROLEMEMBER`` and ``HAS_PERMS_BY_NAME`` each return **NULL** — not 0 —
-    when the name they are asked about does not resolve *for this caller*: an unknown or renamed role,
-    a principal the caller cannot see, a permission name this server version does not carry. Folding
-    that NULL through ``== 1`` yields ``False``, which reads as *"not a member"* and therefore as
-    clean, so a probe that read NOTHING would render as a clean bill of health — the exact false-clean
-    :meth:`SqlServerStore.probe_principal_privileges` names catalog enumeration to avoid, arriving by
-    the other door. ``True``/``False`` from a driver that returns booleans still read as ``1``/``0``;
-    any other value is not read either, by :func:`~messagefoundry.store.privilege.probed_grant`."""
-    return probed_grant(value)
-
-
 class SqlServerStore:
     """SQL Server-backed durable queue (the :class:`Store` protocol). Open with :meth:`open`."""
 
@@ -4795,23 +4784,20 @@ class SqlServerStore:
                     rows = [dict(zip(names, r)) for r in await cur.fetchall()]  # noqa: B905
                     if not rows:
                         break
-                    for r in rows:
-                        await cur.execute(
-                            f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
-                            (
-                                (
-                                    await self._aencrypt(
-                                        r["v"],
-                                        aad=(
-                                            aad_of(r)
-                                            if aad_of is not None
-                                            else cell_aad(table, column, *(r[c] for c in aad_cols))
-                                        ),
-                                    )
-                                ),
-                                *(r[c] for c in keys),
-                            ),
-                        )
+                    async for chunk, sealed_values in seal_chunks(
+                        self._cipher,
+                        table,
+                        column,
+                        rows,
+                        aad_cols=aad_cols,
+                        aad_of=aad_of,
+                        local_whole_page=False,
+                    ):
+                        for value, r in zip(sealed_values, chunk, strict=True):
+                            await cur.execute(
+                                f"UPDATE {table} SET [{column}]=? WHERE {where_keys}",
+                                (value, *(r[c] for c in keys)),
+                            )
                     sealed += len(rows)
                 await self._commit(conn)
             except BaseException:
@@ -5198,15 +5184,25 @@ class SqlServerStore:
         SERVER``, ``CONTROL`` on the database), so a principal over-granted by direct ``GRANT`` rather
         than by role membership is still seen.
 
-        **A NULL column is NOT READ, and a read that is not complete is never ``OBSERVED``** (BACKLOG
-        #1234). All three built-ins answer NULL when the name does not resolve for the caller, so the
-        argument above — *an empty enumeration must not render as a clean bill of health* — was
-        defeated by its own replacement until this arm distinguished the three states. Any probed
-        grant that reads NULL makes the whole report :attr:`StorePrivilegeStatus.UNOBSERVABLE`, named
-        grant by grant in the detail, because the documented grant is then genuinely UNVERIFIED: a
-        role that was never read is not a role the principal does not hold. Grants that DID read as
-        held are still reported, since a partial read can only understate an over-grant, never invent
-        one."""
+        **A NULL column is NOT READ, and so is any answer but 0 or 1** (BACKLOG #1234, #6015, by
+        :func:`~messagefoundry.sqlserver_roles.probed_grant`). All three built-ins answer NULL when
+        the name does not resolve for the caller, so the argument above — *an empty enumeration must
+        not render as a clean bill of health* — was defeated by its own replacement until this arm
+        distinguished the three states. A fixed role, ``CONTROL SERVER`` or database ``CONTROL``
+        that is not read is named grant by grant in the detail and in ``unread``: a role that was
+        never read is not a role the principal does not hold. With no over-grant read, that makes
+        the report :attr:`StorePrivilegeStatus.UNOBSERVABLE` (#1234). With one read, such as
+        ``sysadmin``, ``db_owner`` or a ``CONTROL``, the report stays ``OBSERVED`` with it in the
+        excess, so under enforce with no accepted opt-out the start refuses (owner ruling
+        2026-11-23 on #6015 item 1). A partial read can only understate an over-grant, never
+        invent one.
+
+        The grants that count only under ``external`` (``CREATE TABLE``, ``ALTER`` on the default
+        schema, ``VIEW DEFINITION`` on the default schema and ``dbo``, the audit-table rights) are
+        weighed after the excess (#6714): unread with nothing else found, the report is
+        ``UNOBSERVABLE``; unread beside an over-grant that WAS read, it stays ``OBSERVED`` and names
+        them in :attr:`~messagefoundry.store.privilege.StorePrivilegeReport.unread`, so the
+        over-grant is weighed as one (under enforce with no accepted opt-out, the start refuses)."""
         server_cols = [
             f"IS_SRVROLEMEMBER(?) AS srv_{i}" for i in range(len(SQLSERVER_FIXED_SERVER_ROLES))
         ]
@@ -5226,7 +5222,9 @@ class SqlServerStore:
             # counted only under external, where the runtime login must hold none.
             " HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE') AS create_table,"
             " SCHEMA_NAME() AS default_schema,"
-            " HAS_PERMS_BY_NAME(SCHEMA_NAME(), 'SCHEMA', 'ALTER') AS alter_schema,"
+            # QUOTENAME (#6015 item 4), as the VIEW DEFINITION columns below and the proc-deploy
+            # guard pass their schema, so the schema probes quote one way.
+            " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'ALTER') AS alter_schema,"
             # #6714: VIEW DEFINITION on the two schemas a store's tables resolve through. Only
             # provision-admin needs it, so under external the runtime login holding it is excess.
             " HAS_PERMS_BY_NAME(QUOTENAME(SCHEMA_NAME()), N'SCHEMA', N'VIEW DEFINITION')"
@@ -5242,27 +5240,27 @@ class SqlServerStore:
                 detail="the privilege query returned no row",
             )
         database = str(row["db_name"] or self._settings.database or "")
-        # Three-way, never two: held / not held / NOT READ. See _probed_grant for why a NULL folded to
+        # Three-way, never two: held / not held / NOT READ. See probed_grant for why a NULL folded to
         # False is a false-clean rather than a rounding error.
         unread: list[str] = []
         held_server: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_SERVER_ROLES):
-            grant = _probed_grant(row[f"srv_{i}"])
+            grant = probed_grant(row[f"srv_{i}"])
             if grant is None:
                 unread.append(f"server role {name}")
             elif grant:
                 held_server.append(name)
         held_database: list[str] = []
         for i, name in enumerate(SQLSERVER_FIXED_DATABASE_ROLES):
-            grant = _probed_grant(row[f"dbr_{i}"])
+            grant = probed_grant(row[f"dbr_{i}"])
             if grant is None:
                 unread.append(f"database role {name}")
             elif grant:
                 held_database.append(name)
-        control_server = _probed_grant(row["control_server"])
+        control_server = probed_grant(row["control_server"])
         if control_server is None:
             unread.append("control server")
-        control_database = _probed_grant(row["control_db"])
+        control_database = probed_grant(row["control_db"])
         if control_database is None:
             unread.append(f"CONTROL on database {database}")
         external = self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
@@ -5270,19 +5268,19 @@ class SqlServerStore:
         # unread one never turns an over-grant that WAS read into an unobserved report: it is
         # weighed after the excess, below (#6714), so a read db_owner still refuses under enforce.
         external_unread: list[str] = []
-        create_table = _probed_grant(row["create_table"])
+        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
+        create_table = probed_grant(row["create_table"])
         if create_table is None:
             external_unread.append(f"create table on database {database}")
-        alter_schema = _probed_grant(row["alter_schema"])
+        alter_schema = probed_grant(row["alter_schema"])
         if alter_schema is None:
-            external_unread.append("ALTER on the default schema")
+            external_unread.append(f"ALTER on schema {default_schema}")
         # #6714: one column per distinct schema; when the default schema is dbo the two name one.
-        default_schema = str(row["default_schema"] or "") or "(unresolved default schema)"
         view_def_columns = {default_schema: "view_def_default"}
         view_def_columns.setdefault("dbo", "view_def_dbo")
         view_definition: list[str] = []
         for schema, column in view_def_columns.items():
-            grant = _probed_grant(row[column])
+            grant = probed_grant(row[column])
             if grant is None:
                 external_unread.append(view_definition_grant(schema))
             elif grant:
@@ -5295,25 +5293,59 @@ class SqlServerStore:
             probed = len(SQLSERVER_FIXED_SERVER_ROLES) + len(SQLSERVER_FIXED_DATABASE_ROLES) + 2
             held_labels = [f"server role {r}" for r in server_roles]
             held_labels += [f"database role {r}" for r in database_roles]
+            # A read CONTROL is an over-grant this report may refuse on, so it is named as read.
+            if control_server:
+                held_labels.append("control server")
+            if control_database:
+                held_labels.append(f"CONTROL on database {database}")
             also_unread = ""
             if external:  # owner ruling R16 and #6714: each is a finding there
+                if create_table:
+                    held_labels.append(f"create table on database {database}")
+                if alter_schema:
+                    held_labels.append(f"ALTER on schema {default_schema}")
                 held_labels += list(audit_writes)
                 if view_definition:
                     held_labels.append(view_definition_grant(*view_definition))
                 if external_unread:
                     also_unread = f"; also not read: {', '.join(external_unread)}"
-            # The catalog enumeration below is skipped deliberately: it is additive only, and widening
-            # a report already saying the read was incomplete buys nothing an operator can act on.
+            # Owner ruling 2026-11-23 on #6015 item 1 ("Refuse when read"): an over-grant that WAS
+            # read keeps the report OBSERVED with it in the excess, so it is weighed as one (under
+            # enforce it refuses) rather than demoted to an unobserved warning by a neighbouring
+            # unread column. Unread reads as not held here, which can only understate the excess.
+            read_excess = sqlserver_excess(
+                server_roles=server_roles,
+                database_roles=database_roles,
+                control_server=control_server is True,
+                control_database=control_database is True,
+                database=database,
+                external=external,
+                create_table=create_table is True,
+                alter_schema=(default_schema if alter_schema else None),
+                audit_writes=audit_writes,
+                view_definition=tuple(view_definition),
+            )
+            # The catalog enumeration below is skipped on this path, so a user-defined role is not
+            # weighed here: with no fixed-role over-grant read, a login whose only over-grant is a
+            # user-defined role reads unobserved, which under enforce warns unless
+            # [store].require_least_privilege is declared.
             return StorePrivilegeReport(
                 backend=self.backend,
-                status=StorePrivilegeStatus.UNOBSERVABLE,
+                status=(
+                    StorePrivilegeStatus.OBSERVED
+                    if read_excess
+                    else StorePrivilegeStatus.UNOBSERVABLE
+                ),
                 principal=str(row["login_name"] or ""),
                 database=database,
                 server_roles=server_roles,
                 database_roles=database_roles,
+                excess=read_excess,
+                unread=tuple(unread + (external_unread if external else [])),
                 detail=(
                     f"the privilege query returned NULL, or a value that is not 0 or 1, for"
-                    f" {len(unread)} of {probed} probed grant(s), so they were not read and must not"
+                    f" {len(unread)} of the {probed} role and CONTROL grant(s) probed, so they were"
+                    " not read and must not"
                     f" be reported as absent: {', '.join(unread)}"
                     " (IS_SRVROLEMEMBER / IS_ROLEMEMBER / HAS_PERMS_BY_NAME answer NULL when the name"
                     " does not resolve for this caller); what DID read as held:"
@@ -5350,7 +5382,8 @@ class SqlServerStore:
             database=database,
             external=external,
             create_table=bool(create_table),
-            alter_schema=(str(row["default_schema"] or "") if alter_schema else None),
+            # The unresolved label, never "": an empty name would read as no grant (a false clean).
+            alter_schema=(default_schema if alter_schema else None),
             audit_writes=audit_writes,
             view_definition=tuple(view_definition),
         )
@@ -5371,6 +5404,7 @@ class SqlServerStore:
                     database=database,
                     server_roles=server_roles,
                     database_roles=database_roles,
+                    unread=tuple(external_unread),
                     detail=(
                         f"{note}; [store].schema_management is 'external', which requires INSERT and"
                         " SELECT only on audit_log, no schema DDL right and no view definition on"
@@ -5385,6 +5419,8 @@ class SqlServerStore:
             server_roles=server_roles,
             database_roles=database_roles,
             excess=excess,
+            # #6015 item 2: an unread external grant beside a read over-grant reaches the summary.
+            unread=tuple(external_unread) if external else (),
             detail=(
                 f"database user {str(row['db_user'] or '')!r}; {note}; measured against the "
                 + (
@@ -6549,37 +6585,71 @@ class SqlServerStore:
         return await self._fetch_rows(sql, params)
 
     def _clamp_bounds(
-        self, timeout_clamp: float | None
+        self, timeout_clamp: float | None, *, share_deadline: bool = False
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
         """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
         ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
         the borrow, the statement and the rollback bounds, so none can be set without the others; a
         shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
-        the other two."""
+        the other two. With ``share_deadline`` the statement timeout is only a cap, which
+        :meth:`_statement_timeout_left` cuts to what the borrow left (BACKLOG #5064)."""
         if timeout_clamp is None:
             return self._acquire(), None, None
         # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
         # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
         # rollback after a failure gets the same floored clamp (BACKLOG #5066).
         floored_clamp = max(1.0, timeout_clamp)
+        borrow_limit = (
+            _sqlserver_shared_borrow_limit(timeout_clamp) if share_deadline else floored_clamp
+        )
         return (
-            self._acquire_clamped(floored_clamp),
+            self._acquire_clamped(borrow_limit),
             _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
             floored_clamp,
         )
 
+    @staticmethod
+    def _statement_timeout_left(timeout_clamp: float, statement_cap: int, started: float) -> int:
+        """The statement timeout of a statement whose borrow and statement share the clamp's
+        deadline, given the ``perf_counter()`` taken before its borrow: the whole seconds the borrow
+        left (:func:`~messagefoundry.config.settings._sqlserver_statement_timeout_left`). Raises
+        :class:`StoreAcquireTimeout` when the borrow left less than the 1 s a statement needs, so
+        the statement is never issued past the deadline; a renew refused here extends nothing
+        (BACKLOG #5064). The message stays inside ``safe_exc``'s default limit."""
+        elapsed = perf_counter() - started
+        seconds = _sqlserver_statement_timeout_left(timeout_clamp, elapsed, statement_cap)
+        if seconds is None:
+            raise StoreAcquireTimeout(
+                f"sqlserver: pool wait left under 1s of a {max(1.0, timeout_clamp):g}s clamp;"
+                f" statement not issued; retune with {CLAMPED_BORROW_ADVICE}"
+            )
+        return seconds
+
     async def _fetch_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        share_deadline: bool = False,
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
         says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
         keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
         refresh are MERGEs that come through here, so a claim that committed must not read as a
         failed renew (BACKLOG #5064)."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(
+            timeout_clamp, share_deadline=share_deadline
+        )
+        started = perf_counter()
         result: list[dict[str, Any]] | None = None
         try:
             async with borrow as conn:
+                if share_deadline and timeout_clamp is not None and statement_timeout is not None:
+                    # Before the try: a refusal here has issued nothing, so nothing to roll back.
+                    statement_timeout = self._statement_timeout_left(
+                        timeout_clamp, statement_timeout, started
+                    )
                 try:
                     async with (
                         self._statement_timeout(conn, statement_timeout),
@@ -6619,7 +6689,12 @@ class SqlServerStore:
         return rows[0] if rows else None
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
@@ -6631,17 +6706,27 @@ class SqlServerStore:
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+        So a call can take up to about twice the clamp before its statement returns.
 
-        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
-        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
-        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
-        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
-        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
-        statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
-        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
-        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
+        **``share_deadline``, which only the lease claim passes (BACKLOG #5064),** puts the two
+        under one deadline, the clamp floored at 1 s from before the borrow, as
+        ``DbCoordinator``'s borrow and statement share one (``pipeline.cluster._call_within``). The
+        borrow waits at most
+        :func:`~messagefoundry.config.settings._sqlserver_shared_borrow_limit`, and the statement
+        timeout is then cut to the whole seconds the borrow left, or the statement is refused
+        (:meth:`_statement_timeout_left`). From a 2 s clamp up the statement timeout therefore
+        expires by the deadline. Under 2 s the whole-second timeout cannot fit after any borrow, so
+        it runs at 1 s and the claim can overrun the clamp by up to 1 s less its fraction.
+        ``ServiceSettings._sqlserver_renew_bounds`` still counts the two as separate windows. Only
+        the claim takes this because only it re-extends the lease; the heartbeat, refresh and
+        release keep both windows, so a busy pool fails them no sooner than before.
+
+        **Outside both windows, and outside the shared deadline:** at least the cursor's creation,
+        an executor dispatch between the borrow and the statement, and the COMMIT after it. The
+        COMMIT is a call on the connection, not a statement, so neither the clamp nor
+        ``[store].command_timeout`` is known to bound it, by a reading of pyodbc's documentation,
+        not a measurement. Whether msodbcsql bounds ``SQLEndTran`` needs a live SQL Server, and
+        BACKLOG #6621 measures it (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -6652,7 +6737,7 @@ class SqlServerStore:
         session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
         its close lands or the server ends it, and the timed-out rollback keeps its executor thread
         until the driver returns."""
-        rows = await self._fetch_rows(sql, params, timeout_clamp)
+        rows = await self._fetch_rows(sql, params, timeout_clamp, share_deadline=share_deadline)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
