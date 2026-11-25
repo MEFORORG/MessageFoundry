@@ -33,6 +33,7 @@ through the real routes as the built-in Auditor.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import csv
 import io
 import json
@@ -1359,3 +1360,81 @@ async def test_a_cancel_as_the_writes_finish_is_not_swallowed() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert written == ["row"], "the write was abandoned"
+
+
+class _WriteFailed(Exception):
+    """The synthetic failure of a deferred audit write."""
+
+
+async def test_a_cancel_then_a_failing_write_ends_in_the_cancel_and_logs_the_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #6884. RED when: ``_write_through_cancellation`` lets a write's error escape after
+    an earlier cancel. The cancel lands while the write waits; the write then fails on the loop's
+    next wait. The caller must end in ``CancelledError``, with the write's error logged,
+    and not leave with the write's error and its cancel unconsumed. The test above covers a cancel
+    in the turn the write finishes; this one parts the two by a whole wait."""
+    from messagefoundry.auth.service import _write_through_cancellation
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def write() -> None:
+        started.set()
+        await release.wait()
+        raise _WriteFailed("synthetic write failure")
+
+    task = asyncio.ensure_future(_write_through_cancellation([write], what="the test's write"))
+    try:
+        await started.wait()
+        task.cancel()
+        for _ in range(3):  # let the cancel land on the caller's wait before the write fails
+            await asyncio.sleep(0)
+        assert not task.done(), "the caller left before its write finished"
+        # The failure is logged once, by the service, and asyncio adds no second record of THIS
+        # write's error (a cancelled shield used to add "exception in shielded future"). Only those
+        # are counted, so an unrelated ERROR from elsewhere in the run cannot fail the test.
+        with caplog.at_level(logging.ERROR):
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    finally:
+        # A failed assertion above must not leave the write pending past the test.
+        release.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, _WriteFailed):
+                await task
+    assert task.cancelled()
+    errors = [
+        r
+        for r in caplog.records
+        if r.name == "messagefoundry.auth.service" and r.levelno >= logging.ERROR
+    ]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    # The walk below reads the same capture that just held the service's record, so it saw records.
+    assert len(caplog.records) >= 1
+    echoed = [
+        r
+        for r in caplog.records
+        if r.name == "asyncio"
+        and r.exc_info is not None
+        and isinstance(r.exc_info[1], _WriteFailed)
+    ]
+    assert echoed == [], [r.getMessage() for r in echoed]
+    assert "the test's write failed while the request was cancelled" in errors[0].getMessage()
+    assert errors[0].exc_info is not None and isinstance(errors[0].exc_info[1], _WriteFailed)
+
+
+async def test_an_uncancelled_caller_still_gets_the_write_error() -> None:
+    """BACKLOG #6884, the control. RED when: the fix swallows a write's error for a caller nobody
+    cancelled. With no cancel, a failed write raises to the caller as it did when the rows were
+    written inline."""
+    from messagefoundry.auth.service import _write_through_cancellation
+
+    async def write() -> None:
+        await asyncio.sleep(0)
+        raise _WriteFailed("synthetic write failure")
+
+    with pytest.raises(_WriteFailed):
+        await _write_through_cancellation([write])
