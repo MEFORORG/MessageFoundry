@@ -997,7 +997,9 @@ async def require_seal_for_write(
         return
     if kind != SESSION_KIND and stored is not None and not isinstance(stored, str):
         # A record's stored seal that is not text (a BLOB a writer put there) is no seal: Forged,
-        # as main's record checks read it. A session's propagates as a TypeError, as on main.
+        # as main's record checks read it. A session's cannot arrive here as non-text:
+        # `SessionRecord.from_mapping` reads the seal with `str()`, so under the Transit sealer a
+        # BLOB seal fails `_parse` and raises `RowSealError`.
         raise RowSealError(kind, subject)
     fields = list(fields)
     if kind != SESSION_KIND:
