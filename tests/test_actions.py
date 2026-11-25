@@ -943,7 +943,7 @@ def test_date_diff_field_shares_timezones_time_precisions() -> None:
     # helper reads the one tuple timezone.py defines rather than keeping its own copy.
     import messagefoundry.timezone as timezone_mod
 
-    assert actions_mod._TIME_PRECISIONS is timezone_mod._TIME_PRECISIONS
+    assert vars(actions_mod)["_TIME_PRECISIONS"] is timezone_mod._TIME_PRECISIONS
 
 
 @pytest.mark.parametrize("path", ["ZTS-1", "ZTS-1.1"])
