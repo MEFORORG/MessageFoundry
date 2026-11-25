@@ -59,6 +59,7 @@ from messagefoundry.parsing.sniff import (
     _looks_like_hl7,
 )
 from messagefoundry.parsing.split import one_message_bytes, split_batch
+from messagefoundry.path_reach import is_absent
 from messagefoundry.redaction import safe_exc, safe_name
 from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
@@ -3427,14 +3428,15 @@ def _inside_watch_tree_by_identity(
     parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
     below the watch directory returns False: the scan's skip matches its spelling, and
     :func:`_open_dest` refuses a link in it. ``dest_dir`` need not exist yet: its nearest existing
-    parent is what is compared. A path that cannot be read compares as not the watch directory, and
-    so does every path when the watch directory cannot be read or reports no file identity (an
-    inode of 0, as some SMB servers do, which would make every directory on the volume match); each
-    such skip is logged at WARNING. A Windows share fault that reports ENOENT (a ``winerror`` other
-    than 2 or 3, such as an unreachable server or share) is read as unreadable, not as absent. When
-    no part of ``dest_dir``, down to its root, gave an identity to compare, the WARNING says the
-    check gave no verdict, naming ``setting`` and the path's class, never the path's text. Touches
-    the filesystem, so call it off the event loop."""
+    parent is what is compared. When the watch directory cannot be read or reports no file
+    identity (an inode of 0, as some SMB servers do, which would make every directory on the volume
+    match), the check does not run. A part of ``dest_dir`` that cannot be read, a Windows share
+    fault that maps to ENOENT included (:func:`~messagefoundry.path_reach.is_absent`), is not
+    compared, and the walk goes on to its parents, which can still match. When the walk then
+    matches nothing and some part could not be read, or no part gave an identity at all, the
+    False is no verdict. Each of those outcomes is logged at WARNING, naming ``setting`` and the
+    archive path's class, never its text. The False return does not tell a verdict from no
+    verdict. Touches the filesystem, so call it off the event loop."""
     if _dirs_below(dest_dir, directory) is not None:
         return False
     try:
@@ -3442,71 +3444,64 @@ def _inside_watch_tree_by_identity(
         real = Path(os.path.realpath(dest_dir))
     except (OSError, ValueError) as exc:
         logger.warning(
-            "file source %s: the archive directory identity check did not run: %s",
+            "file source %s: the %s identity check did not run: %s",
             directory,
+            setting,
             _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
         )
         return False
     if watch.st_ino == 0:
         logger.warning(
-            "file source %s: the archive directory identity check did not run: the watch "
-            "directory reports no file identity",
+            "file source %s: the %s identity check did not run: the watch directory reports no "
+            "file identity",
             directory,
+            setting,
         )
         return False
     compared = False
+    fault: str | None = None
     for candidate in (real, *real.parents):
         try:
             st = os.stat(candidate)
-        except FileNotFoundError as exc:
-            if getattr(exc, "winerror", None) in (None, 2, 3):
-                continue  # not created yet: its parent is compared next
-            # ERROR_BAD_NETPATH (53), ERROR_BAD_NET_NAME (67) and their kin map to ENOENT, but
-            # they are a share fault, not a directory still to be created.
-            logger.warning(
-                "file source %s: an archive directory path could not be read for the identity "
-                "check, so its parent is compared instead: %s",
-                directory,
-                _describe_os_error(exc),
-            )
-            continue
         except (OSError, ValueError) as exc:
-            logger.warning(
-                "file source %s: an archive directory path could not be read for the identity "
-                "check, so its parent is compared instead: %s",
-                directory,
-                _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
-            )
+            if isinstance(exc, OSError) and is_absent(exc):
+                continue  # not created yet: its parent is compared next
+            if fault is None:  # the first fault names the cause; later parts usually repeat it
+                fault = _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__
             continue
         if os.path.samestat(st, watch):
             return True
         # An inode of 0 is no identity (some SMB servers), so it is no comparison either.
         compared = compared or st.st_ino != 0
-    if not compared:
-        # No part, the root included, gave an identity: each was absent, unreadable or reported
-        # none, as on an unreachable share or server, so a False here is no verdict.
+    if fault is not None or not compared:
+        # A part that could not be read may be the one that reaches the watch tree, and with no
+        # identity read nothing was compared, so this False is no verdict.
         logger.warning(
-            "file source %s: the %s identity check gave no verdict: no part of its %s path "
-            "gave a file identity to compare",
+            "file source %s: the %s identity check gave no verdict on its %s path: %s",
             directory,
             setting,
             _path_class(real),
+            f"a part could not be read: {fault}"
+            if fault is not None
+            else "no part gave a file identity to compare",
         )
     return False
 
 
 def _path_class(path: PurePath) -> str:
     """The class of ``path`` for a log line that must not carry its text: ``UNC`` for a UNC path,
-    verbatim ``//?/UNC/`` form included, ``device`` for any other ``//?/`` or ``//./`` form,
-    ``drive`` for any other Windows path with a drive, else ``local``."""
-    drive = path.drive
-    if drive.startswith("\\\\?\\UNC\\"):
+    ``//?/UNC/`` and ``//./UNC/`` forms included, ``device`` for any other ``//?/`` or ``//./``
+    form, ``drive`` for any other Windows path with a drive, else ``local``."""
+    # Windows reads the prefix in any case. ntpath splits //./UNC/server as a device drive
+    # ``//./UNC`` with no separator after it, so the separator is added before comparing.
+    drive = path.drive.upper() + "\\"
+    if drive.startswith(("\\\\?\\UNC\\", "\\\\.\\UNC\\")):
         return "UNC"
     if drive.startswith(("\\\\?\\", "\\\\.\\")):
         return "device"
     if drive.startswith("\\\\"):
         return "UNC"
-    return "drive" if drive else "local"
+    return "drive" if path.drive else "local"
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:

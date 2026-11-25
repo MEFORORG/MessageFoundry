@@ -501,8 +501,9 @@ def test_an_archive_path_with_no_readable_part_skips_the_check_and_says_so(
     with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
         assert not file_module._inside_watch_tree_by_identity(archive, inbox, "error_subdir")
     path_class = "drive" if sys.platform == "win32" else "local"
-    assert f"the error_subdir identity check gave no verdict: no part of its {path_class} path" in (
-        caplog.text
+    assert (
+        f"the error_subdir identity check gave no verdict on its {path_class} path: no part gave"
+        in caplog.text
     )
     assert "unreachable-share" not in caplog.text
 
@@ -524,15 +525,67 @@ def test_a_share_fault_reported_as_enoent_is_logged_not_read_as_absent(
     def bad_netpath(path: Any, *args: Any, **kwargs: Any) -> Any:
         if os.fspath(path) in (os.fspath(archive), os.fspath(link)):
             exc = FileNotFoundError(2, "The network path was not found")
-            exc.winerror = 53  # type: ignore[attr-defined]
+            exc.winerror = 53  # type: ignore[attr-defined,unused-ignore]
             raise exc
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "stat", bad_netpath)
     monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: os.fspath(p))
     with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
-        assert not file_module._inside_watch_tree_by_identity(archive, inbox)
-    assert caplog.text.count("could not be read for the identity check") == 2
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox, "error_subdir")
+    # The namespace root above the link reads, and that is still no verdict on the archive.
+    assert caplog.text.count("the error_subdir identity check gave no verdict") == 1
+    assert "a part could not be read" in caplog.text
+    assert "dfs-link" not in caplog.text
+
+
+def test_a_share_fault_on_every_part_is_no_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A missing share (ERROR_BAD_NET_NAME, 67) faults on every part, the share root included.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "missing-share" / "archive"
+    real_stat = os.stat
+
+    def bad_net_name(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(inbox):
+            return real_stat(path, *args, **kwargs)
+        exc = FileNotFoundError(2, "The network name cannot be found")
+        exc.winerror = 67  # type: ignore[attr-defined,unused-ignore]
+        raise exc
+
+    monkeypatch.setattr(os, "stat", bad_net_name)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox, "processed_subdir")
+    assert caplog.text.count("the processed_subdir identity check gave no verdict") == 1
+    assert "a part could not be read" in caplog.text
+    assert "missing-share" not in caplog.text
+
+
+def test_a_part_that_cannot_be_read_does_not_stop_a_match_above_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The walk goes on past an unreadable part, so a parent that is the watch directory matches.
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    blocked = inbox / "blocked"
+    real_stat = os.stat
+
+    def denied(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if os.fspath(path) == os.fspath(blocked):
+            raise PermissionError(13, "Access is denied")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", denied)
+    monkeypatch.setattr(os.path, "realpath", lambda p, *a, **k: os.fspath(blocked))
+    assert file_module._inside_watch_tree_by_identity(alias / "blocked", inbox)
 
 
 def test_an_archive_path_with_no_file_identity_is_no_verdict(
@@ -581,6 +634,8 @@ def test_an_archive_path_whose_parent_exists_logs_no_skip(
         (PureWindowsPath(r"\\?\UNC\server\share\archive"), "UNC"),
         (PureWindowsPath(r"\\?\D:\archive"), "device"),
         (PureWindowsPath(r"\\.\D:\archive"), "device"),
+        (PureWindowsPath(r"\\?\unc\server\share\archive"), "UNC"),
+        (PureWindowsPath(r"\\.\UNC\server\share\archive"), "UNC"),
         (PureWindowsPath(r"D:\archive"), "drive"),
         (PurePosixPath("/srv/archive"), "local"),
     ],
