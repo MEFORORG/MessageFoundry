@@ -33,6 +33,14 @@ It reads the whole message, fires on every commit, and runs before any git read.
 not start with one of them, such as an indented or backticked quote, passes. It is inert on a box until
 ``scripts/coord/install-git-hooks.ps1`` re-copies this file into the shared ``.git/hooks``.
 
+A fourth check is ADVISORY ONLY (observe mode) and never refuses a commit:
+
+    A `Verified-by:` trailer names how the change was checked: `code-review xhigh`, `verify`,
+    `tests` or `none`. A missing or unrecognised one prints one line to stderr, and the commit
+    goes ahead.
+
+It exists to measure how often commits say how they were verified before anything enforces it.
+
 Three scoping decisions for the claim rule, each load-bearing:
 
 * **Subject line only.** A body may reference other items freely -- this very repo's commits routinely
@@ -509,6 +517,29 @@ def _refuse_trailers(hits: list[tuple[int, str]]) -> int:
     return 1
 
 
+_VERIFIED_BY_LINE = re.compile(r"^Verified-by\s*:(?P<value>.*)", re.IGNORECASE)
+_VERIFIED_BY_VALUES = ("code-review xhigh", "verify", "tests", "none")
+
+
+def _verified_by_advisory(message: str) -> str | None:
+    """The one advisory line for a missing or unrecognised `Verified-by:` trailer, else None.
+
+    OBSERVE MODE: main() prints this and carries on. Nothing here may refuse a commit.
+    """
+    values = [
+        " ".join(m.group("value").split())
+        for line in message.split("\n")
+        if (m := _VERIFIED_BY_LINE.match(line))
+    ]
+    allowed = ", ".join(_VERIFIED_BY_VALUES)
+    if not values:
+        return f"advisory: no 'Verified-by:' trailer ({allowed}); commit not refused\n"
+    if any(v.lower() in _VERIFIED_BY_VALUES for v in values):
+        return None
+    shown = _safe_for_message(values[0], 80)
+    return f"advisory: 'Verified-by: {shown}' is not one of: {allowed}; commit not refused\n"
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         return 0  # not wired as a commit-msg hook; do nothing rather than guess
@@ -523,6 +554,10 @@ def main() -> int:
     trailers = _attribution_trailers(message)
     if trailers:
         return _refuse_trailers(trailers)
+
+    advisory = _verified_by_advisory(message)
+    if advisory is not None:
+        sys.stderr.write(advisory)
 
     subject = _subject(message)
     items, bare = _citations(subject)
