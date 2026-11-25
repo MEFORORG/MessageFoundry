@@ -577,7 +577,7 @@ from messagefoundry.store.transit_attestation import (
     read_transit_bound_attestation,
     transit_bound_gap,
 )
-from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
+from messagefoundry.transports.ai_broker import AiBrokerError, AiOpenerSlot, ai_broker_from_settings
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -4897,6 +4897,9 @@ def create_app(
     # read. On a direct create_app it is the embedder's to pass, and it should be the policy its
     # engine's connections were built with. create_managed_app's lifespan stashes its own at start.
     app.state.tls_settings = tls_settings
+    # BACKLOG #5527 items 3 to 5: where POST /ai/chat holds its anchored opener, so the opener
+    # lives as long as this app, and another app in the same process holds its own.
+    app.state.ai_opener_slot = AiOpenerSlot()
     # Store settings back the M5 GET /security/posture view (backend, key_provider source,
     # require_encryption / allow_unencrypted_phi). The managed-app lifespan sets the live value once the
     # store opens; here it supports the direct-construction (test) path.
@@ -5504,16 +5507,24 @@ def create_app(
         # context that reads the system trust store, under a lock a worker thread may hold, or
         # builds the held anchored opener, which reads the [tls] CA and CRL files when it is built.
         tls_settings = getattr(request.app.state, "tls_settings", None)
+        # The app's own slot for the held anchored opener (BACKLOG #5527 items 3 to 5), which
+        # create_app always sets.
+        opener_slot = getattr(request.app.state, "ai_opener_slot", None)
         try:
             # BACKLOG #5527: an embedder's stash of another type is a misconfiguration, mapped to
             # the 503 below, rather than an AttributeError the route would answer 500 for.
             if tls_settings is not None and not isinstance(tls_settings, TlsSettings):
                 raise AiBrokerError("app.state.tls_settings is not a TlsSettings")
+            # Refused as the stash above is, None or absent included, rather than built around
+            # with an opener for each request that re-reads the [tls] files.
+            if not isinstance(opener_slot, AiOpenerSlot):
+                raise AiBrokerError("app.state.ai_opener_slot is not an AiOpenerSlot")
             broker = await asyncio.to_thread(
                 ai_broker_from_settings,
                 ai,
                 posture=_phi_read_posture,
                 trust_anchor_policy=tls_settings.policy() if tls_settings is not None else None,
+                opener_slot=opener_slot,
             )
         except AiBrokerError as exc:
             _log.warning("engine AI broker misconfigured: %s", exc)
