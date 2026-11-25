@@ -791,8 +791,9 @@ No anchor is passed on an `oidc` session, whose window and anchor move only at t
 #2142). An assertion that reaches a session that has already met its factor, for example one
 staged while the session was pending and answered after another tab met the factor (the challenge
 moves with the session's re-key), does at least these: it marks the factor, clears the failure
-counter, re-keys the session and records the request's address in the account's known-address
-record (vault BACKLOG #2145). It moves no anchor and no window. So, unlike a TOTP code, a passkey never renews a window
+counter and re-keys the session, and once the re-key succeeds it records the request's address in
+the account's known-address record, under the conditions `_mark_login_address_known` states (vault
+BACKLOG #2145). It moves no anchor and no window. So, unlike a TOTP code, a passkey never renews a window
 once the factor is met. `POST /ui/mfa` no longer re-renders the gate for a session that has
 already met its factor: a refused code there lands on `/ui`, as the page's GET does.
 

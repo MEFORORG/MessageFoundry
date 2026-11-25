@@ -22646,9 +22646,11 @@ class MessageStore:
         answer.
 
         ``BEGIN IMMEDIATE`` (vault BACKLOG #2964 item 23): the stamp reads the row before it writes,
-        and under a deferred ``BEGIN`` a writer in another process that committed after that read
-        failed the write busy at once, so a factor just proved read as a store error. Taking the
-        lock at the ``BEGIN`` waits that writer out under ``busy_timeout`` instead."""
+        and under a deferred ``BEGIN`` the write failed busy at once whenever a writer in another
+        process held SQLite's write lock, since a read transaction's upgrade waits for nobody, so a
+        factor just proved read as a store error. Taking the lock at the ``BEGIN`` waits that writer
+        out under ``busy_timeout`` instead. The lock is then held across the seal check and the
+        re-seal, which under a Vault transit sealer are Vault calls."""
         stamp = mfa_stamp(time.time() if now is None else now, anchor)
         async with _writer_txn(self._db, self._lock, immediate=True):
             written = await self._write_session(token_hash, stamp)

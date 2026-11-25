@@ -2015,7 +2015,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # its refused code lands on /ui rather than on a gate re-rendered for it. verify_mfa
             # has already audited and charged any code within the bound. The re-render below is
             # pending-only. The notice says the code was refused (vault BACKLOG #2964 item 21):
-            # a bare /ui is what a success lands on, so the refusal read as one.
+            # a bare /ui is what a success lands on, so the refusal read as one. Not on a
+            # directory refusal, whose code was never checked: it lands on /ui as before.
+            if elevation.directory_refusal is not None:
+                return RedirectResponse("/ui", status_code=303)
             return RedirectResponse("/ui?m=mfa_code_refused", status_code=303)
         mfa = await auth.mfa_status(identity)
         wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)

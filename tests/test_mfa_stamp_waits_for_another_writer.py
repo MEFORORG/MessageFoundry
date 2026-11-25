@@ -4,9 +4,9 @@
 
 ``MessageStore.mark_session_mfa_verified`` reads the session row and writes its stamp in one
 transaction. Opened with a deferred ``BEGIN``, the transaction took SQLite's write lock only at the
-write, so a writer in another process that committed after the read failed the stamp with
-``SQLITE_BUSY_SNAPSHOT`` at once, and a factor the user had just proved was answered as a store
-error. ``BEGIN IMMEDIATE`` takes the lock at the ``BEGIN``, waiting out the other writer under
+write, and a read transaction's upgrade waits for nobody: while a writer in another process held
+the lock, the stamp failed busy at once, and a factor the user had just proved was answered as a
+store error. ``BEGIN IMMEDIATE`` takes the lock at the ``BEGIN``, waiting out the other writer under
 ``busy_timeout``, so the stamp lands once it commits. A second connection on the same file stands
 in for the other process. Synthetic accounts only.
 """
@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
 from messagefoundry.auth.tokens import hash_token, mint_token
 from messagefoundry.store.store import MessageStore
@@ -25,8 +26,8 @@ from messagefoundry.store.store import MessageStore
 
 async def test_the_mfa_stamp_waits_for_another_processs_writer(tmp_path: Path) -> None:
     """RED when: the stamp's ``_writer_txn`` opens with a deferred ``BEGIN``. Its read then runs
-    while the other connection holds the write lock, and that connection's commit makes the read's
-    snapshot stale, so the write raises ``sqlite3.OperationalError`` rather than wait."""
+    while the other connection holds the write lock, and its write raises
+    ``sqlite3.OperationalError`` at once rather than wait."""
     path = tmp_path / "stamp.db"
     store = await MessageStore.open(path)
     other: aiosqlite.Connection | None = None
@@ -44,9 +45,15 @@ async def test_the_mfa_stamp_waits_for_another_processs_writer(tmp_path: Path) -
         await other.execute("BEGIN IMMEDIATE")
         await other.execute("INSERT INTO stand_in_for_another_process VALUES (1)")
         stamp = asyncio.create_task(store.mark_session_mfa_verified(token_hash))
-        # Long enough for a deferred BEGIN to have read the row and reached its write.
+        # The stamp holds the store's writer lock from before its BEGIN, so once it does the stamp
+        # has started; the sleep then gives a deferred BEGIN time to reach its write.
+        async with asyncio.timeout(10):
+            while not store._lock.locked():
+                await asyncio.sleep(0.01)
         await asyncio.sleep(0.3)
-        assert not stamp.done(), "the stamp finished while another writer held the lock"
+        if stamp.done():
+            await stamp  # raises the stamp's own error, if it failed
+            pytest.fail("the stamp finished while another writer held the lock")
         await other.execute("COMMIT")
         await asyncio.wait_for(stamp, timeout=10)
         row = await store.get_session(token_hash)

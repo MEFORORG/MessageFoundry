@@ -361,7 +361,8 @@ def unprovisioned_banner(unprovisioned: bool) -> Markup:
     return el("p", UNPROVISIONED_NOTICE, class_="banner", role="alert")
 
 
-# The notices a refused per-name control redirects with, keyed by the ?m= code. An allow-list, so
+# The notices the dashboard shows, keyed by the ?m= code: at least those a refused per-name control
+# redirects with, and the MFA gate's one for a refused code. An allow-list, so
 # the query string can select a sentence but never supply one. The two store lines are the engine's
 # answers, and a console test pins them to it (vault BACKLOG #3746).
 _CONTROL_NOTICES: dict[str, str] = {
@@ -376,10 +377,7 @@ _CONTROL_NOTICES: dict[str, str] = {
     "control_refused": "the engine refused that action; check the connection's status below",
     # POST /ui/mfa, for a refused code on a session that had already met its factor (vault BACKLOG
     # #2964 item 21): without it the refusal landed on this page exactly as a success does.
-    "mfa_code_refused": (
-        "that code wasn't accepted; this session had already verified its second factor, so it "
-        "needed no code"
-    ),
+    "mfa_code_refused": "that code wasn't accepted; this session needed no code",
 }
 
 
