@@ -106,8 +106,8 @@ def anonymize(
 
     ``blanked``, when given, collects the address of every field the ``date`` kind scrubbed to empty
     because its value was not a timestamp it could keep. :func:`anonymize_checked` puts those addresses in
-    the report for you; a caller of this function has no other record of them. A message this
-    function refuses adds no address to the list (BACKLOG #5540).
+    the report for you; a caller of this function has no other record of them. When the addresses
+    are added is stated once, on :func:`.hl7.anonymize_message`.
     """
     keyer = Keyer(salt)
     if rules is None:

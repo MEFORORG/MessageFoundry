@@ -70,8 +70,7 @@ def anonymize_message(
             raise AnonError("message MSH-2 repeats an encoding character — refusing to emit")
         raise AnonError("message has no parseable MSH / encoding characters — refusing to emit")
     seps, _field_sep = parsed
-    # Held apart from the caller's list until the message is written (BACKLOG #5540); None when the
-    # caller asked for no record, so the date check is not run for nothing.
+    # None when the caller asked for no record, so the date check is not run for nothing.
     found: list[str] | None = [] if blanked is not None else None
     try:
         msg = Message.parse(text)

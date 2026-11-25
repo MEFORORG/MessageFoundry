@@ -658,8 +658,10 @@ def surrogate_field_recorded(
     """:func:`surrogate_field`, and a record of the one case where a rule destroys a value without
     anyone having decided that: the ``DATE`` kind scrubbing a repetition that is not a valid
     timestamp to empty (BACKLOG #2330). ``path`` is appended to ``blanked`` once per field it
-    happens in, and only once the field has been written: a field this refuses is not recorded
-    (BACKLOG #5540). The address only, never the value, so the list is safe to log.
+    happens in, unless this function refuses the field. It writes nothing itself, and each
+    adapter's own whole-field check runs after it, so the adapters keep the record apart until the
+    message is written (``hl7.anonymize_message``, BACKLOG #5540). The address only, never the
+    value, so the list is safe to log.
 
     A ``DROP`` is not recorded: the rule map already says that field is blanked. Both adapters call
     this, each with the value it read, so they agree wherever they read the same value.
@@ -677,11 +679,12 @@ def surrogate_field_recorded(
         # keep rules first; a direct adapter call may not, and the adapter writes the value back.
         if kind != SurrogateKind.KEEP:
             _no_control(written, seps)
-        if blanked is not None and emptied:
-            blanked.append(path)
-        return written
     except _HeldDelimiter as held:
         cause = held.cause
+    else:
+        if emptied and blanked is not None:
+            blanked.append(path)
+        return written
     # Raised outside the handler, so the refusal carries no chained exception.
     raise SurrogateSeparatorRefused(path, cause)
 

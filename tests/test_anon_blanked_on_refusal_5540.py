@@ -155,9 +155,9 @@ def test_a_refusal_in_the_site_code_pass_records_nothing(
 
 
 @_SIDES
-def test_the_shared_helper_records_a_field_only_once_it_is_written(side: _Side) -> None:
+def test_the_shared_helper_does_not_record_a_field_it_refuses(side: _Side) -> None:
     """``surrogate_field_recorded`` called directly: a date field it refuses is not recorded, and
-    the same field it writes is."""
+    the same field it returns is."""
     module = side.surrogates
     refused_seps = module.read_message_seps(_message("Q7734", encoding=_DOT_ENCODING))[0]
     plain_seps = module.read_message_seps(_message("Q7734"))[0]
@@ -171,3 +171,21 @@ def test_the_shared_helper_records_a_field_only_once_it_is_written(side: _Side) 
     assert blanked == []
     module.surrogate_field_recorded("EVN-2", side.kind.DATE, value, keyer, plain_seps, blanked)
     assert blanked == ["EVN-2"]
+
+
+@_SIDES
+def test_a_refusal_by_the_adapters_own_whole_field_check_records_nothing(side: _Side) -> None:
+    """MSH-2 declares NUL as the component separator. The shared helper passes the date field and
+    records EVN-2, then each adapter's own whole-field check (the tee's ``_whole_field``, the
+    engine's ``Message.set``) refuses the NUL it would write. The helper's record cannot cover
+    that refusal; the adapter's held list does."""
+    nul = chr(0)
+    raw = _message(
+        "Q7734", evn2=f"{_NOT_A_DATE}~20260315{nul}S", encoding=nul + _DEFAULT_ENCODING[1:]
+    )
+    blanked: list[str] = []
+    with pytest.raises(side.anon.AnonError):
+        side.hl7.anonymize_message(
+            raw, side.keyer(_SALT), (side.rule("EVN-2", side.kind.DATE),), blanked
+        )
+    assert blanked == []
