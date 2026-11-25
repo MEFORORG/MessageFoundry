@@ -2261,7 +2261,10 @@ def test_drop_redundant_archive_reports_an_archive_gone_before_its_claim(
 
     assert dropped is False
     assert not list(tmp_path.glob("*.mfclaim"))
-    gone_line = "the archive 'old.log.gz' was already gone"
+    gone_line = (
+        "the archive 'old.log.gz' could not be found when it was to be claimed (already gone, or "
+        "its directory unreachable); this pass does not remove it"
+    )
     if dest_gone:
         assert not dest.exists()
         assert gone_line in caplog.text
@@ -2337,8 +2340,8 @@ def test_drop_redundant_archive_reports_a_claim_gone_before_its_put_back(
 
     assert dropped is False
     assert not list(tmp_path.glob("*.mfclaim")) and not dest.exists()
-    assert "was removed meanwhile" in caplog.text
-    assert "KEPT" not in caplog.text
+    assert "could not be found to put it back" in caplog.text
+    assert "KEPT as" not in caplog.text
 
 
 @pytest.mark.parametrize("fail", ["link", "remove"])

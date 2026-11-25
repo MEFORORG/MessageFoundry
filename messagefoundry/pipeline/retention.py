@@ -278,7 +278,12 @@ def _drop_redundant_archive(
             # taken, and a peer compressor holding it under its own claim may yet put it back.
             # `lexists` because Windows also raises FileNotFoundError for a claim path too long, with
             # `dest` still there; an `lstat` that fails too (a lost share, say) still reads as gone.
-            log.debug("app-log %r: the archive %r was already gone", name, os.path.basename(dest))
+            log.debug(
+                "app-log %r: the archive %r could not be found when it was to be claimed (already "
+                "gone, or its directory unreachable); this pass does not remove it",
+                name,
+                os.path.basename(dest),
+            )
             return False
         log.warning(
             "app-log %r: the redundant archive %r could not be claimed for removal; it is kept",
@@ -305,8 +310,10 @@ def _drop_redundant_archive(
         os.link(claim, dest)
     except FileNotFoundError:
         log.warning(
-            "app-log %r: the claimed archive %r was removed meanwhile (by a peer's app_log_days "
-            "sweep, say), so it could not be put back",
+            "app-log %r: the claimed archive %r could not be found to put it back (removed "
+            "meanwhile by a peer's app_log_days sweep, say, or its directory unreachable); if it "
+            "remains, it is KEPT under that name until an operator acts or, while app_log_days is "
+            "set and compression is on, its sweep ages it out",
             name,
             os.path.basename(claim),
         )
@@ -1665,8 +1672,8 @@ class RetentionRunner:
             if _drop_redundant_archive(source, read_st, data, dest, name=name):
                 log.warning(
                     "app-log %r: the source %s after its archive was placed; the source is kept "
-                    "and holds every archived byte, so the archive was removed and the next pass "
-                    "retries",
+                    "and holds every archived byte, so the archive is redundant and was removed or "
+                    "could not be found to remove; the next pass retries",
                     name,
                     change,
                 )
