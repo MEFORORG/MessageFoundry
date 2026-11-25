@@ -252,7 +252,7 @@ function Write-SettingsFile([string]$Path, $Data) {
             catch {
                 $sharing = $_.Exception.GetBaseException().HResult -eq -2147024864  # ERROR_SHARING_VIOLATION
                 # A retry is only a retry while settings.json is still where it was.
-                if ($attempt -eq 3 -or -not $sharing -or -not (Test-Path -LiteralPath $Path)) { throw }
+                if ($attempt -eq 3 -or -not $sharing -or ($item -and -not (Test-Path -LiteralPath $Path))) { throw }
                 Start-Sleep -Milliseconds (50 * $attempt)
             }
         }
@@ -307,15 +307,20 @@ function Get-FailedSwapReport([string]$Path, [string]$Tmp, [string]$SwapBak, [st
         catch { $restoreErr = "$_" }
     }
     $msg = if (Test-Path -LiteralPath $Path) {
-        "settings.json was not updated ($Why); the new content was discarded"
+        "settings.json was not updated ($Why); the new content was not installed"
     }
-    elseif ($SwapBak) { "settings.json is MISSING after a failed swap ($Why). The new content is in $Tmp" }
-    else { "settings.json was not created ($Why). The new content is in $Tmp" }
+    elseif ($SwapBak) { "settings.json is MISSING after a failed swap ($Why)" }
+    else { "settings.json was not created ($Why)" }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $msg += $(if (Test-Path -LiteralPath $Tmp) { ". The new content is in $Tmp" } else { ". The new content's temp file $Tmp is gone too" })
+    }
     if ($restored) { $msg += "; the previous content was put back from the swap's backup" }
     if ($SwapBak -and (Test-Path -LiteralPath $SwapBak)) { $msg += "; the previous content is in $SwapBak" }
     if ($restoreErr) { $msg += "; putting it back failed: $restoreErr" }
     if ($BackedTo) { $msg += "; a copy of the previous content is in $BackedTo" }
-    if (-not (Test-Path -LiteralPath $Path)) { $msg += ". Rename one of them to $Path" }
+    # Re-running first would read the missing file as empty and write a settings.json holding only
+    # the statusLine, so the restore comes first.
+    if (-not (Test-Path -LiteralPath $Path)) { $msg += ". Rename one of them to $Path before running this installer again" }
     return "$msg."
 }
 
@@ -375,8 +380,9 @@ if ($script:GaveConfigDir -and @($ConfigDir).Count -eq 0) { Stop-Cannot "-Config
 # after a `cd`, the two differ, so a relative argument was checked in one directory and wired to
 # another. GetUnresolvedProviderPathFromPSPath reads $PWD, expands no wildcard, and needs no file to
 # exist. A bare file name also gets a real parent this way: Split-Path 'settings.json' -Parent is ''.
-# A drive that does not exist, or a $PWD on a non-filesystem drive such as HKCU:, is a usage error and
-# answers exit 2 like any other, never a raw exception and exit 1.
+# On the install path, a drive that does not exist, or a $PWD on a non-filesystem drive such as HKCU:,
+# is a usage error and answers exit 2 like any other, never a raw exception and exit 1. -Status and
+# -Uninstall carry a gone path on instead; see the catch below.
 function Resolve-ArgPath([string]$Path, [string]$What) {
     if ([string]::IsNullOrWhiteSpace($Path)) { Stop-Cannot "$What was given as an empty string" }
     $provider = $null; $drive = $null
@@ -384,8 +390,9 @@ function Resolve-ArgPath([string]$Path, [string]$What) {
     catch {
         # AN AUDIT OR AN UNINSTALL GOES ON PAST A GONE ROOT, so one root on an unmapped drive does not
         # hide the rest. The raw path is NOT a reading of that root. For a -SettingsPath target both
-        # modes test it with Test-PathRootReachable and report it UNKNOWN, never as absent; a
-        # -ConfigDir, -HomeDir or pinned root still stops at Assert-RootExists with exit 2.
+        # modes test it with Test-PathRootReachable and report it UNKNOWN, never as absent. A gone
+        # -ConfigDir still stops at Assert-RootExists with exit 2, and a gone -HomeDir under the default
+        # rule still ends on a raw Join-Path error with exit 1, as it did before this resolver.
         if ($Status -or $Uninstall) { return $Path }
         Stop-Cannot "$What cannot be resolved to a file path: $Path ($($_.Exception.GetBaseException().Message))"
     }
@@ -615,7 +622,7 @@ if ($Uninstall) {
     # An unreachable root is not a dry-run success either: nothing about it was read.
     if ($WhatIfPreference -and $unknown -eq 0) { exit 0 }
     if ($failed + $unknown -eq 0) { exit 0 }
-    if ($removed + $absent + $foreign + $wouldRemove -eq 0) { exit 1 }
+    if ($removed + $absent + $foreign -eq 0) { exit 1 }
     exit 3
 }
 

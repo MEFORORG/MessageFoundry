@@ -11,12 +11,14 @@ and that one runs with both its ``$PWD`` and its process directory inside ``tmp_
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import shutil
 import string
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -81,10 +83,27 @@ def _install(
     return _spawn(cmd, cwd, extra_env)
 
 
+def _fault(tmp_path: Path, mode: str) -> dict[str, str]:
+    """The swap fault, with TEMP pointed at ``tmp_path``. The seam fires only under the system temp
+    directory, and TEMP as the process spells it can differ from ``tmp_path``, which pytest has
+    resolved (an 8.3 ``RUNNER~1`` on a hosted runner), so the test names its own temp directory."""
+    return {"MEFOR_TEST_STATUSLINE_SWAP_FAULT": mode, "TEMP": str(tmp_path), "TMP": str(tmp_path)}
+
+
 def _free_drive() -> str:
-    """A drive letter nothing is mapped to, found at run time; skips the test when all are taken."""
+    """A drive letter nothing is mapped to, found at run time; skips the test when all are taken.
+    A disconnected persistent mapping still holds its letter in the logical-drive mask, and still
+    gets a PowerShell drive, so the mask is consulted as well as the path."""
+    mask = 0
+    if sys.platform == "win32":
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
     free = next(
-        (d for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\")), None
+        (
+            d
+            for i, d in reversed(list(enumerate(string.ascii_uppercase)))
+            if not mask & (1 << i) and not os.path.exists(f"{d}:\\")
+        ),
+        None,
     )
     if free is None:
         pytest.skip("every drive letter is in use, so no gone drive can be named")
@@ -297,7 +316,7 @@ def test_a_swap_that_fails_part_way_puts_the_original_back(tmp_path: Path) -> No
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside"},
+        extra_env=_fault(tmp_path, "original-moved-aside"),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "FAILED" in proc.stdout and "was not updated" in proc.stdout, proc.stdout
@@ -315,7 +334,7 @@ def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_pa
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside-restore-fails"},
+        extra_env=_fault(tmp_path, "original-moved-aside-restore-fails"),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert not settings.exists()
@@ -328,6 +347,29 @@ def test_a_swap_whose_restore_also_fails_keeps_both_copies_and_names_them(tmp_pa
     assert str(tmp) in flat and str(bak) in flat, proc.stdout
 
 
+def test_the_swap_fault_seam_never_fires_outside_the_temp_directory(tmp_path: Path) -> None:
+    """THE NEGATIVE CONTROL FOR THE SEAM. With the fault set but TEMP pointed elsewhere, the target is
+    not under the temp directory, so the real swap runs: a leaked variable cannot touch a real root."""
+    root = _root(tmp_path, {"keep": True})
+    settings = root / "settings.json"
+    elsewhere = tmp_path / "other-temp"
+    elsewhere.mkdir()
+    proc = _install(
+        tmp_path,
+        "-SettingsPath",
+        str(settings),
+        cwd=tmp_path,
+        extra_env={
+            "MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside-restore-fails",
+            "TEMP": str(elsewhere),
+            "TMP": str(elsewhere),
+        },
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    assert doc["keep"] is True and "statusLine" in doc
+
+
 def test_a_failed_swap_on_a_root_with_no_settings_keeps_the_new_content(tmp_path: Path) -> None:
     """With no settings.json before the run there is no backup to put back, so the complete temp file
     is the only copy of the new content; it stays, and the FAILED line names it."""
@@ -338,7 +380,7 @@ def test_a_failed_swap_on_a_root_with_no_settings_keeps_the_new_content(tmp_path
         "-SettingsPath",
         str(settings),
         cwd=tmp_path,
-        extra_env={"MEFOR_TEST_STATUSLINE_SWAP_FAULT": "original-moved-aside"},
+        extra_env=_fault(tmp_path, "original-moved-aside"),
     )
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert not settings.exists()
