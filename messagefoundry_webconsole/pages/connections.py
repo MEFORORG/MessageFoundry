@@ -375,12 +375,9 @@ _CONTROL_NOTICES: dict[str, str] = {
         "can make; see the engine log"
     ),
     "control_refused": "the engine refused that action; check the connection's status below",
-    # POST /ui/mfa, for a refused code on a session that had already met its factor (vault BACKLOG
-    # #2964 item 21): without it the refusal landed on this page exactly as a success does.
-    "mfa_code_refused": (
-        "this session had already met its second factor and needed no code; the code you entered "
-        "was not accepted"
-    ),
+    # POST /ui/mfa, for a refused code on a session that owed no code (vault BACKLOG #2964 item
+    # 21): without it the refusal landed on this page exactly as a success does.
+    "mfa_code_refused": "this session needed no code; the code you entered was not accepted",
 }
 
 
