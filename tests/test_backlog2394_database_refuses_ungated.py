@@ -125,6 +125,8 @@ async def test_a_send_on_a_refused_connection_fails_as_a_permanent_config_fault(
     with pytest.raises(NegativeAckError) as raised:
         await destination.send('{"a": 1}')
     assert raised.value.permanent and raised.value.config_fault, raised.value
+    # The fix is the installed package, so the stop names that, not the connection's settings.
+    assert raised.value.remedy is not None and "aioodbc" in raised.value.remedy
     assert isinstance(raised.value.__cause__, UngatedConnectionError)
     assert "db.example" not in str(raised.value)
     await _closed_once_and_never_used(rig)

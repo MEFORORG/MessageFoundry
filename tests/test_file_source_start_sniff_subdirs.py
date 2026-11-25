@@ -414,15 +414,23 @@ def _link_dir(target: Path, link: Path) -> None:
         os.symlink(target, link, target_is_directory=True)
 
 
-@pytest.mark.parametrize("knob", ["processed_subdir", "error_subdir"])
+@pytest.mark.parametrize(
+    ("after_read", "knob"),
+    [
+        ("move", "processed_subdir"),
+        ("move", "error_subdir"),
+        ("delete", "error_subdir"),
+        ("leave", "error_subdir"),
+    ],
+)
 @pytest.mark.parametrize("below", ["", "done"], ids=["the-watch-dir", "inside-it"])
-@pytest.mark.parametrize("after_read", ["move", "leave"])
 def test_an_archive_subdir_reaching_the_watch_tree_through_a_link_is_refused_at_start(
     tmp_path: Path, knob: str, below: str, after_read: str
 ) -> None:
     """Red on the unfixed code: a value spelled outside the watch directory that reaches it, or a
     directory inside it, through a link or a junction passed, and archived files would be listed
-    and ingested again on every poll."""
+    and ingested again on every poll. Refused before it is created, so nothing is made inside the
+    watch tree."""
     inbox = tmp_path / "in"
     inbox.mkdir()
     alias = tmp_path / "alias"
@@ -432,6 +440,43 @@ def test_an_archive_subdir_reaching_the_watch_tree_through_a_link_is_refused_at_
     with pytest.raises(SourceStartupError, match=knob) as caught:
         src._prepare_subdirs()
     assert "alias" not in str(caught.value)
+    assert not (inbox / "done").exists()
+
+
+@pytest.mark.parametrize("after_read", ["leave", "delete"])
+def test_a_processed_subdir_through_a_link_is_not_judged_where_nothing_is_archived(
+    tmp_path: Path, after_read: str
+) -> None:
+    # Only the move mode writes processed_dir, so in the others it is not judged.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    src = _source(inbox, after_read=after_read, processed_subdir=str(alias / "done"))
+    src._prepare_subdirs()
+
+
+def test_a_watch_directory_with_no_file_identity_skips_the_check_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An inode of 0 on every directory (some SMB servers) would make every archive directory on
+    the volume match, so the check does not run, and a WARNING says it did not."""
+    from messagefoundry.transports import file as file_module
+
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    real_stat = os.stat
+
+    def no_identity(path: Any, *args: Any, **kwargs: Any) -> Any:
+        st = real_stat(path, *args, **kwargs)
+        return os.stat_result((st.st_mode, 0, *tuple(st)[2:]))
+
+    monkeypatch.setattr(os, "stat", no_identity)
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.file"):
+        assert not file_module._inside_watch_tree_by_identity(archive, inbox)
+    assert "reports no file identity" in caplog.text
 
 
 def test_an_archive_subdir_outside_the_watch_tree_through_a_link_still_starts(

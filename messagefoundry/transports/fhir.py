@@ -1106,6 +1106,9 @@ class FhirDestination(DestinationConnector):
         # Read strictly, and first: on every branch, and before a hop guard can log a crossing for
         # a build this refuses. bool("false") is True (vault BACKLOG #3234 added step 8).
         allow_expired = flag_from_settings(s, "tls_allow_expired")
+        # The same for the behaviour flags, so a build they refuse logs no listed loosening first.
+        capture_response_flag = flag_from_settings(s, "capture_response")
+        dynamic_headers_flag = flag_from_settings(s, "dynamic_headers")
         url = s.get("url")
         if not isinstance(url, str) or not url:
             raise ValueError(
@@ -1215,7 +1218,7 @@ class FhirDestination(DestinationConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         # ADR 0013: capture the FHIR server reply (assigned resource / ETag / OperationOutcome). Default
         # False → returns None, byte-identical.
-        self.capture_response: bool = flag_from_settings(s, "capture_response")
+        self.capture_response: bool = capture_response_flag
         # #154: allow-list of HTTP response headers to capture — Location/ETag of a FHIR create are the
         # motivating case. Empty default → byte-identical. Shared parser/filter with REST.
         self.capture_response_headers = normalize_header_allowlist(
@@ -1224,7 +1227,7 @@ class FhirDestination(DestinationConnector):
         # #68: opt in to per-message HTTP headers a Handler stamps into the ADR 0081 metadata bag
         # (http.header.* entries). Default False → the delivery worker skips the metadata read and send
         # is byte-identical. When True, consumes_metadata tells the worker to pass this message's bag.
-        self.consumes_metadata: bool = flag_from_settings(s, "dynamic_headers")
+        self.consumes_metadata: bool = dynamic_headers_flag
         self._headers = self._build_headers(s)
         # vault BACKLOG #1965: on an update sent as a transaction entry, a static conditional header,
         # which qualified every PUT, moves into the entry with the rest; on the outer POST it would

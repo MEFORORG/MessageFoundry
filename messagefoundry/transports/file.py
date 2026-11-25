@@ -1131,6 +1131,23 @@ class FileSource(SourceConnector):
         """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
         credential is set). In ``leave`` mode both are best-effort (a read-only share can't create them
         and must not fail start); otherwise both are required."""
+        # _archive_subdir compares spellings, so a value spelled outside the watch directory that
+        # reaches it through a link, a junction, an 8.3 name, or a device or UNC form passes it.
+        # Moved files would then sit where the scan lists them and its spelling-based skip does
+        # not, and be ingested again on every poll (BACKLOG #5682). Compared here by file identity,
+        # before either directory is created, so a refused one is not made inside the watch tree.
+        # processed_dir is written only by the move mode; error_dir takes a quarantine in any mode.
+        archives = [("error_subdir", self.error_dir)]
+        if self.after_read == "move":
+            archives.insert(0, ("processed_subdir", self.processed_dir))
+        for knob, dest in archives:
+            if _inside_watch_tree_by_identity(dest, self.directory):
+                raise SourceStartupError(
+                    f"file source {knob} reaches the watch directory {self.directory} or a "
+                    "directory inside it through another spelling (a link, a junction or a short "
+                    "name), so every archived file would be ingested again; spell it relative to "
+                    "the watch directory, or point it outside the watch directory (value withheld)"
+                )
         if self.after_read == "leave":
             # Leave-in-place (#142) never moves/deletes a source file, so it needs no .processed dir — and
             # a genuinely read-only share can't create either subdir anyway. Best-effort: a quarantine
@@ -1155,23 +1172,6 @@ class FileSource(SourceConnector):
                     f"file source archive directory {refused!r} under {self.directory} is a link or a "
                     "junction, and every move would be refused; make it a real directory, or set "
                     "processed_subdir/error_subdir to an absolute path outside the watch directory"
-                )
-        # _archive_subdir compares spellings, so a value spelled outside the watch directory that
-        # reaches it through a link, a junction, an 8.3 name, a device or UNC form or a case variant
-        # passes it. Moved files would then sit where the scan lists them and its spelling-based skip
-        # does not, and be ingested again on every poll (BACKLOG #5682). Compared here, by file
-        # identity, once the directories exist.
-        for knob, dest in (
-            ("processed_subdir", self.processed_dir),
-            ("error_subdir", self.error_dir),
-        ):
-            if _inside_watch_tree_by_identity(dest, self.directory):
-                raise SourceStartupError(
-                    f"file source {knob} reaches the watch directory {self.directory} or a "
-                    "directory inside it through another spelling (a link, a junction, a short "
-                    "name or a case variant), so every archived file would be ingested again; "
-                    "spell it relative to the watch directory, or point it outside the watch "
-                    "directory (value withheld)"
                 )
 
     async def start(
@@ -3424,22 +3424,36 @@ def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
     that directory or one inside it (BACKLOG #5682). Each of ``dest_dir``'s resolved path and its
     parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
     below the watch directory returns False: the scan's skip matches its spelling, and
-    :func:`_open_dest` refuses a link in it. A path that cannot be read compares as not the watch
-    directory, as does a watch directory that cannot be read. Touches the filesystem, so call it
-    off the event loop."""
+    :func:`_open_dest` refuses a link in it. ``dest_dir`` need not exist yet: its nearest existing
+    parent is what is compared. A path that cannot be read compares as not the watch directory, and
+    so does every path when the watch directory cannot be read or reports no file identity (an
+    inode of 0, as some SMB servers do, which would make every directory on the volume match); each
+    such skip is logged at WARNING. Touches the filesystem, so call it off the event loop."""
     if _dirs_below(dest_dir, directory) is not None:
         return False
     try:
         watch = os.stat(directory)
         real = Path(os.path.realpath(dest_dir))
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "file source %s: the archive directory identity check did not run: %s",
+            directory,
+            _describe_os_error(exc) if isinstance(exc, OSError) else type(exc).__name__,
+        )
+        return False
+    if watch.st_ino == 0:
+        logger.warning(
+            "file source %s: the archive directory identity check did not run: the watch "
+            "directory reports no file identity",
+            directory,
+        )
         return False
     for candidate in (real, *real.parents):
         try:
             if os.path.samestat(os.stat(candidate), watch):
                 return True
         except (OSError, ValueError):
-            continue
+            continue  # not created yet, or unreadable: its parent is compared next
     return False
 
 

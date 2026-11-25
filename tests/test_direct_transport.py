@@ -998,7 +998,10 @@ _RSASSA_PSS_OID_DER = bytes.fromhex("06092a864886f70d01010a")
 
 
 def _mint_ec_leaf(
-    common_name: str, ca_key: rsa.RSAPrivateKey, ca_cert: x509.Certificate
+    common_name: str,
+    ca_key: rsa.RSAPrivateKey,
+    ca_cert: x509.Certificate,
+    names: dict[str, Any] | None = None,
 ) -> tuple[ec.EllipticCurvePrivateKey, x509.Certificate]:
     """An EC (P-256) leaf issued by the RSA test CA — the key type that reaches an approved signature
     with no padding parameter at all."""
@@ -1014,13 +1017,13 @@ def _mint_ec_leaf(
         .not_valid_before(now - datetime.timedelta(days=1))
         .not_valid_after(now + datetime.timedelta(days=365))
     )
-    return key, _with_san(builder, common_name, **_SIGNER_NAMES).sign(ca_key, hashes.SHA256())
+    return key, _with_san(builder, common_name, **(names or {})).sign(ca_key, hashes.SHA256())
 
 
 def _ec_signer(pki: dict[str, Any], tmp_path: Path) -> dict[str, str]:
     """Overrides swapping the RSA signer for an EC one. Only the SIGNER changes — the recipient cert
     and trust anchor are untouched, so this isolates the key type."""
-    key, cert = _mint_ec_leaf("EC Sender Direct", pki["ca_key"], pki["ca_cert"])
+    key, cert = _mint_ec_leaf("EC Sender Direct", pki["ca_key"], pki["ca_cert"], _SIGNER_NAMES)
     cert_p = tmp_path / "ec_signer.crt"
     key_p = tmp_path / "ec_signer.key"
     _write_pem(cert_p, cert)

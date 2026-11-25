@@ -545,7 +545,7 @@ def _address_binding_problem(
             else ""
         )
         return (
-            f"Direct destination '{setting}' does not name {field.rstrip('s')} address {position} of "
+            f"Direct destination '{setting}' does not name {field.removesuffix('s')} address {position} of "
             f"{len(recipients)} in '{field}': it carries no subjectAltName rfc822Name equal to that address, and "
             f"no dNSName equal to its domain on a cert that names no rfc822Name{ignored}"
         )

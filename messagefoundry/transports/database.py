@@ -3986,7 +3986,8 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     (:func:`~messagefoundry.odbc_call_gate.require_call_gate`) has no safe cancellation exit, so
     it is closed here, while no call runs on it.
     :class:`~messagefoundry.odbc_call_gate.UngatedConnectionError` then propagates, and each caller
-    classifies it as it does any other failure to borrow. A stand-in the gate cannot wrap is not
+    classifies it: :func:`_connect` as a permanent ``config_fault``, and at least the source poll,
+    the mark, ``db_lookup`` and the login role probe as they classify any other failure to borrow. A stand-in the gate cannot wrap is not
     refused, as ``require_call_gate`` leaves it alone.
 
     **Its handle is dropped before any await**, so the pool never lends it again, and given back
@@ -4408,9 +4409,18 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
         return pool, await _acquire(pool, timeout)
     except DeliveryError:
         raise
-    except (_DriverMissingError, UngatedConnectionError) as exc:
-        # Both texts are engine literals naming neither the DSN nor the server (_ENGINE_FIXED_TEXT).
+    except _DriverMissingError as exc:
         raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
+    except UngatedConnectionError as exc:
+        # An engine literal naming neither the DSN nor the server (_ENGINE_FIXED_TEXT). The fix is
+        # the installed package, not the connection's settings, so the stop names that.
+        raise NegativeAckError(
+            str(exc),
+            code="db",
+            permanent=True,
+            config_fault=True,
+            remedy="install the aioodbc release pyproject.toml pins",
+        ) from exc
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE
         if state is None:
