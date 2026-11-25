@@ -1462,3 +1462,21 @@ def test_ldap_empty_password_never_binds(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(auth, "_service_conn", must_not_be_called)
     bind = auth.authenticate("someuser", "")
     assert bind.principal is None and bind.answer is None  # no lookup ran (BACKLOG #2434)
+
+
+async def test_login_with_an_unencodable_password_is_refused_at_the_boundary(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # BACKLOG #6880: a JSON body's \ud800 escape decodes to a lone surrogate, which argon2-cffi's
+    # UTF-8 encode would refuse. The request model's ``str`` field refuses it first, so sign-in
+    # answers 422 and never reaches ``verify_password``; that function's own catch is defence in
+    # depth for any caller that skips the model. The raw body is sent by hand because httpx's own
+    # JSON encoder would refuse the surrogate before the request left.
+    monkeypatch.setattr("messagefoundry.auth.service._sleep_until", _no_sleep)
+    service = await _service(engine)
+    await _add(service, "dave", Role.VIEWER)
+    body = b'{"username": "dave", "password": "a-strong-\\ud800-passphrase", "provider": "local"}'
+    async with _client(engine, service) as c:
+        r = await c.post("/auth/login", content=body, headers={"Content-Type": "application/json"})
+        assert r.status_code == 422
+        assert (await _login(c, "dave")).status_code == 200  # the account still signs in

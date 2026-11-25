@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import logging
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -26,6 +27,7 @@ from messagefoundry.auth import (
     verify_password,
 )
 from messagefoundry.auth.permissions import BUILTIN_ROLE_PERMISSIONS
+from tests._content_free import escapes
 
 
 def test_administrator_has_every_permission() -> None:
@@ -159,6 +161,60 @@ def test_password_hash_roundtrip_and_rejections() -> None:
     assert verify_password(h, "wrong") is False
     assert verify_password("not-a-valid-hash", "x") is False
     assert needs_rehash(h) is False
+
+
+# --- BACKLOG #6880: argon2-cffi encodes before it parses, so an unencodable input must not raise -----
+
+
+def _password_log_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    records = [r for r in caplog.records if r.name == "messagefoundry.auth.passwords"]
+    # The encode error carries the whole hash or password in ``.object`` and the offending
+    # character's escape in its text, so it must never ride along on the record.
+    assert all(r.exc_info is None and r.exc_text is None for r in records)
+    return records
+
+
+@pytest.mark.parametrize(
+    ("bad_char", "password"),
+    [
+        ("é", "Str0ng!Passphrase"),
+        ("\ud800", "Str0ng!Passphrase"),
+        ("é", "Str0ng!\ud800Passphrase"),  # both inputs bad: the hash encode fails first
+    ],
+)
+def test_verify_password_non_ascii_stored_hash_is_a_logged_non_match(
+    bad_char: str, password: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A corrupted stored hash (the same function verifies recovery-code hashes) used to raise
+    # UnicodeEncodeError out of argon2-cffi's ASCII encode, breaking the docstring's promise.
+    h = hash_password("Str0ng!Passphrase")
+    corrupted = h[:-1] + bad_char
+    with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+        assert verify_password(corrupted, password) is False
+    records = _password_log_records(caplog)
+    assert [r.levelname for r in records] == ["WARNING"]
+    # Neither the hash nor the password reaches the log, nor the offending character in any of
+    # the forms an encode error prints it (it prints the escape, never the literal).
+    text = "\n".join(r.getMessage() for r in records)
+    assert h[:-1] not in text and "Str0ng!" not in text and "position" not in text
+    for form in escapes(bad_char):
+        assert form not in text
+
+
+def test_verify_password_unencodable_password_is_a_quiet_non_match(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A lone surrogate cannot encode as UTF-8. It is caller input, not corruption, so it is an
+    # ordinary mismatch logged at DEBUG only.
+    h = hash_password("Str0ng!Passphrase")
+    with caplog.at_level("DEBUG", logger="messagefoundry.auth.passwords"):
+        assert verify_password(h, "Str0ng!\ud800Passphrase") is False
+    records = _password_log_records(caplog)
+    assert [r.levelname for r in records] == ["DEBUG"]
+    text = records[0].getMessage()
+    assert "Str0ng!" not in text and "position" not in text
+    for form in escapes("\ud800"):
+        assert form not in text
 
 
 def test_tokens_are_unique_and_only_the_hash_is_storable() -> None:

@@ -13,8 +13,12 @@ in the ``users`` table.
 
 from __future__ import annotations
 
+import logging
+
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
+
+_log = logging.getLogger(__name__)
 
 # argon2id cost parameters (ASVS 11.4.2, 11.4.4). These are RFC 9106 section 4's SECOND recommended
 # option, and argon2-cffi exposes the same tuple as ``argon2.profiles.RFC_9106_LOW_MEMORY``. They
@@ -65,6 +69,23 @@ def verify_password(stored_hash: str, password: str) -> bool:
     try:
         return _hasher.verify(stored_hash, password)
     except (VerificationError, InvalidHashError):
+        return False
+    except UnicodeEncodeError:
+        # argon2-cffi encodes the hash as ASCII before it reads the hash's type prefix, and encodes
+        # the password as UTF-8 after that read but before argon2 sees it. Neither encode failure
+        # becomes one of its own exception types (BACKLOG #6880). A non-ASCII hash, password or
+        # recovery code alike, can only be storage corruption, worth a WARNING. A password that will
+        # not encode (a lone surrogate) is caller input, and no stored hash can match it, because
+        # ``hash_password`` cannot hash it either, so it is an ordinary mismatch. The API's request
+        # models already refuse a lone surrogate with a 422, so that branch guards callers that skip
+        # them. The exception text quotes the offending character's escape and its position, so
+        # neither branch logs it.
+        if not stored_hash.isascii():
+            _log.warning(
+                "stored argon2 hash is not ASCII (storage corruption); treating it as a non-match"
+            )
+        else:
+            _log.debug("password does not encode as UTF-8; treating it as a non-match")
         return False
 
 
