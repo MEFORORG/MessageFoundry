@@ -801,8 +801,7 @@ def test_a_mark_the_text_would_drop_refuses_below_openssl_3(
 
 
 def test_a_non_ascii_byte_on_a_begin_line_refuses(cas: tuple[_Ca, _Ca]) -> None:
-    """A non-ASCII byte on a ``-----BEGIN `` line refuses. The second, clean block keeps the file
-    from refusing first as holding no block."""
+    """A non-ASCII byte on a ``-----BEGIN `` line refuses, beside a clean block as well."""
     good, evil = cas
     data = good.pem.replace(b"BEGIN CERTIFICATE", b"BEGIN CERTIFIC\xc3\xa9ATE", 1) + evil.pem
     with pytest.raises(TrustAnchorError, match="non-ASCII byte") as refused:
