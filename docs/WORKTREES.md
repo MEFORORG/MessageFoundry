@@ -182,7 +182,7 @@ nothing prompts.
 
 | Route | Reaches | Refuses, before it removes anything |
 |---|---|---|
-| `-Name <dir>` | The registered `<repo>-<dir>` sibling of the primary checkout, whichever copy runs (BACKLOG #1894) | Without `-Force`: uncommitted tracked changes and untracked files no exclude rule covers (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
+| `-Name <dir>` | The registered `<repo>-<dir>` sibling of the primary checkout, run from the primary's copy; another checkout's sibling with `-RepoRoot <that checkout>`. A linked worktree's copy refuses `-Name` without `-RepoRoot` (BACKLOG #1894) | Without `-Force`: uncommitted tracked changes and untracked files no exclude rule covers (which `-Discard` parks instead), files flagged skip-worktree or assume-unchanged, and the git repositories inside the tree listed in the next section. Unless `-AllowOrphanedAllocations`: an unlanded ledger number. Whatever `-Force` says: a detached HEAD no ref holds, a commit only the tree's HEAD reflog or its own per-worktree refs hold (on `-Name` without `-DeleteBranch`, one the kept branch's reflog holds does not count), `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` or `GIT_INDEX_FILE` set, `GIT_CONFIG` or a `GIT_CONFIG_<anything>` variable set, a caller standing in the tree or running a copy of the script that lives in it (a junction or 8.3 alias included), a held claim, git or working-tree activity in six hours, uncommitted work written in six hours at any depth, and a nested worktree. |
 | `-Path <path>` | Any registered linked worktree that is not under `.claude/worktrees` (one above the primary does not count; see below) | Everything `-Name` refuses, and the list in the next section. |
 | `-List` | Nothing. It is read-only. | It prints each worktree, its class, and which route reaches it. |
 
@@ -328,7 +328,8 @@ classifier still counts that segment, so its deny text offers no `-Path` line fo
 One layout overlaps. Before BACKLOG #1894, `new.ps1` run from a linked worktree made its sibling
 **beside that worktree**, and for a harness-made worktree that is also under `.claude/worktrees`.
 `-Path` refuses it like the rest. `remove.ps1 -RepoRoot <that worktree> -Name <n>` still removes
-it; the linked copy without `-RepoRoot` refuses while such a tree exists, naming both candidates.
+it. A linked worktree's copy run with `-Name` and no `-RepoRoot` refuses, whatever stands beside
+it, so it never reaches the primary's sibling instead.
 
 **The session registry does not see where a session works, so other signals are read.** The
 registry records a launch directory. A subagent Builder is recorded under its parent's directory,
@@ -359,10 +360,12 @@ their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
 ### `-Name` removes the sibling of the primary
 
-**Every copy searches the same place.** `remove.ps1 -Name <n>` reaches `<repo-parent>\<repo-name>-<n>`,
-where the repo is the clone's **primary** checkout, the first entry of `git worktree list`, whichever
-copy runs and from any cwd outside the worktree being removed (git can't remove the worktree you're
-standing in). `new.ps1` creates its sibling in the same place from every copy. Until BACKLOG #1894 both
+**Run the primary's copy.** `remove.ps1 -Name <n>` reaches `<repo-parent>\<repo-name>-<n>`, where the
+repo is the clone's **primary** checkout, the first entry of `git worktree list`, from any cwd outside
+the worktree being removed (git can't remove the worktree you're standing in). A copy in a linked
+worktree, or below a checkout's top, refuses `-Name` unless `-RepoRoot` names the checkout, because
+re-anchored it would reach a tree its own older run never could. `new.ps1` creates its sibling
+beside the primary from every copy. Until BACKLOG #1894 both
 anchored on the copy's own checkout, so a copy in a linked worktree made and searched
 `<that worktree>-<n>`; `-RepoRoot <that worktree> -Name <n>` still reaches a tree made that way.
 `new.ps1` prints the exact command with the root filled in. (BACKLOG #1078.)

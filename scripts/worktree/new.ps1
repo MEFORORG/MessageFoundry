@@ -89,7 +89,8 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 # BOTH LAYOUTS ANCHOR ON THE MAIN WORKTREE, whichever copy runs (BACKLOG #1894 for the sibling; the
 # nested layout always did). The sibling used to be `<this copy's checkout>-<Name>`, so a copy in a
 # linked worktree made the tree beside ITSELF, often under .claude\worktrees, where remove.ps1 -Path
-# refuses to reach it. remove.ps1 -Name anchors on the main worktree the same way.
+# refuses to reach it. remove.ps1 -Name anchors on the main worktree too, and its copy in a linked
+# worktree refuses -Name unless -RepoRoot names the checkout.
 $mainLine = @(& git -C $RepoRoot worktree list --porcelain 2>$null) |
     Where-Object { $_ -like 'worktree *' } | Select-Object -First 1
 if (-not $mainLine) { throw "cannot find the main worktree of $RepoRoot" }

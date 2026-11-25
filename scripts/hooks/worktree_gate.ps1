@@ -3677,7 +3677,7 @@ function Find-FirstAnsweringRoot([string[]]$Cands, [string]$CwdRaw) {
 #     -Nested it makes <main worktree>/.claude/worktrees/<Name>. Either way it copies the
 #     leak-gate token list, builds the .venv and holds the add lock. remove.ps1 has two removal
 #     routes (vault BACKLOG #1017). -Name tears down only the sibling of the main worktree, or of the
-#     checkout -RepoRoot names. -Path is the checked route: any registered linked worktree that is
+#     checkout -RepoRoot names; a linked worktree's copy refuses -Name without -RepoRoot. -Path is the checked route: any registered linked worktree that is
 #     NOT under .claude/worktrees. So a tree under .claude/worktrees has NO scripted teardown, except
 #     a sibling an older new.ps1 made beside a linked worktree there, which -RepoRoot <that worktree>
 #     -Name still reaches (see new.ps1's Show-NextSteps for why the rest are not reached).
