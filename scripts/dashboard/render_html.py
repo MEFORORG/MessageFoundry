@@ -409,6 +409,12 @@ color:var(--muted);flex-wrap:wrap}
 .key{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
 .key.s1{background:var(--s1)}.key.s2{background:var(--s2)}.key.s3{background:var(--s3)}
 footer{color:var(--muted);font-size:12px;margin-top:24px}
+.wide{margin-top:12px}.tablewrap{overflow-x:auto}
+table.prio{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+.prio th,.prio td{padding:5px 10px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+.prio thead th{color:var(--muted);font-weight:600}
+.prio tbody th,.prio thead th:first-child{text-align:left}
+.prio tr.sum th,.prio tr.sum td{font-weight:650;border-bottom:none}
 """
 
 
@@ -449,16 +455,16 @@ def tile(
     shown = [f for f in facts if not str(f.get("id", "")).endswith(".provenance")]
     dl = "".join(f"<dt>{esc(f.get('label', ''))}</dt><dd>{fmt(f.get('value'))}</dd>" for f in shown)
     error = row.get("error")
-    if row.get("ref") and not provenance_lines and not error:
-        # A missing tool header is said on the tile's face, never only inside the disclosure.
-        error = next(
-            (
-                f.get("error")
-                for f in facts
-                if str(f.get("id", "")).endswith(".provenance") and f.get("error")
-            ),
-            "the snapshot holds no scorecard provenance lines",
-        )
+    if row.get("ref") and not provenance_lines:
+        # A missing tool header is said on the tile's face, never only inside the disclosure,
+        # and beside any other error rather than hidden by it.
+        # Its own words, not the provenance fact's error: that fact inherits the metric's error,
+        # which says why the metric failed, not that the header is absent.
+        reason = "the snapshot holds no scorecard provenance lines"
+        if not error:
+            error = reason
+        elif reason not in str(error):
+            error = f"{error}; {reason}"
     note = f'<p class="note">{esc(row["note"])}</p>' if row.get("note") else ""
     how = ""
     if row.get("ref"):
@@ -495,6 +501,41 @@ def tile(
         + note
         + (f'<p class="err">{esc(error)}</p>' if error else "")
         + "</section>"
+    )
+
+
+def priority_table(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Ledger rows by priority (rows) and status (columns), with totals; "no data" when the
+    snapshot holds no priority census."""
+    if not rows:
+        return '<p class="nodata">no data: the snapshot holds no priority census</p>'
+    priorities = list(dict.fromkeys(str(r["priority"]) for r in rows))
+    statuses = list(dict.fromkeys(str(r["status"]) for r in rows))
+    cell = {(str(r["priority"]), str(r["status"])): r.get("value") for r in rows}
+
+    def total(values: Sequence[Any]) -> Any:
+        # A total over a cell with no measurement is no measurement either.
+        return None if any(not _number(v) for v in values) else sum(values)
+
+    head = "".join(f"<th>{esc(s.capitalize())}</th>" for s in statuses)
+    body = []
+    for p in priorities:
+        values = [cell.get((p, s)) for s in statuses]
+        label = "Unscored" if p == tr.UNSCORED_LABEL else p
+        body.append(
+            f"<tr><th>{esc(label)}</th>"
+            + "".join(f"<td>{fmt(v)}</td>" for v in values)
+            + f"<td>{fmt(total(values))}</td></tr>"
+        )
+    columns = [total([cell.get((p, s)) for p in priorities]) for s in statuses]
+    body.append(
+        '<tr class="sum"><th>Total</th>'
+        + "".join(f"<td>{fmt(v)}</td>" for v in columns)
+        + f"<td>{fmt(total(columns))}</td></tr>"
+    )
+    return (
+        '<div class="tablewrap"><table class="prio"><thead><tr><th>Priority</th>'
+        f"{head}<th>Total</th></tr></thead><tbody>{''.join(body)}</tbody></table></div>"
     )
 
 
@@ -621,6 +662,10 @@ def render(data: dict[str, Any]) -> str:
 <p class="stamp">{stamp_html}</p>
 <p class="lede">{lede(headline)} Window {esc(window)}, through {esc(data.get("through") or "unknown")} (UTC).</p>
 <div class="tiles">{tiles}</div>
+<section class="chart wide"><h2>Ledger rows by priority</h2>{priority_table(tr.priority_rows(snap))}
+<p class="note">Every ledger row, open and closed, by the priority on its own Cluster line and its
+status banner. Open, partial and in progress are open rows; closed, declined and superseded are
+closed ones. As of the vault at run time.</p></section>
 {ledger}
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}
 {legend(repos)}</section>

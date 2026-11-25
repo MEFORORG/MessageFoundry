@@ -736,7 +736,27 @@ def test_child_runs_in_utf8_mode() -> None:
 
 # -- the vault read, with a fake archive ------------------------------------------------------------
 
-_FAKE_CHECKER = 'LEDGER_FILE_GLOBS = ("docs/BACKLOG*.md",)\n'
+_FAKE_CHECKER = """
+import re
+
+LEDGER_FILE_GLOBS = ("docs/BACKLOG*.md",)
+SHIPPED_BANNER, DECLINED_BANNER, RETIRED_BANNER = "S", "D", "R"
+PRIORITIZED_BANNER, IN_PROGRESS_BANNER = "O", "I"
+PARTIAL_LINE = re.compile(r"^> \\*\\*PARTIAL")
+
+
+class Item:
+    def __init__(self, line, banner):
+        self.line, self.body_line, self.section_lines = line, line + 1, []
+        self.banner_lines = [(line, banner)]
+        self.is_open = banner in (PRIORITIZED_BANNER, IN_PROGRESS_BANNER)
+
+
+def parse_items(text):
+    # One row per "filed" line: the first open, the rest shipped.
+    lines = [n for n, ln in enumerate(text.splitlines(), 1) if ln.startswith("filed ")]
+    return [Item(n, PRIORITIZED_BANNER if i == 0 else SHIPPED_BANNER) for i, n in enumerate(lines)]
+"""
 _FAKE_REPORT = """
 import datetime as dt
 from collections import Counter
@@ -847,6 +867,7 @@ def test_read_vault_lists_with_nul_and_clips_at_through(tmp_path: Path) -> None:
     assert c.weeks[cm.AFTER_THROUGH]["filed"] == 1
     assert c.undated["filed"] == 1  # an unparseable date is still undated, not clipped
     assert c.open_by_verdict == {"owner-ruling": 1}
+    assert c.by_priority == {"unscored": {"open": 1, "closed": 2}}
     # Nothing of the vault's was imported into this process.
     assert "ledger_weekly_report" not in sys.modules
     assert "backlog_status_check" not in sys.modules
@@ -1532,3 +1553,80 @@ def test_xlsx_cells_without_a_reference_follow_the_previous_cell() -> None:
         "Batch queue",
     )
     assert rows == [["a", "", "3", "4"]]
+
+
+# -- ledger rows by priority -----------------------------------------------------------------------
+
+
+def _load_driver() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "dashboard_vault_census", _PATH.parent / "_vault_census.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _Row:
+    def __init__(self, banners: list[str], *, section: int = 0, line: int = 1) -> None:
+        self.line, self.body_line = line, line + 1 + len(banners)
+        self.banner_lines = [(line + 1 + i, b) for i, b in enumerate(banners)]
+        self.section_lines = [section] if section else []
+        self.is_open = not any(b in "SDR" for b in banners)
+
+
+_CHECKER = type(
+    "Checker",
+    (),
+    {
+        "SHIPPED_BANNER": "S",
+        "DECLINED_BANNER": "D",
+        "RETIRED_BANNER": "R",
+        "IN_PROGRESS_BANNER": "I",
+        "PARTIAL_LINE": __import__("re").compile(r"^> \*\*PARTIAL"),
+    },
+)
+
+
+@pytest.mark.parametrize(
+    ("banners", "block", "status"),
+    [
+        (["O"], ["> O filed"], "open"),
+        (["I", "O"], ["> I working", "> O filed"], "in progress"),
+        (["I", "O"], ["> **PARTIAL 2026-10-01 built half**", "> O filed"], "partial"),
+        (["S", "I"], ["> S shipped", "> **PARTIAL x**"], "closed"),
+        (["D"], ["> D no"], "declined"),
+        (["R"], ["> R gone"], "superseded"),
+    ],
+)
+def test_row_status_buckets_are_disjoint(banners: list[str], block: list[str], status: str) -> None:
+    vc = _load_driver()
+    lines = ["## 1. Title", *block, "body"]
+    assert vc.row_status(_CHECKER, _Row(banners), lines) == status
+
+
+def test_row_priority_reads_the_rows_own_section_line() -> None:
+    vc = _load_driver()
+    lines = [
+        "## 1. Title",
+        "> O filed",
+        "**Cluster:** Ops. **Priority:** P2. **Verdict:** build.",
+        "Quotes another row: **Priority:** P1.",
+    ]
+    assert vc.row_priority(_Row(["O"], section=3), lines) == "P2"
+    # Prose that quotes a priority is not the row's own; no section line is unscored.
+    assert vc.row_priority(_Row(["O"]), lines) == vc.UNSCORED == "unscored"
+
+
+def test_backlog_burn_flags_a_priority_table_that_disagrees(tmp_path: Path) -> None:
+    m = cm.Metric("backlog_burn", "", "", "", "")
+    # The census holds 12 open rows; this table holds 3.
+    census = _census(by_priority={"P1": {"open": 2, "partial": 1, "closed": 9}})
+    cm.c_backlog_burn(_vault_ctx(tmp_path, census), m)
+    assert m.detail["by_priority"] == {"P1": {"open": 2, "partial": 1, "closed": 9}}
+    assert "counts 3 open rows, the census 12" in m.detail["partial_error"]
+    m = cm.Metric("backlog_burn", "", "", "", "")
+    census = _census(by_priority={"P1": {"open": 10, "in progress": 2, "declined": 4}})
+    cm.c_backlog_burn(_vault_ctx(tmp_path, census), m)
+    assert "partial_error" not in m.detail

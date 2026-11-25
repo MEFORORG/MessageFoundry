@@ -193,6 +193,9 @@ HISTORY_MAX_WEEKS = 104
 FORECAST_WEEKS = 4
 FORECAST_SHORT_WEEKS = 2
 
+#: The priority table's statuses that are open rows; the rest are closed kinds.
+OPEN_STATUSES = ("open", "partial", "in progress")
+
 #: The census activity columns that take a row off the open ledger.
 CLOSED_COLUMNS = ("closed", "declined", "superseded")
 
@@ -667,6 +670,8 @@ class Census:
     active_verdicts: list[str]
     deferred_verdict: str
     activity: list[str]
+    #: Rows per priority per status (``_vault_census.priority_census``).
+    by_priority: dict[str, dict[str, int]] = field(default_factory=dict)
 
     @property
     def open_rows(self) -> int:
@@ -812,6 +817,11 @@ def _read_vault(ctx: Context) -> VaultRead:
         active_verdicts=[str(v) for v in got["active_verdicts"]],
         deferred_verdict=str(got["deferred_verdict"]),
         activity=[str(c) for c in got["activity"]],
+        # Absent, the table is empty and c_backlog_burn's open-row check marks it partial.
+        by_priority={
+            str(p): {str(k): int(v) for k, v in c.items()}
+            for p, c in got.get("by_priority", {}).items()
+        },
     )
     # The checker's anti-narrowing floors, reused: a dropped, emptied or unscanned ledger file, then
     # the row-count floor. The archive is no git top level, so the checker globs it from disk.
@@ -876,7 +886,18 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
         "undated": dict(c.undated),
         "series_is": "closed minus filed, per week",
         "after_through": dict(c.weeks.get(AFTER_THROUGH, {})),
+        "by_priority": {p: dict(counts) for p, counts in c.by_priority.items()},
     }
+    # The priority table's open buckets must hold every open row the census counted: a parser
+    # change on either side would otherwise make the table quietly disagree with the tile.
+    table_open = sum(
+        n for counts in c.by_priority.values() for k, n in counts.items() if k in OPEN_STATUSES
+    )
+    if table_open != c.open_rows:
+        add_partial(
+            m.detail,
+            f"the priority table counts {table_open} open rows, the census {c.open_rows}",
+        )
     history = burn_history(c.weeks, labels[-1])
     m.detail["history"] = history
     m.detail["open_series"] = open_history(history, c.open_rows, c.weeks.get(AFTER_THROUGH, {}))

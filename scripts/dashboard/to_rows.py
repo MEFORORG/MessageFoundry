@@ -3,8 +3,9 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Flatten a ``collect_metrics.py`` snapshot into the dashboard's two row files.
 
-WRITES ``<out>/metrics.json`` (one row per headline metric, then one per fact) and
-``<out>/series.json`` (one row per series per ISO week). Each file is ``{"rows": [...], "meta":
+WRITES ``<out>/metrics.json`` (one row per headline metric, then one per fact),
+``<out>/series.json`` (one row per series per ISO week) and ``<out>/priority.json`` (one row per
+ledger priority per status). Each file is ``{"rows": [...], "meta":
 [...]}``, and ``meta`` carries this converter's own source and the snapshot it read.
 
 THE ROWS ARE AS PRIVATE AS THE SNAPSHOT: they quote the same vault counts. ``--out`` is refused
@@ -281,22 +282,26 @@ def ledger_history(snap: Snapshot) -> list[dict[str, Any]]:
 BATCH_STATES = ("FREE", "IN PROGRESS", "QUIET", "NO BUILDER", "BUILT", "MERGED", "DONE")
 
 
+def _whole(value: Any) -> int | None:
+    """A batch count as the collector writes it, a whole number; anything else is no
+    measurement. Never converted, so a float such as 1e999 cannot raise."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def _other_batches(d: dict[str, Any]) -> Any:
     """Batches in a state the list above does not name, so the breakdown always sums."""
     by = d.get("batches_by_state")
     if not isinstance(by, dict):
         return None
-    try:
-        return sum(int(n) for s, n in by.items() if s not in BATCH_STATES)
-    except (TypeError, ValueError):
-        # A malformed count is no measurement; the page shows no data rather than raising.
-        return None
+    counts = [_whole(n) for s, n in by.items() if s not in BATCH_STATES]
+    return None if None in counts else sum(n for n in counts if n is not None)
 
 
 def _batches(state: str) -> Callable[[dict[str, Any]], Any]:
     def read(d: dict[str, Any]) -> Any:
         by = d.get("batches_by_state")
-        return by.get(state, 0) if isinstance(by, dict) else None
+        # A state with no batches is absent from the map, so absent is a real zero.
+        return _whole(by.get(state, 0)) if isinstance(by, dict) else None
 
     return read
 
@@ -480,6 +485,42 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
     return rows
 
 
+#: The bucket ``_vault_census.py`` puts a row whose Cluster line names no priority in.
+UNSCORED_LABEL = "unscored"
+
+#: The priority table's columns, in order: the open statuses, then the closed kinds.
+PRIORITY_STATUSES = (*cm.OPEN_STATUSES, "closed", "declined", "superseded")
+
+
+def _priority_key(priority: str) -> tuple[int, str]:
+    # P0, P1, ... in order, then anything else (the unscored bucket) after them.
+    return (0, priority) if priority[:1] == "P" and priority[1:].isdigit() else (1, priority)
+
+
+def priority_rows(snap: Snapshot) -> list[dict[str, Any]]:
+    """One row per ledger priority per status, priorities in order and every status present, so a
+    zero is a measured zero. Empty for a snapshot that holds no priority census."""
+    by = snap.detail("backlog_burn").get("by_priority")
+    if not isinstance(by, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for priority in sorted((str(p) for p in by), key=_priority_key):
+        counts = _dict(by.get(priority))
+        statuses = [*PRIORITY_STATUSES, *sorted(k for k in counts if k not in PRIORITY_STATUSES)]
+        for status in statuses:
+            value = counts.get(status, 0)
+            rows.append(
+                {
+                    "priority": priority,
+                    "status": status,
+                    "value": value
+                    if isinstance(value, int) and not isinstance(value, bool)
+                    else None,
+                }
+            )
+    return rows
+
+
 def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
     # Unresolved, the window's newest week is the one that may be in progress: fail closed and
     # mark it partial rather than plot it as complete.
@@ -577,6 +618,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out.mkdir(parents=True, exist_ok=True)
         cm.write_json_atomic(out / "metrics.json", {"rows": metrics, "meta": info})
         cm.write_json_atomic(out / "series.json", {"rows": series, "meta": info})
+        cm.write_json_atomic(out / "priority.json", {"rows": priority_rows(snap), "meta": info})
     except (OSError, ValueError) as exc:
         print(f"ERROR: cannot write {out}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

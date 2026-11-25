@@ -388,9 +388,62 @@ def test_missing_asvs_provenance_is_said_on_the_tile() -> None:
     assert "holds no scorecard provenance lines" not in tile
 
 
-def test_a_malformed_batch_count_renders_no_data() -> None:
+@pytest.mark.parametrize("bad", ["many", float("inf"), 2.0, True, None])
+def test_a_malformed_batch_count_renders_no_data(bad: Any) -> None:
     snap = _snapshot()
-    snap["metrics"].append(
-        _metric("batch_progress", value=1.0, detail={"batches_by_state": {"X": "many"}})
+    by = {"X": bad, "FREE": bad, "DONE": 4}
+    snap["metrics"].append(_metric("batch_progress", value=1.0, detail={"batches_by_state": by}))
+    page = rh.render(snap)
+    nodata = '<dd><span class="nodata">no data</span></dd>'
+    assert f"<dt>Other state</dt>{nodata}" in page
+    assert f"<dt>Free</dt>{nodata}" in page
+    assert "<dt>Done</dt><dd>4</dd>" in page
+    assert "<dt>Built</dt><dd>0</dd>" in page  # absent from the map: a real zero
+
+
+def test_missing_asvs_provenance_is_said_beside_another_error() -> None:
+    snap = _snapshot()
+    snap["metrics"][3]["error"] = "the tool timed out"
+    page = rh.render(snap)
+    tile = page[page.index("<h3>asvs") :]
+    tile = tile[: tile.index("</section>")]
+    assert (
+        '<p class="err">the tool timed out; the snapshot holds no scorecard provenance lines</p>'
+        in tile
     )
-    assert "Other state" in rh.render(snap)
+
+
+def test_the_priority_table_has_totals_and_every_status() -> None:
+    snap = _snapshot()
+    snap["metrics"][0]["detail"]["by_priority"] = {
+        "P1": {"open": 2, "closed": 3},
+        "unscored": {"partial": 1, "declined": 1},
+    }
+    page = rh.render(snap)
+    table = page[page.index('<table class="prio">') : page.index("</table>")]
+    heads = re.findall(r"<th>([^<]+)</th>", table[: table.index("</thead>")])
+    assert heads == [
+        "Priority",
+        "Open",
+        "Partial",
+        "In progress",
+        "Closed",
+        "Declined",
+        "Superseded",
+        "Total",
+    ]
+    assert (
+        "<tr><th>P1</th><td>2</td><td>0</td><td>0</td><td>3</td><td>0</td><td>0</td><td>5</td></tr>"
+        in table
+    )
+    assert "<th>Unscored</th>" in table
+    assert (
+        '<tr class="sum"><th>Total</th><td>2</td><td>1</td><td>0</td><td>3</td><td>1</td><td>0</td><td>7</td></tr>'
+        in table
+    )
+    # The table sits above the charts.
+    assert page.index("Ledger rows by priority") < page.index("Ledger range")
+
+
+def test_a_snapshot_without_a_priority_census_says_no_data() -> None:
+    assert "no data: the snapshot holds no priority census" in rh.render(_snapshot())

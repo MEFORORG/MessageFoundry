@@ -486,3 +486,41 @@ def test_series_rows_carry_the_ledger_history() -> None:
     rows = [r for r in tr.series_rows(tr.Snapshot(data)) if r["week"] == "2026-W46"]
     got = {r["series"]: r["value"] for r in rows}
     assert got == {"Filed, all weeks": 4, "Closed, all weeks": 3, "Open rows": 13}
+
+
+def test_priority_rows_order_and_fill_every_status() -> None:
+    by = {"unscored": {"open": 1}, "P2": {"closed": 4, "odd": 1}, "P1": {"open": 2}}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    rows = tr.priority_rows(snap)
+    assert list(dict.fromkeys(r["priority"] for r in rows)) == ["P1", "P2", "unscored"]
+    p2 = {r["status"]: r["value"] for r in rows if r["priority"] == "P2"}
+    assert p2 == {
+        "open": 0,
+        "partial": 0,
+        "in progress": 0,
+        "closed": 4,
+        "declined": 0,
+        "superseded": 0,
+        "odd": 1,
+    }
+    assert tr.priority_rows(tr.Snapshot({})) == []
+
+
+def test_main_writes_the_priority_file(tmp_path: Path) -> None:
+    snap = tmp_path / "metrics.json"
+    detail = {"by_priority": {"P1": {"open": 2}}}
+    snap.write_text(json.dumps({"metrics": [{"id": "backlog_burn", "detail": detail}]}), "utf-8")
+    out = tmp_path / "rows"
+    try:
+        code = tr.main([str(snap), str(out)])
+    except SystemExit as exc:  # pragma: no cover - argparse
+        code = int(exc.code or 0)
+    if code == 1:
+        pytest.skip("the temporary directory is inside a git work tree on this machine")
+    rows = json.loads((out / "priority.json").read_text(encoding="utf-8"))["rows"]
+    assert {"priority": "P1", "status": "open", "value": 2} in rows
+
+
+def test_unscored_label_matches_the_census_driver() -> None:
+    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
+    assert f'UNSCORED = "{tr.UNSCORED_LABEL}"' in source
