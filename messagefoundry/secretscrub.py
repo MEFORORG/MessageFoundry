@@ -2294,7 +2294,8 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
     #5550). Each caller runs it before the passes that would rewrite the markers:
-    :func:`scrub_credentials` runs it as its first pass, before its label passes, and
+    :func:`scrub_credentials` applies the same block pattern itself, as the first pattern its
+    ``_run`` applies, before its label passes, in each reading that keeps the key-block pass, and
     ``support/redact.py``, ``logging_setup`` and the tray chain run it before the PHI pass.
     :func:`scrub_credentials` also runs it a second time, last, over the reading it keeps, where it
     masks only a block whose BEGIN marker that reading still holds (the comment above

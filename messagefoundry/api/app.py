@@ -982,11 +982,15 @@ def _read_log_tail(
 
     Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
     newest ``.log``/``.txt`` file (``offset=0`` = the most recent ``limit`` lines); the page is returned in
-    file order (oldest-first within the window). Every line is passed through
-    :func:`~messagefoundry.support.redact.redact_log_line`, after the cross-line key-body mask
-    (:func:`~messagefoundry.support.redact.mask_key_body_lines`) — the SAME redactor the support bundle uses — so
-    the browser sees identical PHI/secret coverage; the redaction is best-effort (a residual single-token
-    identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
+    file order (oldest-first within the window). Every line served is passed through
+    :func:`~messagefoundry.support.redact.redact_log_record`, the per-line pass the support bundle's
+    ``redact_log_text`` runs too, after the cross-line key-body mask
+    (:func:`~messagefoundry.support.redact.mask_key_body_lines`) over the page and the lines before it
+    back to where a key block covering it could begin
+    (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text:
+    the bundle masks across its bounded read window, and keeps the audit copies, while this reads the
+    whole file and, with ``audit_copies=False``, drops them before the mask. The redaction is
+    best-effort (a residual single-token identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
     **never raises** (an unreadable dir/file yields an empty, unavailable page).
@@ -1019,9 +1023,11 @@ def _read_log_tail(
     total = len(all_lines)
     end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
     start = max(0, end - limit)
-    # Before paging, as the bundle does before its tail cut, so a PRIVATE KEY block whose BEGIN line
-    # is on an earlier page still has its body masked on this one (BACKLOG #5550).
-    page = redact.mask_key_body_lines(all_lines)[start:end]
+    # From where a PRIVATE KEY block covering the page could begin, so a block whose BEGIN line is on
+    # an earlier page still has its body masked on this one, without masking the whole file on each
+    # request (BACKLOG #5550).
+    first = redact.key_body_mask_from(all_lines, start)
+    page = redact.mask_key_body_lines(all_lines[first:end])[start - first :]
     return [redact_log_record(line) for line in page], total, True
 
 

@@ -12,6 +12,7 @@ here is synthetic; the key material is generated (``tests/_pem_fixture.py`` says
 from __future__ import annotations
 
 import itertools
+import random
 import re
 from collections import Counter
 from pathlib import Path
@@ -23,6 +24,7 @@ from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.support import bundle as bundle_mod
 from messagefoundry.support import redact as redact_mod
 from messagefoundry.support.redact import (
+    key_body_mask_from,
     mask_key_body_lines,
     redact_log_record,
     redact_log_text,
@@ -246,3 +248,75 @@ def test_the_fallback_mask_prints_nothing_the_reading_before_it_hid(
                 assert not newly, (name, text, old_line, new_line)
                 hidden += bool(_printed(old_line) - _printed(new_line))
     assert hidden > 0
+
+
+def _window_corpus() -> list[str]:
+    """Log lines a page boundary can fall between: body lines, markers, headers, escaped breaks,
+    lines of plain words that could be body lines, and log records that cannot."""
+    return [
+        "2026-11-25 12:00:00,001 ERROR mefor.tls key load failed:",
+        "key load failed: " + pem_marker("BEGIN", "RSA PRIVATE KEY"),
+        pem_marker("BEGIN", "RSA PRIVATE KEY"),
+        pem_marker("BEGIN", "EC PRIVATE KEY"),
+        pem_marker("END", "RSA PRIVATE KEY"),
+        _KEY_LINE,
+        _KEY_LAST,
+        "AbC",
+        "",
+        " \t",
+        "Proc-Type: 4,ENCRYPTED",
+        "DEK-Info: AES-----128,0A1B",
+        _KEY_LAST + "\\n" + _KEY_LAST,
+        _KEY_LAST + "\\n" + pem_marker("END", "RSA PRIVATE KEY"),
+        "AAAA\\n2026.x",
+        "plain words",
+        "PID|1||MRN7712345^^^HOSP^MR||ZQDOE^ZQJANE||19700101|F",
+    ]
+
+
+def test_masking_from_the_scan_start_equals_masking_the_whole_list() -> None:
+    """``key_body_mask_from`` lets ``GET /logs/tail`` mask from near its page instead of over the
+    whole file; every page of every list must come out as it does from the whole list."""
+    corpus, rng = _window_corpus(), random.Random(5550)
+    pages = differing = 0
+    for _ in range(600):
+        lines = [rng.choice(corpus) for _ in range(rng.randint(1, 14))]
+        whole = mask_key_body_lines(lines)
+        for end in range(len(lines) + 1):
+            for start in range(end + 1):
+                first = key_body_mask_from(lines, start)
+                assert first <= start
+                assert mask_key_body_lines(lines[first:end])[start - first :] == whole[start:end]
+                pages += 1
+                # The control: masking from the page start alone gets some page wrong.
+                differing += mask_key_body_lines(lines[start:end]) != whole[start:end]
+    assert pages and differing
+
+
+def test_the_log_viewer_masks_near_its_page_not_the_whole_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cost of ``GET /logs/tail``: the cross-line mask runs over the page and the lines before
+    it back to where a block could begin, not over every line of the file on each request."""
+    from messagefoundry.api.app import _read_log_tail
+
+    records = [f"2026-11-25 12:00:{i % 60:02d},001 INFO mefor.x line {i}." for i in range(5000)]
+    block = pem_block("RSA PRIVATE KEY", "\n", _KEY_LINE, _KEY_LINE[::-1], _KEY_LAST).split("\n")
+    lines = [*records, *block, *records[:20]]
+    (tmp_path / "engine.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    seen: list[int] = []
+    real = redact_mod.mask_key_body_lines
+
+    def spy(given: list[str]) -> list[str]:
+        seen.append(len(given))
+        return real(given)
+
+    monkeypatch.setattr(redact_mod, "mask_key_body_lines", spy)
+    page, total, available = _read_log_tail(str(tmp_path), limit=10, offset=0)
+    assert available and total == len(lines) and len(page) == 10
+    assert seen and max(seen) <= 11, seen
+    # A page starting inside the block still masks the body, from its BEGIN line on.
+    seen.clear()
+    page, _, _ = _read_log_tail(str(tmp_path), limit=22, offset=0)
+    assert not any(_KEY_LAST[:-2] in line for line in page), page
+    assert seen and max(seen) <= 20 + len(block) + 1, seen

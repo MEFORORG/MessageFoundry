@@ -77,6 +77,7 @@ from messagefoundry.secretscrub import _PRIVATE_KEY_BLOCK as _SHARED_PRIVATE_KEY
 from messagefoundry.secretscrub import _WIDE_DSN_PASSWORD as _SHARED_DSN_PASSWORD
 
 __all__ = [
+    "key_body_mask_from",
     "mask_key_body_lines",
     "redact_log_line",
     "redact_log_record",
@@ -815,6 +816,28 @@ def redact_log_text(text: str) -> str:
     return "\n".join(redact_log_record(ln) for ln in lines)
 
 
+#: A line that could sit inside a PRIVATE KEY block's body: a superset of the characters
+#: :data:`_PRIVATE_KEY_BLOCK` reads in a body line, its two header lines and an escaped line break,
+#: so a line it refuses ends any block before it.
+_MAYBE_KEY_BODY_LINE = re.compile(r"[A-Za-z0-9+/=\\ \t:,-]*+")
+
+
+def key_body_mask_from(lines: list[str], start: int) -> int:
+    """The index to run :func:`mask_key_body_lines` from so that ``lines[start:]`` comes out as it
+    does from the whole list (BACKLOG #5550): the nearest line before ``start`` that no block's body
+    can cover, or 0.
+
+    A block's body is made of whole lines the block pattern reads as body lines, so a block that
+    covers a line at or after ``start`` has its BEGIN line at or after the nearest earlier line that
+    cannot be one. Masking from there costs the lines from there on, not the whole list. A run of
+    lines that each could be a body line, such as lines of plain words, is scanned back over whole,
+    so on such a run the cost is the run's length."""
+    index = min(start, len(lines))
+    while index > 0 and _MAYBE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
+        index -= 1
+    return max(index - 1, 0)
+
+
 def mask_key_body_lines(lines: list[str]) -> list[str]:
     """``lines`` with each line after a BEGIN line that a PRIVATE KEY block's body covers whole
     written as secretscrub's key-block mask writes it, one character for one (BACKLOG #5550).
@@ -825,9 +848,11 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
     line at a time, where no line holds its BEGIN marker and its body together. A body line of 24 or
     more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
     last line, printed. So the block is found over the joined lines, and only the lines its body
-    covers from their first character to their last are replaced, so nothing but "x" runs is left
-    on them for a later pass to read differently. Every other line stays as it was. The mask keeps a
-    ``Proc-Type:`` or ``DEK-Info:`` header as it is.
+    covers from their first character to their last are replaced, each with what the mask writes for
+    it, so no base64 run is left on them for a later pass to read differently. The mask writes the
+    base64 characters as "x" and leaves the rest of such a line as it was: at least its spaces and
+    tabs, an escaped line break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole.
+    Every other line stays as it was.
 
     At least these still print as before: a last body line that shares its line with an escaped line
     break, as in ``<body>\\n-----END ...``, and is too short for the sweep; a body whose lines each
