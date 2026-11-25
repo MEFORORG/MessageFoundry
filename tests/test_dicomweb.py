@@ -1323,7 +1323,8 @@ async def test_dicomweb_the_pre_read_writes_its_held_lines_with_the_first_read_f
 ) -> None:
     # Where the read raises a fault the codec does not wrap, the lines pydicom logged on the way
     # are written with the first WARNING, so it has its reason in the log; they pass the same
-    # redacting filter. A later read's lines are dropped, as its WARNING is.
+    # default-deny filter, so a line no template pins is written withheld. A later read's lines
+    # are dropped, as its WARNING is.
     pytest.importorskip("pydicom")
     from messagefoundry.transports import dicomweb
 
@@ -1342,7 +1343,7 @@ async def test_dicomweb_the_pre_read_writes_its_held_lines_with_the_first_read_f
         assert await dest.send(PAYLOAD) is None
         assert await dest.send(PAYLOAD) is None
     assert [r.getMessage() for r in caplog.records if r.name == "pydicom"] == [
-        "synthetic pydicom line before the fault"
+        "pydicom WARNING line withheld: it matches no pinned template"
     ]
     assert len(opener.requests) == 2
 
