@@ -41,9 +41,14 @@ The bridge does not fail closed on a fault; this is a known gap. At least these
 end the bridge or its launcher with a non-zero exit, and no deny or block
 output, which the registered line delivers to Codex as 1: a hook that exits
 non-zero other than 2, or times out, on any event but SessionStart, and, on any
-event, unreadable settings, a bad payload or a missing `.venv`. The bridge then
-prints none of the event's output, so what earlier hooks returned, a deny
-included, is lost, and later hooks of the event do not run. How Codex handles
+event, unreadable settings, a bad payload or a missing `.venv`. A hook that
+exits non-zero, times out or prints JSON that is not an object does not stop
+the event's later hooks: they still run, and the first such failure is raised
+once they have. If any hook of the event exited 2, the event
+is blocked as for a lone exit 2. If another hook returned a deny, an ask or a
+block, the bridge prints the event's output with that decision and a
+`systemMessage` naming the failure, and exits 0. Otherwise it prints none of
+the event's output and exits as above. How Codex handles
 that 1 is not measured here. The assumed behaviour is that Codex treats an exit
 other than 0 or 2 as a non-blocking error, so the event is not blocked: a
 PreToolUse fault lets the tool run, a PostToolUse fault loses the event's

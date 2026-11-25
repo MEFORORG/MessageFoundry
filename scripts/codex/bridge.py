@@ -20,6 +20,7 @@ import sys
 import time
 import tomllib
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 # Must equal $blockExit in invoke.ps1; a mismatch leaves a block at 2, which its caller's
@@ -171,6 +172,28 @@ def sync_skills(
 
 class HookBlocked(Exception):
     """A hook exited 2."""
+
+
+# The keys a non-tool event's matcher reads, in the order Claude Code's events carry them.
+DISCRIMINATOR_KEYS = ("source", "trigger", "agent_type", "reason")
+# Events whose exit-0 plain-text stdout Claude Code adds to the model's context.
+PLAIN_TEXT_CONTEXT_EVENTS = ("SessionStart", "UserPromptSubmit")
+
+
+def blocks(result: dict[str, Any]) -> bool:
+    """Whether a merged result already stops or holds the event, as a deny, ask or block does."""
+    specific = result.get("hookSpecificOutput") or {}
+    decision = specific.get("decision")
+    return (
+        result.get("continue") is False
+        or result.get("decision") == "block"
+        or specific.get("permissionDecision") in ("deny", "ask")
+        or (isinstance(decision, dict) and decision.get("behavior") == "deny")
+    )
+
+
+def hook_label(hook: dict[str, Any]) -> str:
+    return " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))
 
 
 def outer_timeout(root: Path, event: str) -> float:
@@ -356,18 +379,38 @@ def dispatch(root: Path, payload: dict) -> dict:
         aliases.add("PowerShell")
     if "apply_patch" in aliases:
         aliases.update(("Edit", "Write"))
+    # A null or empty key falls through to the next one, so it never reads as the text "None".
     discriminator = (
         aliases
         if event in ("PreToolUse", "PostToolUse", "PermissionRequest")
         else {
-            str(
-                payload.get(
-                    "source",
-                    payload.get("trigger", payload.get("agent_type", payload.get("reason", ""))),
-                )
+            next(
+                (
+                    str(payload[key])
+                    for key in DISCRIMINATOR_KEYS
+                    if payload.get(key) not in (None, "")
+                ),
+                "",
             )
         }
     )
+    # Outside SessionStart a failed hook no longer stops the event's later hooks, so one crashing
+    # or slow hook cannot skip a later guard. The first block, or else the first fault, is raised
+    # once every hook has run, which keeps the exit code a lone failing hook gave on origin/main.
+    blocked: HookBlocked | None = None
+    fault: Exception | None = None
+
+    def record(exc: Exception, label: str) -> None:
+        nonlocal blocked, fault
+        if isinstance(exc, HookBlocked):
+            if blocked is None:
+                blocked = exc
+                return
+        elif fault is None:
+            fault = exc
+            return
+        print(f"Codex bridge: hook {label!r} also failed: {exc}", file=sys.stderr)
+
     for group in config.get("hooks", {}).get(event, []):
         matcher = group.get("matcher", "")
         if matcher not in ("", "*") and not any(
@@ -400,13 +443,15 @@ def dispatch(root: Path, payload: dict) -> dict:
                 completed.check_returncode()
             except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
                 # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
-                # Code: the session starts with every other hook's context. Elsewhere it propagates.
-                # Run as `python bridge.py hook` or `pwsh -File invoke.ps1 hook`, a hook's exit 2
-                # and a fault `__main__` catches both exit 2, with no deny or block output.
-                # docs/CODEX.md states what the registered line returns.
+                # Code: the session starts with every other hook's context. Elsewhere it is raised
+                # after the event's later hooks have run. Run as `python bridge.py hook` or
+                # `pwsh -File invoke.ps1 hook`, a hook's exit 2 and a fault `__main__` catches both
+                # exit 2, with no deny or block output. docs/CODEX.md states what the registered
+                # line returns.
+                label = hook_label(hook)
                 if event != "SessionStart":
-                    raise
-                label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))
+                    record(exc, label)
+                    continue
                 message = f"Codex bridge: SessionStart hook {label!r} failed: {exc}"
                 print(message, file=sys.stderr)
                 merge_output(result, {"systemMessage": message})
@@ -417,7 +462,7 @@ def dispatch(root: Path, payload: dict) -> dict:
             try:
                 update = json.loads(output)
             except json.JSONDecodeError:
-                if event != "SessionStart":
+                if event not in PLAIN_TEXT_CONTEXT_EVENTS:
                     print(output, file=sys.stderr)
                     continue
                 output = output.replace(
@@ -429,12 +474,22 @@ def dispatch(root: Path, payload: dict) -> dict:
                 }
             if not isinstance(update, dict):
                 if event != "SessionStart":
-                    raise ValueError("Hook JSON output must be an object")
+                    record(ValueError("Hook JSON output must be an object"), hook_label(hook))
+                    continue
                 message = "Codex bridge: a SessionStart hook printed JSON that is not an object"
                 print(message, file=sys.stderr)
                 merge_output(result, {"systemMessage": message})
                 continue
             merge_output(result, update)
+    if blocked is not None:
+        raise blocked
+    if fault is not None:
+        if not blocks(result):
+            raise fault
+        # Another hook's deny, ask or block is delivered rather than lost to the fault's exit.
+        message = f"Codex bridge: a hook failed, so the other hooks' decision stands: {fault}"
+        print(message, file=sys.stderr)
+        merge_output(result, {"systemMessage": message})
     return result
 
 

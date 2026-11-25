@@ -584,3 +584,97 @@ def test_every_fault_path_exits_as_on_main(tmp_path, path, fault):
             completed = _invoke_file(root, "hook", payload=payload)
     expected = 1 if not venv else _MAIN_FAULT_EXIT[path]
     assert completed.returncode == expected, (completed.stdout, completed.stderr)
+
+
+# --- BACKLOG #5496: a failed hook no longer stops the event's later hooks. A lone fault still
+# raises as on main; a block, or another hook's deny, ask or block, is never lost to a fault.
+
+_EXIT_1 = _py("import sys; sys.exit(1)")
+
+
+def _marker(path):
+    return _py(f"open({str(path)!r}, 'w').close()")
+
+
+def _deny_hook():
+    return handler(json.dumps(_DENY))
+
+
+@pytest.mark.parametrize(
+    ("first", "expected"),
+    [
+        (_EXIT_1, subprocess.CalledProcessError),
+        (_py("import time; time.sleep(5)", timeout=0.2), subprocess.TimeoutExpired),
+        (handler("[1]"), ValueError),
+    ],
+    ids=["exit-1", "timeout", "non-object-json"],
+)
+def test_a_failed_hook_still_runs_the_later_hooks_then_raises(bridge, tmp_path, first, expected):
+    ran = tmp_path / "later-hook-ran"
+    settings(tmp_path, [first, _marker(ran)])
+    with pytest.raises(expected):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+    assert ran.exists()
+
+
+def test_a_hooks_exit_2_still_runs_the_later_hooks_then_blocks(bridge, tmp_path):
+    ran = tmp_path / "later-hook-ran"
+    settings(tmp_path, [_py("import sys; sys.exit(2)"), _marker(ran)])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+    assert ran.exists()
+
+
+@pytest.mark.parametrize("order", ["fault-first", "deny-first"])
+def test_a_deny_stands_over_another_hooks_fault(bridge, tmp_path, order):
+    hooks = [_EXIT_1, _deny_hook()]
+    settings(tmp_path, hooks if order == "fault-first" else hooks[::-1])
+    result = bridge.dispatch(tmp_path, _PAYLOAD)
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "a hook failed" in result["systemMessage"]
+
+
+def test_a_later_exit_2_blocks_over_an_earlier_fault(bridge, tmp_path):
+    settings(tmp_path, [_EXIT_1, _py("import sys; sys.exit(2)")])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+
+
+def test_an_allow_does_not_hide_a_fault(bridge, tmp_path):
+    allow = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
+    settings(tmp_path, [handler(json.dumps(allow)), _EXIT_1])
+    with pytest.raises(subprocess.CalledProcessError):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+
+
+def test_a_fault_beside_a_deny_exits_0_with_the_deny_through_the_bridge(tmp_path):
+    root = _make_repo(tmp_path, _hooks(_EXIT_1, _py(f"print({json.dumps(_DENY)!r})")), venv=False)
+    completed = _direct(root, "hook", "--block-exit", "10")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- BACKLOG #5496 item 1 (S34-14): a null or empty discriminator key falls through to the next,
+# and UserPromptSubmit keeps a hook's exit-0 plain text as context, as Claude Code does.
+
+
+def _event_settings(root, event, matcher, handlers):
+    (root / ".claude").mkdir(exist_ok=True)
+    groups = [{"matcher": matcher, "hooks": handlers}]
+    text = json.dumps({"hooks": {event: groups}})
+    (root / ".claude/settings.json").write_text(text, encoding="utf-8")
+
+
+@pytest.mark.parametrize("empty", [None, ""], ids=["null", "empty"])
+def test_a_null_or_empty_discriminator_key_falls_through(bridge, tmp_path, empty):
+    context = {"hookSpecificOutput": {"hookEventName": "PreCompact", "additionalContext": "ran"}}
+    _event_settings(tmp_path, "PreCompact", "^manual$", [handler(json.dumps(context))])
+    payload = {"session_id": "x", "hook_event_name": "PreCompact", "source": empty}
+    assert bridge.dispatch(tmp_path, {**payload, "trigger": "manual"}) == context
+
+
+def test_user_prompt_submit_keeps_plain_text_as_context(bridge, tmp_path):
+    _event_settings(tmp_path, "UserPromptSubmit", "", [handler("plain prompt context")])
+    payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+    result = bridge.dispatch(tmp_path, payload)
+    assert result["hookSpecificOutput"]["additionalContext"] == "plain prompt context"
