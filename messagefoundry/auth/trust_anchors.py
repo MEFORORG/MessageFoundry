@@ -648,6 +648,9 @@ _PEM_PIECE = 254
 #: What OpenSSL's PEM reader strips from the end of each read before it compares the text: at
 #: least every byte up to and including the space.
 _PEM_TRAILING = bytes(range(0x21))
+#: The oldest OpenSSL whose byte-order-mark rule :func:`anchor_cadata` follows, as measured: 3.5.7
+#: on CPython 3.14. Below it a file where the text would drop a mark refuses (BACKLOG #5229).
+_MARK_RULE_MEASURED_FROM = (3, 5, 0)
 #: Each byte at or above 0x80 as ``?``, so the text keeps every offset and every LF of the file.
 _HIGH_AS_QUERY = bytes(range(0x80)) + b"?" * 0x80
 #: The RFC 1421 headers of an encrypted PEM block, lower-cased (BACKLOG #2270, :func:`anchor_cadata`).
@@ -867,8 +870,9 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
 
     This rests on OpenSSL's PEM reader as measured on CPython 3.14 with OpenSSL 3.5, and
     ``tests/test_trust_anchor_byte_binding.py`` holds it against ``cafile=`` itself. Another
-    OpenSSL that reads differently can make the two differ again. The mark rule is OpenSSL 3.x's,
-    so below OpenSSL 3.0 a file where this would drop a mark in front of a BEGIN refuses instead.
+    OpenSSL that reads differently can make the two differ again. The mark rule is measured only
+    on OpenSSL 3.5, so below OpenSSL 3.5 (:data:`_MARK_RULE_MEASURED_FROM`) a file where this would
+    drop a mark in front of a BEGIN refuses instead.
 
     **No PEM block refuses.** ``create_default_context`` tests ``cadata`` for truth, so an empty
     string loads the WHOLE OS trust store: measured, 87 anchors on one Windows host. ``cafile=``
@@ -988,12 +992,12 @@ def anchor_cadata(data: bytes, spec: AnchorSpec) -> str:
             "no NUL, so the engine does not load it: remove that byte",
             scope="nul",
         )
-    if mark_dropped and ssl.OPENSSL_VERSION_INFO < (3, 0, 0):
+    if mark_dropped and ssl.OPENSSL_VERSION_INFO < _MARK_RULE_MEASURED_FROM:
         raise TrustAnchorError(
             f"{spec.setting}: the trust anchor {spec.path!r} has a UTF-8 byte-order mark in front "
-            "of a -----BEGIN line, and the engine knows where OpenSSL drops such a mark only for "
-            f"OpenSSL 3.0 and later, while this interpreter uses {ssl.OPENSSL_VERSION}. Save the "
-            "file without a byte-order mark",
+            "of a -----BEGIN line, and the engine has measured where OpenSSL drops such a mark "
+            f"only for OpenSSL 3.5 and later, while this interpreter uses {ssl.OPENSSL_VERSION}. "
+            "Save the file without a byte-order mark",
             scope="byte_order_mark",
         )
     if non_ascii:

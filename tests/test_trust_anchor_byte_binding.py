@@ -61,6 +61,12 @@ from tests.test_tls_cipher_assertion_sites import _ad_settings, _context_ldap3_b
 _NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
 _NA = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)
 _SPEC = AnchorSpec("t", "[t].ca", "t.pem")
+#: A row where the text drops a byte-order mark loads only on an OpenSSL whose mark rule was
+#: measured; on an older one it refuses, which the version-patching test below holds.
+_MEASURED_MARK_RULE = pytest.mark.skipif(
+    ssl.OPENSSL_VERSION_INFO < ta._MARK_RULE_MEASURED_FROM,
+    reason="this OpenSSL is older than the one whose byte-order-mark rule was measured",
+)
 
 
 # --- a tiny PKI: two unrelated CAs, each with a localhost leaf, RFC 5280-conformant -----------------
@@ -436,7 +442,11 @@ def test_plain_ascii_pem_passes_through_unchanged(cas: tuple[_Ca, _Ca]) -> None:
 @pytest.mark.parametrize(
     "wrap",
     [
-        pytest.param(lambda pem: b"\xef\xbb\xbf" + pem, id="utf-8 byte-order mark"),
+        pytest.param(
+            lambda pem: b"\xef\xbb\xbf" + pem,
+            id="utf-8 byte-order mark",
+            marks=_MEASURED_MARK_RULE,
+        ),
         pytest.param(
             lambda pem: b"Bag Attributes\n    friendlyName: M\xc3\xbcller CA\n" + pem,
             id="non-ASCII comment above the block",
@@ -586,9 +596,14 @@ def _trusted(pem: bytes) -> bytes:
             ["evil-ca", "good-ca"],
             id="long, its END, then non-ASCII",
         ),
-        pytest.param(lambda a, b: _BOM + a, ["good-ca"], id="mark at file start"),
         pytest.param(
-            lambda a, b: _BOM + a + _BOM + b, ["evil-ca", "good-ca"], id="mark after END (copy a+b)"
+            lambda a, b: _BOM + a, ["good-ca"], id="mark at file start", marks=_MEASURED_MARK_RULE
+        ),
+        pytest.param(
+            lambda a, b: _BOM + a + _BOM + b,
+            ["evil-ca", "good-ca"],
+            id="mark after END (copy a+b)",
+            marks=_MEASURED_MARK_RULE,
         ),
         pytest.param(lambda a, b: a + _BOM + b"x\n" + b, ["evil-ca", "good-ca"], id="mark on text"),
         pytest.param(lambda a, b: a + b"\n" + _BOM + b, ["good-ca"], id="mark after blank line"),
@@ -698,8 +713,13 @@ _IN_PLACE = [
     pytest.param(lambda a, b: b"# M\xc3\xbcller CA\n" + a, True, id="non-ASCII comment above"),
     pytest.param(lambda a, b: a + b"# caf\xc3\xa9\n" + b, True, id="non-ASCII comment between"),
     pytest.param(lambda a, b: a + b"trailer \xc3\xa9\n", True, id="non-ASCII trailer"),
-    pytest.param(lambda a, b: _BOM + a, False, id="mark at file start"),
-    pytest.param(lambda a, b: _BOM + a + _BOM + b, False, id="mark after END (copy a+b)"),
+    pytest.param(lambda a, b: _BOM + a, False, id="mark at file start", marks=_MEASURED_MARK_RULE),
+    pytest.param(
+        lambda a, b: _BOM + a + _BOM + b,
+        False,
+        id="mark after END (copy a+b)",
+        marks=_MEASURED_MARK_RULE,
+    ),
 ]
 
 
@@ -744,24 +764,26 @@ def test_an_ascii_file_is_handed_on_unchanged(
     assert anchor_cadata(data, _SPEC) == data.decode("ascii")
 
 
-def _nul_in_the_body(pem: bytes) -> bytes:
+def _in_the_body(pem: bytes, extra: bytes) -> bytes:
     lines = pem.split(b"\n")
-    lines[2] = lines[2][:10] + b"\0" + lines[2][10:]
+    lines[2] = lines[2][:10] + extra + lines[2][10:]
     return b"\n".join(lines)
 
 
 @pytest.mark.parametrize(
     "shape",
     [
-        pytest.param(_nul_in_the_body, id="inside the block"),
-        pytest.param(lambda pem: pem + b"# a\0b\n", id="after the block"),
+        pytest.param(_in_the_body, id="inside the block"),
+        pytest.param(lambda pem, extra: pem + b"# a" + extra + b"b\n", id="after the block"),
     ],
 )
-def test_a_nul_byte_refuses(shape: Callable[[bytes], bytes], cas: tuple[_Ca, _Ca]) -> None:
-    """A PEM file holds no NUL, so one refuses wherever it is."""
+def test_a_nul_byte_refuses(shape: Callable[[bytes, bytes], bytes], cas: tuple[_Ca, _Ca]) -> None:
+    """A PEM file holds no NUL, so one refuses wherever it is. The control is the same file
+    without the NUL, which loads, so the refusal is the NUL's and not the shape's."""
     good, _ = cas
+    assert anchor_cadata(shape(good.pem, b""), _SPEC)  # the control
     with pytest.raises(TrustAnchorError, match="NUL byte") as refused:
-        anchor_cadata(shape(good.pem), _SPEC)
+        anchor_cadata(shape(good.pem, b"\0"), _SPEC)
     assert refused.value.scope == "nul"
 
 
@@ -778,17 +800,20 @@ def test_a_nul_byte_beside_a_private_key_still_names_the_key(cas: tuple[_Ca, _Ca
     ("version", "refuses"),
     [
         pytest.param((1, 1, 1, 23, 15), True, id="OpenSSL 1.1.1"),
-        pytest.param((3, 0, 0, 0, 15), False, id="OpenSSL 3.0.0"),
+        pytest.param((3, 0, 0, 0, 15), True, id="OpenSSL 3.0.0"),
+        pytest.param((3, 4, 99, 99, 15), True, id="OpenSSL 3.4, newest patch"),
+        pytest.param((3, 5, 0, 0, 15), False, id="OpenSSL 3.5.0"),
     ],
 )
-def test_a_mark_the_text_would_drop_refuses_below_openssl_3(
+def test_a_mark_the_text_would_drop_refuses_below_openssl_3_5(
     version: tuple[int, ...],
     refuses: bool,
     cas: tuple[_Ca, _Ca],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Where the mark is dropped is OpenSSL 3.x's rule, so below 3.0 a file where the text would
-    drop one in front of a BEGIN refuses rather than show OpenSSL a block it may keep hidden."""
+    """Where the text drops a mark follows OpenSSL's reader as measured on 3.5, so on an older
+    OpenSSL a file where the text would drop one in front of a BEGIN refuses rather than show
+    OpenSSL a block it may keep hidden."""
     good, _ = cas
     monkeypatch.setattr(ssl, "OPENSSL_VERSION_INFO", version)
     if not refuses:

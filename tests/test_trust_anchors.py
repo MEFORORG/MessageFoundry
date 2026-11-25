@@ -2296,6 +2296,8 @@ class _NoTlsLoad:
 
     PROTOCOL_TLS_CLIENT = ssl.PROTOCOL_TLS_CLIENT
     SSLError = ssl.SSLError
+    OPENSSL_VERSION = ssl.OPENSSL_VERSION  # anchor_cadata reads both before it builds a context
+    OPENSSL_VERSION_INFO = ssl.OPENSSL_VERSION_INFO
 
     @staticmethod
     def SSLContext(_protocol: object) -> Any:
