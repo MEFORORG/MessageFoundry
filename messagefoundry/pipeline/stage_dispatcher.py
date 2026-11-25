@@ -354,9 +354,6 @@ class _LaneState:
     # Consecutive re-pend episodes of that record that sent nothing and parked, for their backoff
     # and to log a lease-read fault once. Reset when the record clears.
     stranded_waits: int = 0
-    # BACKLOG #5704: this lane's run of pre-claim gate faults (_lane_may_claim), so a gate that keeps
-    # raising logs on a backoff rather than once per _LANE_ERROR_BACKOFF_SECONDS (BACKLOG #1844).
-    gate_faults: FailureRun = field(default_factory=FailureRun)
 
 
 @dataclass
@@ -625,6 +622,10 @@ class StageDispatcher:
         # BACKLOG #1844: the sweep retries every sweep_interval (0.25 s by default), so an outage would
         # otherwise log four tracebacks a second per stage. See messagefoundry.log_backoff.
         self._sweep_faults = FailureRun()
+        # BACKLOG #5704: the run of pre-claim gate faults (_lane_may_claim). One per dispatcher, not
+        # per lane: the runner's gate reads runner-wide state, so a fault in it is every lane's, and
+        # a run per lane would multiply each emission by the lane count.
+        self._gate_faults = FailureRun()
         # Per-lane coalesced timer handles + their armed deadlines (earliest-wins refresh).
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._timer_deadline: dict[str, float] = {}
@@ -996,6 +997,7 @@ class StageDispatcher:
                 claimer.release_faults, f"{claimer.name} release"
             )
         self._sweep_faults = self._close_run_on_stop(self._sweep_faults, "sweep")
+        self._gate_faults = self._close_run_on_stop(self._gate_faults, "may_claim")
         self._slots_free = self._max_processing_lanes
         # A start()-after-stop() begins with a clean supervision record: every task is new.
         self._supervised.clear()
@@ -1280,7 +1282,7 @@ class StageDispatcher:
             st = self._states.get(lane)
             if st is None or st.phase is not _LanePhase.READY:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
-            may = self._lane_may_claim(lane, st)
+            may = self._lane_may_claim(lane)
             if may is None:  # the gate raised: a timed park, so the lane asks again after a backoff
                 self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
                 continue
@@ -2291,18 +2293,18 @@ class StageDispatcher:
         if until is not None:
             self._arm_timer(lane, until)
 
-    def _lane_may_claim(self, lane: str, st: _LaneState) -> bool | None:
+    def _lane_may_claim(self, lane: str) -> bool | None:
         """Ask the pre-claim gate; None when it raised, which is logged. The caller parks the lane
         on a timer rather than letting the raise kill the claimer with the lane popped and READY.
 
-        The fault is logged through the lane's own :class:`FailureRun` (BACKLOG #1844, #5704), so a
-        gate that keeps raising writes its 1st, 2nd, 4th, 8th ... record of a cause, each with the
-        run's count and the traceback, rather than one per backoff; the gate answering again closes
-        the run with one recovery line."""
+        The fault is logged through this dispatcher's :class:`FailureRun` (BACKLOG #1844, #5704), so
+        a gate that keeps raising writes its 1st, 2nd, 4th, 8th ... record of a cause, each with the
+        run's count, the lane and the traceback, rather than one per lane per backoff. The gate
+        answering again closes the run with one recovery line, and so does :meth:`stop`."""
         try:
             may = self._may_claim(lane)
         except Exception as exc:  # noqa: BLE001 — a gate fault must not kill the claimer
-            st.gate_faults = st.gate_faults.record(
+            self._gate_faults = self._gate_faults.record(
                 log,
                 exc,
                 "StageDispatcher %s may_claim raised %s for lane %s; parking it for a backoff",
@@ -2311,10 +2313,10 @@ class StageDispatcher:
                 lane,
             )
             return None
-        if st.gate_faults.count:
-            st.gate_faults = st.gate_faults.clear(
+        if self._gate_faults.count:
+            self._gate_faults = self._gate_faults.clear(
                 log,
-                "StageDispatcher %s may_claim for lane %s",
+                "StageDispatcher %s may_claim (answered for lane %s)",
                 self._stage.value,
                 lane,
                 level=logging.WARNING,

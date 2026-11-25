@@ -72,24 +72,32 @@ def test_a_gate_that_keeps_raising_logs_on_a_backoff(caplog: pytest.LogCaptureFi
             assert _ask(dispatcher, "bad") == []
     errors = _gate_errors(caplog)
     # The 1st, 2nd, 4th and 8th of one cause, each carrying the run's count and the traceback.
-    assert len(errors) == 4, [r.getMessage() for r in errors]
-    assert "8" in errors[-1].getMessage()
+    assert [r.getMessage().rsplit("(", 1)[1] for r in errors] == [
+        "consecutive failures: 1)",
+        "consecutive failures: 2)",
+        "consecutive failures: 4)",
+        "consecutive failures: 8)",
+    ]
     assert all(r.exc_info is not None for r in errors)
     dispatcher._cancel_timer("bad")
 
 
-def test_each_lane_keeps_its_own_run(caplog: pytest.LogCaptureFixture) -> None:
+def test_lanes_share_one_run(caplog: pytest.LogCaptureFixture) -> None:
+    """The runner's gate reads runner-wide state, so one fault is every lane's. A run per lane would
+    write lanes x log2(asks) records; one run writes log2 of all the asks."""
+
     def gate(lane: str) -> bool:
-        raise KeyError(lane)
+        raise RuntimeError("the same gate fault")
 
     dispatcher = _dispatcher(gate)
+    lanes = [f"lane-{i}" for i in range(16)]
     with caplog.at_level(logging.INFO, logger=_LOGGER):
-        _ask(dispatcher, "a")
-        _ask(dispatcher, "b")
-    # A second lane's first fault is its own first record, not held back by the first lane's run.
-    assert len(_gate_errors(caplog)) == 2
-    dispatcher._cancel_timer("a")
-    dispatcher._cancel_timer("b")
+        for lane in lanes:
+            _ask(dispatcher, lane)
+    # 16 faults of one cause: records at 1, 2, 4, 8 and 16. A run per lane would write 16.
+    assert len(_gate_errors(caplog)) == 5
+    for lane in lanes:
+        dispatcher._cancel_timer(lane)
 
 
 def test_the_gate_answering_again_closes_the_run_once(caplog: pytest.LogCaptureFixture) -> None:
@@ -109,4 +117,19 @@ def test_the_gate_answering_again_closes_the_run_once(caplog: pytest.LogCaptureF
     recovered = [r for r in caplog.records if "recovered after 3" in r.getMessage()]
     assert len(recovered) == 1
     assert recovered[0].levelno == logging.WARNING
-    assert dispatcher._states["lane"].gate_faults.count == 0
+    assert dispatcher._gate_faults.count == 0
+
+
+async def test_stop_closes_an_open_run(caplog: pytest.LogCaptureFixture) -> None:
+    def gate(lane: str) -> bool:
+        raise RuntimeError("a gate fault")
+
+    dispatcher = _dispatcher(gate)
+    with caplog.at_level(logging.INFO, logger=_LOGGER):
+        for _ in range(3):
+            _ask(dispatcher, "lane")
+        dispatcher._cancel_timer("lane")
+        await dispatcher.stop()
+    closed = [r for r in caplog.records if "may_claim: stopped with 3" in r.getMessage()]
+    assert len(closed) == 1
+    assert dispatcher._gate_faults.count == 0
