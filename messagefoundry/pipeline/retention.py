@@ -274,9 +274,10 @@ def _drop_redundant_archive(
     except OSError as exc:
         if isinstance(exc, FileNotFoundError) and not os.path.lexists(dest):
             # Gone since it was validated (a peer's `app_log_days` sweep, say), so nothing is kept.
-            # False, as for an archive already gone at the read above: no claim was taken, and a peer
-            # compressor holding it under its own claim may yet put it back. `lexists` because Windows
-            # also maps a too-long claim path or a lost share to FileNotFoundError, `dest` still there.
+            # Returns False, the value an archive already gone at the read above returns: no claim was
+            # taken, and a peer compressor holding it under its own claim may yet put it back.
+            # `lexists` because Windows also raises FileNotFoundError for a claim path too long, with
+            # `dest` still there; an `lstat` that fails too (a lost share, say) still reads as gone.
             log.debug("app-log %r: the archive %r was already gone", name, os.path.basename(dest))
             return False
         log.warning(
@@ -314,7 +315,7 @@ def _drop_redundant_archive(
         log.warning(
             "app-log %r: the source or the claimed archive changed while the archive was being "
             "removed, and the archive could not be put back; it is KEPT as %r until an operator acts "
-            "or, where app_log_days is set, its sweep ages it out",
+            "or, while app_log_days is set and compression is on, its sweep ages it out",
             name,
             os.path.basename(claim),
         )
@@ -327,7 +328,8 @@ def _drop_redundant_archive(
     except OSError:
         log.warning(
             "app-log %r: the claimed archive %r was linked back but could not be removed; it is KEPT "
-            "until an operator acts or, where app_log_days is set, its sweep ages it out",
+            "until an operator acts or, while app_log_days is set and compression is on, its sweep "
+            "ages it out",
             name,
             os.path.basename(claim),
         )
