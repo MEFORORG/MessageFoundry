@@ -921,22 +921,6 @@ _SPOOL_POLL = 1.0
 #: instead, which keeps the order.
 _SPOOL_REPLAY_BATCH = 500
 
-#: How many times in a row a spooled entry's stream send may fail on a connection that was up before
-#: the listener drops it as undeliverable (BACKLOG #5923). A collector that closes the connection on
-#: a frame it refuses, one over its size limit for one, fails that send on every retry while it
-#: would take the next entry, so kept at the head the entry would hold every later one behind it.
-_SPOOL_HEAD_REFUSALS = 5
-#: The send errors that read as the collector closing or resetting a connection it had accepted,
-#: so a refusal of the record in hand rather than a collector that is slow or down (BACKLOG #5923).
-#: A timeout is not one: a collector that stopped answering holds every record alike.
-_COLLECTOR_REFUSALS: tuple[type[BaseException], ...] = (
-    ConnectionResetError,
-    BrokenPipeError,
-    ConnectionAbortedError,
-    ssl.SSLEOFError,
-    ssl.SSLZeroReturnError,
-)
-
 #: The least time, in seconds, from a UDP forwarder's socket being built to its rebuild after a
 #: failed send (BACKLOG #5923). A rebuild clears a socket that went bad; the interval keeps an
 #: outage from costing a new socket per record.
@@ -1012,13 +996,6 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
     #: listener's report (BACKLOG #5923). Never the exception's text, which for a formatting error
     #: can quote the record, and never a record field.
     send_error_cause: str = ""
-    #: Whether the last stream send was written to a connection that was up and failed because the
-    #: collector closed or reset it, set by :meth:`emit` and narrowed by :meth:`handleError`
-    #: (BACKLOG #5923). ``False`` for a datagram, for a send that failed before or in its connect,
-    #: and for one that failed on any other error, a timeout included.
-    #: :meth:`_ForwardQueueListener._replay` reads it to tell a collector that refuses one entry
-    #: from one that is down.
-    send_reached_collector: bool = False
     #: The connect error a ``defer_connect`` handler absorbed at construction, or ``None``.
     startup_error: OSError | None = None
     #: When :meth:`createSocket` last ran, on the monotonic clock: a UDP socket is rebuilt after a
@@ -1078,7 +1055,6 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         encoding, the same lazy reconnect, and every failure routed to :meth:`handleError`. The
         stdlib's Unix-socket branch is left out, because every forwarder arm is built with a
         ``(host, port)`` address; do not build this class with a socket path."""
-        self.send_reached_collector = False
         try:
             msg = self.format(record)
             if self.ident:
@@ -1092,7 +1068,6 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
                     payload += b"\x00"
                 self.socket.sendto(payload, self.address)
             else:
-                self.send_reached_collector = True
                 self.socket.sendall(b"%d %b" % (len(payload), payload))
         except Exception:
             self.handleError(record)
@@ -1130,8 +1105,6 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
         send has returned, throttled and with no record content.
         """
         exc = sys.exception()
-        if not isinstance(exc, _COLLECTOR_REFUSALS):
-            self.send_reached_collector = False
         if exc is not None:
             errno_part = f", errno {exc.errno}" if isinstance(exc, OSError) and exc.errno else ""
             self.send_error_cause = type(exc).__name__ + errno_part
@@ -1574,15 +1547,8 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
         #: or by a send error that was not a network error (BACKLOG #1966). Never "sent".
         self.undeliverable = 0
         self._last_undeliverable_report: float | None = None
-        #: When :meth:`_head_refused` last reported a dropped spooled record (BACKLOG #5923): its own
-        #: throttle, so an undeliverable report of the other kind never hides it.
-        self._last_refusal_report: float | None = None
         #: When :meth:`_send` last reported a failed network send (BACKLOG #5923).
         self._last_send_failure_report: float | None = None
-        #: The spooled entry whose stream send failed after the connect, and how many times in a
-        #: row; :meth:`_head_refused` reads both (BACKLOG #5923).
-        self._head_entry: SpoolEntry | None = None
-        self._head_refusals = 0
         self._spool_drops_reported = 0
         self._last_spool_drop_report: float | None = None
         #: ``spool.read_errors`` as of the last read-fault report (BACKLOG #2278).
@@ -1673,7 +1639,6 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
             target.send_failed = False
             target.send_error = False
             target.send_error_cause = ""
-            target.send_reached_collector = False
         super().handle(record)
         cause = getattr(target, "send_error_cause", "") or "no exception recorded"
         if getattr(target, "send_error", False):
@@ -1780,51 +1745,10 @@ class _ForwardQueueListener(logging.handlers.QueueListener):
                 }
             )
             if not self._send(replayed):
-                if self._head_refused(entry):
-                    spool.advance()
-                    continue
                 self._collector_failed()
                 return
             spool.advance()
-            self._head_refusals = 0
             self._retry_delay = _SPOOL_RETRY_MIN
-
-    def _head_refused(self, entry: SpoolEntry) -> bool:
-        """Whether the spooled ``entry``, whose send just failed, is dropped as undeliverable
-        (BACKLOG #5923): its stream send failed :data:`_SPOOL_HEAD_REFUSALS` times in a row
-        because the collector closed or reset a connection it had accepted
-        (:data:`_COLLECTOR_REFUSALS`). Counted in :attr:`undeliverable` and reported, throttled and
-        with no record content. A failure before or in the connect, any datagram failure included,
-        and any other send error, a timeout included, starts the count over, since a collector that
-        is down holds every entry alike and dropping would only lose them. What this cannot tell
-        apart is a collector that takes the connection and then closes or resets it on every send
-        for a reason of its own: the head is dropped then too, one entry per
-        :data:`_SPOOL_HEAD_REFUSALS` tries."""
-        if not getattr(self._target, "send_reached_collector", False):
-            self._head_refusals = 0
-            return False
-        if entry is not self._head_entry:  # peek() returns one object until advance()
-            self._head_entry, self._head_refusals = entry, 0
-        self._head_refusals += 1
-        if self._head_refusals < _SPOOL_HEAD_REFUSALS:
-            return False
-        self._head_entry, self._head_refusals = None, 0
-        self.undeliverable += 1
-        now = time.monotonic()
-        last = self._last_refusal_report
-        if last is None or now - last >= _FORWARD_DROP_REPORT_INTERVAL:
-            self._last_refusal_report = now
-            cause = getattr(self._target, "send_error_cause", "") or "no exception recorded"
-            _log.error(
-                "off-box log forwarding dropped a spooled record as undeliverable: its send failed "
-                "%d times in a row, each time the collector closed or reset a connection it had "
-                "accepted (%s), so it would hold every later record behind it; %d undeliverable so "
-                "far. Record content is not shown here.",
-                _SPOOL_HEAD_REFUSALS,
-                cause,
-                self.undeliverable,
-            )
-        return True
 
     def _report_spool_drop(self) -> None:
         """Report spool drops at most once per :data:`_FORWARD_DROP_REPORT_INTERVAL`. The report is a
@@ -2315,9 +2239,8 @@ class ForwarderStatus:
     queue_dropped: int = 0
     #: Records a network error cost, with no spool to keep them.
     unsent: int = 0
-    #: Records dropped for a datagram too large to send (``EMSGSIZE``), a send error that was not a
-    #: network error, or a spooled record whose stream send failed on an accepted connection
-    #: ``_SPOOL_HEAD_REFUSALS`` times in a row (BACKLOG #5923).
+    #: Records dropped for a datagram too large to send (``EMSGSIZE``) or a send error that was
+    #: not a network error.
     undeliverable: int = 0
     #: Records the on-disk spool refused: full, or the write failed.
     spool_dropped: int = 0

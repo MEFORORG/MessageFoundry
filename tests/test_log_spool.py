@@ -964,15 +964,14 @@ def test_on_windows_winerror_2_does_confirm_a_segment_gone(
 
 
 @pytest.mark.parametrize("winerror", [2, 3])
-def test_a_dangling_symlink_segment_is_retired_and_its_link_kept(
+def test_a_dangling_symlink_segment_is_retired_and_its_link_unlinked(
     spool_dir: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
 ) -> None:
     """A head segment whose path is a dangling symlink (lstat shows a link, stat says not found)
-    cannot be opened now, so the read passes over it: it is retired from the order, and the read
-    moves on. The link is kept, since its target may only be out of reach just now (BACKLOG
-    #5811). On Windows a link into a missing directory gives winerror 3, which counts here too.
-    NEGATIVE CONTROL: on cf6bfe2d12 winerror 3 wedged the spool; on 33870a40944 the link was
-    unlinked."""
+    can never be opened, so it counts as gone: it is retired, the link itself is unlinked, and
+    the read moves on. On Windows a link into a missing directory gives winerror 3, which counts
+    here too. NEGATIVE CONTROL: on cf6bfe2d12 the link was not unlinked, and winerror 3 wedged
+    the spool."""
     monkeypatch.setattr(log_spool, "_WINDOWS", True)
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
@@ -1012,7 +1011,7 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_kept(
             entry = spool.peek()
             assert entry is not None and entry.line not in lost
             assert spool.unreadable == 1 and spool.read_errors == 0
-            assert unlinked == []
+            assert unlinked == [head_seq]
     finally:
         spool.close()
 
@@ -1020,9 +1019,9 @@ def test_a_dangling_symlink_segment_is_retired_and_its_link_kept(
 def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
     spool_dir: Path, tmp_path: Path
 ) -> None:
-    """A real dangling symlink at the head: peek retires it and keeps the link, the next start's
-    open() indexes the link rather than refusing the spool, and every other undelivered segment is
-    sent. NEGATIVE CONTROL: on cf6bfe2d12 the restart raised SpoolUnavailable for the link."""
+    """A real dangling symlink at the head: peek retires it and removes the link, so the next
+    start's open() does not refuse the spool, and every other undelivered segment is sent.
+    NEGATIVE CONTROL: on cf6bfe2d12 the link stayed and the restart raised SpoolUnavailable."""
     spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
     spool.open()
     try:
@@ -1037,7 +1036,7 @@ def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
             pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
         entry = spool.peek()
         assert entry is not None and entry.line not in lost
-        assert os.path.lexists(head)
+        assert not os.path.lexists(head)
     finally:
         spool.close()
     restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
@@ -1047,241 +1046,6 @@ def test_a_spool_with_a_retired_dangling_link_opens_again_and_sends_the_rest(
         assert _drain(restarted) == expected
     finally:
         restarted.close()
-
-
-def _symlink_or_skip(target: Path, link: Path) -> None:
-    try:
-        os.symlink(target, link)
-    except (OSError, NotImplementedError) as exc:  # Windows without symlink rights
-        pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
-
-
-def test_a_link_segment_whose_target_is_out_of_reach_is_replayed_once_it_is_back(
-    spool_dir: Path, tmp_path: Path
-) -> None:
-    """A head segment that is a link to a file on a mount that is down: the read passes over it
-    and the rest is sent, and the link is kept, so once the mount is back the next start sends the
-    records it holds (BACKLOG #5811). NEGATIVE CONTROL: on 33870a40944 the peek unlinked the link,
-    so the restart never sent them."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    mount = tmp_path / "mount"
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        head = _segments(spool_dir)[0]
-        held = head.read_bytes()
-        lost = [json.loads(line)["line"] for line in held.splitlines()]
-        head.unlink()
-        _symlink_or_skip(mount / "head.jsonl", head)  # the mount is down: no such directory
-        rest = _drain(spool)
-        assert rest == [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
-    finally:
-        spool.close()
-    mount.mkdir()  # the mount is back
-    (mount / "head.jsonl").write_bytes(held)
-    restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    restarted.open()
-    try:
-        assert _drain(restarted) == lost
-    finally:
-        restarted.close()
-
-
-def test_a_directory_replaced_at_the_spool_path_retires_nothing(
-    spool_dir: Path, tmp_path: Path
-) -> None:
-    """The path now names another, empty directory: an empty mountpoint left by a dropped mount, or
-    a directory replaced under the spool. Every segment's lstat there says not found, but that is
-    not this spool's directory, so it is a read fault that retires nothing, and the spool replays
-    whole once the path names its directory again (BACKLOG #5811). Simulated by pointing the spool
-    at the other directory, since Windows refuses to rename a directory holding an open file.
-    NEGATIVE CONTROL: on 33870a40944 one peek retired every segment."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    empty_mountpoint = tmp_path / "mountpoint"
-    empty_mountpoint.mkdir()
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        segments = _segments(spool_dir)
-        assert len(segments) >= 2
-        used = spool.bytes_used
-        spool.directory = empty_mountpoint
-        assert spool.peek() is None
-        assert spool.read_faulted and spool.read_errors == 1 and spool.unreadable == 0
-        assert spool.bytes_used == used
-        assert spool._writer is None
-        # An append meanwhile is dropped and counted, not written where the spool's own directory
-        # would hide it once it is back.
-        assert not spool.append(_entry(99))
-        assert spool.dropped == 1
-        assert list(empty_mountpoint.iterdir()) == []
-        spool.directory = spool_dir
-        assert _segments(spool_dir) == segments
-        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
-    finally:
-        spool.directory = spool_dir
-        spool.close()
-
-
-def test_a_replaced_directory_holding_another_spools_lock_is_not_present(
-    spool_dir: Path, tmp_path: Path
-) -> None:
-    """A directory at the spool path with another identity and a ``spool.lock`` some other spool
-    left there is not this spool's, so nothing is retired. NEGATIVE CONTROL: with the lock file's
-    presence alone taken as proof, every segment was retired as gone."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    old = tmp_path / "old-spool"
-    old.mkdir()
-    (old / "spool.lock").write_bytes(b"")
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        segments = _segments(spool_dir)
-        spool.directory = old
-        assert spool.peek() is None
-        assert spool.unreadable == 0
-        spool.directory = spool_dir
-        assert _segments(spool_dir) == segments
-        assert _drain(spool) == [f"record {n:04d}" for n in range(6)]
-    finally:
-        spool.directory = spool_dir
-        spool.close()
-
-
-def test_the_same_directory_with_another_identity_still_reads_as_present(spool_dir: Path) -> None:
-    """A directory whose IDs changed under the spool (a share remounted with client-made inode
-    numbers) still holds the spool's lock file, so it reads as the spool's: a segment really gone
-    there is retired and the rest replays, rather than the spool faulting until a restart."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        assert spool._directory_identity is not None
-        spool._directory_identity = (spool._directory_identity[0] + 1, 1)  # the IDs moved
-        first = _segments(spool_dir)[0]
-        lost = [json.loads(line)["line"] for line in first.read_bytes().splitlines()]
-        first.unlink()
-        expected = [f"record {n:04d}" for n in range(6) if f"record {n:04d}" not in lost]
-        assert _drain(spool) == expected
-        assert spool.unreadable == 1 and spool.read_errors == 0
-    finally:
-        spool.close()
-
-
-def test_a_link_segment_whose_target_comes_back_mid_run_is_read_whole(
-    spool_dir: Path, tmp_path: Path
-) -> None:
-    """A link open() indexed while its target was out of reach counts 0 bytes. When the target is
-    back before the read reaches it, the reader takes the link's real size, so every record in it
-    is sent before the link is retired (BACKLOG #5811). NEGATIVE CONTROL: with the size left at
-    0, advance() read the link as drained after its first record and deleted it."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=200)
-    spool.open()
-    mount = tmp_path / "mount"
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        head = _segments(spool_dir)[0]
-        held = head.read_bytes()
-        assert len(held.splitlines()) >= 2
-        head.unlink()
-        _symlink_or_skip(mount / "head.jsonl", head)
-    finally:
-        spool.close()
-    restarted = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=200)
-    restarted.open()  # the mount is down here: the link is indexed at size 0
-    try:
-        mount.mkdir()  # the mount is back before the read reaches the link
-        (mount / "head.jsonl").write_bytes(held)
-        assert _drain(restarted) == [f"record {n:04d}" for n in range(6)]
-    finally:
-        restarted.close()
-
-
-class _FakeSegmentPath:
-    """A segment path whose ``stat`` raises ``stat_error`` and whose ``lstat`` shows ``mode``."""
-
-    def __init__(self, stat_error: OSError, mode: int) -> None:
-        self.stat_error = stat_error
-        self.mode = mode
-
-    def stat(self) -> os.stat_result:
-        raise self.stat_error
-
-    def lstat(self) -> os.stat_result:
-        return os.stat_result((self.mode, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-
-
-def test_a_link_segment_whose_target_is_not_found_is_indexed_not_refused() -> None:
-    """A kept link whose target is not found at the next start is indexed at size 0, so that start
-    keeps its spool and the read passes over the link."""
-    path: Any = _FakeSegmentPath(FileNotFoundError(errno.ENOENT, "target gone"), stat.S_IFLNK)
-    assert log_spool._indexed_size(path) == 0
-
-
-@pytest.mark.parametrize(
-    "error",
-    [OSError(errno.ESTALE, "stale handle"), OSError(errno.EACCES, "denied"), _windows_error(64)],
-)
-def test_a_link_segment_whose_target_errs_otherwise_still_refuses_the_spool(error: OSError) -> None:
-    """A link whose target errs other than by not being found is not passed over: indexed at 0,
-    every peek() faulted on it and held every later record behind it for the life of the run. So
-    open() refuses the spool, as it did before BACKLOG #5811."""
-    path: Any = _FakeSegmentPath(error, stat.S_IFLNK)
-    with pytest.raises(OSError):
-        log_spool._indexed_size(path)
-
-
-def test_a_regular_segment_whose_stat_fails_still_refuses_the_spool() -> None:
-    """The control: a regular file that cannot be read is not a link, so open() reports it."""
-    path: Any = _FakeSegmentPath(OSError(errno.EACCES, "denied"), stat.S_IFREG | 0o600)
-    with pytest.raises(OSError):
-        log_spool._indexed_size(path)
-
-
-def test_a_directory_that_drops_while_open_lists_it_refuses_the_spool(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A segment read as gone while the directory itself is out of reach by the end of the listing:
-    open() indexes nothing from that listing and the process runs without a spool, rather than
-    starting with an empty order that new appends would number below the old segments."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    for n in range(3):
-        assert spool.append(_entry(n))
-    spool.close()
-    monkeypatch.setattr(log_spool, "_indexed_size", lambda path: None)
-    monkeypatch.setattr(LogSpool, "_directory_present", lambda self: False)
-    with pytest.raises(SpoolUnavailable):
-        LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60).open()
-
-
-@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to rename a directory with open files")
-def test_a_directory_renamed_away_and_replaced_retires_nothing(
-    spool_dir: Path, tmp_path: Path
-) -> None:
-    """The same case with a real rename: the spool's directory moves aside and an empty one takes
-    its path. Nothing is retired, and the moved directory still holds every segment. NEGATIVE
-    CONTROL: on 33870a40944 one peek retired every segment."""
-    spool = LogSpool(spool_dir, max_bytes=100_000, segment_bytes=60)
-    spool.open()
-    moved = tmp_path / "moved"
-    try:
-        for n in range(6):
-            assert spool.append(_entry(n))
-        count = len(_segments(spool_dir))
-        os.rename(spool_dir, moved)
-        spool_dir.mkdir()
-        assert spool.peek() is None
-        assert spool.read_faulted and spool.unreadable == 0
-        assert len(spool._segments) == count
-        assert len(_segments(moved)) == count
-    finally:
-        spool.close()
 
 
 def test_a_directory_that_drops_between_the_checks_retires_nothing(
@@ -2319,187 +2083,6 @@ def test_a_failed_udp_send_keeps_a_young_socket_or_one_a_lookup_failed(
     finally:
         handler.socket = None
         handler.close()
-
-
-class _RefusesOneFrame:
-    """A connected stream socket whose collector closes the connection on a frame holding
-    ``refused`` (one over its size limit, say), so that ``sendall`` fails, and takes every other
-    frame. Shared by every connection a test makes, so it records each frame it was handed."""
-
-    def __init__(self, refused: bytes, frames: list[bytes]) -> None:
-        self.refused = refused
-        self.frames = frames
-
-    def sendall(self, data: bytes) -> None:
-        self.frames.append(data)
-        if self.refused in data:
-            raise ConnectionResetError(errno.ECONNRESET, "the collector closed the connection")
-
-    def settimeout(self, _timeout: float | None) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
-def _stream_listener(
-    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, connect: Callable[[Any], None]
-) -> tuple[_ForwardQueueListener, _TimeoutSysLogHandler]:
-    """A stopped listener over a TCP handler whose connect is ``connect``, so a test drives
-    replay by hand with no network."""
-    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", connect)
-    handler = _TimeoutSysLogHandler(
-        address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
-    )
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    return _ForwardQueueListener(queue.Queue(), handler, spool=spool), handler
-
-
-def _replay_retries(listener: _ForwardQueueListener, times: int) -> None:
-    for _ in range(times):
-        listener._retry_at = 0.0
-        listener._replay()
-
-
-def test_a_spooled_record_the_collector_refuses_does_not_hold_the_head_for_good(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """BACKLOG #5923 step 1: a collector that closes the connection on one frame fails that send on
-    every retry while it takes the others. After _SPOOL_HEAD_REFUSALS such failures in a row the
-    entry is dropped as undeliverable and the entries behind it are sent, in order. NEGATIVE
-    CONTROL: on 33870a40944 the entry stayed at the head and nothing behind it was ever sent."""
-    frames: list[bytes] = []
-
-    def connect(self: Any) -> None:
-        self.socket = _RefusesOneFrame(b"REFUSED", frames)
-
-    spool = LogSpool(spool_dir, max_bytes=1_000_000)
-    spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
-    try:
-        for line in ("REFUSED", "second", "third"):
-            assert spool.append(SpoolEntry(level="WARNING", line=line))
-        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS - 1)
-        assert spool.pending and listener.undeliverable == 0  # held, below the cap
-        assert not any(b"second" in frame for frame in frames)
-        _replay_retries(listener, 1)
-        assert listener.undeliverable == 1
-        assert not spool.pending
-        assert b"second" in frames[-2] and b"third" in frames[-1]
-        assert listener.send_failing is False
-    finally:
-        handler.close()
-        spool.close()
-
-
-def test_a_collector_that_is_down_never_has_a_spooled_record_dropped(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The control for the test above: a connect that fails is not a refusal, however often it
-    happens, so the head is kept and nothing is dropped."""
-
-    def connect(self: Any) -> None:
-        raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
-
-    spool = LogSpool(spool_dir, max_bytes=1_000_000)
-    spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
-    try:
-        assert spool.append(SpoolEntry(level="WARNING", line="head"))
-        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS * 3)
-        assert spool.pending and listener.undeliverable == 0
-        assert listener.send_failures == logging_setup._SPOOL_HEAD_REFUSALS * 3
-    finally:
-        handler.close()
-        spool.close()
-
-
-@pytest.mark.parametrize(
-    "error",
-    [TimeoutError("timed out"), OSError(errno.ENETUNREACH, "unreachable")],
-)
-def test_a_send_that_fails_other_than_by_a_reset_never_has_its_spooled_record_dropped(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
-) -> None:
-    """A send on a connection that was up but failed on a timeout, or any error but the collector
-    closing or resetting it, is not a refusal of the record (BACKLOG #5923): a collector that
-    stopped answering holds every record alike, so the head is kept. NEGATIVE CONTROL: counting
-    every failure after the connect dropped the head after 5 timeouts."""
-
-    class _Fails:
-        def sendall(self, data: bytes) -> None:
-            raise error
-
-        def settimeout(self, _timeout: float | None) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    def connect(self: Any) -> None:
-        self.socket = _Fails()
-
-    spool = LogSpool(spool_dir, max_bytes=1_000_000)
-    spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
-    try:
-        assert spool.append(SpoolEntry(level="WARNING", line="head"))
-        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS * 3)
-        assert spool.pending and listener.undeliverable == 0
-    finally:
-        handler.close()
-        spool.close()
-
-
-def test_a_refusal_drop_is_reported_even_inside_another_undeliverable_reports_window(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The refusal drop has its own report throttle (BACKLOG #5923), so an undeliverable record of
-    the other kind reported just before it does not hide it."""
-    frames: list[bytes] = []
-
-    def connect(self: Any) -> None:
-        self.socket = _RefusesOneFrame(b"refused", frames)
-
-    spool = LogSpool(spool_dir, max_bytes=1_000_000)
-    spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
-    listener._last_undeliverable_report = time.monotonic()
-    try:
-        assert spool.append(SpoolEntry(level="WARNING", line="refused"))
-        with caplog.at_level(logging.ERROR, logger=logging_setup._log.name):
-            _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS)
-        assert listener.undeliverable == 1
-        assert any("dropped a spooled record" in r.getMessage() for r in caplog.records)
-    finally:
-        handler.close()
-        spool.close()
-
-
-def test_a_connect_failure_between_refusals_starts_the_count_over(
-    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Refusals count only in a row: a failed connect between them resets the count, so a
-    collector that flaps is not read as refusing the entry."""
-    frames: list[bytes] = []
-    attempts: list[int] = []
-
-    def connect(self: Any) -> None:
-        attempts.append(1)
-        if len(attempts) % 2 == 0:
-            raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
-        self.socket = _RefusesOneFrame(b"head", frames)
-
-    spool = LogSpool(spool_dir, max_bytes=1_000_000)
-    spool.open()
-    listener, handler = _stream_listener(spool, monkeypatch, connect)
-    try:
-        assert spool.append(SpoolEntry(level="WARNING", line="head"))
-        _replay_retries(listener, logging_setup._SPOOL_HEAD_REFUSALS * 2)
-        assert spool.pending and listener.undeliverable == 0
-    finally:
-        handler.close()
-        spool.close()
 
 
 @pytest.mark.parametrize(

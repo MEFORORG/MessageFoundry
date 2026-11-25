@@ -273,10 +273,7 @@ its statements no longer match the code; where they disagree, this amendment hol
   after which the newest records are dropped and counted. Dropping each record as undeliverable
   instead would turn spool retention into a loss of log evidence for every cause that clears.
   A filter that refuses one record by its content or length with one of these errnos would hold
-  the spool head; that case is not handled (reasoned, not measured). Over TCP or TLS, a spooled
-  entry the collector refuses is not undeliverable in the sense of this bullet: each refused try is
-  a failed send, kept for a retry and setting `send_failing`, until the entry is dropped after the
-  count `docs/CONFIGURATION.md` `[logging]` gives (BACKLOG #5923).
+  the spool head; that case is not handled (reasoned, not measured).
 - **With a spool, a UDP collector whose name lookup fails for a temporary reason at start is now
   deferred**, as a TCP or TLS collector that is not reachable yet is, instead of the process
   running with no forwarder. A name that does not exist is still permanent.
