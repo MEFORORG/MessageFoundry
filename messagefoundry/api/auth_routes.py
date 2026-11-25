@@ -1846,15 +1846,22 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         compromise. The caller's own session is kept where the revoke re-stamps it, so the caller
         stays signed in; otherwise it ends too, and the reply says which. Their other sessions end
         with everyone's. ``users:manage``, as the per-account revoke above, behind a
-        single-use proof bound to this action, since it ends sessions of the caller's own.
-        Audited, with the count, even when nothing was live."""
+        single-use proof bound to this action while ``[auth].require_action_step_up`` is on (the
+        default), since it ends sessions of the caller's own; off, the session's step-up window
+        serves instead. The audit row, with the count even when it is zero, is written after the
+        revoke commits: a store that refuses it fails the request with the sessions already
+        ended."""
         revoked, kept = await service.revoke_every_session(
             actor=identity.username,
             keep_token_hash=hash_token(bearer_token(request) or ""),
             client=client_ip(request),
         )
         outcome = "this session was kept" if kept else "this session was ended too"
-        return SimpleMessage(detail=f"revoked {revoked} session(s); {outcome}")
+        # The count is every unrevoked row the sweep ended, an expired one never purged among
+        # them, as admin-revoke-sessions words it (BACKLOG #5095).
+        return SimpleMessage(
+            detail=f"ended {revoked} unrevoked session row(s), expired ones included; {outcome}"
+        )
 
     @app.put("/users/{user_id}/roles", response_model=SimpleMessage)
     async def set_user_roles(
