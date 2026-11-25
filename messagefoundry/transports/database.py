@@ -4399,14 +4399,17 @@ async def _connect(get_pool: Callable[[], Any], timeout: float) -> tuple[Any, An
     Opening the pool or a pooled connection logs in, so a refused login, a missing ODBC driver or
     the missing ``sqlserver`` extra surfaces here (BACKLOG #5713). A driver error is classified as
     a connect failure (:func:`_classify_db_error`), and the missing extra is a ``config_fault``.
-    Any other failure, with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire
-    timeout already is: nothing has run, so no message can be at fault."""
+    So is a connection the call gate cannot wrap (BACKLOG #2394): the installed aioodbc lends only
+    such connections, so a retry would log in again only to be refused again. Any other failure,
+    with no SQLSTATE, is a transient :class:`DeliveryError`, as the acquire timeout already is:
+    nothing has run, so no message can be at fault."""
     try:
         pool = await get_pool()
         return pool, await _acquire(pool, timeout)
     except DeliveryError:
         raise
-    except _DriverMissingError as exc:
+    except (_DriverMissingError, UngatedConnectionError) as exc:
+        # Both texts are engine literals naming neither the DSN nor the server (_ENGINE_FIXED_TEXT).
         raise NegativeAckError(str(exc), code="db", permanent=True, config_fault=True) from exc
     except Exception as exc:
         state = _log_sqlstate(exc)  # never a codec name read as a SQLSTATE

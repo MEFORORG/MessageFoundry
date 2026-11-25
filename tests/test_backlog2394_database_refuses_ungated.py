@@ -30,7 +30,7 @@ import pytest
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.odbc_call_gate import UngatedConnectionError, call_gate
 from messagefoundry.transports import database
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import NegativeAckError
 from messagefoundry.transports.database import DatabaseDestination
 from tests import test_backlog2394_store_refuses_ungated as _store_arms
 from tests._odbc_cancel_fakes import (
@@ -95,12 +95,13 @@ async def test_an_autocommit_borrow_refuses_before_its_autocommit_set(rig: _Rig)
     await _closed_once_and_never_used(rig)
 
 
-async def test_a_send_on_a_refused_connection_fails_as_a_transient_connect_failure(
+async def test_a_send_on_a_refused_connection_fails_as_a_permanent_config_fault(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
-    """End to end through a destination send: the refusal surfaces as the transient
-    ``DeliveryError`` ``_connect`` makes of any failure with no SQLSTATE, so the message is
-    retried, not dead-lettered, and no statement ran."""
+    """End to end through a destination send: the refusal surfaces as a permanent
+    ``config_fault``, which stops the lane rather than retrying a login every borrow refuses
+    (BACKLOG #2394 added item 2), and no statement ran. Red before: a transient
+    ``DeliveryError``."""
     conn = rig.ungated()
 
     async def create_pool(**kwargs: Any) -> _WakingPool:
@@ -121,10 +122,11 @@ async def test_a_send_on_a_refused_connection_fails_as_a_transient_connect_failu
             },
         )
     )
-    with pytest.raises(DeliveryError) as raised:
+    with pytest.raises(NegativeAckError) as raised:
         await destination.send('{"a": 1}')
-    assert not isinstance(raised.value, NegativeAckError), raised.value
+    assert raised.value.permanent and raised.value.config_fault, raised.value
     assert isinstance(raised.value.__cause__, UngatedConnectionError)
+    assert "db.example" not in str(raised.value)
     await _closed_once_and_never_used(rig)
 
 
