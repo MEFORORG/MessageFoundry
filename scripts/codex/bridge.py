@@ -394,9 +394,10 @@ def dispatch(root: Path, payload: dict) -> dict:
             )
         }
     )
-    # Outside SessionStart a failed hook no longer stops the event's later hooks, so one crashing
-    # or slow hook cannot skip a later guard. The first block, or else the first fault, is raised
-    # once every hook has run, which keeps the exit code a lone failing hook gave on origin/main.
+    # Outside SessionStart a failed hook no longer stops the event's later hooks: they still run
+    # while the event's shared budget lasts, and once it is spent each later hook is recorded as
+    # timed out without running. The first block, or else the first fault, is raised once every hook
+    # has been tried, which keeps the exit code a lone failing hook gave on origin/main.
     blocked: HookBlocked | None = None
     fault: Exception | None = None
 
@@ -411,77 +412,95 @@ def dispatch(root: Path, payload: dict) -> dict:
             return
         print(f"Codex bridge: hook {label!r} also failed: {exc}", file=sys.stderr)
 
-    for group in config.get("hooks", {}).get(event, []):
-        matcher = group.get("matcher", "")
-        if matcher not in ("", "*") and not any(
-            re.search(matcher, value) for value in discriminator
-        ):
-            continue
-        for hook in group.get("hooks", []):
-            if hook.get("type") != "command" or hook.get("async"):
-                raise ValueError(
-                    f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
-                )
-            if deadline is None:
-                # Read only once a hook will run, so an event with none skips the file. The margin
-                # never takes more than half the budget, or a short cap would run nothing.
-                cap = outer_timeout(root, event)
-                deadline = time.monotonic() + cap - min(OUTER_TIMEOUT_MARGIN, cap / 2)
-            try:
-                argv = hook_argv(root, hook)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(argv, 0)
-                limit = hook.get("timeout", 30)
-                completed = run_hook(
-                    argv, payload, root, env, remaining if limit is None else min(limit, remaining)
-                )
-                if completed.stderr:
-                    print(completed.stderr, file=sys.stderr, end="")
-                if completed.returncode == 2:
-                    raise HookBlocked(completed.stderr or "Claude hook blocked this event")
-                completed.check_returncode()
-            except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
-                # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
-                # Code: the session starts with every other hook's context. Elsewhere it is raised
-                # after the event's later hooks have run. Run as `python bridge.py hook` or
-                # `pwsh -File invoke.ps1 hook`, a hook's exit 2 and a fault `__main__` catches both
-                # exit 2, with no deny or block output. docs/CODEX.md states what the registered
-                # line returns.
-                label = hook_label(hook)
-                if event != "SessionStart":
-                    record(exc, label)
-                    continue
-                message = f"Codex bridge: SessionStart hook {label!r} failed: {exc}"
-                print(message, file=sys.stderr)
-                merge_output(result, {"systemMessage": message})
+    try:
+        for group in config.get("hooks", {}).get(event, []):
+            matcher = group.get("matcher", "")
+            if matcher not in ("", "*") and not any(
+                re.search(matcher, value) for value in discriminator
+            ):
                 continue
-            output = completed.stdout.strip()
-            if not output:
-                continue
-            try:
-                update = json.loads(output)
-            except json.JSONDecodeError:
-                if event not in PLAIN_TEXT_CONTEXT_EVENTS:
-                    print(output, file=sys.stderr)
+            for hook in group.get("hooks", []):
+                if hook.get("type") != "command" or hook.get("async"):
+                    raise ValueError(
+                        f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
+                    )
+                if deadline is None:
+                    # Read only once a hook will run, so an event with none skips the file. The margin
+                    # never takes more than half the budget, or a short cap would run nothing.
+                    cap = outer_timeout(root, event)
+                    deadline = time.monotonic() + cap - min(OUTER_TIMEOUT_MARGIN, cap / 2)
+                try:
+                    argv = hook_argv(root, hook)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, 0)
+                    limit = hook.get("timeout", 30)
+                    completed = run_hook(
+                        argv,
+                        payload,
+                        root,
+                        env,
+                        remaining if limit is None else min(limit, remaining),
+                    )
+                    if completed.stderr:
+                        print(completed.stderr, file=sys.stderr, end="")
+                    if completed.returncode == 2:
+                        raise HookBlocked(completed.stderr or "Claude hook blocked this event")
+                    completed.check_returncode()
+                except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
+                    # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
+                    # Code: the session starts with every other hook's context. Elsewhere it is raised
+                    # after the event's later hooks have run. Run as `python bridge.py hook` or
+                    # `pwsh -File invoke.ps1 hook`, a hook's exit 2 and a fault `__main__` catches both
+                    # exit 2, with no deny or block output. docs/CODEX.md states what the registered
+                    # line returns.
+                    label = hook_label(hook)
+                    if event != "SessionStart":
+                        record(exc, label)
+                        continue
+                    message = f"Codex bridge: SessionStart hook {label!r} failed: {exc}"
+                    print(message, file=sys.stderr)
+                    merge_output(result, {"systemMessage": message})
                     continue
-                output = output.replace(
-                    "scripts\\coord\\seat.ps1",
-                    "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
-                )
-                update = {
-                    "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
-                }
-            if not isinstance(update, dict):
-                if event != "SessionStart":
-                    record(ValueError("Hook JSON output must be an object"), hook_label(hook))
+                output = completed.stdout.strip()
+                if not output:
                     continue
-                message = "Codex bridge: a SessionStart hook printed JSON that is not an object"
-                print(message, file=sys.stderr)
-                merge_output(result, {"systemMessage": message})
-                continue
-            merge_output(result, update)
+                try:
+                    update = json.loads(output)
+                except json.JSONDecodeError:
+                    if event not in PLAIN_TEXT_CONTEXT_EVENTS:
+                        print(output, file=sys.stderr)
+                        continue
+                    output = output.replace(
+                        "scripts\\coord\\seat.ps1",
+                        "scripts\\codex\\invoke.ps1 run scripts/coord/seat.ps1",
+                    )
+                    update = {
+                        "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
+                    }
+                if not isinstance(update, dict) and event == "UserPromptSubmit":
+                    update = {
+                        "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
+                    }
+                if not isinstance(update, dict):
+                    if event != "SessionStart":
+                        record(ValueError("Hook JSON output must be an object"), hook_label(hook))
+                        continue
+                    message = "Codex bridge: a SessionStart hook printed JSON that is not an object"
+                    print(message, file=sys.stderr)
+                    merge_output(result, {"systemMessage": message})
+                    continue
+                merge_output(result, update)
+    except Exception as exc:
+        # A fault outside a hook's own run, such as a bad matcher, an unsupported transport or
+        # malformed output, still ends the event, but never loses a block already recorded.
+        if blocked is None:
+            raise
+        print(f"Codex bridge: after a hook blocked, the event failed: {exc}", file=sys.stderr)
+        raise blocked from None
     if blocked is not None:
+        if fault is not None:
+            print(f"Codex bridge: a hook also failed: {fault}", file=sys.stderr)
         raise blocked
     if fault is not None:
         if not blocks(result):

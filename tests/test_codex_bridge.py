@@ -641,6 +641,32 @@ def test_a_later_exit_2_blocks_over_an_earlier_fault(bridge, tmp_path):
         bridge.dispatch(tmp_path, _PAYLOAD)
 
 
+@pytest.mark.parametrize(
+    "later",
+    [
+        [{"type": "command", "command": sys.executable, "async": True}],
+        [handler(json.dumps({"systemMessage": 5}))],
+    ],
+    ids=["async-transport", "malformed-output"],
+)
+def test_a_later_error_does_not_lose_a_recorded_block(bridge, tmp_path, later):
+    settings(tmp_path, [_py("import sys; sys.exit(2)"), *later])
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+
+
+def test_a_later_groups_bad_matcher_does_not_lose_a_recorded_block(bridge, tmp_path):
+    groups = [
+        {"matcher": "Bash", "hooks": [_py("import sys; sys.exit(2)")]},
+        {"matcher": "(", "hooks": [handler("{}")]},
+    ]
+    (tmp_path / ".claude").mkdir()
+    text = json.dumps({"hooks": {"PreToolUse": groups}})
+    (tmp_path / ".claude/settings.json").write_text(text, encoding="utf-8")
+    with pytest.raises(bridge.HookBlocked):
+        bridge.dispatch(tmp_path, _PAYLOAD)
+
+
 def test_an_allow_does_not_hide_a_fault(bridge, tmp_path):
     allow = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}
     settings(tmp_path, [handler(json.dumps(allow)), _EXIT_1])
@@ -679,6 +705,12 @@ def test_user_prompt_submit_keeps_plain_text_as_context(bridge, tmp_path):
     payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
     result = bridge.dispatch(tmp_path, payload)
     assert result["hookSpecificOutput"]["additionalContext"] == "plain prompt context"
+
+
+def test_user_prompt_submit_keeps_a_json_scalar_as_plain_text(bridge, tmp_path):
+    _event_settings(tmp_path, "UserPromptSubmit", "", [handler("3")])
+    payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
+    assert bridge.dispatch(tmp_path, payload)["hookSpecificOutput"]["additionalContext"] == "3"
 
 
 # --- BACKLOG #5501: dispatch over the TRACKED .claude/settings.json, not a synthetic one, with
