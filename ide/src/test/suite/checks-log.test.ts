@@ -324,7 +324,7 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
       assert.ok(commit > 1, `no commit ran: ${JSON.stringify(runs)}`);
       // The stub's ls-files lists nothing, so no `rm --cached` runs between the two.
       assert.deepStrictEqual(runs[commit - 2], ["add", "-A", "--", "."]);
-      assert.deepStrictEqual(runs[commit - 1].slice(0, 5), ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard"]);
+      assert.deepStrictEqual(runs[commit - 1].slice(0, 5), ["ls-files", "-z", "--cached", "--ignored", "-x"]);
       assert.strictEqual(runs.filter(isStageAll).length, 1, JSON.stringify(runs));
     }
   });
@@ -344,6 +344,30 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
   // gitignore, the minted TLS key here, must not reach the baseline (BACKLOG #5413, #8237 item 2).
   const realGit = realExecFileSyncGit();
   (realGit ? test : test.skip)("a secret staged before setup is left out of the baseline commit (BACKLOG #5413)", async () => {
+    // The machine's own git config and excludes are kept out, as source-control-templates.test.ts
+    // keeps them out, so the result does not depend on the box that runs it.
+    const saved = { ...process.env };
+    const emptyConfig = path.join(ws, ".no-git-config");
+    fs.writeFileSync(emptyConfig, "");
+    Object.assign(process.env, {
+      GIT_CONFIG_GLOBAL: emptyConfig,
+      GIT_CONFIG_NOSYSTEM: "1",
+      XDG_CONFIG_HOME: path.join(ws, ".no-xdg"),
+    });
+    try {
+      await secretStagedBeforeSetup();
+    } finally {
+      for (const k of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "XDG_CONFIG_HOME"]) {
+        if (saved[k] === undefined) {
+          delete process.env[k];
+        } else {
+          process.env[k] = saved[k];
+        }
+      }
+    }
+  }).timeout(30000); // real git, several launches: slow on a Windows runner
+
+  async function secretStagedBeforeSetup(): Promise<void> {
     const g = (...args: string[]): string => realGit!(args, ws);
     g("init", "-q");
     g("config", "user.name", "Synthetic Tester");
@@ -352,8 +376,14 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     fs.writeFileSync(path.join(ws, "api-generated-key.pem"), "synthetic, not a key\n");
     fs.mkdirSync(path.join(ws, "keys"));
     fs.writeFileSync(path.join(ws, "keys", "handoff.key"), "synthetic\n");
+    fs.mkdirSync(path.join(ws, ".mefor"));
+    fs.writeFileSync(path.join(ws, ".mefor", "messagefoundry.db"), "synthetic\n");
     fs.writeFileSync(path.join(ws, "route.py"), "# synthetic\n");
+    // The user's own ignore rule, with a file they force-added under it: setup leaves that one staged.
+    fs.writeFileSync(path.join(ws, ".gitignore"), "*.local\n");
+    fs.writeFileSync(path.join(ws, "team.local"), "synthetic\n");
     g("add", "-A");
+    g("add", "-f", "team.local");
     childProcess.execFile = ((
       file: string,
       args: string[],
@@ -375,10 +405,16 @@ commandSuite("Set Up Version Control & Checks: what reaches the Checks channel",
     assert.ok(committed.includes("route.py"), JSON.stringify(committed));
     assert.ok(!committed.includes("api-generated-key.pem"), `the key was committed: ${JSON.stringify(committed)}`);
     assert.ok(!committed.includes("keys/handoff.key"), `the key was committed: ${JSON.stringify(committed)}`);
-    // The file stays on disk, and the channel names it.
+    assert.ok(!committed.includes(".mefor/messagefoundry.db"), `the store was committed: ${JSON.stringify(committed)}`);
+    // Only setup's own entries are applied: the file the user force-added under their rule stays.
+    assert.ok(committed.includes("team.local"), JSON.stringify(committed));
+    // The file stays on disk, and the channel counts it by top-level entry, never by full path below one.
     assert.ok(fs.existsSync(path.join(ws, "api-generated-key.pem")));
-    assert.ok(lines().some((l) => l.endsWith("  api-generated-key.pem")), JSON.stringify(lines()));
-  }).timeout(30000); // real git, several launches: slow on a Windows runner
+    const written = lines();
+    assert.ok(written.some((l) => l.endsWith("  api-generated-key.pem")), JSON.stringify(written));
+    assert.ok(written.some((l) => l.endsWith("  keys/ (1 file)")), JSON.stringify(written));
+    assert.ok(!written.some((l) => l.includes("handoff.key")), JSON.stringify(written));
+  }
 
   test("a repository that already has a commit is offered no baseline and nothing is staged", async () => {
     hasHead = true;

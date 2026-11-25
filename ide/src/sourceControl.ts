@@ -604,7 +604,7 @@ function logResult(label: string, res: { stdout: string; stderr: string }): void
 // index after a Cancel, one stray `git commit` away from history (BACKLOG #5413). The pre-flight
 // check reads the files on disk, not the index, so it needs nothing staged. The `.` pathspec keeps a
 // workspace that is a subfolder of a larger repository from staging its parent's changes. Staged
-// files the gitignore matches are then taken back out ({@link unstageIgnored}).
+// files setup's own gitignore entries match are then taken back out ({@link unstageIgnored}).
 async function stageBaseline(bin: string, ws: string): Promise<boolean> {
   const res = await git(bin, ["add", "-A", "--", "."], ws);
   if (res.code !== 0) {
@@ -615,17 +615,59 @@ async function stageBaseline(bin: string, ws: string): Promise<boolean> {
   return unstageIgnored(bin, ws);
 }
 
-// How many paths one `git rm --cached` call takes, so a long list stays under the OS argv limit.
-const UNSTAGE_BATCH = 100;
+// The most paths, and the most characters of them, one `git rm --cached` call takes, so a long list
+// stays well under the Windows command-line limit of 32,767 characters.
+const UNSTAGE_BATCH_PATHS = 100;
+const UNSTAGE_BATCH_CHARS = 8000;
+
+/** `paths` in order, cut into batches of at most {@link UNSTAGE_BATCH_PATHS} paths and, where each
+ *  path is shorter than it, {@link UNSTAGE_BATCH_CHARS} characters. */
+function unstageBatches(paths: readonly string[]): string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let chars = 0;
+  for (const p of paths) {
+    if (batch.length > 0 && (batch.length >= UNSTAGE_BATCH_PATHS || chars + p.length > UNSTAGE_BATCH_CHARS)) {
+      batches.push(batch);
+      batch = [];
+      chars = 0;
+    }
+    batch.push(p);
+    chars += p.length + 1;
+  }
+  if (batch.length > 0) {
+    batches.push(batch);
+  }
+  return batches;
+}
+
+/** The Checks-channel summary of the paths left out: a count per top-level entry, never a full path,
+ *  since a name below `captures/` or `out/` can hold message content. Control characters in a
+ *  top-level name are shown escaped, so a name cannot forge a channel line. */
+function unstagedSummary(paths: readonly string[]): string[] {
+  const counts = new Map<string, number>();
+  for (const p of paths) {
+    const slash = p.indexOf("/");
+    const head = slash < 0 ? p : `${p.slice(0, slash)}/`;
+    counts.set(head, (counts.get(head) ?? 0) + 1);
+  }
+  return [...counts].map(([head, n]) => {
+    const shown = JSON.stringify(head).slice(1, -1);
+    return head.endsWith("/") ? `  ${shown} (${n} file${n === 1 ? "" : "s"})` : `  ${shown}`;
+  });
+}
 
 // `git add -A` never removes a path that is already in the index, so a file the user staged before
 // setup wrote the gitignore, such as the minted TLS key, would still go into the baseline (BACKLOG
-// #5413, #8237 item 2). Only a repository with no commit gets a baseline, so taking an ignored path
-// out of the index here removes it from that first commit only; the file on disk is kept. Every path
-// the gitignore rules match is taken out, one the user force-added included, and each is named on the
-// Checks channel so it can be added back with `git add -f`. A failure refuses the commit.
+// #5413, #8237 item 2). So the staged paths that setup's own gitignore entries (GITIGNORE_ENTRIES)
+// match are taken back out of the index; the user's other ignore rules are not applied, so a file
+// they force-added under one of their own rules stays staged. The file on disk is kept. Since the
+// path is ignored, a later `git add -A` does not add it back either: it stays out of every commit
+// until someone runs `git add -f`. The Checks channel says how many left, by top-level entry, before
+// any is unstaged, so a failure partway still leaves the record. A failure refuses the commit.
 async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
-  const listed = await git(bin, ["ls-files", "-z", "--cached", "--ignored", "--exclude-standard", "--", "."], ws);
+  const patterns = GITIGNORE_ENTRIES.flatMap((p) => ["-x", p]);
+  const listed = await git(bin, ["ls-files", "-z", "--cached", "--ignored", ...patterns, "--", "."], ws);
   if (listed.code !== 0) {
     logResult(`--- listing ignored staged files failed: git exit code ${listed.code} ---`, listed);
     void vscode.window.showErrorMessage(
@@ -634,10 +676,22 @@ async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
     return false;
   }
   const ignored = listed.stdout.split("\0").filter((p) => p !== "");
-  for (let i = 0; i < ignored.length; i += UNSTAGE_BATCH) {
-    // --literal-pathspecs, so a file name holding `*` or `:(` names only itself.
-    const batch = ignored.slice(i, i + UNSTAGE_BATCH);
-    const rm = await git(bin, ["--literal-pathspecs", "rm", "--cached", "-q", "--", ...batch], ws);
+  if (ignored.length === 0) {
+    return true;
+  }
+  logChecks(
+    [
+      `Leaving out of the baseline ${ignored.length} staged file(s) that setup's .gitignore entries match ` +
+        "(kept on disk; `git add -f` adds one back):",
+      ...unstagedSummary(ignored),
+    ].join("\n"),
+  );
+  showChecks();
+  for (const batch of unstageBatches(ignored)) {
+    // --literal-pathspecs, so a file name holding `*` or `:(` names only itself. -f, because with no
+    // HEAD git refuses an index entry whose file changed since `add -A`, such as a live engine's log
+    // or store; --cached keeps the removal to the index, so the file itself is never touched.
+    const rm = await git(bin, ["--literal-pathspecs", "rm", "--cached", "-f", "-q", "--", ...batch], ws);
     if (rm.code !== 0) {
       logResult(`--- unstaging ignored files failed: git exit code ${rm.code} ---`, rm);
       void vscode.window.showErrorMessage(
@@ -645,14 +699,6 @@ async function unstageIgnored(bin: string, ws: string): Promise<boolean> {
       );
       return false;
     }
-  }
-  if (ignored.length > 0) {
-    logChecks(
-      [
-        `Left out of the baseline: ${ignored.length} staged file(s) the .gitignore matches (kept on disk):`,
-        ...ignored.map((p) => `  ${p}`),
-      ].join("\n"),
-    );
   }
   return true;
 }
