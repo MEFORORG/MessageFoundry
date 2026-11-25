@@ -1249,6 +1249,28 @@ async def _finish_with_the_set_read_failing(
     read_fault: Exception,
     audit_fault: Exception | None,
 ) -> tuple[MessageStore, str, Elevation]:
+    service, token, response = await _arm_the_set_read_fault(
+        store, monkeypatch, read_fault, audit_fault
+    )
+    try:
+        refused = await service.finish_webauthn_assertion(
+            token, response, rp_id=_RP, origin=_ORIGIN
+        )
+    finally:
+        monkeypatch.undo()
+    return store, token, refused
+
+
+async def _arm_the_set_read_fault(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    read_fault: Exception,
+    audit_fault: Exception | None,
+) -> tuple[AuthService, str, str]:
+    """A local passkey assertion staged on ``store``, with its sign-count write patched to answer
+    ``moved`` and then make the passkey set read raise ``read_fault`` and, when given, the audit
+    write raise ``audit_fault``. Returns the service, the token and the response; the caller
+    finishes it and undoes ``monkeypatch``."""
     service, token, response, _user_id = await _local_assertion(store)
     real_update = store.update_webauthn_sign_count
 
@@ -1267,13 +1289,7 @@ async def _finish_with_the_set_read_failing(
         return answer
 
     monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
-    try:
-        refused = await service.finish_webauthn_assertion(
-            token, response, rp_id=_RP, origin=_ORIGIN
-        )
-    finally:
-        monkeypatch.undo()
-    return store, token, refused
+    return service, token, response
 
 
 @pytest.mark.parametrize(
@@ -1334,25 +1350,9 @@ async def _raise_with_the_set_read_failing(
     token. The caller closes the store."""
     store = await MessageStore.open(":memory:", cipher=make_cipher(generate_key()))
     try:
-        service, token, response, _user_id = await _local_assertion(store)
-        real_update = store.update_webauthn_sign_count
-
-        async def _fault(*_args: Any, **_kwargs: Any) -> Any:
-            raise read_fault
-
-        async def _audit_fault(*_args: Any, **_kwargs: Any) -> Any:
-            assert audit_fault is not None
-            raise audit_fault
-
-        async def _moved(*args: Any, **kwargs: Any) -> SignCountAnswer:
-            answer = await real_update(*args, **kwargs)
-            assert answer == "moved"
-            monkeypatch.setattr(store, "list_webauthn_credentials", _fault)
-            if audit_fault is not None:
-                monkeypatch.setattr(store, "record_audit", _audit_fault)
-            return answer
-
-        monkeypatch.setattr(store, "update_webauthn_sign_count", _moved)
+        service, token, response = await _arm_the_set_read_fault(
+            store, monkeypatch, read_fault, audit_fault
+        )
         try:
             with pytest.raises(type(read_fault)) as raised:
                 await service.finish_webauthn_assertion(token, response, rp_id=_RP, origin=_ORIGIN)
@@ -1475,11 +1475,11 @@ async def test_a_pyodbc_root_read_fault_takes_the_connect_class_path(
     adds. RED when: the catch drops ``store_connect_errors()`` and the fault raises. CONTROL: the
     call set alone really misses it."""
     assert not isinstance(_PyodbcError(), store_call_errors())
-    # pyodbc puts the SQLSTATE first and the driver message second; the SQLSTATE is logged
-    # (BACKLOG #3775 added item 14), the message is not.
+    # pyodbc puts the SQLSTATE first and the driver message second; the message is not logged.
     await _assert_the_read_fault_refuses(
         _PyodbcError("40001", "synthetic: chosen as the deadlock victim"), monkeypatch, caplog
     )
+    assert "deadlock victim" not in _error_log_text(caplog)
 
 
 #: Faults outside the refusal set, each built in the test (BACKLOG #3775 added item 9).
@@ -1514,18 +1514,32 @@ async def test_a_fault_outside_the_refusal_set_raises_after_an_audit_row(
         await store.close()
 
 
+#: Audit-write faults for the raise path: a refusal, a defect class and an unlisted class.
+_RAISE_PATH_AUDIT_FAULTS: dict[str, Callable[[], Exception]] = {
+    "refused": lambda: sqlite3.OperationalError("synthetic: the audit write was refused"),
+    "defect": lambda: sqlite3.ProgrammingError("synthetic: the audit write misbound"),
+    "unlisted": lambda: TypeError("synthetic: the audit write hit a code defect"),
+}
+
+
+@pytest.mark.parametrize("audit_case", list(_RAISE_PATH_AUDIT_FAULTS))
 async def test_a_raise_whose_audit_row_is_refused_still_raises_the_read_fault(
-    monkeypatch: pytest.MonkeyPatch,
+    audit_case: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: a store that refuses it too
-    still gets the read fault back, not the audit write's error. RED when: the audit refusal
-    replaces the read fault, or turns the raise into a return."""
+    """BACKLOG #3775 added item 9. The ``read_raised`` row is soft: whatever its write raises, the
+    read fault is what raises, and the write's failure is logged. RED when: the audit write's
+    exception replaces the read fault (the helper's ``raised.value is read_fault`` check), turns
+    the raise into a return, or goes unlogged; or the logged failure carries the read fault's
+    message. Before added item 9 every case failed the logged-failure check: no row was tried.
+    """
     store, token = await _raise_with_the_set_read_failing(
         monkeypatch,
         sqlite3.InterfaceError("synthetic: SQLITE_MISUSE"),
-        sqlite3.OperationalError("synthetic: the audit write was refused"),
+        _RAISE_PATH_AUDIT_FAULTS[audit_case](),
     )
     try:
+        assert "audit row could not be written" in caplog.text
+        assert "SQLITE_MISUSE" not in _error_log_text(caplog)
         assert await _audited_assertion_failures(store) == []
         session = await store.get_session(hash_token(token))
         assert session is not None and session.mfa_verified_at is None
@@ -1543,13 +1557,19 @@ async def test_a_server_driver_sqlstate_is_named_on_the_refusal_line(
     class _AsyncpgLike(RuntimeError):
         sqlstate = "40P01"
 
+    # The SQLSTATE is read only for an error from a server driver's own module.
+    _AsyncpgLike.__module__ = "asyncpg.exceptions"
+
     store, _token, refused = await _assert_with_the_set_read_failing(
         monkeypatch, _AsyncpgLike("synthetic: deadlock detected")
     )
     try:
         assert refused.ok is False
         error_lines = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
-        assert any("40P01" in line and "refused as a store error" in line for line in error_lines)
+        assert any(
+            "(sqlstate 40P01)" in line and "refused as a store error" in line
+            for line in error_lines
+        )
         assert not any("deadlock detected" in line for line in error_lines)
         assert {"reason": "store_error"} in await _audited_assertion_failures(store)
     finally:

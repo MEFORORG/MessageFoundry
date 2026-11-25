@@ -423,10 +423,11 @@ def _passkey_read_errors() -> tuple[type[Exception], ...]:
     :func:`_session_write_errors` by ``ValueError`` and ``RuntimeError``; of the two sets, only the
     connect set takes pyodbc's ``Error`` root, which pyodbc raises for a deadlock victim. The caller
     raises ``AUDIT_WRITE_DEFECTS`` although these sets take them, and so does every other class
-    that reaches the catch, ``sqlite3.InterfaceError`` among them, each after an audit row naming
-    ``reason=read_raised`` (:meth:`AuthService._passkey_standing`). These classes do not tell a store fault from a bug, so a bug that raises one of them refuses
-    too. Cached, as ``store_call_errors`` is, so a refusal does not run the driver import on the
-    event loop."""
+    that reaches the catch, ``sqlite3.InterfaceError`` among them; what it audits on the way is
+    :meth:`AuthService._passkey_standing`'s to say. These classes do not tell a store fault from a
+    bug, so a bug that raises one of them refuses too. Cached, as ``store_call_errors`` is, so a
+    refusal does not run the driver import on the event loop. Each class once: both sets name
+    ``OSError`` (BACKLOG #3775 added item 19)."""
     return tuple(dict.fromkeys((*store_call_errors(), *store_connect_errors())))
 
 
@@ -20414,8 +20415,8 @@ class AuthService:
         is the holder re-read, with no other await between it and the write (BACKLOG #3068). An
         exception in the passkey re-read that :func:`_passkey_read_errors` takes refuses, unless
         it is one of ``AUDIT_WRITE_DEFECTS``, and the refusal is audited with
-        ``reason=store_error`` unless the store refuses that row too; every other ``Exception``
-        raises, after a row audited the same way with ``reason=read_raised`` (BACKLOG #3775)."""
+        ``reason=store_error`` unless the store refuses that row too. Every other exception raises;
+        :meth:`_passkey_standing` says which of those it audits first (BACKLOG #3775)."""
         if not token:
             return Elevation()
         session = await self._load_session(hash_token(token))
@@ -20605,53 +20606,70 @@ class AuthService:
         """:meth:`_passkey_held`, as :meth:`finish_webauthn_assertion` asks it after the sign-count
         write, or ``None`` when it raised one of :func:`_passkey_read_errors` that is not one of
         ``AUDIT_WRITE_DEFECTS``. The refusal is then logged by exception type, and audited
-        ``reason=store_error`` unless the store refuses that row too.
+        ``reason=store_error`` unless the store refuses that row too; an audit write that raises a
+        defect class raises in its place.
 
-        Any other ``Exception`` still raises, as before, but is audited first with
-        ``reason=read_raised``, soft in the same way (BACKLOG #3775 added item 9): the sign count
-        has already moved, so without the row such an attempt left no ``auth.*`` row. At least
-        ``sqlite3.InterfaceError``, ``CipherError`` and ``AUDIT_WRITE_DEFECTS`` take that path. A
-        ``BaseException`` that is not an ``Exception``, a cancel among them, writes no row."""
+        Any other ``Exception`` raises (BACKLOG #3775 added item 9), but is logged by type and
+        audited ``reason=read_raised`` first, so a raise after the sign-count write is not left with
+        no ``auth.*`` row. That row is soft, and nothing its write raises replaces the read's
+        exception: the write's own failure is logged, and the row is then missing. At least
+        ``sqlite3.InterfaceError``, ``CipherError`` and ``AUDIT_WRITE_DEFECTS`` but
+        ``RecursionError`` take that path. ``MemoryError``, ``RecursionError`` and a
+        ``BaseException`` that is not an ``Exception``, a cancel among them, raise with no row."""
         try:
             return await self._passkey_held(user, cred)
-        except Exception as exc:  # audited below; every class but a refusal re-raises
+        except (MemoryError, RecursionError):
+            raise  # nothing more is asked of a process that has run out of memory or stack
+        except Exception as exc:  # audited below, then every class but a refusal raises again
             fault: Exception = exc
-        # SQLite's bad statement or bind is a defect, not a store refusal, so it raises. On
-        # PostgreSQL and SQL Server a bad statement is a driver DatabaseError, so it is refused.
-        refused = isinstance(fault, _passkey_read_errors()) and not isinstance(
-            fault, AUDIT_WRITE_DEFECTS
-        )
-        # The type only at ERROR, with its module so a driver's ``Error`` names its driver, and the
-        # SQLSTATE a server driver names (BACKLOG #3775 added item 14): a ValueError's message can
-        # quote a row's value, as the directory probe's log line avoids. A refusal's traceback, with
-        # the message, goes to DEBUG; a raise carries its own.
-        kind = type(fault)
-        _log.error(
-            "finish_webauthn_assertion: the passkey re-read raised %s.%s (sqlstate %s), for %s; %s",
-            kind.__module__,
-            kind.__qualname__,
-            driver_sqlstate(fault),
-            user.username,
-            "refused as a store error" if refused else "the ceremony raises",
-        )
-        if refused:
-            _log.debug("finish_webauthn_assertion: the passkey re-read raised", exc_info=fault)
-        # Outside the except block, so a refused audit write's logged traceback carries no
-        # ``__context__`` naming the read fault and its message. Soft, so a store that refuses that
-        # row too still gets the refusal, or the read fault, back: the refusal is the fail-closed
-        # control, and the row only records it.
-        reason = "store_error" if refused else "read_raised"
-        await write_audit_soft(
-            lambda: self._assertion_refused(user, client, reason),
-            log=_log,
-            message="the auth.webauthn_failed %s audit row could not be written",
-            args=(reason,),
-            errors=audit_write_errors(),
-            defects=AUDIT_WRITE_DEFECTS,
-        )
-        if not refused:
-            raise fault
-        return None
+        try:
+            # SQLite's bad statement or bind is a defect, not a store refusal, so it raises. On
+            # PostgreSQL and SQL Server a bad statement is a driver DatabaseError, so it is refused.
+            refused = isinstance(fault, _passkey_read_errors()) and not isinstance(
+                fault, AUDIT_WRITE_DEFECTS
+            )
+            # The type only at ERROR, with its module so a driver's ``Error`` names its driver: a
+            # ValueError's message can quote a row's value, as the directory probe's log line
+            # avoids. A refusal's traceback, with the message, goes to DEBUG; a raise carries its
+            # own. A server driver's SQLSTATE is named too (BACKLOG #3775 added item 14); it is
+            # read only for an error from asyncpg or pyodbc, whose modules are then loaded, so no
+            # driver import runs here on the event loop.
+            kind = type(fault)
+            state = (
+                driver_sqlstate(fault)
+                if kind.__module__.partition(".")[0] in ("asyncpg", "pyodbc")
+                else None
+            )
+            _log.error(
+                "finish_webauthn_assertion: the passkey re-read raised %s.%s%s, for %s; %s",
+                kind.__module__,
+                kind.__qualname__,
+                f" (sqlstate {state})" if state is not None else "",
+                user.username,
+                "refused as a store error" if refused else "the ceremony raises",
+            )
+            if refused:
+                _log.debug("finish_webauthn_assertion: the passkey re-read raised", exc_info=fault)
+            # Outside the except block, so a refused audit write's logged traceback carries no
+            # ``__context__`` naming the read fault and its message. Soft, so a store that refuses
+            # the row still gets the refusal back: the refusal is the fail-closed control, and the
+            # row only records it. On the raise path no class is a defect here, so the read's own
+            # exception is the one that raises.
+            reason = "store_error" if refused else "read_raised"
+            await write_audit_soft(
+                lambda: self._assertion_refused(user, client, reason),
+                log=_log,
+                message="the auth.webauthn_failed %s audit row could not be written",
+                args=(reason,),
+                errors=audit_write_errors() if refused else (Exception,),
+                defects=AUDIT_WRITE_DEFECTS if refused else (),
+            )
+            if not refused:
+                raise fault
+            return None
+        finally:
+            # The traceback holds this frame, so the name is dropped rather than left as a cycle.
+            del fault
 
     async def _passkey_still_held(self, user_id: str, cred: WebAuthnCredential) -> bool:
         """Whether the account still holds ``cred`` after a conditional delete wrote nothing, which

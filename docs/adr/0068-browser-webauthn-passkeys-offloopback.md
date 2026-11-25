@@ -672,21 +672,23 @@ What an exception in the passkey set read after the write does, on any sign-coun
 by class (BACKLOG #3775; `AuthService._passkey_standing` in `messagefoundry/auth/service.py`).
 Everything `_passkey_held` awaits runs under one catch: at least the set read with the account
 re-load and seal-failure report it can make, and the account-row check made when the set does not
-hold the passkey. The catch first re-raises the classes in `AUDIT_WRITE_DEFECTS`
+hold the passkey. The catch never refuses the classes in `AUDIT_WRITE_DEFECTS`
 (`messagefoundry/audit_write.py`), at least `NotImplementedError`, `RecursionError` and
-`sqlite3.ProgrammingError`. It then refuses with `store_error` every exception in
-`store_call_errors()` or `store_connect_errors()` (`messagefoundry/store/base.py`), logs the
-account and the exception's type, and audits the refusal unless the store refuses that row too. Those sets take at
+`sqlite3.ProgrammingError`: they raise, as the end of this paragraph says. It refuses with
+`store_error` every other exception in `store_call_errors()` or `store_connect_errors()`
+(`messagefoundry/store/base.py`), logs the account and the exception's type, and audits the
+refusal unless the store refuses that row too. Those sets take at
 least every other `RuntimeError`, `OSError` and `ValueError`, SQLite's `DatabaseError`, asyncpg's
 roots and pyodbc's `Error` root where those drivers are installed, and `StoreAcquireTimeout`; the
 `RuntimeError` and `ValueError` halves are vault BACKLOG #4728 finding 3, and a closed SQLite
 connection raises `ValueError`. These classes do not tell a store fault from a bug, so a bug that
 raises one of them is refused as `store_error` too. Every other exception that reaches the catch
 raises out of the ceremony, `sqlite3.InterfaceError` among them: it is a `sqlite3.Error` but not a
-`DatabaseError`. Since 2026-11-25 each such raise, the `AUDIT_WRITE_DEFECTS` classes included, is
-first audited `auth.webauthn_failed` with `reason=read_raised` unless the store refuses that row
-too (BACKLOG #3775 added item 9), because the sign count has already moved and the raise otherwise
-left the attempt with no audit row. A cancel writes no row. The session, account and lock re-read, which since 2026-11-05 follows that set read
+`DatabaseError`. Since 2026-11-25 such a raise, the `AUDIT_WRITE_DEFECTS` classes included, is
+first logged by type and audited `auth.webauthn_failed` with `reason=read_raised` (BACKLOG #3775
+added item 9), because until then a raise after the sign-count write left the attempt with no audit
+row. That row is soft: a store that refuses it, or whose audit write raises anything, leaves no row,
+and the read's exception still raises. `MemoryError`, `RecursionError` and a cancel write no row. The session, account and lock re-read, which since 2026-11-05 follows that set read
 rather than preceding it (BACKLOG #3068), is outside this catch, so an exception there raises.
 
 **Why a gone passkey still raises the signal.** A self-service passkey delete takes no account

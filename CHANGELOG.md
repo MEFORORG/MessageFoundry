@@ -41,12 +41,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   [CONNECTIONS.md](docs/CONNECTIONS.md). (`BACKLOG #2705`)
 
 ### Fixed
-- **A passkey sign-in whose passkey re-read raises is audited before it raises.** After the
-  sign-count write, an exception in the passkey set read that the store-error refusal does not take
-  (at least `sqlite3.InterfaceError` and a defect class) still raises out of the ceremony, but now
-  writes an `auth.webauthn_failed` row with `reason=read_raised` first, unless the store refuses that
-  row too. Before, such an attempt moved the sign count and left no audit row. The ERROR line for
-  either outcome now also names a server driver's SQLSTATE. (`BACKLOG #3775`)
 - **The `supervise` process's own TLS log forwarder now picks up a replaced CRL without a
   restart.** An engine process applied a replaced `[logging].forward_tls_crl_file` to its running
   forwarder, but the supervisor builds no engine, so nothing in it did. On a first deployment a
