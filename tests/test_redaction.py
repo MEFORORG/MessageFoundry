@@ -7,6 +7,7 @@ safe_name() derives a safe label for a partner-chosen file name, which redact() 
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import http.client
 import inspect
@@ -739,7 +740,7 @@ def _delimiter_free_run(delimiters: frozenset[str], chars: int) -> str:
 
 
 def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], chars: int) -> int:
-    """Characters ``field_run`` reads, on the larger of two inputs of about ``chars`` characters.
+    """Characters ``field_run`` reads, on the largest of its inputs of about ``chars`` characters.
 
     **One delimiter-free token.** Each start the engine admits past the guard is charged the rest of
     the token, which the run's first repetition reads before the start can succeed or fail. Which
@@ -754,7 +755,8 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
     breaks of a line and is charged that too (BACKLOG #2958 step 6 item b).
 
     The charge per start is the model. A start that re-reads its token more than once, the nested
-    shape, is not seen; :func:`test_the_field_run_and_segment_patterns_nest_no_repetition` reads it."""
+    shape, is not seen; :func:`test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped`
+    reads it."""
     delimiter = min(delimiters)
     fields = f"{delimiter}x{delimiter}y"
     run = _delimiter_free_run(delimiters, chars)
@@ -778,9 +780,10 @@ def _field_run_reads(field_run: re.Pattern[str], delimiters: frozenset[str], cha
     return max(token, spaced)
 
 
-#: The ASCII white space characters ``\s`` holds, each separating one of the field-run meter's word
-#: lines.
-_WHITESPACE = " \t\n\r\x0b\x0c"
+#: Every ASCII character ``\s`` matches, each separating one of the field-run meter's word lines:
+#: the six usual ones and the four information separators ``\x1c`` to ``\x1f``, the first of
+#: which is MLLP's end-of-block byte. Read from ``re`` rather than listed.
+_WHITESPACE = "".join(c for c in map(chr, range(128)) if re.match(r"\s", c))
 
 
 def _segment_reads(segment: re.Pattern[str], separator: str, chars: int) -> int:
@@ -851,7 +854,9 @@ def _check_reads(reads: Callable[[int], int], what: str) -> None:
 
 def _assert_read_red_and_quadratic(reads: Callable[[int], int], what: str) -> None:
     """A control's two claims: the arms' own assertion reds on the regressed pattern, and the
-    pattern's reads grow quadratically when the input doubles, so the red is not a constant factor."""
+    pattern's reads grow quadratically when the input doubles, so the red is not a constant factor.
+    Each size is read once, cached for both claims."""
+    reads = functools.cache(reads)
     with pytest.raises(AssertionError, match="quadratic again"):
         _check_reads(reads, what)
     large = reads(_LINEARITY_CHARS)
@@ -1064,10 +1069,11 @@ def test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped(case: 
     ids=["greedy-in-greedy", "lazy-in-greedy", "greedy-in-lazy"],
 )
 def test_the_field_run_and_segment_patterns_nest_no_repetition(case: str, nesting: str) -> None:
-    """The regression the meters cannot see: a repetition inside a repeated group, which re-reads one
-    token many times from a single start. Read from the patterns as compiled, since the ReDoS scanner
-    cannot reach the separator-aware ones statically, with a control per nesting shape: the field
-    run's first repetition rewritten into each must be found."""
+    """The control for the regression the meters cannot see: a repetition inside a repeated group,
+    which re-reads one token many times from a single start. The field run's first repetition
+    rewritten into each nesting shape must be found, so
+    :func:`test_the_field_run_and_segment_patterns_nest_no_repetition_as_shipped`, which reads the
+    shipped patterns as compiled since the ReDoS scanner cannot reach them statically, can see it."""
     pair = _linearity_case(case)
     _guard, spelling = _field_run_guard(pair.field_run)
     run = rf"[^\s{spelling}]"

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""No fragment of a credential the generic ODBC dialect sends WITHOUT braces reaches the log surfaces
-below: each word of its value is masked character for character (BACKLOG #5030).
+"""Each word of a credential the generic ODBC dialect sends WITHOUT braces is masked character for
+character on the log surfaces below, except at least the words a later pass reads, which the
+comment on ``secretscrub._CONNECTION_STRING_MEMBER`` names (BACKLOG #5030).
 
 ``transports/database.py`` sends every ``odbc_params`` value plain, ``sslpassword`` among them. Such
 a value may hold a space, ",", "&" and, for a password, "=". The plain value class of the log
@@ -307,7 +308,7 @@ def _keep_without(*words: str) -> re.Pattern[str]:
 #: with the rule on is evidence. A rule is a pattern, or for the "#" fix and the mask itself a
 #: function, swapped for its earlier form.
 _RULE_CONTROLS = (
-    ("kept credential and query words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
+    ("kept credential and query-filter words", "_MEMBER_KEEP", _NEVER, ";xpass=:?code=;xpass=;f6q"),
     (
         "kept PHI words",
         "_MEMBER_KEEP",
@@ -563,21 +564,21 @@ def test_a_bundle_marker_in_a_member_value_is_still_read_by_the_bundle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The line a review found: the mask wrote ``mfb64:redacted:``, so a chain line the bundle read
-    back printed ``QUJDkey``, which ``origin/main`` hid there. On every path, the body prints only
+    back printed ``QUJDpwd``, which ``origin/main`` hid there. On every path, the body prints only
     where the baseline prints it too, and every path through the bundle hides it."""
-    line = "connect failed;xpass=mfb64:v1:QUJDkey= tail"
+    line = "connect failed;xpass=mfb64:v1:QUJDpwd= tail"
     paths = _every_redaction_path(line)
     with monkeypatch.context() as patched:
         _without_member_pass(patched)
         baseline = _every_redaction_path(line)
     assert [
-        p for p, out in paths.items() if "QUJDkey" in out and "QUJDkey" not in baseline[p]
+        p for p, out in paths.items() if "QUJDpwd" in out and "QUJDpwd" not in baseline[p]
     ] == []
     through_the_bundle = [
         p for p in paths if "bundle" in p or p.startswith(("redact_log_line", "store path"))
     ]
     assert len(through_the_bundle) == 5
-    assert [p for p in through_the_bundle if "QUJDkey" in paths[p]] == [], paths
+    assert [p for p in through_the_bundle if "QUJDpwd" in paths[p]] == [], paths
 
 
 @pytest.mark.parametrize("line", _SHAPES_THE_WORD_MASK_PRINTED)
@@ -595,6 +596,31 @@ def test_a_shape_the_word_mask_printed_prints_nothing_the_baseline_hid_on_any_pa
         path: [f for f in _planted(line) if f in out and f not in baseline[path]]
         for path, out in paths.items()
     }
+    assert not {path: found for path, found in printed.items() if found}, paths
+
+
+#: Lines a review found printing a value ``origin/main`` hid on six later paths, once ``key`` and
+#: ``auth`` left the kept words and before the key-label words joined them (BACKLOG #5030 added item
+#: 1): the mask took a compound key label ``_KEY_MATERIAL`` reads, so a second redaction lost it.
+_SHAPES_A_KEY_LABEL_PRINTED = (
+    ";Accesstoken=,accessKey:Jane Doe\nb2qe5qMRNmasterKey=",
+    ';Accesstoken=accessKey:"\n\ne5qb2qsubscriptionKey=',
+)
+
+
+@pytest.mark.parametrize("line", _SHAPES_A_KEY_LABEL_PRINTED)
+def test_a_compound_key_label_in_a_value_prints_nothing_the_baseline_hid(
+    monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    paths = _every_redaction_path(line)
+    with monkeypatch.context() as patched:
+        _without_member_pass(patched)
+        baseline = _every_redaction_path(line)
+    printed = {
+        path: [f for f in _planted(line) if f in out and f not in baseline[path]]
+        for path, out in paths.items()
+    }
+    assert _planted(line)
     assert not {path: found for path, found in printed.items() if found}, paths
 
 
@@ -664,6 +690,8 @@ def test_the_kept_words_and_shapes_cover_what_later_passes_read() -> None:
         "secretscrub credential words": secretscrub._CREDENTIAL_WORDS,
         "secretscrub token words": secretscrub._TOKEN_WORDS,
         "secretscrub key-material words": secretscrub._KEY_MATERIAL_WORDS,
+        "secretscrub key-label words": secretscrub._KEY_LABEL_WORDS,
+        "secretscrub query-credential compounds": secretscrub._QUERY_CREDENTIAL_COMPOUNDS,
         "secretscrub env prefix": (secretscrub._ENV_PREFIX,),
         "logging_setup query keys": logging_setup._CREDENTIAL_QUERY_KEYS,
         "logging_setup query stop words": logging_setup._QUERY_STOP_WORDS,
@@ -886,10 +914,13 @@ def test_a_password_word_holding_a_query_credential_word_is_masked(
 
 def test_the_query_credential_words_are_not_kept_words() -> None:
     """No log pass reads them: ``credential_query_params`` reads them in a configured URL's parameter
-    names. The pass that reads ``key=`` in log text reads it under a longer word this list keeps."""
+    names. A log pass reads ``key`` and ``auth`` only inside a longer label this list keeps, at
+    least ``_KEY_LABEL_WORDS`` (``accessKey``, ``AccountKey``, ``authKey``), checked here."""
     for word in secretscrub._QUERY_CREDENTIAL_WORDS:
         assert secretscrub._MEMBER_KEEP.search(word) is None, word
         assert word.casefold() not in {w.casefold() for w in secretscrub._MEMBER_KEEP_WORDS}
+    for label in ("accessKey", "AccountKey", "authKey", "SharedAccessKey", "subscriptionKey"):
+        assert secretscrub._MEMBER_KEEP.search(label) is not None, label
 
 
 @pytest.mark.parametrize(

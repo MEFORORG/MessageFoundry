@@ -1949,7 +1949,9 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # an ``origin/main`` tree, where it does not print there. On its last run, seeds 101 to 110 and
 # 201 to 210, 3,000,000 random lines of which 1,215,761 hold a ";" and 807,717 a marker shape, it
 # printed no line on any path, against the member pass off and against an ``origin/main`` tree
-# alike. The word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
+# alike. That run was BEFORE BACKLOG #5030 added item 1 took ``key``, ``sig``, ``auth`` and ``jwt``
+# off :data:`_MEMBER_KEEP_WORDS` and put the key-label words on it, and was not repeated after;
+# the seeded sample in the test passes on the change. The word mask before it, ``redacted`` for every word, printed 1 line on a chain line the
 # bundle read back on the first ten seeds, and the "#" rule before its fix printed on five later
 # paths.
 #
@@ -2031,8 +2033,10 @@ _CONNECTION_STRING_MEMBER = re.compile(
 
 #: Words a member value keeps where a word holds one, matched as a substring ignoring case, and a
 #: later pass reads the word there (:func:`_kept_word`; BACKLOG #5030). Each is a word some pass
-#: after the member pass reads, so masking it would change what that pass does on a second redaction. At least: this module's credential, token and key-material
-#: words and its ``MEFOR_`` prefix; the write-time query filter's keys
+#: after the member pass reads, so masking it would change what that pass does on a second
+#: redaction. At least: this module's credential and token words, its key-label words
+#: (:data:`_KEY_LABEL_WORDS`, the compound ones such as ``accessKey`` and ``AccountKey`` among them,
+#: which ``_KEY_MATERIAL`` reads) and its ``MEFOR_`` prefix; the write-time query filter's keys
 #: (``logging_setup._CREDENTIAL_QUERY_KEYS``: ``code`` and ``state``, the rest hold ``token`` or
 #: ``session``); the support bundle's ``mfb64`` marker and ``basic``/``digest`` scheme words; and the
 #: PHI pass's anchors: ``mrn``, its JSON key words (``redaction._JSON_PHI_KEY``: ``family``,
@@ -2041,13 +2045,14 @@ _CONNECTION_STRING_MEMBER = re.compile(
 #:
 #: NOT :data:`_QUERY_CREDENTIAL_WORDS` (``key``, ``sig``, ``auth``, ``jwt``), which this list held
 #: until BACKLOG #5030 added item 1: :func:`credential_query_params` reads them in a configured
-#: URL's parameter names, and no log pass reads them. Kept, they kept a password word that held
+#: URL's parameter names. A log pass reads ``key`` and ``auth`` only inside a longer label this
+#: list keeps, at least the key-label words above. Kept alone, they kept a password word that held
 #: one before a ":" or "=", so ``;sslpassword=Monkey:Banana42;`` printed ``Monkey``.
 #: ``tests/test_connection_string_member_scrub.py`` holds this to those sources.
 _MEMBER_KEEP_WORDS = (
     *_CREDENTIAL_WORDS,
     *_TOKEN_WORDS,
-    *_KEY_MATERIAL_WORDS,
+    *_KEY_LABEL_WORDS,
     *_MEMBER_EXTRA_WORDS,
     _ENV_PREFIX,
     "code",
@@ -2069,13 +2074,16 @@ _MEMBER_KEEP_WORDS = (
     "responsibleperson",
 )
 #: :data:`_MEMBER_KEEP_WORDS` as one search, reduced by subsumption (``pass`` holds ``password``,
-#: ``api_key`` holds ``intake_api_key_next``, ``encryption_key`` holds ``encryption_keys_retired``).
+#: ``api_key`` holds ``intake_api_key_next``, ``encryption_key`` holds ``encryption_keys_retired``,
+#: ``secret`` holds ``secretkey``, ``accesskey`` holds ``sharedaccesskey``).
 #: Spelled literally, so the regex scanner in ``tests/test_security_static.py`` reads it; the member
 #: test holds it to the tuple.
 _MEMBER_KEEP = re.compile(
-    r"(?i)medicalrecordlocator|responsibleperson|encryption_key|authorization|private_key|identifier"
-    r"|credential|birthdate|address|patient|session|telecom|api_key|api-key|mefor_|bearer|family"
-    r"|secret|digest|apikey|given|state|token|basic|mfb64|pass|code|name|0010|pwd|mrn"
+    r"(?i)medicalrecordlocator|responsibleperson|subscriptionkey|encryption_key|encryptionkey"
+    r"|authorization|secondarykey|private_key|identifier|credential|accountkey|privatekey"
+    r"|birthdate|accesskey|masterkey|address|patient|session|telecom|api_key|api-key|authkey"
+    r"|mefor_|bearer|family|secret|digest|apikey|given|state|token|basic|mfb64|pass|code|name"
+    r"|0010|pwd|mrn"
 )
 
 #: One unit of a member value. Group 1 is a WORD, which the mask may replace; every other
@@ -2187,17 +2195,17 @@ def _mask_member_value(text: str, start: int, end: int) -> str:
         out.append(text[pos:word_start])
         pos = word_end
         segment = _MEMBER_SEGMENT_ID.search(word)
+        after_percent = word_start > 0 and text[word_start - 1] == "%"
         if _kept_word(text, word, word_end):
             out.append(word)
         elif segment is not None and text.startswith("|", word_end):
             # The ID stays for the segment pattern; a prefix before its "." or "-" is masked,
             # and right after a "%" its hex escape stays one, as in the branch below: masked
             # without it, ``%3B.PID|`` became ``%0x.PID|`` (BACKLOG #5030 added item 3).
-            after_percent = word_start > 0 and text[word_start - 1] == "%"
             prefix = _masked_word(word[: segment.start(1)], after_percent)
             out.append(prefix + segment.group(1))
         else:
-            out.append(_masked_word(word, word_start > 0 and text[word_start - 1] == "%"))
+            out.append(_masked_word(word, after_percent))
     out.append(text[pos:end])
     return "".join(out)
 
