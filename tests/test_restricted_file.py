@@ -1068,6 +1068,19 @@ def test_a_posix_key_on_a_delegated_file_system_is_refused(fstype: str) -> None:
     assert "/private" not in problem
 
 
+def test_a_posix_mount_refusal_names_no_role_its_caller_does_not_hold() -> None:
+    """The reason is spliced after whatever the caller names, a key file, the secrets directory or
+    the custody directory, so its remedy must work for each: it once told a secrets-directory
+    refusal to move "its store directory", which that directory has none of (vault BACKLOG #5657)."""
+    mounts = [("/", "ext4"), ("/private/tmp", "nfs")]
+    problem = _typed_link_problem("/private/tmp/secrets", mounts)
+    assert problem is not None
+    assert "store directory" not in problem and "the engine mints" not in problem
+    assert problem.endswith(
+        "keep it, and the folders its path runs through, on a local file system"
+    )
+
+
 @pytest.mark.parametrize("fstype", ["9p", "virtiofs", "nfs4"])
 def test_a_posix_root_mount_is_not_judged_by_its_type(fstype: str) -> None:
     """A sandbox whose ``/`` is a 9p or virtiofs share would otherwise refuse every key file; a
@@ -1095,7 +1108,7 @@ def test_a_posix_mount_type_the_refusal_cannot_print_is_not_quoted() -> None:
 
 
 def test_a_posix_mount_table_that_could_not_be_read_judges_no_type() -> None:
-    """With no mount table (``fstype_fn`` answers ``None``, as off Linux) nothing is refused for
+    """With no mount read (``fstype_fn`` answers ``None``, as off Linux) nothing is refused for
     its type, and the walk is otherwise unchanged."""
     assert _typed_link_problem("/private/tmp/keys/k.key", []) is None
 
@@ -1126,8 +1139,8 @@ def test_broad_access_problem_refuses_a_key_the_mount_table_puts_on_nfs(
 def test_broad_access_problem_refuses_where_the_linux_mount_table_cannot_be_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """On Linux no mount table means no type on the path was judged, so it is refused rather than
-    passed as if it had been."""
+    """On Linux an unreadable ``/proc/self/mountinfo`` means no type on the path was judged, so it
+    is refused rather than passed as if it had been."""
     os.chmod(tmp_path, 0o700)
     key = tmp_path / "k.key"
     key.write_bytes(b"synthetic")

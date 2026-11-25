@@ -489,13 +489,14 @@ than a path is not checked
 - On POSIX the check refuses at least a key file whose own name is a link, one owned by an account
   other than the engine's own or root, one whose mode has a group or other read or write bit,
   whoever is in the group, and one held in a directory that such an account owns or that a group or
-  other may write without the sticky bit (vault BACKLOG #5636). Where it can read the host's
-  mount table, as on Linux, its walk of the key file's path also refuses a path on at least an
-  NFS, CIFS or SMB, 9p, virtiofs or FUSE mount, where something other than the owner and mode
-  bits decides who reaches the file (vault BACKLOG #5657); on Linux a mount table it cannot read is
-  refused. The secrets directory's own check refuses such a mount on its path too, under either
-  enforcement setting. The list of types is open: it does not judge at least a type it does not
-  name, the mount at `/`, any type on a host with no mount table, such as macOS, a mount an
+  other may write without the sticky bit (vault BACKLOG #5636). Where it can read
+  `/proc/self/mountinfo`, as on Linux, its walk of the key file's path also refuses a path on at
+  least an NFS, CIFS or SMB, 9p, virtiofs or FUSE mount, where something other than the owner and
+  mode bits decides who reaches the file (vault BACKLOG #5657); on Linux, where that file cannot be
+  read, the path is refused. It does not judge mount types where it cannot read that file, for
+  example on macOS and the BSDs, whose mount tables it does not read. The secrets directory's own
+  check refuses such a mount on its path too, under either enforcement setting. The list of types
+  is open: it does not judge at least a type it does not name, the mount at `/`, a mount an
   automounter has not made yet, a network file system beneath an overlay mount, or a file in the
   secrets directory that is a mount of its own. Keep key files on a local file system. It reads no
   access list itself, so it can pass a key that a file system of a type it does not judge, or an

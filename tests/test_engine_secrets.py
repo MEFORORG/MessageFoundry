@@ -652,6 +652,33 @@ def test_a_posix_secrets_directory_whose_parent_others_may_write_is_refused(
         open_secrets_directory(_env(directory))
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the mount table is read off Windows")
+def test_a_posix_secrets_directory_on_nfs_is_refused_naming_that_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A secrets directory on an NFS mount is refused, and the refusal names the secrets directory
+    and tells the operator to keep that directory on a local file system. It once told them to
+    move "its store directory", which a secrets directory has none of (vault BACKLOG #5657)."""
+    from messagefoundry import restricted_file
+
+    directory = _directory(tmp_path)
+    assert open_secrets_directory(_env(directory)) is not None  # the control
+    monkeypatch.setattr(
+        restricted_file,
+        "read_mounts",
+        lambda: [("/", "ext4"), (os.path.realpath(tmp_path), "nfs4")],
+    )
+    with pytest.raises(SecretsDirectoryError) as refused:
+        open_secrets_directory(_env(directory))
+    text = str(refused.value)
+    assert text.startswith(
+        f"the secrets directory {SECRETS_DIRECTORY_VARIABLE} names is not restricted: its path is "
+        "on a mount of type nfs4,"
+    ), text
+    assert "keep it, and the folders its path runs through, on a local file system" in text, text
+    assert "store directory" not in text, text
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="a directory junction is a Windows link")
 def test_a_real_directory_junction_on_windows_is_refused_before_anything_follows_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

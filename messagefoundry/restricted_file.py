@@ -1197,13 +1197,15 @@ def _posix_link_problem(
         return any(link.startswith(prefix) for link in links)
 
     if delegated:
-        # The mount point is a path; this text names none.
+        # The mount point is a path; this text names none. "It" is whatever the caller names, a key
+        # file, the secrets directory or the custody directory, so the remedy is the same for each
+        # and names no role (vault BACKLOG #5657).
         fstype = next(iter(delegated.values()))
         shown = fstype if _PRINTABLE_FILE_SYSTEM_TYPE.fullmatch(fstype) else "network or FUSE"
         return (
             f"its path is on a mount of type {shown}, where something other than the owner and "
-            "mode bits this check reads decides who may read or replace it; keep it, or for a key "
-            "the engine mints, its store directory, on a local file system"
+            "mode bits this check reads decides who may read or replace it; keep it, and the "
+            "folders its path runs through, on a local file system"
         )
     for finding in verdict.findings:
         about_holder = finding.kind == DIRECTORY and above_a_link(finding.path)
@@ -1229,9 +1231,10 @@ def _posix_link_problem(
 def _posix_host_link_problem(path: Path) -> str | None:
     """:func:`_posix_link_problem` for ``path`` on this host. A read that fails is a finding whose
     reason quotes the error, so the error is rebuilt without the file name it carries. The mount
-    types are read from this process's mount table once per call. On Linux a table that cannot be
-    read is refused, since no type on the path was judged; elsewhere, as on macOS, there is none
-    to read and no type is judged. POSIX only."""
+    types are read from ``/proc/self/mountinfo`` once per call, and judged only where that can be
+    read. On Linux a file that cannot be read is refused, since no type on the path was judged.
+    Elsewhere, for example on macOS and the BSDs, which have mount tables this does not read, no
+    type is judged. POSIX only."""
     if sys.platform == "win32":  # pragma: no cover - guard for the type checker on Windows
         raise OSError("a POSIX path is walked on POSIX only")
 
@@ -1407,8 +1410,8 @@ def broad_access_problem(
     or capability SID (:func:`_is_package_sid`) is reported the same way. POSIX
     (:func:`_posix_key_file_problem`): a file owned by an account other than the engine's own or
     root, a group or other read or write bit, and a directory holding it that such an account owns
-    or that a group or other may write with no sticky bit. Where the mount table can be read, the
-    walk below also refuses a path on a mount whose type leaves access to a server or a user-space
+    or that a group or other may write with no sticky bit. Where ``/proc/self/mountinfo`` can be
+    read, the walk below also refuses a path on a mount whose type leaves access to a server or a user-space
     program (:func:`_posix_delegated_file_system`), since those owner and mode bits do not decide
     who reaches the file there.
 
