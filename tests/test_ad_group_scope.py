@@ -25,9 +25,13 @@ from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.permissions import Role
 from messagefoundry.auth.service import (
     _AD_SCOPE_WRITE_ATTEMPTS,
+    _SIGN_IN_UNAVAILABLE,
+    ACCOUNT_DELETED,
     ACCOUNT_REFUSED,
     CHANNEL_SCOPE_CHANGE_REFUSED_ACTION,
+    SCOPE_SYNC_CONTENDED,
     AuthService,
+    LoginOutcome,
     _AdChannelScopeContended,
     _AdChannelScopeRefused,
     _allowed_channels,
@@ -1178,15 +1182,19 @@ async def test_a_scope_write_that_misses_on_every_attempt_fails_the_sign_in(
         await store.close()
 
 
+@pytest.mark.parametrize(
+    ("held", "reason"), [(False, ACCOUNT_DELETED), (True, ACCOUNT_REFUSED)], ids=["gone", "sealed"]
+)
 @pytest.mark.parametrize("on_try", [1, _AD_SCOPE_WRITE_ATTEMPTS])
 async def test_a_miss_whose_re_read_finds_no_row_refuses_the_sign_in(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_try: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, on_try: int, held: bool, reason: str
 ) -> None:
-    """A miss whose settled re-read returns no user refuses the sign-in as the role write does,
-    ``account_refused``, with nothing written, on the first attempt and the last. It is not
+    """A miss whose settled re-read returns no user refuses the sign-in, with nothing written, on
+    the first attempt and the last. A row gone is ``account_deleted``, as the caller's pre-mint
+    read names it (BACKLOG #5624); a row failing its seal is ``account_refused``. It is not
     returned for the caller to judge: the caller's own re-read could find the row readable again
     and mint on a scope this sign-in neither wrote nor checked. Nor is it reported as contention."""
-    store = await MessageStore.open(tmp_path / f"svc6887d{on_try}.db")
+    store = await MessageStore.open(tmp_path / f"svc6887d{on_try}{held}.db")
     try:
         service = AuthService(store, AuthSettings())
         await service.initialize()
@@ -1203,7 +1211,7 @@ async def test_a_miss_whose_re_read_finds_no_row_refuses_the_sign_in(
 
         async def gone_on_try(user_id: str) -> Any:
             if tries >= on_try:
-                return SimpleNamespace(user=None, held=False)
+                return SimpleNamespace(user=None, held=held)
             return await real_lookup(user_id)
 
         monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
@@ -1212,7 +1220,7 @@ async def test_a_miss_whose_re_read_finds_no_row_refuses_the_sign_in(
         with pytest.raises(_AdChannelScopeRefused) as refused:
             await service._sync_ad_channel_scope(user, frozenset(), ["grp-a"])
 
-        assert refused.value.reason == ACCOUNT_REFUSED
+        assert refused.value.reason == reason
         assert tries == on_try  # positive control: the refusing attempt ran, and no later one
         assert (await store.get_user("ada")).channel_scope is None  # nothing written
         assert await store.list_sessions("ada"), "a refused sync revoked"
@@ -1314,3 +1322,122 @@ async def test_the_ad_scope_write_compare_and_sets_on_scope_and_source(tmp_path:
         assert await cas("nobody", "[]", expected_scope=None, expected_source=None) is False
     finally:
         await s.close()
+
+
+# --- BACKLOG #6887: an unwritten scope is an audited refusal of the sign-in ------------------
+
+_SCOPE_PAIR = ("https://idp.example/tenant", "S-1-scope-sync-6887")
+_SCOPE_LEGS = ("kerberos", "oidc")
+
+
+async def _scope_sign_in(service: AuthService, leg: str) -> LoginOutcome:
+    """The completion both directory legs call; the OIDC leg presents the bound pair."""
+    if leg == "kerberos":
+        return await service._complete_ad_login(_ops_principal(), None, mfa_verified=True)
+    return await service._complete_ad_login(
+        _ops_principal(),
+        None,
+        mfa_verified=True,
+        mech="oidc",
+        session_mechanism=SessionMechanism.OIDC,
+        federated_subject=_SCOPE_PAIR,
+        idp_auth_time=time.time(),
+    )
+
+
+async def _scope_signed_in(store: MessageStore, leg: str) -> tuple[AuthService, str, str]:
+    """jdoe signed in once on ``leg`` with scope ``IB_A``, bound to :data:`_SCOPE_PAIR` on the
+    OIDC leg; the scope map then moves to ``IB_B``, so the next sign-in writes the scope. Returns
+    the service, the account id and that first sign-in's live token."""
+    service = AuthService(
+        store,
+        AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        ),
+    )
+    await service.initialize()
+    await store.set_ad_group_role_map([(_OPS, Role.OPERATOR.value)])
+    await store.set_ad_group_scope_map([(_OPS, "IB_A")])
+    first = await _scope_sign_in(service, "kerberos")
+    user = await store.get_user_by_username("jdoe")
+    assert user is not None
+    if leg == "oidc":
+        assert await store.set_user_federated_subject(user.id, *_SCOPE_PAIR) is not None
+        first = await _scope_sign_in(service, leg)
+    assert first.ok and first.token is not None
+    await store.set_ad_group_scope_map([(_OPS, "IB_B")])
+    return service, user.id, first.token
+
+
+async def _refusal_rows(store: MessageStore, reason: str) -> list[dict[str, Any]]:
+    rows = [json.loads(r["detail"] or "{}") for r in await store.list_audit()]
+    return [r for r in rows if r.get("reason") == reason]
+
+
+@pytest.mark.parametrize("leg", _SCOPE_LEGS)
+async def test_an_account_deleted_before_the_scope_write_is_an_audited_account_deleted_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """The account is deleted between the sign-in's read and its scope write. The write misses,
+    the re-read finds no row, and the sign-in is refused as ``account_deleted`` with its audit row
+    (BACKLOG #5624), as the pre-mint read refused it before the compare-and-set. No session is
+    minted. Before this was rendered at the call site the refusal raised out of the sign-in."""
+    store = await MessageStore.open(tmp_path / f"del6887{leg}.db")
+    try:
+        service, user_id, _ = await _scope_signed_in(store, leg)
+        real_cas = store.set_ad_channel_scope_if_unchanged
+
+        async def deleted_first(*args: Any, **kwargs: Any) -> bool:
+            await store.delete_user(user_id)
+            return await real_cas(*args, **kwargs)
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", deleted_first)
+
+        out = await _scope_sign_in(service, leg)
+
+        assert not out.ok and out.token is None
+        assert out.reason == ACCOUNT_DELETED
+        assert await store.get_user(user_id) is None  # positive control: the delete ran
+        assert await store.list_sessions(user_id) == [], "a refused sign-in minted a session"
+        assert len(await _refusal_rows(store, ACCOUNT_DELETED)) == 1
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("leg", _SCOPE_LEGS)
+async def test_a_scope_write_contended_past_the_bound_is_an_audited_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, leg: str
+) -> None:
+    """Every compare-and-set misses. The sign-in is refused as ``scope_sync_contended``, answered
+    as a temporary failure like the session insert's contention, with one audit row naming it. No
+    session is minted, and the first sign-in's session stands: nothing was written to revoke for."""
+    store = await MessageStore.open(tmp_path / f"cont6887{leg}.db")
+    try:
+        service, user_id, first = await _scope_signed_in(store, leg)
+        tries = 0
+
+        async def always_moved(*args: Any, **kwargs: Any) -> bool:
+            nonlocal tries
+            tries += 1
+            return False
+
+        monkeypatch.setattr(store, "set_ad_channel_scope_if_unchanged", always_moved)
+
+        out = await _scope_sign_in(service, leg)
+
+        assert tries == _AD_SCOPE_WRITE_ATTEMPTS  # positive control: the bound was reached
+        assert not out.ok and out.token is None
+        assert out.reason == SCOPE_SYNC_CONTENDED
+        assert out.error == _SIGN_IN_UNAVAILABLE
+        rows = await _refusal_rows(store, SCOPE_SYNC_CONTENDED)
+        assert len(rows) == 1 and rows[0].get("provider") == "ad"
+        if leg == "oidc":
+            assert rows[0].get("mech") == "oidc"
+        assert len(await store.list_sessions(user_id)) == 1, "a refused sign-in minted a session"
+        assert await service.identity_for_token(first) is not None, "a refusal ended a session"
+    finally:
+        await store.close()
