@@ -83,10 +83,10 @@ function Resolve-BoxPath {
     # keyed on the session's cwd and seat.ps1 on `git rev-parse --show-toplevel`, so one worktree
     # could name two boxes, each one the other end never read.
     #
-    # Returns the worktree root when $Path is a folder inside a live worktree that git does not
-    # ignore. Returns $Path UNCHANGED, so its key is exactly what it was before this function, when:
-    #   - $Path is the worktree root itself (the common case, answered with no git call);
-    #   - $Path is not rooted, or sits in no checkout: no root is guessed;
+    # Returns the worktree root when $Path is that root (the common case, answered with no git call)
+    # or a folder inside a live worktree that git does not ignore. Returns $Path UNCHANGED, so its
+    # key is exactly what it was before this function, in at least these cases:
+    #   - $Path is not fully qualified, or sits in no checkout: no root is guessed;
     #   - the nearest `.git` above $Path names no git directory, as a pruned worktree's stale `.git`
     #     file does: the walk never passes it to reach a checkout further up;
     #   - git IGNORES $Path in the checkout found above it. A removed worktree's leftover directory
@@ -104,25 +104,32 @@ function Resolve-BoxPath {
         $raw = $Path.Trim()
         # Fully qualified, not merely rooted: `D:` or `\x` would resolve against a current directory.
         if (-not $raw -or -not [System.IO.Path]::IsPathFullyQualified($raw)) { return $Path }
-        # GetFullPath collapses `..` and slash direction, so the walk below climbs real parents.
-        $full = [System.IO.Path]::GetFullPath($raw).TrimEnd('\', '/')
+        # GetFullPath collapses `..` and slash direction, so the walk below climbs real parents. A
+        # trailing separator is trimmed except from a drive root, where `D:` would name D's current
+        # directory rather than `D:\`.
+        $full = [System.IO.Path]::GetFullPath($raw)
+        if ($full.Length -gt [System.IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\', '/') }
         $at = $full
         $root = $null
         while ($at) {
-            $dotGit = Join-Path $at '.git'
-            if (Test-Path -LiteralPath $dotGit) {
+            $dotGit = [System.IO.Path]::Combine($at, '.git')
+            if ([System.IO.File]::Exists($dotGit) -or [System.IO.Directory]::Exists($dotGit)) {
                 if (-not (Test-BoxGitDir -DotGit $dotGit)) { return $Path }
                 $root = $at
                 break
             }
-            $parent = Split-Path -Parent $at
-            if (-not $parent -or $parent -eq $at) { break }
-            $at = $parent.TrimEnd('\', '/')
+            $at = [System.IO.Path]::GetDirectoryName($at)
         }
-        if (-not $root -or $full.Length -eq $root.Length) { return $Path }
-        # Relative to the root, in forward slashes, with a trailing slash so a directory-only pattern
-        # such as `/.claude/worktrees/` matches it.
-        $rel = ($full.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/') + '/'
+        if (-not $root) { return $Path }
+        # The root itself, in GetFullPath's form, so a `..` spelling of it keys as its subdirectories
+        # do. ConvertTo-BoxKeyPath already folds case, slashes and a trailing separator, so a plain
+        # absolute root keys exactly as it did before.
+        if ($full.Length -eq $root.Length) { return $full }
+        # A CHILD of the folder, not the folder with a trailing slash. Measured in a Windows checkout
+        # with core.autocrlf: each CRLF blank line of .gitignore is a lone `\r` pattern, and
+        # check-ignore matched it against every `<untracked dir>/` probe, so an untracked subdirectory
+        # read as ignored. A folder that a pattern does ignore still answers for its children.
+        $rel = ($full.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/') + '/mefor-box-probe'
         $null = & git -C $root check-ignore -q -- $rel 2>$null
         # 1 is "not ignored". 0 is ignored, and anything else is git failing to answer.
         if ($LASTEXITCODE -eq 1) { return $root }
@@ -133,9 +140,10 @@ function Resolve-BoxPath {
 
 function Test-BoxGitDir {
     # Whether the `.git` at $DotGit names a git directory, read the way git reads it and calling no
-    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD. The same rule as
-    # Get-CcxGitCommonDir in scripts/hooks/_hookinput.ps1, which this file cannot load (it is kept
-    # byte-identical with korus, and mail.ps1 and seat.ps1 never load hook code); change both together.
+    # git: a directory, or a file whose `gitdir:` line names one, that holds HEAD. A weaker rule than
+    # Get-CcxGitCommonDir in scripts/hooks/_hookinput.ps1, which also follows `commondir`; this file
+    # cannot load that one (it is kept byte-identical with korus, and mail.ps1 and seat.ps1 never load
+    # hook code).
     param([Parameter(Mandatory)][string]$DotGit)
     $Root = Split-Path -Parent $DotGit
     try {
@@ -167,7 +175,8 @@ function Get-BoxReadKeys {
         $keys += ConvertTo-BoxKey -Path $Path
         $keys += ConvertTo-LegacyBoxKey -Path $Path
     }
-    return , $keys
+    # Unrolled, so `@(Get-BoxReadKeys ...)` and `foreach ($k in Get-BoxReadKeys ...)` both see keys.
+    return $keys
 }
 
 # Set at load so a StrictMode caller can read it before the first load below.

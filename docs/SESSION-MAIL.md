@@ -218,11 +218,13 @@ one from both ends.
 the watcher and `seat.ps1` each pass a path through `Resolve-BoxPath` in `mail-key.ps1` before keying
 it. A folder inside a live worktree is raised to the nearest root above it, so a session started in a
 subdirectory reads the box its seat record publishes. This is not a prefix match: the walk stops at the
-first `.git`, and every other path keeps the key it had before. That covers a root, a path in no
-checkout, a path under a `.git` that names no git directory, and a folder git ignores. A removed
-worktree's leftover directory under the primary's `.claude/worktrees/` is ignored, so it never reaches
-the primary's box. Mail queued under a subdirectory's old key is moved into the root's box by the
-drain and the watcher, as the legacy key's mail is.
+first `.git`. A path that is not raised keeps the key it had before; at least a path in no checkout, a
+path under a `.git` that names no git directory, a folder git ignores, and a path git fails to answer
+for are not raised. A removed worktree's leftover directory under the primary's `.claude/worktrees/`
+is ignored, so mail sent to that PATH does not reach the primary's box. Its session's seat record is a
+separate matter: `seat.ps1` keys on git's toplevel, which for that directory is the primary. Mail
+queued under a subdirectory's old key is moved into the root's box when a session whose cwd is that
+subdirectory drains or watches, as the legacy key's mail is.
 
 **Injectivity comes from the hash, not the slug.** The key is `<readable-slug>-<hash>`. Two different
 worktree paths can sanitise to the same slug, and the failure mode of a slug-only key is one worktree

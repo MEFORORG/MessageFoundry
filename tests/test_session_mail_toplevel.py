@@ -143,6 +143,24 @@ def test_mail_queued_under_a_subdirectory_key_is_still_read(repo: Path) -> None:
     assert box_files(repo, _key(repo), "inbox")
 
 
+def test_status_still_counts_a_claim_left_under_a_subdirectory_key(repo: Path) -> None:
+    sub = _sub(repo)
+    old_inbox = _queue_under_the_subdirectory_key(repo, sub, "claimed before the keyer")
+    claiming = old_inbox.parent / "claiming"
+    claiming.mkdir()
+    for f in old_inbox.glob("*.json"):
+        f.rename(claiming / f.name)
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(MAIL),
+         "-MailRoot", str(mail_root(repo)), "-Status", "-Json"],
+        cwd=str(sub), capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    status = json.loads(proc.stdout)
+    assert status["Key"] == _key(repo)
+    assert status["LegacyClaiming"] == 1
+
+
 def test_the_watcher_wakes_on_mail_under_a_subdirectory_key(repo: Path) -> None:
     sub = _sub(repo)
     _queue_under_the_subdirectory_key(repo, sub, "wake me")
@@ -162,6 +180,16 @@ def test_the_watcher_wakes_on_mail_under_a_subdirectory_key(repo: Path) -> None:
 def test_the_primary_checkout_keys_on_itself_and_raises_its_subdirectory(repo: Path) -> None:
     assert _resolve(repo) == str(repo), "a root is returned unchanged, so its key never moved"
     assert _same(_resolve(_sub(repo)), repo)
+
+
+def test_an_untracked_subdirectory_is_raised_under_a_crlf_gitignore(repo: Path) -> None:
+    # A CRLF blank line is a lone `\r` pattern, which check-ignore matched against a trailing-slash
+    # probe of any untracked directory (measured in a Windows checkout with core.autocrlf).
+    (repo / ".gitignore").write_bytes(b"/.claude/worktrees/\r\n\r\n*.log\r\n")
+    sub = _sub(repo)
+    assert not list(sub.iterdir()), "no tracked file under it"
+    assert _same(_resolve(sub), repo)
+    assert not _same(_resolve(repo / ".claude" / "worktrees" / "gone"), repo)
 
 
 def test_a_path_in_no_checkout_is_keyed_as_given(tmp_path: Path) -> None:
