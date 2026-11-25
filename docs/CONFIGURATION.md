@@ -222,7 +222,7 @@ backend-limited.
 | `pool_size` | int | 40 | server DBs — **server-DB only** (no-op on SQLite). The inverted-U optimum (raised from 5; do **not** set higher — over-provisioning is catastrophic, [ADR 0062](adr/0062-default-store-pool-size.md)). **Per engine:** `engines × pool_size` share one `max_connections` — see [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §3 |
 | `connect_timeout`, `command_timeout` | int (s) | 15 / 30 | server DBs — the **login** and **statement** bounds respectively; neither bounds the wait for a free pooled connection (that is `acquire_timeout`). The long open-time schema work is exempt from `command_timeout`: on SQL Server the whole DDL batch; on Postgres only the FIFO covering-index rebuild and `ix_messages_received`, while every other Postgres DDL statement at open, index builds included, keeps it. Another open's wait for the schema lock while that work runs takes `schema_lock_timeout` instead (BACKLOG #1726) |
 | `schema_lock_timeout` | num (s) | 600 | server DBs — upper bound on a store open's wait for the schema lock that serializes the open-time DDL batch across engine shards and cluster nodes (BACKLOG #1726). The holder's long schema work is exempt from `command_timeout` (the row above), so on a first upgrade that builds an index over a large table it can hold the lock far longer than a statement; size this above that build. Must be `> 0` and at most 2147483 (the largest `sp_getapplock` wait), so the WAIT is always bounded: on SQL Server nothing else ends it, and a service stop cannot interrupt the driver thread waiting in it, so a stop that arrives during the wait can take up to this long. It also bounds the holder's own DDL lock waits: once an open holds the schema lock, no DDL statement waits longer than this for its table lock (SQL Server `SET LOCK_TIMEOUT`; Postgres a transaction-local `lock_timeout`, which keeps a stricter role or database setting), so an index build queued behind an open transaction on its table cannot hold the schema lock forever, and on Postgres cannot leave its queued lock request blocking every later write to that table for longer. A Postgres statement that keeps `command_timeout` gives up at that shorter bound first, with the driver's timeout. It never bounds how long a build runs once it has its lock. At the limit the open fails with `SchemaLockTimeout`, naming the lock and this setting, or, when the holder's DDL statement waited it out, with its subclass `SchemaDdlLockTimeout`; either way its transaction rolls back with nothing applied, and the next start retries the idempotent batch. Other store locks keep their `command_timeout`-derived wait. No-op on SQLite. |
-| `acquire_timeout` | num (s) | 30 | server DBs — upper bound on **one pooled-connection borrow**, and on the throwaway pool a `DatabaseRef` reference sync opens. Must be a finite number `> 0`, so `inf` and `nan` are refused (BACKLOG #5979); there is no "0 disables" value. On a SQL Server cluster this value also caps the lease claim's pool wait, so it feeds the renew-clamp check: a claim whose pool wait plus statement timeout reaches the detection margin steps a derived `[cluster].lease_renew_timeout_seconds` down, or refuses the config (the `lease_renew_timeout_seconds` row says how). At the limit the borrow raises `StoreAcquireTimeout`, an ordinary `Exception` the stage worker handles like any other transient store failure (the row stays claimable, the handoff re-runs idempotently) — and a connection the pool hands over after the borrower gave up is released back rather than stranded. 30 s sits far above a healthy wait; read p95/p99 from the `pool_status()` acquire-wait histogram before lowering it. No-op on SQLite. **The two backends reach this differently** — read the scope note in [`CONNECTIONS.md`](CONNECTIONS.md) ("Behaviour at the store-pool acquire limit") rather than assuming it is uniform. |
+| `acquire_timeout` | num (s) | 30 | server DBs — upper bound on **one pooled-connection borrow**, and on the throwaway pool a `DatabaseRef` reference sync opens. Must be a finite number `> 0`, so `inf` and `nan` are refused (BACKLOG #5979); there is no "0 disables" value. On a SQL Server cluster this value also caps the lease claim's pool wait, so it feeds the renew-clamp check: a claim whose pool wait plus statement timeout reaches the detection margin steps a derived `[cluster].lease_renew_timeout_seconds` down, or refuses the config (the `lease_renew_timeout_seconds` row says how). At the limit the borrow raises `StoreAcquireTimeout`, an ordinary `Exception` the stage worker handles like any other transient store failure (the row stays claimable, the handoff re-runs idempotently) — and a connection the pool hands over after the borrower gave up is released back when the abandoned borrow ends holding it; the driver shapes where the cancel can strand it instead are listed in [`CONNECTIONS.md`](CONNECTIONS.md) ("Behaviour at the store-pool acquire limit"). 30 s sits far above a healthy wait; read p95/p99 from the `pool_status()` acquire-wait histogram before lowering it. No-op on SQLite. **The two backends reach this differently** — read the scope note in [`CONNECTIONS.md`](CONNECTIONS.md) ("Behaviour at the store-pool acquire limit") rather than assuming it is uniform. |
 | `warm_pool` | bool | `true` | server DBs — pre-open pooled connections in the background on graph start/promotion so a connection burst (the post-promotion delivery workers, or a cold start) finds them warm instead of paying cold connects (TCP+TLS+login). Best-effort, self-releasing, **no-op on SQLite**. On by default (it touches no commit/correctness seam); set `false` to opt out on a connection-constrained/licensed site. |
 | `warm_pool_timeout` | num (s) | 15 | server DBs — upper bound on the background warm-up; on expiry it logs and continues with a partially warm pool. Must be `> 0`. A **clustered** server-DB node also rejects an **explicit** value `>= [cluster].leader_fence_timeout_seconds` (a warm should finish within the leadership term that started it); the default (15 < the 20 fence) never trips this. |
 | `warm_pool_target` | int | — | server DBs — how many connections to pre-open. Unset (default) = a safe fraction of the pool (`min(pool_size-1, pool_size//2)`), so the warm never pins more than half the pool; an explicit value is clamped to `pool_size-1`. A pool of 1 is never warmed. At the default `pool_size = 40` this is `min(39, 20) = 20` pre-opened per server-DB engine at startup. |
@@ -849,7 +849,7 @@ document ([SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)).
 | `monitoring_read_rate_limit_per_actor` | int | 600 | max monitoring reads per user per window (`0` disables this dimension) |
 | `monitoring_read_rate_limit_global` | int | 0 | max monitoring reads across all users per window (`0` = off) |
 | `monitoring_read_rate_limit_window_seconds` | float | 60 | sliding-window length; must be above `0` |
-| `admin_write_rate_limit_enabled` | bool | `true` | per-actor anti-automation pacing on the **state-changing admin surface** (ASVS 2.4.2) — **NON-GET only**, charged from one per-actor bucket by `require_step_up`, `require_step_up_action` and `require_paced`. Charged on the `/ui` surface too, by `require_ui` -- the console reaches the handlers in-process, so it re-applies the floor rather than inheriting it ([BACKLOG #287](BACKLOG.md)) |
+| `admin_write_rate_limit_enabled` | bool | `true` | per-actor anti-automation pacing on the **state-changing admin surface** (ASVS 2.4.2) — **NON-GET only**, charged from one per-actor bucket by `require_step_up`, `require_step_up_action` and `require_paced`, plus the one read `GET /me/step-up`. Charged on the `/ui` surface too, by `require_ui` -- the console reaches the handlers in-process, so it re-applies the floor rather than inheriting it ([BACKLOG #287](BACKLOG.md)) |
 | `admin_write_rate_limit_per_actor` | int | 12 | max state-changing admin writes per actor per window (`0` disables this dimension; a negative value is refused at load); there is deliberately **no global arm** — one operator's bulk work must never throttle another's |
 | `admin_write_rate_limit_window_seconds` | float | 15.0 | sliding-window length, above 0. The default is a **provisional** human-timing floor ([BACKLOG #287](BACKLOG.md)). A script making more than 12 admin writes in 15 s is refused. Over budget → `429` + a `Retry-After` naming the caller's own wait, the same on the JSON API and the `/ui` console ([SECURITY.md](SECURITY.md), *The write floor's `Retry-After` is the actor's real wait*), refused before any further work |
 | `admin_write_min_interval_seconds` | float | 0.15 | the least time between two admin writes by one actor ([BACKLOG #2301](BACKLOG.md), ASVS 2.4.2). A write that lands sooner after the same actor's last admitted write is refused like an over-budget one, with the same `429`. The count above admits its budget back to back; this gap makes a burst wait. The default is a **provisional** human-timing floor from the keystroke-level model, derived in the comment on the setting. `0` turns the gap off. While `admin_write_rate_limit_enabled` is on, it must be shorter than `admin_write_rate_limit_window_seconds`, or the settings are refused at load |
@@ -1464,8 +1464,11 @@ that carries the request's id can instead be taken as the message's result; see 
 paragraph below.
 Each worker kill writes one `WARNING` naming the inbound, the phase and a cause token, and no message
 content, except a graph refusal, which writes none, and a shutdown, logged at `INFO`. The runner alerts
-on a graph refusal against the graph the engine serves; one against a graph a reload has replaced
-gets neither the alert nor the runner's line. The line says the worker was `killed`, or that it `exited` for a cause recorded
+on a graph refusal from the worker's session still serving, against a graph equal to the one the
+engine serves. A refusal overtaken by a reload or its rollback gets neither the alert nor the
+runner's line, even when the reload re-applies the same registry: the message runs again, and the
+rerun's refusal, if the cause stands, raises the alert (BACKLOG #6830; step 4 under the graph
+refusal below says when the message does not run again). The line says the worker was `killed`, or that it `exited` for a cause recorded
 only once the worker is seen gone (a crash, an exit during boot or right after it), which may still be
 a signal from outside the engine. The reap that ends a worker can write more lines, kill or not. On
 POSIX a `WARNING` naming the inbound and the pid says a worker that was already reaped could not have
@@ -1587,13 +1590,23 @@ other module bytes than the engine loaded:
    is re-pended, or dead-lettered once its attempts reach the retry cap, and the
    `connection_stopped` alert fires as well.
 4. Every later message on that inbound is refused the same way, without starting another worker,
-   until a reload changes the graph the engine serves. Those refusals raise no further alert and
-   log no further `WARNING` line of their own. Each other inbound's worker is compared when it
-   starts, and each one refused raises its own alert. A reload that does not clear the cause
-   raises the alert again. Nothing resolves it on its own, so resolve it in the alert list once
+   until a reload. Those refusals raise no further alert and log no further `WARNING` line of
+   their own. Any reload that applies, even one that leaves the graph the same, starts a fresh
+   worker for the next message, which is compared again. A reload refused before it swaps the
+   graph keeps the worker's session and its refusal, so later messages are still refused from it,
+   with no new comparison and no new alert. A refusal still in progress when a reload or its
+   rollback replaces the worker is neither alerted nor failed: the message is retried at once on a
+   fresh worker, or re-pended, and the refusal of the worker it next runs on, if the cause stands,
+   raises the alert. A re-pended message does not always run again: at least a row whose inbound
+   the reload removed never runs, and on a pooled lane repeated re-pends count as infrastructure
+   faults toward `infra_fault_stop_after`, which can stop the lane. The re-pend of an overtaken
+   refusal is logged at `INFO` with no traceback (BACKLOG #6830), though it still counts there;
+   other re-pends for a closed worker are logged at `ERROR`. Each other inbound's worker is compared when it starts,
+   and each one refused raises its own alert. A reload that does not clear the cause raises the
+   alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.
 
-Reload the config: the engine keeps that refusal until a reload changes the graph it serves. Other files in the config directory, such as
+Reload the config: the engine keeps that refusal until a reload applies. Other files in the config directory, such as
 `connections.toml` and the code-set tables, are not part of the digest: the worker uses the
 engine's code sets, and `connections.toml` changes the names, which are compared anyway.
 
@@ -1623,6 +1636,16 @@ depth **256**; each is a fail-closed rejection, not a truncation. The graph's co
 by the engine once per worker start, so a sandboxed `code_set(...)` always resolves to the value the
 engine itself is serving — an unreloaded edit to `codesets/` changes nothing until you reload, exactly
 as with `mode=off`.
+
+**XML signature verification does not run in a sandbox worker.** With `mode` set to `subprocess` or
+`isolated`, a Router, Handler or `accepts=` predicate that calls `verify()` from
+`messagefoundry.parsing.xml` gets at least a `SandboxError` once it reaches the `cryptography`
+import, which the worker's forbidden-import guard blocks; another error can come first, such as the
+`ValueError` for a call with no trust anchor. The import fails closed: left uncaught, the error
+fails that message's call as an isolation denial. `SandboxError` is a `RuntimeError`, so a Handler
+that catches `RuntimeError` catches it too. `mode="off"`, the default, is unaffected, and is the
+only setting that avoids it today. It is engine-wide: it gives up the process boundary for every Router and
+Handler, not only the one that verifies. The fix is tracked in vault BACKLOG #6812.
 
 **What this boundary does NOT cover.** It confines the *address space*, not the machine: a sandboxed
 Router/Handler can still import `os`/`subprocess`/`ctypes`, open files, and spawn processes as the
@@ -1668,7 +1691,7 @@ on a live feed; a Router that only reads is unaffected. Grep your config for `os
 |---|---|---|---|
 | `mode` | enum | `off` | `off` (in-process, byte-identical, no subprocess), `subprocess` (persistent per-inbound worker child), or `isolated` (the same worker, with `db_lookup`/`fhir_lookup` brokered through the engine; see *`mode="isolated"`* above). Any other value refuses to load. |
 | `wall_seconds` | float (>0) | 5.0 | **Authoritative** wall-clock cap per Router/Handler call on **every** platform — the parent kills a worker that overruns it, so a pathological busy-loop can't wedge intake. The worker sets no `RLIMIT_CPU`, so CPU that admin code spends outside a call, such as a thread left running or a grandchild that leaves the worker's process group, has no bound at all ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-07). |
-| `mem_mb` | int (≥1) or null | 512 | POSIX-only memory cap (MiB) inside the child (no-op on Windows). `null` disables it. **On Linux it is headroom above the loaded graph:** the worker measures its own `VmData` once it has loaded the graph, and sets `RLIMIT_DATA` to that plus `mem_mb`. So a graph bigger than `mem_mb` still starts, and address space a thread only reserves does not count. The worker also starts with `MALLOC_ARENA_MAX=2` unless you pass your own value through `pass_environment`, so threads cannot use up the headroom for the worker's whole life. On other POSIX systems it is an absolute `RLIMIT_AS` cap on the whole worker, and the worker logs a line saying so. A call that runs out of memory fails with an error naming the memory cap, which the `[delivery] internal_error` policy handles (`ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform halts), and its worker exits so the next message gets a fresh one ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-11). |
+| `mem_mb` | int (≥1) or null | 512 | POSIX-only memory cap (MiB) inside the child; Windows gets no memory cap. `null` disables it. **On Linux 4.7 or later it is headroom above the loaded graph**, where the worker reads the kernel's `major.minor` from its release and `/proc/self/status` gives a `VmData`: the worker measures its own `VmData` once it has loaded the graph, and sets `RLIMIT_DATA` to that plus `mem_mb`. So a graph bigger than `mem_mb` still starts, and address space a thread only reserves does not count. The worker also starts with `MALLOC_ARENA_MAX=2` unless you pass your own value through `pass_environment`, so threads cannot use up the headroom for the worker's whole life. In at least these cases it is an absolute `RLIMIT_AS` cap on the whole worker instead, and the worker logs a line saying so: a POSIX kernel whose `uname` does not name Linux, Linux before 4.7, a kernel release with no readable `major.minor`, and no `VmData`. If `setrlimit` fails, the worker logs it and sets no memory cap of its own; a limit it inherited still applies. A call that runs out of memory fails with an error naming the memory cap, which the `[delivery] internal_error` policy handles (`ERROR`/dead-letter under the default `continue`; under `stop` the inbound's routing or transform halts), and its worker exits so the next message gets a fresh one ([ADR 0087](adr/0087-sandbox-subprocess-isolation.md), amendment of 2026-10-11). |
 | `pass_environment` | list of names | `[]` | Extra environment variable **names** the worker is given, beyond its allowlist. Use it for a variable your config code reads. Names only; the value comes from the engine's own environment at worker start. **Refused at load**: at least an entry that is not a variable name, such as `NAME=value`; any of the engine's own names, which are any `MEFOR_*` name and `VAULT_TOKEN` and `PGPASSWORD`; and `PYTHONINSPECT`, which leaves a child waiting at a prompt. `messagefoundry/childenv.py` (`pass_environment_refusal`) holds the rule. Give a variable your config reads a name outside `MEFOR_`. Whatever you list is readable by every Router and Handler, so do not list a secret of your own either. Env: `MEFOR_SANDBOX_PASS_ENVIRONMENT`, comma-separated. |
 | `startup_seconds` | float (>0) | 30.0 | Bound on the one-time child bootstrap (config load + guard install) before start fails closed. |
 
@@ -2929,7 +2952,8 @@ secret. Each file in that directory holds one setting and is named exactly as it
   and one held in a directory that such an account owns or that a group or other may write
   without the sticky bit, since any account that may write it may replace what it holds. On
   Windows it also reads the folder that holds the directory, as [PHI.md](PHI.md)
-  section 2, *The folders above a key file*, states for a key file. It also
+  section 2, *The folders above a key file*, states for a key file, except where ADR 0214's
+  amendments say no such folder is read, such as at some drive roots. It also
   refuses a relative path, a file that is not a regular file, a file named for no setting above
   (an `env()` file name is letters, digits and underscores after the prefix), two `env()` files
   whose names differ only in case, an empty file, one that is not UTF-8, and one over 64 KiB. A
@@ -2968,9 +2992,9 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
 - **A container.** Mount a host directory read-only, as `docker/compose.yaml` shows for
   `/run/mefor/secrets`, and own it as the TLS directory there is owned: uid 10001, the directory
   `0700` and each file `0600`. The engine refuses a directory or file whose mode has a group or
-  other read or write bit, or that another account owns, and a bind mount keeps the host's modes
-  and owners, so a mode the runtime sets on a path it creates for you passes only when it has no
-  such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
+  other read or write bit, or that an account other than the engine's own or root owns, and a
+  bind mount keeps the host's modes and owners, so a mode the runtime sets on a path it creates
+  for you passes only when it has no such bit. A Kubernetes Secret volume serves each file as a link, so it is refused here.
 - **systemd credentials.** A unit can point the variable at its credentials directory with
   `Environment=MEFOR_SECRETS_DIRECTORY=%d` and one `LoadCredential=` per setting, the credential
   named as the variable. That is not measured here; Linux is not a supported v1 deployment target

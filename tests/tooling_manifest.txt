@@ -24,6 +24,7 @@
 # lands in neither this list nor its explicit stay-list.
 tests/test_adr0071_crossing_count.py
 tests/test_adr_0019_0173_revert_guard.py
+tests/test_adr_0019_status_names_every_amendment.py
 tests/test_adr_index_coverage.py
 tests/test_afk_decision_log.py
 tests/test_afk_digest.py
@@ -86,6 +87,7 @@ tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_coord_host_box_key.py
+tests/test_coord_owner_log_create_and_age.py
 tests/test_coord_owner_log_pipes.py
 tests/test_coord_root.py
 tests/test_coord_shared_root_claims.py

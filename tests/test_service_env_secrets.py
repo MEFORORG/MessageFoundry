@@ -822,15 +822,16 @@ def test_a_store_key_and_another_secret_in_the_nssm_list_name_both_remedies() ->
     assert "protect-key" in refusal and "MEFOR_SECRETS_DIRECTORY" in refusal
 
 
-def test_an_unreadable_list_does_not_refuse_on_another_secret_in_the_environment() -> None:
-    """The unobservable branch keeps the store key's rule only: it reads key-class names from
-    this process's environment and no other."""
+def test_an_unreadable_list_refuses_another_secret_in_the_environment() -> None:
+    """The unobservable branch reads the other secret-class names from this process's
+    environment too, and refuses them as it refuses a store key there (vault BACKLOG #2595, slice
+    B's other half; ``tests/test_b2595_service_env_secret_elsewhere.py`` covers the rest)."""
     probe = _Probe(ancestors=_UNDER_NSSM, services={100: "MessageFoundry"}, unreadable=True)
     posture = read_service_env_posture(
         probe=probe, environ={"MEFOR_STORE_PASSWORD": _PASSWORD_VALUE}
     )
-    assert service_env_refusal(posture) is None
-    assert _names(posture) == ["service_environment_unobservable"]
+    assert service_env_refusal(posture) is not None
+    assert _names(posture) == ["service_environment_unobservable", "secret_in_service_environment"]
 
 
 def test_the_old_named_not_refused_entry_is_gone_and_only_the_refusals_twin_names_it() -> None:

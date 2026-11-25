@@ -81,6 +81,8 @@ def _env(root: str | Path | None, **extra: str) -> dict[str, str]:
     env = dict(os.environ)
     env.pop("MEFOR_COORD_ROOT", None)
     env.pop("CLAUDE_CODE_SESSION_ID", None)
+    # An inherited Codex marker would refuse every -BumpEpoch here for the wrong reason.
+    env.pop("KORUS_AGENT", None)
     if root is not None:
         env["MEFOR_COORD_ROOT"] = str(root)
     env.update(extra)
@@ -617,3 +619,182 @@ def test_lane_level_reads_seats_from_the_shared_root(dispatcher_repo: Path, shar
 def test_lane_level_skips_with_a_note_when_the_root_is_down(dispatcher_repo: Path) -> None:
     text = _lane_level(dispatcher_repo, DEAD_UNC)
     assert text.startswith("[lane] SKIPPED: the coordination root did not resolve"), text
+
+
+# ------------------------------------------------------------- writer exit codes and the pool epoch
+
+
+# BACKLOG #7593: a CLI writer verb that writes nothing must exit non-zero; the hook path stays 0.
+@pytest.mark.parametrize(
+    ("verb", "expected"),
+    [
+        (("-Declare", "-Seat", "builder", "-Goal", "g"), 1),
+        (("-Close",), 1),
+        (("-BumpEpoch",), 1),
+        (("-Record",), 0),
+        (("-Prompt",), 0),
+    ],
+)
+def test_an_unresolved_worktree_fails_a_cli_verb_but_not_the_hook(
+    tmp_path: Path, shared: Path, verb: tuple[str, ...], expected: int
+) -> None:
+    not_a_repo = tmp_path / "plain"
+    not_a_repo.mkdir()
+    proc = _ps(
+        COORD / "seat.ps1",
+        not_a_repo,
+        *verb,
+        "-Worktree",
+        str(not_a_repo),
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-nowt"),
+    )
+    assert proc.returncode == expected, proc.stderr
+    if expected:
+        # Exit 1 from the rule-1 branch, not from some unrelated failure.
+        assert "could not resolve a rooted existing worktree" in proc.stderr, proc.stderr
+    assert not (shared / "seats").exists()
+
+
+def _bump(repo: Path, shared: Path) -> subprocess.CompletedProcess[str]:
+    return _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-BumpEpoch",
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-bump"),
+    )
+
+
+def test_bump_epoch_starts_an_absent_epoch_at_two_and_increments_an_existing_one(
+    repo: Path, shared: Path
+) -> None:
+    proc = _bump(repo, shared)
+    assert proc.returncode == 0, proc.stderr
+    epoch = shared / "seats" / ".pool-epoch"
+    assert epoch.read_text(encoding="utf-8-sig").strip() == "2"
+    epoch.write_text("41", encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 0, proc.stderr
+    assert epoch.read_text(encoding="utf-8-sig").strip() == "42"
+    assert "pool epoch is now 42" in proc.stdout
+    # The mutex and the temp file are gone afterwards.
+    assert sorted(p.name for p in (shared / "seats").glob(".pool-epoch*")) == [".pool-epoch"]
+
+
+# BACKLOG #7594, reached through the top-level catch, which must exit non-zero for a CLI verb
+# (BACKLOG #7593).
+@pytest.mark.parametrize("content", ["not-a-number", ""])
+def test_bump_epoch_refuses_an_unreadable_epoch_rather_than_resetting_it(
+    repo: Path, shared: Path, content: str
+) -> None:
+    epoch = shared / "seats" / ".pool-epoch"
+    epoch.parent.mkdir(parents=True)
+    epoch.write_text(content, encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 1, proc.stdout
+    assert "could not be read, so it was not bumped" in proc.stderr
+    assert "holds no whole number" in proc.stderr
+    assert epoch.read_text(encoding="utf-8") == content
+    assert not (shared / "seats" / ".pool-epoch.lock").exists()
+
+
+def test_the_record_hook_keeps_the_epoch_fallback_for_an_unreadable_file(
+    repo: Path, shared: Path
+) -> None:
+    epoch = shared / "seats" / ".pool-epoch"
+    epoch.parent.mkdir(parents=True)
+    epoch.write_text("not-a-number", encoding="utf-8")
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-Record",
+        "-Worktree",
+        top,
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-rec-epoch"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    recs = list((shared / "seats").rglob("sess-rec-epoch.json"))
+    assert len(recs) == 1, proc.stdout + proc.stderr
+    assert json.loads(recs[0].read_text(encoding="utf-8-sig"))["poolEpoch"] == 1
+
+
+def test_bump_epoch_is_refused_for_a_codex_session(repo: Path, shared: Path) -> None:
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-BumpEpoch",
+        env=_env(shared, KORUS_AGENT="codex", KORUS_SESSION_ID="cx-1"),
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert "REFUSED for a Codex session" in proc.stderr
+    # Nothing was read or written: the refusal comes before any registry directory is made.
+    assert not (shared / "seats").exists() and not (_local(repo) / "codex-seats").exists()
+
+
+def test_writer_errors_take_a_bracketed_root_and_the_record_host(
+    repo: Path, tmp_path: Path
+) -> None:
+    # '[1]' is a wildcard to Add-Content -Path, which then writes nothing (BACKLOG #7593). A file where
+    # the .writer-alive directory belongs makes the heartbeat fail, which must stay non-fatal.
+    shared = tmp_path / "sh[1]" / "mefor-coord"
+    seats = shared / "seats"
+    seats.mkdir(parents=True)
+    (seats / ".writer-alive").write_text("not a directory", encoding="utf-8")
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    proc = _ps(
+        COORD / "seat.ps1",
+        repo,
+        "-Record",
+        "-Worktree",
+        top,
+        env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-brk", COMPUTERNAME="ENV-SAYS-OTHER"),
+    )
+    assert proc.returncode == 0, proc.stderr
+    errors = seats / ".writer-errors.txt"
+    assert errors.is_file(), proc.stderr
+    lines = [
+        ln for ln in errors.read_text(encoding="utf-8-sig").splitlines() if "writer-alive" in ln
+    ]
+    assert lines, errors.read_text(encoding="utf-8-sig")
+    host = lines[0].split("\t")[1]
+    # The same name the record carries, not the planted environment variable.
+    recs = list(seats.rglob("sess-brk.json"))
+    assert len(recs) == 1, proc.stderr
+    assert host == json.loads(recs[0].read_text(encoding="utf-8-sig"))["host"] != "ENV-SAYS-OTHER"
+
+
+def test_a_read_only_heartbeat_is_replaced_and_no_temp_is_left(repo: Path, shared: Path) -> None:
+    # Pins the temp-then-rename write through its -ReplaceReadOnly rename: an in-place Set-Content
+    # fails on a read-only file. It does not observe atomicity itself.
+    top = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel")
+    alive = shared / "seats" / ".writer-alive"
+    for run in range(2):
+        proc = _ps(
+            COORD / "seat.ps1",
+            repo,
+            "-Record",
+            "-Worktree",
+            top,
+            env=_env(shared, CLAUDE_CODE_SESSION_ID="sess-alive"),
+        )
+        assert proc.returncode == 0, proc.stderr
+        beats = list(alive.iterdir())
+        assert len(beats) == 1 and beats[0].suffix == ".txt", beats
+        assert time.strptime(beats[0].read_text(encoding="utf-8-sig").strip(), "%Y-%m-%dT%H:%M:%SZ")
+        if run == 0:
+            os.chmod(beats[0], 0o444)
+    assert not (shared / "seats" / ".writer-errors.txt").exists()
+
+
+def test_bump_epoch_waits_on_a_held_mutex_and_never_steals_it(repo: Path, shared: Path) -> None:
+    seats = shared / "seats"
+    seats.mkdir(parents=True)
+    (seats / ".pool-epoch").write_text("7", encoding="utf-8")
+    lock = seats / ".pool-epoch.lock"
+    lock.write_text("pid=1 host=elsewhere", encoding="utf-8")
+    proc = _bump(repo, shared)
+    assert proc.returncode == 1, proc.stdout
+    assert "timed out" in proc.stderr and "Not stealing it" in proc.stderr
+    assert "held by: pid=1 host=elsewhere" in proc.stderr
+    assert (seats / ".pool-epoch").read_text(encoding="utf-8") == "7"
+    assert lock.read_text(encoding="utf-8") == "pid=1 host=elsewhere"

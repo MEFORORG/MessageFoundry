@@ -221,6 +221,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
+        # NOT engine source, and it does NOT meet the criterion above: it reads docs/PHI.md
+        # off disk, and a docs/ edit sets `tooling=true`. It stays because ci.yml's merge_group
+        # arm pins `tooling=false`, so as tooling it would run in no queue entry. On a docs-only
+        # pull request it runs only once ci.yml's DOC_GUARDS list names it.
+        "test_phi_reencrypt_on_write_doc.py",
         # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
         # test trees' log quiesce: it reads tests/conftest.py's ``_Baseline`` as pytest loaded it
@@ -273,6 +278,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
+        # NOT engine source, and it does NOT meet the criterion above: it reads docs/SECURITY.md
+        # off disk, and a docs/ edit sets `tooling=true`. It stays because ci.yml's merge_group
+        # arm pins `tooling=false`, so as tooling it would run in no queue entry. On a docs-only
+        # pull request it runs only once ci.yml's DOC_GUARDS list names it.
+        "test_security_events_feed_doc_once.py",
         # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, but it meets the
         # criterion above, as test_conftest_name_collision_guard.py does. Its subject is the
         # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and

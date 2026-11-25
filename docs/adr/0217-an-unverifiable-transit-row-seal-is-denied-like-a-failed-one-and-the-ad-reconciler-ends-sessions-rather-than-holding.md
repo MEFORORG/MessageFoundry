@@ -902,10 +902,13 @@ it supersedes, and only where it disagrees; the earlier text is kept as it was.
   account's row still raises out of `_load_users`, and so out of the pass. At least two later
   reads still raise on an Unverifiable row: `_load_user`, in the re-read of each account its probe
   found present and in `_apply_reconcile_revocation`, and `_load_user_by_username` in the rename
-  step. The rename step runs after the revocations are applied, so a raise there ends a pass that
-  has already ended sessions, before the rest of its renames and its bookkeeping and alerts run.
+  step. The rename step runs after the revocations are applied, so a raise there ended a pass that
+  had already ended sessions, before the rest of its renames and its bookkeeping and alerts ran.
   The rename step's read and the dropped account's lost state are named here for filing on vault
-  #8202.
+  #8202. (Amended 2026-11-22, vault BACKLOG #3069 item 1: the rename step's reads still raise, and
+  the reconcile loop now catches the answer. An Unverifiable one skips that rename, logged at
+  ERROR. An Outage is paged once and stops the renames. Either way the pass returns its plan, so
+  its bookkeeping and alerts run.)
 - **The held `refused()` log.** `RevokeSealOutcome.refused` no longer logs at refusal time, inside
   the writer transaction. Its line is held and written once the outcome is known, with the
   committed or the failed wording, as the skipped-raise count is, which is logged after a commit

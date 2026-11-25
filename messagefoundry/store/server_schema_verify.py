@@ -50,8 +50,12 @@ method, a key column or expression carrying a collation, an operator class or a 
 that opens with a ``::`` or ``CAST`` cast of a column, a key built ``USING INDEX``, a SQL Server
 inline ``INDEX``, a ``NOT NULL`` table constraint, a column type or clause it does not know, a SQL
 Server column that leaves its nullability to the session, ``COLLATE CATALOG_DEFAULT``, and a ``--``
-or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text. A unit test
-reads each shipped batch, so a new form fails there before it reaches an open.
+or ``/*`` inside a quoted string, which may be dynamic SQL's comment or a literal's text, any
+``/*`` inside a block comment the reader finds, even a balanced one, since both servers nest them,
+and a line comment it finds holding a NUL, or a CR or other line break that is not part of a run
+of CRs reaching the LF that closes the comment or the end of the comment's entry in the batch.
+(the misreads below name where it finds none) A unit test reads each shipped batch, so a new form
+fails there before it reaches an open.
 
 An ``ALTER COLUMN`` or added ``PRIMARY KEY`` that opens its entry in the batch, with nothing
 before it, is read as reaching every store, and one with anything before it, even a statement a
@@ -66,8 +70,16 @@ procedure's body runs only when it is called; DDL an ``EXEC ... AT`` runs on a l
 after a ``USE`` in another database, is read as this store's; a literal joined to more text by
 anything other than a ``+`` or ``||`` right after its closing quote is read whole; a literal a
 variable holds is read as run by an ``EXEC`` of that variable whatever the text between them does
-to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; and a
-``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
+to it, other than a ``SET @v``, ``SELECT @v`` or compound assignment written that way; the comment
+reader ends a ``[`` at its first ``]`` on both servers, so after a SQL Server ``]]`` escape a
+``--``, or a ``/*`` that a later ``*/`` closes, is read as a comment and hides the DDL after it,
+and a ``"`` or ``'`` there opens a quote the server does not see, which raises as unterminated
+unless a second unpaired quote of the same kind follows, and given one, a ``"`` can hide a real
+comment, so DDL the server skips is read as run, and a ``'``, which hides no comment, since a
+marker inside one raises, can pair the ``'`` of a later real literal as its close, so a ``--``
+inside that literal is read as a comment and hides the DDL after it, and on PostgreSQL a comment
+inside an ``ARRAY[...]`` or subscript is read as part of a name and the DDL it comments out as
+run; and a ``DROP COLUMN`` raises where the reader finds the column's name among the words of an expression,
 ``INCLUDE`` or partial index on its table, other than as a key column, but that word search can miss
 a name, so a ``DROP COLUMN`` that should raise may instead keep an index PostgreSQL drops.
 
@@ -229,6 +241,12 @@ _DATA_STATEMENT = frozenset({"insert", "update", "delete", "merge", "select", "t
 _DDL_OBJECT = re.compile(
     r"\s+(?:TABLE|INDEX|VIEW|PROC|PROCEDURE|TRIGGER|FUNCTION|SEQUENCE|SCHEMA|TYPE|DATABASE)\b", re.I
 )
+#: Characters that raise inside a ``--`` comment the reader finds, except CRs in a run that
+#: reaches the LF closing the comment or the end of the entry: the reader ends a comment at LF
+#: alone, and a server may end it sooner. PostgreSQL ends one at CR as well, and SQL Server's
+#: reading of a CR is not relied on; the rest are refused for the same reason ``transports/database.py`` refuses them.
+#: They are refused only inside a ``--`` comment, not elsewhere in the batch.
+_OTHER_LINE_BREAKS: Final = frozenset("\x00\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 _TOKEN = re.compile(r"""N?'(?:[^']|'')*'|"[^"]*"|\[[^\]]*\]|\w+|\S""")
 
 
@@ -301,22 +319,46 @@ def _strip_comments(raw: str) -> str:
     """``raw`` with its ``--`` and ``/* */`` comments blanked, read left to right so a quote inside a
     comment opens nothing and a comment marker inside a quoted name is not one. A marker inside a
     string literal raises: in an ``EXEC`` string it is dynamic SQL's comment, in any other a
-    literal's text, and the reader cannot tell which."""
+    literal's text, and the reader cannot tell which. Any ``/*`` inside a block comment the reader
+    finds raises, even a balanced one, because both servers nest them and the first ``*/`` would
+    not end it (BACKLOG #5062 item 26). A line comment the reader finds that holds a NUL or a line
+    break other than LF raises, because a server may end the comment there and run what follows:
+    PostgreSQL ends one at a CR, and the reader does not rely on SQL Server reading a CR otherwise.
+    CRs that run up to the LF ending it, or to the end of ``raw``, are allowed: nothing follows
+    them on the line for a server to run. The reader finds no comment inside a ``[...]``, which it
+    ends at its first ``]`` on both servers, so on PostgreSQL a comment inside an ``ARRAY[...]`` or
+    subscript is neither refused nor blanked, and a ``]]`` misread can hide one, as the module
+    docstring says."""
     out: list[str] = []
     i, n = 0, len(raw)
     while i < n:
         ch = raw[i]
         if raw.startswith("--", i):
             end = raw.find("\n", i)
-            i = n if end < 0 else end
+            end = n if end < 0 else end
+            body = raw[i:end].rstrip("\r")
+            if not _OTHER_LINE_BREAKS.isdisjoint(body):
+                bad = next(c for c in body if c in _OTHER_LINE_BREAKS)
+                raise ValueError(
+                    f"a DDL line comment holds {bad!r}, a NUL or a line break other than LF:"
+                    f" {raw[i:end][:60]!r}"
+                )
+            i = end
             out.append(" ")
         elif raw.startswith("/*", i):
             end = raw.find("*/", i + 2)
             if end < 0:
                 raise ValueError(f"unterminated comment in DDL near {raw[i : i + 40]!r}")
+            # Through the closer's star, so a ``/*/`` inside counts as the opener a server reads.
+            if (inner := raw.find("/*", i + 2, end + 1)) >= 0:
+                near = raw[max(i, inner - 20) : inner + 40]
+                raise ValueError(f"a nested block comment in DDL near {near!r}")
             i = end + 2
             out.append(" ")
         elif ch in "'\"[":
+            # Not _quoted_end: its subscript reading of a ``[`` after a word let ``AS[x--y]``
+            # hide the DDL after it (review of BACKLOG #5062 item 26), so a ``[`` here ends at
+            # its first ``]``, which leaves the ``]]`` misread the module docstring names.
             close = "]" if ch == "[" else ch
             end = raw.find(close, i + 1)
             if end < 0:

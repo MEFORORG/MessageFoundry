@@ -1995,6 +1995,16 @@ blocked.
 > is the thing that was missing when ten sessions were stranded and the rule was first designed. Ship the
 > cure, then decide whether you still want the prohibition.
 
+**The gate's write rule (rule 1) keys on the write's resolved target path, not on where the session
+sits.** A relative path is resolved against the session's cwd first, so for a relative path the cwd
+does decide the verdict; give the absolute path into your worktree. Not every rule is path-keyed: rule 2 keys on the cwd.
+In the 30-day window measured above, **29% of the writes made by those same 166 primary-seated
+sessions landed inside a sibling worktree by absolute path** — already correct. A cwd-keyed write rule
+would have denied every one of them. So for writes, a session may stay where it is and write into its
+worktree by absolute path, with no need to `cd`, relocate, or restart. A fan-out is different: rule 2
+denies a dispatch made while the session's cwd is the primary. Whether the session must then be
+started in a worktree depends on rule 3, as the blockquote above says.
+
 ### Recovering a relocated session — `sessions.ps1`
 
 If a session was relocated into a worktree before rule 3 existed (or by a plain terminal, which the gate
@@ -2015,10 +2025,14 @@ pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Rehome <prefix>          # 
 it never moves anything — and `-Rehome` refuses on a session that still looks live (written within
 `-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
-**It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
-the writes made by those same 166 primary-seated sessions landed inside a sibling worktree by absolute
-path** — already correct. A cwd-keyed gate would have denied every one of them. So a session may stay
-where it is and simply write into its worktree; there is no need to `cd`, relocate, or restart.
+It also refuses at least these cases (BACKLOG #7622, #7623). A session registry file that does not
+parse and was written in the last 24h, has vanished, or carries a future stamp: it may be this session's
+own record mid-write. `-Force` overrides this one. A file at the destination that is not a title stub,
+meaning not only `custom-title`/`ai-title` records: it may be a real transcript, and `-Force` does not
+override it. Where a title stub is at the destination, an existing `<id>.jsonl.stub.bak`, which is
+never overwritten; with no stub there, a stale backup does not refuse. If a sidecar dir already
+exists at the destination, the transcript still moves, the source sidecar stays where it is, and a
+warning names it.
 
 Already dirty in the primary when the gate stops you? Don't redo the work — move it:
 
