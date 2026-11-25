@@ -133,7 +133,7 @@ function Get-SkillInstructionSource {
     # Only a checkout of this repository may name the seat: another repository's marker, or its
     # roster with no Special alias, would hand a Special seat the instruction. Such a cwd, or one
     # whose common dir (or this script's) cannot be read, is read as undeclared instead: its marker
-    # and roster are skipped, $env:KORUS_SEAT is read against this script's own roster, and an
+    # (unless it vetoes as `special`, below) and roster are skipped, $env:KORUS_SEAT is read against this script's own roster, and an
     # undeclared seat gets the instruction with its Special-skips sentence. Refusing would cost a
     # non-Special seat whose shell sits in another checkout its reload after a compaction. Compared
     # through links as well as by text, because the script's path and a worktree's gitdir line may
@@ -143,6 +143,11 @@ function Get-SkillInstructionSource {
     $ours = $own -and $theirs -and ((Test-CcxSamePath $own $theirs) -or
         (Test-CcxSamePath (ConvertTo-CcxRealPath $own) (ConvertTo-CcxRealPath $theirs)))
     if (-not $ours) {
+        # A marker that cannot NAME the seat may still VETO the instruction: `special` in the cwd's
+        # checkout, of whatever repository or with an unreadable common dir, prints nothing, as it
+        # did before the repository check. Only the instruction is fail-closed this way.
+        $foreign = Join-Path $root '.claude/seat.local.txt'
+        if ((Test-Path -LiteralPath $foreign) -and ((Get-Content -LiteralPath $foreign -Raw -ErrorAction Stop).Trim().ToLowerInvariant() -eq 'special')) { return $null }
         [Console]::Error.WriteLine("afk-kill.ps1: the hook input's cwd $($p.Cwd) is in $root, which is not shown to be a checkout of this repository, so its seat marker is not read")
         $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     }

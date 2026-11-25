@@ -334,7 +334,7 @@ def _undeclared(proc: subprocess.CompletedProcess[str]) -> None:
 
 # Each undeclared case below sets this repository's own marker to Special too, so reading either
 # marker instead of resolving as undeclared would print nothing and fail the test.
-@pytest.mark.parametrize("seat", ["special", "adhoc", "builder"])
+@pytest.mark.parametrize("seat", ["adhoc", "builder"])
 def test_a_foreign_marker_does_not_decide_the_seat(sb: Sandbox, seat: str) -> None:
     # BACKLOG #7559. A cwd in another repository's checkout must not let that checkout's marker, or
     # its roster missing the Special alias, name the seat: either way it reads as undeclared.
@@ -353,14 +353,34 @@ def test_a_foreign_cwd_reads_korus_seat_against_our_roster(sb: Sandbox, seat: st
 
 def test_a_foreign_cwd_with_a_non_special_korus_seat_gets_the_instruction(sb: Sandbox) -> None:
     # The negative control for the test above.
-    foreign = _foreign_repo(sb, "special")
+    foreign = _foreign_repo(sb, "builder")
     _undeclared(_seat_run(sb, "off", None, cwd=foreign / "src", KORUS_SEAT="builder"))
 
 
 def test_a_linked_worktree_of_another_repository_reads_as_undeclared(sb: Sandbox) -> None:
     wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "special"))
-    _mark(wt, "special")
+    _mark(wt, "builder")
     _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+def _veto(proc: subprocess.CompletedProcess[str]) -> None:
+    """No instruction and no fault: a `special` marker the seat check cannot trust still vetoes."""
+    assert proc.stdout == "", (proc.stdout, proc.stderr)
+    assert "no skill instruction" not in proc.stderr, proc.stderr
+
+
+# A marker outside this repository cannot NAME the seat, but `special` in it still VETOES the
+# instruction, as it did before the repository check. Each case leaves KORUS_SEAT empty and this
+# repository's own marker on a non-Special seat, so only the cwd's marker can silence the hook.
+def test_a_foreign_special_marker_vetoes_the_instruction(sb: Sandbox) -> None:
+    foreign = _foreign_repo(sb, "special")
+    _veto(_seat_run(sb, "off", "builder", cwd=foreign / "src"))
+
+
+def test_a_foreign_linked_worktree_special_marker_vetoes_the_instruction(sb: Sandbox) -> None:
+    wt = _linked_worktree(sb, "fwt", repo=_foreign_repo(sb, "builder"))
+    _mark(wt, " Special\n")
+    _veto(_seat_run(sb, "off", "builder", cwd=wt))
 
 
 def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> None:
@@ -370,8 +390,19 @@ def test_a_worktree_whose_git_dir_is_gone_reads_as_undeclared(sb: Sandbox) -> No
     (wt / ".git").write_text(
         f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
     )
-    _mark(wt, "special")
+    _mark(wt, "builder")
     _undeclared(_seat_run(sb, "off", "special", cwd=wt))
+
+
+def test_a_special_marker_where_the_git_dir_is_gone_vetoes_the_instruction(sb: Sandbox) -> None:
+    # Its common dir cannot be read, so the marker cannot name the seat, but it can still veto.
+    wt = sb.repo.parent / "orphan"
+    wt.mkdir()
+    (wt / ".git").write_text(
+        f"gitdir: {sb.repo / '.git' / 'worktrees' / 'gone'}\n", encoding="utf-8"
+    )
+    _mark(wt, "special")
+    _veto(_seat_run(sb, "off", "builder", cwd=wt))
 
 
 def _dir_link(link: Path, target: Path) -> None:
@@ -421,7 +452,14 @@ def test_a_worktree_of_this_repository_spelled_through_a_link_names_its_seat(
 def test_an_unreadable_own_checkout_reads_as_undeclared(sb: Sandbox) -> None:
     # The script's own common dir cannot be read, so no cwd can be shown to be this repository's.
     (sb.repo / ".git" / "HEAD").unlink()
-    _undeclared(_seat_run(sb, "off", "special"))
+    _undeclared(_seat_run(sb, "off", "builder"))
+
+
+def test_a_special_marker_in_an_unreadable_own_checkout_vetoes_the_instruction(
+    sb: Sandbox,
+) -> None:
+    (sb.repo / ".git" / "HEAD").unlink()
+    _veto(_seat_run(sb, "off", "special"))
 
 
 @pytest.mark.parametrize("stdin", ["", "not json", "{}", "MISSING"])
