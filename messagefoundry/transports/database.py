@@ -123,6 +123,7 @@ from messagefoundry.odbc_call_gate import (
 )
 from messagefoundry.odbc_dsn import odbc_brace, odbc_connection_string
 from messagefoundry.odbc_env import disable_driver_manager_pooling
+from messagefoundry.path_reach import UNREACHABLE_WINERRORS
 from messagefoundry.redaction import (
     UNDER_A_DRIVER_ERROR,
     args_hold_a_message,
@@ -135,6 +136,7 @@ from messagefoundry.redaction import (
     sqlite_errorname_of,
     sqlstate_text,
 )
+from messagefoundry.restricted_file import WINERROR_ACCESS_DENIED
 from messagefoundry.sqlserver_roles import (
     SQLSERVER_FIXED_DATABASE_ROLES,
     SQLSERVER_FIXED_SERVER_ROLES,
@@ -1019,7 +1021,7 @@ def _windows_path_verdict(
             kind, target = probe(part)
         except (FileNotFoundError, NotADirectoryError) as exc:
             winerror = getattr(exc, "winerror", None)
-            if winerror in _WINDOWS_UNREACHABLE:
+            if winerror in UNREACHABLE_WINERRORS:
                 raise _LeavesHost("the path is on a share Windows could not reach") from None
             if isinstance(exc, NotADirectoryError) or winerror in _MISSING_WINERRORS:
                 raise _PathEnds from None
@@ -1229,9 +1231,15 @@ def _refuse_remote_paths(
 #: check alike (:func:`driver_file_rule`). Neither names a path.
 #: Kept short: a stored failure keeps about the first 200 characters, and the build's prefix and
 #: the connection name come first.
+#: Off Windows only the spelling is checked (:data:`_WALKS_BEYOND_SPELLING`), so the rule names
+#: what that refuses, a path that starts with two separators or a device prefix
+#: (:func:`~messagefoundry.transports.db_endpoint.is_remote_spelling`), and no network drive
+#: (vault BACKLOG #8153, item 25).
 REMOTE_PATH_RULE = (
     "must be a plain local path on this host: not a share, a network drive, a link to one, or a "
-    "path it cannot read"
+    "path the check cannot read"
+    if sys.platform == "win32"
+    else "must be a plain local path on this host: not a network path or a device path"
 )
 #: The entry rule covers a folder that cannot be listed or is past the entry cap too, so it points
 #: at the WARNING, which names the cause's kind.
@@ -1305,7 +1313,7 @@ def _capath_folder_clear(folder: str) -> bool:
             listing = os.scandir(folder)
         except (FileNotFoundError, NotADirectoryError) as exc:
             winerror = getattr(exc, "winerror", None)
-            if winerror in _WINDOWS_UNREACHABLE:
+            if winerror in UNREACHABLE_WINERRORS:
                 # A share Windows could not reach, which CPython raises as not found, read as the
                 # walk's own probe reads it (_windows_path_verdict): the folder leads off the host.
                 _not_cleared("an sslcapath folder is on a share Windows could not reach", exc)
@@ -1458,9 +1466,6 @@ _MAX_DRIVER_CA_FILE_BYTES = 1 << 20
 #: ``ERROR_INVALID_NAME``: Windows' answer for a path it cannot spell, such as one with a leading
 #: space before the drive letter.
 _WINDOWS_INVALID_NAME = 123
-#: ``ERROR_BAD_NETPATH`` and ``ERROR_BAD_NET_NAME``: a share Windows could not reach, which
-#: CPython raises as ``FileNotFoundError`` though a file may be there.
-_WINDOWS_UNREACHABLE = frozenset({53, 67})
 #: The not-found answers that mean no file or folder is there: 2 ``ERROR_FILE_NOT_FOUND`` and 3
 #: ``ERROR_PATH_NOT_FOUND``, and ``None``, a ``FileNotFoundError`` with no ``winerror``, as ENOENT
 #: is off Windows. Read at an ``sslcapath`` folder's open (:func:`_capath_folder_clear`), by the
@@ -1473,15 +1478,12 @@ _WINDOWS_UNREACHABLE = frozenset({53, 67})
 #: missing file, a missing folder, a path through a file, a drive letter with no volume, a missing
 #: volume GUID and a missing ``\\?\GLOBALROOT`` device.
 _MISSING_WINERRORS = frozenset({None, 2, 3})
-#: The ``stat`` failures of libpq's root certificate that leave it to libpq, by ``errno`` off
-#: Windows: no file is there, or libpq, running as the same identity, cannot ``stat`` it either and
-#: so loads nothing. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
-#: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM: both raise ``PermissionError``,
-#: which :func:`_libpq_cannot_stat_either` leaves off Windows, since libpq, as the same identity,
-#: is denied too; a denial on a Kerberos network mount can still clear once a ticket renews.
-#: Every other failure, at least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and ENOTCONN on a network
-#: mount, takes the read's handling, which refuses it: libpq stats again at every connect, and may
-#: then load a file the build never checked.
+#: The ``errno`` values of a failed ``stat`` that :func:`_libpq_cannot_stat_either` leaves to
+#: libpq off Windows. ENOENT and ENOTDIR: no such file. ENAMETOOLONG: a name the filesystem cannot
+#: hold. ELOOP: a link loop no ``stat`` resolves. EACCES and EPERM, which raise
+#: ``PermissionError``: libpq, as the same identity, is denied too, though a denial on a Kerberos
+#: network mount can clear once a ticket renews. At least EIO, ETIMEDOUT, ESTALE, EHOSTDOWN and
+#: ENOTCONN on a network mount are not in it.
 _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
     {errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP, errno.EACCES, errno.EPERM}
 )
@@ -1493,8 +1495,8 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: ``ERROR_FILENAME_EXCED_RANGE`` (ENOENT, the ENAMETOOLONG case); 1921
 #: ``ERROR_CANT_RESOLVE_FILENAME`` (EINVAL, the ELOOP case); and 5 ``ERROR_ACCESS_DENIED``
 #: (EACCES), the only Windows ``PermissionError`` left. A network fault Windows reports as one of
-#: these codes is left too, and may clear before a later connect. Every other code takes the read's
-#: handling, which refuses at least 53 and 67 (:data:`_WINDOWS_UNREACHABLE`), 59
+#: these codes is left too, and may clear before a later connect. Codes not in it include at
+#: least 53 and 67 (:data:`~messagefoundry.path_reach.UNREACHABLE_WINERRORS`), 59
 #: ``ERROR_UNEXP_NET_ERR``, 64 ``ERROR_NETNAME_DELETED``, 121 ``ERROR_SEM_TIMEOUT`` and 1231
 #: ``ERROR_NETWORK_UNREACHABLE``, all EINVAL but 53 and 67, and the ``PermissionError`` faults
 #: 21 ``ERROR_NOT_READY``, 23 ``ERROR_CRC``, 31 ``ERROR_GEN_FAILURE``, 32
@@ -1502,10 +1504,15 @@ _LIBPQ_STAT_LEFT_ERRNOS = frozenset(
 #: on a directory too. This set judges the file's own ``stat``. Before it, the
 #: :func:`names_another_host` walk has refused at least a code other than a missing name met on a
 #: folder in the path, 5, 123 and 1921 among them, so on a folder those are refused, not left.
-#: The walk's probe also reads the file's own name, and refuses there a not-found code other than
-#: 2 and 3 (:data:`_MISSING_WINERRORS`, vault BACKLOG #5197), so 15, 161 and 206 are left here only
-#: when the ``stat`` meets one the walk's probe did not.
-_LIBPQ_STAT_LEFT_WINERRORS = frozenset({2, 3, 5, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921})
+#: The walk's probe also reads the file's own name, and refuses there a code other than 2 and 3
+#: (:data:`_MISSING_WINERRORS`, vault BACKLOG #5197), so the others are met at the ``stat`` only
+#: where the walk's refusal did not cover them. At least two such cases are reachable (vault
+#: BACKLOG #8153, item 7): 123 for a ``PGSSLROOTCERT`` with a leading space, whose padded
+#: spelling alone the walk stopped on, which :func:`names_another_host` does not refuse (measured
+#: on Windows 11 with CPython 3.14), and any of them for a path changed after the walk.
+_LIBPQ_STAT_LEFT_WINERRORS = frozenset(
+    {2, 3, WINERROR_ACCESS_DENIED, 15, _WINDOWS_INVALID_NAME, 161, 206, 267, 1921}
+)
 
 
 #: What a CA file's read checks it for, as its refusals word it.
@@ -1570,6 +1577,17 @@ def _refuse_ca_content(setting: str, data: bytes, *, refusing: str) -> None:
 
 #: libpq's root certificate file name under its home directory (``ROOT_CERT_FILE`` in libpq).
 _LIBPQ_ROOT_CERT = "root.crt"
+#: Who may write the folder of a copy libpq loads as its root certificate, as a refusal's remedy
+#: names it: the copy is a trust anchor no ACL check covers (vault BACKLOG #8153, item 25).
+_LIBPQ_COPY_FOLDER = (
+    "a local folder only administrators and the service account can write"
+    if sys.platform == "win32"
+    else "a local folder only root and the service account can write"
+)
+#: The remedy every libpq root-certificate refusal opens with, right after its setting, so a
+#: stored failure, which keeps about the first 200 characters (``redaction.safe_exc``), keeps it
+#: for a connection name of ordinary length (vault BACKLOG #8153, items 6, 24 and 31).
+_LIBPQ_REMEDY = f"set PGSSLROOTCERT to a copy in {_LIBPQ_COPY_FOLDER}"
 
 
 def _libpq_root_certs() -> list[tuple[str, str]]:
@@ -1680,15 +1698,7 @@ def _windows_roaming_appdata() -> str | None:
     except ImportError as exc:
         raise OSError("ctypes could not be loaded to ask for SHGetFolderPathA") from exc
     try:
-        get_folder = ctypes.WinDLL("shell32").SHGetFolderPathA
-        get_folder.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_uint32,
-            ctypes.c_char_p,
-        ]
-        get_folder.restype = ctypes.c_long
+        get_folder = _shell_get_folder_path_a()
         buf = ctypes.create_string_buffer(260)  # MAX_PATH, the size the call is documented to take
         failed = get_folder(None, _CSIDL_APPDATA, None, 0, buf) != 0
     except (OSError, AttributeError, ctypes.ArgumentError) as exc:
@@ -1704,6 +1714,27 @@ def _windows_roaming_appdata() -> str | None:
     raise OSError("SHGetFolderPathA gave a folder its code page does not decode")
 
 
+@cache
+def _shell_get_folder_path_a() -> Callable[..., int]:
+    """``SHGetFolderPathA`` from ``shell32``, typed once rather than loaded at every build (vault
+    BACKLOG #8153, item 19), as :func:`_get_drive_type` keeps ``GetDriveTypeW``. A load that
+    raises is not kept, so the next build tries again. Windows only."""
+    if sys.platform != "win32":  # pragma: no cover - guard for the type checker on POSIX
+        raise OSError("SHGetFolderPathA exists only on Windows")
+    import ctypes
+
+    get_folder = ctypes.WinDLL("shell32").SHGetFolderPathA
+    get_folder.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_char_p,
+    ]
+    get_folder.restype = ctypes.c_long
+    return cast("Callable[..., int]", get_folder)
+
+
 def _refuse_encrypted_libpq_root_cert(
     named: Mapping[str, Any], *, family: str, connection: str | None = None
 ) -> None:
@@ -1712,8 +1743,8 @@ def _refuse_encrypted_libpq_root_cert(
     refuses an ``sslca``.
 
     psqlODBC hands libpq no ``sslrootcert``, since the generic dialect refuses that keyword and
-    ``pqopt``, so libpq takes a file :func:`_libpq_root_certs` names, each of which is judged
-    here and refused on its own. libpq 17's
+    ``pqopt``, so libpq takes a file :func:`_libpq_root_certs` names, each of which
+    :func:`_refuse_libpq_root_cert_file` judges and refuses on its own. libpq 17's
     ``initialize_SSL`` loads that file at every TLS attempt whose ``stat`` of it succeeds, whatever
     the mode, and only a ``verify`` mode fails the connect when the ``stat`` fails. So the check
     runs for the psqlODBC family whenever ``sslmode`` asks libpq for TLS, erring wide on ``allow``
@@ -1721,22 +1752,17 @@ def _refuse_encrypted_libpq_root_cert(
     unset: psqlODBC sends ``disable`` to libpq when no mode is given (``DEFAULT_SSLMODE`` in its
     ``dlg_specific.h``), and a DSN-less connection reads no registered DSN's mode.
 
-    A path that names another host (:func:`names_another_host`) is refused unread, with
-    ``PGSSLROOTCERT`` as the way out. On Windows that check's walk reads each name of the path
-    before the file is judged. It refuses at least a folder the system could not read or resolve,
-    saying the file could not be read, and a chain of links it will not follow further or a path
-    through a file, saying it must be a plain local path, not a share, a network drive, a link to
-    one, or a path the check cannot read (``docs/CONNECTIONS.md``, Generic ODBC). A ``stat``
-    failure that says no file is there, or that libpq could not ``stat`` it either, is left to
-    libpq (:func:`_libpq_cannot_stat_either`): at least a missing name other than a share Windows
-    could not reach, and off Windows a permission denial. Every other ``stat`` failure is judged
-    as a failed read is, with no second look for a directory, so it is refused unless it says no
-    file is there, since libpq stats again at every connect and may load the file once the fault
-    clears.
-    Past the ``stat``, the path takes :func:`_read_driver_file`'s read,
-    as an ``sslca`` does: a directory is left to libpq, and a file that cannot be opened or read,
-    or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused, as libpq would fail the connect on
-    a file it cannot load.
+    A path that names another host (:func:`names_another_host`) is refused unread, and on Windows
+    that check's walk reads each name of the path before the file is judged; a walk stopped by a
+    name the system could not read is refused as unread. The file's own ``stat`` is then left or
+    refused as :func:`_libpq_cannot_stat_either` says. Past the ``stat``, the path takes
+    :func:`_read_driver_file`'s read, as an ``sslca`` does: a directory is left to libpq, and a
+    file that cannot be opened or read, or one past :data:`_MAX_DRIVER_CA_FILE_BYTES`, is refused.
+    Off Windows, libpq 17's source fails the connect on a file whose ``stat`` passes and whose load
+    fails (read, not measured). On Windows, libpq's ``stat`` opens the file and CPython's needs
+    only its attributes, so libpq may skip a file whose read is denied rather than fail on it, which
+    was not measured; the refusal errs on the side of refusing there (vault BACKLOG #8153, items 5
+    and 29). Each refusal opens with its remedy (:data:`_LIBPQ_REMEDY`).
 
     **It reads the environment of the process that builds the connection**, so ``messagefoundry
     check`` and a dry run judge their own machine's file, not the service's. **It runs when the
@@ -1753,21 +1779,25 @@ def _refuse_encrypted_libpq_root_cert(
         found = _libpq_root_certs()
     except OSError as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
-            "PGSSLROOTCERT to a local path; the folder libpq reads it from could not be named, so "
-            f"it was not read to check {_CA_CHECKED_FOR}"
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: "
+            f"{_LIBPQ_REMEDY}; the folder libpq reads it from could not be named, so it was not "
+            f"read to check {_CA_CHECKED_FOR}"
         ) from exc
     except _UnholdableShellFolder as exc:
         raise ValueError(
-            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: set "
-            f"PGSSLROOTCERT to a local path; {exc}"
+            f"{hop_name_prefix(connection)}DATABASE libpq's default root certificate: "
+            f"{_LIBPQ_REMEDY}; {exc}"
         ) from exc
     for source, path in found:
         _refuse_libpq_root_cert_file(f"{hop_name_prefix(connection)}DATABASE {source}", path)
 
 
 def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
-    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load."""
+    """:func:`_refuse_encrypted_libpq_root_cert`'s judgement of one file libpq could load: the
+    host check, then the file's own ``stat``, left or refused as :func:`_libpq_cannot_stat_either`
+    says, then :func:`_read_driver_file`'s read. The ``stat`` is made here, where libpq's rule is
+    known, and :func:`~messagefoundry.auth.trust_anchors.read_if_regular` makes its own again,
+    since it takes none from its caller."""
     what = "root certificate file"
     unread: dict[str, str] = {}
     with judging_file_keyword(setting):
@@ -1779,21 +1809,40 @@ def _refuse_libpq_root_cert_file(setting: str, path: str) -> None:
             # path leads off the host, so this refusal names the walk's cause, which the general
             # one below does not.
             raise ValueError(
-                f"{setting}: the {what} could not be read to check {_CA_CHECKED_FOR}: {cause}; "
-                "check the path and the folders above it, or set PGSSLROOTCERT to a readable "
-                "local path"
+                f"{setting}: {_LIBPQ_REMEDY}, or check the path and the folders above it; the "
+                f"{what} could not be read to check {_CA_CHECKED_FOR}: {cause}"
             )
-        # Worded as _refuse_remote_path words it: the walk may have stopped on a local path it
-        # could not finish, so the remedy cannot be only to name a local path. The copy it names
-        # is a trust anchor no ACL check covers, so the remedy says who may write its folder.
+        # The walk may have stopped on a local path it could not finish, so the remedy cannot be
+        # only to name a local path.
         raise ValueError(
-            f"{setting}: the {what} must be a plain local path on this host: not a share, a "
-            "network drive, a link to one, or a path it cannot read; check the path and the "
-            "folders above it, or point PGSSLROOTCERT at a readable copy in a local folder only "
-            f"administrators and the service account can write. It was not read to check "
-            f"{_CA_CHECKED_FOR}"
+            f"{setting}: {_LIBPQ_REMEDY}, or check the path and the folders above it; the {what} "
+            f"{REMOTE_PATH_RULE}, so it was not read to check {_CA_CHECKED_FOR}"
         )
-    data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR, leave_unstatable=True)
+    try:
+        os.stat(path)
+    except ValueError:
+        # A path os.stat cannot take, such as one holding a NUL: libpq cannot load it either.
+        logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
+        return
+    except OSError as exc:
+        if not _libpq_cannot_stat_either(exc):
+            raise ValueError(
+                f"{setting}: {_LIBPQ_REMEDY}, or retry once the fault clears; the {what} could "
+                f"not be stat'ed to check {_CA_CHECKED_FOR}: {_why(exc)}"
+            ) from exc
+        # The class and codes, never the path, which can name the account. A missing file is the
+        # ordinary case; anything else left is worth an operator's look.
+        missing = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        logger.log(
+            logging.DEBUG if missing else logging.INFO,
+            "%s: left to libpq, which loads no file it cannot stat: %s (errno %s, winerror %s)",
+            setting,
+            type(exc).__name__,
+            exc.errno,
+            getattr(exc, "winerror", None),
+        )
+        return
+    data = _read_driver_file(path, setting, what, _CA_CHECKED_FOR)
     if data is not None:
         _refuse_ca_content(
             setting, data, refusing="refusing to build a connection libpq loads it on"
@@ -1832,8 +1881,7 @@ def _driver_file_spellings(
         given = verdicts[keyword]
     if names_another_host(value, given):
         raise error(
-            f"{setting}: the {what} is not a plain local path on this host, so it was not read "
-            f"to check {checked_for}"
+            f"{setting}: the {what} {REMOTE_PATH_RULE}, so it was not read to check {checked_for}"
         )
     for path in driver_file_spellings(value, given):
         try:
@@ -1866,7 +1914,6 @@ def _read_driver_file(
     error: type[ValueError] = ValueError,
     leave_irregular: bool = True,
     leave_unreachable: bool = False,
-    leave_unstatable: bool = False,
 ) -> bytes | None:
     """The bytes of one spelling of a file a driver loads, for the engine to check first, or
     ``None`` when the file is left to the driver. ``what`` and ``checked_for`` word a refusal, and
@@ -1882,30 +1929,9 @@ def _read_driver_file(
     (:func:`_names_no_file`), unless ``leave_unreachable`` says the driver will not read the file
     either: then :class:`_UnreachedShare` is raised.
 
-    With ``leave_unstatable``, for a driver that loads a file only once its ``stat`` succeeds, as
-    libpq loads its root certificate, a ``stat`` failure that says no file is there, or that the
-    driver could not ``stat`` it either (:func:`_libpq_cannot_stat_either`), is left to the driver
-    too: at least a missing name other than a share Windows could not reach, and off Windows a
-    permission denial. On Windows the caller's :func:`names_another_host` walk has already refused
-    at least a folder in the path the system could not read, as
-    :func:`_refuse_encrypted_libpq_root_cert` says. Every other ``stat`` failure is judged as a
-    failed read is, with no second look for a directory, so it is refused unless it says no file is
-    there, since the driver stats again at each connect and may then load the file. That costs a
-    second ``stat`` of a path that passes, which :func:`read_if_regular` makes again.
-
     The file is read by :func:`~messagefoundry.auth.trust_anchors.read_if_regular`, which says
     how a device or pipe is judged without being read, or waited on."""
-    stat_failed = False
     try:
-        if leave_unstatable:
-            try:
-                os.stat(path)
-            except OSError as exc:
-                if not _libpq_cannot_stat_either(exc):
-                    stat_failed = True
-                    raise  # judged below as a failed read, with no second look for a directory
-                logger.debug("%s: the driver loads no file it cannot stat, so it is left", setting)
-                return None
         data = read_if_regular(path, _MAX_DRIVER_CA_FILE_BYTES + 1)
     except ValueError:
         # A path os.stat cannot take, such as one holding a NUL: the driver cannot load it either.
@@ -1917,20 +1943,16 @@ def _read_driver_file(
         # again after that failure alone: on a share Windows could not reach, a second look would
         # wait out the same network timeout again. A path through a file names
         # no file either. POSIX reports it as NotADirectoryError, which keywrap refused, so sslkey
-        # still does; Windows reports it as a missing name, left to the driver. A failed stat is
-        # not looked at again: it says nothing of a directory swapped in, and the second look
-        # would wait out the same device or network fault on the event loop.
+        # still does; Windows reports it as a missing name, left to the driver.
         if isinstance(exc, NotADirectoryError) or (
-            not stat_failed
-            and isinstance(exc, (PermissionError, IsADirectoryError))
-            and os.path.isdir(path)
+            isinstance(exc, (PermissionError, IsADirectoryError)) and os.path.isdir(path)
         ):
             _irregular(setting, what, checked_for, error, leave_irregular)
             return None
         if _names_no_file(exc):
             logger.debug("%s: no file at this spelling, so the engine does not check it", setting)
             return None
-        if leave_unreachable and getattr(exc, "winerror", None) in _WINDOWS_UNREACHABLE:
+        if leave_unreachable and getattr(exc, "winerror", None) in UNREACHABLE_WINERRORS:
             logger.debug(
                 "%s: the share was not reached, and the driver reads no such file", setting
             )
@@ -1972,11 +1994,16 @@ def _names_no_file(exc: OSError) -> bool:
 
 
 def _libpq_cannot_stat_either(exc: OSError) -> bool:
-    """Whether a failed ``stat`` of libpq's root certificate is left to libpq at once:
+    """Whether a failed ``stat`` of libpq's root certificate is left to libpq, the one statement of
+    that rule (vault BACKLOG #8153, item 9). libpq 17's ``initialize_SSL`` loads the file only
+    when its ``stat`` succeeds, so a failure that says no file is there, or that libpq, running as
+    the same identity, could not ``stat`` it either, loads nothing and is left:
     :data:`_LIBPQ_STAT_LEFT_WINERRORS` by ``winerror`` where Windows set one, so a Windows
     ``PermissionError`` is left only as ``ERROR_ACCESS_DENIED``; else any ``PermissionError``, or
-    :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``. Any other failure takes
-    :func:`_read_driver_file`'s handling of a failed read."""
+    :data:`_LIBPQ_STAT_LEFT_ERRNOS` by ``errno``. Every other failure refuses the build with no
+    second look for a directory (:func:`_refuse_libpq_root_cert_file`), since libpq stats again at
+    every connect and may load the file once the fault clears, when the check does not run again,
+    and a second look would wait out the same device or network fault."""
     winerror = getattr(exc, "winerror", None)
     if winerror is not None:
         return winerror in _LIBPQ_STAT_LEFT_WINERRORS
