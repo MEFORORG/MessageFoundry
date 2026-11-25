@@ -60,7 +60,9 @@ async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
     # through the GRANT minted below, which _grant_action_step_up deadlines at
     # now + step_up_max_age_seconds, i.e. already expired. The mint is the CONTROL, not setup: drop
     # it and the POST bounces for want of ANY grant, which it does under any window (BACKLOG #1851).
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off: under it this no-factor session is MFA-pending and is sent to enrol before
+    # any window is read (BACKLOG #1149), so the window would not be what refuses.
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     other = await service.login("op", PW)  # the target 2nd session
@@ -91,7 +93,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
     # The revoke-others twin of the per-session test above, and the same correction applies: the
     # negative window bites through the ADR 0077 GRANT's TTL, not through has_recent_step_up, so the
     # _mint_action below is what puts the window under test (BACKLOG #1851). Reasoning: that twin.
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    # require_mfa off, for the reason the twin above gives (BACKLOG #1149).
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     await service.login("op", PW)  # a 2nd session
@@ -114,7 +117,8 @@ async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
 
 def test_session_terminate_actions_registered_password_only() -> None:
     # Both terminate POSTs are registered auto_retry continuations (so /ui/reauth can re-POST them),
-    # step_up=False (password-only) so a no-factor session is never deadlocked out of revoking.
+    # step_up=False (password-only). A pending session with no factor is still sent to enrol by
+    # /ui/reauth (BACKLOG #1149), which keys on the action rather than on this flag.
     from messagefoundry_webconsole import is_safe_ui_action, lookup_ui_action
 
     assert is_safe_ui_action("/ui/account/sessions/revoke-others") is True
@@ -127,11 +131,25 @@ def test_session_terminate_actions_registered_password_only() -> None:
     assert is_safe_ui_action("/ui/account/sessions/revoke-others/extra") is False  # extra segment
 
 
-async def test_revoke_reauth_only_no_mfa_deadlock(engine: Engine) -> None:
-    # A require_mfa but UNENROLLED cookie session under a stale window: GET /ui/reauth?next=<terminate>
-    # renders the PASSWORD reauth form (200), NOT the enroll_first divert — the step_up=False
-    # registration keeps a no-factor user out of the enroll-loop so they can still revoke.
+async def test_revoke_reauth_sends_a_no_factor_pending_session_to_enrol(engine: Engine) -> None:
+    # BACKLOG #1149: a require_mfa but UNENROLLED cookie session is MFA-pending, and a terminate is
+    # refused to it whatever it proves, so GET /ui/reauth?next=<terminate> sends it to enrol rather
+    # than rendering a password form whose re-proof would mint nothing. It is not deadlocked: the
+    # enrolment it is sent to satisfies the session, after which the terminate works.
     service = AuthService(engine.store, AuthSettings(require_mfa=True, step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/reauth", params={"next": "/ui/account/sessions/revoke-others"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/account?m=enroll_first"
+
+
+async def test_revoke_reauth_stays_password_only_when_no_factor_is_owed(engine: Engine) -> None:
+    # The control for the test above: with require_mfa off the same no-factor session owes nothing,
+    # so /ui/reauth renders the PASSWORD form (200, no code field), as before BACKLOG #1149.
+    service = AuthService(engine.store, AuthSettings(require_mfa=False, step_up_max_age_seconds=-1))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:

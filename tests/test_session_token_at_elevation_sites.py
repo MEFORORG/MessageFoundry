@@ -36,7 +36,7 @@ from _totp_clock import fresh_totp, pin_totp_clock
 
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
-from messagefoundry.auth.service import STEP_UP_ACTION_SESSION_TERMINATE, AuthService
+from messagefoundry.auth.service import STEP_UP_ACTION_MFA_ENROLL, AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import ADMIN_USERNAME, login_admin
@@ -243,7 +243,9 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
 
     The account holds NO factor on purpose. ``_factor_binding_is_blocked`` would correctly refuse
     this purpose (and every factor-binding one) to a pending session whose account already has a
-    factor (BACKLOG #1951), and that refusal would hide the grant this asserts.
+    factor (BACKLOG #1951), and that refusal would hide the grant this asserts. The purpose is
+    ``mfa_enroll`` rather than ``session_terminate`` because a session-ending grant is refused to
+    every pending session, this one included (BACKLOG #1149).
     """
     store, service = await _service()
     try:
@@ -260,7 +262,7 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
             password,
             token=token,
             client="10.0.0.7",
-            purpose=STEP_UP_ACTION_SESSION_TERMINATE,
+            purpose=STEP_UP_ACTION_MFA_ENROLL,
         )
         assert elevation.ok is True
         fresh = elevation.token
@@ -274,10 +276,10 @@ async def test_the_step_up_reauth_elevates_the_token_in_place() -> None:
             "stamp landed before the rotation, since it is rowcount-blind"
         )
         # has_action_step_up is single-use, so this both proves the key and spends the grant.
-        assert await service.has_action_step_up(fresh, STEP_UP_ACTION_SESSION_TERMINATE) is True, (
+        assert await service.has_action_step_up(fresh, STEP_UP_ACTION_MFA_ENROLL) is True, (
             "...and the action-bound grant was re-keyed onto the new token, not stranded on the old"
         )
-        assert await service.has_action_step_up(token, STEP_UP_ACTION_SESSION_TERMINATE) is False, (
+        assert await service.has_action_step_up(token, STEP_UP_ACTION_MFA_ENROLL) is False, (
             "...and is NOT reachable on the retired one"
         )
     finally:
