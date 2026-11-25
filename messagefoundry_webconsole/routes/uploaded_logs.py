@@ -189,7 +189,7 @@ RESEND_DENIED_NOTICE = (
 RESEND_USERNAME_NOTICE = (
     "That resend did not run, and nothing was injected. Your account's username is blank or has "
     "spaces before or after it, so it cannot be recorded as the user who injected the message. "
-    "An administrator should correct the username."
+    "The username comes from your directory or identity provider, so it must be corrected there."
 )
 RESEND_STOPPED_NOTICE = (
     "That resend did not run — nothing was injected. The target inbound connection is registered but "

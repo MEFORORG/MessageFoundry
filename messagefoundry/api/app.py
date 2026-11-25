@@ -4278,6 +4278,11 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     return []
 
 
+#: The ``X-Refusal-Code`` value of the upload resend's 403 for an acting username that cannot label
+#: an injected message (BACKLOG #6589). The channel denial's 403 carries none, so a client tells the
+#: two apart by it; the web console's ``uploaded_logs`` routes read the same value.
+RESEND_USERNAME_REFUSAL_CODE: Final = "username_unusable"
+
 #: The status a refused operator resubmission answers with, by the ingress guard that refused it
 #: (BACKLOG #1911). An oversize body is 413. A body that contradicts the inbound's declared type is 415,
 #: the same status the upload route gives a non-text file. A body the listener could not have decoded,
@@ -4286,11 +4291,6 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
 #: refuses fewer bodies than the listener: ``admit_resubmitted_body`` says which. A ``parse``
 #: refusal there is at least a parser fault, and a body past ``Peek.parse``'s segment cap is a
 #: ``size`` refusal, as on a re-route.
-#: The ``X-Refusal-Code`` value of the upload resend's 403 for an acting username that cannot label
-#: an injected message (BACKLOG #6589). The channel denial's 403 carries none, so a client tells the
-#: two apart by it; the web console's ``uploaded_logs`` routes read the same value.
-RESEND_USERNAME_REFUSAL_CODE: Final = "username_unusable"
-
 _INGRESS_GUARD_STATUS: dict[str, int] = {
     "size": 413,
     "type": 415,

@@ -10840,9 +10840,8 @@ OPERATOR_ORIGINS: Final = frozenset({MessageOrigin.OPERATOR_EDIT, MessageOrigin.
 
 def is_origin_actor(value: object) -> TypeGuard[str]:
     """Whether ``value`` can name the user behind an operator origin (BACKLOG #6589): a non-blank
-    string with no surrounding whitespace, so it matches the username it names. The rule
-    :func:`require_ingress_audit` applies, exposed so a caller can refuse first, as the upload
-    resend route does."""
+    string with no surrounding whitespace. The rule :func:`require_ingress_audit` applies, exposed
+    so a caller can refuse first, as the upload resend route does."""
     return isinstance(value, str) and bool(value) and value == value.strip()
 
 
@@ -10853,11 +10852,10 @@ def require_ingress_audit(
 
     Before anything is written, :class:`TypeError` is raised for an operator origin (one in
     :data:`OPERATOR_ORIGINS`) with no audit, with one that is not callable, or with no
-    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace,
-    so it matches the username it names; and for an audit or an ``origin_actor`` given with any
-    other origin. The audit must also build a row: an inject always writes a message, so a ``None``
-    row raises inside the transaction and rolls the inject back. A live receipt keeps the default
-    ``partner`` origin and passes neither.
+    ``origin_actor`` naming the user, which must be non-blank and carry no surrounding whitespace;
+    and for an audit or an ``origin_actor`` given with any other origin. The audit must also build a
+    row: an inject always writes a message, so a ``None`` row raises inside the transaction and
+    rolls the inject back. A live receipt keeps the default ``partner`` origin and passes neither.
 
     It keys on ``origin``, so it cannot see an operator's inject written with the default
     ``partner`` origin and nothing else: such a call writes neither the operator label nor an audit
