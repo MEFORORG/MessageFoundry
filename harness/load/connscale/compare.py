@@ -61,23 +61,31 @@ COLLAPSE_MISSING = "MISSING"  # no pooled arm to compare
 
 
 def _sandbox_arm(r: ConnScaleRecord) -> str:
-    """The arm one record asked for, and what the engine parsed where that differs."""
+    """The arm one record asked for, and, where it differs, the arm its env parses as.
+
+    Both come from the record's :class:`SandboxReading`: the mode the profile asked for, and the
+    mode the engine's settings parser reads from the env the harness gave the step. Neither is
+    reported by the running engine.
+    """
     sb = r.sandbox
     if sb is None or sb.effective == sb.requested:
         return r.sandbox_mode
     if sb.effective is None:
-        return f"{sb.requested} (the engine's settings did not parse)"
-    return f"{sb.requested} (the engine parsed {sb.effective})"
+        return f"{sb.requested} (its env did not parse)"
+    return f"{sb.requested} (its env parses as {sb.effective})"
 
 
 def _sandbox_arms(records: Iterable[ConnScaleRecord]) -> tuple[str, ...]:
-    """The ``[sandbox]`` arms ``records`` ran under, sorted (BACKLOG #5090).
+    """The ``[sandbox]`` arms ``records`` name, sorted (BACKLOG #5090), as :func:`_sandbox_arm`
+    reads them: from the harness-parsed env, not from what the engine reports.
 
     No comparison here keys a cell on the sandbox arm: ``profile._validate`` refuses a sandbox A/B
     beside any other A/B, so one run's records carry one arm. Records from two arms would pool into
     one cell, so a comparison handed them fails rather than grade the mixture, and every comparison
-    names the arm it ran under, which its table did not. A step whose engine parsed another mode
-    than it asked for is its own arm here, so a fallback is named, and a partial one fails.
+    names the arm its records name, which its table did not. A record whose env parses as another
+    arm than it asked for counts as its own arm, so the mixed-arm FAIL catches a record whose env
+    names a different arm. It does not detect an engine that ran another mode than its env names;
+    the ``sandbox_workers`` SLO's process walk is the runtime evidence, and only for a subprocess arm.
     """
     return tuple(sorted({_sandbox_arm(r) for r in records}))
 
@@ -263,7 +271,7 @@ class ClaimModeComparison:
     # ``(sweep_mode, count)`` cells the CANDIDATE produced that the baseline never did (BACKLOG #5429).
     # They have no row to fail, so the verdict fails on them directly rather than skipping them.
     orphan_candidate_cells: list[tuple[str, int]] = field(default_factory=list)
-    # The [sandbox] arms the records ran under (:func:`_sandbox_arms`); more than one fails the A/B.
+    # The [sandbox] arms the records name (:func:`_sandbox_arms`); more than one fails the A/B.
     sandbox_arms: tuple[str, ...] = ()
 
     @property
@@ -1002,7 +1010,7 @@ class FuseModeComparison:
     # have no row and no baseline gap, so without this a GO on the other counts would mask them
     # (BACKLOG #5430).
     unrun_cells: list[tuple[str, str, int]] = field(default_factory=list)
-    # The [sandbox] arms the records ran under (:func:`_sandbox_arms`); more than one is a NO-GO.
+    # The [sandbox] arms the records name (:func:`_sandbox_arms`); more than one is a NO-GO.
     sandbox_arms: tuple[str, ...] = ()
 
     @property
@@ -1031,7 +1039,7 @@ class FuseModeComparison:
     @property
     def ok(self) -> bool:
         """The correctness fold for the run's exit code: every present B1 arm held zero-loss, none
-        is missing, no cell went unrun in both arms, and the records ran under one sandbox arm.
+        is missing, no cell went unrun in both arms, and the records name one sandbox arm.
         The GO/NO-GO throughput decision is reported separately and does NOT fail the run (a
         null/negative fusion result banks nothing but is not an error, ADR 0071 §6.4b)."""
         return (

@@ -673,8 +673,8 @@ fuse_modes = [false, true]
 
 def test_a_fusion_ab_over_two_sandbox_arms_is_no_go_and_names_them_bug_5090() -> None:
     """BACKLOG #5090. RED when: the fusion (and so the batching) A/B pools records from two
-    [sandbox] arms into one cell and reports GO, or its table names no arm. A step whose engine
-    parsed another mode than it asked for counts as its own arm, so a partial fallback fails too."""
+    [sandbox] arms into one cell and reports GO, or its table names no arm. A record whose env
+    parses as another arm than it asked for counts as its own arm, so it fails the A/B too."""
     from dataclasses import replace
 
     from harness.load.connscale.report import SandboxReading
@@ -689,10 +689,10 @@ def test_a_fusion_ab_over_two_sandbox_arms_is_no_go_and_names_them_bug_5090() ->
     assert cmp.overall_verdict == FUSE_GO and cmp.ok  # the control: one arm grades as before
     assert "\nsandbox: subprocess\n" in cmp.render_table()
 
-    fell_back = [*one_arm[:-1], replace(one_arm[-1], sandbox=arm("off"))]
-    mixed = build_fuse_comparison(fell_back, (False, True))
+    env_differs = [*one_arm[:-1], replace(one_arm[-1], sandbox=arm("off"))]
+    mixed = build_fuse_comparison(env_differs, (False, True))
     assert mixed is not None
     assert mixed.overall_verdict == FUSE_NO_GO and not mixed.ok
-    assert mixed.sandbox_arms == ("subprocess", "subprocess (the engine parsed off)")
+    assert mixed.sandbox_arms == ("subprocess", "subprocess (its env parses as off)")
     assert "SANDBOX ARMS MIXED" in mixed.render_table()
     assert mixed.to_json_dict()["sandbox_arms"] == list(mixed.sandbox_arms)

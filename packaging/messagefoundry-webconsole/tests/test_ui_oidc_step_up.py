@@ -936,37 +936,59 @@ async def test_the_budget_spent_warning_escapes_the_client_address(
         assert "\r" not in line and "\n" not in line, line
 
 
-def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
-    """BACKLOG #5090. RED when: a log call in the console's OIDC routes passes the client address
-    without ``scrub_log_argument``. The test above drives one of these lines; this covers the rest,
-    which a flood or a full flow cache reaches. Every argument is read, the format string and the
-    keywords included, so an f-string naming ``client`` fails too. A copy of the address under
-    another name is not followed."""
+def _client_log_census(source: str) -> tuple[int, list[int]]:
+    """``(client-bearing log arguments, lines that log one unscrubbed)`` for ``_log.*`` calls in
+    ``source``. Every argument is read, the format string and the keywords included, so an f-string
+    naming ``client`` counts too. A copy of the address under another name is not followed."""
     import ast
 
-    from messagefoundry_webconsole.routes import oidc as oidc_routes
-
-    tree = ast.parse(Path(oidc_routes.__file__).read_text(encoding="utf-8"))
-    sites = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "_log"
-    ]
     bearing = 0
-    for call in sites:
+    unscrubbed: list[int] = []
+    for call in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "_log"
+        ):
+            continue
         for arg in [*call.args, *(kw.value for kw in call.keywords)]:
             if not any(isinstance(n, ast.Name) and n.id == "client" for n in ast.walk(arg)):
                 continue
             bearing += 1
-            assert (
+            if not (
                 isinstance(arg, ast.Call)
                 and isinstance(arg.func, ast.Name)
                 and arg.func.id == "scrub_log_argument"
-            ), f"line {call.lineno} logs the client unscrubbed"
+            ):
+                unscrubbed.append(call.lineno)
+    return bearing, unscrubbed
+
+
+def test_every_client_bearing_log_line_in_the_oidc_routes_is_scrubbed() -> None:
+    """BACKLOG #5090. RED when: a log call in the console's OIDC routes passes the client address
+    without ``scrub_log_argument``. The test above drives one of these lines; this covers the rest,
+    which a flood or a full flow cache reaches."""
+    from messagefoundry_webconsole.routes import oidc as oidc_routes
+
+    bearing, unscrubbed = _client_log_census(Path(oidc_routes.__file__).read_text(encoding="utf-8"))
+    assert not unscrubbed, f"lines that log the client unscrubbed: {unscrubbed}"
     assert bearing >= 6, bearing  # the control: the walk found the lines it exists to check
+
+
+def test_the_client_log_census_flags_an_unscrubbed_line() -> None:
+    """The negative control for the census above: a raw argument, an f-string and a keyword each
+    fail it, and a scrubbed argument and a line with no client do not."""
+    source = "\n".join(
+        [
+            '_log.warning("raw %s", client)',
+            '_log.warning(f"fstring {client}")',
+            '_log.warning("kw %(c)s", extra=client)',
+            '_log.warning("ok %s", scrub_log_argument(client or "?"))',
+            '_log.warning("no client here %s", other)',
+        ]
+    )
+    assert _client_log_census(source) == (4, [1, 2, 3])
 
 
 async def test_spent_audit_and_sign_in_budgets_do_not_refuse_an_idp_step_up_return(

@@ -2010,7 +2010,13 @@ def test_every_sliding_window_limiter_is_filed_under_the_right_requirement() -> 
     for accessor in sorted(_BUSINESS_LIMIT_ACCESSORS):
         # Each accessor's own settings: the monitoring read was checked against admin_write's
         # row before BACKLOG #5090, so its own row could go unseen.
-        field = next(f for f in ("phi_read", "monitoring_read", "admin_write") if f in accessor)
+        field = next(
+            (f for f in ("phi_read", "monitoring_read", "admin_write") if f in accessor), None
+        )
+        assert field is not None, (
+            f"{accessor} names none of phi_read, monitoring_read or admin_write; map it to the "
+            "settings prefix of its 2.1.3 business-logic-limits row here"
+        )
         assert f"{field}_rate_limit_enabled" in limits, (
             f"{accessor}'s settings have no row in the 2.1.3 business-logic-limits table"
         )
