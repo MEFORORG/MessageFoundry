@@ -42,6 +42,8 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
+from messagefoundry.logging_guard import _last_resort
+
 if TYPE_CHECKING:
     from messagefoundry.config.settings import SecretsSettings
     from messagefoundry.config.tls_policy import HopPosture
@@ -134,17 +136,29 @@ def log_import_failure(
     credential scrub removes a filesystem path, and an import error's text can carry one, or a
     source line. An ``ImportError``'s module name is logged when it is a plain dotted name.
     ``logger`` is the caller's own module logger, so the line names the module that refused; this
-    module's logger when ``None``."""
+    module's logger when ``None``. A failure to log is reported on stderr by its class and never
+    raised: a caller logs this inside its own handler, where a raised error would replace its
+    refusal and chain the import error, text and all."""
     module = getattr(exc, "name", None) if isinstance(exc, ImportError) else None
     named = (
         f", module {module!r}" if isinstance(module, str) and _MODULE_NAME.fullmatch(module) else ""
     )
-    (logger or _log).warning(
+    _warn_or_report(
+        logger or _log,
         "%s: an import failed (%s%s); its text is not logged, as it can carry a filesystem path",
         label,
         type(exc).__name__,
         named,
     )
+
+
+def _warn_or_report(logger: logging.Logger, message: str, *args: object) -> None:
+    """``logger.warning(message, *args)``, with a failure to log reported on stderr by its class
+    (``logging_guard._last_resort``), never raised."""
+    try:
+        logger.warning(message, *args)
+    except Exception as fault:  # noqa: BLE001 -- reported below, by class, never raised
+        _last_resort(f"a provider WARNING could not be logged ({type(fault).__name__})")
 
 
 def _load_external_provider(
@@ -202,17 +216,18 @@ def _build_external_provider(
 ) -> SecretProvider:
     """Call ``module.build_provider``, refusing any error it raises that is not a
     :class:`SecretProviderError` with one by class (vault BACKLOG #6709). A provider's own refusal
-    keeps its text. Any other error is a fault in the provider's construction: its text is not
-    repeated or chained, for the reason :func:`_load_external_provider` gives for an import's."""
+    keeps its text, and ``MemoryError`` and ``RecursionError`` propagate. Any other error is a
+    fault in the provider's construction: its text is not repeated or chained, for the reason
+    :func:`_load_external_provider` gives for an import's."""
     try:
         provider: SecretProvider = module.build_provider(settings, posture=posture)
-    except SecretProviderError:
+    except (SecretProviderError, MemoryError, RecursionError):
         raise
     except Exception as exc:  # noqa: BLE001 -- a provider's construction may raise any class; refused below, logged by class
         failed = type(exc).__name__
-        _log.warning("[secrets].provider=%r: building the provider failed (%s)", name, failed)
     else:
         return provider
+    _warn_or_report(_log, "[secrets].provider=%r: building the provider failed (%s)", name, failed)
     raise SecretProviderError(
         f"[secrets].provider={name!r}: its provider could not be built ({failed})."
     )

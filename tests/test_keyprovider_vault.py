@@ -12,6 +12,7 @@ a silent degrade to the identity cipher, and never with key material in the mess
 from __future__ import annotations
 
 import base64
+import logging
 import sys
 from typing import Any
 
@@ -213,6 +214,54 @@ def test_the_processs_own_limits_are_not_read_as_a_broken_hvac(
         keyprovider_vault._import_hvac()
 
 
+class _RaisingFilter(logging.Filter):
+    """A log filter that fails on every record, as a broken redaction filter would."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        raise ValueError("filter fault")
+
+
+def test_a_raising_log_filter_leaves_the_hvac_refusal_whole(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Round 2: the WARNING is logged inside the handler, so a raising filter made a raw
+    # ValueError, chained to the import error and its text.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "hvac":
+            raise OSError(_BROKEN_HVAC_TEXT)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+    raising = _RaisingFilter()
+    keyprovider_vault._log.addFilter(raising)
+    try:
+        with pytest.raises(KeyProviderError) as caught:
+            keyprovider_vault._import_hvac()
+    finally:
+        keyprovider_vault._log.removeFilter(raising)
+    assert "did not import (OSError)" in str(caught.value)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "could not be logged (ValueError)" in capsys.readouterr().err
+
+
+def test_the_hvac_refusal_survives_the_key_seams_fixed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round 2: unrecorded, the refusal was replaced by "the key source failed" at the seam.
+    from messagefoundry.store.base import resolve_active_key
+
+    _configure_env(monkeypatch)
+    supply_vault_hop(monkeypatch, STORE)
+    monkeypatch.setitem(sys.modules, "hvac", None)
+    with pytest.raises(KeyProviderError) as caught:
+        resolve_active_key(StoreSettings(key_provider="vault"))
+    assert "install 'messagefoundry[vault]'" in str(caught.value)
+
+
 def test_a_missing_hvac_says_install_not_reinstall(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "hvac", None)
     with pytest.raises(KeyProviderError) as caught:
@@ -234,6 +283,18 @@ def test_a_provider_build_that_fails_is_a_key_provider_error(
         resolve_key_provider(StoreSettings(key_provider="vault"))
     assert "could not be built (ValueError" in str(caught.value)
     assert "0451" not in str(caught.value)
+
+
+@pytest.mark.parametrize("error", [MemoryError, RecursionError])
+def test_the_processs_own_limits_pass_the_provider_build(
+    monkeypatch: pytest.MonkeyPatch, error: type[BaseException]
+) -> None:
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise error()
+
+    monkeypatch.setattr(keyprovider_vault, "build_provider", _boom)
+    with pytest.raises(error):
+        resolve_key_provider(StoreSettings(key_provider="vault"))
 
 
 def test_a_providers_own_refusal_from_its_build_keeps_its_text(

@@ -1069,11 +1069,12 @@ def detached(error: CipherError) -> CipherError:
     values' plaintext; the errors' types, texts and links are kept. Cleared in place, so a caller
     that keeps ``error`` itself keeps the cleared error.
 
-    Past :data:`_DETACH_LIMIT` exceptions it stops, logs a WARNING and cuts the graph there, so no
-    exception it did not clear stays reachable (vault BACKLOG #6706 item 1): a visited error's
-    link to an unvisited one is set to ``None``, and an unvisited member of a visited group, which
-    its group's tuple keeps, has its traceback and its own links cleared. The nearest links are
-    visited first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept."""
+    Past :data:`_DETACH_LIMIT` exceptions it stops, logs a WARNING and cuts the graph there
+    (vault BACKLOG #6706 item 1): a visited error's link to an unvisited one is set to ``None``,
+    and an unvisited member of a visited group, which its group's tuple keeps, has its traceback
+    and its own links cleared, down through any group nested in it. The nearest links are visited
+    first, so ``error``'s own cause, which :func:`gave_no_verdict` reads, is kept. The cut is made
+    on the exceptions themselves, so another error sharing one of them sees it cut too."""
     seen: set[int] = set()
     visited: list[BaseException] = []
     pending: collections.deque[BaseException] = collections.deque([error])
@@ -1100,18 +1101,23 @@ def detached(error: CipherError) -> CipherError:
 def _cut_unvisited(visited: list[BaseException], seen: set[int]) -> None:
     """For :func:`detached` past its limit: unlink every exception not in ``seen`` from the
     ``visited`` ones. A group's members cannot be unlinked, so an unvisited member is cleared
-    instead, and its own links cut."""
+    instead and its own links cut, and a member that is a group has its members cleared alike.
+    Group tuples hold no cycle, so that descent ends."""
+    members: list[BaseException] = []
     for link in visited:
         if link.__cause__ is not None and id(link.__cause__) not in seen:
             link.__cause__ = None
         if link.__context__ is not None and id(link.__context__) not in seen:
             link.__context__ = None
         if isinstance(link, BaseExceptionGroup):
-            for member in link.exceptions:
-                if id(member) not in seen:
-                    member.__traceback__ = None
-                    member.__cause__ = None
-                    member.__context__ = None
+            members.extend(m for m in link.exceptions if id(m) not in seen)
+    while members:
+        member = members.pop()
+        member.__traceback__ = None
+        member.__cause__ = None
+        member.__context__ = None
+        if isinstance(member, BaseExceptionGroup):
+            members.extend(member.exceptions)
 
 
 def decrypt_or_error(cipher: Cipher, stored: str, aad: bytes | None) -> str | CipherError:

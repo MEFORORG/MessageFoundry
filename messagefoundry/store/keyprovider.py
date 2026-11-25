@@ -325,7 +325,7 @@ def _load_external_provider(
     # which reads a ValueError as a refused key. Chained, as the import refusal above is.
     try:
         provider: KeyProvider = module.build_provider(settings, posture=posture)
-    except KeyProviderError:
+    except (KeyProviderError, MemoryError, RecursionError):
         raise
     except Exception as exc:
         raise KeyProviderError(

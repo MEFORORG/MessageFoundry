@@ -313,7 +313,8 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
         return False, True
     if unavailable:
         return True, False
-    return False, _classified(is_vault_bad_request, exc) is not False
+    bad_request = _classified(is_vault_bad_request, exc)
+    return False, bad_request is None or bool(bad_request)
 
 
 def _classified(check: Callable[[BaseException], bool], exc: Exception) -> bool | None:
@@ -801,8 +802,8 @@ class TransitCipher(_UnmarkedPolicy):
         return batch_input
 
     def _send_alone_from_now(self, op: str, why: str, failure_type: str = "") -> None:
-        """Turn batching off for this cipher, with one WARNING naming why and, for a refused
-        batch, the failure's type (vault BACKLOG #6706 item 2)."""
+        """Turn batching off for this cipher, with a WARNING naming why and, for a refused batch,
+        the failure's type (vault BACKLOG #6706 item 2)."""
         if not self._batch_alone:
             _warn_quietly(
                 lambda: (

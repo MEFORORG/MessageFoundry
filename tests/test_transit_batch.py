@@ -847,6 +847,28 @@ def test_detached_past_its_limit_clears_an_unvisited_group_member(
     assert not _frames_reach(error, "value 0")
 
 
+def test_detached_past_its_limit_clears_a_group_nested_in_an_unvisited_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raised(exc: Exception) -> Exception:
+        try:
+            raise exc
+        except Exception as caught:  # noqa: BLE001 -- builds a traceback for the test
+            return caught
+
+    secret = "value 0"  # a local the members' frames reach until they are cleared
+    inner = raised(
+        ExceptionGroup("inner", [raised(ValueError(f"x {secret[:0]}")) for _ in range(3)])
+    )
+    outer = raised(ExceptionGroup("outer", [raised(KeyError("a")), raised(KeyError("b")), inner]))
+    error = CipherError("synthetic")
+    error.__context__ = outer
+    monkeypatch.setattr(crypto, "_DETACH_LIMIT", 3)
+    assert _frames_reach(error, "value 0")
+    assert detached(error) is error
+    assert not _frames_reach(error, "value 0")
+
+
 def test_detached_under_its_limit_returns_the_same_error() -> None:
     error = _chain(CipherError("synthetic"), 3)
     assert detached(error) is error and not _frames_reach(error, "value 0")

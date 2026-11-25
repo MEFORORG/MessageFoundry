@@ -138,13 +138,16 @@ def _import_hvac() -> Any:
             log_import_failure(_HVAC_CLIENT, exc, logger=_log)
     else:
         return hvac
+    # Recorded (:func:`_recorded_refusal`), so a seam that replaces a provider error with fixed
+    # text keeps these. Each is built from constants and a class name alone.
     if failed is None:
-        raise KeyProviderError(
+        raise _recorded_refusal(
             f"{_HVAC_CLIENT} requires the optional {_EXTRA!r} extra (hvac not importable): "
             f"install 'messagefoundry[{_EXTRA}]'."
         )
-    raise KeyProviderError(
-        f"{_HVAC_CLIENT}: hvac is installed but did not import ({failed}): "
+    raise _recorded_refusal(
+        f"{_HVAC_CLIENT}: hvac is installed but did not import "
+        f"({failed if failed.isidentifier() else 'an error'}): "
         f"reinstall 'messagefoundry[{_EXTRA}]'."
     )
 
