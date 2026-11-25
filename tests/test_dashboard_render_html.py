@@ -537,6 +537,12 @@ def test_the_priority_table_has_totals_and_every_status() -> None:
     )
     # The table sits above the charts.
     assert page.index("Ledger rows by priority") < page.index("Ledger range")
+    # The note names each fallback bucket by the label the table shows, as one sentence each.
+    note = " ".join(
+        page.split('<p class="note">Every ledger row', 1)[1].split("</p>", 1)[0].split()
+    )
+    assert f'is in the "{rh.tr.PRIORITY_LABELS[rh.tr.ESTIMATE_LABEL]}" row;' in note
+    assert "is unscored." in note
 
 
 def test_a_snapshot_without_a_priority_census_says_no_data() -> None:

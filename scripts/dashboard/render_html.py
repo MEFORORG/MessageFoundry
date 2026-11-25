@@ -696,9 +696,9 @@ def render(data: dict[str, Any]) -> str:
 <section class="chart wide"><h2>Ledger rows by priority</h2>{priority_table(tr.priority_rows(snap))}
 <p class="note">Every ledger row that carries a status banner, open and closed, by its tier and its status
 banner. The tier is the one on the row's first banner score line, else the priority on its own
-Cluster line; a row whose score line carries no tier and whose Cluster line names none is an
-in the scored, no tier column (often a filing estimate); a row with no score and no Cluster priority is unscored. Open, partial and in progress are open rows; closed, declined and superseded are
-closed ones. As of the vault at run time.</p></section>
+Cluster line. A row with a score but neither tier is in the "Scored, no tier" row; most of
+these are filing estimates. A row with no score and no Cluster priority is unscored. Open,
+partial and in progress are open rows; closed, declined and superseded are closed ones. As of the vault at run time.</p></section>
 {ledger}
 <section class="chart"><h2>Pull requests merged per week</h2>{merged}
 {legend(repos)}</section>
