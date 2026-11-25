@@ -19,6 +19,7 @@ import urllib.error
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from decimal import Decimal
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
@@ -1652,3 +1653,61 @@ def test_a_snapshot_a_refresh_replaces_during_the_skip_check_is_not_served(
         finally:
             cache._gate.release()
     assert len(calls) == publish_on
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        True,
+        False,
+        pytest.param(Decimal("1"), id="decimal"),
+        pytest.param("3600", id="text"),
+    ],
+)
+def test_the_cache_refuses_an_interval_the_settings_can_never_produce(
+    field: str, value: float
+) -> None:
+    """BACKLOG #6904. A NaN or infinite floor wedges key rotation after the first fetch, and a bool,
+    text or other type is not a number of seconds. The settings produce none of them, so refusing
+    them takes no value a site could configure. Each is a ValueError naming the field and
+    withholding the value."""
+    with pytest.raises(ValueError, match=field) as refused:
+        _cache_with(field, value, lambda: b"")
+    assert "value withheld" in str(refused.value)
+
+
+def _cache_with(field: str, value: float, fetch: Callable[[], bytes]) -> oidc.JwksCache:
+    if field == "ttl_seconds":
+        return oidc.JwksCache(fetch, ttl_seconds=value)
+    return oidc.JwksCache(fetch, min_refetch_seconds=value)
+
+
+@pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, 365 * 24 * 3600 + 1, 10**400, 1e300],
+    ids=["zero", "negative", "past-one-year", "int-too-large-for-a-float", "huge-finite"],
+)
+def test_the_cache_accepts_any_int_or_finite_interval(
+    field: str, value: float, rsa_key: rsa.RSAPrivateKey
+) -> None:
+    """BACKLOG #6904. Any int the settings accept still builds the cache, as before this guard, so
+    ``serve`` does not refuse a value ``check`` and ``verify`` pass. Range limits are the settings
+    layer's."""
+    cache = _cache_with(field, value, lambda: _jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+
+
+def test_a_negative_refetch_floor_still_removes_the_bound(rsa_key: rsa.RSAPrivateKey) -> None:
+    """BACKLOG #6904. ``min_refetch_seconds`` of ``0`` or less removes the amplification bound, as
+    the security-loosening report says: every unknown-kid lookup fetches."""
+    fetch = _CountingFetch(_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+    cache = oidc.JwksCache(fetch, min_refetch_seconds=-1, clock=lambda: 0.0)
+    for _ in range(3):
+        with pytest.raises(oidc.JwksError):
+            cache.get_key("k9", alg=SignatureAlgorithm.RS256)
+    assert fetch.calls == 3

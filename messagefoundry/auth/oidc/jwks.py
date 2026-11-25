@@ -27,6 +27,7 @@ amplify into a fetch storm against the IdP.
 from __future__ import annotations
 
 import base64
+import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -261,6 +262,24 @@ class _CacheState:
     fetched_at: float
 
 
+def _require_interval(name: str, value: float) -> float:
+    """``value`` as an int or a finite float, or :class:`ValueError` (BACKLOG #6904).
+
+    Only what the settings can never produce is refused: a NaN or an infinity, a bool, text, or any
+    other type. Every comparison against NaN is false, so a NaN floor refuses every refetch after
+    the first and wedges key rotation for good, as an infinite floor does. Any int stays legal and
+    behaves as it always has, a negative one included: ``min_refetch_seconds`` of ``0`` or less
+    removes the amplification bound, a choice the security-loosening report names. Range limits are
+    the settings layer's to set, where the operator sees them at load. The refusal withholds the
+    value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"JwksCache {name} must be an int or a float (value withheld)")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"JwksCache {name} must be finite (value withheld)")
+    return value
+
+
 def _require_gate_wait(value: float) -> float:
     """``value`` as a gate wait above 0 and at most ``threading.TIMEOUT_MAX``, or
     :class:`ValueError` (BACKLOG #6905). Zero would refuse every lookup that meets a refresh in
@@ -299,6 +318,10 @@ class JwksCache:
       later fails and leaves the old keys in place. A key past the TTL is never served instead
       (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
+
+    ``ttl_seconds`` and ``min_refetch_seconds`` must be an int or a finite float, and
+    ``gate_wait_seconds`` a number above 0 and at most ``threading.TIMEOUT_MAX``, or construction
+    raises :class:`ValueError` (BACKLOG #6904).
     """
 
     def __init__(
@@ -311,8 +334,8 @@ class JwksCache:
         gate_wait_seconds: float = DEFAULT_JWKS_GATE_WAIT_SECONDS,
     ) -> None:
         self._fetch = fetch
-        self._ttl = ttl_seconds
-        self._min_refetch = min_refetch_seconds
+        self._ttl = _require_interval("ttl_seconds", ttl_seconds)
+        self._min_refetch = _require_interval("min_refetch_seconds", min_refetch_seconds)
         self._gate_wait = _require_gate_wait(gate_wait_seconds)
         self._clock = clock
         self._state: _CacheState | None = None
