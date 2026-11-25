@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import string
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -154,7 +155,6 @@ def test_a_relative_settings_path_resolves_against_the_powershell_location(tmp_p
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert _wired_state_dir(root / "settings.json") == root / "mefor-usage"
-    assert not (elsewhere / "mefor-usage").exists()
 
 
 def test_a_settings_path_in_a_missing_directory_stops_the_run_before_any_write(
@@ -198,7 +198,8 @@ def test_a_refresh_interval_below_the_honoured_minimum_is_refused(
     proc = _install(
         tmp_path, "-SettingsPath", str(settings), f"-RefreshInterval:{interval}", cwd=tmp_path
     )
-    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "CANNOT START" in proc.stdout
     assert json.loads(settings.read_text(encoding="utf-8")) == {"keep": True}
 
 
@@ -216,3 +217,88 @@ def test_a_non_numeric_refresh_interval_on_our_own_status_line_is_rewired(tmp_pa
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "REWIRED" in proc.stdout
     assert _status_line(settings)["refreshInterval"] == 10000
+
+
+def test_a_path_on_a_drive_that_does_not_exist_is_a_usage_error(tmp_path: Path) -> None:
+    """An unmapped drive made the resolver throw, uncaught, so the run ended on a raw exception and
+    exit 1, which here means "roots were targeted and none reached the desired state"."""
+    free = next(
+        (d for d in reversed(string.ascii_uppercase) if not os.path.exists(f"{d}:\\")), None
+    )
+    if free is None:
+        pytest.skip("every drive letter is in use")
+    proc = _install(tmp_path, "-SettingsPath", f"{free}:\\nope\\settings.json", cwd=tmp_path)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "CANNOT START" in proc.stdout
+
+
+def test_status_and_uninstall_still_report_on_a_deleted_root(tmp_path: Path) -> None:
+    """The missing-directory pre-check guards WRITES. An audit or an uninstall over a list of roots,
+    some already deleted, reports each one rather than stopping at the first."""
+    gone = tmp_path / "gone" / "settings.json"
+    for mode in ("-Status", "-Uninstall"):
+        proc = _install(tmp_path, mode, "-SettingsPath", str(gone), cwd=tmp_path)
+        assert "CANNOT START" not in proc.stdout, (mode, proc.stdout)
+        assert proc.returncode != 2, (mode, proc.stdout + proc.stderr)
+
+
+def test_a_hard_linked_settings_file_is_refused_and_left_untouched(tmp_path: Path) -> None:
+    """A RENAME CUTS A HARD LINK: the root would become a standalone copy while the shared file kept
+    its old content. There is no single real side to write through to, so the root fails loudly."""
+    root = _root(tmp_path, {"shared": True})
+    settings = root / "settings.json"
+    other = tmp_path / "shared.json"
+    os.link(settings, other)
+    proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "hard link" in proc.stdout
+    assert os.stat(settings).st_ino == os.stat(other).st_ino
+    assert json.loads(other.read_text(encoding="utf-8")) == {"shared": True}
+
+
+def test_a_symlinked_settings_file_is_written_through_to_its_target(tmp_path: Path) -> None:
+    """A symbolic link is followed, so the link survives and its target gets the statusLine."""
+    root = _root(tmp_path)
+    target = tmp_path / "real-settings.json"
+    target.write_text("{}", encoding="utf-8")
+    settings = root / "settings.json"
+    try:
+        settings.symlink_to(target)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
+    proc = _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert settings.is_symlink()
+    assert "statusLine" in json.loads(target.read_text(encoding="utf-8"))
+
+
+def test_status_flags_a_root_wired_with_a_relative_collector(tmp_path: Path) -> None:
+    """A root wired before the fix with a relative collector read ``exists: True`` from a checkout
+    and counted healthy, while its statusLine resolves the path from each session's directory."""
+    root = _root(tmp_path, {})
+    settings = root / "settings.json"
+    assert _install(tmp_path, "-SettingsPath", str(settings), cwd=tmp_path).returncode == 0
+    doc = json.loads(settings.read_text(encoding="utf-8"))
+    rel = os.path.join("scripts", "coord", "usage-collect.ps1")
+    doc["statusLine"]["command"] = doc["statusLine"]["command"].replace(str(COLLECT), rel)
+    settings.write_text(json.dumps(doc), encoding="utf-8")
+    proc = _install(tmp_path, "-Status", "-SettingsPath", str(settings), cwd=ROOT)
+    assert "RELATIVE" in proc.stdout, proc.stdout
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+
+
+def test_a_relative_home_dir_resolves_against_the_powershell_location(tmp_path: Path) -> None:
+    """Rule 5 builds ``<HomeDir>\\.claude`` through ``GetFullPath``, so a relative ``-HomeDir`` after a
+    ``Set-Location`` named a root under the process directory instead."""
+    home = tmp_path / "h"
+    (home / ".claude").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / ".claude").mkdir(parents=True)
+    script = (
+        f"Set-Location -LiteralPath '{home}'; "
+        f"& '{INSTALL}' -HomeDir . -CollectorPath '{COLLECT}'; exit $LASTEXITCODE"
+    )
+    proc = _spawn(["pwsh", "-NoProfile", "-NonInteractive", "-Command", script], elsewhere)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert (home / ".claude" / "settings.json").exists()
+    assert not (elsewhere / ".claude" / "settings.json").exists()

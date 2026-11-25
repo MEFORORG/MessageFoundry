@@ -76,7 +76,6 @@ param(
     # Milliseconds. Minimum honoured by Claude Code is 1000, so a smaller value is refused rather than
     # written: the run's own "refreshInterval: <n> ms" summary would otherwise state a rate that never
     # applies (BACKLOG #7577).
-    [ValidateRange(1000, [int]::MaxValue)]
     [int]$RefreshInterval = 10000,
     # LOWEST-LEVEL OVERRIDE, AND IT HAS NO DEFAULT ON PURPOSE. A default here is what made the
     # CLAUDE_CONFIG_DIR pin unreachable: a pin can only be consulted when nothing has already answered
@@ -148,7 +147,7 @@ function Assert-RootExists([string]$Path, [string]$What) {
     $msg = "$What does not exist: $Path"
     if ($Path -like '*,*') {
         $msg += "`n              (that string contains a comma -- `pwsh -File` passes it as ONE value;" +
-        " repeat -ConfigDir per path, or use -AllRoots)"
+        " run once per path, or use -AllRoots)"
     }
     Stop-Cannot $msg
 }
@@ -189,6 +188,15 @@ function Write-SettingsFile([string]$Path, $Data) {
     # 771 bytes of run 1's POST-install content. The only pre-install copy was destroyed by the run
     # that claimed to be making one, which is worse than not backing up at all: the operator is told a
     # backup exists and it holds the wrong content.
+    # A RENAME REPLACES THE NAME, NOT THE FILE IT LINKS TO, so the replace below would cut a link that
+    # Set-Content wrote through. A symbolic link is followed to its final target, which is the file the
+    # operator meant; a hard link has no "real" side to follow, so it is refused, loudly, and the
+    # root counts FAILED rather than silently becoming a standalone copy.
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($item -and $item.LinkType -eq 'SymbolicLink') { $Path = $item.ResolveLinkTarget($true).FullName }
+    elseif ($item -and $item.LinkType -eq 'HardLink') {
+        throw "settings.json is a hard link; replacing it would cut the link, so it was left untouched"
+    }
     $backedTo = $null
     if (Test-Path -LiteralPath $Path) {
         $dest = "$Path.bak-usage-$BackupStamp"
@@ -203,12 +211,18 @@ function Write-SettingsFile([string]$Path, $Data) {
     # setting in it (BACKLOG #7576). The encoding is UTF-8 WITHOUT a BOM, which is what Set-Content
     # -Encoding UTF8 wrote on pwsh 7; [Text.Encoding]::UTF8 would add one. $Path is absolute (the
     # target resolver makes it so), which matters because these .NET calls resolve a relative path
-    # against the process directory, not $PWD. The finally removes a temp file a failed write or
-    # rename leaves behind; after a successful rename it no longer exists.
+    # against the process directory, not $PWD. THE RENAME IS RETRIED, as the collector's is: a file
+    # just created is often held open for a moment by a scanner, and one sharing violation would
+    # otherwise fail the root. The finally removes a temp file a failed write or rename leaves behind;
+    # after a successful rename it no longer exists.
     $tmp = "$Path.$PID.tmp"
     try {
         [System.IO.File]::WriteAllText($tmp, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
-        [System.IO.File]::Move($tmp, $Path, $true)
+        foreach ($attempt in 1..3) {
+            # Untyped catch: a .NET method's exception arrives wrapped in MethodInvocationException.
+            try { [System.IO.File]::Move($tmp, $Path, $true); break }
+            catch { if ($attempt -eq 3) { throw }; Start-Sleep -Milliseconds (50 * $attempt) }
+        }
     }
     finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
@@ -264,15 +278,30 @@ if ($AllRoots -and ($script:GaveConfigDir -or $script:GaveSettingsPath)) {
 if ($script:GaveSettingsPath -and @($SettingsPath).Count -eq 0) { Stop-Cannot "-SettingsPath was given with no value" }
 if ($script:GaveConfigDir -and @($ConfigDir).Count -eq 0) { Stop-Cannot "-ConfigDir was given with no value" }
 
-# EVERY PATH ARGUMENT IS MADE ABSOLUTE AGAINST $PWD FIRST (BACKLOG #7577). ConvertTo-NormalRootPath
+# THE PATH ARGUMENTS ARE MADE ABSOLUTE AGAINST $PWD FIRST (BACKLOG #7577): at least -SettingsPath,
+# -ConfigDir, -HomeDir and -CollectorPath. A relative CLAUDE_CONFIG_DIR pin is not, because it names no
+# $PWD of its own. ConvertTo-NormalRootPath
 # and the .NET file calls resolve a relative path against [Environment]::CurrentDirectory, which a
 # Set-Location does not move, while Test-Path and Set-Content resolve it against $PWD. Called with `&`
 # after a `cd`, the two differ, so a relative argument was checked in one directory and wired to
 # another. GetUnresolvedProviderPathFromPSPath reads $PWD, expands no wildcard, and needs no file to
 # exist. A bare file name also gets a real parent this way: Split-Path 'settings.json' -Parent is ''.
+# A drive that does not exist, or a $PWD on a non-filesystem drive such as HKCU:, is a usage error and
+# answers exit 2 like any other, never a raw exception and exit 1.
 function Resolve-ArgPath([string]$Path, [string]$What) {
     if ([string]::IsNullOrWhiteSpace($Path)) { Stop-Cannot "$What was given as an empty string" }
-    return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $provider = $null; $drive = $null
+    try { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive) }
+    catch { Stop-Cannot "$What cannot be resolved to a file path: $Path ($($_.Exception.GetBaseException().Message))" }
+    if ($provider.Name -ne 'FileSystem') { Stop-Cannot "$What does not name a file-system path: $Path (it resolved under $($provider.Name))" }
+    return $full
+}
+
+$HomeDir = Resolve-ArgPath $HomeDir "-HomeDir"
+# IN THE BODY, NOT A [ValidateRange]: a binding failure exits 1 with pwsh's own text, and exit 1 here
+# means "roots were targeted and none reached the desired state". A usage error is exit 2.
+if ($RefreshInterval -lt 1000) {
+    Stop-Cannot "-RefreshInterval $RefreshInterval is under 1000 ms, the minimum Claude Code honours"
 }
 
 $targets = @()
@@ -283,9 +312,6 @@ if ($script:GaveSettingsPath) {
             $s = Resolve-ArgPath $_ "-SettingsPath"
             [pscustomobject]@{ Settings = $s; Root = (ConvertTo-NormalRootPath (Split-Path $s -Parent)) }
         })
-    # BEFORE ANY WRITE, as for -ConfigDir: a missing directory found inside the write loop fails that
-    # one target after the others were written, the mixed state the pre-passes exist to prevent.
-    foreach ($t in $targets) { Assert-RootExists $t.Root "the directory of -SettingsPath $($t.Settings)" }
 }
 elseif ($script:GaveConfigDir) {
     $targetFrom = "-ConfigDir"
@@ -347,6 +373,9 @@ if ($Status) {
             # Said IN ADDITION to the path arms below, not instead of them: the path it names is
             # still a fact an operator may need, and a root can be PowerShell source AND elsewhere.
             $psSource = Test-IsPowerShellSourceStatusLine $cmd
+            # A RELATIVE COLLECTOR runs from each session's working directory, so Test-Path from this
+            # audit's $PWD cannot vouch for it (BACKLOG #7577). Such a root needs a re-install.
+            $relColl = $coll -and -not [System.IO.Path]::IsPathFullyQualified($coll)
             if ($null -eq $wired) {
                 Write-Host "    publishes to  : UNKNOWN (legacy command, no -StateDir -- the collector chooses at run time)"
                 Write-Host "                    re-install this root to bake the path in: -ConfigDir `"$($t.Root)`""
@@ -358,14 +387,18 @@ if ($Status) {
             }
             else {
                 Write-Host "    publishes to  : $wired"
-                if ($psSource) { $bad++ } else { $ok++ }
+                if ($psSource -or $relColl) { $bad++ } else { $ok++ }
             }
             if ($psSource) {
                 Write-Host "    but it cannot : the command is PowerShell source, and bash (which runs a statusLine) cannot parse it, so it publishes NOTHING" -ForegroundColor Yellow
                 # The legacy arm above already printed the same re-install line; one is enough.
                 if ($null -ne $wired) { Write-Host "                    re-install this root to replace it: -ConfigDir `"$($t.Root)`"" }
             }
-            if ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
+            if ($relColl) {
+                Write-Host "    collector     : $coll   -- RELATIVE; a session resolves it from its own directory, so it may name nothing" -ForegroundColor Yellow
+                Write-Host "                    re-install this root to wire an absolute path: -ConfigDir `"$($t.Root)`""
+            }
+            elseif ($coll) { Write-Host "    collector     : $coll   exists: $(Test-Path -LiteralPath $coll)" }
             else { Write-Host "    collector     : UNKNOWN (command shape not recognised)" }
         }
         elseif ($own -eq 'UNREADABLE') {
@@ -492,6 +525,12 @@ if (-not (Test-Path -LiteralPath $CollectorPath)) {
 # both bash and pwsh, and a partial run would leave the box in a mixed state.
 Assert-ShellQuotable $CollectorPath "the collector path"
 foreach ($t in $targets) { Assert-ShellQuotable (Get-UsageStateDir $t.Root) "the publish path for $($t.Root)" }
+# A -SettingsPath directory is checked HERE, on the install path only, and before any write: a missing
+# directory found inside the write loop fails that one target after the others were written, the mixed
+# state these pre-passes exist to prevent. -Status and -Uninstall still report on a deleted root.
+if ($targetFrom -eq '-SettingsPath') {
+    foreach ($t in $targets) { Assert-RootExists $t.Root "the directory of -SettingsPath $($t.Settings)" }
+}
 
 $wrote = 0; $rewired = 0; $unchanged = 0; $refusing = 0; $failed = 0; $would = 0
 Write-Host ""
