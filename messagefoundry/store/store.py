@@ -234,6 +234,7 @@ from messagefoundry.store.row_seal import (
     transit_seal_refusals,
 )
 from messagefoundry.store.schema_verify import (
+    _ORDINARY_TABLE,
     SchemaMismatchError,
     is_schema_step_error,
     live_schema_differences,
@@ -9177,17 +9178,19 @@ def forget_store_salt(path: Path) -> bool:
     refuses while another connection holds the file. After the delete, the main file is re-read with
     no ``-wal`` beside it. A refusal is the caller's to report; it never places an unproven copy."""
 
+    # The ordinary-table predicate, so a virtual `store_salt` another tool left, whose module may
+    # not be loaded here, is not probed and cannot raise "no such module" (BACKLOG #6719 item 4).
+    salt_table = (
+        f"SELECT count(*) FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'store_salt'"
+    )
+
     def drop(conn: sqlite3.Connection) -> bool:
-        exists = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-        ).fetchone()
-        return exists is not None and conn.execute("DELETE FROM store_salt").rowcount > 0
+        exists = conn.execute(salt_table).fetchone()[0]
+        return bool(exists) and conn.execute("DELETE FROM store_salt").rowcount > 0
 
     def gone(proof: sqlite3.Connection) -> bool:
         return not (
-            proof.execute(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'store_salt'"
-            ).fetchone()[0]
+            proof.execute(salt_table).fetchone()[0]
             and proof.execute("SELECT count(*) FROM store_salt").fetchone()[0]
         )
 
@@ -14335,8 +14338,10 @@ class MessageStore:
         open() with an opaque ``FOREIGN KEY constraint failed``: ``queue.message_id`` is FK-enforced
         and this INSERT runs under ``foreign_keys=ON``. A skipped orphan was unreplayable anyway (no
         message to view/route); we log how many were dropped."""
+        # The ordinary-table predicate: a virtual `outbox` is another tool's, and reading it could
+        # raise "no such module" (BACKLOG #6719 item 4).
         cur = await db.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='outbox'"
+            f"SELECT name FROM sqlite_master AS m WHERE {_ORDINARY_TABLE} AND m.name = 'outbox'"
         )
         if await cur.fetchone() is None:
             return  # already migrated (or a fresh DB) — nothing to fold in
@@ -23093,9 +23098,8 @@ class MessageStore:
 
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT name FROM main.sqlite_master WHERE type = 'table'"
-                " AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%')"
-                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+                f"SELECT m.name FROM main.sqlite_master AS m WHERE {_ORDINARY_TABLE}"
+                " AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
             )
             names = [str(row[0]) for row in await cur.fetchall()]
             occupancy: dict[str, bool] = {}

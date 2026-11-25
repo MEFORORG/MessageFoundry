@@ -198,6 +198,58 @@ async def test_a_counted_store_whose_salt_is_a_readable_foreign_object_gets_the_
         assert await _counts_under_a_dek(db) is True
 
 
+async def test_a_virtual_outbox_is_not_folded_into_the_queue(tmp_path: Path) -> None:
+    """BACKLOG #6719 item 4: the legacy-outbox fold uses the ordinary-table predicate, so an
+    unloaded virtual table named ``outbox`` is left alone rather than read, which raised."""
+    path = tmp_path / "vt-outbox.db"
+    _sql(path, "CREATE TABLE t (a TEXT)")
+    _plant_unloaded_virtual_table(path, "outbox")
+    async with _connected(path) as db:
+        with pytest.raises(sqlite3.OperationalError, match="no such module"):
+            await db.execute("SELECT COUNT(*) FROM outbox")  # control: reading it raises
+        await MessageStore._migrate_outbox_to_queue(db)  # nothing to fold, and no raise
+
+
+def test_forget_store_salt_leaves_a_virtual_salt_table_alone(tmp_path: Path) -> None:
+    """BACKLOG #6719 item 4: an unloaded virtual ``store_salt`` is not this build's salt table, so
+    forgetting the salt finds nothing to drop instead of raising "no such module"."""
+    from messagefoundry.store.store import forget_store_salt
+
+    path = tmp_path / "vt-salt.db"
+    _sql(path, "CREATE TABLE t (a TEXT)")
+    _plant_unloaded_virtual_table(path, "store_salt")
+    assert forget_store_salt(path) is False
+    # Control: an ordinary salt table holding a row is still dropped.
+    other = tmp_path / "salt.db"
+    _sql(other, "CREATE TABLE store_salt (salt TEXT)", "INSERT INTO store_salt VALUES ('s')")
+    assert forget_store_salt(other) is True
+
+
+async def test_the_census_reads_tables_through_the_schema_checks_predicate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #6719 item 5: ``table_occupancy`` selects its tables with ``_ORDINARY_TABLE`` itself,
+    not a copy of it that could drift, and still leaves out an unloaded virtual table."""
+    import messagefoundry.store.store as store_mod
+
+    path = tmp_path / "census.db"
+    await _fresh(path)
+    _plant_unloaded_virtual_table(path, "vt")
+    store = await MessageStore.open(path)
+    try:
+        occupancy = await store.table_occupancy()
+        assert "vt" not in occupancy and "messages" in occupancy
+        assert getattr(store_mod, "_ORDINARY_TABLE") is _ORDINARY_TABLE  # noqa: B009 -- not re-exported
+        # The census reads the shared name at call time: narrowing it narrows the census.
+        monkeypatch.setattr(
+            store_mod, "_ORDINARY_TABLE", f"{_ORDINARY_TABLE} AND m.name <> 'users'"
+        )
+        narrowed = await store.table_occupancy()
+    finally:
+        await store.close()
+    assert "users" in occupancy and "users" not in narrowed
+
+
 #: Every table with a flag saying whether it is virtual, so one walk both counts the tables it saw
 #: and finds the virtual ones (a virtual table's ``type`` is ``table`` too). The flag is the module's
 #: own predicate, so the pin and the reads it guards cannot disagree (BACKLOG #6719 item 9).
