@@ -505,19 +505,25 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
     return rows
 
 
-#: The bucket ``_vault_census.py`` puts a row whose Cluster line names no priority in.
+#: The bucket ``_vault_census.py`` puts a row with no tier, no Cluster-line priority and no score in.
 UNSCORED_LABEL = "unscored"
+#: The bucket ``_vault_census.py`` puts a row in whose banner score carries no tier and whose
+#: Cluster line names no priority.
+ESTIMATE_LABEL = "estimate only"
+#: The measured tier a scoring pass gives a row it holds for demand, a bucket of its own.
+DEMAND_GATE = "DEMAND-GATE"
 
 #: The priority table's columns, in order: the open statuses, then the closed kinds.
 PRIORITY_STATUSES = (*cm.OPEN_STATUSES, "closed", "declined", "superseded")
 
 
 def _priority_key(priority: str) -> tuple[int, int, str]:
-    # P0, P1, ... in NUMERIC order, so P10 follows P9 rather than P1, then anything else (the
-    # unscored bucket) after them.
+    # P0, P1, ... in NUMERIC order, so P10 follows P9 rather than P1; then DEMAND-GATE; then any
+    # bucket the driver does not name; then the estimates; the unscored rows last.
     if priority[:1] == "P" and priority[1:].isascii() and priority[1:].isdigit():
         return (0, int(priority[1:]), priority)
-    return (1, 0, priority)
+    rank = {DEMAND_GATE: 1, ESTIMATE_LABEL: 3, UNSCORED_LABEL: 4}.get(priority, 2)
+    return (rank, 0, priority)
 
 
 def priority_rows(snap: Snapshot) -> list[dict[str, Any]]:

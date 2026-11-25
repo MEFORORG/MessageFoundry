@@ -76,7 +76,16 @@ def clipped_census(report: Any, sources: Any, through: dt.date) -> tuple[Any, in
 
 #: A row's priority, as its section marker line writes it: ``**Cluster:** X. **Priority:** P3.``
 _PRIORITY = re.compile(r"\*\*Priority:\*\*\s*(P[0-9]+)\b")
-#: The priority bucket of a row whose section marker names none.
+#: A banner-block score line: ``Value **6/10**``, the score ``parse_items`` takes from the FIRST
+#: banner-block line that holds one.
+_SCORE = re.compile(r"\bValue \*\*[0-9]+(?:\.[0-9]+)?/10\*\*")
+#: The measured tier a scoring pass writes on that line: ``**Re-scored 2026-11-25 -> P2.**``. Some
+#: rows write the arrow as U+2192 rather than ``->``.
+_TIER = re.compile(r"(?:->|→)\s*(P[0-9]+|DEMAND-GATE)\.")
+#: The priority bucket of a row whose banner block holds a score with no tier, and whose section
+#: marker names no priority: a filing seat's estimate, never a measured tier.
+ESTIMATE = "estimate only"
+#: The priority bucket of a row with no tier, no section-marker priority and no score.
 UNSCORED = "unscored"
 
 
@@ -101,12 +110,23 @@ def row_status(checker: Any, item: Any, lines: Sequence[str]) -> str | None:
 
 
 def row_priority(item: Any, lines: Sequence[str]) -> str:
-    """The priority on the row's OWN section marker line, never one its prose quotes."""
+    """The row's priority bucket, read only from its OWN lines, never from one its prose quotes.
+
+    First, the tier on the FIRST banner-block line holding a ``Value **N/10**`` score, the line a
+    scoring pass writes (it never rewrites the Cluster line); else the priority on the row's
+    section marker line; else :data:`ESTIMATE` when that score line carries no tier; else
+    :data:`UNSCORED`."""
+    block = lines[item.line : item.body_line - 1]
+    score = next((line for line in block if _SCORE.search(line)), None)
+    if score is not None:
+        tier = _TIER.search(score)
+        if tier:
+            return tier[1]
     for n in item.section_lines[:1]:
         m = _PRIORITY.search(lines[n - 1])
         if m:
             return m[1]
-    return UNSCORED
+    return UNSCORED if score is None else ESTIMATE
 
 
 def priority_census(checker: Any, sources: Sequence[tuple[str, str]]) -> dict[str, dict[str, int]]:

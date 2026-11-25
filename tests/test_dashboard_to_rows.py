@@ -543,3 +543,17 @@ def test_main_writes_the_priority_file(tmp_path: Path) -> None:
 def test_unscored_label_matches_the_census_driver() -> None:
     source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
     assert f'UNSCORED = "{tr.UNSCORED_LABEL}"' in source
+
+
+def test_estimate_label_matches_the_census_driver() -> None:
+    source = (_PATH.parent / "_vault_census.py").read_text(encoding="utf-8")
+    assert f'ESTIMATE = "{tr.ESTIMATE_LABEL}"' in source
+    assert f"|{tr.DEMAND_GATE})" in source
+
+
+def test_priority_rows_order_tiers_then_demand_gate_estimates_and_unscored() -> None:
+    names = ("unscored", "estimate only", "DEMAND-GATE", "P10", "P2", "P1")
+    by = {p: {"open": 1} for p in names}
+    snap = tr.Snapshot({"metrics": [{"id": "backlog_burn", "detail": {"by_priority": by}}]})
+    order = list(dict.fromkeys(r["priority"] for r in tr.priority_rows(snap)))
+    assert order == ["P1", "P2", "P10", "DEMAND-GATE", "estimate only", "unscored"]

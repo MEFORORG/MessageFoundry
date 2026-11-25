@@ -1615,6 +1615,41 @@ def test_row_priority_reads_the_rows_own_section_line() -> None:
     assert vc.row_priority(_Row(["O"]), lines) == vc.UNSCORED == "unscored"
 
 
+_CLUSTER_P3 = "**Cluster:** Ops. **Priority:** P3. **Verdict:** build."
+_SCORED = "> **Re-scored 2026-11-25 {arrow} {tier}.** Value **6/10** . Difficulty **3/10**"
+_ESTIMATE_LINE = "> **Filed 2026-11-20.** Value **4/10** . Difficulty **2/10**"
+
+
+@pytest.mark.parametrize(
+    ("block", "cluster", "priority"),
+    [
+        # A banner tier beats the Cluster priority, in either arrow form.
+        ([_SCORED.format(arrow="->", tier="P2")], _CLUSTER_P3, "P2"),
+        ([_SCORED.format(arrow="→", tier="P1")], _CLUSTER_P3, "P1"),
+        ([_SCORED.format(arrow="->", tier="DEMAND-GATE")], None, "DEMAND-GATE"),
+        # Only the FIRST score line counts: a later tier does not override an untiered first one.
+        ([_ESTIMATE_LINE, _SCORED.format(arrow="->", tier="P1")], None, "estimate only"),
+        # An untiered estimate: the Cluster priority wins, else the estimate bucket.
+        ([_ESTIMATE_LINE], _CLUSTER_P3, "P3"),
+        ([_ESTIMATE_LINE], None, "estimate only"),
+        # A tier quoted on a line with no score is prose, not the row's tier.
+        (["> O filed; see the row re-scored -> P1. elsewhere"], None, "unscored"),
+        (["> O filed"], None, "unscored"),
+    ],
+)
+def test_row_priority_reads_the_first_banner_score_line(
+    block: list[str], cluster: str | None, priority: str
+) -> None:
+    vc = _load_driver()
+    lines = ["## 1. Title", *block]
+    section = 0
+    if cluster is not None:
+        lines.append(cluster)
+        section = len(lines)
+    lines.append("Body prose quoting **Re-scored -> P1.** Value **9/10**.")
+    assert vc.row_priority(_Row(block, section=section), lines) == priority
+
+
 def test_backlog_burn_flags_a_priority_table_that_disagrees(tmp_path: Path) -> None:
     m = cm.Metric("backlog_burn", "", "", "", "")
     # The census holds 12 open rows; this table holds 3.
