@@ -371,8 +371,8 @@ decision.
 - `auth/ldap_tls.py` adds `NarrowedTls`, a subclass of `ldap3.Tls`. Its `wrap_socket` wraps the
   socket with the factory's context and then calls ldap3's own host name check, unchanged. That
   wrap step is copied from ldap3, and `tests/test_ldap_tls.py` pins a hash of ldap3's
-  `wrap_socket` source. *(CHANGED 2026-11-24, BACKLOG #6879: the copy now also sends SNI, as
-  `messagefoundry/auth/ldap_tls.py` states.)* Patching ldap3's module global for one call was
+  `wrap_socket` source. *(CHANGED 2026-11-25, BACKLOG #6879: the copy now also sends SNI where
+  `_sni_name` in `messagefoundry/auth/ldap_tls.py` gives a name.)* Patching ldap3's module global for one call was
   rejected, because binds run on worker threads and a module global is shared by all of them.
 - The bind no longer passes `ciphers=`. `NarrowedTls` builds the factory itself from `validate`
   and `ca_certs_data`, and takes no other ldap3 argument, because the engine's context would not
@@ -392,9 +392,9 @@ run, not a handshake reading.
 ### What it keeps
 
 CA loading and verification mode are what ldap3 did, for the arguments the engine passes.
-*(CHANGED 2026-11-24, BACKLOG #6879: this read "CA loading, verification mode and the absence of
-SNI are what ldap3 did". The ClientHello now names the host the connection dials, as
-`messagefoundry/auth/ldap_tls.py` states.)* ldap3's post-handshake host name check still runs,
+*(CHANGED 2026-11-25, BACKLOG #6879: this read "CA loading, verification mode and the absence of
+SNI are what ldap3 did". The ClientHello now names the host the connection dials, where
+`_sni_name` in `messagefoundry/auth/ldap_tls.py` gives a name.)* ldap3's post-handshake host name check still runs,
 and still only when verifying. Each connection gets a fresh context, as before. `tests/test_tls_cipher_assertion_sites.py` now
 ties the context each connection wraps with to one the assertion ran on, by identity. The replica
 and its equivalence test are gone.
@@ -409,7 +409,7 @@ and its equivalence test are gone.
   7.1 grades it. *(CORRECTED 2026-10-28: this read "The LDAPS context loads no CRL. It is still
   among the hops the DEPLOYMENT guide lists as delegated.")*
 - **Client certificates, a pinned protocol version and `ssl_options`.** The engine passes none, and
-  `NarrowedTls` accepts none. *(CHANGED 2026-11-24, BACKLOG #6879: this listed SNI too.)*
+  `NarrowedTls` accepts none. *(CHANGED 2026-11-25, BACKLOG #6879: this listed SNI too.)*
 - **The other TLS 1.3 residuals.** The 2026-09-26 amendment's 3.14 gap stands on every hop, LDAPS
   included, and `tests/test_tls_default_suites.py` keeps its tripwire for the day the interpreter
   changes.

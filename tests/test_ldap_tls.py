@@ -11,8 +11,9 @@ server thread, so each claim is a handshake rather than an attribute read:
 * a host name refusal closes the TLS socket it wrapped, where ldap3's own ``Tls``, the control,
   leaves it open while the refusal's traceback is held (BACKLOG #3017);
 * the copy of ldap3's wrap step is pinned to the ldap3 source it was taken from;
-* the ClientHello names the host each connection dials, normalised, where ldap3's own ``Tls``, the
-  control, sends no SNI, while the host name check still gets the host as written (BACKLOG #6879);
+* the ClientHello names the host each connection dials where ``_sni_name`` gives a name, and
+  carries none where it gives none; ldap3's own ``Tls``, the control, sends no SNI, and the host
+  name check still gets the host as written (BACKLOG #6879);
 * on an interpreter with ``SSLContext.set_ciphersuites`` (CPython 3.15) the hop refuses a TLS 1.3
   peer offering only ``TLS_AES_128_GCM_SHA256``, while ldap3's own ``Tls`` accepts it as the
   control, and the bind constructs instead of refusing. On 3.14 the paired test measures the
