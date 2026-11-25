@@ -416,8 +416,10 @@ def dispatch(root: Path, payload: dict) -> dict:
     # Outside SessionStart a hook that fails other than by exit 2 no longer stops the event's later
     # hooks: they still run while the event's shared budget lasts, and once it is spent each later
     # hook is recorded as timed out without running. A hook's exit 2 still ends the event at once,
-    # as on origin/main. The first fault is raised once every hook has been tried, unless another
+    # as on origin/main. The first fault is raised once the event's hooks end, unless another
     # hook's deny, ask or block stands; that keeps the exit code a lone failing hook gave on main.
+    # A fault outside a hook's own run, such as an unsupported hook, ends them early, before every
+    # hook has been tried, and that fault is then the one raised.
     fault: Exception | None = None
 
     def record(exc: Exception, label: str) -> None:
@@ -490,10 +492,9 @@ def dispatch(root: Path, payload: dict) -> dict:
                         print(output, file=sys.stderr)
                         continue
                     update = plain_text_context(event, output)
-                # A JSON scalar from a prompt hook is still its plain text. SessionStart reports one
-                # as a note, as tests/test_b616_5879_codex_hook_shell_and_budget.py pins.
-                if not isinstance(update, dict) and event == "UserPromptSubmit":
-                    update = plain_text_context(event, output)
+                # JSON that is not an object is a failed hook on every event but SessionStart, as
+                # on origin/main; SessionStart reports one as a note, as
+                # tests/test_b616_5879_codex_hook_shell_and_budget.py pins.
                 if not isinstance(update, dict):
                     if event != "SessionStart":
                         record(ValueError("Hook JSON output must be an object"), hook_label(hook))

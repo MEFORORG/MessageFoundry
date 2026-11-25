@@ -724,10 +724,18 @@ def test_user_prompt_submit_keeps_plain_text_as_context(bridge, tmp_path):
     assert result["hookSpecificOutput"]["additionalContext"] == "plain prompt context"
 
 
-def test_user_prompt_submit_keeps_a_json_scalar_as_plain_text(bridge, tmp_path):
-    _event_settings(tmp_path, "UserPromptSubmit", "", [handler("3")])
+@pytest.mark.parametrize("printed", ["3", '"text"', "[1]", "null"])
+def test_user_prompt_submit_refuses_json_that_is_not_an_object(bridge, tmp_path, printed):
+    # As on origin/main: JSON that is not an object is a failed hook, never context, as
+    # docs/CODEX.md says; a later hook still runs, and the failure is raised once they end.
+    context = {
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "ok"}
+    }
+    handlers = [handler(printed), handler(json.dumps(context))]
+    _event_settings(tmp_path, "UserPromptSubmit", "", handlers)
     payload = {"session_id": "x", "hook_event_name": "UserPromptSubmit", "prompt": "hi"}
-    assert bridge.dispatch(tmp_path, payload)["hookSpecificOutput"]["additionalContext"] == "3"
+    with pytest.raises(ValueError, match="must be an object"):
+        bridge.dispatch(tmp_path, payload)
 
 
 # --- BACKLOG #5501: dispatch over the TRACKED .claude/settings.json, not a synthetic one, with
