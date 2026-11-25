@@ -54,11 +54,15 @@ _JOSE_CURVES: dict[str, Callable[[], ec.EllipticCurve]] = {
 
 DEFAULT_JWKS_TTL_SECONDS = 3600.0
 DEFAULT_JWKS_MIN_REFETCH_SECONDS = 300.0
-#: How long a lookup waits for the gate a refresh holds across its fetch before it fails closed
-#: (BACKLOG #6905). The same 10 s as ``oidc_http.DEFAULT_IDP_TIMEOUT_SECONDS``, the bound on one IdP
-#: round trip, which says a hung IdP must degrade the login and never pin a worker thread. A test
-#: holds the two equal; this module cannot import that one, which imports this module.
-DEFAULT_JWKS_GATE_WAIT_SECONDS = 10.0
+#: The one definition of the IdP timeout. ``oidc_http`` passes it to urllib as
+#: ``DEFAULT_IDP_TIMEOUT_SECONDS``, where it bounds each socket operation of a fetch, not the fetch
+#: as a whole, so a refresh can run longer than this.
+IDP_TIMEOUT_SECONDS = 10.0
+#: How long a lookup waits for the gate a refresh holds across its fetch before it is refused
+#: (BACKLOG #6905): the IdP timeout, so a hung IdP degrades the login rather than pinning each
+#: waiting lookup for as long as the fetch runs. It bounds the WAIT, not the refresh. A waiter whose
+#: wait runs out is refused even if that refresh later fails and leaves the old keys in place.
+DEFAULT_JWKS_GATE_WAIT_SECONDS = IDP_TIMEOUT_SECONDS
 #: The largest ``ttl_seconds`` or ``min_refetch_seconds`` the cache takes: one year. A larger value
 #: is no different from forever, which wedges key rotation; the settings report names anything past
 #: the 3600 s TTL default as a loosening, so this ceiling refuses only the absurd (BACKLOG #6904).
@@ -265,6 +269,21 @@ def _require_interval(name: str, value: float) -> float:
     return seconds
 
 
+def _require_gate_wait(value: float) -> float:
+    """``value`` as a gate wait above 0 and at most ``threading.TIMEOUT_MAX``, or
+    :class:`ValueError` (BACKLOG #6905). Zero would refuse every lookup that meets a refresh in
+    progress, and ``Lock.acquire`` raises ``OverflowError`` past ``TIMEOUT_MAX``."""
+    if isinstance(value, str):
+        raise ValueError("JwksCache gate_wait_seconds must be a number, not text (value withheld)")
+    seconds = float_setting(value, knob="gate_wait_seconds", transport="JwksCache")
+    if not 0 < seconds <= threading.TIMEOUT_MAX:
+        raise ValueError(
+            "JwksCache gate_wait_seconds must be above 0 and at most threading.TIMEOUT_MAX "
+            "(value withheld)"
+        )
+    return seconds
+
+
 class JwksCache:
     """A bounded, TTL'd key cache with a global min-refetch floor (ADR 0142).
 
@@ -278,13 +297,16 @@ class JwksCache:
     * a miss (unknown ``kid``, or the TTL has expired) triggers **at most one** fetch per
       ``min_refetch_seconds``, globally — the amplification bound — after which an unknown ``kid``
       simply raises :class:`JwksError` until the floor elapses. A miss that arrives while a fetch
-      is in progress waits for it, at most ``gate_wait_seconds``, then decides again against the
-      keys it finds once that fetch ends: the new ones, or on a failed fetch the old ones. A wait
-      that runs out fails closed with :class:`JwksError`; a key past the TTL is never served
-      instead (BACKLOG #6905);
+      is in progress waits for the gate that fetch holds, at most ``gate_wait_seconds``. If it gets
+      the gate it decides again against the keys it finds: the new ones, or on a failed fetch the
+      old ones. If its wait runs out first, it is refused with :class:`JwksError`, unless the keys
+      published by then hold the ``kid`` within the TTL, and it is refused even if that fetch later
+      fails and leaves the old keys in place. A key past the TTL is never served instead
+      (BACKLOG #6905). The wait is bounded; the fetch is bounded only per socket operation;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
 
-    ``ttl_seconds`` and ``min_refetch_seconds`` must be numbers from 0 to one year, or construction
+    ``ttl_seconds`` and ``min_refetch_seconds`` must be numbers from 0 to one year, and
+    ``gate_wait_seconds`` a number above 0 and at most ``threading.TIMEOUT_MAX``, or construction
     raises :class:`ValueError` (BACKLOG #6904).
     """
 
@@ -300,11 +322,7 @@ class JwksCache:
         self._fetch = fetch
         self._ttl = _require_interval("ttl_seconds", ttl_seconds)
         self._min_refetch = _require_interval("min_refetch_seconds", min_refetch_seconds)
-        # Clamped, because Lock.acquire raises OverflowError past TIMEOUT_MAX (about 49 days on
-        # Windows), and a wait that long is no different from the unbounded one it replaces.
-        self._gate_wait = min(
-            _require_interval("gate_wait_seconds", gate_wait_seconds), threading.TIMEOUT_MAX
-        )
+        self._gate_wait = _require_gate_wait(gate_wait_seconds)
         self._clock = clock
         self._state: _CacheState | None = None
         self._last_fetch_attempt: float | None = None
@@ -324,7 +342,9 @@ class JwksCache:
         #:
         #: EVERY WAIT FOR IT IS BOUNDED, AND RUNNING OUT FAILS CLOSED (BACKLOG #6905). A stalled
         #: IdP otherwise pinned each waiting lookup, and the ``asyncio.to_thread`` worker under it,
-        #: for as long as the fetch ran. ``DEFAULT_JWKS_GATE_WAIT_SECONDS`` says why 10 s.
+        #: for as long as the fetch ran. ``DEFAULT_JWKS_GATE_WAIT_SECONDS`` says why 10 s. The
+        #: lookup that holds it for the fetch is not bounded by that wait, only by the fetch's own
+        #: per-socket-operation timeout.
         #:
         #: A blocking wait is safe here because ``get_key`` never runs on the event loop. Its one
         #: caller outside this module is ``claims.py`` ``get_key(kid, alg=alg)``, reached from
@@ -377,9 +397,14 @@ class JwksCache:
             return bound
 
         if not self._gate.acquire(timeout=self._gate_wait):
+            # The refresh may have published the kid as the wait ran out; one gate-free read of
+            # what it published, never a key past the TTL.
+            bound = self._fresh(self._state, kid, self._clock())
+            if bound is not None:
+                return bound
             raise JwksError(
-                f"no key for kid {kid!r}; a JWKS refresh in progress did not finish within "
-                f"{self._gate_wait:.0f}s"
+                f"no key for kid {kid!r}; waited {self._gate_wait:g}s for a JWKS refresh in "
+                "progress to release the cache"
             )
         try:
             return self._lookup_holding_gate(kid)

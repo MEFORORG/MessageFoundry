@@ -1271,20 +1271,33 @@ def _run_lookup(
     return thread
 
 
+class _Warm:
+    """A cache that fetched ``k1`` at 0 s, its clock moved to ``at``, past the 300 s refetch floor,
+    so the next miss fetches, and that fetch parks until released. The TTL is the default 3600 s.
+    ``ticked`` is set on every clock read, which shows a lookup has entered the cache."""
+
+    def __init__(
+        self, rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float, gate_wait: float = 10.0
+    ) -> None:
+        self.fetch = _BlockingFetch(later, first=_jwks_bytes(_rsa_jwk(rsa_key, "k1")))
+        self.now = [0.0]
+        self.ticked = threading.Event()
+        self.cache = oidc.JwksCache(
+            self.fetch, min_refetch_seconds=300.0, clock=self._clock, gate_wait_seconds=gate_wait
+        )
+        self.warm = self.cache.get_key("k1", alg=SignatureAlgorithm.RS256)
+        self.now[0] = at
+
+    def _clock(self) -> float:
+        self.ticked.set()
+        return self.now[0]
+
+
 def _warm_cache(
     rsa_key: rsa.RSAPrivateKey, later: bytes, *, at: float = 400.0, gate_wait: float = 10.0
 ) -> tuple[oidc.JwksCache, _BlockingFetch, object]:
-    """A cache that fetched ``k1`` at 0 s, its clock moved to ``at``, past the 300 s refetch floor,
-    so the next miss fetches, and that fetch parks until released. The TTL is the default 3600 s."""
-    first = _jwks_bytes(_rsa_jwk(rsa_key, "k1"))
-    fetch = _BlockingFetch(later, first=first)
-    now = [0.0]
-    cache = oidc.JwksCache(
-        fetch, min_refetch_seconds=300.0, clock=lambda: now[0], gate_wait_seconds=gate_wait
-    )
-    warm = cache.get_key("k1", alg=SignatureAlgorithm.RS256)
-    now[0] = at
-    return cache, fetch, warm
+    warm = _Warm(rsa_key, later, at=at, gate_wait=gate_wait)
+    return warm.cache, warm.fetch, warm.warm
 
 
 def test_a_cached_kid_lookup_does_not_wait_on_a_stalled_refresh(
@@ -1321,14 +1334,18 @@ def test_a_kid_past_its_ttl_is_not_served_while_the_refresh_withdrawing_it_runs(
     """BACKLOG #6905 keeps this bound. Past the TTL, a lookup of ``k1`` refreshes, and the IdP's new
     key set withdraws ``k1``. A concurrent lookup of ``k1`` made while that refresh is parked must
     not be served the withdrawn key: only a key WITHIN the TTL skips the gate."""
-    cache, fetch, _ = _warm_cache(rsa_key, _jwks_bytes(_rsa_jwk(rsa_key, "k2")), at=4000.0)
+    state = _Warm(rsa_key, _jwks_bytes(_rsa_jwk(rsa_key, "k2")), at=4000.0)
+    cache, fetch = state.cache, state.fetch
 
     results: dict[str, object] = {}
     refreshing = _run_lookup(cache, "k1", results, "refreshing")
     assert fetch.entered.wait(timeout=10), "the expired-kid lookup never reached the fetch"
+    state.ticked.clear()  # the refreshing lookup reads the clock no more until it publishes
     concurrent = _run_lookup(cache, "k1", results, "concurrent")
     try:
+        assert state.ticked.wait(timeout=10), "the concurrent lookup never entered the cache"
         concurrent.join(timeout=0.5)  # time for a lookup that skips the gate to have returned
+        assert concurrent.is_alive(), "the concurrent lookup returned while the refresh was parked"
     finally:
         fetch.release.set()
         refreshing.join(timeout=10)
@@ -1365,18 +1382,46 @@ def test_a_lookup_waiting_on_a_stalled_refresh_fails_closed_when_its_wait_runs_o
         waiter.join(timeout=10)
     refused = results["waiter"]
     assert isinstance(refused, oidc.JwksError), f"the waiter was served: {refused!r}"
-    assert "did not finish within" in str(refused)
+    assert "waited 0.2s for a JWKS refresh" in str(refused)
     assert not isinstance(results["refreshing"], BaseException), results["refreshing"]
     assert fetch.calls == 2
 
 
-def test_the_gate_wait_is_one_idp_round_trip() -> None:
-    """The 10 s the cache waits for a refresh is the bound on one IdP round trip, stated twice
-    because ``oidc_http`` imports ``jwks`` and so cannot be imported by it."""
-    from messagefoundry.auth.oidc import jwks as jwks_mod
-    from messagefoundry.auth.oidc_http import DEFAULT_IDP_TIMEOUT_SECONDS
+def test_a_lookup_whose_wait_runs_out_serves_a_key_published_meanwhile(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """BACKLOG #6905. A lookup whose wait for the gate runs out reads the published keys once more
+    without it, so a key that became current while it waited is served rather than refused. The
+    gate is held by the test, and moving the clock back inside the TTL stands in for a publish.
 
-    assert jwks_mod.DEFAULT_JWKS_GATE_WAIT_SECONDS == DEFAULT_IDP_TIMEOUT_SECONDS
+    REDS without that read: the lookup is then refused although the key is current."""
+    state = _Warm(rsa_key, b"", at=4000.0, gate_wait=0.2)
+    cache = state.cache
+    results: dict[str, object] = {}
+    assert cache._gate.acquire(timeout=10)  # stands in for a refresh holding it across a fetch
+    try:
+        state.ticked.clear()
+        waiter = _run_lookup(cache, "k1", results, "waiter")
+        assert state.ticked.wait(timeout=10), "the lookup never entered the cache"
+        state.now[0] = 100.0  # k1 is within its TTL again, as if a refresh had just published it
+        waiter.join(timeout=10)
+    finally:
+        cache._gate.release()
+    assert not waiter.is_alive(), "the lookup never finished"
+    assert results["waiter"] is state.warm
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, -1.0, float("nan"), float("inf"), threading.TIMEOUT_MAX * 2, True, "10"],
+    ids=["zero", "negative", "nan", "inf", "past-timeout-max", "bool", "text"],
+)
+def test_the_cache_refuses_a_gate_wait_it_cannot_honour(value: float) -> None:
+    """BACKLOG #6905. Zero would refuse every lookup that meets a refresh, and past
+    ``threading.TIMEOUT_MAX`` ``Lock.acquire`` itself refuses; neither is clamped."""
+    with pytest.raises(ValueError, match="gate_wait_seconds") as refused:
+        oidc.JwksCache(lambda: b"", gate_wait_seconds=value)
+    assert "value withheld" in str(refused.value)
 
 
 @pytest.mark.parametrize("field", ["ttl_seconds", "min_refetch_seconds"])
