@@ -1658,8 +1658,13 @@ count is above `0` (vault BACKLOG #2613).
   sent for assistance over https that verifies the endpoint's certificate, and its handshake
   checks no OCSP. **It checks no CRL unless all three of these hold** (BACKLOG #5527):
   `[tls].crl_file` is set; the `[tls]` section reaches the app serving `POST /ai/chat`; and the
-  endpoint's host is not loopback as `is_loopback_hop_host` in `config/tls_policy.py` reads it,
-  which says which spellings count; at least `localhost.` reads as remote and gets the CRL.
+  endpoint's host is not loopback as `is_loopback_hop_host` in `config/tls_policy.py` reads it.
+  That reads the host as spelled, not where the endpoint runs: at least a spelling with a
+  trailing dot, such as `localhost.`, or a short form such as `127.1` reads as remote, so an
+  endpoint on this machine spelled that way gets the CRL and, without one, the refusal below.
+  That predicate's docstring lists `[::1]` as remote, but that is its raw input: the broker hands
+  it the URL's host with the brackets stripped, so an endpoint URL holding `[::1]` reads as
+  loopback. In this entry, "loopback" means this reading.
   `messagefoundry serve`
   hands its app that section. An embedder's `create_managed_app` holds none unless it passes a
   `TlsSettings` as `tls_settings`. A direct `create_app` (the embedded path) holds none unless its
@@ -1678,11 +1683,13 @@ count is above `0` (vault BACKLOG #2613).
   `[tls].crl_file` is checked on this hop where the first bullet says, for example an off-box
   endpoint on an engine started by `serve`, and there it is the other way across under
   `enforce`, so prefer it where you hold the CRL of the endpoint certificate's
-  issuer. It is instance-wide: once set, an off-box endpoint it reaches whose issuer has no CRL
+  issuer. It is instance-wide: once set, a non-loopback endpoint it reaches whose issuer has no CRL
   in that file fails its handshake, and this flag does not change that.
   For an endpoint under a public CA you hold no CRL for, a short-lived endpoint certificate is the
   main honest basis; put its lifetime in the reason. A gateway on this machine that checks the
-  upstream's revocation itself needs no attestation at all: a loopback endpoint is not refused.
+  upstream's revocation itself needs no attestation when the endpoint URL spells its host as
+  loopback, in the first bullet's reading: a loopback endpoint is not refused. Spelled with a
+  trailing dot or a short form, the same gateway is refused like an off-box endpoint.
 - **What it cannot do:** it never lifts the broker's other refusals, at least an `http` endpoint,
   an endpoint missing from `[ai].allowed_endpoints`, and credentials in the URL. The process-wide
   `MEFOR_TLS_REVOCATION_ATTESTED` does **not** cross this hop under an enforcing or unknown
@@ -1697,7 +1704,7 @@ count is above `0` (vault BACKLOG #2613).
   whatever `[ai].mode` is.
 - **At load:** the flag without a reason, a blank reason, a reason without the flag, or a reason
   holding a control character or a lone surrogate is refused when the settings load.
-- **Reversible:** yes. Delete both lines and restart. An off-box endpoint then refuses again,
+- **Reversible:** yes. Delete both lines and restart. A non-loopback endpoint then refuses again,
   unless a set `[tls].crl_file` is checked on it, where the first bullet says (BACKLOG #5527):
   that hop crosses on its CRL, with or without this pair.
 

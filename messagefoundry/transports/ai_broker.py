@@ -122,17 +122,16 @@ _AI_HOP_CELL = "[ai] engine AI broker (verified TLS, no revocation check)"
 _AI_HOP_CELL_OTHER = "[ai] engine AI broker (verified TLS)"
 
 #: The ways across that refusal under an enforcing posture where no CRL can reach the hop: the
-#: attestation pair, or an endpoint the refusal reads as on-box: the host :func:`hop_url_host`
-#: takes from the URL (brackets stripped) read by ``is_loopback_hop_host``, whose "A limit"
-#: paragraph lists spellings it reads as remote. So the remedy names spellings that read as on-box
-#: rather than "this machine". Each remedy is written out in full, with no text made from another,
+#: attestation pair, or an endpoint the refusal reads as on the box, as
+#: :func:`_refuse_an_unrevoked_ai_hop` states that reading. So the remedy names spellings that
+#: read as on the box rather than "this machine". Each remedy is written out in full, with no text made from another,
 #: so a grep for its opening words finds it (BACKLOG #5527 item 13).
 _AI_ATTESTATION_LEVER = (
     "Set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], listed in [ai].allowed_endpoints; a spelling with a trailing "
-    "dot, or a short form such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints; at least a "
+    "spelling with a trailing dot, or a short form such as 127.1, reads as remote."
 )
 
 #: The ways across that refusal under an enforcing posture, on the terms below:
@@ -150,8 +149,8 @@ _AI_CRL_LEVER = (
     "or its handshake fails), or set [ai].endpoint_revocation_attested = true with an "
     "[ai].endpoint_revocation_attested_reason that says what covers revocation of the AI "
     "endpoint's certificate, or use an endpoint URL whose host reads as loopback here, such as "
-    "localhost, 127.0.0.1 or [::1], listed in [ai].allowed_endpoints; a spelling with a trailing "
-    "dot, or a short form such as 127.1, reads as remote."
+    "localhost, 127.0.0.1 or [::1], with its host listed in [ai].allowed_endpoints; at least a "
+    "spelling with a trailing dot, or a short form such as 127.1, reads as remote."
 )
 
 
@@ -185,8 +184,10 @@ def _first_crossing(kind: str, host: str) -> bool:
 
 class AiBrokerError(ValueError):
     """The engine broker is mis-configured (at least: missing endpoint/key, an endpoint outside the SSRF
-    allowlist, a cleartext-http endpoint, which always carries the key, or an off-box endpoint the
-    revocation guard refuses) or the provider call failed. Raised with a PHI-/secret-safe
+    allowlist, a cleartext-http endpoint, which always carries the key, or an endpoint the
+    revocation guard refuses because its host does not read as loopback, which can be one on this
+    machine: :func:`_refuse_an_unrevoked_ai_hop` says which spellings read so) or the provider call
+    failed. Raised with a PHI-/secret-safe
     message (redacted host + status only) so it can surface as a clean API error without leaking the
     prompt, the response, or the key."""
 
@@ -306,7 +307,14 @@ def _refuse_an_unrevoked_ai_hop(
     guard uses, asked through ``RevocationHopGuard.capture(...).disposition()``, with these inputs:
 
     * **On the box** is :func:`~messagefoundry.config.tls_policy.is_loopback_hop_host` on the
-      endpoint's host. Every opener dials a loopback host direct, whatever proxy it has (vault
+      host :func:`~messagefoundry.config.tls_policy.hop_url_host` takes from the endpoint URL.
+      This is the one statement of the reading the refusal and its remedies use. It reads the
+      host as spelled, not where the endpoint runs, so "not on the box" means the host does not
+      read as loopback, not that the endpoint is off this machine: at least a spelling with a
+      trailing dot, such as ``localhost.``, or a short form such as ``127.1`` reads as remote and
+      is refused, though it may name this machine. ``[::1]``, which that predicate's own
+      docstring lists as remote, is its raw input; the URL host comes with the brackets
+      stripped, so an endpoint URL holding ``[::1]`` reads as on the box. Every opener dials a loopback host direct, whatever proxy it has (vault
       BACKLOG #2579), so a proxy does not move a loopback endpoint off the box.
     * ``revocation_attested`` goes in the per-hop ``attested`` slot. It is
       ``[ai].endpoint_revocation_attested``, which load refuses without a reason. Only the value
@@ -330,7 +338,7 @@ def _refuse_an_unrevoked_ai_hop(
       construction gate, so there is no ambient posture to read.
 
     **The three answers.** REFUSE raises :class:`AiBrokerError`, which the route answers 503.
-    WARN crosses and logs a WARNING that names the pair; that is an off-box, unattested hop on an
+    WARN crosses and logs a WARNING that names the pair; that is an unattested hop not on the box, as read above, on an
     instance whose ``[security].enforcement`` is ``warn``. ALLOW crosses; a hop that crossed an
     enforcing or unknown posture on its attestation logs a WARNING through
     ``tls_policy.log_attested_crossing``, with the reason. A hop on the box logs nothing, and

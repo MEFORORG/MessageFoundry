@@ -1223,7 +1223,10 @@ bind-guard ladder above:
     off-box hops above are then refused unless attested.
 
   **The AI-broker endpoint is gated the same way** (BACKLOG #2193, owner ruling 2026-10-27). An
-  off-box `[ai].endpoint` is refused under `enforce` unless a `[tls].crl_file` reaches it, as it
+  `[ai].endpoint` whose host does not read as loopback is refused under `enforce`, which can be a
+  gateway on this machine spelled with a trailing dot or a short form; the
+  `[ai].endpoint_revocation_attested` entry in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md)
+  says which spellings read as loopback. It is refused unless a `[tls].crl_file` reaches it, as it
   can since BACKLOG #5527 on an engine started by `messagefoundry serve`, or
   `[ai].endpoint_revocation_attested = true` is set with an
   `[ai].endpoint_revocation_attested_reason`. On that engine the broker also verifies the endpoint

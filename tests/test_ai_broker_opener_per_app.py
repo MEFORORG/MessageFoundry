@@ -200,8 +200,9 @@ def test_the_on_box_remedy_names_the_hosts_the_code_reads_as_loopback() -> None:
     near_misses = ("localhost.", "127.0.0.1.", "127.1")
     for lever in (ai_broker_mod._AI_ATTESTATION_LEVER, ai_broker_mod._AI_CRL_LEVER):
         assert "this machine" not in lever
-        assert "a spelling with a trailing dot, or a short form such as 127.1" in lever
+        assert "at least a spelling with a trailing dot, or a short form such as 127.1" in lever
         assert "whose host reads as loopback here, such as localhost, 127.0.0.1 or [::1]" in lever
+        assert "with its host listed in [ai].allowed_endpoints" in lever
     # Each host the remedy names builds under an enforcing posture, with no CRL or attestation.
     for host in named + also_loopback:
         _broker(
