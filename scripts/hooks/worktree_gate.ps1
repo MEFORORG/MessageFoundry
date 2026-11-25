@@ -918,13 +918,13 @@ function Get-ScanRawIndexMap($Seg) {
 }
 
 # $Raw from $Start up to the first match of $Split whose every character the shell reads as code, by
-# Get-QuoteStateMap's reading, or to the end of $Raw where none is. Rule 3d's quote-aware victim split
+# $Quote, Get-QuoteStateMap's reading of $Raw, or to the end of $Raw where none is. Rule 3d's quote-aware victim split
 # (BACKLOG #5643). Where Get-QuoteStateMap misreads a quote, the cut lands elsewhere; rule 3d only ADDS
 # the victims read from this text, so a misreading costs a false deny or a victim not read here, never a
 # deny the other splits make.
-function Get-CodeSplitPrefix([string]$Raw, [string]$Convention, [int]$Start, [string]$Split) {
-    if ($Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
-    $q = Get-QuoteStateMap $Raw $Convention
+function Get-CodeSplitPrefix([string]$Raw, $Quote, [int]$Start, [string]$Split) {
+    if ($null -eq $Quote -or $Start -lt 0 -or $Start -gt $Raw.Length) { return "" }
+    $q = $Quote
     foreach ($m in [regex]::Matches($Raw.Substring($Start), $Split)) {
         $at = $Start + $m.Index
         $code = $true
@@ -5133,6 +5133,18 @@ What to do instead:
         $oldEnd = $(if ($oldRawMatch.Success) { $oldRawMatch.Index + $oldRawMatch.Length } else { -1 })
         $oldWindow = $null
         $added = @()
+        # One quote map per segment, shared by every quote-aware split below, and none past the
+        # length Get-AddedCommandReadings also stops at ($maxRewrite there), where they add nothing.
+        $segQuote = $(if ($seg.Raw.Length -le 32768) { Get-QuoteStateMap $seg.Raw ([string]$seg.Conv) } else { $null })
+        # THE FIRST READING'S VICTIM, QUOTE-AWARE TOO (BACKLOG #5643, review round e8390625a8): its split
+        # cuts a quoted victim at a `;`, `&&`, `||` or `|` inside the quotes. The victims read off the
+        # text before the first separator the shell reads as code are ADDED to its own, so this runs
+        # even where Get-ScanRawIndexMap answers nothing and the added reading below is skipped.
+        if ($oldEnd -ge 0) {
+            foreach ($v in @(Get-WorktreeVictimTokens (Get-CodeSplitPrefix $seg.Raw $segQuote $oldEnd $wtVictimSplit))) {
+                if ($oldVictims -cnotcontains $v) { $oldVictims += $v }
+            }
+        }
         $map = Get-ScanRawIndexMap $seg
         if ($null -ne $map) {
             foreach ($sm in [regex]::Matches($seg.Scan, '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)')) {
@@ -5173,11 +5185,11 @@ What to do instead:
                 if ($sameAsOld) { $oldWindow = $win }
                 $a2 = ($seg.Raw.Substring($rawEnd) -split $wtVictimSplit, 2)[0]
                 # AND THE SAME SPLIT, QUOTE-AWARE (BACKLOG #5643 residual list, "the pre-splitters are
-                # not quote-aware"): both splits above cut a quoted victim at a `;`, `&&`, `}` or `)`
-                # inside its quotes, so `"<tmp>/x;y/../<wt>"` named `"<tmp>/x` and was ALLOWED. This one
-                # ends only at a separator the shell reads as code. ADDED beside the two, so a victim
-                # either of them names is still judged.
-                $a3 = Get-CodeSplitPrefix $seg.Raw ([string]$seg.Conv) $rawEnd $wtVictimSplit
+                # not quote-aware"): the split above cuts a quoted victim at a `;`, `&&`, `||`, `|`,
+                # `}`, `)` or lone `&` inside its quotes, so `"<tmp>/x;y/../<wt>"` named `"<tmp>/x` and
+                # was ALLOWED. This one ends only at a separator the shell reads as code. ADDED beside
+                # it, so a victim it names is still judged.
+                $a3 = Get-CodeSplitPrefix $seg.Raw $segQuote $rawEnd $wtVictimSplit
                 $seenHere = @()
                 foreach ($v in @(Get-WorktreeVictimTokens $a2) + @(Get-WorktreeVictimTokens $a3)) {
                     if ($seenHere -ccontains $v) { continue }
@@ -5295,10 +5307,15 @@ What to do instead:
         #     quote-aware scan runs. The added reading splits with $wtVictimSplit, defined above the
         #     segment loop, which also cuts at a `}`, `)` or lone `&`, so there a quoted path holding
         #     one of those is truncated too. NARROWED 2026-11-25 (BACKLOG #5643), NOT FIXED: the added
-        #     reading also reads the victims before the first separator Get-QuoteStateMap calls code
-        #     (Get-CodeSplitPrefix), so `"<tmp>/x;y/../<wt>"` is judged whole there. It runs only
-        #     where the added reading runs (Get-ScanRawIndexMap answers, and the invocation passes
-        #     its tests), and it shares that quoting model's misreadings.
+        #     reading, and the first reading too, also read the victims before the first separator
+        #     Get-QuoteStateMap calls code (Get-CodeSplitPrefix), so `"<tmp>/x;y/../<wt>"` is judged
+        #     whole. Not on a segment longer than 32768 characters, and it shares that quoting
+        #     model's misreadings. The victim TOKENIZER it feeds still misreads at least these, each
+        #     measured ALLOW on 2026-11-25 by review round e8390625a8: a word quoted only in part
+        #     (`"<tmp>/x;y"/../<wt>`, `"<tmp>/Primary-"wt2`), which it splits at the quote; a posix
+        #     `$'<wt>'`, read as a bare `$`; an unquoted escaped separator (`<tmp>/x\;y/../<wt>`),
+        #     whose backslash it keeps; and, under PowerShell, a `''` doubled inside a single-quoted
+        #     victim (`'<tmp>/x''s;y/../<wt>'`).
         #
         # All of these belong to the RESOLVER rather than to this rule; fixing them here would be the
         # fourth resolution rule in one file, which is what calling the shared helper exists to avoid.

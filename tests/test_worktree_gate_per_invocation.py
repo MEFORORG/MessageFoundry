@@ -306,7 +306,34 @@ def test_a_quoted_victim_holding_a_separator_is_read_whole(
     `|` rows). The `)` and `}` rows already deny there, through the first reading's split, which
     does not cut at those; they pin that."""
     cmd = template.format(tmp=rig.tmp.as_posix())
-    assert "worktree" in _reason(rig, cmd, rig.outside)
+    verb = "move" if " move " in cmd else "remove"
+    assert f"worktree {verb}" in _reason(rig, cmd, rig.outside)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        'git worktree remove "{tmp}/x;y/../Primary-wt2"',
+        "git worktree remove '{tmp}/x;y/../Primary-wt2'",
+        'git status ; git worktree remove "{tmp}/x;y/../Primary-wt2"',
+    ],
+)
+def test_a_quoted_victim_holding_a_separator_is_read_whole_under_powershell(
+    rig: SimpleNamespace, template: str
+) -> None:
+    """The same, under the PowerShell tool's quoting (review round e8390625a8). A `''` doubled
+    inside the single-quoted victim still allows: the victim tokenizer splits at it (residual)."""
+    cmd = template.format(tmp=rig.tmp.as_posix())
+    assert "worktree remove" in _reason_tool(rig, cmd, rig.outside)
+
+
+def test_a_quoted_victim_on_a_segment_with_no_scan_map_is_still_read_whole(
+    rig: SimpleNamespace,
+) -> None:
+    """The first reading reads the quote-aware victim itself, so it does not depend on the added
+    reading, which needs a git token at command position: here `sudo` stands before it."""
+    cmd = f'sudo git worktree remove "{rig.tmp.as_posix()}/x;y/../Primary-wt2"'
+    assert "worktree remove" in _reason(rig, cmd, rig.outside)
 
 
 @pytest.mark.parametrize(
