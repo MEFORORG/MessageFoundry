@@ -883,8 +883,9 @@ class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     refusal, or whose reading raises one of
     :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while a probe under the latest
     version answers a well-formed MAC naming another version (vault BACKLOG #6707). It also covers
-    a 400 whose probe answers no well-formed MAC, whatever the reply says (vault BACKLOG #6707
-    item 73): no evidence of a refused version, but a break at the row with its alert.
+    a 400 hvac raises as ``InvalidRequest`` whose probe answers no well-formed MAC, whatever the
+    reply's wording (vault BACKLOG #6707 item 73): no evidence of a refused version, but a break
+    at the row with its alert. Its text does not name that cause; the cipher's warning does.
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
     page, and that cannot be told apart from a tamper behind it. So this is a subclass: a handler

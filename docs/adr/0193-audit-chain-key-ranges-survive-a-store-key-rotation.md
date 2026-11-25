@@ -467,8 +467,8 @@ section 0): this is what the first deployment's first routine rotation would hav
    (corrected 2026-11-11, BACKLOG #6707). **[AMENDED 2026-11-24, vault BACKLOG #6707 item 73: the
    probe answer must now be a MAC `row_seal.transit_mac_version` accepts, naming a version other
    than the pinned one, for the refused label. At least an empty answer, one naming no version
-   and one that is not text give `AuditKeyVersionUnverifiedError` whatever the reply says, a break
-   at that row with the alert. A malformed answer starting `vault:v<pinned>:`, and one that is not
+   and one that is not text give `AuditKeyVersionUnverifiedError` whatever the wording of a 400
+   hvac raises as `InvalidRequest`, a break at that row with the alert. A malformed answer starting `vault:v<pinned>:`, and one that is not
    text, read as no refused version before this amendment. A probe that raises, or answers a
    well-formed MAC naming the pinned version, is no refused version. The words above are kept as
    decided.]** The walk records a
@@ -567,7 +567,11 @@ All against an in-process fake Transit client with key versions, never a real se
    `_refuses_only_version` reads as a refused version (2026-10-27 amendment, item 3, where "a
    pinned call" now reads as this verify call) raises `AuditKeyVersionRefusedError`, or
    `AuditKeyVersionUnverifiedError` where `_names_no_version_reason` does not read it as Vault's
-   own refusal, and is a break at that row with the alert. An outage `is_vault_unavailable` names
+   own refusal, and is a break at that row with the alert. **[AMENDED 2026-11-24, vault BACKLOG
+   #6707 item 73: a 400 whose probe answers no well-formed MAC also gives
+   `AuditKeyVersionUnverifiedError`, without reading the reply, and is a break at that row with
+   the alert; it is no evidence of a refused version. The 2026-10-27 amendment, item 3, says which
+   answers do.]** An outage `is_vault_unavailable` names
    raises a plain `CipherError`, and the walk could not run (`_settled_verify_failure`). A failure of the
    verify call that is neither a refused version nor an outage `is_vault_unavailable` names is
    checked by `_recheck_refused_row` once the handler has let go of it (BACKLOG #2720): a

@@ -1274,12 +1274,13 @@ class TransitCipher(_UnmarkedPolicy):
         key itself is missing, so a probe under the latest version, over FIXED input, must succeed
         too. Fixed input keeps a row's own content from deciding the answer. A probe answering a
         MAC :func:`~messagefoundry.store.row_seal.transit_mac_version` accepts, naming a version
-        other than ``key_version``, reads ``"version"``. A probe answering anything else that is
-        no such MAC, at least an empty, versionless or non-text one, reads ``"malformed"`` (vault
-        BACKLOG #6707 item 73): no evidence that Transit refused the version, but the caller
-        still reads it as a break at the row. Such an answer was a break before item 73 too,
-        except a text one starting ``vault:v<key_version>:`` or a non-text one, which could not
-        run. A well-formed answer naming ``key_version``, or a probe that raises, reads ``""``.
+        other than ``key_version``, reads ``"version"``. A well-formed MAC naming ``key_version``,
+        or a probe that raises, reads ``""``. Any answer that is no well-formed MAC, at least an
+        empty, versionless or non-text one, reads ``"malformed"`` (vault BACKLOG #6707 item 73): no
+        evidence that Transit refused the version, but the caller still reads it as a break at the
+        row. Before item 73 such an answer was a break too, except a text one starting
+        ``vault:v<key_version>:`` or a non-text one, which went to the fixed-input recheck and
+        raised plain :class:`CipherError`.
 
         This infers the cause from the reply; it does not read the key's version range. So a node
         whose copy of the key lags a rotation can refuse a real, newer version and still pass."""

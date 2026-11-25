@@ -10266,7 +10266,8 @@ async def settle_transit_bound_attestation(
     provider runs off the event loop, because it is a blocking Vault call. A cipher failure of
     that call reads as a gap, not an error, so a row anyone with DML wrote cannot stop a ``warn``
     start. A 400 whose reply's wording reads as a version refusal, while the probe under the
-    latest version answers a well-formed MAC, such as one for a version a forged hash names, says
+    latest version answers a well-formed MAC naming another version, such as one for a version a
+    forged hash names, says
     Transit refused the check; the code reads only that wording, which a proxy can imitate. At
     least a 400 not read as a version refusal, a 400 whose probe answers no well-formed MAC, and
     an outage that raises :class:`CipherError` say the MAC could not be checked (vault BACKLOG

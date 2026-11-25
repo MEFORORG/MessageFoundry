@@ -2340,7 +2340,8 @@ async def test_a_planted_genesis_version_whose_probe_answers_no_well_formed_mac_
 ) -> None:
     """Vault BACKLOG #6707 item 73, Lander hold 7133673869 on PR 3238: with the genesis row's
     version planted and a probe answering no well-formed MAC, the store still opens, logs an ERROR
-    naming the genesis row, and the walk reports the break at row 1, as on main."""
+    naming the genesis row, and the walk reports the break at row 1. Main did so for the first
+    three answers; for the last two it failed the open with a plain cipher error."""
     from messagefoundry.store.crypto import AuditKeyVersionUnverifiedError
 
     _needs_hvac()
