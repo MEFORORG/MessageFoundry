@@ -74,6 +74,8 @@ from messagefoundry.config.settings import (
     StorePrivilegeStatus,
     StoreSettings,
     _clamped_statement_timeout,
+    _sqlserver_shared_borrow_limit,
+    _sqlserver_statement_timeout_left,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -101,6 +103,7 @@ from messagefoundry.store.base import (
     SchemaLockTimeout,
     SchemaNotProvisionedError,
     SchemaProvisionResult,
+    StoreAcquireTimeout,
     StoreNotFoundError,
     TableCensusIncomplete,
     acquire_pooled,
@@ -6582,37 +6585,71 @@ class SqlServerStore:
         return await self._fetch_rows(sql, params)
 
     def _clamp_bounds(
-        self, timeout_clamp: float | None
+        self, timeout_clamp: float | None, *, share_deadline: bool = False
     ) -> tuple[AbstractAsyncContextManager[Any], int | None, float | None]:
         """``(borrow, statement timeout, rollback bound)`` for one statement. ``timeout_clamp`` is
         ``None`` for every caller outside the SQL Server cluster coordinator, and ``None`` keeps the :meth:`_acquire` borrow and ``[store].command_timeout``. One value sets
         the borrow, the statement and the rollback bounds, so none can be set without the others; a
         shorter ``[store].command_timeout`` still ends the statement first, and bounds neither of
-        the other two."""
+        the other two. With ``share_deadline`` the statement timeout is only a cap, which
+        :meth:`_statement_timeout_left` cuts to what the borrow left (BACKLOG #5064)."""
         if timeout_clamp is None:
             return self._acquire(), None, None
         # The borrow is floored at 1 s like the statement, so a sub-second clamp runs as 1 s on
         # both, as the coordinator's warning says, and a 0 clamp never refuses every borrow. The
         # rollback after a failure gets the same floored clamp (BACKLOG #5066).
         floored_clamp = max(1.0, timeout_clamp)
+        borrow_limit = (
+            _sqlserver_shared_borrow_limit(timeout_clamp) if share_deadline else floored_clamp
+        )
         return (
-            self._acquire_clamped(floored_clamp),
+            self._acquire_clamped(borrow_limit),
             _clamped_statement_timeout(timeout_clamp, self._settings.command_timeout),
             floored_clamp,
         )
 
+    @staticmethod
+    def _statement_timeout_left(timeout_clamp: float, statement_cap: int, started: float) -> int:
+        """The statement timeout of a statement whose borrow and statement share the clamp's
+        deadline, given the ``perf_counter()`` taken before its borrow: the whole seconds the borrow
+        left (:func:`~messagefoundry.config.settings._sqlserver_statement_timeout_left`). Raises
+        :class:`StoreAcquireTimeout` when the borrow left less than the 1 s a statement needs, so
+        the statement is never issued past the deadline; a renew refused here extends nothing
+        (BACKLOG #5064). The message stays inside ``safe_exc``'s default limit."""
+        elapsed = perf_counter() - started
+        seconds = _sqlserver_statement_timeout_left(timeout_clamp, elapsed, statement_cap)
+        if seconds is None:
+            raise StoreAcquireTimeout(
+                f"sqlserver: pool wait left under 1s of a {max(1.0, timeout_clamp):g}s clamp;"
+                f" statement not issued; retune with {CLAMPED_BORROW_ADVICE}"
+            )
+        return seconds
+
     async def _fetch_rows(
-        self, sql: str, params: tuple[Any, ...], timeout_clamp: float | None = None
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        timeout_clamp: float | None = None,
+        *,
+        share_deadline: bool = False,
     ) -> list[dict[str, Any]]:
         """The body of :meth:`_fetchall` and :meth:`_fetchone_clamped`; :meth:`_clamp_bounds`
         says what ``timeout_clamp`` sets. A failure of the pool release alone, after the commit,
         keeps the result, as :meth:`_write_rows` does: the lease claim and the config-version
         refresh are MERGEs that come through here, so a claim that committed must not read as a
         failed renew (BACKLOG #5064)."""
-        borrow, statement_timeout, floored_clamp = self._clamp_bounds(timeout_clamp)
+        borrow, statement_timeout, floored_clamp = self._clamp_bounds(
+            timeout_clamp, share_deadline=share_deadline
+        )
+        started = perf_counter()
         result: list[dict[str, Any]] | None = None
         try:
             async with borrow as conn:
+                if share_deadline and timeout_clamp is not None and statement_timeout is not None:
+                    # Before the try: a refusal here has issued nothing, so nothing to roll back.
+                    statement_timeout = self._statement_timeout_left(
+                        timeout_clamp, statement_timeout, started
+                    )
                 try:
                     async with (
                         self._statement_timeout(conn, statement_timeout),
@@ -6652,7 +6689,12 @@ class SqlServerStore:
         return rows[0] if rows else None
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[Any, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[Any, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> dict[str, Any] | None:
         """:meth:`_fetchone` bounded by ``timeout_clamp`` (ADR 0157 Inc 0). The cluster lease
         claim/renew and the config-version refresh are at least its callers (BACKLOG #5064);
@@ -6664,17 +6706,27 @@ class SqlServerStore:
         the floor, :meth:`_acquire_clamped` the minimum): a renew that waited out a saturated pool past the
         fence would otherwise still extend the lease after this node self-fenced. The statement's
         own timeout is :func:`_clamped_statement_timeout`, applied by :meth:`_statement_timeout`.
+        So a call can take up to about twice the clamp before its statement returns.
 
-        **Not the Postgres bound.** ``DbCoordinator``'s borrow and statement SHARE one deadline
-        (``pipeline.cluster._call_within``), so its renew is in flight for at most the clamp after
-        it is issued. Here they do not: the statement timeout counts whole seconds, so what a borrow
-        leaves of a 1 s clamp cannot be expressed. A renew can therefore land up to about twice the
-        clamp after it is issued, while ``ClusterSettings._renew_fits_the_margin`` compares the
-        clamp alone with the margin. The COMMIT after the statement is a call on the connection, not a
-        statement, so neither the clamp nor ``[store].command_timeout`` is known to bound it, by a
-        reading of pyodbc's documentation, not a measurement. Whether msodbcsql bounds
-        ``SQLEndTran`` needs a live SQL Server, and BACKLOG #6621 measures it; until then the COMMIT
-        is outside both windows (BACKLOG #5064 keeps that as a stated reason, not a bound).
+        **``share_deadline``, which only the lease claim passes (BACKLOG #5064),** puts the two
+        under one deadline, the clamp floored at 1 s from before the borrow, as
+        ``DbCoordinator``'s borrow and statement share one (``pipeline.cluster._call_within``). The
+        borrow waits at most
+        :func:`~messagefoundry.config.settings._sqlserver_shared_borrow_limit`, and the statement
+        timeout is then cut to the whole seconds the borrow left, or the statement is refused
+        (:meth:`_statement_timeout_left`). From a 2 s clamp up the statement timeout therefore
+        expires by the deadline. Under 2 s the whole-second timeout cannot fit after any borrow, so
+        it runs at 1 s and the claim can overrun the clamp by up to 1 s less its fraction.
+        ``ServiceSettings._sqlserver_renew_bounds`` still counts the two as separate windows. Only
+        the claim takes this because only it re-extends the lease; the heartbeat, refresh and
+        release keep both windows, so a busy pool fails them no sooner than before.
+
+        **Outside both windows, and outside the shared deadline:** at least the cursor's creation,
+        an executor dispatch between the borrow and the statement, and the COMMIT after it. The
+        COMMIT is a call on the connection, not a statement, so neither the clamp nor
+        ``[store].command_timeout`` is known to bound it, by a reading of pyodbc's documentation,
+        not a measurement. Whether msodbcsql bounds ``SQLEndTran`` needs a live SQL Server, and
+        BACKLOG #6621 measures it (BACKLOG #5064 keeps that as a stated reason, not a bound).
 
         **The ROLLBACK after a failure has its own bound (BACKLOG #5066):** the clamp floored at
         1 s, applied on the event loop by :meth:`_rollback_or_discard`. One that fails or runs past
@@ -6685,7 +6737,7 @@ class SqlServerStore:
         session keeps its open transaction, and the ``HOLDLOCK`` locks on ``leader_lease``, until
         its close lands or the server ends it, and the timed-out rollback keeps its executor thread
         until the driver returns."""
-        rows = await self._fetch_rows(sql, params, timeout_clamp)
+        rows = await self._fetch_rows(sql, params, timeout_clamp, share_deadline=share_deadline)
         return rows[0] if rows else None
 
     async def _execute(self, sql: str, params: tuple[Any, ...] = ()) -> int:
