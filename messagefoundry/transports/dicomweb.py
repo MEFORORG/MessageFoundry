@@ -529,10 +529,9 @@ def _warn_read_fault(fault: str, held: list[logging.LogRecord]) -> None:
     class name of a fault it does not wrap, so that object's data set UID is not compared (BACKLOG
     #5914). The fault's own text can carry a value, so it is not written (PHI-safe). With the first
     WARNING go the lines pydicom logged during that read, ``held``, through the DICOM transport's
-    default-deny screen (:func:`~messagefoundry.transports.dicom._write_held`): a line a pinned
-    template or value-free line matches is written, any value in it the screen does not keep read as
-    ``[redacted]``, and a line nothing pins is written withheld, none of its message kept.
-    Later reads' lines are dropped, as on a read that succeeds."""
+    default-deny screen (:func:`~messagefoundry.transports.dicom._write_held` says how), so a line
+    no template pins is written withheld, not redacted. Later reads' lines are dropped, as on a read
+    that succeeds."""
     if not _first_pre_read_warning("read"):
         return
     _write_held(held)
@@ -569,12 +568,13 @@ def _data_set_instance_uid(obj: bytes) -> tuple[str | None, bool]:
     C-STORE and each SCU association put it back. With the extra found, the SCU's ignore is put back
     next: one ``warnings`` filter for every warning attributed to a pydicom module, since pydicom's
     ``warn_and_log`` raises a warning with the same text as its log line, value included. pydicom's
-    log lines from the parse are held, as the SCP holds its reads' lines
-    (:func:`~messagefoundry.transports.dicom._logs_held`), and written only with that first WARNING,
-    through the same default-deny screen as the SCP's: a pinned line is written with any value the
-    screen does not keep read as ``[redacted]``, and a line nothing pins is written withheld.
-    Otherwise none is written, since the object is sent as bytes and a line on how pydicom read it
-    says nothing about the send. pydicom's own copy of such a line as a Python warning is not held;
+    log lines from the parse, on the loggers the DICOM transport's filter is on, are held, as the
+    SCP holds its reads' lines (:func:`~messagefoundry.transports.dicom._logs_held`), and written
+    only with that first WARNING, through the same default-deny screen as the SCP's
+    (:func:`~messagefoundry.transports.dicom._write_held`); otherwise none is written, since the
+    object is sent as bytes and a line on how pydicom read it says nothing about the send. A line
+    on another pydicom logger is not held: the record factory screens it and it is written as it
+    is logged. pydicom's own copy of such a line as a Python warning is not held;
     that ignore drops it, where it is in force. A parse failure is logged by exception class only,
     never the UID or the bytes (PHI-safe)."""
     _install_record_screen()  # a host may have replaced the record factory since the import

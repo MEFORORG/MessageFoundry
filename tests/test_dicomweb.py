@@ -1377,19 +1377,25 @@ async def test_dicomweb_the_pre_read_drops_its_held_lines_on_the_other_exits(
 
 
 async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # A host that replaced the log record factory after the import has it put back before the
-    # DICOMweb read, as the SCP start, each C-STORE and each SCU association do, so a pydicom logger
-    # with no filter on it is screened during the read too (BACKLOG #6637).
+    # DICOMweb read, over the host's own, as the SCP start, each C-STORE and each SCU association
+    # do, so a pydicom logger with no filter on it is screened during the read too (BACKLOG #6637).
     pytest.importorskip("pydicom")
     from messagefoundry.transports import dicom as dicom_module
     from messagefoundry.transports import dicomweb
 
     in_force: list[object] = []
+    unlisted = "pydicom.unlisted_probe_6637"
+    assert unlisted not in dicom_module._FILTERED_LOGGERS  # control: no filter on it
+
+    def host(*args: object, **kwargs: object) -> logging.LogRecord:
+        return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
 
     def parse(data: bytes) -> object:
         in_force.append(logging.getLogRecordFactory())
+        logging.getLogger(unlisted).warning("synthetic unlisted line PAYLOAD-MARKER-6637")
         raise DicomPeekError("synthetic parse failure")
 
     monkeypatch.setattr(dicomweb, "_dicom_extra_installed", lambda: True)
@@ -1397,13 +1403,20 @@ async def test_dicomweb_the_pre_read_puts_a_replaced_record_factory_back(
     dest = _dest()
     dest._opener = _FakeOpener(body=STORED_OK.encode(), status=200)  # type: ignore[assignment]
     original = logging.getLogRecordFactory()
+    caplog.clear()
     try:
-        logging.setLogRecordFactory(logging.LogRecord)
-        assert await dest.send(PAYLOAD) is None
+        logging.setLogRecordFactory(host)
+        with caplog.at_level(logging.WARNING):
+            assert await dest.send(PAYLOAD) is None
     finally:
         logging.setLogRecordFactory(original)
     assert len(in_force) == 1  # control: the read ran
-    assert isinstance(in_force[0], dicom_module._ScreeningRecordFactory)
+    factory = in_force[0]
+    assert isinstance(factory, dicom_module._ScreeningRecordFactory)
+    assert factory._previous is host  # the host's factory is wrapped, not dropped
+    assert [r.getMessage() for r in caplog.records if r.name == unlisted] == [
+        f"{unlisted} WARNING {dicom_module._LINE_WITHHELD}"
+    ]
 
 
 def test_dicomweb_the_pre_read_object_does_warn_through_pydicom(

@@ -882,10 +882,9 @@ def _raised_at(exc: BaseException) -> str:
 
 def _write_held(held: list[logging.LogRecord]) -> None:
     """Write records :func:`_logs_held` held, through each logger's filter, which now screens them
-    (:func:`_screen_record`) rather than holding them: a line :func:`_screened_line` keeps is
-    written as it returns it, any value it does not keep read as :data:`_REDACTED`, and any other
-    line is written withheld: its logger, its level, :data:`_LINE_WITHHELD` and any exception's
-    class, none of its message."""
+    with :func:`_screen_record` rather than holding them. So a line :func:`_screened_line` keeps is
+    written as it returns it, and any other line is written withheld, not redacted; docs/DICOM.md,
+    *The rule, stated once here*, says what a withheld line and a screened traceback keep."""
     for record in held:
         logging.getLogger(record.name).handle(record)
 
@@ -938,8 +937,8 @@ def _read_command_set(command_set: bytes) -> tuple[int, bool, bool] | None:
     not valid. Otherwise pynetdicom writes its own as it reads the message, so one the association
     ends on later for another reason, such as a data set past its bound or the message deadline,
     has none of them; the end's own line says why it ended. :class:`_PeerValueFilter` screens each
-    line as :func:`_write_held` says: a pinned line loses a peer's value it does not keep, and a
-    line nothing pins is written withheld (vault BACKLOG #5081, BACKLOG #6637)."""
+    line as :func:`_write_held` says, so a line nothing pins is written withheld, not redacted
+    (vault BACKLOG #5081, BACKLOG #6637)."""
     from pynetdicom.dimse_messages import _MESSAGE_TYPES, DIMSEMessage
     from pynetdicom.dsutils import decode
 
