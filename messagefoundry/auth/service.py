@@ -6955,12 +6955,23 @@ class AuthService:
         * py_webauthn's own counter-regression rejection is a clone signal (ADR 0068 decision 4).
         * Any other refusal is audited ``auth.webauthn_failed`` only when ``audit_bad_signature``."""
         try:
+            public_key: bytes | None = self._b64url_decode(cred.public_key)
+        except ValueError:
+            # BACKLOG #6886. A stored key that is not base64url (a length one past a multiple of
+            # four, or non-ASCII text; ``binascii.Error`` is a ``ValueError``) escaped as an
+            # unhandled error. It will never sign in either, so it takes the refused-key path
+            # below. Decoded apart from the verify, so a ``ValueError`` the verify raises is not
+            # read as the stored key's.
+            public_key = None
+        try:
+            if public_key is None:
+                raise webauthn.StoredKeyRefusedError("the stored credential key is not base64url")
             return webauthn.verify_assertion(
                 response_json=response_json,
                 challenge=challenge,
                 rp_id=rp_id,
                 origin=origin,
-                public_key=self._b64url_decode(cred.public_key),
+                public_key=public_key,
                 current_sign_count=cred.sign_count,
             )
         except webauthn.StoredKeyRefusedError:

@@ -12,6 +12,7 @@ here is real: the in-repo soft authenticator drives py_webauthn's own verify fun
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -38,7 +39,11 @@ from messagefoundry.auth.service import (  # noqa: E402
     lockable_account_census,
 )
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
-from messagefoundry.store.store import MessageStore, PasskeyRowMalformed  # noqa: E402
+from messagefoundry.store.store import (  # noqa: E402
+    MessageStore,
+    PasskeyRowMalformed,
+    WebAuthnCredential,
+)
 from tests._admin_account import login_admin  # noqa: E402
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
@@ -612,6 +617,37 @@ async def test_a_valid_assertion_beside_a_wrong_password_counts_on_the_second_st
         assert user.second_step_locked_until is not None
         out = await service.login(identity.username, password, passkey=_proof(service, auth))
         assert not out.ok, "the second-step lock did not refuse the combined passkey sign-in"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("stored", ["AAAAA", "éééé"], ids=["one-past-four", "non-ascii"])
+async def test_an_undecodable_stored_key_refuses_the_combined_sign_in(
+    monkeypatch: pytest.MonkeyPatch, stored: str
+) -> None:
+    """BACKLOG #6886, the sign-in leg. RED when: a stored key ``base64.urlsafe_b64decode`` cannot
+    read raises out of :meth:`AuthService.login` (whose assertion check "never raises for bad
+    input") instead of refusing. On this keyless store no digest check reads the key first. The
+    refusal is the ``stored_key_refused`` row the key rule writes, deferred with the sign-in's own
+    refused row; the right password does not sign the account in past it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, identity, password, auth = await _passkey_owner(store)
+        real_list = store.list_webauthn_credentials
+
+        async def undecodable(user_id: str) -> list[WebAuthnCredential]:
+            return [
+                dataclasses.replace(cred, public_key=stored) for cred in await real_list(user_id)
+            ]
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        marker = len(await store.list_audit(limit=500))
+        out = await service.login(identity.username, password, passkey=_proof(service, auth))
+        assert not out.ok and out.token is None
+        rows = await _audit_rows(store, marker)
+        refused = [json.loads(d) for a, d in rows if a == "auth.webauthn_failed"]
+        assert refused == [{"reason": "stored_key_refused", "label": "key"}], rows
+        assert stored not in json.dumps(rows)
     finally:
         await store.close()
 

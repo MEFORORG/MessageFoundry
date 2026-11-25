@@ -472,6 +472,50 @@ async def test_a_stored_key_registration_would_refuse_fails_sign_in_audited(
         await store.close()
 
 
+#: Stored keys ``base64.urlsafe_b64decode`` cannot read: a length one past a multiple of four
+#: (``binascii.Error``), and non-ASCII text (``ValueError``). Synthetic, and neither is a key.
+_UNDECODABLE_KEYS = ("AAAAA", "éééé")
+
+
+@pytest.mark.parametrize("stored", _UNDECODABLE_KEYS, ids=["one-past-four", "non-ascii"])
+async def test_an_undecodable_stored_key_is_a_refused_key_on_the_second_factor_leg(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stored: str
+) -> None:
+    """BACKLOG #6886. RED when: a stored key that is not base64url raises out of
+    :meth:`AuthService.finish_webauthn_assertion` instead of being refused. Such a key will never
+    sign in, so it takes the refused-key path: the caller's one refusal, the WARNING naming the
+    label, and the ``stored_key_refused`` row, with nothing of the key in the log or the row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        auth, token = await _enroll(service, identity, token)
+        real_list = store.list_webauthn_credentials
+
+        async def undecodable(user_id: str) -> list[WebAuthnCredential]:
+            return [
+                dataclasses.replace(cred, public_key=stored) for cred in await real_list(user_id)
+            ]
+
+        monkeypatch.setattr(store, "list_webauthn_credentials", undecodable)
+        with caplog.at_level(logging.WARNING, logger=_SERVICE_LOG):
+            refused = await _finish_assertion(service, token, auth)
+        assert refused == Elevation(), "the caller must see the same refusal as a bad signature"
+        warned = _stored_key_warnings(caplog)
+        assert len(warned) == 1 and "'test key'" in warned[0], warned
+        assert stored not in caplog.text
+        events = await service.security_events_for(identity.username)
+        failed = [e for e in events if e["action"] == "auth.webauthn_failed"]
+        assert len(failed) == 1
+        assert json.loads(failed[0]["detail"]) == {
+            "reason": "stored_key_refused",
+            "label": "test key",
+        }
+        assert "auth.webauthn_verified" not in [e["action"] for e in events]
+    finally:
+        await store.close()
+
+
 async def test_a_bad_signature_is_not_audited_as_a_refused_stored_key(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
