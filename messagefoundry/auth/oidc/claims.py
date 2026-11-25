@@ -11,7 +11,7 @@ gate (``amr``/``acr``), which is BACKLOG #99(g)'s real control.
 Every rejection is a :class:`ClaimsError` carrying a **closed-set reason slug** (:data:`REASONS`) — the
 browser layer maps that slug to an allow-listed error code and audits it, never reflecting IdP text.
 The engine verifies what the IdP **asserts**, cryptographically; it does not and cannot prove the IdP
-*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the claimed username
+*enforced* MFA. The success value is a :class:`FederatedPrincipal` carrying the username
 (which selects no account), ``sub``, the evidence recorded in the audit, and the verified ``exp``
 and ``auth_time`` the engine session is capped by.
 """
@@ -117,17 +117,21 @@ class OidcClaimPolicy:
 @dataclass(frozen=True, slots=True)
 class FederatedPrincipal:
     """The verified outcome of a federated login: the ``(issuer, sub)`` pair that selects the local
-    account, the claimed username, the evidence folded into the ``auth.login_success`` audit detail,
-    and the verified ``exp`` and ``auth_time``.
+    account, the username, the evidence folded into the ``auth.login_success`` audit detail, and the
+    verified ``exp`` and ``auth_time``.
+
+    ``username`` is the username claim with its UPN suffix removed while ``username_strip_domain``
+    is on (the default), so ``jdoe@corp.example`` becomes ``jdoe``; with stripping off it is the
+    claim verbatim.
 
     ``username`` selects no account. The relying party selects the account by the non-reassignable
     ``(issuer, subject)`` pair alone (ADR 0184), refuses a pair no account is bound to (only the
-    administrative binding surface binds one), and carries the claimed username into that refusal's
+    administrative binding surface binds one), and carries this ``username`` into that refusal's
     audit row as a hint. The ladder still refuses at least a token whose username claim is missing.
     Only while ``username_strip_domain`` is on does it also refuse at least a claim with no suffix,
     an empty local part, or a suffix off the allow-list; with it off the claim is used verbatim and
-    no suffix is checked (:func:`_resolve_username` holds the full rule). A username is reassignable, so selecting by it would hand a
-    reassigned name the prior holder's account."""
+    no suffix is checked (:func:`_resolve_username` holds the full rule). A username is
+    reassignable, so selecting by it would hand a reassigned name the prior holder's account."""
 
     username: str
     subject: str

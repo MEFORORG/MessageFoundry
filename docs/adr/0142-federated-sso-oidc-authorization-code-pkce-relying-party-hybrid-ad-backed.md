@@ -144,10 +144,10 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
 - **AC-2** — WHEN a federated login completes, THE SYSTEM SHALL resolve roles from on-prem AD via
   `resolve_principal`, never from a token claim.
   → `tests/test_auth_oidc_service.py`
-- **AC-3** — IF the `id_token` fails any verification rung (declared token class via `typ`/`events`,
-  a `crit` header, signature, `iss`, `aud`/`azp`, `exp`/`iat` skew, required `sub`, `nonce`, `kid` unknown/ambiguous,
-  key below the floor), THEN THE SYSTEM SHALL refuse the login, mint no session, and audit a
-  closed-set reason slug.
+- **AC-3** — IF the `id_token` fails any verification rung (at least: declared token class via
+  `typ`/`events`, a `crit` header, signature, `iss`, `aud`/`azp`, `exp`/`iat` skew, required `sub`,
+  `nonce`, `kid` unknown/ambiguous, key below the floor), THEN THE SYSTEM SHALL refuse the login,
+  mint no session, and audit a closed-set reason slug.
   → `tests/test_auth_oidc.py`
 
   *Amended 2026-07-28 (ASVS 9.2.2).* The class rungs were added because an access token
