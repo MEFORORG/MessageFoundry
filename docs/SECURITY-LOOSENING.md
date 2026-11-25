@@ -229,6 +229,7 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 | | `[auth].login_rate_limit_enabled`, `login_rate_limit_per_ip`, `login_rate_limit_global`, `login_rate_limit_window_seconds` | `true` / `10` / `60` / `60` s (`false`, a count of `0` or above its default, or a window below `60` s is named, and `0` or a window of `0` or less turns a limit off) |
 | | `[auth].lockout_minutes`, `lockout_threshold`, `lockout_max_minutes` | `15` / `5` / `1440` (minutes below `15` or a ceiling below `1440` is named, and so is a threshold above `5`; minutes of `0` or less means no lock ever holds) |
 | | `[auth].phi_read_rate_limit_enabled`, `phi_read_rate_limit_per_actor`, `phi_read_rate_limit_window_seconds` | `true` / `120` / `60` s (`false`, a count of `0` or above `120`, or a window below `60` s) |
+| | `[auth].monitoring_read_rate_limit_enabled`, `monitoring_read_rate_limit_per_actor`, `monitoring_read_rate_limit_window_seconds` | `true` / `600` / `60` s (`false`, a count of `0` or above `600`, or a window below `60` s) |
 | | `[auth].admin_write_rate_limit_enabled`, `admin_write_rate_limit_per_actor`, `admin_write_rate_limit_window_seconds`, `admin_write_min_interval_seconds` | `true` / `12` / `15` s / `0.15` s (`false`, a count of `0` or above `12`, a window below `15` s, or a gap below `0.15` s) |
 | | `[auth].mfa_verify_min_elapsed_seconds`, `oidc_callback_min_elapsed_seconds` | `1.0` s / `1.0` s (*conditional* — the second a loosening only with OIDC on; a floor below `1.0` s, and `0` turns it off) |
 | | `[auth].oidc_callback_floor_exempt_amr` | `[]` (*conditional* — a loosening only with OIDC on and the callback floor on; any value listed) |
@@ -271,7 +272,8 @@ Earlier versions of this guide called this an open owner question. The 2026-10-2
 `[auth].ad_connect_timeout`, `[auth].ad_receive_timeout`,
 `[auth].ad_group_search_deadline`, `[auth].admin_new_ip_step_up`, `[auth].require_action_step_up`, the three
 `[auth].password_check_*` keys, the four `[auth].login_rate_limit_*` keys, the three `[auth].lockout_*`
-keys, the three named `[auth].phi_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
+keys, the three named `[auth].phi_read_rate_limit_*` keys, the three named
+`[auth].monitoring_read_rate_limit_*` keys, the four `[auth].admin_write_*` keys,
 `[auth].mfa_verify_min_elapsed_seconds`, `[auth].oidc_callback_min_elapsed_seconds`,
 `[auth].oidc_callback_floor_exempt_amr`,
 `[auth].max_sessions_per_user`, `[auth].oidc_flow_cache_max`,
@@ -1164,6 +1166,27 @@ count is above `0` (vault BACKLOG #2613).
   client can reach. Prefer a modest raise to turning it off, and put it back afterwards.
 - **Compensating controls:** keep sessions short, restrict the operator surface with
   `[security].allowed_client_networks`, and review the PHI-access audit rows.
+- **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
+
+### `[auth].monitoring_read_rate_limit_*` looser than its default — monitoring reads go less paced
+> No sign-in condition applies (vault BACKLOG #1191, ASVS 15.2.2). Named:
+> `monitoring_read_rate_limit_enabled = false`; a `monitoring_read_rate_limit_window_seconds` below
+> `60` s; a `monitoring_read_rate_limit_per_actor` of `0` (off) or above `600`. The window cannot be
+> `0` or less (the load refuses it). With the limiter off, its parts are not named again.
+> `monitoring_read_rate_limit_global` ships **off** (`0`), so no value of it is looser than the
+> default and it is never named.
+- **What you lose:** the per-account pace on six `monitoring:read` GETs of the JSON API
+  ([SECURITY.md](SECURITY.md), *Monitoring-read pacing*, names them). One signed-in account can make
+  the engine rebuild the wiring graph and scan the store through those routes faster, up to as fast
+  as it answers. With the pace on, some of that work stays reachable unpaced: the `/ws/stats`
+  socket runs the outbox counts on every frame, and where the web console is served
+  (`[security].serve_web_console` on) that socket also runs the `GET /connections` dashboard read,
+  and the console's in-process reads reach the paced handlers uncharged. That section, *What it
+  does not charge*, says how.
+- **When acceptable:** a monitoring tool on one known account that polls faster than the default
+  allows, on a host no untrusted client can reach. Prefer a modest raise to turning it off.
+- **Compensating controls:** keep sessions short, and restrict who reaches the API with
+  `[security].allowed_client_networks`.
 - **Reversible:** yes, immediately — restore the default (or delete the line) and restart.
 
 ### `[auth].admin_write_*` looser than its default — state-changing admin actions go less paced
@@ -2175,7 +2198,12 @@ count is above `0` (vault BACKLOG #2613).
 - **When acceptable:** during bring-up, while a DBA reduces the grant. Not as a steady state.
 - **It is never silent:** a WARN at every start naming each excess grant; a `store_privilege_preflight`
   audit row; a `store_principal_over_granted` entry here and in `GET /security/posture`, whose
-  `store_privilege` field carries the full observation.
+  `store_privilege` field carries the observation's status, excess list and detail. When the probe
+  also named grants it could not read, the entry lists them and says the excess list may be
+  incomplete (BACKLOG #6015). An entry without that clause is not proof the list is complete: at
+  least a failed SQL Server user-defined role enumeration is noted in the detail, and the audit
+  row's, rather than in the entry, and a SQL Server read with a fixed role unread skips that
+  enumeration without noting it.
 - **How it refuses:** by default under `enforce`. `[store].require_least_privilege = true`
   ([`CONFIGURATION.md`](CONFIGURATION.md)) makes the refusal outrank the opt-out and extends it to an
   unobservable probe. The refuse/warn split is `[security].enforcement`.

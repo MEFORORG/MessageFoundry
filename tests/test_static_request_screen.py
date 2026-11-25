@@ -119,11 +119,13 @@ def test_a_clean_token_url_passes_the_screen(
     assert provider._check_token_url("https://as.example.org/token", connection=None) == "https"
 
 
-def test_a_refused_lookup_leaves_no_crossing_record_from_an_earlier_lookup(
+def test_a_lookup_the_static_screen_refuses_runs_no_gate_for_an_earlier_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Step 11: every lookup is screened before any is built, so the first lookup's hop gates
-    never run when the second is refused."""
+    """Step 11: every lookup is screened before any is built, so the first lookup's proxy route
+    is never built when the second fails the static-request screen. Only that screen's refusal is
+    tested here; tests/test_fhir_lookup_gate_order.py covers a cleartext first lookup and the
+    other checks that run before any lookup is built (BACKLOG #8299 item 6)."""
     from messagefoundry.transports.rest import egress_route_from_settings as real
 
     built: list[str] = []
@@ -142,6 +144,15 @@ def test_a_refused_lookup_leaves_no_crossing_record_from_an_earlier_lookup(
             egress=_OPEN,
         )
     assert built == []
+    # The control: with a second lookup the screen passes, both proxy routes are built.
+    FhirLookupExecutor(
+        {
+            "first": {"url": "https://fhir.example.org/fhir"},
+            "second": {"url": "https://fhir.example.org/fhir/x"},
+        },
+        egress=_OPEN,
+    )
+    assert built == ["fhir_lookup:first", "fhir_lookup:second"]
 
 
 @pytest.mark.parametrize("kind", [ConnectorType.REST, ConnectorType.SOAP])

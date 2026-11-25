@@ -283,8 +283,8 @@ def _apply_owner_only_dacl(paths: list[str]) -> str | dict[str, str]:
     could not be, with the reason; an empty dict means every one was. The user is the SID in
     this process's own token, never a name or an environment variable, which another party could
     have set. Protected means no entry is inherited from the folder. Native calls rather than
-    ``icacls``: the tee imports nothing from ``messagefoundry``, whose ``_secure_file`` pins that
-    tool's path, and an API call has no program to plant.
+    ``icacls``: the tee imports nothing from ``messagefoundry``, and an API call has no program to
+    plant.
     """
     if sys.platform != "win32":
         return "an owner-only DACL is a Windows control"

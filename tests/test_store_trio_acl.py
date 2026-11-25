@@ -780,9 +780,8 @@ def test_a_store_directory_reached_through_a_junction_is_not_hardened(tmp_path: 
 def test_a_store_outside_a_hardened_directory_stays_owner_only(tmp_path: Path) -> None:
     # A developer checkout or a temp directory: the half of ADR 0163's property the fix keeps. The
     # directory is BUILT broad (the user plus BUILTIN\Users), not inherited from the runner's temp,
-    # and the file is reset to inherit it, so it starts with no explicit entry of any kind: the old
-    # owner-only rewrite leaves other principals' explicit entries in place (measured), which is a
-    # separate, pre-existing gap and not what this test is about.
+    # and the file is reset to inherit it, so it starts with no explicit entry of any kind: which
+    # explicit entries the owner-only rewrite keeps is tested in tests/test_store.py.
     me = _my_sid()
     data = tmp_path / "data"
     data.mkdir()
