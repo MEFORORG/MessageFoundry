@@ -3307,8 +3307,9 @@ class RetentionSettings(_Section):
     # (skipped, not attempted, when the volume lacks room) and the written archive is INTEGRITY-VALIDATED
     # (decompressed off disk and compared byte-for-byte) *before* the original is removed — a failed
     # validation always leaves the original in place. The archive inherits the source's mtime, so the
-    # `app_log_days` delete window still ages it out (that sweep extends to `*.log.gz`/`*.txt.gz` only
-    # while this window is on). Set this SHORTER than `app_log_days` — a longer window compresses nothing,
+    # `app_log_days` delete window still ages it out (that sweep extends to `*.log.gz`/`*.txt.gz`, and
+    # to a claimed `*.gz.<pid>-<ns>.mfclaim` the compressor left behind, only while this window is on).
+    # Set this SHORTER than `app_log_days` — a longer window compresses nothing,
     # because the delete sweep runs first and has already removed the file.
     # 0 = never compress (the default). A no-op unless ``[logging].log_dir`` is set.
     app_log_compress_days: int = 0
