@@ -2292,7 +2292,13 @@ class DicomScpSource(SourceConnector):
             max_object_bytes=self._max_object_bytes,
             min_message_bytes_per_second=self._min_message_bytes_per_second,
         )
-        server.start_serving()
+        try:
+            server.start_serving()
+        except BaseException:
+            # make_server has bound the port, and nothing else holds this server to close it,
+            # so a start whose accept loop cannot start (no thread) would keep the port held.
+            server.server_close()
+            raise
         self._ae = ae
         self._server = server
 

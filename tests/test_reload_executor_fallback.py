@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import socket
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -99,8 +100,11 @@ async def test_a_working_executor_runs_the_hop_off_the_loop() -> None:
     assert ran_on and ran_on[0] is not threading.current_thread()
 
 
-async def test_work_the_executor_cancels_while_queued_runs_on_a_thread_of_its_own() -> None:
+async def test_work_the_executor_cancels_while_queued_runs_on_a_thread_of_its_own(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """``shutdown(cancel_futures=True)`` cancels queued work; it runs on its own thread instead."""
+    caplog.set_level(logging.WARNING, logger=threadhop.__name__)
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     asyncio.get_running_loop().set_default_executor(pool)
     taken, release = threading.Event(), threading.Event()
@@ -118,6 +122,10 @@ async def test_work_the_executor_cancels_while_queued_runs_on_a_thread_of_its_ow
     release.set()
     assert (await asyncio.wait_for(queued, 5)).name == "threadhop-fallback"
     await blocker
+    assert (
+        "the executor never began the probe hop, so it runs on its own thread: "
+        "the executor cancelled the probe hop" in caplog.text
+    )
 
 
 # --- the hops a reload makes ---------------------------------------------------------------------
@@ -217,6 +225,40 @@ async def test_a_refused_dicom_start_still_starts_the_server(
     _refuse_default_executor()
     await source.start(object())  # type: ignore[arg-type]
     assert started == [True]
+
+
+async def test_a_dicom_start_with_no_thread_fails_and_releases_its_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no thread to start, the start runs on the loop and its accept loop cannot start, so
+    the start fails. make_server has bound the port by then, and the failed start closes it."""
+    pytest.importorskip("pynetdicom")
+    source = _scp()
+    monkeypatch.setattr(dicom, "require_receipt", lambda handler, *, source: handler)
+    built: list[Any] = []
+    admitting = dicom._admitting_server_class()
+
+    class Recording(admitting):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(dicom, "_admitting_server_class", lambda: Recording)
+    _refuse_default_executor()
+
+    def no_thread(self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", no_thread)
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            await source.start(object())  # type: ignore[arg-type]
+    (server,) = built
+    assert server.socket.fileno() == -1
+    assert source._server is None
+    port = server.server_address[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", port))  # refused with the port still held
 
 
 async def test_a_refused_reload_target_check_still_resolves(tmp_path: Path) -> None:
