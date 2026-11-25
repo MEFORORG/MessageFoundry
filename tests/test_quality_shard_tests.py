@@ -231,3 +231,98 @@ def test_check_collection_exits_by_what_pytest_collected(
         mod.main(["--suite", "engine", "--shard", "1", "--of", "2", "--check-collection"])
     with pytest.raises(SystemExit):
         mod.main(["--shard", "1", "--of", "2", "--", "-m", "x"])
+
+
+# --- the tooling suite (owner ruling 2026-11-24) --------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def tooling_shards() -> int:
+    """ci.yml's tooling shard count, read from its partition guard, which
+    tests/test_ci_tooling_gate.py holds to the windows-2025 legs' `of`. A fixture, so a drifted
+    guard line fails these tests rather than this module's collection."""
+    text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    counts = set(re.findall(r"shard_tests\.py --suite tooling --of (\d+) --check-collection", text))
+    assert len(counts) == 1, f"ci.yml's tooling guard reads {sorted(counts)}"
+    return int(counts.pop())
+
+
+@pytest.fixture(scope="module")
+def tooling(mod: ModuleType, tooling_shards: int) -> dict[int, list[str]]:
+    return mod.partition(tooling_shards, "tooling")
+
+
+def test_the_tooling_shards_partition_exactly_the_manifest(
+    mod: ModuleType,
+    files: list[str],
+    tooling: dict[int, list[str]],
+    engine: dict[int, list[str]],
+    tooling_shards: int,
+) -> None:
+    """Every manifest file in exactly one tooling shard, no other file in any, and the tooling and
+    engine suites disjoint, so no file runs on both tiers or on neither."""
+    manifest = mod.tooling_files()
+    listed = [f for shard in sorted(tooling) for f in tooling[shard]]
+    sizes = ", ".join(f"shard {n} {len(tooling[n])}" for n in sorted(tooling))
+    print(f"[shards] tooling: {sizes} files")
+    assert sorted(tooling) == list(range(1, tooling_shards + 1))
+    assert len(set(listed)) == len(listed), "a file is in two tooling shards"
+    assert set(listed) == manifest & set(files) == manifest
+    assert all(tooling.values()), "a tooling shard is empty"
+    engine_files = {f for shard in engine.values() for f in shard}
+    assert not engine_files & manifest
+
+
+def test_the_tooling_split_is_salted_and_the_salt_moves_it(mod: ModuleType) -> None:
+    """The salt is what balanced the split on the measured junit (TOOLING_SALT holds the numbers).
+    Pinned, as the coverage split's value is, so a dropped or changed salt reds here rather than as
+    a slow shard. The file is one of the tier's largest and one the salt moves: shard 2 unsalted.
+    Falsified by returning `shard_of(path, shards)` for the tooling suite: RED on the first
+    assertion. Restored."""
+    path = "tests/test_worktree_prune_merged.py"
+    assert mod.assign(path, 3, "tooling") == 3
+    assert mod.shard_of(path, 3) == 2
+    manifest = sorted(mod.tooling_files())
+    moved = [p for p in manifest if mod.assign(p, 3, "tooling") != mod.shard_of(p, 3)]
+    assert moved, "the salted split equals the unsalted one, so the salt does nothing"
+
+
+def test_main_prints_a_tooling_shard(
+    mod: ModuleType,
+    tooling: dict[int, list[str]],
+    tooling_shards: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", str(tooling_shards)]) == 0
+    assert capsys.readouterr().out.splitlines() == tooling[1]
+    assert mod.main(["--suite", "tooling", "--shard", "1", "--of", "1"]) == 0
+    assert sorted(capsys.readouterr().out.splitlines()) == sorted(mod.tooling_files())
+
+
+def test_check_collection_judges_the_tooling_suite(
+    mod: ModuleType, tooling: dict[int, list[str]], tooling_shards: int
+) -> None:
+    """The guard's verdicts on the tooling split, on a stubbed collection: a collected file outside
+    the manifest is a fault. That is a file carrying the `tooling` mark itself, the shape
+    tests/test_scan_forbidden_site_prefix_width.py had until the guard found it."""
+
+    def check(*answers: tuple[list[str], int]) -> int:
+        """Each call of the stub answers with the next (files, exit code) pair."""
+        queue = list(answers)
+
+        def run(*_a: object, **_k: object) -> subprocess.CompletedProcess[str]:
+            files, code = queue.pop(0)
+            out = "".join(f"{path}::test_x\n" for path in files)
+            return subprocess.CompletedProcess(args=[], returncode=code, stdout=out, stderr="")
+
+        result: int = mod.check_collection(tooling_shards, "tooling", ["-m", "tooling"], run=run)
+        assert not queue, "the stub was asked fewer times than expected"
+        return result
+
+    every = [f for shard in sorted(tooling) for f in tooling[shard]]
+    quiet, rest = every[0], every[1:]
+    assert check((every, 0)) == 0
+    assert check(([*every, "tests/test_quality_shard_tests_not_in_the_manifest.py"], 0)) == 1
+    # A manifest file the suite ignores but a shard's named path would run is a fault.
+    assert check((rest, 0), ([], 5)) == 0
+    assert check((rest, 0), ([quiet], 0)) == 1

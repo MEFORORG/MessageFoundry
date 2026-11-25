@@ -545,7 +545,8 @@ def test_restore_leaves_no_partial_store_when_the_copy_dies(
 
     monkeypatch.setattr(os, "link", _no_hard_links)
     # Patching copyfileobj globally reaches only _place_restored_store on this path: _extract_member
-    # uses its own read loop, and the plaintext branch is skipped for an encrypted archive.
+    # reads through dr_backup._read_chunks, which does not call copyfileobj, and the plaintext branch
+    # is skipped for an encrypted archive.
     monkeypatch.setattr(shutil, "copyfileobj", _die_mid_copy)
 
     rc = main(["restore", archive, "--to", str(dest), "--service-config", toml])

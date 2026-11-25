@@ -77,11 +77,13 @@ def alert_sink_for(state: Any) -> AlertSink:
     return sink if sink is not None else _FALLBACK_ALERT_SINK
 
 
-#: ``granted_by`` on the ``administrator_granted`` alert a directory sign-in raises (vault BACKLOG
-#: #2610): no administrator acted, the directory's group membership did. It is a fixed marker, styled
-#: like the ``<kerberos>`` audit actor. ``POST /users`` refuses the name (``auth/usernames.py``), but
-#: provision-admin and the directory create paths do not, so an account literally named
-#: ``<directory>`` could read the same in this field; the alert's ``via`` names the route either way.
+#: ``granted_by`` on the ``administrator_granted`` alert raised when the directory, not an
+#: administrator, grants Administrator: a directory sign-in (vault BACKLOG #2610) and the directory
+#: reconciler (``via=directory_reconcile``). It is a fixed marker, styled like the ``<kerberos>``
+#: audit actor. The new-username rule's ``<...>`` form covers it; which paths apply that rule, and
+#: what the rule still admits, ``auth/usernames.py`` states. An account named so by a path that skips
+#: the rule, or spelled to render the same, could read the same in this field; the alert's ``via``
+#: names the route either way.
 DIRECTORY_GRANTED_BY = "<directory>"
 
 
@@ -1484,7 +1486,9 @@ async def _recorded_decision(
     The audit chain has no drain (BACKLOG #1421); a refused route-body request writes at most two
     decision rows. For the step-up refusals of :func:`spend_step_up_action` and
     :func:`refuse_unless_step_up_window_live`, made in a route body after its gate admitted the
-    request, see :func:`_record_route_refusal`. Other refusals a route body makes after its gate
+    request, see :func:`_record_route_refusal`. For the monitoring-read 429 a gate holds for its
+    route body, with no grant row written, see :func:`raise_deferred_monitoring_refusal` and
+    :func:`record_deferred_monitoring_refusal`. Other refusals a route body makes after its gate
     admitted the request write no ``auth.gate_refused`` row. The reason comes from the
     :class:`_GateRefusal` the check raised. Any other exception leaves the block with no decision
     row from it, which is right for the :func:`_mfa_refusal` 403: it wrote its own
@@ -1519,7 +1523,8 @@ async def _record_gate_refusal(
 
 @dataclass(frozen=True)
 class _AdmittedDecision:
-    """What a ``proof_in_route`` gate admitted, kept for the refusal row its route body may owe."""
+    """What a ``proof_in_route`` gate admitted, kept for the refusal row its route body may owe.
+    :func:`require_monitoring_read` keeps one beside a 429 it holds for its route body."""
 
     auth: AuthService
     identity: Identity
@@ -1627,15 +1632,20 @@ async def refuse_from_new_address(request: Request) -> None:
     The step-up gates already asked this. The PHI reads and the paced writes did not, so on a
     first deployment a bearer token replayed from a second address would have read message bodies
     and started or stopped connections with no signal. Callers: :func:`require_phi_read`,
-    :func:`require_paced` and the HTTP reveal path in ``api/app.py`` (``_admit_reveal``). It gives
+    :func:`require_paced` and the HTTP reveal path in ``api/app.py``
+    (``_refuse_reveal_phi_read``, which ``_admit_reveal`` and ``GET /connections`` reach). It gives
     them the step-up gates' refusal: 403 + ``X-Step-Up-Required: 1``, cleared by a
     ``POST /me/reauth`` from the new address, which re-anchors the session. An ``oidc`` session is
     sent to the IdP step-up instead (:func:`_step_up_refusal`). A first sighting writes
     ``auth.new_address_reverify_required`` and a notice, deduped and capped per session as
     :meth:`AuthService.flag_new_client_ip` says.
 
-    It is NOT in :func:`require`, deliberately: the base gate carries the monitoring polls, and an
-    operator whose address changes behind a NAT pool would be refused on every one until a step-up.
+    It is NOT in :func:`require` or :func:`require_monitoring_read`, deliberately: those gates carry
+    the JSON API's repeated monitoring reads, and a JSON client whose address changes behind a NAT
+    pool, or behind a proxy not listed in ``[api].trusted_proxies``, would be refused on every one
+    until a step-up. The web console's in-process reads go through ``require_ui`` and reach neither
+    gate. A monitoring ``reveal`` read does ask, through ``_refuse_reveal_phi_read`` in
+    ``api/app.py``.
 
     Costs one session read per request while ``[auth].admin_new_ip_step_up`` is on, and one more
     on a refusal, to pick its wording. The gate has
@@ -1984,6 +1994,175 @@ def require_phi_read(*permissions: Permission) -> Callable[[Request], Awaitable[
         return identity
 
     return _gate(dependency, before_body)
+
+
+def require_monitoring_read(
+    *permissions: Permission,
+    defer_when_query: str | None = None,
+    defer_value_valid: Callable[[str], bool] | None = None,
+) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require`, plus a **per-actor pace** on six ``monitoring:read`` GETs (vault BACKLOG
+    #1191, ASVS 15.2.2). Five of them cost store or parse work per call: ``/graph/edges`` rebuilds
+    the wiring graph, and ``/status``, ``/stats``, ``/metrics`` and ``/connections`` read aggregates
+    whose cost grows with the store. ``/metrics/history`` copies an in-memory ring and reads no
+    store; it was put in the set because the console's Flow and trends page reads it beside
+    ``/graph/edges``. The console is not charged, though: it calls these handlers in process
+    through ``require_ui`` (``messagefoundry_webconsole/_auth.py``), so this dependency never runs
+    for it, and the pace on all six bounds JSON clients only. The six share one budget per
+    account, per API process. docs/SECURITY.md,
+    *Monitoring-read pacing*, says the default's basis.
+
+    Charged at ADMISSION, before the route does its work. A throttled read is logged (not silent),
+    answered 429 with a ``Retry-After`` (:func:`_charge_monitoring_read` says its value), and
+    recorded as an ``auth.gate_refused`` row with reason ``throttled`` wherever
+    :func:`_audited_permission` names one (on by default). It does not ask the new-address
+    question: :func:`refuse_from_new_address` says why these reads stay outside it. No pace on the
+    embedding/no-auth path (there is no per-actor identity to key on).
+
+    ``defer_when_query`` names a query parameter that delays the REFUSAL, not the charge: when the
+    request carries it, the gate still charges the budget at admission, but a 429 it would answer
+    is held on the request, with no decision row yet, until the route body calls
+    :func:`raise_deferred_monitoring_refusal` after its own checks. ``defer_value_valid``, when
+    given, defers only a value that will pass the route's validation, so an invalid one is charged
+    and refused here as any other read. A held 429 the route never raises, at least because one of
+    its own checks refused the request first, writes no log line. Where a check refused it, that
+    refusal answers the request, and the throttled row is written only where the route calls
+    :func:`record_deferred_monitoring_refusal` for that refusal. ``GET /connections`` defers on
+    ``reveal`` (vault BACKLOG #1191); docs/SECURITY.md, *Monitoring-read pacing*, says why."""
+
+    async def dependency(request: Request) -> Identity:
+        auth, identity = await _admit(request, permissions, mfa_gate=True)
+        if auth is None:
+            return identity
+        deferred_value = (
+            request.query_params.get(defer_when_query) if defer_when_query is not None else None
+        )
+        if deferred_value is not None and (
+            defer_value_valid is None or defer_value_valid(deferred_value)
+        ):
+            refusal = _charge_monitoring_read(request, auth, identity)
+            if refusal is None:
+                await _record_grant(request, auth, identity, permissions)
+            else:
+                setattr(
+                    request.state,
+                    _DEFERRED_MONITORING_REFUSAL_ATTR,
+                    _DeferredRefusal(_AdmittedDecision(auth, identity, permissions), refusal),
+                )
+            return identity
+        async with _recorded_decision(request, auth, identity, permissions):
+            enforce_monitoring_read_pacing(request, auth, identity)
+        return identity
+
+    return _gate(dependency, _authenticate_session_before_body)
+
+
+@dataclass(frozen=True)
+class _DeferredRefusal:
+    """A refusal a gate decided at admission and left for its route body to raise."""
+
+    decision: _AdmittedDecision
+    refusal: _GateRefusal
+
+
+#: The ``request.state`` attribute :func:`require_monitoring_read` leaves a held refusal on.
+_DEFERRED_MONITORING_REFUSAL_ATTR = "mefor_deferred_monitoring_refusal"
+
+
+async def raise_deferred_monitoring_refusal(request: Request) -> None:
+    """Raise the monitoring-read 429 a :func:`require_monitoring_read` gate held for this request,
+    logging it and writing its ``auth.gate_refused`` row (reason ``throttled``) where
+    :func:`_audited_permission` names one, as the gate itself would have. The gate wrote no grant
+    row for such a request.
+
+    A no-op where nothing is held, at least: the budget had room, the no-auth path, a request
+    without the deferring parameter, and the web console's in-process call, whose own request
+    carries nothing held. A route that defers must call this on every path that does the paced
+    work, or it serves a throttled caller. No runtime check enforces that. For ``GET /connections``
+    a test in ``tests/test_monitoring_read_pacing.py`` pins the raise:
+    ``test_an_out_of_scope_reveal_is_denied_and_audited_with_the_budget_spent``. Any other route
+    that passes ``defer_when_query`` needs its own such test."""
+    held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
+    if not isinstance(held, _DeferredRefusal):
+        return
+    delattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR)
+    decision = held.decision
+    _log_monitoring_throttle(request, decision.identity)
+    await _record_gate_refusal(
+        request, decision.auth, decision.identity, decision.permissions, held.refusal
+    )
+    raise held.refusal
+
+
+async def record_deferred_monitoring_refusal(
+    request: Request, answered: HTTPException, *, answered_reason: str | None = None
+) -> None:
+    """Write the ``auth.gate_refused`` row (reason ``throttled``) of a monitoring-read 429 a
+    :func:`require_monitoring_read` gate held for this request, and drop the held refusal, without
+    raising it or logging it. For a route body whose own refusal ``answered`` is about to
+    propagate in place of the held 429 and may write no denial row of its own, at least the
+    serve-hop refusal and a new-address refusal whose row was deduped.
+
+    The row keeps the throttle fact and also records what the caller was answered:
+    ``answered_status`` is ``answered``'s status, and ``answered_reason`` is ``answered_reason``
+    where given, else the reason a :class:`_GateRefusal` carries, else null. It is written only
+    where :func:`_audited_permission` names one, as on the gate's own refusals, so with
+    ``[security].audit_all_authorization_decisions`` off no row is written for a GET. A failed
+    write raises in place of ``answered``. A no-op where nothing is held."""
+    held = getattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR, None)
+    if not isinstance(held, _DeferredRefusal):
+        return
+    delattr(request.state, _DEFERRED_MONITORING_REFUSAL_ATTR)
+    decision = held.decision
+    audited = _audited_permission(request, decision.permissions)
+    if audited is None:
+        return
+    if answered_reason is None and isinstance(answered, _GateRefusal):
+        answered_reason = answered.reason
+    await decision.auth.audit_gate_refused(
+        decision.identity,
+        audited,
+        request.url.path,
+        reason=held.refusal.reason,
+        client=client_ip(request),
+        answered_status=answered.status_code,
+        answered_reason=answered_reason,
+    )
+
+
+def _charge_monitoring_read(
+    request: Request, auth: AuthService, identity: Identity
+) -> _GateRefusal | None:
+    """Charge the per-actor monitoring-read budget (vault BACKLOG #1191) and return the 429 to
+    answer when it is spent, or None. Its caller logs the refusal when it raises it. Its
+    Retry-After is the actor's own wait, in whole seconds, or the whole window while the
+    all-accounts count is spent (:meth:`AuthService.monitoring_read_retry_after`)."""
+    if auth.allow_monitoring_read(identity.user_id):
+        return None
+    return _GateRefusal(
+        status.HTTP_429_TOO_MANY_REQUESTS,
+        "too many requests; please slow down",
+        reason="throttled",
+        headers={"Retry-After": str(auth.monitoring_read_retry_after(identity.user_id))},
+    )
+
+
+def _log_monitoring_throttle(request: Request, identity: Identity) -> None:
+    """The WARNING line a raised monitoring-read 429 writes (logged, not silent)."""
+    log.warning(
+        "monitoring-read throttled (anti-automation): actor=%s path=%s",
+        identity.username,
+        request.url.path,
+    )
+
+
+def enforce_monitoring_read_pacing(request: Request, auth: AuthService, identity: Identity) -> None:
+    """Charge the per-actor monitoring-read budget, logging and raising the 429 of
+    :func:`_charge_monitoring_read` when it is spent."""
+    refusal = _charge_monitoring_read(request, auth, identity)
+    if refusal is not None:
+        _log_monitoring_throttle(request, identity)
+        raise refusal
 
 
 def enforce_phi_read_pacing(request: Request, identity: Identity) -> None:

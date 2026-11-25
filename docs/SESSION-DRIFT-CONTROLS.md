@@ -420,17 +420,41 @@ the next action — and no test asserts on deny-text content.
 
 ### G8 — Two allowlists, two installers, no sync
 
-The gate reads `~/.claude/hooks/worktree-gate.repos.txt`; the selfheal backstop reads
-`~/.claude-hooks/worktree-gate.repos.txt`. `install-gate.ps1` rewrites its own unconditionally;
-`install-selfheal.ps1` seeds the other only if absent. Adding a governed repo via one installer never
-reaches the other, and `install-gate.ps1 -Uninstall` leaves the backstop armed and still willing to
-`git checkout` the primary — so the "verified byte-for-byte clean uninstall" claim is true of the gate and
-false of the estate. They agree today by luck.
+As found, the gate read `~/.claude/hooks/worktree-gate.repos.txt` and the selfheal backstop read
+`~/.claude-hooks/worktree-gate.repos.txt`. `install-gate.ps1` rewrote its own unconditionally;
+`install-selfheal.ps1` seeded the other only if absent. Nothing synced the two, so adding a governed
+repo through the gate installer never reached the backstop, and `install-gate.ps1 -Uninstall` left the
+backstop armed and still willing to `git checkout` the primary.
 
-Related: `install-selfheal.ps1` lacks the `CLAUDECODE` refusal its sibling has, and its source is
-`$PSScriptRoot` — the calling session's own worktree copy, which that session may freely edit. The
-**higher-privilege** component (it runs `git checkout` on the primary unattended) is the **less
-protected** one. `~/.claude-account-2.lock` has the three gate matchers and no selfheal hook at all.
+Since BACKLOG #7613, `install-selfheal.ps1` creates no allowlist. A backstop copy taken from a
+checkout at or after `98c9cc91ec9` (2026-07-29) reads the gate's file first and the legacy one only as
+a fallback; an older copy reads only the legacy file until `install-selfheal.ps1` is run again from a
+newer checkout. The installer copies whatever `worktree-selfheal.ps1` sits beside it and stamps no
+version, so the install date does not settle which copy a box holds; grep the installed copy for
+`.claude/hooks/worktree-gate.repos.txt`. The rest of this paragraph is about a gate-first copy; an
+older one ignores the gate's file entirely.
+
+For a gate-first copy, a repo `install-gate.ps1` adds reaches the backstop. A legacy copy an earlier
+run seeded is still read once the gate's file is gone: `install-gate.ps1 -Uninstall` deletes the
+gate's file, and where that legacy copy remains the backstop stays armed on the roots it lists.
+Neither installer deletes the legacy file; `install-selfheal.ps1` prints a note naming it when it
+exists and the gate's file is absent. The reverse also holds: once `install-gate.ps1` creates the
+gate's file, the backstop stops reading the legacy one, and a root only the legacy file listed loses
+the backstop with no message. By the same rule, `-Uninstall -Repo` narrowed to zero roots leaves a
+gate file that names no root, which the backstop reads in preference to the legacy one, so the
+backstop is off, although `install-gate.ps1` calls that the same state as `-Uninstall`.
+
+So the "verified byte-for-byte clean uninstall" claim is false, of the gate alone as well as of the
+estate. Depending on what earlier runs did, `-Uninstall` leaves at least
+`worktree-gate.repos.txt.bak`, `worktree_gate.ps1.receipt.json`, `worktree_gate.ps1.bak` after a
+re-install, the deny log `worktree-gate.log` after any deny, and a `settings.json.bak` in each config
+dir it rewrites, besides any legacy allowlist.
+
+Related: `install-selfheal.ps1` now carries the `CLAUDECODE` refusal its sibling has, but its source is
+still `$PSScriptRoot`, the calling session's own worktree copy, which that session may freely edit. The
+**higher-privilege** component (it runs `git checkout` on the primary unattended) installs from the
+**less protected** source. `~/.claude-account-2.lock` had the three gate matchers and no selfheal hook
+at all when this was found.
 
 ### G9 — Coverage is enumerated, so every hole is silent
 
@@ -632,7 +656,7 @@ analysis must be redone.
 | B4 | **Mostly done** | Per-line scanning, continuation folding, interpreter-argument recursion, quoted spans blanked. **Not** done: the split helper is still not shared with `block-blanket-git-stage.ps1`, so the two hooks can still disagree about what a command is. |
 | B5, B8 | **Done** | Rules 1a and 3c: the gate's own script and allowlist are governed, and the `git config` keys that disarm the shared repo are denied from any worktree. **Not** done: `~/.claude/settings.json` is deliberately left writable — the `update-config` skill exists to edit it, and blocking it would break a supported workflow to close a hole needing a far more deliberate act. |
 | B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
-| B10 | **Done** | One allowlist, shared by the gate and the backstop, with the legacy path kept as a fallback so a version-skewed installed copy cannot silently disarm the backstop. `install-selfheal.ps1` gained the `CLAUDECODE` refusal its sibling always had — the *higher*-privilege installer was the unprotected one. |
+| B10 | **Half done** | The gate and a current backstop copy read one allowlist first, the gate's, and the backstop keeps the legacy path as a fallback. That fallback is not skew-safe: `-Uninstall` does not remove a legacy copy, so the backstop stays armed on it, and once the gate's file exists a root only the legacy file lists loses the backstop silently (G8). Still missing, at least: a `-Status`, an `-Uninstall` and a multi-config-dir loop for `install-selfheal.ps1`, and B1's gate-matcher versus selfheal-hook parity check. `install-selfheal.ps1` gained the `CLAUDECODE` refusal its sibling always had — the *higher*-privilege installer was the unprotected one. |
 | B6 | **Mostly done** | `.worktreeinclude` added, so the leak gate's gitignored token list reaches every worktree Claude Code creates itself (`--worktree`, desktop sessions, `isolation: worktree` subagents) — previously only `new.ps1`'s own worktrees got it, and a fresh first-party worktree could not commit at all. **Worktree-first is now the documented default entry point** ([WORKTREES.md](WORKTREES.md) §"Start the session in the worktree", CLAUDE.md §5): create the worktree, start the session **in** it, and never brief a worker to relocate. **The blocker under it is reachable now, not closed.** `isolation: worktree` was unusable for build work because the harness creates a checkout and installs nothing — measured 2026-09-16, **47 of 86** nested worktrees had a usable `.venv` against **21 of 22** siblings — so a session wanting an environment took a sibling and relocated into it, which is the owner prompt this was costing. `scripts/worktree/ensure-venv.ps1` now owns the bootstrap (idempotent, runnable in any worktree) and `new.ps1` calls it; the extras-parity and `constraints.lock` gates moved with the declaration. **Stated exactly: the harness still installs nothing.** Any session can now fix that in one command, but nothing makes it fire, so it still depends on the brief carrying the line. Closing that needs a `SubagentStart` check -- unfiled, and it must be silent when a venv is present or it becomes noise every reader learns to skip. **Not** done: `new.ps1` calling `git worktree lock` while a session is live. `seat.ps1` now locks a seat's worktree from SessionStart to a clean exit, against the Desktop worktree GC rather than as hijack prevention (BACKLOG #2524; [WORKTREES.md](WORKTREES.md), "A seat locks its worktree on arrival"). |
 | B11 | **Started** | Rule 3d closes the worst of G9: `git worktree remove` / `move` on another session's checkout. **Not** done: the rest of the absent verbs (`rm`, `mv`, `sparse-checkout`, `checkout-index`, `bisect`, `branch -f`, `update-ref`, `read-tree`), `gh pr checkout`, and G11's teardown half — `prune-merged.ps1` is still sibling-only. Its wrong-cwd green no-op is **fixed** (2026-07-30): it refuses with exit 2 and names both paths, and it will not `--force`-remove a sibling containing a nested worktree. **Raised in priority 2026-09-16:** B6 now documents nested worktrees as where build sessions land, so their missing teardown is no longer incidental -- it is the default population. Measured that day: **86 nested worktrees**, and a venv is ~887 MB, so roughly 42 GB has already accumulated with no scripted way to reap it. Disk is the lesser half. `ensure-venv.ps1` checks where the engine and the web console import from and reinstalls when either is not the checkout's (BACKLOG #2857), but it does not compare installed versions against `constraints.lock`, so a nested tree that lives for weeks keeps a venv pinned to an old lock while the script reports nothing to do -- the ruff 0.16 drift its own comment describes, now aimed at the default population. The fix is small and known: teach `remove.ps1` to resolve a nested name, and leave `prune-merged.ps1`'s blanket nested exclusion alone. A removal guard used in the field that day, and the shape this should adopt: head equals `origin/<branch>` **and** `git status --porcelain` empty **and** `git ls-files --others --exclude-standard` empty -- all three, per worktree, before anything is touched. A committed-and-pushed worktree is fully recoverable and an uncommitted edit is not, which is the only line that matters. Five siblings were removed under it and one held back as dirty and unpushed. **2026-09-30 (BACKLOG #1038): the nested teardown is NOT built, and a route for it was withdrawn.** `remove.ps1 -Nested` existed for one round. Its occupancy fence failed open twice: the readable-empty exemption also cleared an unreadable registry, and no session record places an `isolation: worktree` subagent in its own tree, because the record carries the parent's cwd (measured: 0 occupants for a live subagent's tree, 1 for its parent's). A deletion tool whose fence fails open is worse than none (Manager decision, batch 184), so the route was removed. What shipped in `remove.ps1`: a detached HEAD whose commits no ref holds is refused, and `-Force` does not override that; and a `git status` that fails refuses instead of reading as clean. **CORRECTED in place:** this entry read that `remove.ps1 -Nested` "refuses ... a tree a live session is recorded in (an unreadable registry refuses too)", which was false on both counts, and earlier "so committed work survives it" with no exception, false for a detached HEAD. The `remove.ps1` comment that `-Nested` guards "live harness and subagent sessions" went with the route. `prune-merged.ps1` keeps its nested exclusion. |
 
