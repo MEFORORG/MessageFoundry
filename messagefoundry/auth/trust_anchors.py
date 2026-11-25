@@ -115,7 +115,9 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
    ``cafile=`` loads what ``cadata=`` refuses. Only the private-key refusal runs (BACKLOG
    #3745, :func:`_refuse_a_private_key`), on the bytes the check read. Item 5 closed the same gap for the inbound CAs.
    A CA the hop never reads, such as one behind ``use_tls=False`` or an ``http://`` url, is not
-   checked, and a pin beside it is refused (:func:`unread_ca_reason`).
+   checked, and a pin beside it is refused (:func:`unread_ca_reason`). An ``http://`` url whose
+   request meets a TLS leg to an ``https://`` forward proxy reads its CA on that leg, so the CA is
+   checked there and its pin honoured (vault BACKLOG #5511 item 49).
 10. **The dialling settings CAs** (vault BACKLOG #3188). At least three settings name a CA that an
     engine hop verifies its server with: ``[tls].internal_ca_file``, ``[alerts].email_tls_ca_file``
     and ``[logging].forward_tls_ca_file``. :func:`collect_anchor_specs` adds each to the settings
@@ -1991,7 +1993,9 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
 
     The switches that build no verifying context: ``tls`` or ``use_tls`` off, a remote-file
     ``protocol`` of plain ``ftp``, ``tls_verify`` off, ``ech_egress`` through an ``http://``
-    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA. The ECH sidecar takes both hops over cleartext
+    sidecar, and on the HTTP family ``verify_tls`` off or an ``http://`` url, unless a token hop reads the CA
+    or the request meets a TLS leg to an ``https://`` forward proxy, which the CA verifies
+    (``transports.rest.http_url_reaches_a_tls_proxy``, vault BACKLOG #5511 item 49). The ECH sidecar takes both hops over cleartext
     loopback and verifies the server itself (ADR 0139). An ``env()`` value not yet resolved reads as unknown, so the load passes it and the
     check after resolution decides. Each caller refuses a pin beside an unread CA and checks no
     file there: a pin nothing checks reads as pinned while nothing is.
@@ -2028,7 +2032,19 @@ def unread_ca_reason(settings: Mapping[str, Any]) -> str | None:
     if not _flag_or_unresolved(settings, "verify_tls", default=True):
         return "verify_tls=False verifies no server certificate, and no token hop reads it"
     if _is_http_url(settings.get("url")):
-        return "the url is http://, so the hop has no TLS, and no token hop reads it"
+        # Imported here, not at the top, for the reason _token_hop_reads_ca gives. A request that
+        # meets a TLS leg to an https:// forward proxy reads the CA there; a proxy setting not yet
+        # text is unknown, so the load passes it and the check after resolution decides (vault
+        # BACKLOG #5511 item 49).
+        from messagefoundry.transports.rest import http_url_reaches_a_tls_proxy
+
+        if http_url_reaches_a_tls_proxy(settings) is False:
+            return (
+                "the url is http://, so the hop to the partner has no TLS, and neither a token "
+                "hop nor a TLS leg to an https:// forward proxy reads it here. The load check "
+                "does not see a proxy inherited from [egress].proxy_url: to pin the CA of an "
+                "https:// proxy leg, set proxy on the connection"
+            )
     return None
 
 
@@ -2243,10 +2259,12 @@ def outbound_anchor_spec(
 
 
 def unread_pin_message(who: str, unread: str) -> str:
-    """The refusal of a pin beside a CA the hop never reads, worded once for every site."""
+    """The refusal of a pin beside a CA the hop never reads, worded once for every site. Worded as
+    what the check finds, since at load it does not see a proxy inherited from
+    ``[egress].proxy_url`` (:func:`unread_ca_reason`)."""
     return (
-        f"{who} tls_ca_pin is set, but the hop never reads its tls_ca_file: {unread}. Nothing "
-        "would check the pin. Remove it"
+        f"{who} tls_ca_pin is set, but the check finds no hop that reads its tls_ca_file: "
+        f"{unread}. Nothing would check the pin. Remove it"
     )
 
 
@@ -2335,6 +2353,8 @@ _CONNECTION_ANCHOR_KEYS = (
     "smart_token_url",
     "oauth2_enabled",
     "oauth2_token_url",
+    "proxy_url",
+    "proxy_no_proxy",
     "tls_ca_file",
     "tls_ca_pin",
 )

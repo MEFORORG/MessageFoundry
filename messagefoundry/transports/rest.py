@@ -2354,6 +2354,47 @@ def _urllib_bypasses(url: str) -> bool:
     return bool(target) and bool(urllib.request.proxy_bypass(target))
 
 
+def http_url_reaches_a_tls_proxy(settings: Mapping[str, Any]) -> bool | None:
+    """Whether a request to the ``http://`` ``url`` in ``settings`` crosses a TLS leg to an
+    ``https://`` forward proxy, or ``None`` while a value it reads is not yet text, such as an
+    ``env()`` reference (vault BACKLOG #5511 item 49).
+
+    On that leg the connection's ``tls_ca_file`` verifies the proxy. urllib's
+    ``Request.set_proxy`` turns an ``http`` request sent to an ``https://`` proxy into an ``https``
+    one, so the opener's https handler dials the proxy with the context the trust anchor built.
+
+    It reads the proxy as the opener routes the request. A loopback host, and a host urllib's own
+    bypass list names, are dialled direct. A ``proxy_url`` address serves a host ``proxy_no_proxy``
+    does not name. Anything else, ``proxy_url = "default"`` and no ``proxy_url`` included, takes
+    the opener's default proxy, read now from the environment and the system settings as the
+    opener reads them when it is built. An ``ech_egress`` hop never meets a proxy. A url that does
+    not parse answers ``False``: the build refuses it."""
+    url, proxy, no_proxy = (settings.get(k) for k in ("url", "proxy_url", "proxy_no_proxy"))
+    if not (
+        isinstance(url, str)
+        and isinstance(proxy, (str, type(None)))
+        and isinstance(no_proxy, (str, list, tuple, type(None)))
+    ):
+        return None
+    if settings.get("ech_egress"):
+        return False
+    try:
+        route = _proxy_route(url, _normalize_no_proxy(no_proxy))
+    except ValueError:
+        return False
+    if route in ("loopback", "urllib-bypassed"):
+        return False
+    explicit = (proxy or "").strip()
+    if route == "proxied" and explicit.lower() not in ("", PROXY_DEFAULT):
+        return explicit.lower().startswith("https://")
+    leg = str(urllib.request.getproxies().get("http") or "").strip()
+    if not leg.lower().startswith("https://"):
+        return False
+    # _proxy_route answers "bypassed" before it asks urllib's own list, which the default proxy
+    # still honours.
+    return route == "proxied" or not _urllib_bypasses(url)
+
+
 @dataclass(frozen=True, slots=True)
 class _HostProxy:
     """A :class:`ProxyConfig` resolved for one (non-bypassed) target host. ``credentialed=False``

@@ -1199,7 +1199,7 @@ def test_a_ca_the_hop_never_reads_is_not_checked_and_its_pin_is_refused(
     pinned = tmp_path / "pinned"
     kw = f", tls_ca_file={gone!r}, tls_ca_pin={'ab' * 32!r}"
     _unread_graph(pinned, _UNREAD[case].format(kw=kw))
-    with pytest.raises(WiringError, match="tls_ca_pin is set, but the hop never reads"):
+    with pytest.raises(WiringError, match="the check finds no hop that reads"):
         load_config(pinned)
 
 

@@ -4487,6 +4487,11 @@ poller. A `deployed = false` connection is not checked, since it is never built.
 behind `use_tls = false` or `tls_verify = false`. On `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` and
 `FhirLookup()` it is also a CA behind `verify_tls = false` or an `http://` url, unless a SMART or
 OAuth2 token hop reads it, and a CA behind `ech_egress` through an `http://` sidecar. A pin there would read as pinned while nothing checks it.
+An `http://` url whose request goes to an `https://` forward proxy is the exception: the CA
+verifies the proxy on that TLS leg, so it is checked and its pin is honoured. The check reads the
+proxy as the opener routes the request, `proxy_no_proxy`, `NO_PROXY` and a loopback host
+included. The load check does not see a proxy inherited from `[egress].proxy_url`, so to pin
+that leg's CA, set `proxy` on the connection (vault BACKLOG #5511 item 49).
 
 **Why a matching pin is no escape here.** On an inbound listener, a matching pin lets a CA load whose
 permissions the engine could not read. That works because the listener loads the exact bytes the
