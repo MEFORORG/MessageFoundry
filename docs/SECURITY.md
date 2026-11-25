@@ -1038,7 +1038,7 @@ to page its `administrator_granted` alert, and the command exits non-zero with t
 `messagefoundry admin-revoke-sessions`, since a re-run refuses an account that holds the role. A
 run refused after it wrote to the account may leave that account's sessions live;
 `messagefoundry admin-revoke-sessions`, run once the store answers, with the `--service-config` or
-`--db` the command used, ends the sessions it finds, of every account (vault BACKLOG #3023). The
+`--db` the command used, ends the sessions it finds, of any account (vault BACKLOG #3023). The
 directory reconciler's revoke counts its attempts the same way, but
 its first attempt carries its `auth.ad_session_revoked` row and its second, without the row,
 always runs, since the first one's error may be the row's; so there a SQL Server pool wait is
@@ -2416,10 +2416,13 @@ the same permission set on the same method reds CI until it is listed here.
 > manual", and shows a race as a refused save with the edits kept.
 >
 > **The monitoring plane is narrowed too, and this used to say the opposite.** For a channel-scoped
-> caller `GET /channels`, `GET /connections`, `GET /events`, `GET /graph/edges` and `GET /alerts/active`
+> caller `GET /channels`, `GET /connections`, `GET /events` and `GET /graph/edges`
 > return only their own inbound connections, and every **shared outbound** is suppressed outright
 > rather than relabelled — its dashboard row, its graph node and its live status all disappear, because
 > an outbound spans channels and its state can reflect another channel's downstream.
+> `GET /alerts/active` is narrowed differently: it filters alert instances by exact scope
+> membership of their `connection`, so a scoped caller sees the instances of every name its scope
+> lists, an outbound's included. An alert on an outbound its scope does not list is not shown.
 > `GET /connections/{name}/events` and `GET /connections/{name}/metadata` answer 403 outside the scope.
 > What stays global is the **aggregate queue counters**, which carry no connection identity to narrow:
 > `GET /stats`, `GET /metrics/history`, and the `outbox_by_status` field of the `/ws/stats` frame —
@@ -2518,8 +2521,26 @@ the same permission set on the same method reds CI until it is listed here.
 > all-channels caller 404 with no row (BACKLOG #3378).
 > `GET /alerts/rules` shows a scoped caller
 > only the rules that name no connection outside its scope: `connection` is `*` or a name in its
-> scope, and `control_target` is unset or in it. Each rule it shows has a null `id` (BACKLOG
-> #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
+> scope, and `control_target` is unset or in it. Each name a rule carries must also be an inbound
+> in `Registry.inbound_names()`, the set the flag route's scope test reads, even when the scope
+> lists it (BACKLOG #3378). The owner ruled on 2026-11-04 that this part "stays strict", which the
+> batch 606 Manager recorded as a scoped caller seeing no outbound rules; this allowlist is the
+> batch Manager's 2026-11-22 reading of that ruling. So a rule
+> naming an outbound, or a name that
+> exists nowhere, is withheld from a scoped caller, and with no graph loaded every rule that
+> names a connection is. A name the runner also knows as an outbound
+> (`RegistryRunner.knows_outbound`, which counts a reload-dropped outbound still draining), a
+> name declared on both sides included, is withheld too, since a rule on it can match the outbound's events. Every
+> `restart_outbound` rule is withheld from a scoped caller too, whatever the graph holds, since
+> its action names the outbound side. So is every rule whose event type only an outbound raises,
+> a `"*"` rule included: `_ALERT_EVENT_SIDE` in `messagefoundry/api/app.py` records each type's
+> side, and an event type or action with no side recorded is withheld too. A type both sides
+> raise, and `any`, still show on a `"*"` rule, though such a rule also matches outbound events.
+> The alert-instance routes were left as they were, on
+> purpose. The batch Manager decided this on 2026-11-22. It read the owner's ruling as covering
+> rules and flagging, not instances. What the ack, resolve, suspend and resume routes admit is in their bullet under
+> *Single-route data rules*, below. Each rule it shows has a null `id`
+> (BACKLOG #3378). The id is the operator's free-text label, so whoever writes `[alerts]` can put any
 > connection name in it, and nothing here reliably tells a label that names one from one that
 > does not. An
 > all-channels caller reads every id. A withheld id writes no audit row, since the rule itself is
@@ -2536,7 +2557,9 @@ the same permission set on the same method reds CI until it is listed here.
 > writes. The console's alerts page does not poll, which `test_ui_object_scope.py` pins; a page
 > that polled would need the row coalesced. The counts are a disclosure in their own right. A
 > scoped caller that holds `audit:read`, such as an Auditor, reads in `GET /audit` how many rules
-> lie outside its scope. A `logs:view` holder reads them in the ERROR line a lost row leaves.
+> it was not shown. That count includes at least rules outside its scope, rules withheld by the
+> inbound, outbound, `restart_outbound` and event-type tests above, and, with no graph loaded, every rule that names a
+> connection, so it is not a count of rules outside the scope alone. A `logs:view` holder reads them in the ERROR line a lost row leaves.
 > Without either, one extra write's latency can show that some rule was withheld. It cannot show
 > which rules or how many. Why it is not
 > `auth.channel_denied` is in `_audit_alert_rules_withheld` in
@@ -5814,8 +5837,8 @@ token claim**. There is no new `auth_provider` value: a federated login resolves
   answers by revoking the session under both hashes, best effort, and failing the ceremony
   closed (BACKLOG #3023). The SQLite store runs one writer at a time, so it has no lock order to get wrong.
 - **An account with no binding still signs in by Windows SSO, and its first engine factor needs
-  an enrolment code** (ADR 0207). The directory credential alone no longer binds it: the binding
-  step also asks a single-use issued code, and so does a federated session on a
+  an enrolment code** (ADR 0207). The directory credential alone no longer enrols its first engine
+  factor: enrolling it also asks a single-use issued code, and so does a federated session on a
   site that turned `oidc_require_mfa_claim` off. See [Directory-account enrolment
   codes](#directory-account-enrolment-codes-adr-0207). The Kerberos row of the [pathway
   table](#authentication-pathways--comparative-strength) describes that leg.
@@ -6862,7 +6885,7 @@ under running engines skips that moment, so stop every engine process and cluste
 store before the restore):
 
 - run `messagefoundry admin-revoke-sessions` against the restored store. It ends the sessions it
-  finds, of every account, and writes one `auth.session_revoked` audit row; *Limits of the session
+  finds, of any account, and writes one `auth.session_revoked` audit row; *Limits of the session
   sweep* under [Federated sign-in](#federated-sign-in-oidc-browser-only--adr-0142) says what it
   may miss;
 - re-apply the changes the restore undid. `messagefoundry restore --help` prints the statement of
@@ -6949,8 +6972,11 @@ the email channel sends:
   form require an address and refuse anything but one plain mailbox (BACKLOG #2018). An
   administrator reaches an existing account with none, before its next sign-in, by setting one with
   `PATCH /users/{id}` `notify_email`.
-- **`GET /me/security-events`** — a pull-based feed of the caller's own audited `auth.*` events
-  (sign-ins, lockouts, password changes), most-recent-first, for accounts without a deliverable mailbox.
+- **`GET /me/security-events`** — a pull-based feed of audited `auth.*` events (sign-ins, lockouts,
+  password changes), most-recent-first, for accounts without a deliverable mailbox. Whose rows it
+  shows is the `GET /me/security-events` bullet under *Single-route data rules*, in [The `/ui`
+  console plane](#the-ui-console-plane-serve_uitrue), with the store-side name-compare residuals
+  that `_security_events_where` in `messagefoundry/store/store.py` lists.
   Both 6.3.5 signals are in it, as `auth.account_locked` and `auth.login_after_failures`, whichever leg
   raised them. It is a read-only view over the tamper-evident audit log (no new store of record). Admin-initiated
   changes (whose audit `actor` is the admin) are delivered by the email channel, not shown in this self
@@ -7972,12 +7998,11 @@ temporary credential lapsed, with at least these `at` values: `"session"` with n
 behind it, `"logout"` at a sign-out, and `"superseded"` at another sign-in on the same browser,
 which may be another account's (BACKLOG #2298, #3749; see [Admin password reset](#admin-password-reset-wp-l3-12-asvs-646)). The permission decides, not the role name; no custom role can grant
 `users:manage` (ADR 0045 D1). The store applies the filter in the query before `limit`, so a page
-never comes back short. The account holder's own `/me/security-events` feed is not filtered: it
-selects rows by the caller's own username at or after the account's `created_at`, so it shows the
-holder their own rows. It can show another account's, at least where an account keeps its
-`created_at` while its name or holder changes, and on the store-side name-compare residuals
-`_security_events_where` in `messagefoundry/store/store.py` lists (the `GET /me/security-events` bullet under *Single-route data rules*, in
-[The `/ui` console plane](#the-ui-console-plane-serve_uitrue)).
+never comes back short. The account holder's own `/me/security-events` feed is not filtered this
+way, and it can show another account's rows. Whose rows it shows is the `GET /me/security-events`
+bullet under *Single-route data rules*, in [The `/ui` console plane](#the-ui-console-plane-serve_uitrue),
+with the store-side name-compare residuals that `_security_events_where` in
+`messagefoundry/store/store.py` lists.
 **The cost, accepted in the ruling: the Auditor can no longer review lockouts.** The list and its
 reasons are in `messagefoundry/auth/audit_visibility.py`.
 

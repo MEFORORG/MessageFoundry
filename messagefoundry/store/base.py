@@ -71,6 +71,7 @@ from messagefoundry.store.content_search import (
     make_spec,
 )
 from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
     RETIRED_WITHOUT_ACTIVE,
     RETIRED_WITHOUT_ACTIVE_TRANSIT,
     AuditMacFn,
@@ -179,6 +180,7 @@ __all__ = [
     "MAX_SCAN_LIMIT",
     "MessageSearchResult",
     "OwnedLanes",
+    "ServerCipherWalk",
     "PoolStatus",
     "QueueStore",
     "ReingressOriginMissing",
@@ -210,6 +212,7 @@ __all__ = [
     "SchemaProvisionResult",
     "StoreGrantsMissingError",
     "backend_supports_reference_sets",
+    "check_walk_identifiers",
     "make_spec",
     "open_store",
     "probe_store_privileges",
@@ -4887,6 +4890,47 @@ def is_store_shape_error(exc: BaseException) -> bool:
     if state == "42000":
         return any(f"({code})" in str(exc) for code in (229, 230))
     return state is not None and state.startswith("42")
+
+
+# --- the read-only cipher-cell walk the server stores share (BACKLOG #1719) --------------------
+# `cipher_cells.read_server_cipher_cells` reads a PostgreSQL or SQL Server store through four
+# methods, for `messagefoundry cipher-audit`. Each backend writes its catalog and chunk reads in its
+# own dialect; the identifier check and the surface-sealed rule are not dialect, so they are here
+# once. Every identifier a walk read is given is a declared constant from `cipher_cells`, and only
+# values are bound as parameters. A read may run more than one statement. Each statement takes its
+# own connection borrow and ends its read transaction before it returns, so no read transaction
+# spans two chunks.
+
+
+def check_walk_identifiers(*names: str) -> None:
+    """Refuse a cipher-walk identifier that is not a plain ASCII name. The walk's names are declared
+    constants, so this only stops a caller that passed something else."""
+    for name in names:
+        if not (name.isascii() and name.isidentifier()):
+            raise ValueError(f"not a plain identifier for the cipher walk: {name!r}")
+
+
+class _SurfaceReads(Protocol):
+    """The two dialect reads :meth:`ServerCipherWalk.cipher_walk_surface_sealed` asks a store for."""
+
+    async def _surface_keyed(self, table: str, column: str) -> bool: ...
+
+    async def _surface_holds_ciphertext(self, table: str, column: str, like: str) -> bool: ...
+
+
+class ServerCipherWalk:
+    """The cipher-walk read both server stores answer alike, over their own dialect reads."""
+
+    async def cipher_walk_surface_sealed(
+        self: _SurfaceReads, table: str, column: str, *, keyed: bool
+    ) -> bool:
+        """Whether the store has sealed ``table.column``, by the rule its at-open sweep applies
+        (BACKLOG #3383); ``keyed`` says the ``keyed_surface`` table exists to be asked. Up to two
+        statements: the surface's marker row, then one marked value."""
+        check_walk_identifiers(table, column)
+        if keyed and await self._surface_keyed(table, column):
+            return True
+        return await self._surface_holds_ciphertext(table, column, f"{MARKER_PREFIX}%")
 
 
 def _absent_sqlite_store(settings: StoreSettings) -> Path | None:

@@ -225,7 +225,7 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | Application log files (`[logging].log_dir`; under NSSM, `<DataDir>\logs\service.out.log` and `service.err.log`) | all (filesystem, not the DB) | **Possibly** — redaction is best-effort; a single-token identifier can survive it | **No** — plaintext on disk, no app-level cipher | **PL-1** | NSSM captures stdout/stderr; the engine writes a log file of its own only when the opt-in `[logging].file` is set (#122, ADR 0162 — same handler filters, engine-owned rotation, refused inside `log_dir`), together with the `*.broken-*` files a write failure rolls aside, which sit outside `log_dir` and are therefore NOT swept by `[retention].app_log_days`. The defence is the handler filters + `safe_exc()`/`safe_text()` + the never-log-bodies rule ([§7](#7-logging--phi-redaction) row 1), and the residual is stated there. The directory ACL is the NSSM installer's **best-effort** `icacls /inheritance:r`; age deletion is `[retention].app_log_days` (files by **mtime** — content is never read, so nothing selective happens here) and optional in-place gzip is `[retention].app_log_compress_days` (the compressor **does** read a file's bytes to archive + integrity-verify them, but only in-process — nothing is logged, and the archive stays inside the same ACL'd directory at the source's mtime). A support bundle copies a tail of this file, at most 500 lines by default, out of the ACL'd directory entirely ([§7](#7-logging--phi-redaction)). Cover the volume with FDE ([§10](#10-secure-deployment--operations-checklist)) | `` `[retention].app_log_days` `` |
 | Off-box forwarder spool (`[logging].forward_spool_dir`; default `log-spool/<engine or shard id>` beside `[store].path`, and `log-spool/supervisor` for the `supervise` process) | all (filesystem, not the DB) | **Possibly** — it holds the same redacted text the forwarder sends, and redaction is best-effort | **No** — plaintext JSONL on disk, no app-level cipher | **PL-1** | BACKLOG #1966, ADR 0200. Records the off-box collector has not yet taken (down, backing off, or still queued at shutdown), kept in order and sent when it answers again, best effort (ADR 0200 states the limits). The spool is fed from the far side of the forwarder hand-off queue, so it only ever holds text the handler filters already processed; a test plants a PHI-shaped value and proves only its redacted form lands. The directory is created `0o700` and segments `0o600` best-effort (no-ops on Windows, where it inherits the parent ACL). A segment is deleted once every entry in it is sent. Bounded by **size**, not age: when full the newest record is dropped and reported. `0` turns the spool off. Cover the volume with FDE ([§10](#10-secure-deployment--operations-checklist)) | `` `[logging].forward_spool_max_bytes` `` |
 | `messages.summary` | all three | **Yes** — MRN / patient name / order | **Yes, when a key is set** — store cipher; AAD binds the row id and its `channel_id` (`message_cell_aad`, vault BACKLOG #2593); store DEK (EF-3) | **PL-2** | Ingest-derived; no SQL search or index exists on it, so encrypting it costs nothing. NULL/blank stay as-is | ``rides `[security].delete_message_bodies_after_days` `` |
-| `messages.metadata` | all three | **Yes** — operator/handler-attached values, and for a body refused before ingress, or a refused loopback re-ingress, its length and `body_hmac`, a keyed digest of it or `null`, never a plain hash (vault BACKLOG #2608, #4796). When each is recorded, and why, is stated once, in [CONFIGURATION.md](CONFIGURATION.md) under `[inbound].refused_body_allowance_bytes` | **Yes, when a key is set** — store cipher; AAD binds the row id and its `channel_id` (`message_cell_aad`, vault BACKLOG #2593); store DEK (EF-3) | **PL-2** | **Nulled by `purge_message_bodies` on the `[retention].messages_days` window, in the same statement as the body** (ASVS 14.2.7) — see [§8](#8-retention--purge) | ``rides `[security].delete_message_bodies_after_days` `` |
+| `messages.metadata` | all three | **Yes** — at least operator/handler-attached values; for a body refused before ingress, or a refused loopback re-ingress, its length and `body_hmac`, a keyed digest of it or `null`, never a plain hash (vault BACKLOG #2608, #4796); and the intake context a source handed over with a received body, which can hold how the sender was admitted, a verified client certificate subject that can name a person, and a poll source's file path, and holds no socket address, the peer's or the listener's (vault BACKLOG #2607; owner ruling 2026-11-22). A value the intake context records verbatim can still contain an IP: at least a certificate subject naming one, and a file path under a UNC directory spelled by IP. When each refused-body field is recorded, and why, is stated once, in [CONFIGURATION.md](CONFIGURATION.md) under `[inbound].refused_body_allowance_bytes` | **Yes, when a key is set** — store cipher; AAD binds the row id and its `channel_id` (`message_cell_aad`, vault BACKLOG #2593); store DEK (EF-3) | **PL-2** | **Nulled by `purge_message_bodies` on the `[retention].messages_days` window, in the same statement as the body** (ASVS 14.2.7) — see [§8](#8-retention--purge) | ``rides `[security].delete_message_bodies_after_days` `` |
 | `messages.error` | all three | **Possibly** — may embed raw fragments from exceptions | **Yes, when a key is set** — store cipher; AAD binds the row id and its `channel_id` (`message_cell_aad`, vault BACKLOG #2593); store DEK (WP-5) | **PL-2** | Also `safe_exc()`-redacted **before** write. NULL/blank values stay as-is | ``rides `[security].delete_message_bodies_after_days` `` |
 | `queue.last_error` | all three | **Possibly** — same | **Yes, when a key is set** — store cipher; AAD `("queue","last_error",id)`; store DEK (WP-5) | **PL-2** | Same double defence (`safe_exc()` then cipher) | ``rides `[security].delete_message_bodies_after_days` `` |
 | `message_events.detail` | all three | **Possibly** — per-message disposition detail | **Yes, when a key is set** — store cipher; AAD `("message_events","detail",message_id,ts,event)`; store DEK | **PL-2** | `id` is AUTOINCREMENT/IDENTITY and unknown at INSERT, so the AAD binds the natural tuple and the column rides its own composite migration/rotation pass. `safe_text()`-scrubbed before write | ``rides `[security].delete_message_bodies_after_days` `` |
@@ -449,9 +449,12 @@ than a path is not checked
   the check does not count them as such groups. At least two kinds of key file are held to a
   stricter owner rule. One is the key at the path where the engine mints its TLS key, when
   `serve` or `supervise` starts with no `[api].tls_cert_file` and no
-  `[api].tls_terminated_upstream`, and so mints or reuses that pair (below). Otherwise this rule
-  does not apply to that path. With an operator certificate, the file `[api].tls_key_file` names,
-  or `[api].tls_cert_file` when no key file is set, is judged as a key file you supply, by the
+  `[api].tls_terminated_upstream`, and so mints or reuses that pair. Otherwise this rule does not
+  apply to that path. The rule: that key must be owned by the engine's own account, SYSTEM or
+  Administrators, whoever wrote it. An engine running as LOCAL SERVICE or NETWORK SERVICE shares
+  that account with other services, and a key that account owns is accepted, though that owner
+  does not show the engine made it. With an operator certificate, the file `[api].tls_key_file`
+  names, or `[api].tls_cert_file` when no key file is set, is judged as a key file you supply, by the
   owner screen above rather than this rule, even where it names the mint path. Another is the key
   custody host and handoff files. A separate check,
   `key_file_handle_problem` ([restricted_file.py](../messagefoundry/restricted_file.py)), refuses
@@ -466,21 +469,31 @@ than a path is not checked
   list or take it over, or when that folder's owner is such a group or cannot be read
   (`FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL`). A folder whose access list
   the engine's account may not read is refused: give that account read access to the folder's
-  permissions. On Windows the TLS key the engine mints must also be owned by the engine's own
-  account, SYSTEM or Administrators; an engine running as LOCAL SERVICE or NETWORK SERVICE shares
-  that account with other services, so that owner does not show the engine made it. Where that
-  folder is read, and what is refused on a network share or a mapped network drive, is in the
-  2026-11-17 entry of the
+  permissions. On both platforms the check also refuses at least a junction or link its walk
+  finds on the key file's path that an account it does not trust could change or re-point,
+  through the link itself or a folder that holds it or lies above it. On Windows it trusts at least
+  SYSTEM, Administrators, TrustedInstaller and the engine's own account, unless that is LOCAL
+  SERVICE or NETWORK SERVICE or cannot be read; on POSIX, root and the engine's own account. A
+  folder above the one that holds the key file is not judged by owner or access unless a junction
+  or link on the path sits in it or below it, so the folders on a link's target side usually are
+  not. A file in the secrets directory is the exception: the directory is checked as a path of its
+  own. Where the folder that holds the key file is
+  read, and what is refused on a network share or a mapped network drive, is in the 2026-11-17
+  entry of the
   [ADR 0214 amendments](adr/0214-a-secrets-directory-and-one-accessor-for-the-engine-s-secret-class-settings.md#amendments),
   under *The share rule*. It is not a complete check of the file's surroundings. Do not rely on
   this check alone. Restrict the
   secrets directory and every folder above it yourself, and the folder that holds each key file
   and every folder above it.
-- On POSIX the check refuses a key file whose own name is a link, one owned by an account other
-  than the engine's own or root, one whose mode has a group or other read or write bit, whoever is
-  in the group, and one held in a directory that another account owns or that a group or other may
-  write without the sticky bit (vault BACKLOG #5636). A directory a group or other account may write is accepted when it has the sticky
-  bit, since that bit keeps them from deleting or renaming a file they do not own. The engine
+- On POSIX the check refuses at least a key file whose own name is a link, one owned by an account
+  other than the engine's own or root, one whose mode has a group or other read or write bit,
+  whoever is in the group, and one held in a directory that such an account owns or that a group or
+  other may write without the sticky bit (vault BACKLOG #5636). It reads the owner and mode bits a
+  file system reports and reads no access list itself, so it can pass a key that a network or FUSE
+  file system, or an access list such as an NFSv4 or macOS one, lets another account reach. Check
+  those yourself. A directory a group or other account may write is accepted
+  when it has the sticky bit, since that bit keeps them from deleting or renaming a file they do
+  not own. The engine
   mints its own TLS key beside the store. **When it mints its own pair and the store directory does
   not exist yet, the engine creates it on POSIX with no group or other write bit (`0755` at most,
   whatever the umask), so a client running as another account can still read the certificate it
@@ -1456,12 +1469,15 @@ route and transform it (BACKLOG #1174).
   transformation are the site's own Python ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
   An earlier version of this bullet said routing reads only the fields a Router asks for; that was
   not what the code does (BACKLOG #1174).
-- **Re-encryption happens on write.** With a key set, the store cipher re-encrypts every PHI column the
-  moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)). So the columns it
-  covers do not linger in plaintext at rest, and the staged queue carries the message forward rather
-  than holding it open. `[security].allow_unencrypted_phi` is the audited keyless opt-out. The
-  decrypted body in process memory is never re-encrypted. It lives in the engine's heap, and also in
-  a per-inbound worker's under `[sandbox].mode = "subprocess"`. It stays there as immutable Python
+- **Re-encryption happens on write.** With a key set, the store cipher re-encrypts each column it
+  covers the moment it is written back ([store/crypto.py](../messagefoundry/store/crypto.py)), so
+  those columns do not linger in plaintext at rest, and the staged queue carries the message
+  forward rather than holding it open. Not every column that can hold PHI is covered: the
+  [section 2 inventory](#2-where-phi-lives--data-at-rest-inventory) says which columns are, and
+  which stay plaintext at rest. `[security].allow_unencrypted_phi` is the audited keyless opt-out.
+  The decrypted body in
+  process memory is never re-encrypted. It lives at least in the engine's heap, and under
+  `[sandbox].mode = "subprocess"` in a per-inbound worker's too. It stays there as immutable Python
   strings, and so does every copy the Router's or Handler's own code makes. It is gone only when that
   code and the garbage collector let it go
   ([ADR 0202](adr/0202-a-handler-receives-the-whole-decrypted-message-so-asvs-11-7-2-is-recorded-as-partial.md)).
@@ -2573,7 +2589,7 @@ space is reused is the DBA's.
 
 #### What nulling `messages.metadata` costs — three accepted consequences
 
-`messages.metadata` carries the operator-attached `SetMeta` bag **and** the engine's correlation-lineage
+`messages.metadata` carries at least the operator-attached `SetMeta` bag, the intake context (vault BACKLOG #2607), **and** the engine's correlation-lineage
 keys, so blanking it degrades three paths that read it *after* the window. All three are **accepted, not
 prevented**, and each is pinned by a regression test. The alternative — retaining PHI past its retention
 window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 exists to close.
