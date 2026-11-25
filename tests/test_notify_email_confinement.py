@@ -381,6 +381,9 @@ async def test_a_refused_birth_and_its_audit_row_roll_back_together() -> None:
         assert appends[0] == 2
         assert await store.get_user_by_username("torn") is None
         assert await store.list_audit(action="auth.ad_user_created") == []
+        # Not vacuous with the count above: a not-adopted row committed on its own, before the
+        # INSERT, would take the allowed append and survive here (BACKLOG #2100).
+        assert await store.list_audit(action="auth.ad_notify_email_not_adopted") == []
     finally:
         await store.close()
 
