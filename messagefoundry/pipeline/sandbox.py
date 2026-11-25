@@ -1165,10 +1165,14 @@ class SandboxSession:
         # ``load_snapshot()``, which runs top-level admin config — the earliest untrusted code and the
         # first chance to spawn a grandchild. Until then the worker runs only its own code: it moves
         # the request pipe off fd 0 (_detach_request_pipe, which starts no process) and parks on its
-        # first read of that pipe's private copy, so assigning here is race-free: any process the
-        # worker later spawns is already in the job. The drains above do not disturb that argument,
-        # which turns on the CHILD's first request-pipe read and not on what the parent's threads
-        # are doing.
+        # first read of that pipe's private copy, so any process admin code later spawns is already
+        # in the job. ``proc`` is not always the worker: on Windows, when ``sys.executable`` is a
+        # virtual environment's ``python.exe`` launcher, ``proc`` is the launcher, and it starts
+        # the real interpreter itself, possibly before this assignment. That interpreter still
+        # landed in the job in every run measured (10 of 10 on an unloaded host, 2026-11-24), but
+        # no ordering here guarantees it, and the owner's acceptance does not name that case. The
+        # launcher's other residual, its second inheritable request-pipe handle, is stated with the
+        # owner's acceptance of 2026-11-24 in ADR 0087's step 8 note on AC-10.
         self._job = _assign_kill_on_close_job(proc)
         try:
             _write_frame(proc.stdin, boot)

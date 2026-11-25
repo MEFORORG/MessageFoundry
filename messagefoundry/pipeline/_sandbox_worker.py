@@ -655,10 +655,12 @@ def main() -> int:
         stdin = _detach_request_pipe()
     except OSError as exc:
         # Read the boot frame first, from the private copy the refusal hands back, so the parent's
-        # boot write completes and it reads this reply as the boot reply, naming the reason. With
-        # no copy (the os.dup itself failed) nothing is read, and a boot frame larger than the
-        # pipe's buffer fails the parent's write first: it then records a failed boot write, and
-        # only the line below, relayed at DEBUG, names the refusal.
+        # boot write completes and it reads this reply as the boot reply, naming the reason. At
+        # least a failed os.dup and a failed reopen of the copy after it leave no copy, and then
+        # nothing is read. The parent's boot write can then fail first: when the boot frame is
+        # larger than the pipe's buffer, and, after a dup2 that moved fd 0 off the pipe, at once
+        # on POSIX, where no reader is left. It then records a failed boot write, and only the
+        # lines below, relayed at DEBUG, name the refusal.
         log.error("sandbox worker refused to boot: the request pipe could not be detached")
         if isinstance(exc, _RequestPipeRefused):
             _drain_boot_frame(exc.reader)
