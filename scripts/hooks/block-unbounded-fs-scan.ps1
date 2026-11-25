@@ -76,6 +76,86 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
     return ($out -join "`n")
 }
 
+# THE SUBSTITUTIONS IN AN UNQUOTED HEREDOC BODY (BACKLOG #5607). Bash runs a `$(...)` or backtick
+# substitution in the body of a heredoc whose delimiter is unquoted (`cat <<EOF`), though the rest
+# of the body is data, so every view above blanks it and allowed `cat <<EOF\n$(find /proc)\nEOF`.
+# This reads each such body from the raw text, with its opener found on $Masked as
+# Hide-HeredocBodies finds it, and adds the text inside each substitution to $Into, to be judged as
+# a command of its own. A body whose delimiter is quoted (`<<'EOF'`, `<<"EOF"`) takes no
+# substitution and adds nothing, nor does a `$(` or backtick after a backslash. The extent of a
+# substitution is read by counting parens, so a quoted paren can make it longer than bash reads it,
+# which can only add text. Each found text adds to $Spent, and past $Cap the rest are skipped.
+function Add-HeredocSubstitutions([string]$Text, [string]$Masked, $Into, $Spent, [int]$Cap) {
+    if ($Masked.IndexOf('<<') -lt 0) { return }
+    $rawLines = $Text.Split([char]10)
+    $maskedLines = $Masked.Split([char]10)
+    $terminator = $null
+    $body = $null
+    $lines = [Math]::Min($rawLines.Count, $maskedLines.Count)
+    for ($n = 0; $n -le $lines; $n++) {
+        if ($null -ne $terminator) {
+            $last = $n -eq $lines
+            if ($last -or $maskedLines[$n].Trim() -ceq $terminator -or $rawLines[$n].Trim() -ceq $terminator) {
+                $terminator = $null
+                if ($null -ne $body) { Add-BodySubstitutions $body.ToString() $Into $Spent $Cap }
+                $body = $null
+            } else {
+                if ($null -ne $body) { [void]$body.Append($rawLines[$n]).Append("`n") }
+            }
+            continue
+        }
+        if ($n -eq $lines) { break }
+        $m = [regex]::Match($maskedLines[$n], '(?:^|\s)(?<!<)<<(?!<)-?[ \t]*')
+        if (-not $m.Success) { continue }
+        $raw = $rawLines[$n]
+        $rest = $raw.Substring([Math]::Min($m.Index + $m.Length, $raw.Length))
+        $d = [regex]::Match($rest, '^(?:''([^'']+)''|"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))')
+        if ($d.Success) {
+            $terminator = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                Where-Object { $_ } | Select-Object -First 1
+            $body = if ($d.Groups[3].Value) { [System.Text.StringBuilder]::new() } else { $null }
+        }
+    }
+}
+
+function Add-BodySubstitutions([string]$Body, $Into, $Spent, [int]$Cap) {
+    $len = $Body.Length
+    $i = 0
+    while ($i -lt $len) {
+        $c = $Body[$i]
+        if ($c -ceq '\') { $i += 2; continue }
+        $start = -1
+        $end = $len
+        if ($c -ceq '$' -and $i + 1 -lt $len -and $Body[$i + 1] -ceq '(') {
+            # Nested substitutions are found again from here, so each is judged on its own too.
+            $start = $i + 2
+            $depth = 0
+            for ($j = $i + 1; $j -lt $len; $j++) {
+                $x = $Body[$j]
+                if ($x -ceq '\') { $j++; continue }
+                if ($x -ceq '(') { $depth++ }
+                elseif ($x -ceq ')') { $depth--; if ($depth -eq 0) { $end = $j; break } }
+            }
+            $next = $i + 2
+        } elseif ($c -ceq '`') {
+            $start = $i + 1
+            for ($j = $start; $j -lt $len; $j++) {
+                if ($Body[$j] -ceq '\') { $j++; continue }
+                if ($Body[$j] -ceq '`') { $end = $j; break }
+            }
+            $next = $end + 1
+        } else {
+            $i++
+            continue
+        }
+        $width = [Math]::Max(0, [Math]::Min($end, $len) - $start)
+        if ($Spent.Value + $width -gt $Cap) { return }
+        $Spent.Value += $width
+        $Into.Add($Body.Substring($start, $width))
+        $i = $next
+    }
+}
+
 # Blank the CONTENTS of quoted spans, keeping the quotes and the length, so a separator or a
 # find-looking word inside quotes never reaches program position (`echo "find /proc"`). Equal
 # length is what lets an offset into the blanked text index the raw text.
@@ -118,7 +198,8 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # `<<E"O"F`, and a glued opener whose word is not a plain name. The older masker in block-blanket-git-stage.ps1 is untouched.
 # Get-SiteTexts, below, adds texts for at least some of two of these, a spaced shift in arithmetic
 # and a `$((cmd) )` nested inside arithmetic, and for some nestings past this view's budget; this
-# view is unchanged.
+# view is unchanged. Add-HeredocSubstitutions, above, reads a third, a substitution in the body
+# of a heredoc whose delimiter is unquoted, for a delimiter its pattern captures whole.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
@@ -731,7 +812,8 @@ function Hide-PowerShellSpans([string]$Text) {
 #     walk can go undenied (found by a Lander probe on 2026-11-23);
 #   - a heredoc delimiter it captures only part of, such as `<<END-X`. The pass then reads the body as
 #     running past the real terminator, so a site on a later line is skipped;
-#   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs.
+#   - a substitution in the body of a heredoc whose delimiter is unquoted, which bash runs and
+#     Add-HeredocSubstitutions, above, reads instead.
 # Past its step budget it returns $null, and the caller then adds nothing. With -From, it reads a
 # command from that offset inside an open `(` and returns where that `(` closes.
 function Get-SiteTexts([string]$Text, [int]$From = -1) {
@@ -1177,6 +1259,38 @@ try {
         $sitePending.Value = $false
         return $false
     }
+    # THE UNQUOTED HEREDOC BODIES (BACKLOG #5607) COME LAST, under the same rule as the per-site
+    # texts: read only once every earlier bound has been judged and allowed, appended, and a throw
+    # returns that allow. Each substitution text is read under the plain and bash views. Built only
+    # for a bash command holding `<<` and a `$(` or a backtick.
+    $heredocPending = @{ Value = ($tool -cne 'PowerShell' -and $cmd.IndexOf('<<', [StringComparison]::Ordinal) -ge 0 -and
+        ($cmd.IndexOf('$(', [StringComparison]::Ordinal) -ge 0 -or $cmd.IndexOf('`') -ge 0))
+        Texts = $null; Next = 0 }
+    function Add-HeredocBounds {
+        if (-not $heredocPending.Value) { return $false }
+        if ($null -eq $heredocPending.Texts) {
+            $texts = [System.Collections.Generic.List[string]]::new()
+            $spent = @{ Value = 0 }
+            $cap = 16 * $cmd.Length + 65536
+            foreach ($masked in @((Hide-QuotedSpans $cmd -Plain), (Hide-QuotedSpans $cmd))) {
+                Add-HeredocSubstitutions $cmd $masked $texts $spent $cap
+            }
+            $heredocPending.Texts = $texts
+        }
+        $texts = $heredocPending.Texts
+        while ($heredocPending.Next -lt $texts.Count) {
+            $t = $texts[$heredocPending.Next]
+            $heredocPending.Next++
+            if (-not $t.Trim()) { continue }
+            $plain = Hide-HeredocBodies $t (Hide-QuotedSpans $t -Plain)
+            $bashView = Hide-HeredocBodies $t (Hide-QuotedSpans $t)
+            Add-ScanBounds $plain $t "heredoc $($heredocPending.Next)|"
+            if ($bashView -cne $plain) { Add-ScanBounds $bashView $t "heredoc $($heredocPending.Next)|" }
+            return $true
+        }
+        $heredocPending.Value = $false
+        return $false
+    }
     foreach ($scan in $scans) { Add-ScanBounds $scan }
 
     # Options whose value is a SEPARATE word, so the value is skipped rather than read as a program,
@@ -1202,7 +1316,7 @@ try {
 
     # A segment both views mask alike is checked once.
     $checked = [System.Collections.Generic.HashSet[string]]::new()
-    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds) -or (Add-RefinedBounds) -or (Add-SiteBounds); $bi++) {
+    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds) -or (Add-RefinedBounds) -or (Add-SiteBounds) -or (Add-HeredocBounds); $bi++) {
         $b = $bounds[$bi]
         if ($b[2] -le 0) { continue }
         $seg = $b[0].Substring($b[1], $b[2])

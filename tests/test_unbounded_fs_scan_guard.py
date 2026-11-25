@@ -1015,6 +1015,45 @@ def test_a_per_site_text_adds_no_deny_for_data(command: str) -> None:
     assert_allowed(run_guard(bash(command)))
 
 
+# BACKLOG #5607: A SUBSTITUTION IN THE BODY OF A HEREDOC WHOSE DELIMITER IS UNQUOTED RUNS. Bash
+# expands `$(...)` and backticks in such a body, so each of these walks runs; every view before the
+# heredoc pass blanked the body as data, and each row was allowed on origin/main.
+HEREDOC_SUBSTITUTION_DENY = [
+    pytest.param("cat <<EOF\n$(find /proc)\nEOF", id="dollar-paren-in-a-bare-body"),
+    pytest.param("cat <<EOF\nmsg `grep -r x /`\nEOF", id="backtick-in-a-bare-body"),
+    pytest.param("cat <<-EOF\n\t$(find / -name x)\n\tEOF", id="dash-heredoc-with-tabs"),
+    pytest.param(
+        'git commit -F - <<EOF\nsee "$(find /proc)"\nEOF', id="double-quotes-in-a-bare-body"
+    ),
+    pytest.param('echo "$(cat <<EOF\nsee $(find /proc)\nEOF\n)"', id="bare-body-in-a-quoted-sub"),
+    pytest.param("cat <<EOF\nnested $(echo $(find /proc))\nEOF", id="nested-in-a-bare-body"),
+    pytest.param("cat <<EOF > f\n$((find /proc) )\nEOF", id="subshell-site-in-a-bare-body"),
+    pytest.param("cat <<EOF\nnever closed $(find /proc)", id="unterminated-bare-body"),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_SUBSTITUTION_DENY)
+def test_a_substitution_in_an_unquoted_heredoc_body_is_denied(command: str) -> None:
+    assert_denied(run_guard(bash(command)))
+
+
+# THE CONTROLS: a body whose delimiter is quoted takes no substitution, an escaped `$(` is text, the
+# rest of a bare body is data, and a single-quoted substitution after the terminator stays data.
+HEREDOC_SUBSTITUTION_ALLOW = [
+    pytest.param("cat <<'EOF'\n$(find /proc)\nEOF", id="single-quoted-delimiter"),
+    pytest.param('cat <<"EOF"\n$(find /proc)\nEOF', id="double-quoted-delimiter"),
+    pytest.param("cat <<EOF\n\\$(find /proc)\nEOF", id="escaped-dollar-paren"),
+    pytest.param("cat <<EOF\nfind /proc and `echo hi`\nEOF", id="prose-beside-a-bounded-sub"),
+    pytest.param("cat <<EOF\n$(echo hi)\nEOF\necho '$(find /proc)'", id="data-after-the-end"),
+    pytest.param("echo '<<EOF $(find /proc)'", id="opener-in-single-quotes"),
+]
+
+
+@pytest.mark.parametrize("command", HEREDOC_SUBSTITUTION_ALLOW)
+def test_the_heredoc_pass_adds_no_deny_for_data(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
 def _guard_seconds(command: str) -> float:
     started = time.monotonic()
     run_guard(bash(command))
@@ -1800,6 +1839,8 @@ EXPECTED_ROW_COUNTS = {
     "REFINED_FALSE_DENY_ALLOW": 14,
     "SITE_TEXT_DENY": 16,
     "SITE_TEXT_ALLOW": 21,
+    "HEREDOC_SUBSTITUTION_DENY": 8,
+    "HEREDOC_SUBSTITUTION_ALLOW": 6,
 }
 
 
