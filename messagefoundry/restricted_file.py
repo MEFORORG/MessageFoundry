@@ -54,7 +54,7 @@ import stat
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -568,6 +568,25 @@ def _windows_access_problem(
     return None
 
 
+def _holder_read_problem(holder: WinSecurity) -> str | None:
+    """Why the access list of the directory that holds a key file could not be judged, with the fix
+    that fits, or ``None`` when it was read. A list that was read but is malformed needs replacing;
+    granting the right to read it would change nothing. Kept free of ctypes so every platform tests
+    it."""
+    if holder.error is None:
+        return None
+    if holder.damaged:
+        return (
+            f"the access list of the directory that holds it is malformed ({holder.error}); "
+            "replace that folder's access list with one that grants only the engine's account, "
+            "SYSTEM and Administrators"
+        )
+    return (
+        f"the permissions of the directory that holds it could not be read ({holder.error}); "
+        "give the account the engine runs as the right to read that folder's permissions"
+    )
+
+
 def _windows_holder_problem(security: WinSecurity) -> str | None:
     """Why the directory this owner and access list belong to lets a broad group or an application
     package replace a key file in it (:data:`_HOLDER_REPLACE_MASK`), or ``None`` (vault BACKLOG
@@ -690,10 +709,9 @@ def _windows_link_problem(
         for target, as_kind in targets:
             security = read_security(target, as_kind)
             if ntpath.dirname(target) == target and security.aces is not None:
-                security = WinSecurity(
-                    security.owner,
-                    tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
-                    security.error,
+                security = replace(
+                    security,
+                    aces=tuple((t, f, m & ~DELETE_ACCESS, s) for t, f, m, s in security.aces),
                 )
             findings = evaluate_windows_object(target, as_kind, security, trust)
             if findings:
@@ -934,11 +952,8 @@ def _windows_surroundings_problem(path: Path, host: WinHost) -> str | None:
     except OSError as exc:  # a reader that could not be run
         reason = exc.strerror or type(exc).__name__
         return f"the folders on its path could not be judged ({reason})"
-    if holder.error is not None:
-        return (
-            f"the permissions of the directory that holds it could not be read ({holder.error}); "
-            "give the account the engine runs as the right to read that folder's permissions"
-        )
+    if (unread := _holder_read_problem(holder)) is not None:
+        return unread
     problem = _windows_holder_problem(holder)
     return None if problem is None else f"the directory that holds it is not restricted: {problem}"
 

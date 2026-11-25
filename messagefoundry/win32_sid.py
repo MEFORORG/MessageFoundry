@@ -7,22 +7,30 @@
 in ``config/wiring.py`` take them from here. They open an object differently and report a failed
 read differently, so each keeps its own reader. Each also keeps its own read of the local
 Administrators group, because the two answer a partial read differently. What they share is
-here: the prototypes of the SID, entry, account and token calls, the text of a binary SID, and the
-SID of the account this process runs as. Other readers still declare their own, at least
+here: the prototypes of the SID, account and token calls, the text of a binary SID, and the SID of
+the account this process runs as. The ``GetAce`` prototype is here too, for ``wiring.py``'s reader;
+the anchor reader walks its DACL without it. Other readers still declare their own, at least
 ``restricted_file.py``'s.
 
 It imports only the standard library and sits outside ``auth/``, so ``config/`` reaches it without
 loading the auth package. ctypes stays behind the platform guard in each function, so mypy and lint
-pass on the Linux CI leg.
+pass on the Linux CI leg. On Windows the two libraries are typed as ``ctypes.WinDLL``, so mypy still
+checks every prototype a caller declares on them.
 """
 
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING and sys.platform == "win32":
+    from ctypes import WinDLL as Library
+else:
+    # Off Windows every function here refuses before it touches a library.
+    Library = Any
 
 
-def sid_libraries() -> tuple[Any, Any]:
+def sid_libraries() -> tuple[Library, Library]:
     """A new ``advapi32`` and ``kernel32``, with the shared prototypes declared.
 
     Each call loads its own pair, so the prototypes a caller declares beside these do not reach
@@ -73,7 +81,7 @@ def sid_libraries() -> tuple[Any, Any]:
     return advapi32, kernel32
 
 
-def sid_text(advapi32: Any, kernel32: Any, sid_ptr: int | None) -> str | None:
+def sid_text(advapi32: Library, kernel32: Library, sid_ptr: int | None) -> str | None:
     """The binary SID at ``sid_ptr`` as text, such as ``S-1-5-18``, or ``None`` for a null pointer
     or a SID ``ConvertSidToStringSidW`` could not render. ``advapi32`` and ``kernel32`` are a pair
     from :func:`sid_libraries`."""
@@ -95,7 +103,7 @@ def sid_text(advapi32: Any, kernel32: Any, sid_ptr: int | None) -> str | None:
             kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
 
 
-def process_user_sid(advapi32: Any, kernel32: Any) -> str | None:
+def process_user_sid(advapi32: Library, kernel32: Library) -> str | None:
     """The SID of the account this process runs as, from its token's ``TokenUser``, or ``None``
     when the token could not be read. ``advapi32`` and ``kernel32`` are a pair from
     :func:`sid_libraries`."""

@@ -1470,9 +1470,9 @@ def test_s12_15_an_entry_of_an_undefined_type_has_no_mask_read_past_its_end(
     tmp_path: Path,
 ) -> None:
     """An entry of a type Windows does not define may be its 4-byte header alone, and the kernel
-    accepts it in a DACL. The reader records no rights for it. Red: it read the four bytes after
-    the header as a mask, here the next entry's header, ``0x00140000``. Why that changes no
-    verdict is in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
+    accepts it in a DACL. The reader records no rights for it, and reads nothing after its header
+    as part of it, such as the next entry's header, ``0x00140000``. Why that changes no verdict is
+    in :func:`~messagefoundry.auth.anchor_path.dacl_entry_fields`."""
     target = tmp_path / "short-entry.txt"
     target.write_bytes(b"synthetic")
     assert _set_protected_dacl(target, [_ace(0x20, b""), _allow_everyone()]) == 0
@@ -1504,7 +1504,7 @@ def test_s12_52_both_windows_readers_take_the_run_as_sid_from_the_shared_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The anchor reader and the config-source reader each answer whatever the shared token read
-    answers, so neither keeps a private copy of it. Red: each read its own token."""
+    answers, so neither keeps a private copy of it."""
     from messagefoundry import win32_sid
     from messagefoundry.config.wiring import _win32_config_source_probes
 
@@ -1516,7 +1516,7 @@ def test_s12_52_both_windows_readers_take_the_run_as_sid_from_the_shared_helper(
 @_windows_only
 def test_s12_52_the_config_source_readers_import_no_auth_module() -> None:
     """The shared helper is a leaf outside ``auth/``, so building the config-source readers loads
-    nothing from the auth package. Red on 44c19f878de, where the helper lived in ``auth/``."""
+    nothing from the auth package."""
     # ``messagefoundry.author_output`` shares the prefix, so the package is matched by its dot.
     code = (
         "import sys\n"
@@ -1624,84 +1624,121 @@ def _acl(entries: list[bytes], *, count: int | None = None, size: int | None = N
     return (header + body + bytes(max(0, acl_size - 8 - len(body))))[:acl_size]
 
 
-_EVERYONE_ALLOW = (0x00, 0, 0x1F01FF, 16)  # the first entry, so its SID starts at 8 + 8
+_EVERYONE_ALLOW = (0, 0x00, 0, 0x1F01FF, 16)  # entry 0, so its SID starts at 8 + 8
+
+
+def _walk(
+    acl: bytes,
+) -> tuple[tuple[tuple[int, int, int, int, int | None], ...], str | None, tuple[int, ...]]:
+    walk = ap.dacl_entries(acl)
+    return walk.entries, walk.reason, walk.malformed
 
 
 def test_s12_15_the_dacl_walk_reads_each_entry_where_it_starts() -> None:
     """The control: a well-formed DACL walks to each entry, and only the allow entry gets a SID
     offset. A header-only entry of an undefined type last reads nothing past it."""
     deny = _ace(0x01, (0x2).to_bytes(4, "little") + _EVERYONE_SID_BYTES)
-    walked = ap.dacl_entries(_acl([deny, _allow_everyone(), _ace(0x20, b"")]))
-    assert walked == (
-        ((0x01, 0, 0, None), (0x00, 0, 0x1F01FF, 8 + 20 + 8), (0x20, 0, 0, None)),
+    assert _walk(_acl([deny, _allow_everyone(), _ace(0x20, b"")])) == (
+        ((0, 0x01, 0, 0, None), (1, 0x00, 0, 0x1F01FF, 8 + 20 + 8), (2, 0x20, 0, 0, None)),
         None,
+        (),
     )
-    assert ap.dacl_entries(_acl([])) == ((), None)
+    assert _walk(_acl([])) == ((), None, ())
 
 
 def test_s12_15_a_dacl_with_slack_after_its_last_entry_reads_in_full() -> None:
     """The control for the bound: Windows often leaves an AclSize larger than its entries, and the
     unused bytes after the last entry are not read as one."""
-    assert ap.dacl_entries(_acl([_allow_everyone()], size=64)) == ((_EVERYONE_ALLOW,), None)
+    assert _walk(_acl([_allow_everyone()], size=64)) == ((_EVERYONE_ALLOW,), None, ())
 
 
 def test_s12_15_the_walk_is_bounded_by_the_dacls_own_aclsize() -> None:
     """Bytes past the header's AclSize are not read as an entry, whatever the caller passed."""
-    acl = _acl([], count=1, size=8) + _allow_everyone()
-    entries, reason = ap.dacl_entries(acl)
+    entries, reason, _ = _walk(_acl([], count=1, size=8) + _allow_everyone())
     assert entries == ()
     assert reason is not None and "starts past the end of the DACL" in reason
 
 
-_UNDEFINED_HEADER = (0x20, 0, 0, None)
+_UNDEFINED_HEADER = (0, 0x20, 0, 0, None)
 _SHORT_CALLBACK = _ace(0x09, b"")  # AceSize 4: a granting type with no room for its rights
 _OVERRUNNING_EVERYONE = (
     _allow_everyone()[:2] + (0xFFFF).to_bytes(2, "little") + _allow_everyone()[4:]
 )
+#: An allow entry with room for its rights and none for its SID, then a grant to Everyone.
+_SID_LESS_THEN_GRANT = _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little")), _allow_everyone()])
+#: An allow entry whose SID has revision 0, which ConvertSidToStringSidW refuses, then a grant to
+#: Everyone.
+_BAD_SID_THEN_GRANT = _acl(
+    [_ace(0x00, (0x1F01FF).to_bytes(4, "little") + bytes(8)), _allow_everyone()]
+)
 
 
 @pytest.mark.parametrize(
-    ("acl", "read", "reason"),
+    ("acl", "read", "reason", "malformed"),
     [
-        # An entry whose AceSize is 0 or 2 stops the walk. Red: GetAce steps by that size
-        # (measured on Windows 11, 2026-11-24 US Central: with 0 it returned entry 0 again for index
-        # 1, with 2 an entry starting inside entry 0), so the Everyone grant after it was not read.
+        # An AceSize of 0 or 2 stops the walk: GetAce steps by it (measured on Windows 11,
+        # 2026-11-24 US Central: with 0 it returned entry 0 again for index 1, with 2 an entry
+        # starting inside entry 0), so no later entry can be found. The entry is read from its
+        # header alone.
         pytest.param(
             _acl([bytes([0x20, 0, 0, 0]), _allow_everyone()]),
             (_UNDEFINED_HEADER,),
-            "shorter than an entry header",
+            "entry 0 of its DACL is shorter than an entry header",
+            (),
             id="acesize-0-first",
         ),
         pytest.param(
             _acl([bytes([0x20, 0, 2, 0]), _allow_everyone()]),
             (_UNDEFINED_HEADER,),
-            "shorter than an entry header",
+            "entry 0 of its DACL is shorter than an entry header",
+            (),
             id="acesize-2-first",
         ),
         pytest.param(
             _acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]),
-            (_EVERYONE_ALLOW, _UNDEFINED_HEADER),
-            "shorter than an entry header",
+            (_EVERYONE_ALLOW, (1, 0x20, 0, 0, None)),
+            "entry 1 of its DACL is shorter than an entry header",
+            (),
             id="acesize-0-after-a-grant",
         ),
-        # A last entry whose AceSize runs past AclSize is read up to the bound, and no further.
+        # A granting entry with an AceSize of 0: its header alone cannot hold its rights.
+        pytest.param(
+            _acl([bytes([0x00, 0, 0, 0]), _allow_everyone()]),
+            (),
+            "entry 0 of its DACL is shorter than an entry header",
+            (0,),
+            id="granting-acesize-0",
+        ),
+        # An AceSize past AclSize: the entry is read from its own bytes up to the bound.
         pytest.param(
             _acl([_OVERRUNNING_EVERYONE]),
             (_EVERYONE_ALLOW,),
-            "runs past the end of the DACL",
+            "entry 0 of its DACL runs past the end of the DACL",
+            (),
             id="acesize-past-aclsize",
         ),
-        # A granting entry too short for its rights, inside the bound: its reason is recorded, its
-        # rights are read from the bytes after it, as GetAce read them on origin/main (here the next
-        # entry's header, 0x00140000), and the walk goes on by its AceSize.
+        pytest.param(
+            _acl(
+                [
+                    _ace(0x00, (0x1F01FF).to_bytes(4, "little"))[:2]
+                    + (0xFFFF).to_bytes(2, "little")
+                    + (0x1F01FF).to_bytes(4, "little")
+                ]
+            ),
+            (),
+            "entry 0 of its DACL runs past the end of the DACL",
+            (0,),
+            id="granting-past-aclsize-without-sid",
+        ),
+        # A granting entry too short for its body, inside the bound: left out as malformed, never
+        # read from the next entry's bytes, and the walk goes on by its AceSize.
         pytest.param(
             _acl([_SHORT_CALLBACK, _allow_everyone()]),
-            ((0x09, 0, 0x00140000, None), (0x00, 0, 0x1F01FF, 8 + 4 + 8)),
-            "too short to hold its rights",
+            ((1, 0x00, 0, 0x1F01FF, 8 + 4 + 8),),
+            "entry 0 of its DACL is too short to hold its rights",
+            (0,),
             id="short-callback-then-grant",
         ),
-        # An allow entry whose SID needs 20 bytes but whose AceSize is 16: the SID's last 4 bytes
-        # are read from the next entry, as on origin/main, and the walk goes on by AceSize.
         pytest.param(
             _acl(
                 [
@@ -1711,58 +1748,73 @@ _OVERRUNNING_EVERYONE = (
                     _allow_everyone(),
                 ]
             ),
-            ((0x00, 0, 0x1F01FF, 16), (0x00, 0, 0x1F01FF, 8 + 16 + 8)),
-            "too short to hold its SID",
+            ((1, 0x00, 0, 0x1F01FF, 8 + 16 + 8),),
+            "entry 0 of its DACL is too short to hold its SID",
+            (0,),
             id="allow-sid-past-acesize",
         ),
         pytest.param(
-            _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]),
-            (),
-            "too short to hold its SID",
-            id="allow-without-sid",
+            _SID_LESS_THEN_GRANT,
+            ((1, 0x00, 0, 0x1F01FF, 8 + 8 + 8),),
+            "entry 0 of its DACL is too short to hold its SID",
+            (0,),
+            id="allow-without-sid-then-grant",
         ),
         pytest.param(
             _acl([_allow_everyone()], count=2),
             (_EVERYONE_ALLOW,),
-            "starts past the end of the DACL",
+            "entry 1 of its DACL starts past the end of the DACL",
+            (),
             id="count-past-aclsize",
         ),
         # An entry that starts within 3 bytes of AclSize, so its AceSize is not inside the DACL.
         pytest.param(
             _acl([_allow_everyone(), bytes(2)], count=2),
             (_EVERYONE_ALLOW,),
-            "starts past the end of the DACL",
+            "entry 1 of its DACL starts past the end of the DACL",
+            (),
             id="header-split-by-aclsize",
         ),
-        pytest.param(_acl([], size=4), (), "too short to hold its header", id="fewer-than-8-bytes"),
+        pytest.param(
+            _acl([], size=4), (), "its DACL is too short to hold its header", (), id="under-8-bytes"
+        ),
         # Eight bytes passed, but the header's own AclSize is 4.
         pytest.param(
             bytes([2, 0, 4, 0, 0, 0, 0, 0]),
             (),
-            "too short to hold its header",
+            "its DACL is too short to hold its header",
+            (),
             id="aclsize-below-8",
         ),
-        # A revision Windows does not define: GetAce refused it, and so does the walk.
-        pytest.param(bytes([9]) + _acl([_allow_everyone()])[1:], (), "revision 9", id="revision-9"),
-        pytest.param(bytes([0]) + _acl([_allow_everyone()])[1:], (), "revision 0", id="revision-0"),
+        # A revision Windows does not define reads no entry.
+        pytest.param(
+            bytes([9]) + _acl([_allow_everyone()])[1:], (), "revision 9", (), id="revision-9"
+        ),
+        pytest.param(
+            bytes([0]) + _acl([_allow_everyone()])[1:], (), "revision 0", (), id="revision-0"
+        ),
     ],
 )
 def test_s12_15_a_dacl_with_an_entry_out_of_its_bounds_is_read_as_incomplete(
-    acl: bytes, read: tuple[tuple[int, int, int, int | None], ...], reason: str
+    acl: bytes,
+    read: tuple[tuple[int, int, int, int, int | None], ...],
+    reason: str,
+    malformed: tuple[int, ...],
 ) -> None:
-    """The walk never reads past the DACL's bound. It returns every entry it could read beside the
-    first reason the read is incomplete, which the reader records as a failed read (BACKLOG #6281,
-    member S12-15)."""
-    entries, stopped = ap.dacl_entries(acl)
+    """The walk reads each entry from its own bytes only, and never past the DACL's bound. It
+    returns every entry it could read, the first reason the read is incomplete, and the granting
+    entries too short for their body (BACKLOG #6281, member S12-15)."""
+    entries, stopped, bad = _walk(acl)
     assert entries == read
     assert stopped is not None and reason in stopped, stopped
+    assert bad == malformed
 
 
 def test_s12_15_the_dacl_revisions_windows_defines_are_read() -> None:
     """The control for the revision check: revisions 2, 3 and 4 read in full."""
     for revision in (2, 3, 4):
         acl = bytes([revision]) + _acl([_allow_everyone()])[1:]
-        assert ap.dacl_entries(acl) == ((_EVERYONE_ALLOW,), None)
+        assert _walk(acl) == ((_EVERYONE_ALLOW,), None, ())
 
 
 def _sid_at(acl: bytes, offset: int) -> str | None:
@@ -1781,10 +1833,11 @@ def _sid_at(acl: bytes, offset: int) -> str | None:
     return "-".join(["S-1", str(authority), *map(str, subs)])
 
 
-#: An allow entry with room for its rights and none for its SID, then a grant to Everyone. Read as
-#: GetAce read it, the first entry's SID is the next entry's header, revision 0, which will not
-#: render.
-_SID_LESS_THEN_GRANT = _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little")), _allow_everyone()])
+def _security(acl: bytes, owner: str = "S-1-5-18") -> WinSecurity:
+    """What the reader records for ``acl``, with the pure SID renderer in place of ctypes."""
+    walk = ap.dacl_entries(acl)
+    aces, reason = ap.dacl_aces(walk, lambda offset: _sid_at(acl, offset))
+    return WinSecurity(owner, aces, reason, walk.malformed, reason is not None)
 
 
 @pytest.mark.parametrize(
@@ -1793,74 +1846,122 @@ _SID_LESS_THEN_GRANT = _acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little")), _allo
         pytest.param(_acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]), id="acesize-0-after-grant"),
         pytest.param(_acl([_SHORT_CALLBACK, _allow_everyone()]), id="short-callback-then-grant"),
         pytest.param(_acl([_OVERRUNNING_EVERYONE]), id="grant-past-aclsize"),
-        pytest.param(_SID_LESS_THEN_GRANT, id="unrenderable-sid-then-grant"),
+        pytest.param(_SID_LESS_THEN_GRANT, id="allow-without-sid-then-grant"),
+        pytest.param(_BAD_SID_THEN_GRANT, id="unrenderable-sid-then-grant"),
     ],
 )
-def test_s12_15_a_grant_the_walk_could_read_is_judged_insecure(acl: bytes) -> None:
+def test_s12_15_a_grant_the_reader_can_read_is_judged_insecure(acl: bytes) -> None:
     """Each DACL grants Everyone full control in an entry the reader can read, so the object is
-    definitely insecure. The reader keeps that grant beside the reason the read is incomplete, and
-    the evaluation scans it before the failure, so the verdict is False, not indeterminate, which a
-    matching pin would let through. Red on 6a7a0322719 for the first shape, on 44c19f878de for the
-    next two, and on e9898ce665f for the last, where a SID that would not render ended the read and
-    dropped the grant after it, as origin/main's reader also did."""
-    walked, stopped = ap.dacl_entries(acl)
-    aces, reason = ap.dacl_aces(walked, stopped, lambda offset: _sid_at(acl, offset))
-    sec = WinSecurity("S-1-5-18", aces, reason)
+    definitely insecure: the verdict is False, which no pin lets through, beside the failed read.
+    A failed read is reported first. A SID that will not render leaves out its own entry only."""
+    sec = _security(acl)
     trust = WinTrust("S-1-5-18", lambda _s: False)
     findings = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
-    assert findings[0].insecure is True and findings[0].sids == ("S-1-1-0",)
-    assert findings[-1].insecure is False and "could not be read" in findings[-1].reason
+    assert findings[0].insecure is False and "could not be read" in findings[0].reason
+    assert any(f.insecure and f.sids == ("S-1-1-0",) for f in findings)
+    assert _verdict(sec, DIRECTORY, trust) is False
+
+
+@pytest.mark.parametrize(
+    "acl",
+    [
+        pytest.param(_acl([_SHORT_CALLBACK]), id="short-callback"),
+        pytest.param(_acl([_ace(0x00, (0x1F01FF).to_bytes(4, "little"))]), id="allow-without-sid"),
+        pytest.param(_SID_LESS_THEN_GRANT, id="allow-without-sid-then-grant"),
+        pytest.param(
+            _acl(
+                [
+                    bytes([0x00, 0, 16, 0])
+                    + (0x1F01FF).to_bytes(4, "little")
+                    + _EVERYONE_SID_BYTES[:8],
+                    _allow_everyone(),
+                ]
+            ),
+            id="allow-sid-past-acesize",
+        ),
+    ],
+)
+def test_s12_15_a_malformed_granting_entry_is_a_definite_finding_naming_no_principal(
+    acl: bytes,
+) -> None:
+    """A granting entry too short for its body is reported as malformed, a definite finding that
+    names no account, so no fix offers to remove an account the DACL does not hold. Every account
+    a finding names is one an entry really holds: an entry is never read from the next entry's
+    bytes, which would name an account no entry holds."""
+    sec = _security(acl)
+    trust = WinTrust("S-1-5-18", lambda _s: True)  # every account but a broad group is trusted
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
+    [bad] = [f for f in findings if f.insecure and not f.sids]
+    assert "entry 0 of its access list is malformed" in bad.reason
+    assert {sid for f in findings for sid in f.sids} <= {"S-1-1-0"}
     assert _verdict(sec, DIRECTORY, trust) is False
 
 
 def test_s12_15_an_unrenderable_sid_is_left_out_and_the_walk_goes_on() -> None:
-    """An allow entry whose SID will not render is left out with its reason, and the entries after
-    it are kept. Where the walk already gave a reason, that first reason is kept."""
-    walked = ((0x00, 0, 0x1F01FF, 100), (0x00, 0, 0x1F01FF, 200), (0x01, 0, 0, None))
-    texts = {200: "S-1-1-0"}
-    aces, reason = ap.dacl_aces(walked, None, texts.get)
-    assert aces == ((0x00, 0, 0x1F01FF, "S-1-1-0"), (0x01, 0, 0, ""))
-    assert reason == "the SID of one of its allow entries could not be read"
-    assert ap.dacl_aces(walked, "entry 0 of its DACL is shorter", texts.get)[1] == (
-        "entry 0 of its DACL is shorter"
+    """An allow entry whose SID will not render is left out with a reason naming its entry, and the
+    entries after it are kept. Where the walk already gave a reason, that first reason is kept."""
+    walk = ap.DaclWalk(
+        ((0, 0x00, 0, 0x1F01FF, 100), (1, 0x00, 0, 0x1F01FF, 200), (2, 0x01, 0, 0, None))
     )
-    assert ap.dacl_aces(walked[1:], None, texts.get) == (aces, None)
+    texts = {200: "S-1-1-0"}
+    aces, reason = ap.dacl_aces(walk, texts.get)
+    assert aces == ((0x00, 0, 0x1F01FF, "S-1-1-0"), (0x01, 0, 0, ""))
+    assert reason == "the SID in entry 0 of its DACL could not be read"
+    earlier = ap.DaclWalk(walk.entries, "entry 3 of its DACL is shorter than an entry header")
+    assert ap.dacl_aces(earlier, texts.get)[1] == earlier.reason
+    assert ap.dacl_aces(ap.DaclWalk(walk.entries[1:]), texts.get) == (aces, None)
 
 
 @_windows_only
-def test_s12_15_the_real_sid_renderer_refuses_the_borrowed_sid_and_keeps_the_grant() -> None:
-    """The same shape with ``ConvertSidToStringSidW`` itself as the renderer, on a copy of the
-    DACL, as the reader renders it."""
+def test_s12_15_the_real_sid_renderer_leaves_out_an_unrenderable_sid_and_keeps_the_grant() -> None:
+    """The same with ``ConvertSidToStringSidW`` itself as the renderer, on a copy of the DACL, as
+    the reader renders it."""
     import ctypes
 
     from messagefoundry import win32_sid
 
     advapi32, kernel32 = win32_sid.sid_libraries()
-    buffer = ctypes.create_string_buffer(_SID_LESS_THEN_GRANT, len(_SID_LESS_THEN_GRANT))
-    walked, stopped = ap.dacl_entries(buffer.raw)
+    buffer = ctypes.create_string_buffer(_BAD_SID_THEN_GRANT, len(_BAD_SID_THEN_GRANT))
     aces, reason = ap.dacl_aces(
-        walked,
-        stopped,
+        ap.dacl_entries(buffer.raw),
         lambda offset: win32_sid.sid_text(advapi32, kernel32, ctypes.addressof(buffer) + offset),
     )
     assert aces == ((0x00, 0, 0x1F01FF, "S-1-1-0"),)
-    assert reason is not None and "too short to hold its SID" in reason
+    assert reason == "the SID in entry 0 of its DACL could not be read"
 
 
 def test_s12_15_an_owner_read_before_a_failed_dacl_read_is_still_judged() -> None:
-    """An untrusted owner read before the DACL walk stopped is definitely insecure, as origin/main
-    judged it: its GetAce walk recorded no failure for an AceSize-0 entry. Red on 72fb7e1a874: the
-    failure returned before the owner was judged, so the verdict was only indeterminate."""
+    """An untrusted owner is definitely insecure whether or not the DACL read failed."""
     trust = WinTrust("S-1-5-18", lambda _s: False)
     failed = "entry 0 of its DACL is shorter than an entry header"
     users = WinSecurity("S-1-5-32-545", (), failed)
     findings = evaluate_windows_object("C:\\x", DIRECTORY, users, trust)
-    assert findings[0].insecure is True and findings[0].owner is True
-    assert findings[-1].reason == f"its permissions could not be read: {failed}"
+    assert findings[0].reason == f"its permissions could not be read: {failed}"
+    assert findings[1].insecure is True and findings[1].owner is True
     assert _verdict(users, DIRECTORY, trust) is False
-    # The control: an owner that could not be read adds nothing beside the failure itself.
-    [only] = evaluate_windows_object("C:\\x", DIRECTORY, WinSecurity(None, (), failed), trust)
-    assert only.insecure is False and only.reason == f"its permissions could not be read: {failed}"
+
+
+def test_s12_15_an_owner_that_could_not_be_read_is_reported_beside_a_failed_read() -> None:
+    """An owner that could not be read is reported beside a failed DACL read, the failed read
+    first."""
+    failed = "entry 0 of its DACL is shorter than an entry header"
+    trust = WinTrust("S-1-5-18", lambda _s: False)
+    findings = evaluate_windows_object("C:\\x", DIRECTORY, WinSecurity(None, (), failed), trust)
+    assert [f.reason for f in findings] == [
+        f"its permissions could not be read: {failed}",
+        "its owner could not be read",
+    ]
+    assert not any(f.insecure for f in findings)
+
+
+def test_s12_15_a_failed_read_is_reported_first() -> None:
+    """The failed read leads, so a caller that quotes the first finding names it."""
+    sec = _security(_acl([_allow_everyone(), bytes([0x20, 0, 0, 0])]))
+    findings = evaluate_windows_object(
+        "C:\\x", DIRECTORY, sec, WinTrust("S-1-5-18", lambda _s: False)
+    )
+    assert "could not be read" in findings[0].reason and findings[0].insecure is False
+    assert findings[1].insecure is True
 
 
 def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
@@ -1869,3 +1970,20 @@ def test_s12_15_an_unreadable_dacl_is_never_judged_sound() -> None:
     trust = WinTrust("S-1-5-18", lambda _sid: True)
     [finding] = evaluate_windows_object("C:\\x", DIRECTORY, sec, trust)
     assert finding.insecure is False and "could not be read" in finding.reason
+
+
+def test_s12_15_a_malformed_holder_list_is_told_to_replace_it_not_to_grant_read_access() -> None:
+    """A holder whose list was read but is malformed is told to replace that list. Granting the
+    right to read it, the fix for a refused read, would change nothing."""
+    from messagefoundry import restricted_file
+
+    damaged = WinSecurity("S-1-5-18", (), "entry 0 of its DACL is malformed", damaged=True)
+    problem = str(restricted_file._holder_read_problem(damaged))
+    assert "is malformed" in problem and "replace that folder's access list" in problem
+    assert "right to read" not in problem
+    # The control: a read that was refused keeps the read-access fix.
+    refused = WinSecurity(None, (), "Win32 error 5 (Access is denied.)")
+    assert "right to read that folder's permissions" in str(
+        restricted_file._holder_read_problem(refused)
+    )
+    assert restricted_file._holder_read_problem(WinSecurity("S-1-5-18", ())) is None

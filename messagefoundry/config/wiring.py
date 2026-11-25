@@ -11270,7 +11270,8 @@ def _win32_config_source_probes() -> _WinConfigSourceProbes:
 
     from messagefoundry import win32_sid
 
-    # The SID, entry, account and token prototypes are shared with auth/anchor_path.py's reader.
+    # The SID, entry, account and token prototypes come from the leaf win32_sid, which
+    # auth/anchor_path.py's reader also uses.
     advapi32, kernel32 = win32_sid.sid_libraries()
 
     # Declare prototypes so 64-bit pointers aren't truncated to a default c_int arg (which raises an

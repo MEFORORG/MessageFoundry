@@ -226,13 +226,18 @@ class WinSecurity:
     ``aces`` holds ``(type, flags, mask, sid)`` per entry, with ``sid`` empty for an entry type the
     reader does not parse, and ``mask`` 0 for a type outside ``_GRANTING_ACE_TYPES``
     (:func:`dacl_entry_fields`). ``aces is None`` is a NULL DACL. ``error`` is set when the read
-    failed, and ``aces`` then holds every entry the reader could still read; an entry it could not
-    read is left out, and ``error`` gives the first reason (:func:`dacl_entries` and
+    failed. ``aces`` then holds every entry the reader could read from that entry's own bytes, and
+    leaves out the rest; ``error`` gives the first reason. ``malformed`` holds the index of each
+    granting entry left out because its own bytes are too short for its rights or SID, so it may
+    grant rights to someone the reader cannot name. ``damaged`` is set when the DACL itself was read
+    but its contents could not be, as opposed to a read that was refused (:func:`dacl_entries` and
     :func:`dacl_aces`)."""
 
     owner: str | None
     aces: tuple[tuple[int, int, int, str], ...] | None
     error: str | None = None
+    malformed: tuple[int, ...] = ()
+    damaged: bool = False
 
 
 @dataclass(frozen=True)
@@ -314,14 +319,29 @@ def evaluate_windows_object(
 ) -> list[ChainFinding]:
     """Every finding for one object in the chain. An empty list means the object is sound.
 
-    The entries are scanned before the owner, and past any entry the reader cannot judge, so a
-    definite insecure entry is never hidden behind an indeterminate one. That holds for a read that
-    failed part way too: every entry the reader could still read is scanned first. Deny entries are
-    ignored: that can only make the rule refuse more, never less."""
+    A failed read comes first, then the definite findings, then the indeterminate ones. Every entry
+    is scanned, past any entry the reader cannot judge and past a failed read, so a definite
+    insecure entry or owner is never left out. A malformed granting entry is a definite finding:
+    whom it grants rights to cannot be read. Deny entries are ignored: that can only make the rule
+    refuse more, never less."""
     if sec.aces is None and sec.error is None:
         return [ChainFinding(path, kind, True, "it has a null DACL, so everyone has full control")]
     mask = WIN_DIR_MASK if kind == DIRECTORY else WIN_FILE_MASK
-    insecure: list[ChainFinding] = []
+    failed = (
+        [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
+        if sec.error is not None
+        else []
+    )
+    insecure = [
+        ChainFinding(
+            path,
+            kind,
+            True,
+            f"entry {index} of its access list is malformed and may grant rights, and whom it "
+            "grants them to cannot be read",
+        )
+        for index in sec.malformed
+    ]
     unsure: list[ChainFinding] = []
     for ace_type, flags, access, sid in sec.aces or ():
         if ace_type not in _GRANTING_ACE_TYPES or flags & INHERIT_ONLY_ACE:
@@ -357,15 +377,6 @@ def evaluate_windows_object(
                     (sid,),
                 )
             )
-    # A read that failed after the owner was read still has its owner judged, so a definite
-    # untrusted owner is not hidden behind the failure either.
-    failed = (
-        [ChainFinding(path, kind, False, f"its permissions could not be read: {sec.error}")]
-        if sec.error is not None
-        else []
-    )
-    if sec.owner is None and failed:
-        return insecure + unsure + failed
     if sec.owner is None:
         unsure.append(ChainFinding(path, kind, False, "its owner could not be read"))
     else:
@@ -393,7 +404,7 @@ def evaluate_windows_object(
                     owner=True,
                 )
             )
-    return insecure + unsure + failed
+    return failed + insecure + unsure
 
 
 # =================================================================================================
@@ -1077,8 +1088,9 @@ class WinHost:
 
 def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
     """``(type, flags, mask)`` of one DACL entry, from the bytes it is given, or what those bytes
-    are too short to hold. :func:`dacl_entries` gives an entry its own AceSize bytes first, and a
-    granting entry too short for its body the bytes up to the DACL's end, as ``GetAce`` read it.
+    are too short to hold. :func:`dacl_entries` gives an entry only its own bytes: up to its
+    AceSize, or up to the DACL's end where its AceSize runs past it, or its header alone where its
+    AceSize is below 4.
 
     Only a granting entry's mask is read, and the mask is 0 for any other type. At least
     :func:`evaluate_windows_object` and ``restricted_file.py``'s link and holder checks read
@@ -1106,75 +1118,79 @@ def dacl_entry_fields(entry: bytes) -> tuple[int, int, int] | str:
 _ACL_REVISIONS = frozenset({2, 3, 4})
 
 
-def dacl_entries(acl: bytes) -> tuple[tuple[tuple[int, int, int, int | None], ...], str | None]:
-    """Each entry of one DACL as ``(type, flags, mask, sid_offset)``, and the first reason the read
-    is incomplete, or ``None`` when every entry was read.
+@dataclass(frozen=True)
+class DaclWalk:
+    """What :func:`dacl_entries` read of one DACL.
+
+    ``entries`` holds ``(index, type, flags, mask, sid_offset)`` per entry read, where ``index`` is
+    the entry's place in the DACL and ``sid_offset`` is where an allow entry's SID starts in the
+    DACL's bytes, ``None`` for any other type. ``reason`` is the first reason the read is
+    incomplete, or ``None``. ``malformed`` holds the index of each granting entry whose own bytes
+    are too short for its rights or SID."""
+
+    entries: tuple[tuple[int, int, int, int, int | None], ...]
+    reason: str | None = None
+    malformed: tuple[int, ...] = ()
+
+
+def dacl_entries(acl: bytes) -> DaclWalk:
+    """Each entry of one DACL, read from that entry's own bytes only.
 
     ``acl`` is the DACL's bytes from its start. The walk is bounded by the smaller of ``len(acl)``
     and the header's own AclSize, so bytes past the DACL are never read as an entry, whatever the
-    caller copied. ``sid_offset`` is where an allow entry's SID starts in ``acl``, for the caller to
-    render, and ``None`` for any other type. A revision Windows does not define reads no entry.
+    caller copied. A revision Windows does not define reads no entry.
 
-    The walk steps from entry to entry by each one's own AceSize, as ``GetAce`` does. When an
-    entry's AceSize is at least 4 and inside the bound but its body is too short, its reason is
-    recorded, the entry is read again from its start to the bound, as ``GetAce`` read it, and kept
-    if that reading holds, and the walk goes on by its AceSize. An AceSize that cannot be trusted
-    stops the walk: one below 4 would make every later index read the same entry again, or the
-    next entry from inside this one, and one past the bound gives no next entry. That entry too is
-    read from its start to the bound. Nothing past the bound is ever read. Every entry kept is
-    returned beside the first reason, so a definite grant among them still counts. Kept free of
-    ctypes so every platform tests it."""
+    The walk steps from entry to entry by each one's own AceSize, as ``GetAce`` does. An entry is
+    read from its own bytes: up to its AceSize, or up to the bound where its AceSize runs past it,
+    or its header alone where its AceSize is below 4. Bytes after an entry are never read as part
+    of it, so an entry too short for its body never takes its rights or SID from the next entry. A
+    granting entry too short for its rights or SID is left out and recorded as malformed, and the
+    walk goes on. An AceSize that cannot be trusted stops the walk: one below 4 would make every
+    later index read the same entry again, or the next entry from inside this one, and one past the
+    bound gives no next entry. Kept free of ctypes so every platform tests it."""
     if len(acl) < 8:
-        return (), "its DACL is too short to hold its header"
+        return DaclWalk((), "its DACL is too short to hold its header")
     # ACL header: revision, sbz1 (bytes), AclSize, AceCount, sbz2 (words).
     if acl[0] not in _ACL_REVISIONS:
-        return (), f"its DACL has revision {acl[0]}, which Windows does not define"
+        return DaclWalk((), f"its DACL has revision {acl[0]}, which Windows does not define")
     bound = min(len(acl), int.from_bytes(acl[2:4], "little"))
     if bound < 8:
-        return (), "its DACL is too short to hold its header"
+        return DaclWalk((), "its DACL is too short to hold its header")
     count = int.from_bytes(acl[4:6], "little")
-    entries: list[tuple[int, int, int, int | None]] = []
-    reason: str | None = None
-
-    def keep(index: int, start: int, end: int) -> None:
-        nonlocal reason
-        fields = dacl_entry_fields(acl[start:end])
-        if isinstance(fields, str):
-            reason = reason or f"entry {index} of its DACL is {fields}"
-            # GetAce handed the entry over whatever its size, and its rights and SID were read
-            # from the bytes after it. Read it the same way, up to the bound and no further, so a
-            # grant origin/main judged is still judged.
-            fields = dacl_entry_fields(acl[start:bound])
-            if isinstance(fields, str):
-                return
-        ace_type, flags, mask = fields
-        entries.append(
-            (ace_type, flags, mask, start + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None)
-        )
-
+    entries: list[tuple[int, int, int, int, int | None]] = []
+    malformed: list[int] = []
+    reasons: list[str] = []
     offset = 8
     for index in range(count):
         if offset + 4 > bound:
-            reason = reason or f"entry {index} of its DACL starts past the end of the DACL"
+            reasons.append(f"entry {index} of its DACL starts past the end of the DACL")
             break
         size = int.from_bytes(acl[offset + 2 : offset + 4], "little")
-        if size < 4 or offset + size > bound:
-            keep(index, offset, bound)
-            reason = reason or (
-                f"entry {index} of its DACL is shorter than an entry header"
-                if size < 4
-                else f"entry {index} of its DACL runs past the end of the DACL"
-            )
+        if size < 4:
+            reasons.append(f"entry {index} of its DACL is shorter than an entry header")
+            end = offset + 4
+        elif offset + size > bound:
+            reasons.append(f"entry {index} of its DACL runs past the end of the DACL")
+            end = bound
+        else:
+            end = offset + size
+        fields = dacl_entry_fields(acl[offset:end])
+        if isinstance(fields, str):
+            reasons.append(f"entry {index} of its DACL is {fields}")
+            if acl[offset] in _GRANTING_ACE_TYPES:
+                malformed.append(index)
+        else:
+            ace_type, flags, mask = fields
+            sid_offset = offset + 8 if ace_type == ACCESS_ALLOWED_ACE_TYPE else None
+            entries.append((index, ace_type, flags, mask, sid_offset))
+        if end != offset + size:
             break
-        keep(index, offset, offset + size)
         offset += size
-    return tuple(entries), reason
+    return DaclWalk(tuple(entries), reasons[0] if reasons else None, tuple(malformed))
 
 
 def dacl_aces(
-    walked: tuple[tuple[int, int, int, int | None], ...],
-    stopped: str | None,
-    render: Callable[[int], str | None],
+    walk: DaclWalk, render: Callable[[int], str | None]
 ) -> tuple[tuple[tuple[int, int, int, str], ...], str | None]:
     """The :class:`WinSecurity` entries from a :func:`dacl_entries` walk, and the first reason the
     read is incomplete.
@@ -1184,13 +1200,13 @@ def dacl_aces(
     gave none, and the entries after it are still kept, so a definite grant after it still counts.
     Kept free of ctypes so every platform tests it."""
     aces: list[tuple[int, int, int, str]] = []
-    reason = stopped
-    for ace_type, flags, mask, sid_offset in walked:
+    reason = walk.reason
+    for index, ace_type, flags, mask, sid_offset in walk.entries:
         sid = ""
         if sid_offset is not None:
             parsed = render(sid_offset)
             if parsed is None:
-                reason = reason or "the SID of one of its allow entries could not be read"
+                reason = reason or f"the SID in entry {index} of its DACL could not be read"
                 continue
             sid = parsed
         aces.append((ace_type, flags, mask, sid))
@@ -1211,7 +1227,7 @@ def windows_host_readers() -> WinHost:
 
     from messagefoundry import win32_sid
 
-    # The SID, entry, account and token prototypes are shared with config/wiring.py's reader.
+    # The SID, account and token prototypes this reader uses are shared with config/wiring.py's.
     advapi32, kernel32 = win32_sid.sid_libraries()
     pvoid_p = ctypes.POINTER(ctypes.c_void_p)
     kernel32.CreateFileW.restype = wintypes.HANDLE
@@ -1294,13 +1310,11 @@ def windows_host_readers() -> WinHost:
             # entry's size can carry a read past the DACL.
             acl_size = ctypes.cast(dacl_ptr.value + 2, ctypes.POINTER(wintypes.WORD))[0]
             acl = ctypes.create_string_buffer(ctypes.string_at(dacl_ptr.value, acl_size), acl_size)
-            walked, stopped = dacl_entries(acl.raw)
+            walk = dacl_entries(acl.raw)
             # Every entry the reader can read goes back with the first reason, so a definite grant
             # among them is still judged (evaluate_windows_object).
-            aces, reason = dacl_aces(
-                walked, stopped, lambda offset: sid_text(ctypes.addressof(acl) + offset)
-            )
-            return WinSecurity(owner, aces, reason)
+            aces, reason = dacl_aces(walk, lambda offset: sid_text(ctypes.addressof(acl) + offset))
+            return WinSecurity(owner, aces, reason, walk.malformed, reason is not None)
         finally:
             if sd_ptr.value:
                 kernel32.LocalFree(sd_ptr)
