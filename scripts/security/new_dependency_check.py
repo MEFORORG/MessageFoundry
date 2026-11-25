@@ -920,7 +920,8 @@ def main(argv: list[str] | None = None) -> int:
     # first spelling, so a --pyproject repeated or reached by two spellings is swept and reported
     # once (BACKLOG #5641). The directory is part of the key because the hatch.toml and uv.toml
     # swept beside a file are read from it: a link to one pyproject from another directory still
-    # has that directory's siblings swept, at the cost of its own refusals reported twice.
+    # has that directory's siblings swept, at the cost of the file's refused entries (not its
+    # registry findings, which are keyed by name) being reported twice.
     by_file: dict[tuple[Path, Path], Path] = {}
     for candidate in args.pyproject or default_pyprojects(_ROOT):
         key = (_same_file_key(candidate), _same_file_key(candidate.parent))

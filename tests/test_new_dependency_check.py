@@ -1563,10 +1563,14 @@ def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
         '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
     )
     (tmp_path / "uv.toml").write_text("extra-index-url = ['https://e.invalid/s']\n", "utf-8")
-    # A second, DISTINCT pyproject in the same directory shares the uv.toml, and the pyproject
-    # de-duplication cannot collapse it (review round e8390625a8: two spellings of one file did).
-    other = tmp_path / "other-pyproject.toml"
-    other.write_text('[project]\nname = "y"\ndependencies = ["httpx>=0.1"]\n', encoding="utf-8")
+    # A second, DISTINCT pyproject in the same directory, named through another spelling of it, so
+    # the uv.toml is reached by two spellings that the pyproject de-duplication cannot collapse
+    # (review rounds e8390625a8 and 7f68c804ce).
+    (tmp_path / "other-pyproject.toml").write_text(
+        '[project]\nname = "y"\ndependencies = ["httpx>=0.1"]\n', encoding="utf-8"
+    )
+    (tmp_path / "sub").mkdir()
+    other = tmp_path / "sub" / ".." / "other-pyproject.toml"
     _stub_registry(monkeypatch)
     assert main(["--pyproject", str(project), "--pyproject", str(other)]) == 1
     assert "1 finding(s)" in capsys.readouterr().err
