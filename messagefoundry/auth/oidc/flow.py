@@ -124,7 +124,10 @@ class PendingFlow:
     code_verifier: str
     return_to: str
     client_ip: str
-    deadline: float
+    #: Stamped by :meth:`FlowCache.put` as the cache's clock plus the cache's TTL, so the cache that
+    #: checks expiry is the only source of both (BACKLOG #6902): a value set before staging is
+    #: replaced. ``0.0`` on a flow never staged, which reads as already expired.
+    deadline: float = 0.0
     #: The hash of the session the browser presented at the START leg, if any (ASVS 7.2.4). The
     #: callback cannot read it for itself: the session cookie is SameSite=Strict and the IdP's
     #: redirect back is a cross-site navigation, so the browser withholds it there. Staged as a hash,
@@ -171,7 +174,8 @@ class FlowCache:
     Keyed on ``sha256(flow_id)`` — the raw ``flow_id`` lives only in the browser cookie, so a cache
     dump never yields a usable flow id. ``put`` **rejects** at the global or per-IP cap rather than
     evicting (eviction = a login DoS). :meth:`pop_if_state_matches` is the only way to consume a
-    flow: single-use, TTL-checked on ``time.monotonic``, and only for the flow's own ``state``.
+    flow: single-use, TTL-checked on the cache's own clock (``time.monotonic`` by default), and only
+    for the flow's own ``state``.
     There is deliberately no plain ``pop``, because consuming before comparing let a forged callback
     spend a sign-in in flight (BACKLOG #3198).
     """
@@ -203,7 +207,11 @@ class FlowCache:
 
     def put(self, flow_id: str, flow: PendingFlow) -> PendingFlow:
         """Stage ``flow`` under ``sha256(flow_id)``, enforcing the global and per-IP caps, and return
-        the staged copy, stamped with the instant it was staged."""
+        the staged copy, stamped with the instant it was staged and the deadline this cache's TTL
+        sets from it.
+
+        A cap of ``0`` or below refuses every flow, an empty cache included. That is deliberate: no
+        cap value switches the bound off."""
         now = self._clock()
         self._prune(now)
         if len(self._entries) >= self._global_cap:
@@ -217,7 +225,7 @@ class FlowCache:
                 f"OIDC login refused: too many pending flows from {flow.client_ip} "
                 f"({self._per_ip_cap})."
             )
-        staged = replace(flow, started=now)
+        staged = replace(flow, started=now, deadline=now + self._ttl)
         self._entries[self._key(flow_id)] = staged
         return staged
 
@@ -274,8 +282,6 @@ def start_flow(
     *,
     return_to: str,
     client_ip: str,
-    ttl_seconds: float = DEFAULT_FLOW_TTL_SECONDS,
-    clock: Callable[[], float] = time.monotonic,
     prior_session_hash: str | None = None,
     step_up_session_hash: str | None = None,
     step_up_user_id: str | None = None,
@@ -284,7 +290,9 @@ def start_flow(
 ) -> tuple[str, PendingFlow]:
     """Mint a flow (state/nonce/PKCE), stage it, and return ``(flow_id, flow)``.
 
-    ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks.
+    ``flow_id`` goes in the browser cookie; ``flow`` carries the values the callback re-checks. Its
+    expiry is ``cache``'s TTL on ``cache``'s clock, stamped by :meth:`FlowCache.put`; nothing here
+    takes a TTL or a clock, so no caller can stage a deadline the cache then reads on another clock.
     """
     flow_id = new_flow_id()
     verifier, _challenge = generate_pkce()
@@ -294,7 +302,6 @@ def start_flow(
         code_verifier=verifier,
         return_to=return_to,
         client_ip=client_ip,
-        deadline=clock() + ttl_seconds,
         prior_session_hash=prior_session_hash,
         step_up_session_hash=step_up_session_hash,
         step_up_user_id=step_up_user_id,

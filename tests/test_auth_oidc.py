@@ -721,7 +721,7 @@ def test_pkce_challenge_is_s256_of_the_verifier() -> None:
 
 def test_flow_round_trip_binds_and_is_single_use() -> None:
     cache = oidc.FlowCache(clock=lambda: 0.0)
-    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     got, consumed = cache.pop_if_state_matches(flow_id, flow.state)
     assert got is not None and got.state == flow.state and consumed
     assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)  # single-use
@@ -733,9 +733,7 @@ def test_a_consumed_flows_age_stops_at_its_consumption() -> None:
     read, so that work must not count as time the person spent before the callback arrived."""
     clock = [0.0]
     cache = oidc.FlowCache(clock=lambda: clock[0])
-    flow_id, flow = oidc.start_flow(
-        cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: clock[0]
-    )
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     assert cache.age(flow) == 0.0 and flow.redeemed is None
     clock[0] = 0.5
     assert cache.age(flow) == 0.5, "an unconsumed flow ages with the clock"
@@ -749,7 +747,7 @@ def test_a_flow_is_consumed_only_by_its_own_state() -> None:
     """BACKLOG #3198. A missing or wrong ``state`` leaves the flow staged, so a forged callback
     cannot spend the one the real IdP return needs. The matching state consumes it once."""
     cache = oidc.FlowCache(clock=lambda: 0.0)
-    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     for forged in (None, "", "forged-" + flow.state, "café"):
         got, consumed = cache.pop_if_state_matches(flow_id, forged)
         assert got is not None and not consumed, forged
@@ -761,32 +759,66 @@ def test_a_flow_is_consumed_only_by_its_own_state() -> None:
 def test_flow_expires() -> None:
     clock = [0.0]
     cache = oidc.FlowCache(ttl_seconds=100.0, clock=lambda: clock[0])
-    flow_id, flow = oidc.start_flow(
-        cache, return_to="/ui", client_ip="10.0.0.1", ttl_seconds=100.0, clock=lambda: clock[0]
-    )
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
     clock[0] = 200.0
     assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)
     assert cache._entries == {}, "an expired flow found on lookup is dropped"
 
 
+def test_the_caches_own_ttl_and_clock_set_a_flows_deadline() -> None:
+    """BACKLOG #6902. RED when: ``start_flow`` stamps the deadline from a TTL and a clock of its
+    own, so a cache built with ``ttl_seconds`` or ``clock`` keeps flows for the module default on
+    ``time.monotonic`` instead. The clock here starts far from ``time.monotonic``, so a deadline
+    read on the wrong clock is unmistakable, and the TTL is far from the 300 s default."""
+    clock = [1e9]
+    cache = oidc.FlowCache(ttl_seconds=7.0, clock=lambda: clock[0])
+    flow_id, flow = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
+    assert flow.deadline == 1e9 + 7.0
+    clock[0] = 1e9 + 6.5
+    assert cache.peek(flow_id) is not None, "the flow lives until the cache's own TTL runs out"
+    clock[0] = 1e9 + 7.0
+    assert cache.peek(flow_id) is None, "the cache's TTL, not the module default, ends it"
+    assert cache.pop_if_state_matches(flow_id, flow.state) == (None, False)
+
+
+def test_put_replaces_a_deadline_set_before_staging() -> None:
+    """BACKLOG #6902. A flow handed straight to ``put`` with a deadline of its own is held to the
+    cache's TTL on the cache's clock, so no caller can set a deadline the cache then reads on
+    another clock."""
+    clock = [50.0]
+    cache = oidc.FlowCache(ttl_seconds=10.0, clock=lambda: clock[0])
+    flow = oidc.PendingFlow(
+        state="st",
+        nonce="n",
+        code_verifier="v",
+        return_to="/ui",
+        client_ip="10.0.0.1",
+        deadline=1e12,
+    )
+    staged = cache.put("flow-1", flow)
+    assert staged.deadline == 60.0 and staged.started == 50.0
+    clock[0] = 60.0
+    assert cache.peek("flow-1") is None
+
+
 def test_flow_cache_rejects_when_full_never_evicts() -> None:
     """A start-leg flood must be REFUSED, not silently drop an earlier legitimate flow."""
     cache = oidc.FlowCache(global_cap=2, per_ip_cap=99, clock=lambda: 0.0)
-    a, _ = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1", clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.2", clock=lambda: 0.0)
+    a, _ = oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.1")
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.2")
     with pytest.raises(oidc.FlowCacheFullError):
-        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.3", clock=lambda: 0.0)
+        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.3")
     assert cache.peek(a) is not None  # the earliest flow survived the flood
 
 
 def test_per_ip_cap_contains_one_source() -> None:
     cache = oidc.FlowCache(global_cap=99, per_ip_cap=2, clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
     with pytest.raises(oidc.FlowCacheFullError):
-        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9", clock=lambda: 0.0)
+        oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.9")
     # a different source is unaffected
-    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.8", clock=lambda: 0.0)
+    oidc.start_flow(cache, return_to="/ui", client_ip="10.0.0.8")
 
 
 def test_state_comparison_is_constant_time() -> None:
