@@ -5301,10 +5301,10 @@ def _extract_member(
             # Reuse the store's own PHI-at-rest primitive, on the empty file, before any of the
             # member's bytes reach it.
             _secure_staged(out, secure)
-            while True:
-                buf = src.read(1024 * 1024)
-                if not buf:
-                    break
+            # `_read_chunks` refuses a None read as an OSError, which each caller reports as it
+            # reports any OSError from this copy, rather than reading it as the member's end and
+            # checking a truncated store (BACKLOG #6687).
+            for buf in _read_chunks(src, f"{name} member"):
                 streamed += len(buf)
                 if streamed > max_member_bytes:
                     raise tarfile.TarError(
@@ -5757,12 +5757,10 @@ def _restore_blocking(
                     # because it has no AEAD tag to fail on first -- a forged archive is simply copied.
                     # Counting the streamed bytes IS the enforcement (a file's size on disk is not a
                     # bound an attacker who supplies the file is subject to), so this cannot become
-                    # `copyfileobj`.
+                    # `copyfileobj`. `_read_chunks` refuses a None read as an OSError rather than
+                    # ending the copy short there (BACKLOG #6687).
                     streamed = 0
-                    while True:
-                        buf = src.read(1024 * 1024)
-                        if not buf:
-                            break
+                    for buf in _read_chunks(src, "plaintext archive"):
                         streamed += len(buf)
                         if streamed > _MAX_RESTORE_PLAINTEXT_BYTES:
                             raise BackupError(
@@ -6921,7 +6919,11 @@ def _place_restored_store(
         placed = False
         try:
             with out, open(src, "rb") as fh:
-                shutil.copyfileobj(fh, out, 1024 * 1024)
+                # Not `copyfileobj`, which reads a None read as the end and would place a
+                # truncated store as placed; `_read_chunks` refuses it as an OSError, which the
+                # cleanup below handles as it does any failed read (BACKLOG #6687).
+                for buf in _read_chunks(fh, "staged store"):
+                    out.write(buf)
                 out.flush()
                 os.fsync(out.fileno())
             placed = True
