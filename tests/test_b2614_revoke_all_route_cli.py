@@ -394,8 +394,8 @@ class _LinkLost(RuntimeError):
 
 @pytest.mark.parametrize(
     "lost",
-    [lambda: OSError("connection reset by peer"), _LinkLost],
-    ids=["OSError", "sqlstate-08"],
+    [lambda: OSError("connection reset by peer"), TimeoutError, _LinkLost],
+    ids=["OSError", "TimeoutError", "sqlstate-08"],
 )
 @pytest.mark.parametrize("committed", [True, False], ids=["after-commit", "before-commit"])
 def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
@@ -407,7 +407,9 @@ def test_a_link_lost_during_the_revoke_reads_as_unknown_and_is_recorded(
 ) -> None:
     """A link that fails during the revoke may fail after the server applied the COMMIT, so the
     command says the outcome is unknown, never "nothing was revoked", and its row records the
-    attempt. The after-commit arm is the case the old text misreported: the sessions ended."""
+    attempt. The after-commit arm is the case the old text misreported: the sessions ended. A
+    TimeoutError is one of these: a driver's command timeout covers the COMMIT, so it can fire
+    after the server committed."""
     monkeypatch.chdir(tmp_path)
     setenv_at_rest_opt_out(monkeypatch)
     _on_a_server_store(monkeypatch)
@@ -618,15 +620,13 @@ def test_an_os_error_on_a_sqlite_store_is_a_refusal(
     assert asyncio.run(_state(db, tokens)) == ([False, False], [])
 
 
-@pytest.mark.parametrize("shape", ["timeout", "inside-except-oserror"])
 def test_a_server_store_failure_that_names_no_lost_commit_is_a_refusal(
-    shape: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """On a server store, a driver's statement timeout before the COMMIT, and a refusal raised
-    while an OSError was being handled, name no lost COMMIT: "nothing was revoked", no row."""
+    """On a server store, a refusal raised while an OSError was being handled names no lost
+    COMMIT: "nothing was revoked", no row."""
     monkeypatch.chdir(tmp_path)
     setenv_at_rest_opt_out(monkeypatch)
     _on_a_server_store(monkeypatch)
@@ -634,8 +634,6 @@ def test_a_server_store_failure_that_names_no_lost_commit_is_a_refusal(
     tokens = asyncio.run(_seed(db))
 
     async def failing(self: MessageStore, **kwargs: object) -> RevokeResult:
-        if shape == "timeout":
-            raise TimeoutError
         try:
             raise ConnectionResetError("reset while reading a setting")
         except OSError:

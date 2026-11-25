@@ -15766,10 +15766,11 @@ def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
     """Whether ``admin-revoke-sessions``' failed revoke may have committed (BACKLOG #5093).
 
     Never on SQLite: the file has no link to lose, and a revoke that raised there rolled back.
-    On a server store, an ``OSError`` raised by the revoke itself, but not a ``TimeoutError``,
-    which a driver's own statement or pool timeout raises before a COMMIT is in doubt; or a
-    SQLSTATE of class 08, or 40003, "statement completion unknown", on the error or in its
-    implicit ``__context__`` chain. The chain is read for a SQLSTATE only: a rollback on a dead
+    On a server store, an ``OSError`` raised by the revoke itself, a ``TimeoutError`` among them,
+    as :func:`_write_outcome_unknown` reads one for the transit-bound commands: a driver's command
+    timeout covers the COMMIT too, so it can fire after the server committed; or a SQLSTATE of
+    class 08, or 40003, "statement completion unknown", on the error or in its implicit
+    ``__context__`` chain. The chain is read for a SQLSTATE only: a rollback on a dead
     connection after a COMMIT whose link failed raises its own error with the lost link as its
     context, while a refusal raised inside an ``except OSError`` block names no lost COMMIT. An
     explicit cause or a suppressed context ends the chain: the raiser chose what it means. The
@@ -15779,7 +15780,7 @@ def _revoke_link_lost(exc: BaseException, *, network: bool) -> bool:
 
     if not network:
         return False
-    if isinstance(exc, OSError) and not isinstance(exc, TimeoutError):
+    if isinstance(exc, OSError):
         return True
     link: BaseException | None = exc
     seen: set[int] = set()
