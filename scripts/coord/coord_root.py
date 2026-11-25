@@ -53,7 +53,6 @@ _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\
 _DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|\Z)")
 _DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/]([^\\/]+)")
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
-_SEP = re.compile(r"[\\/]")
 
 
 @dataclass(frozen=True)
@@ -77,13 +76,15 @@ def local_root(start: str | os.PathLike[str] | None = None) -> Path | None:
         proc = subprocess.run(args, capture_output=True, check=False)  # nosec B603 B607 - fixed argv, no shell
     except OSError:
         return None
+    if proc.returncode != 0:
+        return None
     try:
         out = proc.stdout.decode("utf-8") if os.name == "nt" else os.fsdecode(proc.stdout)
     except UnicodeDecodeError as exc:
         print(f"coord_root: git named a common dir that is not UTF-8 ({exc})", file=sys.stderr)
         return None
     common = out.strip(_WS)
-    if proc.returncode != 0 or not common:
+    if not common:
         return None
     return Path(common) / "mefor-coord"
 
@@ -162,15 +163,11 @@ def unc_host(path: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _root_key(path: str) -> str:
-    r"""One spelling of a UNC root for the down cache; ConvertTo-CoordRootKey builds the same one.
-
-    pathlib turns ``//srv/share/dir/`` into ``\\srv\share\dir`` and PowerShell keeps what it was
-    given, so without one spelling each twin missed, and overwrote, the verdict the other wrote.
-    The first two segments stay as written; past them, empty and '.' segments go.
-    """
-    s = _SEP.split(path[2:])
-    return "\\\\" + "\\".join(s[:2] + [x for x in s[2:] if x and x != "."])
+def _down_server(text: str) -> str | None:
+    """The server a down-cache file names, or None for any other shape, as Get-CoordDownServer reads."""
+    obj = json.loads(text)
+    value = obj.get("server") if isinstance(obj, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def probe_root(path: Path, local: Path | None) -> str | None:
@@ -178,16 +175,15 @@ def probe_root(path: Path, local: Path | None) -> str | None:
     server = unc_host(str(path))
     if server:
         down = local / DOWN_FILE if local else None
-        key = _root_key(str(path))
-        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
-        # skewed clock or a copied file, is ignored rather than trusted.
+        # The verdict is about ONE server; Test-CoordRoot's comment says why. A cache naming another
+        # server, or stamped in the future by a skewed clock or a copied file, is ignored.
         try:
             if down is not None and down.is_file():
                 age = time.time() - down.stat().st_mtime
-                cached = json.loads(down.read_text(encoding="utf-8")).get("root")
-                if cached == key and 0 <= age < DOWN_TTL_SECONDS:
+                cached = _down_server(down.read_text(encoding="utf-8"))
+                if cached == server and 0 <= age < DOWN_TTL_SECONDS:
                     return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
-        except (OSError, ValueError, AttributeError):
+        except (OSError, ValueError):
             pass
         if not _reachable(server):
             if down is not None:
@@ -196,7 +192,8 @@ def probe_root(path: Path, local: Path | None) -> str | None:
                     down.write_text(
                         json.dumps(
                             {
-                                "root": key,
+                                "server": server,
+                                "root": str(path),
                                 "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                             }
                         ),

@@ -243,7 +243,7 @@ def test_the_down_cache_answers_only_for_its_own_root(
 ) -> None:
     down = _local(repo) / "coord-root-down.json"
     down.parent.mkdir(parents=True)
-    down.write_text(json.dumps({"root": r"\elsewhere\x", "at": "now"}), encoding="utf-8")
+    down.write_text(json.dumps({"server": "elsewhere", "at": "now"}), encoding="utf-8")
     monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
     py = coord_root.resolve("claims", repo)
     assert py.error is not None and "cached" not in py.error
@@ -254,7 +254,7 @@ def test_a_future_stamped_down_cache_is_ignored(
 ) -> None:
     down = _local(repo) / "coord-root-down.json"
     down.parent.mkdir(parents=True)
-    down.write_text(json.dumps({"root": _DEAD_UNC, "at": "later"}), encoding="utf-8")
+    down.write_text(json.dumps({"server": "192.0.2.1", "at": "later"}), encoding="utf-8")
     future = time.time() + 86400
     os.utime(down, (future, future))
     monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
@@ -542,39 +542,52 @@ def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> Non
     subprocess.run(["git", "-C", str(r), "init", "-q"], check=True, capture_output=True)
     want = r / ".git" / "mefor-coord"
     assert coord_root.local_root(r) == want
-    # EscapeNonAscii keeps pwsh's stdout ASCII. Without it, a console code page that misread git's
-    # bytes re-encodes them back to the same UTF-8 on the way out, and the test reads the right path
-    # while PowerShell itself held mojibake.
-    # The OEM code page a stock Windows console starts in, set here so the reading does not depend
-    # on how this runner's console was set up.
+    # cp437 is the OEM code page a stock Windows console starts in, set here so the reading does not
+    # depend on this runner's console, and read back, since the setter can be refused with no console.
+    # EscapeNonAscii keeps pwsh's stdout ASCII: otherwise a code page that misread git's bytes
+    # re-encodes them to the same UTF-8 on the way out, and PowerShell's mojibake reads as right.
     got = _pwsh_json(
         "[Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(437); "
-        f"Get-CoordLocalRoot -From '{r}' | ConvertTo-Json -EscapeHandling EscapeNonAscii"
+        f"[ordered]@{{ cp = [Console]::OutputEncoding.CodePage; path = Get-CoordLocalRoot -From '{r}' }}"
+        " | ConvertTo-Json -Compress -EscapeHandling EscapeNonAscii"
     )
-    assert Path(got) == want
+    assert got["cp"] == 437, got
+    assert Path(got["path"]) == want
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
+def test_every_spelling_of_a_root_names_one_server_on_both() -> None:
+    # The down cache is keyed by server, so it needs every spelling of one root, as each twin holds
+    # it (pathlib's for Python), to name the same server on both.
+    spellings = [
         "//srv/share/./dir//",
         r"\\srv\share\dir",
-        r"\\.\UNC\srv\share\x",
-        r"\\UNC\srv\share\x",
-        r"\\?\UNC\srv\share\.\x\\",
-    ],
-)
-def test_the_down_cache_key_is_one_spelling_on_both(path: str) -> None:
-    ps = _pwsh_json(f"ConvertTo-CoordRootKey '{path}' | ConvertTo-Json")
-    assert ps == coord_root._root_key(path)
+        r"\\srv\share\dir\\",
+        r"\\?\UNC\srv\share\.\dir",
+    ]
+    held = [str(Path(p)) for p in spellings]
+    assert {coord_root.unc_host(p) for p in held} == {"srv"}
+    assert set(_ps_unc_hosts(spellings)) == {"srv"}
 
 
-def test_the_down_cache_key_keeps_distinct_roots_apart() -> None:
-    # Dropping every '.' segment merged \\.\UNC\srv (server srv) with \\UNC\srv (server UNC).
-    assert coord_root._root_key(r"\\.\UNC\srv\share\x") != coord_root._root_key(
-        r"\\UNC\srv\share\x"
+def test_the_down_cache_file_reads_the_same_on_both() -> None:
+    # Two readers of one file must give one answer. PowerShell unwrapped a one-element top-level
+    # array, matched a key in any case, and let -ceq filter an array value; Python rejects all three.
+    texts = [
+        '{"server": "srv"}',
+        '{"server": ["srv"]}',
+        '[{"server": "srv"}]',
+        '{"SERVER": "srv"}',
+        '{"server": 5}',
+        '{"root": "srv"}',
+        '"srv"',
+    ]
+    quoted = ", ".join("'" + t.replace("'", "''") + "'" for t in texts)
+    ps = _pwsh_json(
+        f"ConvertTo-Json -Compress -InputObject @(foreach ($t in @({quoted})) "
+        "{ $s = Get-CoordDownServer -Text $t; if ($null -eq $s) { '' } else { $s } })"
     )
-    assert coord_root._root_key("//srv/share/./dir/") == coord_root._root_key(r"\\srv\share\dir")
+    py = [coord_root._down_server(t) or "" for t in texts]
+    assert ps == py == ["srv", "", "", "", "", "", ""]
 
 
 def test_decisions_network_check_reads_a_device_drive_as_its_drive() -> None:
@@ -597,14 +610,48 @@ def test_decisions_network_check_reads_a_device_drive_as_its_drive() -> None:
     assert globalroot is True
 
 
-def test_an_array_in_the_down_cache_is_ignored_on_both(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # PowerShell's -ceq filters an array instead of comparing it, so ["<root>"] read as a hit there
-    # and as a miss in Python.
-    down = _local(repo) / "coord-root-down.json"
-    down.parent.mkdir(parents=True)
-    down.write_text(json.dumps({"root": [_DEAD_UNC], "at": "now"}), encoding="utf-8")
-    monkeypatch.setenv("MEFOR_COORD_ROOT", _DEAD_UNC)
-    ps = _ps(repo, "claims")
-    assert ps["Error"] is not None and "cached" not in str(ps["Error"]), ps
+def test_local_root_runs_git_in_powershells_location(tmp_path: Path, repo: Path) -> None:
+    # `& git` ran in PowerShell's location; a ProcessStartInfo runs in the process cwd unless told.
+    # The process cwd is tmp_path, outside any repository, and Set-Location moves only PowerShell's.
+    got = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{PS}'; Set-Location -LiteralPath '{repo}'; Get-CoordLocalRoot | ConvertTo-Json",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+    assert Path(json.loads(got.stdout)) == _local(repo)
+
+
+def test_local_root_never_runs_a_git_exe_from_the_cwd(tmp_path: Path, repo: Path) -> None:
+    # A bare 'git' handed to CreateProcess runs a git.exe in the process cwd before PATH's, unless
+    # NoDefaultCurrentDirectoryInExePath is set, which Claude Code sets and a plain terminal does
+    # not. whoami.exe stands in for a planted git.exe: it prints no common dir.
+    planted = tmp_path / "plant"
+    planted.mkdir()
+    whoami = Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "whoami.exe"
+    shutil.copyfile(whoami, planted / "git.exe")
+    env = {k: v for k, v in os.environ.items() if k.upper() != "NODEFAULTCURRENTDIRECTORYINEXEPATH"}
+    got = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{PS}'; Get-CoordLocalRoot -From '{repo}' | ConvertTo-Json",
+        ],
+        capture_output=True,
+        encoding="utf-8",
+        check=True,
+        timeout=60,
+        cwd=planted,
+        env=env,
+    )
+    assert Path(json.loads(got.stdout)) == _local(repo)

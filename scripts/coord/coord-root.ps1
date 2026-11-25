@@ -30,8 +30,8 @@
 
     REACHABILITY. A dead SMB server does not answer "no"; it hangs a file call for up to the client's
     session timeout (60 s measured). Test-CoordRoot answers fast instead: a TCP connect to port 445
-    with a short timeout, before any file call. A DOWN verdict is cached in <LOCAL>/coord-root-down.json
-    for 60 s, so a dead share costs one timeout per minute per clone, not one per hook process.
+    with a short timeout, before any file call. A DOWN verdict, keyed by server, is cached in
+    <LOCAL>/coord-root-down.json for 60 s, so a dead share costs one timeout per minute per clone, not one per hook process.
 
     CONSTRAINTS, the same four config-roots.ps1 states, because hooks dot-source this:
       1. NO top-level param() block.
@@ -99,10 +99,14 @@ function Get-CoordLocalRoot {
     # Git writes the path as UTF-8, and `& git` decodes it with [Console]::OutputEncoding, an OEM code
     # page on a stock console, so a non-ASCII checkout read back as mojibake (BACKLOG #7571). Reading
     # the process's own stream as strict UTF-8 matches local_root in the Python twin, and changes no
-    # process-wide encoding.
+    # process-wide encoding. Two things `& git` gave for free are kept by hand: git is found the way
+    # PowerShell finds it, never a git.exe in the process cwd, which a bare name lets CreateProcess
+    # run first; and it runs in PowerShell's location, which is not the process cwd after Set-Location.
     param([string]$From)
     try {
-        $psi = [System.Diagnostics.ProcessStartInfo]::new('git')
+        $git = Get-Command git -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($git.Source)
+        $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
         if ($From) { $psi.ArgumentList.Add('-C'); $psi.ArgumentList.Add($From) }
         foreach ($a in 'rev-parse', '--path-format=absolute', '--git-common-dir') { $psi.ArgumentList.Add($a) }
         $psi.UseShellExecute = $false
@@ -199,16 +203,16 @@ function Get-CoordUncHost {
     return $null
 }
 
-function ConvertTo-CoordRootKey {
-    # One spelling of a UNC root, for the down cache, so each twin reads the verdict the other wrote.
-    # Python's Path turns //srv/share/dir/ into \\srv\share\dir, and PowerShell keeps what it was
-    # given. Every separator becomes a backslash; past the first two segments (the server and share,
-    # or a \\?\ or \\.\ prefix), empty and '.' segments go. The first two stay as written, so
-    # \\.\UNC\srv and \\UNC\srv keep two keys.
-    param([string]$Path)
-    $s = @($Path.Substring(2) -split '[\\/]')
-    $rest = if ($s.Count -gt 2) { @(@($s[2..($s.Count - 1)]) -ne '' -cne '.') } else { @() }
-    return '\\' + ((@($s | Select-Object -First 2) + $rest) -join '\')
+function Get-CoordDownServer {
+    # The server a down-cache file names, or $null for any other shape. Strict, so this twin reads the
+    # file exactly as probe_root does: a JSON object with a string `server`, that key in that case.
+    # -NoEnumerate keeps a top-level array an array, and -ceq never filters one.
+    param([string]$Text)
+    $obj = ConvertFrom-Json -InputObject $Text -NoEnumerate -ErrorAction Stop
+    if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = @($obj.PSObject.Properties | Where-Object { $_.Name -ceq 'server' })
+    if ($p.Count -ne 1 -or $p[0].Value -isnot [string]) { return $null }
+    return $p[0].Value
 }
 
 function Test-CoordRoot {
@@ -218,16 +222,15 @@ function Test-CoordRoot {
     $server = Get-CoordUncHost -Path $Path
     if ($server) {
         $down = if ($LocalRoot) { Join-Path $LocalRoot $script:CoordDownFile } else { $null }
-        $key = if ($down) { ConvertTo-CoordRootKey $Path } else { $null }
-        # The verdict is about ONE root. A cache written for another root, or stamped in the future by a
-        # skewed clock or a copied file, is ignored rather than trusted.
+        # The verdict is about ONE server: what it records is that nothing answered on 445, and both
+        # twins read the same server out of every spelling of a root, where pathlib respells the
+        # rest (BACKLOG #7569). A cache naming another server, or stamped in the future by a skewed
+        # clock or a copied file, is ignored rather than trusted.
         try {
             if ($down -and (Test-Path -LiteralPath $down -PathType Leaf)) {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
-                $cached = ([System.IO.File]::ReadAllText($down) | ConvertFrom-Json -ErrorAction Stop).root
-                # -is [string] first: on an array, -ceq filters rather than compares, and Python's ==
-                # rejects one.
-                if ($cached -is [string] -and $cached -ceq $key -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
+                $cached = Get-CoordDownServer -Text ([System.IO.File]::ReadAllText($down))
+                if ($null -ne $cached -and $cached -ceq $server -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
                     return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
@@ -241,7 +244,7 @@ function Test-CoordRoot {
             try {
                 if ($down) {
                     New-Item -ItemType Directory -Force -Path $LocalRoot | Out-Null
-                    [System.IO.File]::WriteAllText($down, (@{ root = $key; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
+                    [System.IO.File]::WriteAllText($down, (@{ server = $server; root = $Path; at = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Compress))
                 }
             } catch { }
             return @{ Ok = $false; Error = "shared root $Path is unreachable: no answer from ${server}:445 within $($script:CoordProbeTimeoutMs) ms" }
