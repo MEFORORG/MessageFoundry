@@ -989,8 +989,10 @@ def _read_log_tail(
     back to where a key block covering it could begin
     (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text:
     the bundle masks across its bounded read window, and keeps the audit copies, while this reads the
-    whole file and, with ``audit_copies=False``, drops them before the mask. The redaction is
-    best-effort (a residual single-token identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
+    whole file and, with ``audit_copies=False``, drops them before the mask, so a key block an audit
+    copy splits can be masked for one reader and print for another. The redaction is best-effort (a
+    residual single-token identifier can survive), which is why the route is RBAC-gated + audited.
+    ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
     gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
     **never raises** (an unreadable dir/file yields an empty, unavailable page).

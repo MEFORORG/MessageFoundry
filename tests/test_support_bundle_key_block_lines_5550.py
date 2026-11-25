@@ -271,7 +271,28 @@ def _window_corpus() -> list[str]:
         "AAAA\\n2026.x",
         "plain words",
         "PID|1||MRN7712345^^^HOSP^MR||ZQDOE^ZQJANE||19700101|F",
+        # Characters the block pattern's case-insensitive classes read as letters.
+        "MIIEowIBAAKCAQEAKabc",
+        "abıcſQ",
+        "QUJDREVGpassword",
+        " " + _KEY_LAST,
     ]
+
+
+def test_the_whole_body_line_pattern_is_what_the_block_runs_on_over() -> None:
+    """``key_body_mask_from`` stops at a line ``_WHOLE_KEY_BODY_LINE`` refuses; that must be a line
+    the block pattern's body cannot run on past, and every line it accepts one it can."""
+    begin, after = pem_marker("BEGIN", "RSA PRIVATE KEY"), "QUJD"
+    accepted = refused = 0
+    for line in _window_corpus():
+        # ``match``, so a BEGIN marker on the line itself starts no block of its own here.
+        block = redact_mod._PRIVATE_KEY_BLOCK.match(begin + "\n" + line + "\n" + after)
+        runs_on = block is not None and block.group("key_body").endswith("\n" + after)
+        whole = redact_mod._WHOLE_KEY_BODY_LINE.fullmatch(line) is not None
+        assert whole == runs_on, line
+        accepted += whole
+        refused += not whole
+    assert accepted and refused
 
 
 def test_masking_from_the_scan_start_equals_masking_the_whole_list() -> None:
@@ -296,7 +317,7 @@ def test_masking_from_the_scan_start_equals_masking_the_whole_list() -> None:
 def test_the_log_viewer_masks_near_its_page_not_the_whole_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The cost of ``GET /logs/tail``: the cross-line mask runs over the page and the lines before
+    """The cross-line mask's share of ``GET /logs/tail``'s cost: it runs over the page and the lines before
     it back to where a block could begin, not over every line of the file on each request."""
     from messagefoundry.api.app import _read_log_tail
 

@@ -57,6 +57,8 @@ from messagefoundry.secretscrub import (
     _BEARER_TAILS,
     _BYTES_PROBE,
     _CONNECTION_STRING_MEMBER,
+    _KEY_LINE,
+    _KEY_SEPARATOR,
     _KV_TAILS,
     _MEFOR_GLUED_BRANCH,
     _MEFOR_TAILS,
@@ -816,24 +818,27 @@ def redact_log_text(text: str) -> str:
     return "\n".join(redact_log_record(ln) for ln in lines)
 
 
-#: A line that could sit inside a PRIVATE KEY block's body: a superset of the characters
-#: :data:`_PRIVATE_KEY_BLOCK` reads in a body line, its two header lines and an escaped line break,
-#: so a line it refuses ends any block before it.
-_MAYBE_KEY_BODY_LINE = re.compile(r"[A-Za-z0-9+/=\\ \t:,-]*+")
+#: One line :data:`_PRIVATE_KEY_BLOCK` reads as body, whole, so that its body runs on past the line
+#: break after it: the block pattern's own body-line and separator fragments, under its flag, with
+#: an escaped line break between the pieces of one line.
+_KEY_BODY_PIECE = _KEY_LINE + r"[ \t]*+(?=" + _KEY_SEPARATOR + r"|\Z)"
+_WHOLE_KEY_BODY_LINE = re.compile(
+    r"(?i)" + _KEY_BODY_PIECE + r"(?:[ \t]*+" + _KEY_SEPARATOR + _KEY_BODY_PIECE + r")*+"
+)
 
 
 def key_body_mask_from(lines: list[str], start: int) -> int:
     """The index to run :func:`mask_key_body_lines` from so that ``lines[start:]`` comes out as it
-    does from the whole list (BACKLOG #5550): the nearest line before ``start`` that no block's body
-    can cover, or 0.
+    does from the whole list (BACKLOG #5550): the nearest line before ``start`` that a block's body
+    cannot run on past, or 0.
 
-    A block's body is made of whole lines the block pattern reads as body lines, so a block that
-    covers a line at or after ``start`` has its BEGIN line at or after the nearest earlier line that
-    cannot be one. Masking from there costs the lines from there on, not the whole list. A run of
-    lines that each could be a body line, such as lines of plain words, is scanned back over whole,
-    so on such a run the cost is the run's length."""
+    A block's body runs on from one line to the next only over a line it reads as body whole
+    (:data:`_WHOLE_KEY_BODY_LINE`), so a block that covers a line at or after ``start`` has its
+    BEGIN line at or after the nearest earlier line that is not one. Masking from there costs the
+    lines from there on, not the whole list. A run of whole body lines before ``start`` is scanned
+    back over to its first line, so there the cost is the run's length."""
     index = min(start, len(lines))
-    while index > 0 and _MAYBE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
+    while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
         index -= 1
     return max(index - 1, 0)
 
@@ -849,9 +854,10 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
     more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
     last line, printed. So the block is found over the joined lines, and only the lines its body
     covers from their first character to their last are replaced, each with what the mask writes for
-    it, so no base64 run is left on them for a later pass to read differently. The mask writes the
-    base64 characters as "x" and leaves the rest of such a line as it was: at least its spaces and
-    tabs, an escaped line break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole.
+    it, so no character of the key itself is left on them. The mask writes each base64 character as
+    "x" and leaves the rest of such a line as it was: at least its spaces and tabs, an escaped line
+    break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole. A later pass still reads
+    the result: the long-base64 sweep reads a run of 24 or more "x" as base64 and replaces it.
     Every other line stays as it was.
 
     At least these still print as before: a last body line that shares its line with an escaped line
