@@ -2686,11 +2686,11 @@ count is above `0` (vault BACKLOG #2613).
 - **`secret_from_outside_service_lists`: another engine secret reaches the service from outside
   its lists.** An engine secret other than a store key is in the engine's own environment, the
   engine read its service's lists, and it did not read the secret there, so it came from
-  somewhere else, such as the machine-wide environment or a service-start wrapper. Where the
+  somewhere else, such as the machine-wide environment or a `python.exe` wrapper. Where the
   machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
   factories refuse to start on it under `[security].enforcement = "enforce"`, and under `"warn"`
-  the engine starts and names it here. One the engine does not find there, such as a wrapper's,
-  is named here and not refused. A store key from outside the lists is named as
+  the engine starts and names it here. One the engine does not find there, such as a
+  `python.exe` wrapper's, is named here and not refused. A store key from outside the lists is named as
   `store_key_in_service_environment` and not refused. The rule each follows is stated once, in
   the `messagefoundry/serviceenv.py` module docstring. Move it to the secrets directory and
   remove it from where it is set (vault BACKLOG #2595).

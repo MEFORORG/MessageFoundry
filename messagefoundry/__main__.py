@@ -3398,8 +3398,11 @@ def _serve(args: argparse.Namespace) -> int:
     # keeps in a registry key any local user can read. Refused under EVERY enforcement setting
     # (owner rulings 2026-10-01 and 2026-11-14).
     # messagefoundry/serviceenv.py says what the reading covers.
-    # Another engine secret reaching the service from outside those lists, such as from the
-    # machine-wide environment, is refused under enforce only, and named under warn.
+    # At least two more cases. Where the engine read those lists, an engine secret other than a
+    # store key that is in this process's environment and not in them is refused under enforce
+    # only when the machine-wide environment's registry key sets it; otherwise it is named.
+    # Where the engine found its service but could not read the lists, a store key or another
+    # engine secret in this process's environment is refused under every enforcement setting.
     from messagefoundry.serviceenv import service_env_posture, service_env_start_refusal
 
     service_env = service_env_posture()
@@ -6069,7 +6072,9 @@ def _supervise(args: argparse.Namespace) -> int:
     # shard reads the same NSSM service as the supervisor, since that service is an ancestor of
     # both, so every shard would refuse on what `serve` refuses there: an engine secret, or (vault
     # #8212) any MEFOR_VALUE_* variable. Refused under every enforcement setting, as in `serve`.
-    # Under enforce, also a secret reaching the service from outside its lists, as in `serve`.
+    # Under enforce, also a secret from outside its lists that the machine-wide environment's
+    # registry key sets; and, where the lists cannot be read, a secret in this process's
+    # environment under every setting. Both as in `serve`.
     from messagefoundry.serviceenv import (
         service_env_loosenings,
         service_env_posture,

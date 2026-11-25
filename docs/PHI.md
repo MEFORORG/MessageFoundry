@@ -3240,8 +3240,10 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
       `MEFOR_AUTH_AD_BIND_PASSWORD`, future `MEFOR_STORE_ENCRYPTION_KEY`). Under the Windows
       service, not through its NSSM list. `serve` and `supervise` refuse them there where the
       engine could read that list. Where it found its service but could not read the list, they
-      refuse a store key or another engine secret found in their own environment, and under
-      `enforce` they refuse one other than a store key that the machine-wide environment sets: see
+      refuse a store key or another engine secret found in their own environment. Where it could
+      read the list, under `enforce` they also refuse a secret other than a store key that is in
+      their own environment, not in the list, and set in the machine-wide environment's registry
+      key: see
       [SERVICE.md](SERVICE.md#protect-the-store-encryption-key-at-rest-wp-11d).
 - [ ] **Never feed real PHI to `dryrun`/`generate`** or redirect their output to shared locations (§7).
 - [ ] **Treat the harness's real-feed files as PHI.** Before running `python -m harness.reconcile`

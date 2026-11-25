@@ -37,8 +37,10 @@ key, and the Service Control Manager's own ``Environment`` value on the service'
   environment always, and other secrets in the environment under ``enforce``; this refusal is
   that second half for the machine-wide environment, so :func:`service_env_enforced_refusal`
   carries it and the caller applies the setting. The engine refuses only a name it finds set in
-  that environment's registry key: a secret a service-start wrapper exports into the engine's
-  own environment, which ``docs/SERVICE.md`` describes, is named and not refused. A store key
+  that environment's registry key: a secret a ``python.exe`` wrapper between NSSM and the
+  engine exports into the engine's own environment is named and not refused. Under a wrapper
+  the walk does not pass through, such as ``cmd.exe``, the engine does not find its service and
+  this reading names nothing. A store key
   from outside the lists stays named and not refused, as the bullet above says.
 
 **How the engine finds its own service.** Under NSSM the engine is a child of ``nssm.exe``, or a
@@ -1549,7 +1551,7 @@ def _elsewhere_finding(posture: ServiceEnvPosture) -> str | None:
         f"{', '.join(elsewhere)} reaches the Windows service "
         f"{posture.service_name or '<unknown>'!r} through its environment, and the engine did not "
         "read it in the service's own lists, so it came from somewhere else, such as the "
-        f"machine-wide environment or a service-start wrapper{where}. Any process that can read "
+        f"machine-wide environment or a python.exe wrapper{where}. Any process that can read "
         f"the place it came from can read it. {_MOVE}"
     )
 

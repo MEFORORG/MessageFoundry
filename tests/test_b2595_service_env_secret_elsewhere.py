@@ -380,7 +380,7 @@ def test_the_factories_read_the_dial_from_security_settings(
 
 
 def test_a_secret_the_machine_wide_environment_does_not_set_is_named_and_not_refused() -> None:
-    """A service-start wrapper may export a secret into the engine's own environment
+    """A python.exe wrapper between NSSM and the engine may export a secret into the engine's own environment
     (docs/SERVICE.md). The engine does not find it in the machine-wide environment's registry
     key, so it names it and does not refuse."""
     posture = _machine(["MEFOR_AI_ENVIRONMENT=prod"], (), MEFOR_STORE_PASSWORD=_PASSWORD_VALUE)

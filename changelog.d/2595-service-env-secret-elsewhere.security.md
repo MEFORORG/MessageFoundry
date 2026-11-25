@@ -4,7 +4,7 @@
   service and reads its lists, and the secret, such as `MEFOR_STORE_PASSWORD`, is in the
   engine's environment, not in those lists, and set in the machine-wide environment's registry
   key. `serve`, `supervise`, `create_app` and `create_managed_app` apply it. Such a secret from
-  anywhere else, such as a service-start wrapper, is named and not refused, and a store key from
+  anywhere else, such as a `python.exe` wrapper between NSSM and the engine, is named and not refused, and a store key from
   outside the lists is still named as `store_key_in_service_environment` and not refused.
   Where the engine finds its service but cannot read its lists, such a secret in its environment
   now refuses the start under every enforcement setting, as a store key there already did. Move

@@ -233,7 +233,7 @@ names ADR 0019 declared and nobody built. Also not moved: the store key's own re
   the machine-wide environment's registry key sets it, `serve`, `supervise` and both API app
   factories refuse under `enforce`. Where the service is known and its lists could not be read,
   such a secret refuses under every setting, as a store key there already did. Not refused, at
-  least: such a secret from elsewhere, such as a service-start wrapper, which is named; a store
+  least: such a secret from elsewhere, such as a `python.exe` wrapper between NSSM and the engine, which is named; a store
   key from outside the lists, which is named; and a `MEFOR_VALUE_*` variable from outside the
   lists, which is neither refused nor named. An engine that does not find its service reads none
   of this. `messagefoundry/serviceenv.py`'s module docstring states the rule.
