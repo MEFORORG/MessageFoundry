@@ -1079,8 +1079,9 @@ def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_u
     fx: Fixture,
 ) -> None:
     """Red in review round 2 (BACKLOG #1894): reached through a junction, the primary's own copy read
-    its alias spelling as a second candidate and refused as ambiguous, and an alias -RepoRoot built a
-    target path git's list never matched. Both must remove the one real tree."""
+    its alias spelling as a second candidate and refused as ambiguous. It must remove the one real
+    tree. An alias -RepoRoot is refused since review round 3: -Name builds its target from the
+    spelling given, so the spelling must be the checkout's top as git resolves it."""
     alias = fx.root / "alias"
     _junction(alias, fx.primary.parent)
     copy_real_scripts(fx.primary)
@@ -1093,5 +1094,55 @@ def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_u
 
     second = fx.add("viaroot")
     proc = run(fx, "-Name", "viaroot", repo_root=alias / fx.primary.name)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not second.exists() and not fx.is_registered(second)
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "not the top of a checkout" in proc.stderr, proc.stdout + proc.stderr
+    assert second.exists() and fx.is_registered(second)
+
+
+@pytest.mark.parametrize("how", ["explicit", "positional-dot"])
+def test_name_refuses_a_repo_root_below_the_checkout_top(fx: Fixture, how: str) -> None:
+    """Red in review round 3 (BACKLOG #1894): an explicit -RepoRoot was re-read through
+    ``--show-toplevel``, so a subdirectory of the primary re-anchored on the primary and removed
+    ``<primary>-<Name>``, a tree the caller never named. Before #1894 it built ``<subdir>-<Name>`` and
+    threw "No such worktree". A removal script must never reach further than it did."""
+    target = fx.add("foo")
+    sub = fx.primary / "sub"
+    sub.mkdir()
+
+    if how == "explicit":
+        proc = run(fx, "-Name", "foo", repo_root=sub)
+    else:
+        proc = run(fx, "-Name", "foo", ".", repo_root="", cwd=sub)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "Nothing was removed" in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+
+    control = run(fx, "-Name", "foo", repo_root=fx.primary)
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert not target.exists()
+
+
+def test_a_linked_copy_run_through_a_junction_still_refuses_as_ambiguous(fx: Fixture) -> None:
+    """Red in review round 3 (BACKLOG #1894): the ambiguity guard built the copy's old sibling from the
+    junction spelling it was invoked through, which git's list never matches, so it removed
+    ``repo-foo`` while ``repo-host-foo``, the tree the copy's older command meant, was registered."""
+    host = fx.add("host")
+    target = fx.add("foo")
+    beside_host = host.parent / f"{host.name}-foo"
+    _git(fx.primary, "worktree", "add", "-q", "-b", "host-foo", str(beside_host))
+    copy_real_scripts(host)
+    alias = fx.root / "hostalias"
+    _junction(alias, host)
+    try:
+        proc = run(
+            fx, "-Name", "foo", script=alias / "scripts" / "worktree" / "remove.ps1", repo_root=""
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "Ambiguous -Name" in proc.stderr, proc.stdout + proc.stderr
+    assert str(beside_host) in proc.stdout, proc.stdout
+    assert target.exists() and fx.is_registered(target)
+    assert beside_host.exists() and fx.is_registered(beside_host)

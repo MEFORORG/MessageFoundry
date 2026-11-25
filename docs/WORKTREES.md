@@ -393,7 +393,8 @@ destructive script in this directory can be **execution-tested**
 ([`tests/test_worktree_remove.py`](../tests/test_worktree_remove.py) drives `-Name` against a synthetic
 repo, and [`tests/test_worktree_remove_path.py`](../tests/test_worktree_remove_path.py) drives `-Path`
 and `-List`); without it the only repository a test could reach was this one, so the branch-delete
-path was covered by review alone. (BACKLOG #1037.)
+path was covered by review alone. (BACKLOG #1037.) With `-Name` it must be the checkout's own top
+as git resolves it: a subdirectory, or a junction spelling of the top, is refused (BACKLOG #1894).
 
 ## "Will be permanently discarded" is an INDEX test, not a LOSS test — `recoverable.ps1`
 

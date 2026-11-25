@@ -240,7 +240,8 @@ param(
     [Parameter(ParameterSetName = 'ByPath')]
     [switch]$AllowOrphanedAllocations,
 
-    # Repo to operate on, used as given. Defaults to the PRIMARY checkout of the clone this copy
+    # Repo to operate on, used as given; with -Name it must be a checkout's top as git resolves it,
+    # else it is refused (BACKLOG #1894). Defaults to the PRIMARY checkout of the clone this copy
     # belongs to (BACKLOG #1894), so an absolute-path invocation from any cwd and any copy resolves
     # the same checkout. Tests point it at a fixture so the real logic is what gets exercised.
     [Parameter(Position = 1)]
@@ -374,24 +375,39 @@ if ($gitCarriers.Count -gt 0) {
 # reached depended on which copy ran. The first entry of `git worktree list` is the same from every
 # worktree of one clone. Across all copies -Name now reaches fewer trees, only siblings of the
 # primary; a linked copy's own run moves from its own siblings to the primary's, and refuses below
-# while its old target still exists. An explicit -RepoRoot is kept as given. FAIL CLOSED: an
-# unreadable list must not fall back to this copy's own checkout. The list is reused below; nothing
-# between here and there changes it.
-$CopyRoot = $RepoRoot
+# while its old target still exists. An explicit -RepoRoot is kept as given, as before #1894. FAIL
+# CLOSED: an unreadable list must not fall back to this copy's own checkout. The list is reused
+# below; nothing between here and there changes it.
+#
+# The copy's root is also read as git resolves it, because the ambiguity guard below compares it to
+# git's own list: a copy run through a junction is spelled differently, and on that spelling alone
+# the guard would miss the tree the copy's older command meant (BACKLOG #1894 review round 3).
+$CopyRoots = @($RepoRoot)
 $anchorList = @()
 if ($anchorOnPrimary) {
+    $copyTop = "$(& git -C $RepoRoot rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $copyTop) {
+        throw "Could not read the checkout of '$RepoRoot' as git resolves it. Nothing was removed."
+    }
+    $copyTop = [System.IO.Path]::GetFullPath($copyTop).TrimEnd('\', '/')
+    if ((ConvertTo-Norm $copyTop) -ne (ConvertTo-Norm $RepoRoot)) { $CopyRoots += $copyTop }
     $anchorList = @(Get-RepoWorktrees $RepoRoot)
     if ($anchorList.Count -eq 0) {
         throw "Could not list the registered worktrees of '$RepoRoot', so the primary checkout is unknown. Nothing was removed."
     }
     $RepoRoot = [System.IO.Path]::GetFullPath($anchorList[0].Path).TrimEnd('\', '/')
 }
-else {
-    # An explicit root names the same checkout, spelled as git records it, so a -RepoRoot given
-    # through a junction or 8.3 alias still matches git's own worktree list below. An unreadable
-    # answer keeps the spelling given, which the registration check then refuses.
+elseif (-not ($byPath -or $listing)) {
+    # -Name builds its target from this spelling, so it must BE a checkout's top. A subdirectory, or a
+    # positional `.` run from one, used to build `<subdir>-<Name>` and fail as "No such worktree";
+    # re-anchored on the enclosing checkout it would reach `<checkout>-<Name>`, a tree the caller
+    # never named (BACKLOG #1894 review round 3). An alias spelling of the top is refused too, since
+    # git's list below would never match a target built from it.
     $top = "$(& git -C $RepoRoot rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-    if ($LASTEXITCODE -eq 0 -and $top) { $RepoRoot = [System.IO.Path]::GetFullPath($top).TrimEnd('\', '/') }
+    if ($LASTEXITCODE -ne 0 -or -not $top -or (ConvertTo-Norm $top) -ne (ConvertTo-Norm $RepoRoot)) {
+        throw ("-RepoRoot '$RepoRoot' is not the top of a checkout as git resolves it" +
+            $(if ($top) { " ('$top')" } else { '' }) + ". Name the checkout itself. Nothing was removed.")
+    }
 }
 $Parent = Split-Path $RepoRoot -Parent
 $RepoName = Split-Path $RepoRoot -Leaf
@@ -519,8 +535,10 @@ else {
     # now, it would reach `<primary>-<Name>`, another tree that may be someone else's. While the tree
     # it meant is still a registered worktree, refuse and name both, rather than pick one. Once it is
     # gone this cannot tell such a command from a current one.
-    if ($anchorOnPrimary -and (ConvertTo-Norm $CopyRoot) -ne (ConvertTo-Norm $RepoRoot)) {
-        $beside = Join-Path (Split-Path $CopyRoot -Parent) ("{0}-{1}" -f (Split-Path $CopyRoot -Leaf), $Name)
+    # Each spelling of the copy's root is tried: as invoked, and as git resolves it.
+    foreach ($CopyRoot in $(if ($anchorOnPrimary) { $CopyRoots } else { @() })) {
+        if ((ConvertTo-Norm $CopyRoot) -eq (ConvertTo-Norm $RepoRoot)) { continue }
+        $beside = "$CopyRoot-$Name"
         $besideNorm = ConvertTo-Norm $beside
         if ($besideNorm -ne (ConvertTo-Norm $WorktreePath) -and $linkedNorms -contains $besideNorm) {
             Write-Host "REFUSED: -Name $Name from the copy in '$CopyRoot' is ambiguous." -ForegroundColor Red
