@@ -653,6 +653,50 @@ async def test_the_registration_leg_does_not_use_up_the_begin_legs_report(
         await store.close()
 
 
+async def test_the_finish_leg_refuses_a_passkey_whose_stored_id_does_not_decode() -> None:
+    """BACKLOG #6886, the verify's own id check. RED when: the verify stops checking that the stored
+    ``credential_id`` decodes. The begin leg leaves such a passkey out of the allow list, but a
+    browser can still answer with it, and the finish leg finds it by its hash. Here the account
+    holds a good passkey, so a ceremony is staged, and a second one whose stored id does not decode
+    answers it: refused, with the ``stored_key_refused`` row naming it. The good passkey's own
+    assertion is the control that the ceremony itself works."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service = await _service(store)
+        identity, token, _ = await login_admin(service)
+        good, token = await _enroll(service, identity, token, label="good key")
+        bad = SoftAuthenticator(rp_id=RP, origin=ORIGIN)
+        bad, token = await _enroll(service, identity, token, label="bad key", auth=bad)
+        await store._db.execute(
+            "UPDATE webauthn_credentials SET credential_id='AAAAA' WHERE label=?", ("bad key",)
+        )
+        await store._db.commit()
+
+        async def refusals() -> list[Any]:
+            events = await service.security_events_for(identity.username)
+            return [
+                json.loads(e["detail"]) for e in events if e["action"] == "auth.webauthn_failed"
+            ]
+
+        # The begin leg writes its own report of the bad passkey; only the finish leg's row counts.
+        options = await service.begin_webauthn_assertion(token, rp_id=RP)
+        assert options is not None
+        before = await refusals()
+        challenge = base64url_to_bytes(json.loads(options)["challenge"])
+        refused = await service.finish_webauthn_assertion(
+            token, bad.get_response(challenge), rp_id=RP, origin=ORIGIN
+        )
+        assert refused == Elevation(), "a passkey whose stored id does not decode signed in"
+        after = await refusals()
+        row = {"reason": "stored_key_refused", "label": "bad key"}
+        assert len(after) == len(before) + 1 and after.count(row) == before.count(row) + 1, after
+
+        verified = await _finish_assertion(service, token, good)
+        assert verified.ok and verified.token is not None, verified
+    finally:
+        await store.close()
+
+
 async def test_a_good_assertion_never_encodes_the_stored_label(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
