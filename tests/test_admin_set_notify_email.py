@@ -665,7 +665,8 @@ def test_a_busy_store_that_refuses_the_audit_row_keeps_exit_1(
             main([_CMD, "--username", _ADMIN, "--email", _ADDRESS, "--db", str(db), "--json"]) == 1
         )
     error = _error(capsys)
-    assert "audit row goes first, and the store refused it" in error
+    # Both cases say who refused, the engine's own refusal included.
+    assert error.count("the store refused the audit row") == 1 and "audit row goes first" in error
     if busy_error == "acquire-timeout":
         # The engine's own refusal prints whole, so its remedy survives.
         assert str(raised) in error

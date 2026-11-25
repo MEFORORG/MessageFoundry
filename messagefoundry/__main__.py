@@ -7738,8 +7738,8 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         *reach_errors,
     )
 
-    # The name every refusal after the read uses: the stored username once the account is found,
-    # as the output and the audit row name it (BACKLOG #5633 item 7).
+    # The stored username once the account is found, as the output and the audit row name it
+    # (BACKLOG #5633 item 7). The Forged arm below does not use it; its comment says which do.
     named = [wanted]
 
     async def run() -> tuple[str, Any]:
@@ -7822,11 +7822,12 @@ def _admin_unlock(args: argparse.Namespace) -> int:
         # before it may have (BACKLOG #5067).
         left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
         # This Forged arm names the user as typed, so neither this text nor _seal_refusal's WARNING
-        # prints a value from the record that failed its seal (BACKLOG #5633 item 7; tests/test_cli.py
-        # pins it). The read-refused and no-such-user arms below name the typed name too. The other
-        # refusals after the read name named[0], the stored username, which get_user_by_username
-        # returns without checking the record's seal: at least the Unverifiable and Outage arms
-        # print a stored value nobody verified, as they did on main.
+        # prints a value from the record that failed its seal (BACKLOG #5633 item 7;
+        # tests/test_cli.py pins the text, not the WARNING). The read-refused and no-such-user arms
+        # below name the typed name too. At least the Transit, Unverifiable, refused and changed
+        # arms name named[0], the stored username, which get_user_by_username returns without
+        # checking the record's seal, so the Unverifiable arm prints it from a record whose seal
+        # Transit would not check.
         return _emit_error(f"{_seal_refusal(wanted, 'unlock')}. {left}", as_json=args.json)
     if outcome == "open-failed":
         if isinstance(extra, (StoreKeylessError, CipherError)):
@@ -11901,7 +11902,7 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
                 log.debug("admin-set-notify-email: the refusal's traceback", exc_info=exc)
                 left = _opened_left_behind(exc, settings.store, keyed=_open_is_keyed(settings))
                 refused = (
-                    _engine_refusal_text(exc)
+                    f"the store refused the audit row: {_engine_refusal_text(exc)}"
                     if _is_engine_refusal(exc)
                     else f"the store refused the audit row ({type(exc).__name__})"
                 )
@@ -11986,8 +11987,8 @@ def _admin_set_notify_email(args: argparse.Namespace) -> int:
         "--username <name> --email <address>` creates one",
         "has-address": f"the account {username!r} already has a notification address; this command "
         "only fills a missing one -- change it from the web console, which notifies the old address",
-        "audit-refused": f"{extra}. The audit row goes first, and the store refused it, so the "
-        "address is not set. If the engine is running, stop it and re-run",
+        "audit-refused": f"{extra}. The audit row goes first, so the address is not set. If the "
+        "engine is running, stop it and re-run",
         "write-failed": f"the audit row for {username!r} was written, but setting the address "
         f"failed ({extra}); the address is NOT set. Stop the engine and re-run",
     }
