@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import time
 from pathlib import Path
 from typing import Any
@@ -1825,6 +1826,294 @@ async def test_app_log_compression_survives_a_racing_rewrite_of_the_staging_file
     assert old_log.exists() or gzip.decompress(dest.read_bytes()) == body
     assert old_log.exists() and old_log.read_bytes() == body
     assert result.app_logs_compressed == 0  # and it is not reported as compressed
+
+
+_CHANGES = [
+    "append",
+    "replace",
+    "replace_same_size",
+    "rewrite_same_size",
+    "rewrite_same_size_same_mtime",
+    "metadata_only",
+]
+
+
+def _mutate_source(old_log: Path, change: str, *, old: float, late: bytes) -> bytes:
+    """Change ``old_log`` the way ``change`` names and return what it should then hold. Every case but
+    ``rewrite_same_size`` puts the old mtime back, so the size, the file id or the ctime must betray it;
+    the ``*_same_size`` cases keep the size, so only the file id (replace), the mtime (rewrite) or the
+    ctime alone (rewrite with the mtime put back) can."""
+    body = old_log.read_bytes()
+    if change == "metadata_only":
+        # Only the ctime moves (an attribute flip, as backup software clears the archive bit): the
+        # content and the mtime are untouched. Past a coarse ctime tick first, as below.
+        time.sleep(0.05)
+        os.chmod(old_log, stat.S_IREAD)
+        os.chmod(old_log, stat.S_IREAD | stat.S_IWRITE)
+        return body
+    if change == "append":
+        with open(old_log, "ab") as fh:
+            fh.write(late)
+        expected = body + late
+    elif change in ("replace", "replace_same_size"):
+        expected = late if change == "replace" else b"R" * len(body)
+        rotated = old_log.with_name("rotated.tmp")
+        rotated.write_bytes(expected)
+        os.replace(rotated, old_log)
+    else:
+        # Past a coarse ctime tick (Linux stamps ctime from a jiffy clock), so the rewrite's ctime is new.
+        time.sleep(0.05)
+        expected = b"W" * len(body)
+        with open(old_log, "r+b") as fh:
+            fh.write(expected)
+        if change == "rewrite_same_size":
+            os.utime(old_log, (old + 1, old + 1))
+            return expected
+    os.utime(old_log, (old, old))
+    return expected
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_keeps_a_source_that_changed_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A log appended to, rewritten, or replaced (rotated) at the same path after its archive was placed
+    must NOT be unlinked: the validated archive describes only the bytes read at the START, so removing
+    the path would destroy whatever was written into it since. BACKLOG #6805.
+
+    RULE: the read-back at ``dest`` proves the archive matches ``data``; it says nothing about whether
+    ``source`` still holds only ``data``. The unlink must also check that the path is still the same
+    file (device + file id) with the same size and times as when it was read."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not expected:
+            # The window between the dest read-back and the unlink: a writer touches the source path
+            # (once; the code may read `dest` back again before removing a redundant archive).
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (
+        old_log.exists() and old_log.read_bytes() == expected[0]
+    )  # nothing written mid-pass is lost
+    archive = logs / "old.log.gz"
+    if change in ("append", "metadata_only"):
+        # The kept source still holds every archived byte, so the archive this pass placed is removed:
+        # left beside the source it would make every later pass skip this path, forever when no
+        # `app_log_days` window is set. The next pass retries.
+        assert not archive.exists()
+    else:
+        # The source no longer holds the archived bytes: under a replace the archive may be the only
+        # copy of the old content, so it is kept.
+        assert gzip.decompress(archive.read_bytes()) == body
+    assert result.app_logs_compressed == 0 and result.app_log_bytes_reclaimed == 0
+    assert "changed after its archive was placed" in caplog.text
+
+
+@pytest.mark.parametrize("change", _CHANGES)
+async def test_app_log_compression_places_nothing_for_a_source_that_changed_before_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog, change: str
+) -> None:
+    """A source that changed between the read and the rename gets no archive at all: a stale partial
+    ``<name>.gz`` would block every later compression of that path (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (old, old))
+    expected: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_mutate(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            expected.append(_mutate_source(old_log, change, old=old, late=b"late line\n"))
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_mutate)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == expected[0]
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "changed during compression; nothing placed" in caplog.text
+
+
+async def test_app_log_compression_skips_a_file_rotated_in_between_scan_and_read(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A fresh file rotated into an aged path after the scan, and before the read, is not compressed:
+    the scan's age no longer describes it (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    old_log.write_bytes(b"engine started\n" * 500)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    fresh = b"fresh rotated content\n" * 200
+
+    def rotate_then_allow(self, size, *, name):
+        rotated = logs / "rotated.tmp"
+        rotated.write_bytes(fresh)
+        os.utime(rotated, (now, now))
+        os.replace(rotated, old_log)
+        return True
+
+    monkeypatch.setattr(RetentionRunner, "_has_free_space", rotate_then_allow)
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert old_log.read_bytes() == fresh
+    assert not (logs / "old.log.gz").exists()
+    assert not list(logs.glob("*.mftmp"))  # rejected before anything was staged
+    assert result.app_logs_compressed == 0
+    assert "not the file the scan aged" in caplog.text
+
+
+async def test_app_log_compression_never_renames_over_an_archive_that_appeared_meanwhile(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A ``<name>.gz`` a peer compressor placed after the scan is never renamed over: it may be the
+    only copy of a longer read whose source the peer is about to remove (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+    peer = gzip.compress(body + b"a longer read by a peer\n")
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_peer_places(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if path.endswith(".mftmp"):
+            (logs / "old.log.gz").write_bytes(peer)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_peer_places)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert (logs / "old.log.gz").read_bytes() == peer
+    assert old_log.read_bytes() == body
+    assert not list(logs.glob("*.mftmp"))
+    assert result.app_logs_compressed == 0
+    assert "an archive appeared meanwhile" in caplog.text
+
+
+async def test_app_log_compression_keeps_the_archive_when_the_source_goes_before_its_removal(
+    store: MessageStore, tmp_path, monkeypatch
+) -> None:
+    """Removing a redundant archive must not lose the last copy: if the source is removed (by a peer
+    compressor, say) between the check that it still holds every archived byte and the archive's
+    removal, the archive survives (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old = now - 10 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (old, old))
+    mutated: list[bytes] = []
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_append(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and not mutated:
+            mutated.append(_mutate_source(old_log, "append", old=old, late=b"late line\n"))
+        return ok
+
+    real_holds = retention_mod._source_still_holds
+    calls: list[bool] = []
+
+    def holds_then_peer_removes(source, read_st, data):
+        ok = real_holds(source, read_st, data)
+        if not calls:
+            old_log.unlink()  # the peer archived the longer read elsewhere and removed the source
+        calls.append(ok)
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_append)
+    monkeypatch.setattr(retention_mod, "_source_still_holds", holds_then_peer_removes)
+
+    result = await RetentionRunner(
+        store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+    ).run_once()
+
+    assert calls and calls[0] is True  # the branch that removes a redundant archive was reached
+    assert not old_log.exists()
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body  # the last copy survives
+    assert not list(logs.glob("*.mfclaim"))
+    assert result.app_logs_compressed == 0
+
+
+async def test_app_log_compression_reports_a_source_that_vanished_after_placement(
+    store: MessageStore, tmp_path, monkeypatch, caplog
+) -> None:
+    """A source removed (by a peer compressor, say) after the archive was placed keeps the archive and
+    is reported as vanished, not as kept (BACKLOG #6805)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    now = 30 * DAY
+    old_log = logs / "old.log"
+    body = b"engine started\n" * 500
+    old_log.write_bytes(body)
+    os.utime(old_log, (now - 10 * DAY, now - 10 * DAY))
+
+    real_verify = retention_mod._verify_archive
+
+    def verify_then_remove(path, original, *, name):
+        ok = real_verify(path, original, name=name)
+        if not path.endswith(".mftmp") and old_log.exists():
+            old_log.unlink()
+        return ok
+
+    monkeypatch.setattr(retention_mod, "_verify_archive", verify_then_remove)
+
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.retention"):
+        result = await RetentionRunner(
+            store, RetentionSettings(app_log_compress_days=7), clock=lambda: now, log_dir=str(logs)
+        ).run_once()
+
+    assert gzip.decompress((logs / "old.log.gz").read_bytes()) == body
+    assert result.app_logs_compressed == 0
+    assert "vanished after its archive was placed" in caplog.text
 
 
 async def test_app_log_compression_stages_through_an_unpredictable_exclusive_temp_file(
