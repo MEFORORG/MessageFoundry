@@ -836,7 +836,11 @@ def key_body_mask_from(lines: list[str], start: int) -> int:
     (:data:`_WHOLE_KEY_BODY_LINE`), so a block that covers a line at or after ``start`` has its
     BEGIN line at or after the nearest earlier line that is not one. Masking from there costs the
     lines from there on, not the whole list. A run of whole body lines before ``start`` is scanned
-    back over to its first line, so there the cost is the run's length."""
+    back over to its first line, so there the cost is the run's length.
+
+    The list may be cut short at the end too, as ``GET /logs/tail`` cuts it at its page's end: a
+    body line is masked the same whatever follows it, since the pattern reads the end of the text
+    where it reads a line break, and the mask writes each line from that line alone."""
     index = min(start, len(lines))
     while index > 0 and _WHOLE_KEY_BODY_LINE.fullmatch(lines[index - 1]):
         index -= 1
@@ -854,9 +858,10 @@ def mask_key_body_lines(lines: list[str]) -> list[str]:
     more base64 characters fell to the long-base64 sweep, and a shorter one, such as a block's padded
     last line, printed. So the block is found over the joined lines, and only the lines its body
     covers from their first character to their last are replaced, each with what the mask writes for
-    it, so no character of the key itself is left on them. The mask writes each base64 character as
-    "x" and leaves the rest of such a line as it was: at least its spaces and tabs, an escaped line
-    break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole. A later pass still reads
+    it, so no character of the key itself is left on them. The mask writes as "x" every character
+    of such a line but these, which it leaves as they were: its spaces and tabs, an escaped line
+    break in it, and a ``Proc-Type:`` or ``DEK-Info:`` header line whole. So "=" padding, and a
+    letter the pattern's case-insensitive classes read beyond ASCII, become "x" too. A later pass still reads
     the result: the long-base64 sweep reads a run of 24 or more "x" as base64 and replaces it.
     Every other line stays as it was.
 

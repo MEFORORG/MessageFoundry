@@ -2293,15 +2293,17 @@ def _keep_key_marker(m: re.Match[str]) -> str:
 
 def mask_private_key_blocks(text: str) -> str:
     """``text`` with the body of every PRIVATE KEY block masked, one character for one (BACKLOG
-    #5550). The key-block mask runs before the passes that would rewrite the markers, and not
-    always through this function. ``logging_setup`` and the tray chain run this function before
-    the PHI pass, through :func:`mask_private_key_blocks_then`. :func:`scrub_credentials` applies
-    the block pattern itself, as the first pattern its ``_run`` applies, before its label passes,
-    in each reading that keeps the key-block pass. ``support/redact.py`` applies the pattern itself
-    too, in ``redact_log_line`` and across lines in ``mask_key_body_lines``, so a change here does
-    not reach it. :func:`scrub_credentials` then runs this function, last, over the reading it
-    keeps, where it masks only a block whose BEGIN marker that reading still holds (the comment
-    above :data:`_NO_LABEL_BEFORE` says why). At least :func:`scrub_credentials_without_tails`, and so the verify
+    #5550). The block pattern is applied at least here and in the places below, not all through
+    this function. ``logging_setup`` and the tray chain run this function before the PHI pass,
+    through :func:`mask_private_key_blocks_then`, since that pass would rewrite the markers.
+    :func:`scrub_credentials` applies the block pattern itself, as the first pattern its ``_run``
+    applies, before its label passes, in each reading that keeps the key-block pass, and then runs
+    this function, last, after those passes, over the reading it keeps, where it masks only a block
+    whose BEGIN marker that reading still holds (the comment above :data:`_NO_LABEL_BEFORE` says
+    why). ``support/redact.py`` applies the pattern itself, in ``redact_log_line`` and across lines
+    in ``mask_key_body_lines``, and reaches this function only through the
+    :func:`scrub_credentials` layer ``redact_log_line`` runs, so a change here reaches it there and
+    not in its own applications of the pattern. At least :func:`scrub_credentials_without_tails`, and so the verify
     details (``verify_leaf.safe_detail_text``) and the audit tee's field scrub
     (``logging_setup.scrub_log_text``), do not run it, by design: they read as the code before it.
     Text holding no ``-----`` returns as the same object."""

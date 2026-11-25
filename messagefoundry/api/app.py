@@ -987,10 +987,13 @@ def _read_log_tail(
     ``redact_log_text`` runs too, after the cross-line key-body mask
     (:func:`~messagefoundry.support.redact.mask_key_body_lines`) over the page and the lines before it
     back to where a key block covering it could begin
-    (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text:
-    the bundle masks across its bounded read window, and keeps the audit copies, while this reads the
+    (:func:`~messagefoundry.support.redact.key_body_mask_from`). The two do not mask the same text.
+    At least: they pick their file with different listings, so they can read different files; the
+    bundle masks across its bounded read window, and keeps the audit copies, while this reads the
     whole file and, with ``audit_copies=False``, drops them before the mask, so a key block an audit
-    copy splits can be masked for one reader and print for another. The redaction is best-effort (a
+    copy splits can be masked for one reader and print for another. A BEGIN line with no END marker
+    after it masks the lines after it that read as base64 runs, such as a single word, as
+    :func:`~messagefoundry.support.redact.mask_key_body_lines` says. The redaction is best-effort (a
     residual single-token identifier can survive), which is why the route is RBAC-gated + audited.
     ``available`` is False when no
     ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
@@ -1027,8 +1030,8 @@ def _read_log_tail(
     start = max(0, end - limit)
     # From where a PRIVATE KEY block covering the page could begin, so a block whose BEGIN line is on
     # an earlier page still has its body masked on this one, without masking the whole file on each
-    # request (BACKLOG #5550).
-    first = redact.key_body_mask_from(all_lines, start)
+    # request (BACKLOG #5550). A file with no "-----" holds no block, so it skips the scan back.
+    first = redact.key_body_mask_from(all_lines, start) if "-----" in text else start
     page = redact.mask_key_body_lines(all_lines[first:end])[start - first :]
     return [redact_log_record(line) for line in page], total, True
 
