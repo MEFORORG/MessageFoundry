@@ -7472,9 +7472,11 @@ def create_app(
             )
             success = True
         except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
-            # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
-            # host/credential hints) escapes to the caller. A hop refusal from the build is the
-            # exception: the build dials nothing, so it is the engine's own text, the operator's
+            # safe_exc keeps the exception type, applies the PHI redaction patterns to the message and
+            # bounds it to 200 characters. It does NOT remove an SMTP server banner or a host name:
+            # those are not PHI shapes, so up to that bound what the relay or the socket said can
+            # reach the caller, who holds service:configure. A hop refusal from the build gets a
+            # longer bound: the build dials nothing, so it is the engine's own text, the operator's
             # host and the remedy. A send's refusal can quote what the relay advertised.
             if building and isinstance(exc, InsecureHopRefused):
                 detail = safe_exc(exc, limit=_TEST_SEND_BUILD_REFUSAL_LIMIT)
