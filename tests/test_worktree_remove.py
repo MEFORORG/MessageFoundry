@@ -351,7 +351,7 @@ def test_the_script_location_default_still_anchors_when_no_root_is_passed(fx: Fi
     assert not fx.is_registered(wt)
 
 
-_LINKED_REFUSAL = "-Name from a linked worktree's copy needs -RepoRoot"
+_LINKED_REFUSAL = "-Name from this copy needs -RepoRoot"
 
 
 def test_a_copy_in_a_LINKED_worktree_refuses_name_without_repo_root(fx: Fixture) -> None:
@@ -1097,12 +1097,13 @@ def test_a_call_without_a_target_refuses_instead_of_prompting(
     assert fx.branch_exists("alpha")
 
 
-def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_unregistered(
+def test_name_through_a_junction_alias_of_the_primary_refuses_and_names_the_remedy(
     fx: Fixture,
 ) -> None:
-    """Red in review round 2 (BACKLOG #1894): reached through a junction, the primary's own copy read
-    its alias spelling as a second candidate and refused as ambiguous. It must remove the one real
-    tree. An alias -RepoRoot is refused since review round 3: -Name builds its target from the
+    """Reached through a junction of its parent, the primary's own copy spells its pre-#1894 target
+    differently from the primary's sibling. Since review round 5 (BACKLOG #1894) that refuses, fail
+    closed, rather than judge whether two spellings name one directory; the real-path copy removes
+    it. An alias -RepoRoot is refused since review round 3: -Name builds its target from the
     spelling given, so the spelling must be the checkout's top as git resolves it."""
     alias = fx.root / "alias"
     _junction(alias, fx.primary.parent)
@@ -1112,6 +1113,12 @@ def test_name_through_a_junction_alias_of_the_primary_is_neither_ambiguous_nor_u
 
         first = fx.add("viaalias")
         proc = run(fx, "-Name", "viaalias", script=via_alias, repo_root="")
+        assert proc.returncode != 0, proc.stdout + proc.stderr
+        assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+        assert f'-RepoRoot "{fx.primary}"' in proc.stdout, proc.stdout
+        assert first.exists() and fx.is_registered(first)
+        real = fx.primary / "scripts" / "worktree" / "remove.ps1"
+        proc = run(fx, "-Name", "viaalias", script=real, repo_root="")
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert not first.exists() and not fx.is_registered(first)
 
@@ -1212,5 +1219,32 @@ def test_a_copy_below_the_primarys_top_refuses_name(fx: Fixture) -> None:
     proc = run(fx, "-Name", "foo", script=sub / "scripts" / "worktree" / "remove.ps1", repo_root="")
 
     assert proc.returncode != 0, proc.stdout + proc.stderr
-    assert "Nothing was removed" in proc.stderr, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
     assert target.exists() and fx.is_registered(target)
+
+
+@pytest.mark.parametrize("old_sibling", ["absent", "registered"])
+def test_the_primarys_copy_through_a_junction_to_the_checkout_refuses(
+    fx: Fixture, old_sibling: str
+) -> None:
+    """Red at 4a486c9c (BACKLOG #1894 review round 5): the primary's own copy reached through a
+    junction to the checkout passed the linked and below-top tests, so the run moved from
+    ``alias-foo``, which origin/main targeted, to ``repo-foo``. Both must survive the refusal."""
+    target = fx.add("foo")
+    copy_real_scripts(fx.primary)
+    alias = fx.root / "alias"
+    old = fx.root / "alias-foo"
+    if old_sibling == "registered":
+        _git(fx.primary, "worktree", "add", "-q", "-b", "alias-foo", str(old))
+    _junction(alias, fx.primary)
+    try:
+        proc = run(
+            fx, "-Name", "foo", script=alias / "scripts" / "worktree" / "remove.ps1", repo_root=""
+        )
+    finally:
+        os.rmdir(alias)
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert _LINKED_REFUSAL in proc.stderr, proc.stdout + proc.stderr
+    assert target.exists() and fx.is_registered(target)
+    assert old.exists() == (old_sibling == "registered")

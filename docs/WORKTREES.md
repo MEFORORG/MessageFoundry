@@ -329,7 +329,7 @@ One layout overlaps. Before BACKLOG #1894, `new.ps1` run from a linked worktree 
 **beside that worktree**, and for a harness-made worktree that is also under `.claude/worktrees`.
 `-Path` refuses it like the rest. `remove.ps1 -RepoRoot <that worktree> -Name <n>` still removes
 it. A linked worktree's copy run with `-Name` and no `-RepoRoot` refuses, whatever stands beside
-it, so it never reaches the primary's sibling instead.
+it, and names both candidates, so it never reaches the primary's sibling instead.
 
 **The session registry does not see where a session works, so other signals are read.** The
 registry records a launch directory. A subagent Builder is recorded under its parent's directory,
@@ -362,9 +362,10 @@ their HEAD reflogs. `-Name` ran one until BACKLOG #5648.
 
 **Run the primary's copy.** `remove.ps1 -Name <n>` reaches `<repo-parent>\<repo-name>-<n>`, where the
 repo is the clone's **primary** checkout, the first entry of `git worktree list`, from any cwd outside
-the worktree being removed (git can't remove the worktree you're standing in). A copy in a linked
-worktree, or below a checkout's top, refuses `-Name` unless `-RepoRoot` names the checkout, because
-re-anchored it would reach a tree its own older run never could. `new.ps1` creates its sibling
+the worktree being removed (git can't remove the worktree you're standing in). Any other copy, such
+as one in a linked worktree, one below a checkout's top, or one reached through a junction, subst
+or 8.3 alias, refuses `-Name` unless `-RepoRoot` names the checkout, because re-anchored it would
+reach a tree its own older run never could. `new.ps1` creates its sibling
 beside the primary from every copy. Until BACKLOG #1894 both
 anchored on the copy's own checkout, so a copy in a linked worktree made and searched
 `<that worktree>-<n>`; `-RepoRoot <that worktree> -Name <n>` still reaches a tree made that way.
