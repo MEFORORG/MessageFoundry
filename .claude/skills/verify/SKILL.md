@@ -19,11 +19,12 @@ on 2575, signs in as a per-run rig Administrator, and reads the message's dispos
 `GET /messages`. Then it stops the engine and deletes the temp directory. About 20 s.
 
 - Exit 0 prints `PASS e2e smoke`. Exit 1 prints `FAIL <step>: <reason>` on stderr, the step one
-  of `message`, `ports`, `provision`, `serve`, `ready`, `mllp`, `sign-in`, `disposition`. A
+  of `message`, `ports`, `provision`, `serve`, `sign-in`, `ready`, `mllp`, `disposition`. A
   `serve` or `ready` failure also prints the engine log's tail.
 - `FAIL ports` means something already holds 2575, often another engine. Stop it, or point the
   run at your own graph: `--config <dir> --inbound <name> --mllp-port <port>`.
-- `--expect unrouted|filtered|error` asserts another final disposition; `--message <file>` sends
+- `--expect unrouted|filtered|not_deployed|error` asserts another final disposition (`error`
+  only after the ACK: a NAKed message fails `mllp`); `--message <file>` sends
   another file. Synthetic HL7 only.
 
 Its tests, with the negative controls: `pytest tests/test_harness_e2e_smoke.py`.
