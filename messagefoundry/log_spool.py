@@ -475,13 +475,16 @@ class LogSpool:
         ``None``, so the caller tries again later instead of deleting undelivered records. It also
         closes the writer, for the reason the comment below gives.
 
-        A segment confirmed gone as a file is retired without being unlinked, so a segment whose
-        own ``lstat`` reports it gone when it is not is skipped, not deleted: a DFS or share
-        failover that briefly reports a live file gone, in the same directory, can still take it
-        out of the order, and the next start replays it, possibly after newer records were sent.
-        A dangling link segment is unlinked, so records in a target that is only out of reach
-        just now, on a mount that is down for one, are not replayed from it once it is back
-        (BACKLOG #5811)."""
+        Limits this leaves open, at least these (BACKLOG #5811). A segment confirmed gone as a
+        file is retired without being unlinked, so one whose ``lstat`` reports it gone when it is
+        not is skipped, not deleted: a DFS or share failover that briefly reports a live file
+        gone can take it out of the order, and the next start replays it, possibly after newer
+        records were sent. Its bytes then stop counting against ``max_bytes`` until that start.
+        A directory at the spool path that is not the spool's, the empty mountpoint a dropped
+        mount leaves for one, reads as present, so every segment reads as gone and is retired
+        that way, and the next append makes a segment there that the mount hides once it is
+        back. A dangling link segment is unlinked, so records in a target that is only out of
+        reach just now, on a mount that is down for one, are not replayed from it."""
         while True:
             try:
                 entry = self._peek()
@@ -517,9 +520,9 @@ class LogSpool:
                 if seq == self._write_seq:
                     self._close_writer()
                 # A gone file is not unlinked: a delete that later succeeded through reclaim()
-                # could only ever destroy a file the confirmation missed. A dangling link is: it
-                # holds no records, and left in place it would make the next open() refuse the
-                # whole spool.
+                # could only ever destroy a file the confirmation missed. A dangling link is: left
+                # in place it would make the next open() refuse the whole spool. Its target may
+                # still hold records, out of reach just now; the docstring above records that.
                 self._retire(seq, unlink=gone == "link")
             except OSError as exc:
                 self.read_errors += 1
