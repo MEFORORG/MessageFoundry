@@ -3,9 +3,11 @@
 """Property tests: the built-in tolerant HL7 parser round-trips what it is given (ADR 0054).
 
 The parity suite (``tests/test_builtin_hl7_parity.py``) holds the parser to a fixed corpus. These
-tests generate the corpus instead, so the inputs do not share the corpus author's blind spots: any
-separator set, any segment ids, empty fields, repetitions, components, subcomponents, escape
-sequences and non-ASCII data.
+tests generate the corpus instead, so the inputs do not share the corpus author's blind spots. What
+they generate is at least: separator sets drawn from 17 ASCII punctuation characters, three-character
+segment ids from a fixed grid, empty fields, repetitions, components, subcomponents, spaces anywhere
+in a leaf, escape sequences, and non-ASCII data. Not generated, at least: separators that are
+letters, digits, control or non-ASCII characters, a short MSH-2, and BHS or FHS headers.
 
 The normalization the parser intends, and the only one asserted here, is :meth:`Message.parse`'s
 own docstring and :func:`~messagefoundry.parsing.peek.drop_blank_segments`: every line ending
@@ -26,21 +28,25 @@ from hypothesis import strategies as st
 from messagefoundry.parsing import _builtin_hl7
 from messagefoundry.parsing.message import Message, reencode_with_separators
 
-# Deterministic in CI and locally: derandomize fixes the example sequence, and no example database
-# is written into the checkout. The deadline is per example; the cap keeps each test well under 10 s.
+# derandomize fixes the seed, so a run of this file draws the same examples every time. It is not
+# a promise across runs of different shapes: Hypothesis also mixes in literals it scans from the
+# modules imported at the time, so a full-suite run can draw examples this file alone does not. A
+# failure prints its falsifying example; pin it with ``@example`` to replay it anywhere.
+# database=None keeps examples out of the checkout; Hypothesis still caches those literals under
+# .hypothesis/, a directory that writes its own .gitignore. No deadline: a contended runner's
+# stall would otherwise read as a flaky failure with no defect behind it.
 _SETTINGS = settings(
     derandomize=True,
     database=None,
     max_examples=100,
-    deadline=500,
+    deadline=None,
     suppress_health_check=[HealthCheck.too_slow],
 )
 
 # Separator candidates: ASCII punctuation. The ones a message does not use are data in its leaves.
 _SEPARATOR_POOL = "|^~\\&#!$%*+:;=?@_"
-# Data characters: letters, digits and two non-ASCII letters. A space goes only between tokens.
-_DATA_ALPHABET = "ABCXYZabcxyz0189\u00e9\u00fc"
-_HEADER_IDS = {"MSH", "BHS", "FHS"}
+# Data characters: letters, digits and two non-ASCII letters. Spaces are drawn as their own token.
+_DATA_ALPHABET = "ABCXYZabcxyz0189éü"
 
 Seps = tuple[str, str, str, str, str]  # (field, component, repetition, subcomponent, escape)
 
@@ -60,11 +66,7 @@ separator_sets: st.SearchStrategy[Seps] = st.lists(
 
 
 def _leaf(seps: Seps) -> st.SearchStrategy[str]:
-    """A leaf value: data words, an inner space, escape sequences; never a raw source separator.
-
-    No leading or trailing space: the parser strips whitespace around the whole message, so a final
-    field ending in a space would be the one place a byte-identical round trip is not owed.
-    """
+    """A leaf value: data words, spaces, escape sequences; never a raw source separator."""
     esc = seps[4]
     escape_seq = st.sampled_from(["F", "S", "R", "T", "E", "H", "N", "X41", ".br"]).map(
         lambda body: f"{esc}{body}{esc}"
@@ -73,11 +75,7 @@ def _leaf(seps: Seps) -> st.SearchStrategy[str]:
     # escape them, which is what the cross-set test exercises.
     alphabet = _DATA_ALPHABET + "".join(c for c in _SEPARATOR_POOL if c not in seps)
     word = st.text(alphabet=alphabet, min_size=1, max_size=4)
-    token = st.one_of(word, escape_seq)
-    spaced = st.tuples(token, st.sampled_from(["", " "]))
-    return st.lists(spaced, max_size=3).map(
-        lambda pairs: "".join(t + g for t, g in pairs).rstrip(" ")
-    )
+    return st.lists(st.one_of(word, escape_seq, st.just(" ")), max_size=3).map("".join)
 
 
 def _field(seps: Seps) -> st.SearchStrategy[str]:
@@ -91,72 +89,62 @@ _SEGMENT_ID = st.tuples(
     st.sampled_from("APORZ"), st.sampled_from("IVBXT1"), st.sampled_from("DSX12")
 ).map("".join)  # no tuple spells MSH, BHS or FHS
 
+_TERMINATOR = st.lists(st.sampled_from(["\r", "\n", "\r\n"]), min_size=1, max_size=3).map("".join)
+
 
 @st.composite
 def messages(draw: st.DrawFn) -> Generated:
     seps = draw(separator_sets)
     field_sep, comp, rep, sub, esc = seps
-    field = _field(seps)
+    # Empty fields are drawn on purpose, not left to chance, because trailing empty fields
+    # (``PID|1||``) are common HL7 and a rebuild that trims them is a plausible defect.
+    field = st.one_of(st.just(""), _field(seps))
     msh_fields = draw(st.lists(field, max_size=10))
-    msh = field_sep.join([f"MSH{field_sep}{comp}{rep}{esc}{sub}", *msh_fields])
-    lines = [msh]
+    lines = [field_sep.join([f"MSH{field_sep}{comp}{rep}{esc}{sub}", *msh_fields])]
     for _ in range(draw(st.integers(min_value=0, max_value=5))):
-        seg_id = draw(_SEGMENT_ID)
-        fields = draw(st.lists(field, max_size=6))
-        lines.append(field_sep.join([seg_id, *fields]))
+        lines.append(field_sep.join([draw(_SEGMENT_ID), *draw(st.lists(field, max_size=6))]))
+    # The parser strips whitespace around the whole message, so trailing spaces on the LAST line are
+    # the one place a byte-identical round trip is not owed. Every other leaf keeps its edge spaces.
+    lines[-1] = lines[-1].rstrip(" ")
     canonical = "\r".join(lines) + "\r"
 
     # The sender's framing: any mix of line endings, blank lines between segments, and whitespace
     # around the whole message. None of it may survive into encode().
-    terminator = st.lists(st.sampled_from(["\r", "\n", "\r\n"]), min_size=1, max_size=3).map(
-        "".join
-    )
     raw = draw(st.sampled_from(["", " ", "\n", "\r\n "]))
     for line in lines:
-        raw += line + draw(terminator)
+        raw += line + draw(_TERMINATOR)
     raw += draw(st.sampled_from(["", " ", "\r\n", "\n \n"]))
     return Generated(seps=seps, canonical=canonical, raw=raw)
 
 
 @_SETTINGS
 @given(messages())
-def test_parse_then_encode_is_the_canonical_text(gen: Generated) -> None:
-    """``Message.parse(raw).encode()`` is the canonical text: only the documented framing goes."""
-    assert Message.parse(gen.raw).encode() == gen.canonical
+def test_parse_and_reencode_preserve_every_byte(gen: Generated) -> None:
+    """Four properties of one message, asserted together so the generation is paid for once.
 
-
-@_SETTINGS
-@given(messages())
-def test_parse_reads_the_separators_from_msh(gen: Generated) -> None:
-    """The parser takes its separators from MSH-1 and MSH-2, whatever set the sender chose."""
-    assert _builtin_hl7.separators(_builtin_hl7.parse(gen.canonical)) == gen.seps
-
-
-@_SETTINGS
-@given(messages())
-def test_rebuilt_encode_is_byte_identical(gen: Generated) -> None:
-    """Forcing every segment and field through the split model and rebuilding loses no byte.
-
-    A clean ``encode()`` returns the cached text, so the first test never exercises the rebuild that
-    any mutation triggers. This one splits every segment, componentizes every data field, drops the
-    cache and rebuilds, which is the path a Handler's edit takes for every segment it did not touch.
+    1. ``Message.parse(raw).encode()`` is the canonical text: only the documented framing goes.
+    2. The separators are read from MSH-1 and MSH-2, whatever set the sender chose.
+    3. A full rebuild loses no byte. A clean ``encode()`` returns the cached text, so property 1
+       never exercises the rebuild a mutation triggers; this one splits every segment,
+       componentizes every data field, drops the cache and rebuilds. It is not the mixed path of a
+       real edit, where untouched segments stay lazy and are written back verbatim.
+    4. Re-serializing with the message's own separator set changes nothing.
     """
+    assert Message.parse(gen.raw).encode() == gen.canonical, "parse then encode"
+
     parsed = _builtin_hl7.parse(gen.canonical)
+    assert _builtin_hl7.separators(parsed) == gen.seps, "separators from MSH"
+
     seps = parsed["seps"]
     for index, seg in enumerate(parsed["segments"]):
         _builtin_hl7._ensure_split(parsed, index)
-        first_data = 3 if seg["id"] in _HEADER_IDS else 1
+        first_data = 3 if seg["id"] in _builtin_hl7.HEADER_IDS else 1
         for fld in range(first_data, len(seg["fields"])):
             _builtin_hl7._componentize(parsed, index, fld, seps)
     parsed["raw"] = None
-    assert _builtin_hl7.encode(parsed) == gen.canonical
+    assert _builtin_hl7.encode(parsed) == gen.canonical, "full rebuild"
 
-
-@_SETTINGS
-@given(messages())
-def test_reencode_with_own_separators_is_identity(gen: Generated) -> None:
-    """Re-serializing with the message's own separator set changes nothing."""
-    assert reencode_with_separators(gen.canonical, gen.seps) == gen.canonical
+    assert reencode_with_separators(gen.canonical, gen.seps) == gen.canonical, "own-set reencode"
 
 
 @_SETTINGS
@@ -164,9 +152,9 @@ def test_reencode_with_own_separators_is_identity(gen: Generated) -> None:
 def test_reencode_to_another_set_and_back_is_identity(gen: Generated, target: Seps) -> None:
     """A rewrite to any other separator set and back restores the original bytes (ADR 0206 rule 4).
 
-    No data character here is a separator of either set, so every leaf has one spelling under each
-    set and the rewrite owes an exact return. The escape sequences, the separator escapes included,
-    keep their letters across both rewrites.
+    A leaf never holds a source separator, but it may hold a TARGET delimiter as data, which the
+    first rewrite must escape and the second must turn back into the literal character. The escape
+    sequences, the separator escapes included, keep their letters across both rewrites.
     """
     there = reencode_with_separators(gen.canonical, target)
     assert _builtin_hl7.separators(_builtin_hl7.parse(there)) == target

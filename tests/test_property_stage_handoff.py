@@ -4,14 +4,16 @@
 
 CLAUDE.md section 2 states the invariant: each stage handoff (ingress to routed, routed to outbound)
 is one committed transaction, and a re-run of a handoff that already committed is an idempotent
-no-op, because the consumed row is gone. At-least-once delivery rests on that, since a crash after
-the commit and before the worker notices re-runs the handoff.
+no-op, because the consumed row is gone. That re-run is the defensive half of at-least-once: the
+guarded DELETE that makes it a no-op. The other half, a crash BEFORE the commit rolling back and the
+re-claimed row re-deriving the same output, is not exercised here, nor is the fused ingress to
+outbound ``MessageStore.handoff``.
 
 These tests generate the traffic instead of hand-picking it: several inbound connections, zero to
 three handlers per message (so both ``ROUTED`` and ``UNROUTED``), zero to two deliveries per
 handler, a handoff tried before its row was ever claimed, and every committed handoff re-run, in a
-generated order and with a different handler or delivery list than the first run. Each re-run must
-return ``False`` and leave every queue row, message status and message event exactly as it was.
+generated order, at a later ``now``, and with a different handler or delivery list and payload than
+the first run. Each re-run must return ``False`` and leave every row of every table as it was.
 
 SQLite is the reference backend. Every message is a fixed synthetic body, never PHI.
 """
@@ -31,7 +33,8 @@ from hypothesis import strategies as st
 
 from messagefoundry.store.store import MessageStatus, MessageStore, Stage
 
-# Deterministic in CI and locally, and no example database written into the checkout.
+# derandomize fixes the seed; tests/test_property_hl7_roundtrip.py says what that does not promise.
+# database=None keeps examples out of the checkout.
 _SETTINGS = settings(
     derandomize=True,
     database=None,
@@ -70,17 +73,23 @@ def specs(draw: st.DrawFn) -> Spec:
     return Spec(channel=draw(st.sampled_from(_CHANNELS)), handlers=handlers, deliveries=deliveries)
 
 
-async def _snapshot(store: MessageStore) -> tuple[list[Any], list[Any], list[Any]]:
-    """Every queue row, message status and message event, in physical order."""
-    queue = await store._db.execute_fetchall(
-        "SELECT id, message_id, stage, channel_id, destination_name, handler_name, payload,"
-        " body_ref, status, attempts, next_attempt_at FROM queue ORDER BY rowid"
+async def _snapshot(store: MessageStore) -> dict[str, list[str]]:
+    """Every row of every table in the store, each column included, keyed by table name.
+
+    Rows are compared by ``repr`` in sorted order, so a table without a rowid needs no special
+    case. Reading every column is what lets the re-runs at a later ``now`` catch a write that only
+    moves a timestamp or an error text.
+    """
+    tables = await store._db.execute_fetchall(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     )
-    messages = await store._db.execute_fetchall("SELECT id, status FROM messages ORDER BY id")
-    events = await store._db.execute_fetchall(
-        "SELECT message_id, event, destination, detail FROM message_events ORDER BY id"
-    )
-    return [tuple(r) for r in queue], [tuple(r) for r in messages], [tuple(r) for r in events]
+    snap: dict[str, list[str]] = {}
+    for (name,) in tables:
+        rows = await store._db.execute_fetchall(
+            f'SELECT * FROM "{name}"'
+        )  # names from sqlite_master
+        snap[name] = sorted(repr(tuple(r)) for r in rows)
+    return snap
 
 
 async def _ingress_row_id(store: MessageStore, message_id: str) -> str:
@@ -101,12 +110,12 @@ async def store(tmp_path_factory: pytest.TempPathFactory) -> AsyncIterator[Messa
     await s.close()
 
 
-def _route_kwargs(ingress_id: str, mid: str, spec: Spec) -> dict[str, Any]:
+def _route_kwargs(ingress_id: str, mid: str, spec: Spec, raw: str) -> dict[str, Any]:
     return {
         "ingress_id": ingress_id,
         "message_id": mid,
         "channel_id": spec.channel,
-        "handlers": [(h, _RAW) for h in spec.handlers],
+        "handlers": [(h, raw) for h in spec.handlers],
         "disposition": MessageStatus.ROUTED if spec.handlers else MessageStatus.UNROUTED,
     }
 
@@ -121,15 +130,16 @@ async def test_handoff_rerun_is_a_no_op(
 ) -> None:
     suffix = f"_{next(_EXAMPLE)}"
     batch = [dataclasses.replace(s, channel=s.channel + suffix) for s in batch]
+    raws = [_RAW.format(n=f"{suffix}{i}") for i in range(len(batch))]
     mids = [
-        await store.enqueue_ingress(channel_id=s.channel, raw=_RAW.format(n=i), now=_NOW)
-        for i, s in enumerate(batch)
+        await store.enqueue_ingress(channel_id=s.channel, raw=raw, now=_NOW)
+        for s, raw in zip(batch, raws, strict=True)
     ]
 
     # A handoff for a row nobody claimed matches nothing: the INFLIGHT guard makes it a no-op.
     before = await _snapshot(store)
-    for mid, spec in zip(mids, batch, strict=True):
-        kwargs = _route_kwargs(await _ingress_row_id(store, mid), mid, spec)
+    for mid, spec, raw in zip(mids, batch, raws, strict=True):
+        kwargs = _route_kwargs(await _ingress_row_id(store, mid), mid, spec, raw)
         assert not await store.route_handoff(**kwargs, now=_NOW)
     assert await _snapshot(store) == before
 
@@ -138,12 +148,13 @@ async def test_handoff_rerun_is_a_no_op(
     reruns: list[tuple[Callable[..., Awaitable[bool]], dict[str, Any]]] = []
 
     # Ingress -> routed. Claims are FIFO per channel, so they come back in generated order.
-    for mid, spec in zip(mids, batch, strict=True):
+    for mid, spec, raw in zip(mids, batch, raws, strict=True):
         item = await store.claim_next_fifo(spec.channel, now=_NOW, stage=Stage.INGRESS.value)
         assert item is not None and item.message_id == mid
-        kwargs = _route_kwargs(item.id, mid, spec)
+        kwargs = _route_kwargs(item.id, mid, spec, raw)
         assert await store.route_handoff(**kwargs, now=_NOW)
-        every_handler = [(h, _RAW) for h in _HANDLERS]
+        # A payload the first run never wrote, so the re-run always differs from it.
+        every_handler = [(h, "RERUN") for h in _HANDLERS]
         rerun = {**kwargs, "handlers": every_handler, "disposition": MessageStatus.ROUTED}
         reruns.append((store.route_handoff, rerun))
 

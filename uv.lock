@@ -1431,7 +1431,7 @@ requires-dist = [
     { name = "httptools", specifier = "==0.8.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "hvac", marker = "extra == 'vault'", specifier = ">=2.3.0,<3" },
-    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.170" },
+    { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.170.17" },
     { name = "ldap3", specifier = ">=2.9" },
     { name = "lxml", marker = "extra == 'xml'", specifier = ">=6.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
