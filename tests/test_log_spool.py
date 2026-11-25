@@ -2086,6 +2086,88 @@ def test_a_failed_udp_send_keeps_a_young_socket_or_one_a_lookup_failed(
         handler.close()
 
 
+#: How many replay retries the head-holding tests below drive: well past any small count a change
+#: that dropped a failing head after a few tries would use.
+_HEAD_RETRIES = 15
+
+
+def _stream_listener(
+    spool: LogSpool, monkeypatch: pytest.MonkeyPatch, connect: Callable[[Any], None]
+) -> tuple[_ForwardQueueListener, _TimeoutSysLogHandler]:
+    """A stopped listener over a TCP handler whose connect is ``connect``, so a test drives
+    replay by hand with no network."""
+    monkeypatch.setattr(logging.handlers.SysLogHandler, "createSocket", connect)
+    handler = _TimeoutSysLogHandler(
+        address=("127.0.0.1", 9), socktype=socket.SOCK_STREAM, defer_connect=True
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    return _ForwardQueueListener(queue.Queue(), handler, spool=spool), handler
+
+
+def _replay_retries(listener: _ForwardQueueListener, times: int) -> None:
+    for _ in range(times):
+        listener._retry_at = 0.0
+        listener._replay()
+
+
+def test_a_collector_that_is_down_never_has_a_spooled_record_dropped(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A control for the spool head (BACKLOG #5923): a connect that fails, however often, keeps
+    the head and drops nothing, and each failed retry is counted."""
+
+    def connect(self: Any) -> None:
+        raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    listener, handler = _stream_listener(spool, monkeypatch, connect)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="head"))
+        _replay_retries(listener, _HEAD_RETRIES)
+        assert spool.pending and listener.undeliverable == 0
+        assert listener.send_failures == _HEAD_RETRIES
+    finally:
+        handler.close()
+        spool.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError("timed out"), OSError(errno.ENETUNREACH, "unreachable")],
+)
+def test_a_send_that_times_out_or_cannot_route_never_has_its_spooled_record_dropped(
+    spool_dir: Path, monkeypatch: pytest.MonkeyPatch, error: OSError
+) -> None:
+    """A control for the spool head (BACKLOG #5923): a send on a connection that was up but failed
+    on a timeout or an unreachable network says nothing against the record, since a collector
+    that stopped answering holds every record alike, so the head is kept and nothing is dropped."""
+
+    class _Fails:
+        def sendall(self, data: bytes) -> None:
+            raise error
+
+        def settimeout(self, _timeout: float | None) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    def connect(self: Any) -> None:
+        self.socket = _Fails()
+
+    spool = LogSpool(spool_dir, max_bytes=1_000_000)
+    spool.open()
+    listener, handler = _stream_listener(spool, monkeypatch, connect)
+    try:
+        assert spool.append(SpoolEntry(level="WARNING", line="head"))
+        _replay_retries(listener, _HEAD_RETRIES)
+        assert spool.pending and listener.undeliverable == 0
+    finally:
+        handler.close()
+        spool.close()
+
+
 @pytest.mark.parametrize(
     "code", [getattr(errno, "WSAEAFNOSUPPORT", errno.EAFNOSUPPORT), errno.EMSGSIZE]
 )

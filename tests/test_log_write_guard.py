@@ -25,9 +25,7 @@ per_lane halt the internal stages by different mechanisms.
 from __future__ import annotations
 
 import asyncio
-import errno
 import io
-import json
 import logging
 import random
 import shutil
@@ -68,7 +66,7 @@ from messagefoundry.logging_guard import (
     active_guard,
     set_active_guard,
 )
-from messagefoundry.logging_setup import JsonFormatter, LogFile, configure_logging
+from messagefoundry.logging_setup import LogFile, configure_logging
 from messagefoundry.pipeline import stage_dispatcher, wiring_runner
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.stage_dispatcher import LaneResultKind
@@ -875,158 +873,6 @@ def test_an_unformattable_record_on_a_broken_sink_rolls_and_writes_the_notice(
 
     assert [(e.stage, e.stop_requested) for e in events] == [("rolled", False)]
     assert "could not be formatted" in log_path.read_text(encoding="utf-8")
-
-
-def _cp1252_stdout(monkeypatch: pytest.MonkeyPatch) -> io.TextIOWrapper:
-    """A strict cp1252 stdout, as a stream left unhardened is (``serve`` sets its own to replace
-    an unencodable character where the stream allows it). It is also ``sys.stdout``, so the stream
-    sink's re-resolve finds the same object."""
-    stream = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
-    monkeypatch.setattr(sys, "stdout", stream)
-    return stream
-
-
-def _written(stream: io.TextIOWrapper) -> str:
-    stream.flush()
-    buffer = stream.buffer
-    assert isinstance(buffer, io.BytesIO)
-    return buffer.getvalue().decode("cp1252")
-
-
-def test_a_character_the_stream_cannot_encode_does_not_roll_or_stop_a_healthy_sink(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # BACKLOG #5813, the defect engine PR 3059 shipped: on a strict cp1252 stdout a record holding a
-    # character cp1252 has no byte for raised UnicodeEncodeError from the write. The guard read it
-    # as a sink failure, re-resolved to the same stream, failed to re-write the same record and
-    # called the sink unwritable, asking for a stop. The stream is healthy: the record is written
-    # with that character as a JSON-style escape, nothing pages, and the next record lands.
-    # NEGATIVE CONTROL: before the fix `events` held one stage-2 event with stop_requested True.
-    stream = _cp1252_stdout(monkeypatch)
-    events: list[LogSinkEvent] = []
-    guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    handler = GuardedStreamHandler(stream, guard=guard, sink="stdout")
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    try:
-        handler.emit(_record("ward \u2603 bed \U0001f600 caf\u00e9"))
-        handler.emit(_record("the next line"))
-    finally:
-        handler.close()
-
-    assert events == []
-    assert [s.state for s in guard.status()] == ["healthy"]
-    text = _written(stream)
-    # cp1252 has a byte for e-acute, so it is written as itself; the snowman and the astral
-    # character are written as escapes a JSON reader turns back into the same text.
-    assert "ward \\u2603 bed \\ud83d\\ude00 caf\u00e9" in text
-    assert json.loads('"' + "ward \\u2603 bed \\ud83d\\ude00" + '"') == "ward \u2603 bed \U0001f600"
-    assert "the next line" in text
-
-
-def test_an_unencodable_character_in_a_json_sink_keeps_the_line_valid_json(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The escape is JSON's own, so a JSON sink (ensure_ascii=False) still writes one object per
-    # line that a reader parses back to the record's text.
-    stream = _cp1252_stdout(monkeypatch)
-    events: list[LogSinkEvent] = []
-    guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    handler = GuardedStreamHandler(stream, guard=guard, sink="stdout")
-    handler.setFormatter(JsonFormatter())
-    try:
-        handler.emit(_record("ward \u2603"))
-    finally:
-        handler.close()
-
-    assert events == []
-    line = _written(stream).strip().splitlines()[-1]
-    assert json.loads(line)["message"] == "ward \u2603"
-
-
-class _Cp1252BreaksAfterOneWrite(io.TextIOWrapper):
-    """A cp1252 stream whose first write is let through to the encoder and whose every later write
-    raises, as a handle that breaks just after a record it could not encode."""
-
-    calls = 0
-
-    def write(self, text: str) -> int:
-        self.calls += 1
-        if self.calls > 1:
-            raise OSError(errno.EIO, "the handle broke")
-        return super().write(text)
-
-
-def test_a_stream_that_refuses_the_escaped_line_too_still_takes_the_two_stages(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The control: the record's write raises UnicodeEncodeError, so the escape path runs, and the
-    # sink refuses the escaped line too. That is a sink failure, so the guard rolls and, the
-    # re-resolved stream being the same broken one, stops.
-    breaking = _Cp1252BreaksAfterOneWrite(io.BytesIO(), encoding="cp1252", errors="strict")
-    monkeypatch.setattr(sys, "stdout", breaking)
-    events: list[LogSinkEvent] = []
-    guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    handler = GuardedStreamHandler(breaking, guard=guard, sink="stdout")
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    try:
-        handler.emit(_record("ward \u2603"))
-    finally:
-        with suppress(Exception):
-            handler.close()
-
-    assert breaking.calls >= 2  # the record's write, then the escaped line's
-    assert [(e.stage, e.stop_requested) for e in events] == [("unwritable", True)]
-
-
-def test_a_roll_onto_a_narrower_stream_writes_the_record_escaped_for_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The stdout object the sink holds was closed (a capture swap), and the live stdout is a
-    # strict cp1252 one. The roll re-resolves to it, and the record it re-writes is escaped for
-    # that stream rather than raising there. NEGATIVE CONTROL: on 33870a40944 the re-write raised
-    # UnicodeEncodeError and the heal became stage 2.
-    live = _cp1252_stdout(monkeypatch)
-    closed = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
-    events: list[LogSinkEvent] = []
-    guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    handler = GuardedStreamHandler(closed, guard=guard, sink="stdout")
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    closed.close()
-    try:
-        handler.emit(_record("ward \u2603"))
-    finally:
-        handler.close()
-
-    assert [(e.stage, e.stop_requested) for e in events] == [("rolled", False)]
-    assert "ward \\u2603" in _written(live)
-
-
-def test_an_unencodable_record_on_a_breaking_sink_rolls_and_writes_its_escaped_line(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The record cannot be encoded AND the escaped line is refused, so the sink is the fault: the
-    # stream sink re-resolves to the live stdout and the ESCAPED line is written there. A stage-1
-    # heal, with no stop.
-    # NEGATIVE CONTROL: re-writing the raw record after the roll re-raises UnicodeEncodeError on
-    # the live cp1252 stdout and turns the heal into stage 2.
-    live = _cp1252_stdout(monkeypatch)
-    breaking = _Cp1252BreaksAfterOneWrite(io.BytesIO(), encoding="cp1252", errors="strict")
-    events: list[LogSinkEvent] = []
-    guard = LogWriteGuard()
-    guard.set_escalation(events.append)
-    handler = GuardedStreamHandler(breaking, guard=guard, sink="stdout")
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    try:
-        handler.emit(_record("ward \u2603"))
-    finally:
-        handler.close()
-
-    assert [(e.stage, e.stop_requested) for e in events] == [("rolled", False)]
-    assert "ward \\u2603" in _written(live)
 
 
 def test_a_record_whose_logger_name_cannot_be_rendered_does_not_raise(tmp_path: Path) -> None:
