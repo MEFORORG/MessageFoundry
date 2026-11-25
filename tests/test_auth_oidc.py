@@ -18,6 +18,7 @@ import traceback
 import urllib.error
 import uuid
 from collections.abc import Callable, Mapping
+from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 
@@ -1312,29 +1313,27 @@ def test_a_cached_kid_lookup_does_not_wait_on_a_stalled_refresh(
     assert fetch.calls == 2
 
 
-def test_a_kid_past_its_ttl_is_served_cached_while_a_refresh_stalls(
+def test_a_kid_past_its_ttl_is_not_served_while_the_refresh_withdrawing_it_runs(
     rsa_key: rsa.RSAPrivateKey,
 ) -> None:
-    """BACKLOG #6905. Past the TTL, the first lookup of ``k1`` refreshes and the IdP stalls; a
-    concurrent lookup of ``k1`` must be served the cached key at once rather than sit out the stall.
-
-    REDS when a lookup of a cached key past its TTL waits for the gate the refresh holds.
-    """
-    cache, fetch, warm = _warm_cache(rsa_key, _jwks_bytes(_rsa_jwk(rsa_key, "k1")), at=4000.0)
+    """BACKLOG #6905 keeps this bound. Past the TTL, a lookup of ``k1`` refreshes, and the IdP's new
+    key set withdraws ``k1``. A concurrent lookup of ``k1`` made while that refresh is parked must
+    not be served the withdrawn key: only a key WITHIN the TTL skips the gate."""
+    cache, fetch, _ = _warm_cache(rsa_key, _jwks_bytes(_rsa_jwk(rsa_key, "k2")), at=4000.0)
 
     results: dict[str, object] = {}
     refreshing = _run_lookup(cache, "k1", results, "refreshing")
     assert fetch.entered.wait(timeout=10), "the expired-kid lookup never reached the fetch"
+    concurrent = _run_lookup(cache, "k1", results, "concurrent")
     try:
-        cached = _run_lookup(cache, "k1", results, "cached")
-        cached.join(timeout=5)
-        assert not cached.is_alive(), "an expired cached-kid lookup waited on the stalled refresh"
-        assert results["cached"] is warm
+        concurrent.join(timeout=0.5)  # time for a lookup that skips the gate to have returned
     finally:
         fetch.release.set()
         refreshing.join(timeout=10)
-    assert not refreshing.is_alive(), "the refreshing lookup never finished"
-    assert not isinstance(results["refreshing"], BaseException), results["refreshing"]
+        concurrent.join(timeout=10)
+    assert not refreshing.is_alive() and not concurrent.is_alive(), "a lookup never finished"
+    for tag in ("refreshing", "concurrent"):
+        assert isinstance(results[tag], oidc.JwksError), f"{tag} was served: {results[tag]!r}"
     assert fetch.calls == 2
 
 
@@ -1350,14 +1349,17 @@ def test_a_kid_past_its_ttl_is_served_cached_while_a_refresh_stalls(
         True,
         False,
         pytest.param(10**400, id="int-too-large-for-a-float"),
+        pytest.param(Decimal("1e-400"), id="rounds-to-zero"),
+        pytest.param(Decimal("sNaN"), id="signalling-nan"),
     ],
 )
 def test_the_cache_refuses_an_interval_that_is_not_finite_non_negative_seconds(
     field: str, value: float
 ) -> None:
     """BACKLOG #6904. A NaN or infinite floor wedges key rotation after the first fetch, a negative
-    interval has no meaning, and a bool is not a number of seconds. Each is a ValueError, an int too
-    large for a float included, and the refusal withholds the value."""
+    interval has no meaning, a bool is not a number of seconds, and a value that only rounds to zero
+    would silently remove the bound. Each is a ValueError naming the field and withholding the
+    value."""
     with pytest.raises(ValueError, match=field) as refused:
         _cache_with(field, value, lambda: b"")
     assert "value withheld" in str(refused.value)

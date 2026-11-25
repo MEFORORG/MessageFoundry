@@ -27,7 +27,6 @@ amplify into a fetch storm against the IdP.
 from __future__ import annotations
 
 import base64
-import math
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -38,6 +37,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.redaction import json_loads_or_refusal
+from messagefoundry.transports.base import float_setting
 from messagefoundry.transports.signing import (
     SigningError,
     _PublicKey,  # verify-path public-key union
@@ -242,18 +242,14 @@ def _require_interval(name: str, value: float) -> float:
     ``min_refetch_seconds=0`` removes the amplification bound, a choice the security-loosening
     report names. Every comparison against NaN is false, so a NaN floor refuses every refetch after
     the first and wedges key rotation for good, as an infinite floor does. A negative value has no
-    meaning of its own as an interval. A bool is refused, as ``transports.base.float_setting`` refuses one: it
-    is not a number of seconds. The refusal withholds the value, by that function's rule.
+    meaning of its own as an interval. :func:`float_setting` holds the rest of the rule (a bool, a
+    number too large for a float, and a value ``float()`` only rounds to zero are refused too), and
+    its refusal withholds the value.
     """
-    try:
-        valid = not isinstance(value, bool) and math.isfinite(value) and value >= 0
-    except (TypeError, OverflowError):  # not a real number, or an int too large for a float
-        valid = False
-    if not valid:
-        raise ValueError(
-            f"JwksCache {name} must be a finite number of seconds >= 0 (value withheld)"
-        )
-    return float(value)
+    seconds = float_setting(value, knob=name, transport="JwksCache")
+    if seconds < 0:
+        raise ValueError(f"JwksCache {name} must be >= 0 (value withheld)")
+    return seconds
 
 
 class JwksCache:
@@ -268,12 +264,9 @@ class JwksCache:
       on a fetch another caller has in progress;
     * a miss (unknown ``kid``, or the TTL has expired) triggers **at most one** fetch per
       ``min_refetch_seconds``, globally — the amplification bound — after which an unknown ``kid``
-      simply raises :class:`JwksError` until the floor elapses. An unknown ``kid`` that arrives
-      while a fetch is in progress waits for it, then decides again against the keys it finds
-      once that fetch ends: the new ones, or on a failed fetch the old ones;
-    * a ``kid`` still cached but past the TTL is served from the cache, without waiting, while
-      another caller holds the gate, a fetch included (BACKLOG #6905). So a key the IdP has withdrawn
-      can keep verifying, for concurrent callers, until the fetch that withdraws it ends;
+      simply raises :class:`JwksError` until the floor elapses. A miss that arrives while a fetch
+      is in progress waits for it, then decides again against the keys it finds once that fetch
+      ends: the new ones, or on a failed fetch the old ones;
     * a fetch that fails leaves the previous good keys in place (fail-static within the TTL).
 
     ``ttl_seconds`` and ``min_refetch_seconds`` must be finite and non-negative, or construction
@@ -301,12 +294,12 @@ class JwksCache:
         #: floor holds the gate, so it either queues behind the fetch or sees what it published,
         #: and concurrent misses cost the IdP one fetch.
         #:
-        #: A LOOKUP OF A CACHED KEY NEVER WAITS FOR IT (BACKLOG #6905). Waiting made such a lookup
-        #: sit out a stalled IdP. A key within the TTL is read from ``_state`` without the gate; a
-        #: key past it takes the gate only if the gate is free, and otherwise is served as cached.
-        #: Neither read touches the floor, and ``_state`` is an immutable snapshot replaced in one
-        #: assignment, so the ordering hazard above cannot reach them: they see the old keys or the
-        #: new ones.
+        #: A LOOKUP OF A KEY WITHIN THE TTL DOES NOT TAKE IT (BACKLOG #6905). Taking it there made
+        #: such a lookup sit out a stalled IdP. That read touches ``_state`` alone, never the floor,
+        #: and ``_state`` is an immutable snapshot replaced in one assignment, so the ordering hazard
+        #: above cannot reach it: it sees the old keys or the new ones. A key PAST the TTL still
+        #: takes the gate, so it waits out a fetch in progress and is never served once that fetch
+        #: has withdrawn it.
         #:
         #: A blocking lock is safe here because ``get_key`` never runs on the event loop. Its one
         #: caller outside this module is ``claims.py`` ``get_key(kid, alg=alg)``, reached from
@@ -351,38 +344,29 @@ class JwksCache:
         return state.keys.get(kid)
 
     def _lookup(self, kid: str) -> _BoundKey:
-        """The cached or refetched key for ``kid``, under the gate ``__init__`` describes."""
-        state = self._state
-        bound = self._fresh(state, kid, self._clock())
-        if bound is not None:
-            return bound
-        cached = None if state is None else state.keys.get(kid)
-        # Only a lookup with nothing cached to serve waits for the gate.
-        if not self._gate.acquire(blocking=cached is None):
-            assert cached is not None  # a blocking acquire does not return False
-            return cached
-        try:
-            return self._lookup_holding_gate(kid)
-        finally:
-            self._gate.release()
-
-    def _lookup_holding_gate(self, kid: str) -> _BoundKey:
-        now = self._clock()
-        state = self._state
-        bound = self._fresh(state, kid, now)
+        """The cached or refetched key for ``kid``. A key within the TTL is read without the gate;
+        every other lookup runs under it, as ``__init__`` describes."""
+        bound = self._fresh(self._state, kid, self._clock())
         if bound is not None:
             return bound
 
-        if not self._may_fetch(now):
-            # Serve a still-cached key even past the soft TTL rather than fail while throttled...
-            stale = None if state is None else state.keys.get(kid)
-            if stale is not None:
-                return stale
-            raise JwksError(
-                f"no key for kid {kid!r}; JWKS refetch is throttled "
-                f"(min {self._min_refetch:.0f}s between fetches)"
-            )
-        bound = self._refresh(now).keys.get(kid)
-        if bound is None:
-            raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
-        return bound
+        with self._gate:
+            now = self._clock()
+            state = self._state
+            bound = self._fresh(state, kid, now)
+            if bound is not None:
+                return bound
+
+            if not self._may_fetch(now):
+                # Serve a still-cached key even past the soft TTL rather than fail while throttled...
+                stale = None if state is None else state.keys.get(kid)
+                if stale is not None:
+                    return stale
+                raise JwksError(
+                    f"no key for kid {kid!r}; JWKS refetch is throttled "
+                    f"(min {self._min_refetch:.0f}s between fetches)"
+                )
+            bound = self._refresh(now).keys.get(kid)
+            if bound is None:
+                raise JwksError(f"kid {kid!r} not present in the JWKS after refetch")
+            return bound
