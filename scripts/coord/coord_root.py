@@ -49,9 +49,9 @@ _BLANK_OR_COMMENT = re.compile(r"\A[ \t]*(#.*)?\Z")
 _LINE_BREAK = re.compile(r"\r\n|\n|\r")
 # A drive letter, colon and separator, a UNC \\server\share, or (off Windows) a leading slash.
 _ABSOLUTE = re.compile(r"\A(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+|/(?![\\/]))")
-# The three patterns Get-CoordUncHost carries; its comment says why each exists.
-_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|\Z)")
-_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/]([^\\/]+)")
+# The two patterns ConvertTo-CoordPlainRoot carries; its comment says why.
+_DEVICE_DRIVE = re.compile(r"\A[\\/]{2}[?.][\\/]([A-Za-z]:)(?:[\\/](.*))?\Z", re.S)
+_DEVICE_UNC = re.compile(r"\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/](.*)\Z", re.S)
 _UNC = re.compile(r"\A[\\/]{2}([^\\/]+)[\\/]")
 
 
@@ -99,9 +99,10 @@ def shared_root(
     """
     env = os.environ.get(ROOT_ENV, "").strip(_WS)
     if env:
-        if not _absolute(env):
+        plain = _plain(env)
+        if not _absolute(plain):
             return None, "env", f"{ROOT_ENV} is not an absolute path: {env}"
-        return Path(env), "env", None
+        return Path(plain), "env", None
     if local is None:
         local = local_root(start)
     if local is None:
@@ -135,9 +136,21 @@ def shared_root(
         found = m.group(1).strip(_WS)
     if found is None:
         return None, "file", f"{file} names no shared_root"
-    if not _absolute(found):
+    plain = _plain(found)
+    if not _absolute(plain):
         return None, "file", f"{file} names a shared_root that is not an absolute path: {found}"
-    return Path(found), "file", None
+    return Path(plain), "file", None
+
+
+def _plain(path: str) -> str:
+    """A device-path spelling of a root in its plain form, as ConvertTo-CoordPlainRoot rewrites it."""
+    m = _DEVICE_DRIVE.match(path)
+    if m:
+        return m.group(1) + "\\" + (m.group(2) or "")
+    m = _DEVICE_UNC.match(path)
+    if m:
+        return "\\\\" + m.group(1)
+    return path
 
 
 def _absolute(path: str) -> bool:
@@ -156,10 +169,7 @@ def _decode(raw: bytes) -> str:
 
 
 def unc_host(path: str) -> str | None:
-    """The server a path reaches over SMB, or None for a local path, as Get-CoordUncHost answers."""
-    if _DEVICE_DRIVE.match(path):
-        return None
-    m = _DEVICE_UNC.match(path) or _UNC.match(path)
+    m = _UNC.match(path)
     return m.group(1) if m else None
 
 
@@ -182,7 +192,10 @@ def probe_root(path: Path, local: Path | None) -> str | None:
                 age = time.time() - down.stat().st_mtime
                 cached = _down_server(down.read_text(encoding="utf-8"))
                 if cached == server and 0 <= age < DOWN_TTL_SECONDS:
-                    return f"shared root {path} was unreachable {int(age)} s ago (cached in {down})"
+                    return (
+                        f"server {server}, for shared root {path}, was unreachable"
+                        f" {int(age)} s ago (cached in {down})"
+                    )
         except (OSError, ValueError):
             pass
         if not _reachable(server):

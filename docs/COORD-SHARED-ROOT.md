@@ -206,8 +206,11 @@ PreToolUse hook that waits on it would stall every tool call in every session on
 | Hooks that read (announce, mail drain, roster, collision gate) | Skip with a one-line note. Never block the tool call. |
 
 One shared resolver does the probe: a TCP connect to port 445 with a 1.5 s timeout, then the file
-call. It caches a "down" verdict per process for 60 s, so a dead share costs one timeout, not one
-per hook.
+call. It caches a "down" verdict for 60 s in `<LOCAL>/coord-root-down.json`, keyed by the server
+and read by both the PowerShell and the Python resolver, so a dead share costs one timeout per
+minute per clone, not one per hook process. A device-path root (`\\?\X:\p`, `\\?\UNC\srv\share\p`,
+and their `\\.\` forms) is rewritten to its plain spelling before anything reads it; any other
+device form fails fast.
 
 ## Atomicity over SMB
 

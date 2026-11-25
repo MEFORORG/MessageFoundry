@@ -133,10 +133,11 @@ function Get-CoordSharedRoot {
     $envValue = [string][Environment]::GetEnvironmentVariable($script:CoordRootEnv)
     $envValue = $envValue.Trim($script:CoordWs)
     if ($envValue) {
-        if (-not (Test-CoordAbsolutePath $envValue)) {
+        $plain = ConvertTo-CoordPlainRoot $envValue
+        if (-not (Test-CoordAbsolutePath $plain)) {
             return @{ Path = $null; Source = 'env'; Error = "$($script:CoordRootEnv) is not an absolute path: $envValue" }
         }
-        return @{ Path = $envValue; Source = 'env'; Error = $null }
+        return @{ Path = $plain; Source = 'env'; Error = $null }
     }
     $local = if ($LocalRoot) { $LocalRoot } else { Get-CoordLocalRoot -From $From }
     if (-not $local) {
@@ -172,10 +173,24 @@ function Get-CoordSharedRoot {
         $found = $m.Groups[1].Value.Trim($script:CoordWs)
     }
     if ($null -eq $found) { return @{ Path = $null; Source = 'file'; Error = "$file names no shared_root" } }
-    if (-not (Test-CoordAbsolutePath $found)) {
+    $plain = ConvertTo-CoordPlainRoot $found
+    if (-not (Test-CoordAbsolutePath $plain)) {
         return @{ Path = $null; Source = 'file'; Error = "$file names a shared_root that is not an absolute path: $found" }
     }
-    return @{ Path = $found; Source = 'file'; Error = $null }
+    return @{ Path = $plain; Source = 'file'; Error = $null }
+}
+
+function ConvertTo-CoordPlainRoot {
+    # A device-path spelling of a root, rewritten to its plain form: \\?\X:\p and \\.\X:\p become X:\p,
+    # and \\?\UNC\srv\share\p and \\.\UNC\srv\share\p become \\srv\share\p (BACKLOG #7569). Every
+    # consumer then sees a spelling it already handles: claim.ps1 reads the root with wildcard -Path
+    # cmdlets, which misread \\?\, and the 445 probe needs the server a UNC path names. Any other
+    # device form, such as GLOBALROOT or a volume GUID, is left as it is, so its '?' or '.' still
+    # reads as a server no probe reaches and it fails fast. The Python twin carries the same patterns.
+    param([string]$Path)
+    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/]([A-Za-z]:)(?:[\\/](.*))?\z') { return $Matches[1] + '\' + $Matches[2] }
+    if ($Path -cmatch '(?s)\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/](.*)\z') { return '\\' + $Matches[1] }
+    return $Path
 }
 
 function Test-CoordAbsolutePath {
@@ -192,14 +207,11 @@ function Test-CoordSharedKind {
 }
 
 function Get-CoordUncHost {
-    # The server a path reaches over SMB, or $null for a local path. \\?\D:\x and \\.\D:\x are local,
-    # so nothing probes a '?' on 445; \\?\UNC\srv\share names srv. Any other \\?\ or \\.\ form, such as
-    # GLOBALROOT or a volume GUID, still names its '?' or '.', which no probe reaches: it fails fast
-    # rather than risk a file call that hangs. The Python twin carries the same three patterns.
+    # The server name of a \\server\share path, or $null for anything else. A root reaches this
+    # already plain (ConvertTo-CoordPlainRoot), so a device form it left alone names its '?' or '.',
+    # which no probe reaches: it fails fast rather than risk a file call that hangs.
     param([string]$Path)
-    if ($Path -cmatch '\A[\\/]{2}[?.][\\/][A-Za-z]:(?:[\\/]|\z)') { return $null }
-    if ($Path -cmatch '\A[\\/]{2}[?.][\\/][Uu][Nn][Cc][\\/]([^\\/]+)') { return $Matches[1] }
-    if ($Path -cmatch '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
+    if ($Path -match '\A[\\/]{2}([^\\/]+)[\\/]') { return $Matches[1] }
     return $null
 }
 
@@ -231,7 +243,7 @@ function Test-CoordRoot {
                 $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $down).LastWriteTimeUtc).TotalSeconds
                 $cached = Get-CoordDownServer -Text ([System.IO.File]::ReadAllText($down))
                 if ($null -ne $cached -and $cached -ceq $server -and $age -ge 0 -and $age -lt $script:CoordDownTtlSeconds) {
-                    return @{ Ok = $false; Error = "shared root $Path was unreachable $([int]$age) s ago (cached in $down)" }
+                    return @{ Ok = $false; Error = "server $server, for shared root $Path, was unreachable $([int]$age) s ago (cached in $down)" }
                 }
             }
         } catch { }

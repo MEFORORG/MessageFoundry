@@ -492,46 +492,143 @@ def _ps_unc_hosts(paths: list[str]) -> list[object]:
     quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
     out: list[object] = _pwsh_json(
         f"ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
-        "{ $h = Get-CoordUncHost $p; if ($null -eq $h) { '' } else { $h } })"
+        "{ $h = Get-CoordUncHost (ConvertTo-CoordPlainRoot $p); if ($null -eq $h) { '' } else { $h } })"
     )
     return out
 
 
-def test_an_extended_length_path_names_no_server_on_either_side() -> None:
-    # BACKLOG #7569: \\?\D:\coord is local, yet its '?' was probed as a server on 445, so a root that
-    # exists failed as unreachable. \\?\UNC\srv\share names srv, not '?'.
-    cases = {
-        r"\\?\D:\coord": "",
-        r"\\.\D:\coord": "",
-        r"\\?\D:": "",
-        r"\\?\UNC\srv\share\x": "srv",
-        r"\\?\unc\srv\share": "srv",
-        r"\\?\UNC\srv": "srv",
-        # Other device forms keep their '?', so they fail fast rather than reach a file call.
-        r"\\?\GLOBALROOT\Device\Mup\srv\share": "?",
-        r"\\?\Volume{0}\coord": "?",
-        r"\\srv\share\x": "srv",
-        "//srv/share/x": "srv",
-        r"C:\coord": "",
-    }
-    paths = list(cases)
-    assert _ps_unc_hosts(paths) == list(cases.values())
-    assert [coord_root.unc_host(p) or "" for p in paths] == list(cases.values())
+def _ps_plain(paths: list[str]) -> list[object]:
+    quoted = ", ".join("'" + p.replace("'", "''") + "'" for p in paths)
+    out: list[object] = _pwsh_json(
+        f"ConvertTo-Json -Compress -InputObject @(foreach ($p in @({quoted})) "
+        "{ ConvertTo-CoordPlainRoot $p })"
+    )
+    return out
 
 
-def test_an_extended_length_local_root_resolves_on_both(
-    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+# BACKLOG #7569: each device-path spelling, the plain spelling both twins rewrite it to, and the
+# server that plain spelling names. Every consumer of a root (claim.ps1's wildcard -Path cmdlets, the
+# 445 probe, decision.ps1's network check) already handles the plain spelling. \\?\Z:\ stands for a
+# mapped drive: it becomes Z:\, which origin/main never probed either.
+_DEVICE_SPELLINGS = {
+    r"\\?\D:\coord": (r"D:\coord", ""),
+    r"\\.\D:\coord": (r"D:\coord", ""),
+    "//?/D:/coord": (r"D:\coord", ""),
+    r"\\?\D:": ("D:\\", ""),
+    r"\\?\D:\\": ("D:\\\\", ""),
+    r"\\?\Z:\coord": (r"Z:\coord", ""),
+    r"\\?\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
+    r"\\?\unc\srv\share": (r"\\srv\share", "srv"),
+    r"\\.\UNC\srv\share\x": (r"\\srv\share\x", "srv"),
+    r"\\?\UNC\srv": (r"\\srv", ""),
+    # Other device forms are left alone, so their '?' still names a server no probe reaches and
+    # they fail fast, as on origin/main.
+    r"\\?\GLOBALROOT\Device\Mup\srv\share": (r"\\?\GLOBALROOT\Device\Mup\srv\share", "?"),
+    r"\\?\Volume{0}\coord": (r"\\?\Volume{0}\coord", "?"),
+    r"\\?\D:x": (r"\\?\D:x", "?"),
+    r"\\srv\share\x": (r"\\srv\share\x", "srv"),
+    "//srv/share/x": ("//srv/share/x", "srv"),
+    r"C:\coord": (r"C:\coord", ""),
+}
+
+
+def test_a_device_path_root_is_rewritten_to_one_plain_spelling_on_both() -> None:
+    paths = list(_DEVICE_SPELLINGS)
+    plain = [v[0] for v in _DEVICE_SPELLINGS.values()]
+    hosts = [v[1] for v in _DEVICE_SPELLINGS.values()]
+    assert _ps_plain(paths) == plain
+    assert [coord_root._plain(p) for p in paths] == plain
+    assert _ps_unc_hosts(paths) == hosts
+    assert [coord_root.unc_host(coord_root._plain(p)) or "" for p in paths] == hosts
+
+
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\", "//?/"])
+def test_a_device_path_local_root_resolves_to_its_plain_path_on_both(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, prefix: str
 ) -> None:
     shared = tmp_path / "shared"
     shared.mkdir()
-    monkeypatch.setenv("MEFOR_COORD_ROOT", "\\\\?\\" + str(shared))
+    monkeypatch.setenv("MEFOR_COORD_ROOT", prefix + str(shared))
     ps, py = _both(repo, "mail")
     assert py.error is None and ps["Error"] is None, (ps, py)
-    assert _norm(py.path).endswith(_norm(shared / "mail"))
-    monkeypatch.setenv("MEFOR_COORD_ROOT", "\\\\?\\" + str(tmp_path / "absent"))
+    assert str(ps["Path"]) == str(py.path) == str(shared / "mail")
+    monkeypatch.setenv("MEFOR_COORD_ROOT", prefix + str(tmp_path / "absent"))
     ps, py = _both(repo, "mail")
     assert py.error is not None and "does not exist" in py.error, py
     assert "does not exist" in str(ps["Error"]), ps
+
+
+def test_a_device_path_unc_root_probes_its_server_on_both(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live share is not measured here: no test share exists on the runner. The dead one shows the
+    # probe reaches the server the plain spelling names, fast, not '?'.
+    monkeypatch.setenv("MEFOR_COORD_ROOT", r"\\?\UNC\192.0.2.1\nothing\mefor-coord")
+    t0 = time.monotonic()
+    ps, py = _both(repo, "claims")
+    assert time.monotonic() - t0 < 30
+    assert py.error is not None and "192.0.2.1" in py.error, py
+    assert "192.0.2.1" in str(ps["Error"]), ps
+
+
+def test_a_device_path_root_toml_value_is_rewritten_on_both(repo: Path, tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    local = _local(repo)
+    local.mkdir(parents=True)
+    (local / "root.toml").write_text(f"shared_root = '\\\\?\\{shared}'\n", encoding="utf-8")
+    ps, py = _both(repo, "claims")
+    assert py.error is None and py.source == "file", py
+    assert str(ps["Path"]) == str(py.path) == str(shared / "claims")
+
+
+def _claim_checkout(path: Path) -> Path:
+    """A git checkout carrying claim.ps1 and the resolver it dot-sources, as claim.ps1 runs anywhere."""
+    (path / "scripts" / "coord").mkdir(parents=True)
+    for name in ("claim.ps1", "coord-root.ps1"):
+        shutil.copy2(ROOT / "scripts" / "coord" / name, path / "scripts" / "coord" / name)
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+    return path
+
+
+def _run_claim(tree: Path, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(tree / "scripts" / "coord" / "claim.ps1"),
+            *args,
+        ],
+        cwd=str(tree),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+
+
+@pytest.mark.parametrize("prefix", ["\\\\?\\", "\\\\.\\"])
+def test_claim_lists_and_releases_a_claim_under_a_device_path_root(
+    tmp_path: Path, prefix: str
+) -> None:
+    # Round 3 of #7569: claim.ps1 reads the root with wildcard -Path cmdlets, which misread \\?\, so a
+    # root that resolved listed nothing and -Release was a silent no-op.
+    tree = _claim_checkout(tmp_path / "tree")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    env = {k: v for k, v in os.environ.items() if k != "MEFOR_COORD_ROOT"}
+    env["MEFOR_COORD_ROOT"] = prefix + str(shared)
+    taken = _run_claim(tree, env, "-Take", "device-root-key", "-Note", "device-path fixture")
+    assert taken.returncode == 0, taken.stdout + taken.stderr
+    assert [p.name for p in (shared / "claims").glob("*.json")] == ["device-root-key.json"]
+    listed = _run_claim(tree, env, "-List")
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    assert "device-root-key" in listed.stdout, listed.stdout
+    released = _run_claim(tree, env, "-Release", "device-root-key")
+    assert released.returncode == 0, released.stdout + released.stderr
+    assert not list((shared / "claims").glob("*.json")), released.stdout
 
 
 def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> None:
@@ -557,14 +654,14 @@ def test_a_non_ascii_checkout_path_reads_the_same_on_both(tmp_path: Path) -> Non
 
 def test_every_spelling_of_a_root_names_one_server_on_both() -> None:
     # The down cache is keyed by server, so it needs every spelling of one root, as each twin holds
-    # it (pathlib's for Python), to name the same server on both.
+    # it (plain, then pathlib's for Python), to name the same server on both.
     spellings = [
         "//srv/share/./dir//",
         r"\\srv\share\dir",
         r"\\srv\share\dir\\",
         r"\\?\UNC\srv\share\.\dir",
     ]
-    held = [str(Path(p)) for p in spellings]
+    held = [str(Path(coord_root._plain(p))) for p in spellings]
     assert {coord_root.unc_host(p) for p in held} == {"srv"}
     assert set(_ps_unc_hosts(spellings)) == {"srv"}
 
@@ -588,26 +685,6 @@ def test_the_down_cache_file_reads_the_same_on_both() -> None:
     )
     py = [coord_root._down_server(t) or "" for t in texts]
     assert ps == py == ["srv", "", "", "", "", "", ""]
-
-
-def test_decisions_network_check_reads_a_device_drive_as_its_drive() -> None:
-    # decision.ps1 relied on Get-CoordUncHost naming '?' for \\?\Z:\, which read as network. Now that
-    # names no host, the drive behind the prefix is judged as a bare Z:\ is, and a GLOBALROOT path,
-    # which still names '?', reads as network.
-    decision = ROOT / "scripts" / "coord" / "decision.ps1"
-    system = os.environ.get("SYSTEMDRIVE", "C:")
-    body = (
-        f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{decision}', [ref]$null, "
-        "[ref]$null); $fn = $ast.Find({ param($n) $n -is "
-        "[System.Management.Automation.Language.FunctionDefinitionAst] -and "
-        "$n.Name -eq 'Test-SeatRootIsNetwork' }, $true); . ([scriptblock]::Create($fn.Extent.Text)); "
-        f"ConvertTo-Json -Compress -InputObject @((Test-SeatRootIsNetwork '{system}\\coord'), "
-        f"(Test-SeatRootIsNetwork '\\\\?\\{system}\\coord'), "
-        "(Test-SeatRootIsNetwork '\\\\?\\GLOBALROOT\\Device\\Mup\\srv\\share'))"
-    )
-    bare, device, globalroot = _pwsh_json(body)
-    assert device == bare
-    assert globalroot is True
 
 
 def test_local_root_runs_git_in_powershells_location(tmp_path: Path, repo: Path) -> None:
