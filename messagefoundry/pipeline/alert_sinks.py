@@ -618,24 +618,16 @@ _WEBHOOK_WAYS_ACROSS = (
 )
 
 #: The alerts SMTP login's OWN way across its revocation refusal (BACKLOG #2193). ``[tls].crl_file``
-#: reaches this hop's context through the trust anchor :func:`send_plain_email` resolves, but only
-#: where the caller handed the sink a ``[tls]`` policy, so it is offered beside the ``[alerts]`` pair
-#: only then; a connection's attestation is not, as this is no connection.
-_CRL_IS_INSTANCE_WIDE = (
-    "(it is instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that "
-    "file, or its handshake fails)"
-)
-_SMTP_ATTEST = (
-    "set [alerts].email_tls_revocation_attested = true with an "
-    "[alerts].email_tls_revocation_attested_reason"
-)
-_SMTP_NO_LOGIN = (
-    "Or remove [alerts].email_username and the password to send unauthenticated, which takes no "
-    "revocation guard."
-)
+#: reaches this hop's context through the trust anchor :func:`send_plain_email` resolves, but
+#: only where the caller handed the sink a ``[tls]`` policy, so it is offered beside the
+#: ``[alerts]`` pair only then; a connection's attestation is not, as this is no connection.
+#: Each remedy is written out in full, so a grep for the sentence a refusal printed finds it.
 _ALERT_SMTP_WAYS_ACROSS = (
-    f"Configure [tls].crl_file so the engine checks a CRL on this hop {_CRL_IS_INSTANCE_WIDE}, "
-    f"or {_SMTP_ATTEST}. {_SMTP_NO_LOGIN}"
+    "Configure [tls].crl_file so the engine checks a CRL on this hop (it is instance-wide: every "
+    "non-loopback hop it reaches then needs its issuer's CRL in that file, or its handshake "
+    "fails), or set [alerts].email_tls_revocation_attested = true with an "
+    "[alerts].email_tls_revocation_attested_reason. Or remove [alerts].email_username and the "
+    "password to send unauthenticated, which takes no revocation guard."
 )
 
 #: The same refusal's way across where the sink was built with no ``[tls]`` policy (BACKLOG
@@ -643,11 +635,13 @@ _ALERT_SMTP_WAYS_ACROSS = (
 #: setting it is not offered as a remedy on its own.
 _ALERT_SMTP_WAYS_ACROSS_NO_POLICY = (
     "This sink was built with no [tls] policy, so [tls].crl_file does not reach this hop. "
-    f"{_SMTP_ATTEST[0].upper()}{_SMTP_ATTEST[1:]}, or build the sink with the instance [tls] "
+    "Set [alerts].email_tls_revocation_attested = true with an "
+    "[alerts].email_tls_revocation_attested_reason, or build the sink with the instance [tls] "
     "policy (trust_anchor_policy where the sink or its notifier factory is called, or "
-    "tls_settings for an app) "
-    f"and a [tls].crl_file holding the relay issuer's CRL {_CRL_IS_INSTANCE_WIDE}. "
-    f"{_SMTP_NO_LOGIN}"
+    "tls_settings for an app) and a [tls].crl_file holding the relay issuer's CRL (it is "
+    "instance-wide: every non-loopback hop it reaches then needs its issuer's CRL in that file, "
+    "or its handshake fails). Or remove [alerts].email_username and the password to send "
+    "unauthenticated, which takes no revocation guard."
 )
 
 
@@ -789,6 +783,8 @@ def _refuse_alert_smtp_revocation(
     the engine verifies. Stdlib ssl checks no OCSP or CRL, so a revoked but unexpired relay
     certificate would be accepted with no refusal and no record. The owner ruling of 2026-10-27
     guards that hop, with ``[tls].crl_file`` or the ``[alerts]`` attestation pair as the levers.
+    ``[tls].crl_file`` reaches the hop only where the caller passes ``trust_anchor_policy``, so
+    the refusal offers it only then (BACKLOG #5527).
 
     **A hop with no login takes no guard**, by the same ruling, recorded in ADR 0173: it carries no
     credential. The decline does not rest on what the body holds, and an alert body is not PHI-free

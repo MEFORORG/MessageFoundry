@@ -3016,7 +3016,8 @@ _LEASE_LOST_RELEASE_DETAIL: Final = (
 _UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
 
 #: The answer's bound on a hop refusal raised BUILDING the ``POST /alerts/test-email`` transport
-#: (BACKLOG #2193). The revocation guard's text runs to about 900 characters and its levers start
+#: (BACKLOG #2193). The revocation guard's text runs to about 900 to 1,150 characters, the longer
+#: for a sink built with no ``[tls]`` policy (BACKLOG #5527), and its levers start
 #: past ``safe_exc``'s default 200, so the default cut answered a refusal with no way across. Not
 #: :data:`_REFUSAL_LOG_LIMIT`: that one bounds a log line whose text the answer withholds, and this
 #: one bounds what the answer carries. 2048 leaves room for any DNS host name in that text.

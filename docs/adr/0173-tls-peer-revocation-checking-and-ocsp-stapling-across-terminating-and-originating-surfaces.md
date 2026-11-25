@@ -1121,8 +1121,8 @@ reached them.
 
 **The counts.** At least seven hops need a guard: the FHIR lookup, the AI broker (guarded by
 attestation since 2026-10-30, see the note of that date below, and crossing on a set `[tls].crl_file`
-too since 2026-11-10 where the `[tls]` section reaches the app and the endpoint is not loopback,
-BACKLOG #5527), the DICOM SCU,
+too since 2026-11-10 where the `[tls]` section reaches the app and the endpoint host is not
+loopback as `is_loopback_hop_host` reads it, BACKLOG #5527), the DICOM SCU,
 FTPS, LDAPS (guarded since 2026-10-28, see the note above), the alert and security-notice SMTP hop,
 and the alert webhook. BACKLOG #2193 tracks
 all seven, one checklist line per hop. No row in this table needs an owner answer now. DIRECT,
