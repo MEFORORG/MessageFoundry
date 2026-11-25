@@ -528,9 +528,9 @@ async function askCli(
     return;
   }
   // A value that leaves the workspace through a link is refused the same way, before the CLI reads
-  // its `[api].tls_cert_file` (BACKLOG #5411, #8237 item 24). Open limit: the check reads real paths
-  // synchronously, so a link onto an unreachable share holds the extension host for that read.
-  if (readerPathEscapesByLink(setting)) {
+  // its `[api].tls_cert_file` (BACKLOG #5411, #8237 item 24), judged against the captured folder the
+  // CLI runs in. cli.ts readerPathEscapesByLink states its synchronous-read limit.
+  if (readerPathEscapesByLink(setting, workspace)) {
     engineLog().warn(readerLinkEscapeNotice("serviceConfig", `${skipped}.`));
     return;
   }
@@ -831,9 +831,11 @@ function cliCouldAnchor(key: string): boolean {
     // askCli's own guard: with no workspace, or an untrusted one, the CLI is never asked.
     !!workspaceDir() &&
     !isExecGated() &&
-    // And its refusal of a dropped serviceConfig (BACKLOG #5404), so a failure does not schedule
-    // refreshes that can only refuse again.
+    // And its refusals of a dropped serviceConfig (BACKLOG #5404) and of one that leaves the folder
+    // through a link (BACKLOG #5411), so a failure does not schedule refreshes that can only refuse
+    // again.
     writerCheckSetting("serviceConfig").dropped === false &&
+    !readerPathEscapesByLink(writerCheckSetting("serviceConfig")) &&
     !claimedKeys.has(key) &&
     // The settings as they are now too: a host claimed since the last refresh is no longer the CLI's.
     !configuredPins().has(key) &&

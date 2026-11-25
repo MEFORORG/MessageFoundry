@@ -286,7 +286,7 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
   // A writer that read the substitute would act on a file or folder nobody chose (BACKLOG #5404).
   const READER_IN_WRITE = [
     /"codeset", "(?:upsert|rename|remove)", "--config", configDir\(\)/,
-    /"alert", "(?:add|remove)", (?:"--service-config", serviceConfig\(\)|`--service-config=\$\{serviceConfig\(\)\}`)/,
+    /"alert", "(?:add|remove)", (?:"--service-config", serviceConfig\(\)|\.\.\.serviceConfigArgs\(serviceConfig\(\)\))/,
     /connection(?:Upsert|Remove)Args\(configDir\(\)/,
     /connectionServiceConfig\(serviceConfig\(\), serviceConfigIsSet\(\)\)/,
   ];
@@ -302,7 +302,8 @@ suite("the path settings are contained to the workspace folder (BACKLOG #5404)",
   test("control: the pre-fix writer argvs fail the scan", () => {
     assert.strictEqual(offenders('["codeset", "remove", "--config", configDir(), "--name", n]').length, 1);
     assert.strictEqual(offenders('["alert", "add", "--service-config", serviceConfig(), "--data", d]').length, 1);
-    assert.strictEqual(offenders('["alert", "add", `--service-config=${serviceConfig()}`, `--data=${d}`]').length, 1);
+    // The form the alert writers now build their argv in, fed the reader accessor.
+    assert.strictEqual(offenders('["alert", "add", ...serviceConfigArgs(serviceConfig()), `--data=${d}`]').length, 1);
     assert.strictEqual(
       offenders("connectionUpsertArgs(configDir(), connectionServiceConfig(serviceConfig(), serviceConfigIsSet()), c)").length,
       2,

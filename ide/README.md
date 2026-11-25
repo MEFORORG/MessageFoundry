@@ -215,9 +215,12 @@ and uses your user value or the default instead, until you trust the workspace (
   command, New Route, version-control setup and the security editor. A user value does not lift
   that refusal; to use a path elsewhere, remove the workspace value and set the path in user
   settings. Version-control setup writes no commit hook when either folder lies outside the
-  workspace, because the hook is committed; it still sets up the rest. Readers compare the spelling
-  only. Writers also check the real path, in a trusted window. They refuse a value spelled inside the
-  folder when at least one of these holds:
+  workspace, because the hook is committed; it still sets up the rest. Most readers compare the
+  spelling only. Writers also check the real path, in a trusted window, and so do at least three
+  readers of `serviceConfig` that hand the file to the engine CLI: the alert list, engine trust's
+  `cert inventory` and the offline AI policy. A reader that refuses says so and does not read the
+  file. The real-path check refuses a value spelled inside the folder when at least one of these
+  holds:
   - a symbolic link or junction on the named path leads out of the folder;
   - the value climbs with `..`;
   - its real path cannot be read;
@@ -304,7 +307,8 @@ This happens at startup and again whenever you change `messagefoundry.engineUrl`
 workspace, or a `serviceConfig` that names nothing, the extension simply trusts nothing extra. A
 workspace `serviceConfig` that names a path outside the workspace folder, or a user value that is not
 text, is not replaced by another file here: the extension runs no `cert inventory`, trusts no engine
-certificate from it, and says so in the MessageFoundry Engine output. A `caFile` pin still applies.
+certificate from it, and says so in the MessageFoundry Engine output. The same holds for a value
+spelled inside the folder that the real-path check above refuses. A `caFile` pin still applies.
 
 If a request reports that it cannot verify the certificate, check two things: that
 `messagefoundry.serviceConfig` names the settings TOML of the engine you are pointing at, and that

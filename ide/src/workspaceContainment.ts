@@ -302,8 +302,13 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     fallback === undefined
       ? `messagefoundry.${key} names a path`
       : `messagefoundry.${key} is blank, so the CLI opens ${fallback}, a path`;
+  return `MessageFoundry: nothing was written or started. ${linkEscapeCause(subject)}`;
+}
+
+/** What {@link linkEscapeRefusal} and {@link readerLinkEscapeNotice} share: the cause and the remedy. */
+function linkEscapeCause(subject: string): string {
   return (
-    `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
+    `${subject} inside the workspace folder that may ` +
     "lead out of it, or that Windows may open as another name or a device. At least one of these holds: " +
     "a symbolic link or junction on the path leads out, the path climbs with '..', a folder or file name " +
     "on it is a Windows device name such as nul or com1, a folder or file name on it " +
@@ -319,12 +324,7 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
 /** The notice a READER that hands the setting to the CLI gives when cli.ts `readerPathEscapesByLink`
  *  refuses it: the cause {@link linkEscapeRefusal} names, and `skipped`, what the reader did not do. */
 export function readerLinkEscapeNotice(key: PathSettingKey, skipped: string): string {
-  return (
-    `messagefoundry.${key} names a path inside the workspace folder that may lead out of it, or that ` +
-    "Windows may open as another name or a device: a symbolic link or junction on it leads out, it climbs " +
-    "with '..', a folder or file name on it is a Windows device name or ends in a dot or a space or holds " +
-    `a colon, or its real path cannot be read. ${skipped}`
-  );
+  return `${skipped} ${linkEscapeCause(`messagefoundry.${key} names a path`)}`;
 }
 
 /** The scopes of a setting that {@link containedPathSetting} reads: VS Code's `inspect()` answer.

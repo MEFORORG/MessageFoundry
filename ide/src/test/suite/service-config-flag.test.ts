@@ -56,7 +56,8 @@ suite("--service-config is bound with = everywhere the IDE runs the CLI (BACKLOG
     const alert = code("alertEditor.ts");
     const list = alert.slice(alert.indexOf("async function refresh("), alert.indexOf("async function add("));
     assert.ok(ahead(list, "readerPathEscapesByLink(setting)", '"alert", "list"'), list);
-    assert.ok(ahead(code("engineTrust.ts"), "readerPathEscapesByLink(setting)", '"cert", "inventory"'));
+    // Judged against the captured folder the CLI runs in.
+    assert.ok(ahead(code("engineTrust.ts"), "readerPathEscapesByLink(setting, workspace)", '"cert", "inventory"'));
     const ai = code("aiPolicy.ts");
     assert.ok(ahead(ai, 'pathSettingLinkEscape("serviceConfig", s) === undefined', "aiPolicyCliPlan(s.value"), ai);
   });

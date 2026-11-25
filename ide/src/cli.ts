@@ -157,10 +157,11 @@ function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
 /**
  * The refusal text when the file or folder `s` names leaves the workspace through a link
  * ({@link escapesByLink}), else undefined. Run only in a trusted window, for the reason
- * {@link writerSetting} gives. A blank serviceConfig is judged as the fallback file, for a caller
- * that sends no flag for a blank value; one that sends the value as written uses
- * {@link readerPathEscapesByLink}. Exported for the offline AI policy too (aiPolicy.ts), which names
- * that fallback file explicitly (BACKLOG #5411).
+ * {@link writerSetting} gives. A blank serviceConfig is judged as the fallback file, which is what
+ * Start, the connection edits and the offline AI policy open for it; the alert writers send the blank
+ * value as written, so for them the refusal's naming of the fallback file is an open limit. A reader
+ * that sends the value as written uses {@link readerPathEscapesByLink}. Exported for the offline AI
+ * policy (aiPolicy.ts), which names that fallback file explicitly (BACKLOG #5411).
  */
 export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetting): string | undefined {
   // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
@@ -179,10 +180,12 @@ export function pathSettingLinkEscape(key: PathSettingKey, s: ContainedPathSetti
  * ({@link escapesByLink}), for a reader that passes the value as written, at least the alert list
  * and engine trust's `cert inventory` (BACKLOG #5411, #8237 item 24). A blank value names no file,
  * so nothing is checked; the CLI is handed the blank value. Run only in a trusted window, as
- * {@link writerSetting}'s check is.
+ * {@link writerSetting}'s check is. `ws` is the folder the CLI runs in, by default the workspace's.
+ * Open limit: the check reads real paths synchronously, so a link onto an unreachable share holds
+ * the extension host for that read.
  */
-export function readerPathEscapesByLink(s: ContainedPathSetting): boolean {
-  return s.value.trim() !== "" && !isExecGated() && escapesByLink(workspaceDir(), s.value);
+export function readerPathEscapesByLink(s: ContainedPathSetting, ws: string | undefined = workspaceDir()): boolean {
+  return s.value.trim() !== "" && !isExecGated() && escapesByLink(ws, s.value);
 }
 
 /**

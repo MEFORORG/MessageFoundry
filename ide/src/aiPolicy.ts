@@ -135,6 +135,8 @@ export const DEFAULT_AI_POLICY_IO: AiPolicyIo = {
     // enable assistance. Nothing dropped, the setting is set exactly when it is not the default.
     // So does one that leaves the workspace through a link (BACKLOG #5411): the CLI would read a
     // policy file outside it. A blank value is judged as the file the plan then names explicitly.
+    // The check reads real paths synchronously, so a link onto an unreachable share holds the
+    // extension host for that read.
     const s = writerCheckSetting("serviceConfig");
     const usable = s.dropped === false && pathSettingLinkEscape("serviceConfig", s) === undefined;
     const plan = usable ? aiPolicyCliPlan(s.value, s.source !== "default", workspaceDir()) : undefined;
