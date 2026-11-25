@@ -471,7 +471,28 @@ def test_a_refused_revoke_still_says_nothing_was_revoked(
     assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
     error = json.loads(capsys.readouterr().out)["error"]
     assert error.startswith("nothing was revoked: ") and "unknown" not in error, error
+    assert error.endswith(
+        "Retry; if the engine is running on this SQLite store, stop it and re-run"
+    )
     assert asyncio.run(_state(db, tokens)) == ([False, False], [])
+
+
+def test_a_refusal_that_is_not_a_lock_gets_no_stop_the_engine_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control for the hint: only a lock is fixed by stopping a SQLite engine."""
+    monkeypatch.chdir(tmp_path)
+    setenv_at_rest_opt_out(monkeypatch)
+    db = tmp_path / "cli.db"
+    asyncio.run(_seed(db))
+
+    async def refused(self: MessageStore, **kwargs: object) -> RevokeResult:
+        raise sqlite3.OperationalError("disk is full")
+
+    monkeypatch.setattr(MessageStore, "revoke_all_sessions", refused)
+    assert main(["admin-revoke-sessions", "--db", str(db), "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error.startswith("nothing was revoked: ") and error.endswith("Retry"), error
 
 
 def test_an_os_user_that_cannot_be_named_revokes_nothing(
@@ -624,7 +645,8 @@ def test_the_store_contract_states_the_transaction_and_reseal_rules() -> None:
     for rule in (
         "In one transaction it raises the store's global session epoch",
         "re-seals the kept session under its account's new epoch and the new global one",
-        "(an account whose record the seal check refuses goes without its raise)",
+        "(an account whose raise a seal refusal stops goes without it, and so does every account "
+        "after a Vault Transit outage trips the revoke",
         "either way the transaction rolls back",
     ):
         assert rule in contract, rule

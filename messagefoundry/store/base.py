@@ -3685,8 +3685,9 @@ class AuthStore(Protocol):
 
         In one transaction it raises the store's global session epoch (BACKLOG #5091), which ends
         every session minted before it whatever account it belongs to, raises the epoch of each
-        account its read of the account list returns (an account whose record the seal check
-        refuses goes without its raise), ends the sessions it finds, and re-seals the
+        account its read of the account list returns (an account whose raise a seal refusal
+        stops goes without it, and so does every account after a Vault Transit outage trips the
+        revoke: store.py's ``raise_account_epoch``), ends the sessions it finds, and re-seals the
         kept session under its account's new epoch and the new global one, only when it carried
         both epochs those raises replaced (store.py's ``KeptSessionRestamp``, BACKLOG #4975): a
         kept session an earlier sweep missed, or one whose account's record failed its seal, is

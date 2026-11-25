@@ -581,7 +581,7 @@ def test_under_the_keyless_opt_out_a_chain_naming_a_key_exits_1(
 
 #: The commands that route a store key that does not resolve to exit 2. The admin pair joined in
 #: vault BACKLOG #3054, item 11; each exited 1 at the dispatch floor before. ``admin-revoke-sessions``
-#: joined in BACKLOG #5093.
+#: was listed in BACKLOG #5093; it already exited 2 here, through ``_open_store_or_refuse``.
 _KEY_REFUSING_COMMANDS = [
     "audit-verify",
     "audit-anchor",

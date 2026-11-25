@@ -3695,8 +3695,8 @@ async def _record_a_restore(store: Store, sink: AlertSink) -> None:
     start before or after this one; what keeps the archive's sessions from them is the restore
     itself, which ended every session in the file before placing it (``write_restore_marker``).
     This revoke repeats that for anything minted since, and raises the global session epoch,
-    which ends every session minted before it, and each account's epoch where the account's
-    record passes its seal check (``AuthStore.revoke_all_sessions`` says how).
+    which ends every session minted before it, and each account's epoch but where
+    ``AuthStore.revoke_all_sessions`` says an account goes without it.
 
     A store write that fails here raises, so the start fails rather than serving the archive's
     sessions. The alert itself never raises: the record is already committed."""

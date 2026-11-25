@@ -14203,6 +14203,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         audit_write_errors,
         open_store,
         store_call_errors,
+        store_connect_errors,
     )
 
     settings = _host_gated_store_settings(args, false_finding="'no sessions revoked'")
@@ -14237,17 +14238,18 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         )
 
         async def audit(detail: dict[str, object]) -> str | None:
-            """Append the row once the revoke has run. Every refusal, a defect and a Transit
-            MAC failure included, is returned as text rather than raised, so it never replaces
-            what the command says about the revoke. The class goes to WARNING and the traceback
-            to DEBUG: a driver's message can quote a stored value."""
+            """Append the row once the revoke has run. A refusal ``audit_write_errors()`` names,
+            the audit-write defects and a Transit MAC failure among them, is returned as text
+            rather than raised, so it does not replace what the command says about the revoke.
+            The class goes to ERROR and the traceback to DEBUG: a driver's message can quote a
+            stored value."""
             try:
                 await store.record_audit(
                     "auth.session_revoked", actor=actor, detail=json.dumps(detail)
                 )
-            except (*audit_write_errors(), *AUDIT_WRITE_DEFECTS) as exc:
+            except audit_write_errors() as exc:
                 log = logging.getLogger(__name__)
-                log.warning(
+                log.error(
                     "admin-revoke-sessions: the auth.session_revoked row was refused (%s)",
                     type(exc).__name__,
                 )
@@ -14267,7 +14269,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                 revoked = (await store.revoke_all_sessions()).count
             except AUDIT_WRITE_DEFECTS:
                 raise  # a bug, not a refused write
-            except store_call_errors() as exc:
+            except (*store_call_errors(), *store_connect_errors()) as exc:
                 if _write_outcome_unknown(exc):
                     # The link failed, possibly after the server applied the COMMIT, so nothing
                     # here can say whether the sessions ended. The row records the attempt.
@@ -14277,9 +14279,21 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
                         "outcome": "unknown",
                     }
                     return "unknown", None, _store_error_text(exc), await audit(detail)
+                if not isinstance(exc, store_call_errors()) and not _is_transient_driver_error(exc):
+                    # pyodbc's bare Error root on a SQLSTATE that is not transient, such as a
+                    # bind-count mismatch: a defect, as the transit-bound commands treat it, which
+                    # the dispatch floor reports by class and SQLSTATE only.
+                    raise _StoreDefect(_store_error_text(exc)) from exc
                 # The store opened; the revoke itself was refused and rolled back. Not the open
-                # error the arm below words, which would read as a wrong --db path.
-                return "refused", None, _store_error_text(exc), None
+                # error the arm below words, which would read as a wrong --db path. Only a lock
+                # is fixed by stopping a SQLite engine, so only a lock gets that hint, as the
+                # transit-bound commands give it.
+                hint = (
+                    "; if the engine is running on this SQLite store, stop it and re-run"
+                    if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc)
+                    else ""
+                )
+                return "refused", None, f"{_store_error_text(exc)}. Retry{hint}", None
             # The revoke has committed. A failed audit append (a running engine holding the
             # write lock past the busy timeout, say) must not read as "nothing happened".
             return "revoked", revoked, None, await audit({"scope": "all", "count": revoked})
@@ -14301,14 +14315,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "refused":
-        # Only a lock is fixed by stopping a SQLite engine, so only a lock gets that hint, as the
-        # transit-bound commands give it.
-        hint = (
-            "; if the engine is running on this SQLite store, stop it and re-run"
-            if problem is not None and "database is locked" in problem
-            else ""
-        )
-        return _emit_error(f"nothing was revoked: {problem}. Retry{hint}", as_json=args.json)
+        return _emit_error(f"nothing was revoked: {problem}", as_json=args.json)
     if outcome == "unknown":
         recorded = (
             "An auth.session_revoked row with the outcome unknown records the attempt"

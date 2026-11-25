@@ -22780,9 +22780,9 @@ class MessageStore:
 
         The store's global session epoch is raised first (BACKLOG #5091), then the epoch of each
         account its read of the account list returns, as :meth:`revoke_user_sessions` raises one;
-        an account whose
-        record the seal check refuses goes without its raise (:meth:`_bump_session_epoch`), and
-        the global epoch still ends its sessions. Then one sweep ends the rows and the kept
+        an account goes without its raise where :func:`raise_account_epoch` says, at least on a
+        seal refusal and after a Vault Transit outage trips the revoke, and the global epoch
+        still ends its sessions. Then one sweep ends the rows and the kept
         row is re-sealed under its own account's new epoch and the new global one, when it carried
         both epochs those raises replaced (:class:`KeptSessionRestamp`, BACKLOG #4975), and is
         otherwise ended and counted (:meth:`_keep_or_end_session`).
