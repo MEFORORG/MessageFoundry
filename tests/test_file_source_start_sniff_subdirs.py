@@ -13,6 +13,7 @@ Synthetic HL7 only. Deliberately ASCII-only: pytest echoes a failing body to a c
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from pathlib import Path
@@ -21,6 +22,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Source
+from messagefoundry.transports.base import SourceStartupError
 from messagefoundry.transports.file import FileSource
 
 _HL7 = "MSH|^~\\&|SND|FAC|RCV|FAC|20260101120000||ADT^A01|CTL5684|P|2.5.1\rPID|1||12345\r"
@@ -397,3 +399,50 @@ async def test_a_successful_leave_ledger_write_comes_before_the_cache(tmp_path: 
     await src._leave_record("fk1:" + "0" * 64)
     assert seen_when_written == [False]
     assert "fk1:" + "0" * 64 in src._processed_seen
+
+
+# --- BACKLOG #5682: the identity limb ------------------------------------------------------------
+
+
+def _link_dir(target: Path, link: Path) -> None:
+    """A directory link at ``link``: a junction on Windows, which needs no privilege, else a symlink."""
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+    else:
+        os.symlink(target, link, target_is_directory=True)
+
+
+@pytest.mark.parametrize("knob", ["processed_subdir", "error_subdir"])
+@pytest.mark.parametrize("below", ["", "done"], ids=["the-watch-dir", "inside-it"])
+@pytest.mark.parametrize("after_read", ["move", "leave"])
+def test_an_archive_subdir_reaching_the_watch_tree_through_a_link_is_refused_at_start(
+    tmp_path: Path, knob: str, below: str, after_read: str
+) -> None:
+    """Red on the unfixed code: a value spelled outside the watch directory that reaches it, or a
+    directory inside it, through a link or a junction passed, and archived files would be listed
+    and ingested again on every poll."""
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(inbox, alias)
+    value = str(alias / below) if below else str(alias)
+    src = _source(inbox, after_read=after_read, **{knob: value})
+    with pytest.raises(SourceStartupError, match=knob) as caught:
+        src._prepare_subdirs()
+    assert "alias" not in str(caught.value)
+
+
+def test_an_archive_subdir_outside_the_watch_tree_through_a_link_still_starts(
+    tmp_path: Path,
+) -> None:
+    # The control: a link to a directory outside the watch tree is the operator's to use.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    alias = tmp_path / "alias"
+    _link_dir(archive, alias)
+    src = _source(inbox, processed_subdir=str(alias), error_subdir=str(tmp_path / "err"))
+    src._prepare_subdirs()

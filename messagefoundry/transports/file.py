@@ -1155,6 +1155,23 @@ class FileSource(SourceConnector):
                     "junction, and every move would be refused; make it a real directory, or set "
                     "processed_subdir/error_subdir to an absolute path outside the watch directory"
                 )
+        # _archive_subdir compares spellings, so a value spelled outside the watch directory that
+        # reaches it through a link, a junction, an 8.3 name, a device or UNC form or a case variant
+        # passes it. Moved files would then sit where the scan lists them and its spelling-based skip
+        # does not, and be ingested again on every poll (BACKLOG #5682). Compared here, by file
+        # identity, once the directories exist.
+        for knob, dest in (
+            ("processed_subdir", self.processed_dir),
+            ("error_subdir", self.error_dir),
+        ):
+            if _inside_watch_tree_by_identity(dest, self.directory):
+                raise SourceStartupError(
+                    f"file source {knob} reaches the watch directory {self.directory} or a "
+                    "directory inside it through another spelling (a link, a junction, a short "
+                    "name or a case variant), so every archived file would be ingested again; "
+                    "spell it relative to the watch directory, or point it outside the watch "
+                    "directory (value withheld)"
+                )
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -3399,6 +3416,30 @@ def _open_dest(dest_dir: Path, directory: Path, root_real: Path) -> _Dest:
     if dirs is None:
         return _Dest(dest_dir)
     return _Dest(root_real.joinpath(*dirs), held=_win_hold_dirs(root_real, dirs))
+
+
+def _inside_watch_tree_by_identity(dest_dir: Path, directory: Path) -> bool:
+    """True when ``dest_dir`` is spelled outside the watch ``directory`` but is, by file identity,
+    that directory or one inside it (BACKLOG #5682). Each of ``dest_dir``'s resolved path and its
+    parents is compared with the watch directory by ``os.path.samestat``. A ``dest_dir`` spelled
+    below the watch directory returns False: the scan's skip matches its spelling, and
+    :func:`_open_dest` refuses a link in it. A path that cannot be read compares as not the watch
+    directory, as does a watch directory that cannot be read. Touches the filesystem, so call it
+    off the event loop."""
+    if _dirs_below(dest_dir, directory) is not None:
+        return False
+    try:
+        watch = os.stat(directory)
+        real = Path(os.path.realpath(dest_dir))
+    except (OSError, ValueError):
+        return False
+    for candidate in (real, *real.parents):
+        try:
+            if os.path.samestat(os.stat(candidate), watch):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def _dirs_below(dest_dir: Path, directory: Path) -> tuple[str, ...] | None:
