@@ -1871,6 +1871,147 @@ async def test_a_tag_failure_seen_with_no_hook_armed_is_reported_once_one_is(
     assert [table for table, _ in reports] == ["uploaded_file"]
 
 
+async def test_a_body_tag_failure_under_a_held_key_is_reported_once(tmp_path: Path) -> None:
+    """BACKLOG #5552 item 6 (a): a body sealed under a key this store holds but failing its tag
+    (here, another upload's body moved under this id) was refused and never reported."""
+    from messagefoundry.uploads import UploadUnreadableError
+
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    (root / f"{b.file_id}.blob").write_text(
+        (root / f"{a.file_id}.blob").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    for _ in range(2):
+        with pytest.raises(UploadUnreadableError):
+            await store.read_bytes(b.file_id)
+    assert await store.read_bytes(a.file_id) == b"a\n"
+    assert len(reports) == 1
+    table, reason = reports[0]
+    assert table == "uploaded_file_body"
+    assert "body" in reason
+    assert b.file_id[:12] in reason and b.file_id not in reason
+
+
+async def test_a_body_tag_alert_has_its_own_notifier_subject(tmp_path: Path) -> None:
+    """BACKLOG #5552 item 6 (a), review finding: the notifier throttles per subject, so a body
+    alert on the sidecar's subject could be held back by a sidecar page inside the cooldown."""
+    from messagefoundry.pipeline.alerts import alert_cell_tag_failure
+    from messagefoundry.uploads import UploadUnreadableError
+
+    subjects: list[str] = []
+
+    class _Sink:
+        def integrity_drift(self, subject: str, *, reason: str, drift_count: int) -> None:
+            subjects.append(subject)
+
+    sink = _Sink()
+    store = _store(tmp_path, key=True, aad=True)
+    store._cipher.set_tag_failure_hook(  # type: ignore[attr-defined]
+        lambda table, reason: alert_cell_tag_failure(sink, table, reason)  # type: ignore[arg-type]
+    )
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    for suffix in (".meta", ".blob"):
+        (root / f"{b.file_id}{suffix}").write_text(
+            (root / f"{a.file_id}{suffix}").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    await store.list_files()
+    with pytest.raises(UploadUnreadableError):
+        await store.read_bytes(b.file_id)
+    assert len(subjects) == 2 and len(set(subjects)) == 2, subjects
+    assert "uploaded_file-tag" in subjects
+
+
+async def test_a_body_under_a_key_not_held_is_not_reported(tmp_path: Path) -> None:
+    """BACKLOG #5552 item 6 (a): a body under a key that is not configured is a key fault, not a
+    tag failure, so it is refused and not reported."""
+    from messagefoundry.uploads import UploadUnreadableError
+
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    mine = await store.save(data=b"m\n", filename="m.txt", uploader="op", uploader_id="u-op")
+    elsewhere = await _store(tmp_path / "other", key=True, aad=True).save(
+        data=b"x\n", filename="x.txt", uploader="op", uploader_id="u-op"
+    )
+    foreign = (tmp_path / "other" / "uploads" / f"{elsewhere.file_id}.blob").read_text("utf-8")
+    (tmp_path / "uploads" / f"{mine.file_id}.blob").write_text(foreign, encoding="utf-8")
+    with pytest.raises(UploadUnreadableError) as caught:
+        await store.read_bytes(mine.file_id)
+    # The cipher arm, not a damaged or access refusal, so the key-not-held branch is what ran.
+    assert type(caught.value) is UploadUnreadableError
+    assert isinstance(caught.value.__cause__, CipherError)
+    assert reports == []
+
+
+async def test_a_sidecar_and_a_body_report_of_one_upload_are_reported_apart(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5552 item 6 (a): the memo is keyed per part, so one upload's sidecar report does
+    not mute a tag failure of its body for the interval."""
+    store = _store(tmp_path, key=True, aad=True)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]
+    a = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    b = await store.save(data=b"b\n", filename="b.txt", uploader="op", uploader_id="u-op")
+    root = tmp_path / "uploads"
+    for suffix in (".meta", ".blob"):
+        (root / f"{b.file_id}{suffix}").write_text(
+            (root / f"{a.file_id}{suffix}").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    from messagefoundry.uploads import UploadUnreadableError
+
+    with pytest.raises(UploadUnreadableError):
+        await store.read_bytes(b.file_id)
+    parts = sorted(reason.split()[2] for _, reason in reports)
+    assert parts == ["body", "sidecar"], reports
+
+
+async def test_the_listing_scan_lstats_each_sidecar_once_before_its_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5552 item 8: the scan made its own ``lstat`` of each sidecar, under the quota
+    lock, and the open then made the same check again. One ``lstat`` before the open is enough;
+    where there is no ``O_NOFOLLOW`` the open checks the name once more after it."""
+    import messagefoundry.uploads as uploads_mod
+
+    store = _store(tmp_path, key=False)
+    meta = await store.save(data=b"a\n", filename="a.txt", uploader="op", uploader_id="u-op")
+    sidecar = os.path.normcase(str((tmp_path / "uploads" / f"{meta.file_id}.meta").resolve()))
+    calls: list[str] = []
+    real = os.lstat
+
+    def counting(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.path.normcase(os.fspath(path)) == sidecar:
+            calls.append(os.fspath(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", counting)
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    assert len(calls) == (1 if uploads_mod._O_NOFOLLOW else 2), calls
+
+
+def test_a_refusal_before_open_survives_a_copy_and_a_pickle() -> None:
+    """BACKLOG #5552 item 8, review finding: the scan's refusal carries its reason, and a copy or
+    unpickle, which calls the class with ``args`` alone, must rebuild it rather than raise."""
+    import copy
+    import pickle
+
+    from messagefoundry.uploads import _RefusedBeforeOpen
+
+    exc = _RefusedBeforeOpen("x.meta is not a plain file", "it is not a regular file")
+    for again in (copy.copy(exc), pickle.loads(pickle.dumps(exc))):
+        assert isinstance(again, _RefusedBeforeOpen)
+        assert again.reason == "it is not a regular file"
+        assert str(again) == str(exc)
+
+
 async def test_a_sidecar_that_is_not_read_is_logged_once_per_interval(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

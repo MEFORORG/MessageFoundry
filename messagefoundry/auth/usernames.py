@@ -5,8 +5,16 @@
 It imports only the standard library and the engine-free ``controlchars`` leaf, so the request
 model ``api.auth_models.UserCreateRequest`` can apply the same rule the service does without
 importing the service. ``AuthService.create_local_user`` checks it before anything is generated or
-written, and the model mirrors it. It is not applied by ``provision-admin`` or by the directory
-create paths.
+written, and the model mirrors it, so ``POST /users`` refuses a name it refuses. The console's
+``POST /ui/users`` applies it to the name after ``str.strip``, which takes the characters
+``str.isspace`` counts as white space from the ends (at least the C0 separators U+001C to U+001F
+and the line and paragraph separators among them), so a name refused only for such characters at
+its ends is created there trimmed, and the trimmed name passes the rule. A control, format or
+blank-glyph character at an end that is not white space is still refused there. Paths that write a username without it include
+at least
+``provision-admin``, the directory create paths (``POST /users/directory`` and an AD sign-in that
+creates its account) and the directory rename refresh (``AuthService._refresh_cached_username``),
+so an account one of them writes can hold a name this rule refuses.
 
 A name is refused when it is blank or white space alone, when it starts or ends with white space
 (refused rather than trimmed, so the duplicate check and the stored value are the same string),
@@ -20,12 +28,20 @@ synthetic actors (:data:`RESERVED_ACTOR_FORMS`). An account named
 and in an audit export. The NUL case is pinned by
 ``tests/test_username_rule.py::test_the_rule_refuses``.
 
-The ``directory`` name is NOT reserved: nothing at HEAD writes it as an audit actor.
+The bare word ``directory`` is NOT reserved: nothing at HEAD writes it as an audit actor. The
+``granted_by`` marker ``<directory>`` (``api.security.DIRECTORY_GRANTED_BY``), which a directory
+sign-in and the directory reconciler put on the ``administrator_granted`` alert, is reserved, by
+the ``<...>`` form.
 
 What it admits, at least: a space separator inside the name (U+00A0, U+3000), a blank glyph
 :data:`_BLANK_GLYPHS` does not list, and a lookalike letter from another script, so a Cyrillic
-spelling that reads as ``system`` passes. It matches the reserved forms after NFKC and case
-folding; it does not fold confusable letters across scripts.
+spelling that reads as ``system`` passes, as does a reserved form spelled with a delimiter
+lookalike :data:`_DELIMITER_LOOKALIKES` does not list. At least some lookalikes from the same
+script pass too: ``cli:root`` spelled with a dotless i (U+0131), ``<oidc>`` spelled with the
+modifier low arrowheads U+02F1 and U+02F2, and ``<oidc>`` followed by a combining low line
+(U+0332). It matches the reserved forms after NFKC,
+with the delimiter lookalikes that table lists taken to ASCII, and case folding; it folds no
+confusable letters, in any script.
 
 This docstring is the one statement of the rule; the request model, the service and
 docs/SECURITY.md point here rather than restate it.
@@ -47,6 +63,33 @@ from messagefoundry.controlchars import CONTROL_CATEGORIES
 #: ``system``. The literal actor sites are not rewritten to use this; it names their forms, so a
 #: new synthetic actor form must be added here too.
 RESERVED_ACTOR_FORMS: Final = re.compile(r"(?s)system(:.*)?|cli:.*|<.*>")
+
+#: Lookalikes of the delimiters :data:`RESERVED_ACTOR_FORMS` reads that NFKC leaves as they are,
+#: each taken to the ASCII character it renders as before the reserved-form match (BACKLOG #5520
+#: items 3, 14 and 35), so ``cli`` + RATIO + ``root`` or ``<oidc>`` in angle quotation marks is
+#: refused as ``cli:root`` and ``<oidc>`` are. Code points taken from Unicode's confusables data
+#: for ``:``, ``<`` and ``>``, and not every lookalike of them. At least these are left out: some
+#: letters it lists (Canadian syllabics PA and PO, a runic letter and a Lisu tone letter), so a
+#: name in those scripts is not refused as a ``<...>`` form, though the modifier letters U+02D0,
+#: U+02F8, U+A789, U+02C2 and U+02C3 are kept; and U+FE30, which NFKC turns into two full stops
+#: (``..``) rather than a colon. Applied after NFKC, which takes U+2329 and U+232A to U+3008
+#: and U+3009.
+_DELIMITER_LOOKALIKES: Final = str.maketrans(
+    dict.fromkeys(
+        (0x02D0, 0x02F8, 0x0589, 0x05C3, 0x0703, 0x0704, 0x0903, 0x0A83, 0x16EC, 0x17D6, 0x1803)
+        + (0x1809, 0x205A, 0x2236, 0xA789),
+        ":",
+    )
+    | dict.fromkeys((0x02C2, 0x2039, 0x276C, 0x276E, 0x27E8, 0x3008, 0x1D236), "<")
+    | dict.fromkeys((0x02C3, 0x203A, 0x276D, 0x276F, 0x27E9, 0x3009, 0x1D237), ">")
+)
+
+
+def _reserved_form_key(username: str) -> str:
+    """What :data:`RESERVED_ACTOR_FORMS` is matched against: the name's NFKC form, its
+    :data:`_DELIMITER_LOOKALIKES` taken to ASCII, case folded."""
+    return unicodedata.normalize("NFKC", username).translate(_DELIMITER_LOOKALIKES).casefold()
+
 
 #: Unicode's Default_Ignorable_Code_Point ranges (DerivedCoreProperties.txt), inclusive. Most are
 #: format characters :data:`CONTROL_CATEGORIES` already refuses; the rest render as nothing from
@@ -123,7 +166,7 @@ def username_refusal(username: str) -> str | None:
         )
     if username != stripped:
         return "a username must not start or end with white space"
-    if RESERVED_ACTOR_FORMS.fullmatch(unicodedata.normalize("NFKC", username).casefold()):
+    if RESERVED_ACTOR_FORMS.fullmatch(_reserved_form_key(username)):
         return (
             "that username is reserved for the audit trail's own actors "
             '("system", "system:...", "cli:..." and "<...>")'

@@ -186,7 +186,12 @@ class _SqlStore:
         return await self._server.run(sql, str(params[1]) if len(params) > 1 else "")
 
     async def _fetchone_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        share_deadline: bool = False,
     ) -> object:
         return await self._fetchone(sql, params)  # the claim; no driver timeout is modelled here
 
@@ -197,7 +202,12 @@ class _SqlStore:
         return result
 
     async def _execute_clamped(
-        self, sql: str, params: tuple[object, ...], *, timeout_clamp: float
+        self,
+        sql: str,
+        params: tuple[object, ...],
+        *,
+        timeout_clamp: float,
+        count_output: bool = False,
     ) -> int:
         return await self._execute(sql, params)  # heartbeat and release; no driver timeout here
 

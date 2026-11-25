@@ -84,6 +84,7 @@ from messagefoundry.transports.base import (
     resolve_poll_ceiling,
 )
 from messagefoundry.transports.framing import declared_encoding
+from messagefoundry.transports.intake import IntakeContext, deliver
 
 __all__ = [
     "FileDestination",
@@ -1570,7 +1571,11 @@ class FileSource(SourceConnector):
             return _Step.FREE
         try:
             with self._store_call():
-                completed = await self._emit(raw)
+                # Vault BACKLOG #2607: a poll source has no peer, so its intake context is the
+                # path it read.
+                completed = await self._emit(
+                    raw, IntakeContext(transport="file", source=str(path.absolute()))
+                )
         except Exception as exc:
             # The handler records every message-level outcome (parse/validation/routing → ERROR)
             # itself and returns, so an exception escaping here is an infrastructure failure: the
@@ -1945,7 +1950,7 @@ class FileSource(SourceConnector):
         self._seen_add(file_key)
         return True
 
-    async def _emit(self, raw: bytes) -> bool:
+    async def _emit(self, raw: bytes, intake: IntakeContext | None = None) -> bool:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO). Returns
         ``False`` when a stop arrived between a batch's hand-offs and the rest were not handed off
         (BACKLOG #1620): the caller then leaves the file in place, so the next start re-emits it whole.
@@ -1984,12 +1989,14 @@ class FileSource(SourceConnector):
 
         Any exception (a durable-store failure on hand-off K) propagates to the caller, which then
         leaves the whole file in place for the next scan — preserving at-least-once with no partial
-        move (see :meth:`_scan_once`)."""
+        move (see :meth:`_scan_once`).
+
+        ``intake`` names the file every message in it came from (vault BACKLOG #2607)."""
         assert self._handler is not None
         if self.content_type is not None and self.content_type is not ContentType.HL7V2:
             # Non-hl7v2: hand the file's RAW BYTES off verbatim — no text-decode, no HL7 batch split
             # (see the docstring). A binary payload's exact bytes survive to RawMessage.from_bytes.
-            await self._handler(raw)
+            await deliver(self._handler, raw, intake)
             return True
         try:
             text = raw.decode(self.encoding)
@@ -1999,7 +2006,7 @@ class FileSource(SourceConnector):
             # records ERROR for it, exactly as in the pre-split single-hand-off path. Never a drop.
             # UnicodeError, not only UnicodeDecodeError: a codec that refuses every conversion, such
             # as "undefined", raises the base class, and must reach that decode too (BACKLOG #5102).
-            await self._handler(raw)
+            await deliver(self._handler, raw, intake)
             return True
         messages = split_batch(
             text
@@ -2007,14 +2014,16 @@ class FileSource(SourceConnector):
         if len(messages) == 1:
             # A lone message goes as one_message_bytes says (ADR 0206, BACKLOG #5806). CORRECTED
             # 2026-11-23 (BACKLOG #8357 item 5): the docstring above holds the retraction.
-            await self._handler(one_message_bytes(raw, text, messages[0], self.encoding))
+            await deliver(
+                self._handler, one_message_bytes(raw, text, messages[0], self.encoding), intake
+            )
             return True
         for message in messages:
             if self._stop.is_set():
                 return False  # stopping: the rest are re-emitted with the whole file next start
             # FIFO per connection: emit in file order, awaiting each so a slow/failing hand-off
             # back-pressures the rest (and a failure stops the file from being moved — see above).
-            await self._handler(message.encode(self.encoding))
+            await deliver(self._handler, message.encode(self.encoding), intake)
         return True
 
     def _candidates(self) -> list[Path]:
@@ -2674,9 +2683,9 @@ def _win_delete_aged(path: Path, older_than: float) -> bool:
 
 
 # --- helpers -----------------------------------------------------------------
-# The pure magic-byte sniffers (_looks_like_hl7 / _lstrip_bom_ws / _content_matches_declared) were hoisted
-# to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py can reuse them without importing a transport;
-# they are re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
+# The pure magic-byte sniffers were hoisted to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py
+# can reuse them without importing a transport; _looks_like_hl7 and _content_matches_declared are
+# re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
 # existing tests that import them from here are unchanged.
 
 

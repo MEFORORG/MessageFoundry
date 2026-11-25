@@ -1139,6 +1139,7 @@ _PATH_PARAMS = [
     "ProjectRoot",
     "DbPath",
     "SecretsDir",
+    "CustodyDir",  # vault BACKLOG #3411
     # -EngineWheel's inputs (vault BACKLOG #2626), read before the build acts.
     "EngineWheel",
     "RequirementsLock",
@@ -1228,6 +1229,14 @@ def _preflight_facts(tmp_path: Path, script: Path | None = None) -> dict:
 def _sole_call(facts: dict, name: str) -> dict:
     hits = [c for c in facts["commands"] if c["name"] == name]
     assert len(hits) == 1, f"expected exactly one {name} call, found {len(hits)}"
+    return hits[0]
+
+
+def _sole_call_on(facts: dict, name: str, needle: str) -> dict:
+    """The one ``name`` call whose text holds ``needle``, for a command called on more than one
+    directory."""
+    hits = [c for c in facts["commands"] if c["name"] == name and needle in c["text"]]
+    assert len(hits) == 1, f"expected exactly one {name} call holding {needle}, found {len(hits)}"
     return hits[0]
 
 
@@ -2743,6 +2752,8 @@ _FULL_FACTS: dict[str, object] = {
     "ServiceAccountSid": "S-1-5-80-4001",
     "ConfigDir": r"D:\mefor\config",
     "SecretsDir": r"C:\ProgramData\MessageFoundry-secrets",
+    # Under the host key provider only (vault BACKLOG #3411).
+    "CustodyDir": r"C:\ProgramData\MessageFoundry-custody",
     "ConfigInheritanceStripped": True,
     "CachedNssm": r"C:\ProgramData\MessageFoundry\bin\nssm.exe",
     "WerImages": ["messagefoundry.exe", "python.exe"],
@@ -2757,6 +2768,8 @@ _NEEDLE = {
     "config_ace": "Config dir entry",
     "secrets_dir": "Secrets dir ",
     "secrets_ace": "Secrets entry",
+    "custody_dir": "Custody dir ",
+    "custody_ace": "Custody entry",
     "logon_right": "Log on as a service",
     "config_inheritance": "/inheritance:e",
     "wer": "Windows Error Reporting",
@@ -2914,10 +2927,11 @@ def test_a_cleared_residue_is_reported_as_cleared_not_as_remaining(tmp_path: Pat
             "DataAceRemoved": True,
             "ConfigAceRemoved": True,
             "SecretsAceRemoved": True,
+            "CustodyAceRemoved": True,
         }
     )
     text = _notice(tmp_path, facts)
-    assert text.count("REMOVED") >= 4, (
+    assert text.count("REMOVED") >= 5, (
         f"the notice must report what this run actually took back:\n{text}"
     )
     assert "/remove:g" not in text, (
@@ -3744,8 +3758,9 @@ def test_both_switches_are_declared_and_wired(tmp_path: Path) -> None:
     assert names.count(_SECEDIT_FN) == 1, (
         f"expected one {_SECEDIT_FN} call, found {names.count(_SECEDIT_FN)}"
     )
-    assert names.count(_ACE_FN) == 3, (
-        "the account's entry is written on the data dir, the config dir and the secrets dir, so "
+    assert names.count(_ACE_FN) == 4, (
+        "the account's entry is written on the data dir, the config dir, the secrets dir and, "
+        "under the host key provider, the custody dir (vault BACKLOG #3411), so "
         f"each must be removable; found {names.count(_ACE_FN)} {_ACE_FN} calls"
     )
     notice = [c for c in cmds if c["name"] == "Get-UninstallResidueNotice"]
@@ -4018,8 +4033,9 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     lock = _sole_call(facts, "Set-SecretsDirAcl")
     assert "-Account $ServiceAccount" in lock["text"], lock["text"]
     assert lock["start"] > data["start"], "the secrets directory is restricted before the data dir"
-    named = _sole_call(facts, "Set-ServiceEnvironmentValue")
-    assert "MEFOR_SECRETS_DIRECTORY" in named["text"] and "$SecretsDir" in named["text"]
+    # The custody directory (vault BACKLOG #3411) has calls of its own, on $CustodyDir.
+    named = _sole_call_on(facts, "Set-ServiceEnvironmentValue", "$SecretsDir")
+    assert "MEFOR_SECRETS_DIRECTORY" in named["text"], named["text"]
     assert "AppEnvironmentExtra" not in " ".join(
         c["text"] for c in facts["commands"] if c["name"] == "Invoke-Nssm"
     ), "an `nssm set AppEnvironmentExtra` would replace the operator's whole list"
@@ -4033,8 +4049,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
     assert "-AllowMissing" in check["text"] and "-OnlyFolders @()" in check["text"], check["text"]
     # Made in one step with its owner and list (New-RestrictedDirectory), never New-Item then icacls,
     # which leaves a window where the folder inherits Users' create right.
-    creates = _sole_call(facts, "New-RestrictedDirectory")
-    assert "-Path $SecretsDir" in creates["text"], creates["text"]
+    creates = _sole_call_on(facts, "New-RestrictedDirectory", "-Path $SecretsDir")
     assert not [
         c
         for c in facts["commands"]
@@ -4045,7 +4060,7 @@ def test_the_installer_creates_and_names_the_secrets_directory(tmp_path: Path) -
         for c in facts["commands"]
         if c["name"] == "Get-ReparsePointAncestor" and "-Path $SecretsDir" in c["text"]
     )
-    sharers = _sole_call(facts, "Get-OtherServiceNamingPath")
+    sharers = _sole_call_on(facts, "Get-OtherServiceNamingPath", "-Path $SecretsDir")
     empty = _sole_call(facts, "Get-SecretsDirHeldProblem")
     registered = min(
         c["start"]

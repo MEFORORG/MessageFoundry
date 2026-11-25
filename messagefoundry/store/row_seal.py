@@ -32,7 +32,12 @@ name, a one-byte type and its value, every part length-prefixed. So ``None``, th
 text ``"None"`` encode differently, and a seal of one kind never verifies as another. Floats are
 encoded with :meth:`float.hex`, which is exact, so a value that round-trips through a ``REAL`` /
 ``DOUBLE PRECISION`` / ``FLOAT`` column seals identically on every backend. ``-0.0`` encodes as
-``0.0`` does, and :meth:`RowSealer.seal` refuses a float that is not finite (BACKLOG #6717).
+``0.0`` does, for every caller of the encoder, because a SQLite ``REAL`` column reads ``-0.0`` back
+as ``0.0``; that one change to v1 predates any deployment. :meth:`RowSealer.seal` and
+:meth:`TransitRowSealer.seal_async` raise :class:`NonFiniteSealValueError` when a field is a float
+that is not finite. :func:`seal_bytes` itself encodes one without refusing it, so a check over a
+row someone set to such a value fails rather than raises. Other callers of :func:`seal_bytes`, at
+least the store's ``passkey_digest``, encode one without refusing it too (BACKLOG #6717).
 """
 
 from __future__ import annotations
@@ -45,21 +50,29 @@ import functools
 import hashlib
 import hmac
 import logging
+import math
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Final, Protocol
+from typing import Any, Final, Protocol
 
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.store.crypto import (
     _KEY_ID_LEN,
+    BATCH_MAX_CHARS,
+    BATCH_MAX_ITEMS,
     NO_STORE_ID,
+    BatchCipher,
     Cipher,
     CipherError,
     CipherUnavailableError,
+    b64_chars,
+    batch_chars,
+    cell_aad,
     cipher_blocks_on_io,
     derive_row_seal_key,
+    encrypt_many,
     row_seal_key_id,
 )
 from messagefoundry.store.crypto import (
@@ -70,8 +83,8 @@ from messagefoundry.subject_checksum import shorten_with_checksum
 log = logging.getLogger(__name__)
 
 #: The marker every stored seal starts with. Versioned, so a later format is an added version and
-#: never a silent change to what an existing seal means. One change predates any deployment: v1's
-#: encoding of ``-0.0`` moved onto ``0.0``'s (BACKLOG #6717).
+#: never a silent change to what an existing seal means. The module docstring, *One encoder*, names
+#: the one change to v1 that predates any deployment.
 SEAL_PREFIX: Final = "mfseal:v1:"
 
 #: The kind a session row is sealed under. Each sealed table has its own kind.
@@ -115,8 +128,16 @@ _TYPE_BYTES: Final = b"B"
 
 _MAC_HEX_LEN: Final = 64  # HMAC-SHA256, hex
 
-# A float strictly inside (-inf, inf) is finite; a NaN compares false both ways, so it is not.
-_FLOAT_INF: Final = float("inf")
+
+class NonFiniteSealValueError(ValueError):
+    """Raised when a seal is made over a float that is a NaN or an infinity (BACKLOG #6717).
+
+    SQLite stores a NaN as ``NULL``: a ``NOT NULL`` column refuses the write, and a nullable one
+    reads back ``None``, so the seal would fail the next read as if the row had been changed. An
+    infinity round-trips, but no sealed field means anything by one, so it is refused with the NaN.
+    Its own type, so a caller can tell it from the ``ValueError`` a malformed field pair raises
+    when it is unpacked. It is raised before any field is encoded, so a row that also holds a value
+    the encoder cannot read raises this, whatever the field order."""
 
 
 class RowSealError(Exception):
@@ -238,7 +259,7 @@ def _encode_value(value: object) -> tuple[bytes, bytes]:
     if isinstance(value, int):
         return _TYPE_INT, str(value).encode("ascii")
     if isinstance(value, float):
-        # -0.0 == 0.0, so this moves -0.0 alone onto 0.0's encoding and leaves every other float's.
+        # The module docstring, *One encoder*, says why -0.0 takes 0.0's encoding.
         return _TYPE_FLOAT, (0.0 if value == 0.0 else value).hex().encode("ascii")
     if isinstance(value, str):
         # surrogatepass, so a value a driver decoded with surrogateescape still encodes.
@@ -252,6 +273,16 @@ def seal_bytes(kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
     """The canonical bytes a seal is computed over: the scheme tag, ``kind``, then each
     ``(name, value)`` in the order given. The caller supplies a fixed order (a dataclass's field
     order), so two processes encoding one row agree."""
+    return _seal_bytes(kind, fields, finite=False)
+
+
+def _seal_bytes(kind: str, fields: Iterable[tuple[str, object]], *, finite: bool) -> bytes:
+    # ``finite`` is set only where a seal is made (the module docstring says why). The fields are
+    # read whole first, so the refusal precedes any encoder error, as NonFiniteSealValueError says.
+    if finite:
+        fields = tuple(fields)
+        if any(isinstance(v, float) and not math.isfinite(v) for _, v in fields):
+            raise NonFiniteSealValueError("a row seal refuses a float that is not finite")
     out = [_part(_SCHEME), _part(kind.encode("utf-8"))]
     for name, value in fields:
         type_byte, encoded = _encode_value(value)
@@ -319,16 +350,11 @@ class RowSealer:
     def seal(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
         """The stored seal for a row of ``kind`` holding ``fields``.
 
-        Raises at least what the encoder raises, and ``ValueError`` when a float is a NaN or an
-        infinity (BACKLOG #6717). SQLite stores a NaN as ``NULL``, so its seal would fail the next
-        read as if the row had been changed. An infinity round-trips, but no sealed field means
-        anything by one, so it is refused with the NaN rather than sealed. The check is here and not in the encoder, so a row someone set to
-        such a value still fails :meth:`verify` rather than raising from it, and so that
-        :func:`seal_bytes`'s other callers keep their encodings."""
-        fields = tuple(fields)
-        if any(isinstance(v, float) and not -_FLOAT_INF < v < _FLOAT_INF for _, v in fields):
-            raise ValueError("a row seal refuses a float that is not finite")
-        mac = hmac.new(self._key, seal_bytes(kind, fields), hashlib.sha256).hexdigest()
+        Raises at least what the encoder raises, and :class:`NonFiniteSealValueError` when a float
+        is a NaN or an infinity."""
+        mac = hmac.new(
+            self._key, _seal_bytes(kind, fields, finite=True), hashlib.sha256
+        ).hexdigest()
         return f"{SEAL_PREFIX}{self.key_id}:{mac}"
 
     def verify(self, kind: str, fields: Iterable[tuple[str, object]], stored: str | None) -> bool:
@@ -579,6 +605,78 @@ async def cipher_call[**P, T](
     return call(*args, **kwargs)
 
 
+def _batch_cost(plaintext: str, aad: bytes | None) -> int:
+    """What ``TransitCipher.encrypt_many`` counts a value as against :data:`BATCH_MAX_CHARS`."""
+    return b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
+
+
+async def seal_chunks(
+    cipher: Cipher,
+    table: str,
+    column: str,
+    rows: Sequence[Any],
+    *,
+    aad_cols: tuple[str, ...],
+    aad_of: Callable[[Any], bytes] | None = None,
+    local_whole_page: bool,
+) -> AsyncIterator[tuple[Sequence[Any], list[str]]]:
+    """Yield ``(chunk, sealed)``: each chunk of ``rows`` with every row's ``v`` encrypted under its
+    cell AAD, in row order. "Seal" here is the at-rest cell encryption (``mfenc:``), not this
+    module's row seal. The three stores' at-open ``_seal_surface`` share it (BACKLOG #6706). Each
+    writes a chunk's rows before the next chunk is encrypted.
+
+    The AAD is ``aad_of(row)`` when given (the queue payload's routing tag, BACKLOG #2593), else
+    :func:`cell_aad` over ``aad_cols``. The cut is chosen per chunk, from one read of the cipher:
+
+    - A :class:`BatchCipher` whose ``batches_now`` is True (False when it has none) is cut at
+      :data:`BATCH_MAX_ITEMS` values and :data:`BATCH_MAX_CHARS` of base64, the cost
+      ``TransitCipher.encrypt_many`` cuts its requests by, so a chunk Transit accepts as a batch
+      is one request. A value over the character bound is a chunk of its own. A chunk Transit
+      refuses (at least an HTTP 400, a 413, or a reply without its ``reference`` echo) is sent
+      value by value inside the one call, up to one request per value more, while the seal's
+      transaction waits. A cancelled seal can then leave up to :data:`BATCH_MAX_ITEMS` values
+      running on in the Transit pool.
+      A cipher that stops batching between the cut and the call can still send that chunk's
+      values alone inside the one call.
+    - An in-process cipher, such as AES-GCM, keeps the store's shape from before batching: with
+      ``local_whole_page`` (SQLite) the whole page is one chunk, else one value per chunk.
+    - Any other cipher, a Transit cipher sending values alone included, gets one value per chunk,
+      so each call is followed by its write.
+
+    Only the first case is sized here. The cipher itself may still measure a value:
+    ``TransitCipher.encrypt_many`` sizes every value, alone or not.
+
+    Each chunk is one :func:`cipher_call` of :func:`encrypt_many`, and a failure raises, as that
+    does."""
+    items = [
+        (
+            r["v"],
+            aad_of(r) if aad_of is not None else cell_aad(table, column, *(r[c] for c in aad_cols)),
+        )
+        for r in rows
+    ]
+    start = 0
+    while start < len(items):
+        # Read once per chunk; a cipher that does not say it batches is not cut as a batch.
+        batching = isinstance(cipher, BatchCipher) and getattr(cipher, "batches_now", False) is True
+        if batching:
+            end, size = start + 1, _batch_cost(*items[start])
+            while end < len(items) and end - start < BATCH_MAX_ITEMS:
+                cost = _batch_cost(*items[end])
+                if size + cost > BATCH_MAX_CHARS:
+                    break
+                size += cost
+                end += 1
+        elif local_whole_page and not cipher_blocks_on_io(cipher):
+            end = len(items)
+        else:
+            end = start + 1
+        if start:
+            await asyncio.sleep(0)  # an in-process cipher runs inline; let the loop serve between
+        yield rows[start:end], await cipher_call(cipher, encrypt_many, cipher, items[start:end])
+        start = end
+
+
 #: The start check's fixed 32-byte input: a digest of its own label, so it is no row's seal input
 #: (a row's digest is over a length-prefixed label, store id and encoding).
 _START_PROBE_DIGEST: Final = hashlib.sha256(b"mefor/row-seal/transit/start-probe/v1").digest()
@@ -698,8 +796,9 @@ class TransitRowSealer:
         self._clock = clock
         self._throttle = SealFailureThrottle()
 
-    def _digest(self, kind: str, fields: Iterable[tuple[str, object]]) -> bytes:
-        return hashlib.sha256(self._prefix + _part(seal_bytes(kind, fields))).digest()
+    def _digest(self, kind: str, fields: Iterable[tuple[str, object]], *, finite: bool) -> bytes:
+        encoded = _seal_bytes(kind, fields, finite=finite)
+        return hashlib.sha256(self._prefix + _part(encoded)).digest()
 
     def _outage(self, exc: CipherError) -> TransitSealUnavailableError:
         # ERROR line, throttled per cause so a second cause inside the window is still logged. A
@@ -714,9 +813,10 @@ class TransitRowSealer:
         return TransitSealUnavailableError()
 
     @staticmethod
-    def _parse(stored: str | None) -> tuple[str, str, int] | None:
-        """``(key id, Transit string, version)`` from a well-formed stored seal, or ``None``."""
-        if not stored or not stored.startswith(SEAL_PREFIX):
+    def _parse(stored: object) -> tuple[str, str, int] | None:
+        """``(key id, Transit string, version)`` from a well-formed stored seal, or ``None``. A
+        value that is not text is malformed, as :meth:`RowSealer._parse` reads it (BACKLOG #6718)."""
+        if not isinstance(stored, str) or not stored.startswith(SEAL_PREFIX):
             return None
         key_id, sep, mac = stored[len(SEAL_PREFIX) :].partition(":")
         version = transit_mac_version(mac) if sep else None
@@ -731,8 +831,9 @@ class TransitRowSealer:
         return parsed is not None and parsed[0] == self.key_id
 
     async def seal_async(self, kind: str, fields: Iterable[tuple[str, object]]) -> str:
-        """The stored seal for a row of ``kind`` holding ``fields``: one Transit ``hmac`` call."""
-        digest = self._digest(kind, fields)
+        """The stored seal for a row of ``kind`` holding ``fields``: one Transit ``hmac`` call.
+        Raises :class:`NonFiniteSealValueError`, before any call, as :meth:`RowSealer.seal` does."""
+        digest = self._digest(kind, fields, finite=True)
         failure: CipherError | None = None
         mac: object = None
         try:
@@ -804,7 +905,7 @@ class TransitRowSealer:
         key_name, retired = held
         if retired and not accept_retired:
             return False
-        digest = self._digest(kind, fields)
+        digest = self._digest(kind, fields, finite=False)
         entry = hashlib.sha256(
             _part(digest) + _part(key_id.encode("ascii")) + _part(mac.encode("ascii"))
         ).digest()
@@ -995,15 +1096,12 @@ async def require_seal_for_write(
     here; a whole token hash in it would reach ``args``."""
     if sealer is None:
         return
-    if kind != SESSION_KIND and stored is not None and not isinstance(stored, str):
-        # A record's stored seal that is not text (a BLOB a writer put there) is no seal: Forged,
-        # as main's record checks read it. A session's propagates as a TypeError, as on main.
-        raise RowSealError(kind, subject)
     fields = list(fields)
     if kind != SESSION_KIND:
         # A record holding a value the encoder cannot read fails its seal, as main's record checks
         # say. Only the encoding is inside this try, so a TypeError from a defect anywhere in the
-        # check below propagates as itself. A session's encoding error propagates, as on main.
+        # check below propagates as itself. A session's encoding error propagates, as on main,
+        # unless its stored seal is malformed (not text included), which fails before encoding.
         unreadable = False
         try:
             seal_bytes(kind, fields)

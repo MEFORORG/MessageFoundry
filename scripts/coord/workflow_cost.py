@@ -74,8 +74,10 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import NamedTuple
 
 # The script hooks that can start an agent. `log` and `phase` cost nothing and are not read.
 # `workflow()` is priced as unpriceable on purpose: it shares this run's agent counter, but its body
@@ -87,6 +89,7 @@ _HOOKS = ("agent", "parallel", "pipeline", "workflow")
 # The array methods that fan a callback across a receiver. These carry the multiplier, and they are
 # scanned as first-class constructs rather than only as arguments of `parallel()`.
 _FAN_METHODS = ("map", "flatMap", "forEach")
+_LOOPS = ("while", "for", "do")
 
 # `(?<![\w$.])` keeps the token from matching inside `obj.agent(` or `myagent(`. `\b` alone cannot:
 # a dot is a non-word character, so `\bagent` matches happily after one.
@@ -94,9 +97,8 @@ _TOKEN_PATTERN = (
     r"(?<![\w$.])(?P<hook>" + "|".join(_HOOKS) + r")\s*\("
     r"|(?<![\w$.])(?P<from>Array\s*\.\s*from)\s*\("
     r"|\.\s*(?P<fan>" + "|".join(_FAN_METHODS) + r")\s*\("
-    r"|(?<![\w$.])(?P<loop>while|for|do)\b"
+    r"|(?<![\w$.])(?P<loop>" + "|".join(_LOOPS) + r")(?![\w$])"
 )
-_AGENT_WORD_RE = re.compile(r"(?<![\w$.])agent\b")
 _IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
 _OF_RE = re.compile(r"\b(?:of|in)\b")
 _ARRAY_FROM_RE = re.compile(r"^\s*Array\s*\.\s*from\s*\(")
@@ -856,9 +858,11 @@ def _is_declared_at(ctx: _Ctx, i: int) -> bool:
     return i in ctx.declared
 
 
-def _word_re(name: str) -> re.Pattern[str]:
-    """A reference to ``name``: not a member (``x.name``), but a spread (``...name``) counts."""
-    return re.compile(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(name) + r"(?![\w$])")
+def _word_re(*names: str) -> re.Pattern[str]:
+    """A reference to any of ``names``: not a member (``x.name``), but a spread (``...name``)
+    counts."""
+    alternatives = "|".join(map(re.escape, names))
+    return re.compile(r"(?:(?<=\.\.\.)|(?<![\w$.]))(?:" + alternatives + r")(?![\w$])")
 
 
 def _declaration_count(ctx: _Ctx, name: str) -> int:
@@ -985,24 +989,37 @@ def _expr_end(ctx: _Ctx, i: int) -> int:
     """End of an expression-bodied arrow starting at ``i``: a top-level ``;``/``,``/closer, or a
     line break that neither the line before nor the line after continues, a line break held in a
     block comment included."""
+    return _read_expr_end(ctx, i, ";,")[0]
+
+
+def _read_expr_end(ctx: _Ctx, i: int, stops: str) -> tuple[int, bool]:
+    """:func:`_expr_end` with its stop set, and whether that end was read: False where a bracket
+    opened in the expression is never closed, at the end of the file or by a closer of another
+    kind, so the end is a guess. A statement passes ``stops=";"``: a top-level ``,`` does not end
+    one."""
     masked, raw = ctx.masked, ctx.code
-    depth = 0
+    opened: list[str] = []
+    read = True
     for j in range(i, len(masked)):
         c = masked[j]
         if c in _PAIRS:
-            depth += 1
+            opened.append(c)
         elif c in _CLOSERS:
-            if depth == 0:
-                return j
-            depth -= 1
-        elif depth == 0 and c in ";,":
-            return j
-        elif depth == 0 and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
+            if not opened:
+                return j, read
+            # `f(` closed by an enclosing block's `}`: the same end as before, but not a read one.
+            # Pop first: a short-circuited pop left the bracket open, and the scan ran to the end
+            # of the file (BACKLOG #7600).
+            matched = opened.pop() == _OPENERS[c]
+            read = read and matched
+        elif not opened and c in stops:
+            return j, read
+        elif not opened and c == "\n" and j not in ctx.held_newlines and raw[i:j].strip():
             nxt = _NONSPACE_RE.search(raw, j)
             last = i + len(raw[i:j].rstrip()) - 1
             if nxt is None or not _continues(ctx.ends.get(last, _VALUE), raw, nxt.start()):
-                return j
-    return len(masked)
+                return j, read
+    return len(masked), read and not opened
 
 
 def _function_body(ctx: _Ctx, open_paren: int) -> tuple[int, int] | None:
@@ -1110,6 +1127,9 @@ def _width_of(ctx: _Ctx, start: int, end: int) -> tuple[int | None, str]:
     """
     seg = ctx.masked[start:end]
     if not seg.strip():
+        # The mask blanks a string, template or regex literal: blank there is not empty source.
+        if ctx.code[start:end].strip():
+            return None, "a literal whose length is not read"
         return 0, "empty"
     lead = start + (len(seg) - len(seg.lstrip()))
 
@@ -1196,35 +1216,129 @@ def _match_bracket_back(masked: str, close_idx: int, floor: int) -> int:
 # --------------------------------------------------------------------------------------------
 
 
-def _loop_head(ctx: _Ctx, after_kw: int) -> tuple[tuple[int, int] | None, int, int, int]:
-    """Split a loop into (of-expression, body start, body end, resume index).
+class _LoopSpan(NamedTuple):
+    """One loop's parts. ``settled`` is False where the body's extent is a guess (BACKLOG #7600)."""
 
-    The of-expression is the span after ``of``/``in`` in a ``for (const x of ROWS)``, which is a
-    real multiplier and must be resolved rather than shrugged at.
+    subject: tuple[int, int] | None  # the span after `of`/`in` in `for (const x of ROWS)`
+    body_start: int
+    body_end: int
+    resume: int  # where the scan goes on: past the body, and past a `do`'s `while (...)` tail
+    settled: bool
+    cond: tuple[int, int] | None = None  # a `do`'s condition, which runs every iteration too
+
+
+# The statements a brace-less body can open with whose end is not the end of a line: each is read
+# through its parts. A label prefixes another statement.
+_COMPOUND_RE = re.compile(r"(if|switch|try|with)(?![\w$])|[A-Za-z_$][\w$]*\s*:(?!:)")
+_AWAIT_RE = _word_re("await")
+_LOOP_RE = _word_re(*_LOOPS)
+_ELSE_RE = re.compile(r"\s*else(?![\w$])")
+_CATCH_RE = re.compile(r"\s*catch(?![\w$])")
+_FINALLY_RE = re.compile(r"\s*finally(?![\w$])")
+_WHILE_RE = re.compile(r"\s*;?\s*while\s*(?=\()")
+
+
+def _loop_head(ctx: _Ctx, after_kw: int, keyword: str) -> _LoopSpan:
+    """Split the loop whose ``keyword`` ends at ``after_kw`` into its parts.
+
+    The of-expression is a real multiplier and must be resolved rather than shrugged at. A ``do``
+    has no head and ends with ``while (cond)``, which is its tail and not a second loop; a
+    ``for await (... of ROWS)`` is a ``for`` like any other.
     """
     masked = ctx.masked
-    i, n = after_kw, len(masked)
-    while i < n and masked[i].isspace():
-        i += 1
+    n = len(masked)
+    # Skipped over the RAW text: a body that is a string statement is code, not masked space.
+    i = _skip_space(ctx.code, after_kw)
+    if keyword == "for" and _AWAIT_RE.match(masked, i):
+        i = _skip_space(ctx.code, i + len("await"))
     subject: tuple[int, int] | None = None
-    if i < n and masked[i] == "(":
+    if keyword != "do" and i < n and masked[i] == "(":
         close = _match_bracket(masked, i)
         if close == -1:
-            return None, after_kw, after_kw, n
-        head = _OF_RE.search(masked, i + 1, close)
+            return _LoopSpan(None, after_kw, after_kw, n, False)
+        # Only a `for` head iterates: `while (k in R)` tests membership and has no width.
+        head = _OF_RE.search(masked, i + 1, close) if keyword == "for" else None
         if head:
             subject = (head.end(), close)
-        i = close + 1
-    while i < n and masked[i].isspace():
-        i += 1
+        i = _skip_space(ctx.code, close + 1)
     if i < n and masked[i] == "{":
+        body_start = i + 1
+        resume, settled = _statement_end(ctx, i)
+        body_end = resume - 1 if settled else resume
+    else:
+        body_start = i
+        body_end, settled = _statement_end(ctx, i)
+        resume = body_end
+    cond: tuple[int, int] | None = None
+    if keyword == "do":
+        tail = _WHILE_RE.match(masked, resume)
+        close = -1 if tail is None else _match_bracket(masked, tail.end())
+        if tail is None or close == -1:
+            settled = False
+        else:
+            cond = (tail.end() + 1, close)
+            resume = close + 1
+    return _LoopSpan(subject, body_start, body_end, resume, settled, cond)
+
+
+def _statement_end(ctx: _Ctx, i: int) -> tuple[int, bool]:
+    """Where the statement at ``i`` ends, and whether that end was read rather than guessed.
+
+    A block ends past its ``}``; a simple statement at a top-level ``;`` (returned, so the caller
+    can look past it), the enclosing closer, or a line break ASI ends it at -- never at the first
+    ``;`` anywhere, which cut a body inside a nested block short and priced the rest once, exact,
+    outside the loop. ``if``/``else``, ``try``/``catch``/``finally``, ``switch``, ``with``, a
+    label and a nested loop are read through their parts. An end is a guess only where the
+    source runs out first: an unclosed bracket or block, a head with no ``(``, a ``do`` with no
+    ``while (...)`` tail, or nothing left to read.
+    """
+    masked = ctx.masked
+    n = len(masked)
+    i = _skip_space(ctx.code, i)
+    if i >= n:
+        return n, False
+    if masked[i] == "{":
         close = _match_bracket(masked, i)
-        if close == -1:
-            return subject, i, n, n
-        return subject, i + 1, close, close + 1
-    stop = masked.find(";", i)
-    stop = n if stop == -1 else stop
-    return subject, i, stop, stop
+        return (n, False) if close == -1 else (close + 1, True)
+    loop = _LOOP_RE.match(masked, i)
+    if loop:
+        span = _loop_head(ctx, loop.end(), loop.group(0))
+        return span.resume, span.settled
+    head = _COMPOUND_RE.match(masked, i)
+    if head is None:
+        return _read_expr_end(ctx, i, ";")
+    keyword = head.group(1)
+    if keyword is None:  # a label
+        return _statement_end(ctx, head.end())
+    j = _skip_space(ctx.code, head.end())
+    if keyword == "try":
+        end, settled = _statement_end(ctx, j)
+        for clause in (_CATCH_RE, _FINALLY_RE):
+            found = clause.match(masked, end)
+            if found is None:
+                continue
+            k = _skip_space(ctx.code, found.end())
+            if masked[k : k + 1] == "(":
+                close = _match_bracket(masked, k)
+                if close == -1:
+                    return n, False
+                k = close + 1
+            end, ok = _statement_end(ctx, k)
+            settled = settled and ok
+        return end, settled
+    close = _match_bracket(masked, j) if masked[j : j + 1] == "(" else -1
+    if close == -1:
+        return n, False
+    end, settled = _statement_end(ctx, close + 1)
+    if keyword == "if":
+        # The branch's own `;` may sit past the line break ASI was offered or a do-while's `)`:
+        # `a()\n;` and `do a(); while (c)\n;` each end at that `;`, and the `else` follows it.
+        k = _skip_space(ctx.code, end)
+        found = _ELSE_RE.match(masked, k + 1 if masked[k : k + 1] == ";" else end)
+        if found is not None:
+            end, ok = _statement_end(ctx, found.end())
+            settled = settled and ok
+    return end, settled
 
 
 def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
@@ -1286,8 +1400,13 @@ def _price(ctx: _Ctx, start: int, end: int, invoked: bool = False) -> Cost:
             pos = m.end() if invoked else max(m.end(), _function_value_end(ctx, m))
             continue
 
+        # `{ do: 1 }` or `{ while: x }`: the lexer read the word as a name, not the keyword. Only
+        # a word it read as a name is skipped; one it did not classify is still priced as a loop.
+        if ctx.ends.get(m.end() - 1) == _VALUE:
+            pos = m.end()
+            continue
         total = total + _price_loop(ctx, m)
-        pos = _loop_head(ctx, m.end())[3]
+        pos = _loop_head(ctx, m.end(), m.group("loop")).resume
     return total
 
 
@@ -1386,7 +1505,13 @@ def _price_fan_call(ctx: _Ctx, m: re.Match[str], region_start: int, region_end: 
     if is_map:
         # The `fan` alternative of _TOKEN_PATTERN begins with `\.`, so the match already starts AT the
         # dot -- no search needed.
-        width, why = _width_of(ctx, *_receiver_span(ctx, m.start(), region_start))
+        recv_start, recv_end = _receiver_span(ctx, m.start(), region_start)
+        # A receiver the walk could not read (`rows?.map(`, `R!.map(`, an unmatched bracket) is
+        # an empty span, which _width_of reads as an empty array: width 0, exact.
+        if recv_start >= recv_end:
+            width, why = None, "receiver not read"
+        else:
+            width, why = _width_of(ctx, recv_start, recv_end)
         body = args[0] if args else (open_idx + 1, close)
     else:
         spec = _LENGTH_RE.match(ctx.masked[args[0][0] : args[0][1]]) if args else None
@@ -1403,15 +1528,19 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
     A loop over a literal array IS a fan of known width. Reporting it as unknown put real fan-out
     in the unpriced list, which trains a reader to skim the list that matters most.
     """
-    subject, body_start, body_end, _ = _loop_head(ctx, m.end())
-    inner = _price(ctx, body_start, body_end)
-    if not inner.agents and not inner.unknowns:
+    keyword = m.group("loop")
+    span = _loop_head(ctx, m.end(), keyword)
+    inner = _price(ctx, span.body_start, span.body_end)
+    if span.cond is not None:
+        inner = inner + _price(ctx, span.cond[0], span.cond[1])
+    # Free only where the extent was read: a guessed one may have cut agents out of the body.
+    if not inner.agents and not inner.unknowns and span.settled:
         return Cost()
 
     line = ctx.line_of(m.start())
-    keyword = m.group("loop")
-    if subject is not None:
-        width, why = _width_of(ctx, subject[0], subject[1])
+    # A body whose extent is a guess may hold code that runs once, so its count is no width.
+    if span.subject is not None and span.settled:
+        width, why = _width_of(ctx, span.subject[0], span.subject[1])
         if width is not None:
             return _fan_cost(line, width, why, inner, f"{keyword}...of")
 
@@ -1420,7 +1549,11 @@ def _price_loop(ctx: _Ctx, m: re.Match[str]) -> Cost:
             Unknown(
                 kind="loop",
                 line=line,
-                form=f"{keyword} loop, repetitions unknown",
+                form=(
+                    f"{keyword} loop, repetitions unknown"
+                    if span.settled
+                    else f"{keyword} loop, body extent not read, so no width is trusted"
+                ),
                 per_unit=inner.agents,
             ),
         )
@@ -1521,27 +1654,32 @@ def _residue(ctx: _Ctx) -> tuple[Unknown, ...]:
     happened to enumerate. ``ROWS.map(agent)`` passes the hook as a VALUE and matches no call
     pattern at all; this is what catches it, and ``ROWS.map(review)`` over a helper likewise.
     """
+
+    # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
+    # pricer. Read the raw text there, for the reach as for the references (BACKLOG #7599); an
+    # `agent` in a string inside one reads as a false hit, which costs a floor label rather than a
+    # silent under-count.
+    def found(word: re.Pattern[str], lo: int, hi: int) -> Iterator[re.Match[str]]:
+        yield from word.finditer(ctx.masked, lo, hi)
+        for a, b in ctx.interps:
+            if a < hi and b > lo:
+                yield from word.finditer(ctx.raw, max(a, lo), min(b, hi))
+
     # The helpers that can reach an agent, through any chain of helpers. A helper that starts
     # nothing may be passed around freely; flagging it would bury the terms that matter.
     reach = {"agent", "workflow"}
     while True:
-        starts = re.compile(r"(?<![\w$.])(?:" + "|".join(map(re.escape, reach)) + r")(?![\w$])")
+        word = _word_re(*reach)
         grown = {
             n
             for n, h in ctx.helpers.items()
-            if n not in reach and starts.search(ctx.masked, h.body_start, h.body_end)
+            if n not in reach and next(found(word, h.body_start, h.body_end), None)
         }
         if not grown:
             break
         reach |= grown
-    words = [_AGENT_WORD_RE] + [_word_re(n) for n in reach - {"agent"}]
-    hits = [m for word in words for m in word.finditer(ctx.masked)]
-    # The mask blanks a template literal whole, so a call inside `${...}` is invisible to every
-    # pricer. Read the raw text there; an `agent` in a string inside one reads as a false hit,
-    # which costs a floor label rather than a silent under-count.
-    hits += [m for lo, hi in ctx.interps for m in starts.finditer(ctx.raw, lo, hi)]
     out: list[Unknown] = []
-    for m in sorted(hits, key=lambda m: m.start()):
+    for m in sorted(found(word, 0, len(ctx.raw)), key=lambda m: m.start()):
         if (
             m.start() in ctx.attributed
             or m.start() in ctx.def_names
@@ -1584,6 +1722,10 @@ def workflow_name(source: str) -> str | None:
 
 def price_script(source: str) -> Cost:
     """Price one workflow script. The returned cost is EXACT only when ``.exact`` is true."""
+    # U+FEFF is whitespace to JavaScript outside a literal, but a token to the lexer: a BOM'd copy
+    # of a file priced differently. Same length, so every offset holds; one inside a literal
+    # becomes a space too, which changes a snippet and never a count.
+    source = source.replace("\ufeff", " ")
     notes = _MaskNotes()
     masked = _mask(source, notes)
     chars = list(source)
@@ -1789,24 +1931,37 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _self_test()
 
-    if args.stdin:
-        source, label = sys.stdin.read(), "<stdin>"
-    elif args.script:
-        path = Path(args.script)
-        try:
-            source = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"cannot read {path}: {exc}", file=sys.stderr)
-            return 1
-        label = str(path)
-    else:
+    if not (args.stdin or args.script):
         parser.error("give a script path, --stdin, or --self-test")
+    label = "<stdin>" if args.stdin else str(Path(args.script))
+    # Bytes, decoded as UTF-8 on both routes (BACKLOG #7601): `sys.stdin.read()` decoded in the
+    # locale encoding, cp1252 on Windows, so one file priced from two different texts. Undecodable
+    # input is a broken instrument, reported, never a traceback or a guess at the text. Line ends
+    # are translated as the text-mode reads both routes made before did. A BOM is kept here:
+    # `price_script` reads every U+FEFF as the space it is to JavaScript.
+    try:
+        if not args.stdin:
+            data = Path(args.script).read_bytes()
+        elif sys.stdin is None:  # pythonw, or a service with no console
+            raise OSError("there is no standard input")
+        elif hasattr(sys.stdin, "buffer"):
+            data = sys.stdin.buffer.read()
+        else:  # a text stream an embedding caller set: its text is already decoded
+            data = sys.stdin.read().encode("utf-8")
+        source = data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except (OSError, UnicodeError) as exc:
+        print(f"cannot read {label}: {exc}", file=sys.stderr)
+        return 1
 
     cost = price_script(source)
     if args.json:
-        print(json.dumps(to_json(cost, source, label), indent=2))
+        report = json.dumps(to_json(cost, source, label), indent=2)
     else:
-        print(render(cost, source, label))
+        report = render(cost, source, label)
+    # A snippet of UTF-8 source can hold a character the console encoding (cp1252) cannot print:
+    # escape it, for this report only, rather than end the report in a traceback.
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(report.encode(encoding, "backslashreplace").decode(encoding))
 
     return 1 if args.strict and cost.unknowns else 0
 

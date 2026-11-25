@@ -170,6 +170,7 @@ Defaults:
 | Message store | `<DataDir>\messagefoundry.db` |
 | Logs | `<DataDir>\logs\service.out.log`, `service.err.log` |
 | Secrets directory (`-SecretsDir`) | the one the service already names, else `<DataDir>-secrets`; named to the service as `MEFOR_SECRETS_DIRECTORY` |
+| Custody directory (`-CustodyDir`), under `[store].key_provider = 'host'` only | the one the service already names, else `<DataDir>-custody`; named to the service as `MEFOR_CUSTODY_DIRECTORY` ([The custody directory](#the-custody-directory-under-the-host-key-provider)) |
 | Bind | `127.0.0.1:8765` |
 | Log level | `INFO` |
 
@@ -245,21 +246,6 @@ Administrator from an elevated shell on the host:
 messagefoundry provision-admin --username <name> --email <address> --db C:\ProgramData\MessageFoundry\messagefoundry.db
 ```
 
-Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
-LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
-install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
-describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
-environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
-`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
-`[security].enforcement = 'enforce'` the provider also refuses an account that is not local to
-this host, such as a domain user or a gMSA, and the script does not check for that.
-
-The steps above do not yet cover that provider. It refuses a store key set beside it, so step 1's
-key makes `provision-admin` refuse; and it mints the store key, which `--service-account` mints for
-the service's account rather than yours. The script grants that account read only on the secrets
-directory, where the service's first start must write its own key file, so a service the script
-installs under this provider does not start yet (vault BACKLOG #3411).
-
 If the service started first, at the shipped posture it refuses to start. Once the earlier start
 checks pass (the store key and `[alerts]` among them), that refusal names `provision-admin` in the
 log; run the command, then restart the service. In the data directory the install script hardens,
@@ -274,6 +260,210 @@ the service account and the operator can both open the store, in either order. T
 > **absolute** `[store].path` / `--db` to keep it in place (absolute paths bypass the root), or accept the
 > new location. The startup CWD-mismatch WARNING names the resolved paths so any move is visible. Deployments
 > without `--project-root`, or with an absolute DB path, are unchanged.
+
+Under `[store].key_provider = 'host'` (vault BACKLOG #3411) the service cannot run as SYSTEM,
+LOCAL SERVICE or NETWORK SERVICE: that provider refuses them as the engine account. When the
+install script reads that setting, from the settings file as its `Get-SettingsKeyProvider`
+describes, or from `MEFOR_STORE_KEY_PROVIDER` in the service's own
+environment, it refuses such an account before it changes anything: `-AllowLocalSystem` with no
+`-ServiceAccount`, and at least the usual spellings of those accounts as `-ServiceAccount`. Under
+`[security].enforcement = 'enforce'` the provider also refuses an account that is not local to
+this host, such as a domain user or a gMSA, and the script does not check for that.
+
+The steps above do not yet cover that provider. It refuses a store key set beside it, so step 1's
+key makes `provision-admin` refuse; and it mints the store key, which `--service-account` mints for
+the service's account rather than yours (vault BACKLOG #3411).
+
+#### The custody directory under the host key provider
+
+The host key provider keeps two files, `handoff.key`, which `provision-admin --service-account`
+writes, and `master.key`, which the service's first start writes from it and then reads at every
+start. The service must be able to add a file where they live, and a service that may add a file
+to the secrets directory may supply a secret-class setting (ADR 0214's 2026-11-22 amendment). The
+install script's own grant to the service there is read, and the engine refuses no grant to one
+account, so nothing guarantees the service read only there: a rerun keeps an explicit grant to
+the service account itself, such as the write the Vault Agent sink route
+([CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory)) gives it.
+Of the entries the script does not set itself, at least an explicit grant to the service
+account, an explicit Deny entry, and an explicit SYSTEM or Administrators entry with other
+inheritance flags survive: the script turns inheritance off (`/inheritance:r`), which
+drops every inherited entry, and tries to remove every other account's Allow entry that Get-Acl
+lists, a group's included; the read-back, which reads the same list, refuses the install when a
+listed one survives. At least a conditional (callback) Allow entry, and a plain one for an
+APPLICATION PACKAGE AUTHORITY principal (the script passes its name, which icacls refuses),
+survive that removal and are refused. An object Allow entry is not in that list, so it is neither
+removed nor refused. The read-back does not check a surviving Deny entry, so one that names
+the service account, or a group it belongs to, can leave the service unable to read its secrets.
+So when the install script reads
+`[store].key_provider = 'host'` it also makes a **custody directory** of its own for those two
+files, `-CustodyDir`, else the one the service already names, else `<DataDir>-custody`, and names
+it to the service as `MEFOR_CUSTODY_DIRECTORY`. It is judged before anything acts by the secrets
+directory's rules, made restricted in one step, and then given this list:
+
+- owner: Administrators, with inheritance off;
+- SYSTEM and Administrators: full control, inherited by the files in it;
+- the service account: read and add-file on the directory itself, inherited by nothing.
+
+The script tries to replace any other plain grant the service account holds there, and to remove
+every other account's allow entry and every deny entry that Get-Acl lists, whoever it names. At
+least a conditional entry, the service account's own included, and an entry for an APPLICATION
+PACKAGE AUTHORITY principal survive that removal, and an object entry is not listed at all. It
+then reads the list back, and refuses, disabling the service, at least when its owner is neither
+Administrators nor SYSTEM, still inherits, still has a listed allow entry for another account or a
+listed deny entry that applies to the directory itself, or gives the service account more or less
+than that grant. At least a surviving inherit-only deny entry, and every object entry, are not
+refused. When the script does not read that provider, it refuses
+`-CustodyDir`.
+
+**The engine.** When `MEFOR_CUSTODY_DIRECTORY` is set, the host provider reads and writes the two
+files there, in place of the directory `MEFOR_SECRETS_DIRECTORY` names or the store's own data
+directory. Before it reads or mints, it checks that directory as it checks a secrets directory, at
+any enforcement setting: a known broad group's right to read it, add a file to it or delete one in
+it is refused, and so is a link. That check reads known broad groups only, so it refuses no entry
+for one account, the service's or any other; the list the script sets is what leaves other
+accounts no entry. While the variable is set and neither file is there, a key file in the secrets
+directory or beside a SQLite store refuses a read and a mint, rather than being taken for no key at
+all, so a mint run without the variable does not lead to a second key.
+
+**Reinstalling over a kept custody directory.** The install script refuses an existing custody
+directory the service does not name, as after an uninstall, and it never removes one that holds
+anything. [When a refusal names master.key or handoff.key](#when-a-refusal-names-masterkey-or-handoffkey)
+says how to go on.
+
+**Minting.** Set the variable in the elevated shell that runs `provision-admin --service-account`,
+to the same path, so the handoff lands where the service looks:
+
+```powershell
+$env:MEFOR_CUSTODY_DIRECTORY = 'C:\ProgramData\MessageFoundry-custody'
+```
+
+#### When a refusal names master.key or handoff.key
+
+This is the one procedure for going on past a refusal that names `master.key` or `handoff.key`, the
+host key provider's files ([The custody directory](#the-custody-directory-under-the-host-key-provider)).
+The engine and the install and uninstall scripts point here when they find one where they cannot
+tie it to this service's store, at least: a key file beside a store that another key provider
+opens, a key file outside the custody directory the service names, and an existing custody
+directory the service does not name, as after an uninstall. Neither the engine nor the scripts can
+tell whose key a file holds, and either file may be the only copy of a store's key on this host.
+
+1. **Delete nothing, and leave every key file where it is**, in every directory the refusal names,
+   except as step 5 says once a copy has replaced an original, and unless step 3 sends you to move
+   one; then move it only as step 5 says, which also says what to
+   do with an original that a copy replaced.
+2. **Stop the service** (`Stop-Service <ServiceName>`) if it is installed, and work from an
+   elevated shell.
+3. **If the file holds this store's key**, as when this store was set up under
+   `[store].key_provider = 'host'`:
+   - When the refusal says `[store].key_provider` is another provider, make the settings change
+     the refusal names. That provider reads the file only from the custody directory
+     `MEFOR_CUSTODY_DIRECTORY` names, else the one `MEFOR_SECRETS_DIRECTORY` names, else beside a
+     SQLite store, and needs to add a file there. So, under the install script, re-run it once the
+     settings name that provider, which makes the custody directory and names it to the service
+     ([The custody directory](#the-custody-directory-under-the-host-key-provider)), and move the
+     file into it as step 5 says.
+   - When the file sits outside the custody directory the service names, move it into that
+     directory as step 5 says.
+   - When the install script refuses a kept custody directory, re-run it with `-CustodyDir` naming
+     a new folder that does not exist yet, which it creates restricted
+     ([The custody directory](#the-custody-directory-under-the-host-key-provider)). Then move each
+     key file from the kept directory into the new one as step 5 says.
+4. **If the file is another store's, or you cannot tell**, this store needs places that hold
+   neither file. Let the install script make each one new and restricted, rather than making or
+   filling a folder by hand. Re-run it with the option for where the file is:
+   - beside the store's database: `-DataDir` naming a new folder that does not exist yet, so the
+     store is `<DataDir>\messagefoundry.db` in a directory the script creates and restricts. Pass
+     no `-DbPath`, or a `-DbPath` naming that same path, as the engine's refusal asks; keep both on
+     every later reinstall. A `-DbPath` outside `-DataDir` names a folder the script grants nothing
+     on.
+   - in the directory `MEFOR_SECRETS_DIRECTORY` names: `-SecretsDir` naming a new folder that does
+     not exist yet. Then add this service's secret files to it as
+     [the secrets directory](#protect-the-store-encryption-key-at-rest-wp-11d) says.
+   - in the directory `MEFOR_CUSTODY_DIRECTORY` names: under the host provider, `-CustodyDir`
+     naming a new folder that does not exist yet. Under another provider the service reads no
+     custody directory of its own, so take the `MEFOR_CUSTODY_DIRECTORY` entry out of its NSSM
+     `AppEnvironmentExtra` list, keeping the other entries.
+
+   A new data directory starts a new, empty store. Never copy another store's database, or any
+   key file, into it. To keep this store's own data, move into the new one, as step 5 says, only
+   files you know are this store's or this service's, and leave everything else where it is, at
+   least any other database with its `-wal` and `-shm` files, since an old data directory may be
+   shared. Those files are at least this store's database, the file the service's `--db` names,
+   with that file's own `-wal` and `-shm` files; and, only where no other store's database sits
+   in the same directory, the `log-spool` folder and the generated API certificate pair,
+   `api-generated-cert.pem` with `api-generated-key.pem`. Move the pair together: where the new
+   directory lacks either file, the engine mints a new pair there, and a client that pins the old
+   certificate then refuses the new one. Leave `master.key` and `handoff.key` where they are: in
+   this step they may be another store's.
+
+   Under the host provider, leave this store's database, with its `-wal` and `-shm` files, out of
+   that move, whichever route above you take. The new store needs a key that
+   `messagefoundry provision-admin --service-account` mints for it, and `provision-admin` refuses
+   to mint for a SQLite store that exists or a server database that holds data, because a new key
+   cannot open it. So under that provider every route above needs a new store too: a new data
+   directory for a SQLite store, a new database for a server store. Then run `provision-admin`
+   again for the new store before step 6, with the arguments the engine's refusal names, at least
+   `--db` naming the new SQLite path by its absolute path, and `MEFOR_CUSTODY_DIRECTORY` set in
+   that shell to the custody directory the service names.
+5. **Moving a file.** Within one volume, move it as an administrator
+   (`Move-Item -LiteralPath <file> -Destination <directory>`): the file keeps its own owner and
+   access list, which the engine checks exactly on a key file. Across volumes a move is a copy,
+   and a plain copy takes the new directory's list in place of the file's own, so the engine
+   refuses a key file copied that way. Copy a key file with its owner and list instead
+   (`robocopy <from directory> <to directory> <file name> /COPY:DATSO /B`). Check that
+   `icacls <file>` prints the same entries for the copy as for the original, and that
+   `(Get-Acl -LiteralPath <file>).Owner` prints the same owner, and keep the original where it is
+   until the service has started and opened its store from the copy. Copy the database files
+   across volumes the same way, and keep their originals until then too. Copy the generated API
+   certificate pair the same way, both files. Once the service has opened its store from the
+   copies:
+   - **A `master.key` original:** keep it as a second copy of the store's key, but take the
+     service's access to it away first. Record its owner and list before you change them
+     (`(Get-Acl -LiteralPath <file>).Sddl`), and keep that record with it: the engine reads it as
+     a key file again only once that owner and list are back, and only as the account it was
+     written for. Moving a file into another folder does not do that: the
+     file keeps its own owner and access list, and an account that list names can still open it
+     by its path. Set the original's owner and list, then check both
+     (`icacls <file> /setowner *S-1-5-32-544`, then
+     `icacls <file> /inheritance:r /grant:r *S-1-5-32-544:F *S-1-5-18:F /remove:g "<service account>"`,
+     then `icacls <file>`, which must print entries for Administrators and SYSTEM only, removing
+     any other with `/remove:g`). Then move it, within its volume, into a folder only
+     administrators can read, and keep it there. It is still read by at least SYSTEM,
+     Administrators, and any account holding a privilege that reads past an access list, such as
+     SeBackupPrivilege, which the `robocopy /B` above uses.
+   - **A `handoff.key` original:** delete it once the service has started from the copy. A
+     handoff is meant to last only from install to the service's first start, which converts it
+     into `master.key` and deletes the copy it read. It is machine-scope DPAPI: on this host, any
+     process that can read the file can unwrap the store key from it, though it does not unwrap
+     on another host without this host's machine DPAPI keys, which at least a disk image or a
+     cloned virtual machine of this host carries.
+   - **The `api-generated-cert.pem` and `api-generated-key.pem` originals:** delete both once the
+     service presents the copied pair. The key original is a second copy of the private key the
+     service presents, readable by at least the accounts its own access list grants read and any
+     account holding a privilege that reads past an access list, such as SeBackupPrivilege.
+   - **The database originals** may hold PHI; dispose of them as [PHI.md](PHI.md) describes.
+6. **Start the service**, and read its log for a refusal ([Verify it's running](#verify-its-running)).
+
+**Without the install scripts**, as on Linux or in a container, the same steps hold with the
+engine stopped in place of the service: leave every key file, and delete none except as the end
+of this paragraph says; for a file that
+is this store's, make the settings change and put the file where the host provider reads it; for
+one that is not, run the store from a new, empty data directory for a file beside it, or set the
+variable that names the file's directory, `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`,
+to a new directory owned by the account the engine runs as, mode 0700, in a folder only that
+account or root may write, and add the engine's other secret files to a new secrets directory. A move
+within one file system keeps the file's owner and mode; across file systems, copy it keeping them
+(`cp -p`, as root). Once the engine has opened its store from the copy, take the engine account's
+access to a `master.key` original away, since the file stays owned by that account with mode 0600
+wherever it moves. Record its owner and mode first (`stat -c '%u:%g %a' <file>`, numeric ids, since
+the engine's account may have no passwd entry) and keep that record with it, so they can be
+restored if the engine ever has to read it again. Then make root its owner (`chown root:root
+<file>`, keeping mode 0600), and move it, within its file system, into a directory root owns with
+mode 0700, so the engine account can neither read it nor rename or delete it; keep it there. On
+Windows, set a kept `master.key` original's owner and list as step 5 says rather than only moving
+it, and delete a `handoff.key` original once the service has started from the copy, as step 5 says.
+Delete the `api-generated-cert.pem` and `api-generated-key.pem` originals once the engine presents
+the copied pair, as step 5 says.
 
 ## Update to a new build (restart vs reinstall)
 
@@ -376,8 +566,12 @@ the directory. Read the list first with `nssm get MessageFoundry AppEnvironmentE
 may hold a value `serve` or `supervise` refused, as the next paragraph says.
 **No secret goes in that list:** any local user can read it. Where the engine could read the
 service's lists, `serve` and `supervise` refuse to start with one of the engine's own secret
-settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse only a store key
-or retired store key found in their own environment, never another secret setting. Use the DPAPI
+settings there, or with any `MEFOR_VALUE_*` variable, secret or not. Where it knows the service but could not read them, they refuse a store key,
+a retired store key or another engine secret setting found in their own environment, under every
+enforcement setting. Where the engine could read the lists, and only under
+`[security].enforcement = "enforce"`, they also refuse an engine secret setting other than a store
+key or a retired store key that is in their own environment, is not in those lists, and is set
+in the machine-wide environment's registry key, where the engine could read that key (vault BACKLOG #2595). Use the DPAPI
 key file for
 the store key, and the secrets directory for the rest (see
 [Protect the store encryption key at rest](#protect-the-store-encryption-key-at-rest-wp-11d)).
@@ -744,7 +938,7 @@ NSSM environment.
   file or a folder holding a folder, that sits below a junction, or that is, holds or sits inside
   at least the data, log, store, config, value-file and settings-file folders, NSSM's folder, the
   engine install, the checkout, the Windows folder and Program Files. It refuses a path another
-  service already names as its `MEFOR_SECRETS_DIRECTORY`, or a folder inside or around one, so a second service on the same
+  service already names as its `MEFOR_SECRETS_DIRECTORY` or `MEFOR_CUSTODY_DIRECTORY`, or a folder inside or around one, so a second service on the same
   `-DataDir` needs its own `-SecretsDir`. The installer makes the directory with its owner and
   access list in one step. The directory starts empty: as an administrator, create or copy in one
   file per setting, named as its variable, and restart the service. Do not move a file in: a
@@ -761,11 +955,13 @@ NSSM environment.
   access list it needs, and the rest of the rules are stated once, in
   [CONFIGURATION.md](CONFIGURATION.md#the-secrets-directory-mefor_secrets_directory). Move each
   of the engine's own secret settings other than the store key and its retired keys here from the
-  service's NSSM list, where `serve` and `supervise` refuse it if the engine could read that
-  list, and not if it could not (the previous bullet links where that is stated).
-  A `MEFOR_VALUE_*` value there is refused the same way, secret or not: move it here, or to the
-  active environment's value file if it is not a secret and is the same for every instance (the
-  previous bullet's link says when and why).
+  service's NSSM list, where `serve` and `supervise` refuse it once the engine finds its
+  service, whether or not it could read that list (the previous bullet links where that is
+  stated).
+  A `MEFOR_VALUE_*` value there is refused too, secret or not, but only where the engine could
+  read that list: where it could not, a `MEFOR_VALUE_*` value is not refused. Move it here, or to
+  the active environment's value file if it is not a secret and is the same for every instance
+  (the previous bullet's link says when and why).
   **Off Windows, no installer creates the directory.** In `docker/compose.yaml` the `engine`
   service's bind mount and its `MEFOR_SECRETS_DIRECTORY` line are both commented out, so uncomment
   both. The `ha` profile's `engine-ha` and `engine-standby` services carry neither line. Add them
@@ -1303,6 +1499,7 @@ list below says what it covers.
 | The `DataDir` tree — logs and message store | Your data | Delete it yourself once you are sure you are not reinstalling. `DataDir` is a PHI sink — dispose of it the way [PHI.md](PHI.md) describes |
 | The service's `nssm.exe`, in the installer's `-NssmDir` (`C:\Program Files\MessageFoundry\nssm` by default) | The copy the service ran; the inventory names the one it was registered with | Delete it yourself only when no other service installed with the same `-NssmDir` remains and you are not reinstalling |
 | An access-control entry for the run-as account on `DataDir` **and** on the config directory | The installer grants both so the service can read config and write logs | `-RemoveAccountAces`, or `icacls "<dir>" /remove:g "*<SID>"` |
+| Under `[store].key_provider = 'host'`, the custody directory `MEFOR_CUSTODY_DIRECTORY` names, with `master.key` (and `handoff.key` before the first start), and the run-as account's read and add-file entry on it | The files hold the store's key, maybe its only copy on this host. Each file carries its own access-control entry for the account, and `-RemoveAccountAces` takes the account's entry off the directory only, not off the files. A reinstall refuses the kept directory while the new service does not name it | Keep the directory and its files while the store is kept; never delete them. `-RemoveAccountAces` removes the directory's entry. To reinstall, see [When a refusal names master.key or handoff.key](#when-a-refusal-names-masterkey-or-handoffkey) |
 | The `SeServiceLogonRight` ("Log on as a service") grant | Setting the service's run-as account does not grant it, so the installer does | `-RemoveLogonRight`, or secpol.msc under Local Policies, User Rights Assignment |
 | Inheritance turned off on `DataDir`, and (with `-LockConfigDir`) on the config directory plus its owner moved to Administrators | See below | `icacls "<dir>" /inheritance:e`, by hand |
 | Windows Error Reporting keys, when you installed with `-SuppressCrashDumps` — **two** surfaces, `ExcludedApplications` and `LocalDumps`, reported separately because Windows evaluates them independently | [Stated above](#suppress-windows-crash-dumps-of-the-engine-adr-0152-phase-0) — removing them switches PHI-carrying dumps back on | By hand, under that registry path |

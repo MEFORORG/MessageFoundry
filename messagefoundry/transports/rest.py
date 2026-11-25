@@ -2931,31 +2931,36 @@ def egress_route_from_settings(
     )
 
 
-def _refuse_unsendable_static_auth(s: Mapping[str, Any], *, connection: str | None) -> None:
-    """Refuse at construction a static REST credential :meth:`RestDestination._build_headers`
-    could not send as configured (BACKLOG #5354). Read on the resolved settings, since the
+def _refuse_unsendable_static_auth(
+    s: Mapping[str, Any], *, connection: str | None, transport: str = "REST destination"
+) -> None:
+    """Refuse at construction a static HTTP credential the connector's ``_build_headers`` could
+    not send as configured (BACKLOG #5354; the FHIR destination and ``FhirLookup`` since BACKLOG
+    #8299 item 8, with ``transport`` naming them). Read on the resolved settings, since the
     factory sees ``env()`` references and cannot tell one that resolves empty from a set value.
 
     One Basic half without the other, or a half that resolves empty, would send no Authorization
     at all. A ``:`` in ``basic_user`` would move the rest of the user into the password, since RFC
     7617 splits the pair at the first colon. ``bearer_token`` beside a Basic pair would be replaced
-    by it without a word. Each refusal names settings, never a value. Digest beside either was
-    already refused by ``refuse_http_digest_conflicts``."""
+    by it without a word. Each refusal names settings, never a value. On the REST and FHIR
+    destinations, Digest beside either was already refused by ``refuse_http_digest_conflicts``,
+    which they call first. ``FhirLookup`` does not call that function and builds no Digest
+    handler."""
     prefix = hop_name_prefix(connection)
     user, password = s.get("basic_user"), s.get("basic_password")
     if bool(user) != bool(password):
         raise HttpAuthError(
-            f"{prefix}REST destination basic_user and basic_password must be set together; one "
+            f"{prefix}{transport} basic_user and basic_password must be set together; one "
             "without the other, or one that resolves empty, would send no HTTP Basic credential"
         )
     if user and ":" in str(user):
         raise HttpAuthError(
-            f"{prefix}REST destination basic_user must not contain ':'; HTTP Basic splits the "
+            f"{prefix}{transport} basic_user must not contain ':'; HTTP Basic splits the "
             "user from the password at the first colon (RFC 7617)"
         )
     if user and s.get("bearer_token"):
         raise HttpAuthError(
-            f"{prefix}REST destination sets both bearer_token and basic_user/basic_password; "
+            f"{prefix}{transport} sets both bearer_token and basic_user/basic_password; "
             "they share the Authorization header, so configure exactly one"
         )
 
@@ -3018,10 +3023,10 @@ class RestDestination(DestinationConnector):
         accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
-        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a connection
-        # that never builds logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
+        # BACKLOG #5529: an http_auth this connection cannot honour is refused first, so a build
+        # this refuses logs no insecure-hop crossing or warning below. Lazy: http_auth imports rest.
         from messagefoundry.transports.http_auth import (
-            refuse_authorization_signer_beside_digest,
+            refuse_authorization_signer_beside_credential,
             refuse_http_digest_conflicts,
         )
 
@@ -3040,7 +3045,7 @@ class RestDestination(DestinationConnector):
         # destination, so verify_tls=false turns off no verification the engine does. It used to skip
         # the revocation guard below, which runs only on the verify-ON branch. Refused here, above
         # refuse_verify_off, so that gate logs no attested crossing and no DISABLED warning for a
-        # connection that never builds. No attestation crosses it, as with proxy_url above.
+        # connection this refuses. No attestation crosses it, as with proxy_url above.
         verify = bool_setting(s, "verify_tls", default=True)
         if self._ech_sidecar is not None and not verify:
             raise ValueError(
@@ -3122,8 +3127,11 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
-        refuse_authorization_signer_beside_digest(
+        # BACKLOG #5526 item 6: under the Authorization name the signature would replace the
+        # configured or minted credential _post writes before it.
+        refuse_authorization_signer_beside_credential(
             None if self._signer is None else self._signer.header_name,
+            s,
             digest=digest_selected,
             connection=config.name,
         )

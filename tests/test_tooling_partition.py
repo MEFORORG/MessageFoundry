@@ -221,6 +221,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # It loads scripts/release/forbidden_members.py by path; that is the RULE it reads, not its
         # subject.
         "test_packaged_tree_denylist.py",
+        # NOT engine source, and it does NOT meet the criterion above: it reads docs/PHI.md
+        # off disk, and a docs/ edit sets `tooling=true`. It stays because ci.yml's merge_group
+        # arm pins `tooling=false`, so as tooling it would run in no queue entry. On a docs-only
+        # pull request it runs only once ci.yml's DOC_GUARDS list names it.
+        "test_phi_reencrypt_on_write_doc.py",
         # NOT engine source, but it meets the criterion above, as
         # test_conftest_name_collision_guard.py does and for the same reason. Its subject is the
         # test trees' log quiesce: it reads tests/conftest.py's ``_Baseline`` as pytest loaded it
@@ -273,6 +278,11 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # via `-m 'not tooling'` AND out of every queue entry, where `ci-gate` reads a skipped need
         # as a pass -- the same defect ci.yml already records against `.gitignore` (BACKLOG #327).
         "test_security_txt_rfc9116.py",
+        # NOT engine source, and it does NOT meet the criterion above: it reads docs/SECURITY.md
+        # off disk, and a docs/ edit sets `tooling=true`. It stays because ci.yml's merge_group
+        # arm pins `tooling=false`, so as tooling it would run in no queue entry. On a docs-only
+        # pull request it runs only once ci.yml's DOC_GUARDS list names it.
+        "test_security_events_feed_doc_once.py",
         # LEFT THE MANIFEST (vault BACKLOG #3652). NOT engine source, but it meets the
         # criterion above, as test_conftest_name_collision_guard.py does. Its subject is the
         # server-DB store suites (tests/test_postgres_store.py, tests/test_sqlserver_store.py and
@@ -689,6 +699,40 @@ def test_the_two_lists_are_disjoint() -> None:
         "would win silently and the file would leave the engine legs. Decide which list it belongs in: "
         f"{both}"
     )
+
+
+class _Item:
+    """The parts of a pytest item the conftest hook reads, so it can be driven without a session."""
+
+    def __init__(self, path: Path, *, marked: bool) -> None:
+        self.path = path
+        self.nodeid = f"tests/{path.name}::test_x"
+        self.marks: list[str] = ["tooling"] if marked else []
+
+    def add_marker(self, mark: pytest.MarkDecorator) -> None:
+        self.marks.append(mark.name)
+
+    def get_closest_marker(self, name: str) -> str | None:
+        return name if name in self.marks else None
+
+
+def test_a_tooling_mark_outside_the_manifest_is_refused(request: pytest.FixtureRequest) -> None:
+    """The tier's test shards run only manifest files, and the engine legs deselect the mark, so a
+    self-marked file outside the manifest would run nowhere. The hook refuses it on every platform;
+    ci.yml's partition guard sees it only where it collects, on Linux. Falsified by making the
+    `if stray:` never true: RED. Restored."""
+    hook = next(
+        p
+        for p in request.config.pluginmanager.get_plugins()
+        if Path(str(getattr(p, "__file__", ""))).resolve() == (_TESTS / "conftest.py").resolve()
+    ).pytest_collection_modifyitems
+    listed = _Item(_TESTS / tooling_manifest.names()[0], marked=False)
+    plain = _Item(_TESTS / "test_not_in_the_manifest_x.py", marked=False)
+    hook([listed, plain])
+    assert listed.marks == ["tooling"] and plain.marks == [], "the control did not mark as expected"
+    stray = _Item(_TESTS / "test_not_in_the_manifest_x.py", marked=True)
+    with pytest.raises(RuntimeError, match="not in tests/tooling_manifest.txt"):
+        hook([listed, stray])
 
 
 def test_marker_is_registered() -> None:
