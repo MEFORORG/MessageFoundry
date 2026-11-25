@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A reload's worker-thread hops still run when the default executor refuses them: on a thread of
-their own, or on the loop only when no thread can start (BACKLOG #5755, items 3 to 5).
+"""The reload hops that take :func:`to_thread_or_loop` still run when the default executor refuses
+them: on a thread of their own, or on the loop only when no thread can start (BACKLOG #5755, items
+3 to 5). Other reload hops have no such fallback; docs/SECURITY.md names at least some.
 
-Each test shuts the loop's default executor down first, the realistic refusal: ``run_in_executor``
+A test that needs a refusal shuts the loop's default executor down, the realistic refusal: ``run_in_executor``
 then raises ``RuntimeError`` at submit, as ``asyncio.to_thread`` did at every one of these hops
 before the fix."""
 

@@ -8169,9 +8169,10 @@ class RegistryRunner:
             self._fuse_transform_executor = None
         self._fusion_active = False
         # ADR 0087 (#197): stop the per-inbound sandbox worker children (kills + reaps each subprocess).
-        # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop.
-        # A default executor that refuses the hop closes them on a thread of its own; only when no
-        # thread can start does it run on the loop (BACKLOG #5755).
+        # Run OFF the loop (each close() waits on a process) so a draining child can't wedge the loop;
+        # what a refused hop does instead is stated on _close_sandbox_sessions. With fusion active, a
+        # refused executor still stops this teardown at the fusing shutdown above, which has no
+        # such fallback, before it gets here.
         # No-op unless [sandbox].mode=subprocess actually spawned any.
         await self._close_sandbox_sessions()
         # THE LOOKUP-EXECUTOR CLOSE, stated here once. The live executor retires like a reload's:
@@ -10088,9 +10089,8 @@ class RegistryRunner:
                 # dead-letters until restart. Dropping the sessions here makes the next dispatch respawn a
                 # child that re-loads the swapped config (its docstring's "Router/Handler changes take
                 # effect immediately" now also holds under mode=subprocess). Off-loop, since close()
-                # waits on a process: on a thread of its own when the executor refuses the hop, and
-                # on the loop only when no thread can start (BACKLOG #5755). No-op unless
-                # mode=subprocess actually spawned any.
+                # waits on a process; _close_sandbox_sessions says what a refused hop does instead.
+                # No-op unless mode=subprocess actually spawned any.
                 await self._close_sandbox_sessions()
                 for ic in new_registry.inbound.values():
                     # The skips are _listener_skip, in its order, which listener_bind_predicate reads

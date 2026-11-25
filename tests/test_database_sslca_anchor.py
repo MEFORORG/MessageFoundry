@@ -608,8 +608,8 @@ async def test_a_refused_executor_still_runs_the_lane_check(
     store: MessageStore, tmp_path: Path, judged: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5755, items 3 and 5: a default executor that refuses the hop runs the lane check's
-    spec build and CA read on a thread of its own. Red with ``asyncio.to_thread`` at those hops: the check
-    raises ``RuntimeError`` and fails a reload, or its rollback, that the CA would pass. The
+    spec build and CA read on a thread of its own. Red with ``asyncio.to_thread`` at those hops: the
+    check raises ``RuntimeError`` and fails a reload, or its rollback, that the CA would pass. The
     refusing executor is one that was shut down, as at a loop's shutdown."""
     import asyncio
     import concurrent.futures
@@ -628,4 +628,7 @@ async def test_a_refused_executor_still_runs_the_lane_check(
         # attribute is private to asyncio's base loop; None there means "make one when needed".
         loop._default_executor = original  # type: ignore[attr-defined]
     # The positive control: the executor did refuse, and the anchor read is the hop it refused.
-    assert "the executor never began the trust anchor read" in caplog.text
+    assert (
+        "the executor never began the trust anchor read, so it runs on its own thread"
+        in caplog.text
+    )
