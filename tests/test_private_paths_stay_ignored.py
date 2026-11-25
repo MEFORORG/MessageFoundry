@@ -59,7 +59,7 @@ _PRIVATE_PATHS: list[tuple[str, str]] = [
     ("/docs/testing/*", "docs/testing/probe-0160.md"),
 ]
 
-# The ONE negated path in the block, and the only tracked file any private rule may cover.
+# The negated paths in the block, and the only tracked files any private rule may cover.
 #
 # `/.claude/` became `/.claude/*` plus `!/.claude/settings.json` so the enforced controls -- the
 # deny-list, and whatever matchers the file wires -- reach a fresh clone and every
@@ -186,6 +186,8 @@ def test_the_negations_re_include_exactly_their_files() -> None:
         ".claude/worktrees/probe-327/CLAUDE.md",
         ".claude/rules/probe-327.md",
         ".claude/skills/probe-327/SKILL.md",
+        ".claude/skills/verify/notes.local.md",
+        ".claude/skills/verify/sub/probe-327.md",
         ".claude/agents/probe-327.md",
     ):
         res = _git("check-ignore", "-q", "--no-index", sibling)

@@ -126,7 +126,7 @@ def test_a_taken_mllp_port_fails_before_any_engine_starts(
         code = e2e_smoke.main(["--config", str(config), "--mllp-port", str(port)])
     out = capsys.readouterr()
     assert code == 1, out.err + out.out
-    assert f"FAIL ports: MLLP port {port} is already in use" in out.err
+    assert f"FAIL ports: MLLP port {port} is in use" in out.err
     assert "step serve" not in out.out
 
 
