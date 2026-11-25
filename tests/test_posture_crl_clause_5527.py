@@ -83,7 +83,7 @@ def test_the_smtp_clause_names_all_three_conditions() -> None:
     clause = _smtp_clause()
     assert clause.startswith("and no CRL unless all three hold: [tls].crl_file is set")
     assert "the [tls] policy reaches the caller that builds the sink" in clause
-    assert "the relay host is not loopback" in clause
+    assert "the relay host is not loopback as config.tls_policy.is_loopback_hop_host" in clause
 
 
 def test_the_smtp_clause_names_the_loopback_relay_as_checking_no_crl() -> None:
@@ -92,8 +92,8 @@ def test_the_smtp_clause_names_the_loopback_relay_as_checking_no_crl() -> None:
 
 def test_the_ai_entry_says_how_loopback_is_read() -> None:
     entry = _ai_entry()
-    assert "the endpoint host is not loopback as the engine reads it: localhost in any" in entry
-    assert "(so localhost. gets the CRL)" in entry
+    assert "the endpoint host is not loopback as config.tls_policy.is_loopback_hop_host" in entry
+    assert "(at least localhost. reads remote and gets the CRL)" in entry
 
 
 def test_a_loopback_relay_resolves_no_crl_whatever_the_file_says() -> None:

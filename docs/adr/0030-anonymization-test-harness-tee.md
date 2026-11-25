@@ -157,9 +157,10 @@
   component of a field. **This adds to the §3 field list; §3 named none of these fields.**
 - **AMENDED 2026-11-25 (BACKLOG #5533): a third pass.** The default map adds the dates `PID-33`,
   `NK1-8`, `NK1-9`, `GT1-13`, `GT1-14`, `GT1-31`, `GT1-32`, `PV1-25`, `PV1-30` and `PV1-35` as
-  `DATE`, and the job titles `NK1-10` and `GT1-49` as `FREETEXT`. `MRG-4` stays `NAME`: `MRN`
-  would key it like `PID-2` but keep its CX.3 to CX.6, CX.9 and CX.10 as captured, where `NAME`
-  rewrites the whole repetition, so the move would scrub less.
+  `DATE`, and the job titles `NK1-10` and `GT1-49` as `FREETEXT`. `MRG-4` stays `NAME` in this
+  pass. `MRN` would key it like `PID-2` and keep its CX.3 to CX.6, CX.9 and CX.10 as captured, as
+  every `MRN` field does, where `NAME` rewrites the whole repetition; BACKLOG #5533 leaves that
+  choice open.
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —

@@ -152,8 +152,9 @@ class FieldRule:
 # and only when it is written identically in both. The kinds match for MRG-1 and PID-3
 # (MRN), for MRG-2 and PID-4, MRG-5 and PV1-19, and MRG-6 and PV1-50 (ID), and for MRG-7 and PID-5
 # (NAME). They do not match for two pairs. MRG-3, the prior account number, takes MRN, while
-# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME: NAME
-# rewrites the whole repetition, where MRN would keep CX.3 to CX.6, CX.9 and CX.10 as captured.
+# PID-18 takes ID. MRG-4, the prior patient id, is a CX paired with PID-2, yet takes NAME. A
+# move to MRN would keep its CX.3 to CX.6, CX.9 and CX.10 as captured, as every MRN field does,
+# where NAME rewrites the whole repetition; BACKLOG #5533 leaves that choice open.
 #
 # BACKLOG #5533 mapped fourteen identifier, name, location and contact fields that were unmapped
 # inside segments this map already scrubs: PID-2/21/23, NK1-13/30/31/32/33/37, GT1-2 and
@@ -164,9 +165,10 @@ class FieldRule:
 # marital status and sex, and PV1-2/4/10 patient class, admission type and hospital service.
 # A second pass mapped twenty more fields of the same class: GT1-4/19/21/24/29/42/45/46/51/56,
 # NK1-12/26/38, MRG-2/5/6 and PV1-5/37/50/52. A third pass mapped the dates PID-33, NK1-8/9,
-# GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. A field of these
-# segments with no rule below, the coded ones above included, is named by the coverage report,
-# and require_full_coverage refuses it.
+# GT1-13/14/31/32 and PV1-25/30/35, and the job titles NK1-10 and GT1-49. At least the job code
+# fields NK1-11 and GT1-50, whose third component is free text, still have no rule. The coverage
+# report names a field with no rule; leak.ALWAYS_DECIDED lists those require_full_coverage can
+# let pass.
 DEFAULT_RULES: tuple[FieldRule, ...] = (
     # PID — patient identity
     FieldRule("PID-2", SurrogateKind.MRN),  # patient id (external), a CX like PID-3
