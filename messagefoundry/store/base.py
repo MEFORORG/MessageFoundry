@@ -3263,24 +3263,26 @@ class AuthStore(Protocol):
         its source the AD sign-in decided from, and report whether it wrote (BACKLOG #6887).
 
         The sign-in decides from a row it read several awaits earlier, and the per-process sign-in
-        queue orders neither a sign-in on another engine shard nor an administrator's write. An
-        unconditional write would then judge whether it changed the scope, which is what revokes
-        the account's other sessions, against a value already replaced: it could revoke a
-        concurrent sign-in's brand-new session for a scope that sign-in had already written. If
-        ``expected_scope`` or ``expected_source`` (``None`` matching NULL) differs from the row
-        read, or the row is gone, nothing is written and this returns ``False``.
+        queue orders neither a sign-in on another engine shard nor an administrator's write. The
+        compare-and-set keeps the sign-in from silently overwriting a scope another writer wrote
+        after this sign-in read the row: if ``expected_scope`` or ``expected_source`` (``None``
+        matching NULL) differs from the row read, or the row is gone, nothing is written and this
+        returns ``False``, and the caller reads the row again and decides again, or refuses. It
+        does not stop concurrent sign-ins from revoking each other's sessions; the caller's
+        docstring, ``AuthService._sync_ad_channel_scope``, says which revokes remain under *WHAT
+        THE COMPARE-AND-SET DOES NOT CLOSE*.
 
         **What makes that compare hold differs per backend**, as for every user-record write. Each
         reads the row, compares in Python, and writes with a compare on the seal it read. Whether a
         row changed after the read then writes nothing depends on the backend. Postgres and SQL
         Server also read the row under a lock held to the write (``FOR UPDATE``, ``UPDLOCK,
-        ROWLOCK``), so there it does, and the seal compare is a second guard. On SQLite the writer lock holds the read and the
-        write together within one process, but the read takes no lock against ANOTHER process
-        writing the same file. Across processes the only guard there is the seal compare in the
-        ``UPDATE``, and only under a row sealer: with one, a row changed in any column after the
-        read loses the compare, and the caller reads that as a miss. A keyless store writes an
-        empty seal on every row, so the compare always matches and nothing stops another
-        process's write landing between this read and this write."""
+        ROWLOCK``), so there it does, and the seal compare is a second guard. On SQLite the writer
+        lock holds the read and the write together within one process, but the read takes no lock
+        against ANOTHER process writing the same file. Across processes the only guard there is
+        the seal compare in the ``UPDATE``, and only under a row sealer: with one, a row changed in
+        any column after the read loses the compare, and the caller reads that as a miss. A
+        keyless store writes an empty seal on every row, so the compare always matches and nothing
+        stops another process's write landing between this read and this write."""
         ...
 
     async def set_user_federated_subject(
