@@ -213,11 +213,32 @@ function ConvertTo-Safe([string]$s) { ($s -replace '[\p{C}]', ' ').Trim() }
 if ($List) {
     foreach ($k in @("adr", "backlog")) {
         $dir = Join-Path $allocRoot $k
-        $mine = @(Get-ChildItem $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
-                $c = Read-CoordText $_.FullName | ConvertFrom-Json
+        # ONE BAD RECORD NAMES ITSELF AND IS SKIPPED (BACKLOG #7560). A parse that threw here, under
+        # "Stop", ended the whole listing; an empty file (the shape a kill between CreateNew and the
+        # write leaves) or a non-object body parsed to something with no fields. -List only reports,
+        # so skipping is safe: the floor keys on file NAMES and still counts a number whose body is bad.
+        # The summary line says how many it skipped, because a skipped record may be this tree's own.
+        #
+        # -LiteralPath HERE AND AT EVERY REGISTRY READ BELOW: a `[` in the registry path is a wildcard
+        # to -Path, which then lists nothing. Measured on a fixture under `wild[1]`: the floor fell
+        # from 60 to the refs' 1, so a used number would read free.
+        $skipped = 0
+        $mine = @(Get-ChildItem -LiteralPath $dir -Filter *.json -EA SilentlyContinue | ForEach-Object {
+                $c = $null
+                $why = "it is empty or is not a JSON object"
+                # -NoEnumerate, so a one-element array is not unwrapped into the object inside it.
+                try { $c = Read-CoordText $_.FullName | ConvertFrom-Json -NoEnumerate } catch { $why = ConvertTo-Safe $_.Exception.Message }
+                # The full type name, not the [pscustomobject] accelerator: that names PSObject, and
+                # MEASURED, an empty file's $null passed `-isnot [pscustomobject]` as an object.
+                if ($null -eq $c -or $c -isnot [System.Management.Automation.PSCustomObject]) {
+                    [Console]::Error.WriteLine("alloc.ps1: WARNING -- allocation record $($_.FullName) could not be read ($why), so it is left out of this list.")
+                    $skipped++
+                    return
+                }
                 if (((Get-PathKey $c.worktree) -ieq (Get-PathKey $repo)) -and (Test-CoordRecordIsHere $c)) { $c }
             })
-        Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })"
+        $incomplete = if ($skipped) { " -- INCOMPLETE: $skipped unreadable record(s) skipped, named on stderr" } else { "" }
+        Write-Host "$k allocated to this worktree: $(if ($mine) { ($mine.number -join ', ') } else { '(none)' })$incomplete"
     }
     return
 }
@@ -328,7 +349,7 @@ if (-not $ShowFloor) {
     # them and hand back a number for unrelated work. Skipping the check costs a hole at worst, which
     # is the direction this block errs in everywhere else.
     $existing = [System.Collections.Generic.List[object]]::new()
-    foreach ($f in ($(if ($titleKey) { Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue }))) {
+    foreach ($f in ($(if ($titleKey) { Get-ChildItem -LiteralPath $alloc -Filter *.json -EA SilentlyContinue }))) {
         # THE FILENAME IS THE NUMBER, AND THE BODY'S `number` FIELD IS NOT. Get-Floor parses
         # `$f.BaseName` and ledger_check.py::owns opens `<number>.json` -- both key on the name. A
         # record copied or hand-repaired during one of the docs/LEDGER-GATE.md recoveries can carry a
@@ -576,7 +597,8 @@ function Get-Floor {
     }
 
 
-    foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {
+    # -LiteralPath, for the wildcard reason at the -List block (BACKLOG #7560).
+    foreach ($f in (Get-ChildItem -LiteralPath $alloc -Filter *.json -EA SilentlyContinue)) {
         $n = 0
         if ([int]::TryParse($f.BaseName, [ref]$n)) { $seen.Add($n) }
     }
@@ -616,7 +638,33 @@ function Get-Floor {
     $watermark = Join-Path $alloc ".floor-highwater"
     $computed = [int](($seen | Measure-Object -Maximum).Maximum)
     $previous = 0
-    if (Test-Path $watermark) { [void][int]::TryParse((Read-CoordText $watermark).Trim(), [ref]$previous) }
+    # A HIGH-WATER FILE THAT IS THERE BUT IS NOT A WHOLE NUMBER REFUSES (BACKLOG #7560). The read used
+    # to fall back to 0, so a garbled file let the floor drop to what the refs show and the write below
+    # then replaced the ratchet with that lower value. Its true value cannot be known from here, and a
+    # guess is what lets a used number read free.
+    #
+    # READ DIRECTLY, NOT PROBED WITH Test-Path: Test-Path answers $false for a path it cannot reach as
+    # well as for an absent one, so an SMB blip read the ratchet as 0. Only a missing file is absent;
+    # any other read failure refuses.
+    #
+    # WHAT THIS DOES NOT CATCH: a torn prefix ("10" left of "1032") is a whole number and reads as one.
+    # The temp-and-rename write below is what keeps this script from leaving one.
+    # TWO REMEDIES, because the two failures need opposite acts. A read that failed says nothing about
+    # the content, so it must not invite a rewrite. A bad value has lost its number, and any value at or
+    # below $computed is the same as deleting the file: holes are free and collisions are not, so the
+    # repair asks for a value ABOVE it.
+    $readRemedy = "Do not rewrite or delete it: its content may be valid. Retry when the share answers, or fix access to the file, then re-run."
+    $ratchetRemedy = "Do not delete it to get past this: that drops the ratchet, and the numbers it held are ones no ref here still shows. Restore the value it held from a backup if one has it. Otherwise this needs the owner: a value at or below the $computed this sweep found is the same as deleting the file, so write one comfortably above it. Then re-run."
+    $raw = $null
+    $absent = $false
+    try { $raw = Read-CoordText $watermark }
+    catch [System.IO.FileNotFoundException] { $absent = $true }
+    catch { throw "alloc.ps1: $refusal -- the high-water file $watermark could not be read ($(ConvertTo-Safe $_.Exception.Message)), so the floor it protects cannot be known and nothing was read as a floor or allocated. $readRemedy" }
+    if (-not $absent) {
+        if (-not [int]::TryParse("$raw".Trim(), [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$previous)) {
+            throw "alloc.ps1: $refusal -- the high-water file $watermark does not hold a whole number, so the floor it protects cannot be known and nothing was read as a floor or allocated. $ratchetRemedy"
+        }
+    }
 
     # NAME THE CAUSE, AND DO NOT SEND THE OPERATOR AFTER A REMEDY THAT CANNOT WORK. This used to end
     # "re-fetch them before trusting any number-space reasoning here", which is wrong twice over now:
@@ -646,7 +694,23 @@ function Get-Floor {
         }
     }
     $floor = [Math]::Max($computed, $previous)
-    if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
+    # WRITTEN THROUGH A TEMP FILE AND ONE RENAME (BACKLOG #7560). Set-Content truncates, then writes, so
+    # a kill or an SMB fault between the two could leave an empty file, which the read above refuses, or
+    # a torn prefix, which it cannot tell from a real value. Move-CoordFileReplace is the overwrite
+    # rename claim.ps1 uses, retried on a sharing fault. A failed write still ends the run, as
+    # Set-Content's throw did; the temp file is removed first.
+    # NOT CLOSED HERE: two concurrent runs still race last-writer-wins, as Set-Content did, so a run
+    # whose refs show less can rename a lower value over a higher one.
+    if ($floor -gt $previous -and -not $Peek) {
+        $tmp = "$watermark.$PID.$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            Set-Content -LiteralPath $tmp -Value $floor -Encoding ASCII
+            Move-CoordFileReplace -Source $tmp -Destination $watermark
+        } catch {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+            throw
+        }
+    }
 
     # ONE NUMBER NOW. `Floor` is the whole observed set's maximum -- "what must I not re-issue" --
     # so it includes every number seen anywhere.

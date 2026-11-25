@@ -107,8 +107,8 @@ What this changes:
    `Read-CoordText`. The Python twin, `read_text` in `coord_root.py`, serves the claim and ledger
    gates, which only read. `tests/test_coord_smb_retry.py` tests each one against a second process
    that holds the file with no sharing. Each test has a control: the plain call must fail.
-   **Not covered, at least:** `alloc.ps1` still rewrites `alloc/<kind>/.floor-highwater` in place.
-   `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
+   `alloc.ps1` replaces `alloc/<kind>/.floor-highwater` through a temp file and a rename, with
+   `Move-CoordFileReplace`. **Not covered, at least:** `tombstone-retired-backlog-allocator.ps1` reads and writes without the helpers. `handoff.ps1`'s
    report reads each handoff with its own capped read. `mail-claim.ps1` keeps its own claim-by-rename
    protocol, and the drain's citation walk fails closed on a held file without retrying. The wiki
    inbox (`wiki/`) and `wiki-cycle/` are read and written by korus scripts, which use neither
