@@ -688,6 +688,32 @@ def test_a_sibling_after_a_bare_token_is_still_collected(repo: Path, tmp_path: P
     assert any("#47" in c["subject"] for c in r["citations"]), r["citations"]
 
 
+def test_a_sibling_on_the_second_line_of_a_wrapped_subject_is_still_collected(
+    repo: Path, tmp_path: Path
+) -> None:
+    """`git log --grep` matches one message LINE at a time, while `%s` joins a wrapped first
+    paragraph into one subject. A git-side query that needs the `BACKLOG` token on the same line
+    as the number loses a sibling the wrap pushed onto line 2, though the joined subject cites it.
+    The git-side query must therefore look for the number alone and leave the token to the subject
+    filter."""
+    backlog(repo, f"## 23. Delivered on the wrapped line\n\n> {PRIORITIZED} open\n\nbody\n")
+    git(
+        repo,
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "four gates that could not fail (BACKLOG #19, #22,\n#23, #31)",
+    )
+    git(repo, "push", "-q", "origin", "main")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "23", tmp_path / "gone", "seat")
+    cites = rows(repo)["23"]["citations"]
+    assert [c["subject"] for c in cites] == [
+        "four gates that could not fail (BACKLOG #19, #22, #23, #31)"
+    ], cites
+
+
 # ===================================================================================================
 # THE LEDGER LIVES IN ANOTHER REPOSITORY -- -LedgerRepo (BACKLOG #5480).
 # ===================================================================================================
@@ -933,7 +959,7 @@ def test_the_citation_cap_is_applied_after_filtering_not_before(repo: Path, tmp_
     """MUST TRIP on origin/main (BACKLOG #7562). git's `--grep` reads the whole message, so every
     commit whose BODY cites the number is a candidate, and `--max-count=40` kept only the 40 newest
     candidates before the subject filter ran. Forty newer non-citations then hid the real delivery
-    commit behind them. A body citation stays a candidate under the narrower git-side query too."""
+    commit behind them. A body citation stays a candidate under the git-side query too."""
     backlog(repo, f"## 47. Delivered long ago\n\n> {PRIORITIZED} open\n\nbody\n")
     git(repo, "commit", "-q", "--allow-empty", "-m", "the real delivery (BACKLOG #47)")
     for i in range(41):

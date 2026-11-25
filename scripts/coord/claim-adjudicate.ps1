@@ -386,14 +386,16 @@ function Get-Citations([string]$ItemKey) {
     $notPr = "(?<!\b(?:PR|pull request)\s*)"
     $inParen = [regex]"(?i)\(\s*BACKLOG\s+(?=#[0-9])[^)]*?$notPr#$ItemKey\b[^)]*\)"
     $afterTok = [regex]"(?i)\bBACKLOG\s+(?=#[0-9])[^()]*?$notPr#$ItemKey\b"
-    # Candidates: a message line holding the BACKLOG token before this number, a superset of both
-    # subject rules above, so a bare squash suffix `(#N)` never becomes one. git's --grep still reads
-    # the BODY as well as the subject, so a candidate is not yet a citation. NO --max-count, then
+    # Candidates: any message line holding `#N` with no digit after it. The query names the number
+    # ALONE because git's --grep matches one LINE at a time while %s joins a wrapped first paragraph
+    # into one subject, so a sibling the wrap put on line 2 has no BACKLOG token on its own line. It
+    # reads the BODY too, so a candidate is not yet a citation: the subject rules above decide, and
+    # they drop a bare squash suffix `(#N)` and a body-only mention. NO --max-count, then
     # (BACKLOG #7562): a cap of 40 raw candidates let 40 newer non-citations hide every real
     # delivery. The cap of five is applied to FILTERED rows, and Select-Object -First stops git once
     # it has them. A display, so a git that was stopped or failed yields fewer rows, never a throw.
     $PSNativeCommandUseErrorActionPreference = $false
-    @(& git -C $repo log --format="%h%x09%s" --grep="BACKLOG[^)]*#$ItemKey([^0-9]|`$)" -E --regexp-ignore-case $mainSha 2>$null |
+    @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E $mainSha 2>$null |
         ForEach-Object {
             $p = $_ -split "`t", 2
             if ($p.Count -eq 2 -and ($inParen.IsMatch($p[1]) -or $afterTok.IsMatch($p[1]))) {
