@@ -14200,6 +14200,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     from messagefoundry.store.base import (
         KeylessAuditChainRefused,
         StoreNotFoundError,
+        audit_write_errors,
         open_store,
         store_call_errors,
     )
@@ -14219,7 +14220,9 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
             as_json=args.json,
         )
 
-    async def run() -> tuple[str, int | None, str | None, str | None]:
+    async def run() -> tuple[
+        Literal["revoked", "refused", "unknown"], int | None, str | None, str | None
+    ]:
         """``(outcome, count, problem, audit_problem)``. ``revoked`` carries the count;
         ``refused`` the store's refusal, which rolled the revoke back; ``unknown`` the link
         failure, after which the revoke may have committed. ``audit_problem`` is the refusal of
@@ -14234,22 +14237,31 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         )
 
         async def audit(detail: dict[str, object]) -> str | None:
+            """Append the row once the revoke has run. Every refusal, a defect and a Transit
+            MAC failure included, is returned as text rather than raised, so it never replaces
+            what the command says about the revoke. The class goes to WARNING and the traceback
+            to DEBUG: a driver's message can quote a stored value."""
             try:
                 await store.record_audit(
                     "auth.session_revoked", actor=actor, detail=json.dumps(detail)
                 )
-            except AUDIT_WRITE_DEFECTS:
-                raise  # a bug, not a refused write
-            except store_call_errors() as exc:
+            except (*audit_write_errors(), *AUDIT_WRITE_DEFECTS) as exc:
+                log = logging.getLogger(__name__)
+                log.warning(
+                    "admin-revoke-sessions: the auth.session_revoked row was refused (%s)",
+                    type(exc).__name__,
+                )
+                log.debug("admin-revoke-sessions: the refusal's traceback", exc_info=exc)
                 return _store_error_text(exc)
             return None
 
-        # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through the
-        # store's own pager, on the logging sink, serve's fallback, since the CLI holds no notifier.
-        seal_pager = getattr(store, "seal_pager", None)
-        if callable(seal_pager):
-            seal_pager().arm(authority_seal_page(LoggingAlertSink()))
         try:
+            # Decision d20261109T200352805-599b24 on ADR 0217, item 5: this revoke pages through
+            # the store's own pager, on the logging sink, serve's fallback, since the CLI holds no
+            # notifier. Inside the try, so a raise here still closes the store.
+            seal_pager = getattr(store, "seal_pager", None)
+            if callable(seal_pager):
+                seal_pager().arm(authority_seal_page(LoggingAlertSink()))
             _refuse_an_unauditable_write(store)
             try:
                 revoked = (await store.revoke_all_sessions()).count
@@ -14289,7 +14301,14 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
     except sqlite3.DatabaseError as exc:
         return _emit_store_open_error(exc, settings.store.path, as_json=args.json)
     if outcome == "refused":
-        return _emit_error(f"nothing was revoked: {problem}. Retry", as_json=args.json)
+        # Only a lock is fixed by stopping a SQLite engine, so only a lock gets that hint, as the
+        # transit-bound commands give it.
+        hint = (
+            "; if the engine is running on this SQLite store, stop it and re-run"
+            if problem is not None and "database is locked" in problem
+            else ""
+        )
+        return _emit_error(f"nothing was revoked: {problem}. Retry{hint}", as_json=args.json)
     if outcome == "unknown":
         recorded = (
             "An auth.session_revoked row with the outcome unknown records the attempt"
@@ -14304,7 +14323,7 @@ def _admin_revoke_sessions(args: argparse.Namespace) -> int:
         )
     if audit_problem is not None:
         return _emit_error(
-            f"revoked {revoked} session(s), but the audit row could not be written: "
+            f"ended {revoked} unrevoked session row(s), but the audit row could not be written: "
             f"{audit_problem}. The sessions are ended; record the act by hand",
             as_json=args.json,
         )
